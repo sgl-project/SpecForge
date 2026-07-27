@@ -40,6 +40,17 @@ except ImportError:
 # --- End Lazy Imports ---
 
 
+def _public_config(args) -> Dict[str, Any]:
+    """Return tracker metadata without copying credentials into run logs."""
+    config = dict(vars(args))
+    for name in list(config):
+        lowered = name.lower()
+        if any(secret in lowered for secret in ("key", "token", "password")):
+            if config[name] is not None:
+                config[name] = "<redacted>"
+    return config
+
+
 class Tracker(abc.ABC):
     """
     Abstract Base Class for experiment trackers.
@@ -52,7 +63,9 @@ class Tracker(abc.ABC):
     def __init__(self, args, output_dir: str):
         self.args = args
         self.output_dir = output_dir
-        self.rank = dist.get_rank()
+        self.rank = (
+            dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        )
         self.is_initialized = False
 
     @classmethod
@@ -160,7 +173,7 @@ class WandbTracker(Tracker):
             init_kwargs = {
                 "project": args.wandb_project,
                 "name": args.wandb_name,
-                "config": vars(args),
+                "config": _public_config(args),
                 "dir": args.wandb_dir,
             }
             if args.wandb_offline:
@@ -217,7 +230,7 @@ class SwanlabTracker(Tracker):
             swanlab.init(
                 project=args.swanlab_project,
                 experiment_name=args.swanlab_name,
-                config=vars(args),
+                config=_public_config(args),
                 logdir=swanlog_dir,
             )
             self.is_initialized = True
@@ -294,7 +307,7 @@ class MLflowTracker(Tracker):
             # This will either use the set URI or the default
             mlflow.set_experiment(args.mlflow_experiment_name)
             mlflow.start_run(run_name=args.mlflow_run_name)
-            mlflow.log_params(vars(args))
+            mlflow.log_params(_public_config(args))
             self.is_initialized = True
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):

@@ -2,10 +2,9 @@
 
 Assumptions about the trainer log and output structure:
 
-- Metric lines match: ``[consumer] step <N> {<dict>}``
-  This is the disaggregated Domino consumer log format. A new method whose trainer
-  uses a different prefix or schema must either emit the same pattern or supply its
-  own checker; update ``METRIC_LINE`` accordingly.
+- Metric lines match either the historical disaggregated consumer form
+  ``[consumer] step <N> {<dict>}`` or the unified trainer form
+  ``step <N>: {<dict>}``.
 - The checkpoint tree layout is: ``<checkpoint_root>/<run-id>-step<N>/training_state.pt``
   If a new method saves checkpoints under a different layout, adjust
   ``checkpoint_paths()`` to match.
@@ -24,17 +23,22 @@ import os
 import re
 from typing import Dict, Tuple
 
-METRIC_LINE = re.compile(r"\[consumer\] step (\d+) (\{.*\})\s*$")
+METRIC_LINES = (
+    re.compile(r"\[consumer\] step (\d+) (\{.*\})\s*$"),
+    re.compile(r"(?:^|\s)step (\d+):\s*(\{.*\})\s*$"),
+)
 
 
 def final_metrics(log_path: str) -> Tuple[int, Dict[str, float]]:
     matches = []
     with open(log_path, encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            match = METRIC_LINE.search(line)
-            if match:
-                metrics = ast.literal_eval(match.group(2))
-                matches.append((int(match.group(1)), metrics))
+            for pattern in METRIC_LINES:
+                match = pattern.search(line)
+                if match:
+                    metrics = ast.literal_eval(match.group(2))
+                    matches.append((int(match.group(1)), metrics))
+                    break
     if not matches:
         raise ValueError(f"no consumer metric lines found in {log_path}")
     return matches[-1]
@@ -45,7 +49,7 @@ def checkpoint_paths(checkpoint_root: str):
     paths = glob.glob(pattern)
 
     def get_step(path: str) -> int:
-        match = re.search(r"-step(\\d+)", path)
+        match = re.search(r"-step(\d+)", path)
         return int(match.group(1)) if match else 0
 
     return sorted(paths, key=get_step)

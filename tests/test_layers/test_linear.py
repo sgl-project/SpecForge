@@ -6,9 +6,17 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 
-from specforge.distributed import gather_tensor, get_tp_group, init_distributed
+from specforge.distributed import get_tp_group, init_distributed
 from specforge.layers import ColumnParallelLinear, RowParallelLinear
 from tests.utils import get_available_port
+
+
+def _gather_tensor(tensor, process_group, dim=-1):
+    parts = [
+        torch.empty_like(tensor) for _ in range(dist.get_world_size(process_group))
+    ]
+    dist.all_gather(parts, tensor, group=process_group)
+    return torch.cat(parts, dim=dim)
 
 
 def run_column_parallel_linear(rank, world_size, port):
@@ -33,7 +41,7 @@ def run_column_parallel_linear(rank, world_size, port):
     # forward
     native_output = native_linear(data)
     sf_output = sf_linear(data)
-    full_sf_output = gather_tensor(sf_output, get_tp_group())
+    full_sf_output = _gather_tensor(sf_output, get_tp_group())
 
     # check
     assert torch.allclose(
@@ -54,9 +62,9 @@ def run_column_parallel_linear(rank, world_size, port):
     # forward
     q, k, v = native_linear(data).chunk(3, dim=1)
     sf_q, sf_k, sf_v = sf_linear(data).chunk(3, dim=1)
-    full_sf_q = gather_tensor(sf_q, get_tp_group())
-    full_sf_k = gather_tensor(sf_k, get_tp_group())
-    full_sf_v = gather_tensor(sf_v, get_tp_group())
+    full_sf_q = _gather_tensor(sf_q, get_tp_group())
+    full_sf_k = _gather_tensor(sf_k, get_tp_group())
+    full_sf_v = _gather_tensor(sf_v, get_tp_group())
 
     # check
     assert torch.allclose(
@@ -83,8 +91,8 @@ def run_column_parallel_linear(rank, world_size, port):
     # forward
     gate, up = native_linear(data).chunk(2, dim=1)
     sf_gate, sf_up = sf_linear(data).chunk(2, dim=1)
-    full_sf_gate = gather_tensor(sf_gate, get_tp_group())
-    full_sf_up = gather_tensor(sf_up, get_tp_group())
+    full_sf_gate = _gather_tensor(sf_gate, get_tp_group())
+    full_sf_up = _gather_tensor(sf_up, get_tp_group())
 
     # check
     assert torch.allclose(

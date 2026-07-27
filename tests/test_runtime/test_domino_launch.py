@@ -1,11 +1,11 @@
 # coding=utf-8
-"""Launcher path (Domino): build_{offline,online}_runtime(strategy="domino").
+"""Domino step schedule and offline launcher.
 
-Domino is the third algorithm on the composable launch. Beyond a StrategySpec it
-needs exactly one shared-contract extension: its loss blends a base loss with a
-step-decayed weight, so DominoTrainStrategy reads the StepContext threaded through
-forward_loss. These tests prove (1) the lambda schedule logic (CPU), and (2) that
-domino trains end-to-end offline and online through the same runtime spine (GPU).
+Domino's immutable algorithm registration injects its concrete step provider.
+Its loss blends a base loss with a step-decayed weight, so
+DominoTrainStrategy reads the StepContext threaded through forward_loss. These
+tests prove the lambda schedule logic on CPU and that Domino trains end to end
+from precomputed features on GPU.
 """
 
 import os
@@ -14,7 +14,10 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
+
 CUDA = torch.cuda.is_available()
+ALGORITHM = builtin_algorithm_registry().resolve("domino")
 
 
 class TestDominoLambdaSchedule(unittest.TestCase):
@@ -41,11 +44,57 @@ class TestDominoLambdaSchedule(unittest.TestCase):
             s._lambda_base(StepContext(global_step=3, total_steps=None)), 0.0
         )
 
+    def test_strategy_preserves_every_model_diagnostic(self):
+        from specforge.runtime.contracts import TrainBatch
+        from specforge.training.strategies.base import DominoTrainStrategy, StepContext
 
-@unittest.skipUnless(CUDA, "Domino launcher FSDP path requires CUDA")
+        class DiagnosticModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+                self.model_metrics = {
+                    "final_loss": torch.tensor(1.25),
+                    "base_loss": torch.tensor(2.5),
+                    "base_accuracy": torch.tensor(0.4),
+                    "accept_len": torch.tensor(3.0),
+                    "base_accept_len": torch.tensor(2.0),
+                    "accuracy_denom": torch.tensor(8.0),
+                    "lambda_base": torch.tensor(0.5),
+                }
+
+            def forward(self, **kwargs):
+                del kwargs
+                return self.weight.square(), torch.tensor(0.75), self.model_metrics
+
+        model = DiagnosticModel()
+        strategy = DominoTrainStrategy(model, lambda_start=1.0, decay_ratio=0.5)
+        batch = TrainBatch(
+            sample_ids=["sample-0"],
+            strategy="domino",
+            tensors={
+                "input_ids": torch.ones(1, 2, dtype=torch.long),
+                "hidden_states": torch.ones(1, 2, 2),
+                "loss_mask": torch.ones(1, 2),
+            },
+        )
+
+        output = strategy.forward_loss(
+            batch,
+            StepContext(global_step=1, total_steps=4),
+        )
+
+        self.assertEqual(
+            set(output.metrics),
+            {*model.model_metrics, "accuracy"},
+        )
+        for name, value in model.model_metrics.items():
+            self.assertIs(output.metrics[name], value)
+        self.assertEqual(float(output.metrics["accuracy"]), 0.75)
+
+
+@unittest.skipUnless(CUDA, "Domino offline launcher path requires CUDA")
 class TestDominoOfflineLaunch(unittest.TestCase):
-    def test_offline_domino_trains_through_fsdp(self):
-        torch.manual_seed(0)
+    def test_domino_trains_from_precomputed_dflash_features(self):
         from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port="29571")
@@ -55,141 +104,52 @@ class TestDominoOfflineLaunch(unittest.TestCase):
         from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
 
-        HIDDEN, SEQ, N, MAX_OPT_STEPS = 64, 32, 4, 2
-        workdir = tempfile.mkdtemp(prefix="domino_launch_")
-        # domino reuses the DFlash offline feature schema {input_ids, hidden_states, loss_mask}
-        feat_dir = fx.write_offline_files_dflash(
-            os.path.join(workdir, "features"), n=N, seq=SEQ, hidden=HIDDEN
+        hidden, sequence_length = 64, 32
+        workdir = tempfile.mkdtemp(prefix="domino_offline_")
+        feature_dir = fx.write_offline_files_dflash(
+            os.path.join(workdir, "features"),
+            n=4,
+            seq=sequence_length,
+            hidden=hidden,
         )
-        domino_model, width, _td, _layers = fx.build_domino(
+        model, width, _target_dir, _layers = fx.build_domino(
             workdir,
-            hidden=HIDDEN,
+            hidden=hidden,
             block_size=4,
             num_anchors=8,
             attention_backend="sdpa",
         )
-        self.assertEqual(width, HIDDEN)
+        self.assertEqual(width, hidden)
 
-        def optimizer_factory(draft_module):
+        def optimizer_factory(module):
             return BF16Optimizer(
-                draft_module,
+                module,
                 lr=1e-3,
                 max_grad_norm=0.5,
                 warmup_ratio=0.0,
-                total_steps=10,
+                total_steps=2,
             )
 
-        trainer, loader = build_offline_runtime(
-            strategy="domino",
-            hidden_states_path=feat_dir,
-            eagle3_model=domino_model,
+        trainer = build_offline_runtime(
+            algorithm=ALGORITHM,
+            hidden_states_path=feature_dir,
+            draft_model=model,
             target_head=None,
             optimizer_factory=optimizer_factory,
             run_id="domino-offline",
             output_dir=os.path.join(workdir, "out"),
-            max_len=SEQ,
+            max_len=sequence_length,
             batch_size=1,
-            num_epochs=3,
-            max_steps=MAX_OPT_STEPS,
-        )
-
-        module = trainer.core.strategy.trainable_module()
-        self.assertIsInstance(module, FSDP)
-
-        step = trainer.fit(loader)
-
-        self.assertEqual(step, MAX_OPT_STEPS)
-        self.assertTrue(
-            all(torch.isfinite(p).all() for p in module.parameters()),
-            "draft params became non-finite — loss was NaN/inf?",
-        )
-
-
-@unittest.skipUnless(CUDA, "Domino online launcher path requires CUDA")
-class TestDominoOnlineLaunch(unittest.TestCase):
-    def test_online_rollout_then_fsdp_train(self):
-        torch.manual_seed(0)
-        from tests.test_runtime import _fixtures as fx
-
-        fx.build_single_rank_distributed(port="29572")
-
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-        from specforge.launch import build_online_runtime
-        from specforge.modeling.target import get_target_engine
-        from specforge.optimizer import BF16Optimizer
-
-        HIDDEN, V, SEQ, ACC, MAX_OPT_STEPS, N = 64, fx.V, 16, 2, 2, 8
-        workdir = tempfile.mkdtemp(prefix="domino_online_")
-
-        domino_model, width, target_dir, layers = fx.build_domino(
-            workdir,
-            hidden=HIDDEN,
-            vocab=V,
-            block_size=4,
-            num_anchors=8,
-            attention_backend="sdpa",
-        )
-        self.assertEqual(width, HIDDEN)
-
-        # domino captures the same hidden_states as DFlash -> reuse the DFlash target
-        target = get_target_engine(
-            target_dir,
-            strategy="domino",
-            backend="hf",
-            torch_dtype=torch.bfloat16,
-            device="cuda",
-        )
-        target.set_capture_layers(layers)
-
-        g = torch.Generator().manual_seed(7)
-        prompts = [
-            {
-                "payload": {
-                    "input_ids": torch.randint(0, V, (SEQ,), generator=g).tolist(),
-                    "loss_mask": [1] * SEQ,
-                }
-            }
-            for _ in range(N)
-        ]
-
-        def optimizer_factory(draft_module):
-            return BF16Optimizer(
-                draft_module,
-                lr=1e-3,
-                max_grad_norm=0.5,
-                warmup_ratio=0.0,
-                total_steps=10,
-            )
-
-        trainer, loader, workers, controller, drive_rollout = build_online_runtime(
-            strategy="domino",
-            target_model=target,
-            prompts=prompts,
-            eagle3_model=domino_model,
-            optimizer_factory=optimizer_factory,
-            run_id="domino-online",
-            output_dir=os.path.join(workdir, "out"),
-            target_hidden_size=HIDDEN,
-            batch_size=1,
-            accumulation_steps=ACC,
             num_epochs=1,
-            max_steps=MAX_OPT_STEPS,
+            max_steps=2,
+            total_steps=2,
+            strategy_kwargs={"lambda_start": 1.0, "decay_ratio": 0.5},
         )
-
-        produced = drive_rollout()
-        self.assertEqual(produced, N)
-        self.assertEqual(controller.sample_queue.depth(), N)
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(module, FSDP)
-
-        step = trainer.fit(loader)
-        self.assertEqual(step, MAX_OPT_STEPS)
-        self.assertTrue(
-            all(torch.isfinite(p).all() for p in module.parameters()),
-            "draft params became non-finite — loss was NaN/inf?",
-        )
+        self.assertEqual(trainer.fit(), 2)
+        self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 
 
 if __name__ == "__main__":

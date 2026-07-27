@@ -7,8 +7,8 @@ from unittest import mock
 
 import torch
 
-from specforge.inference.target_engine.sglang_backend import patch as sglang_patch
-from specforge.inference.target_engine.sglang_backend import utils as sglang_utils
+from specforge.offline_capture.sglang_backend import patch as sglang_patch
+from specforge.offline_capture.sglang_backend import utils as sglang_utils
 
 
 class SGLang0514CompatibilityTest(unittest.TestCase):
@@ -89,7 +89,7 @@ class SGLang0514CompatibilityTest(unittest.TestCase):
             mock.patch.object(sglang_utils, "ForwardBatch", FakeForwardBatch),
             mock.patch.object(sglang_utils, "LogitsMetadata", FakeLogitsMetadata),
         ):
-            result = sglang_utils.replaced_logits_processor_forward_for_eagle3(
+            result = sglang_utils.replaced_logits_processor_forward_for_offline_eagle3(
                 processor,
                 "input_ids",
                 "hidden_states",

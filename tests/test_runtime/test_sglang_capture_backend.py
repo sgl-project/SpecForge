@@ -6,89 +6,85 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Phase B2 — target engine decoupled from the sglang version.
-
-The core invariant: the *algorithm* engine modules (``eagle3_target_model`` /
-``dflash_target_model``) must not import sglang internals at module load — the
-entire sglang-version coupling lives behind ``SGLangCaptureBackend``. That
-invariant is checked here with a pure-AST scan (no torch needed, so it runs even
-where torch cannot import). A sibling test asserts ``sglang_server`` is
-selectable through the factory.
-"""
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Offline capture is the only local SGLang version boundary."""
 
 import ast
 import os
+import subprocess
+import sys
 import unittest
 
-_TARGET_DIR = os.path.normpath(
-    os.path.join(
-        os.path.dirname(__file__), "..", "..", "specforge", "inference", "target_engine"
-    )
+_CAPTURE_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "specforge", "offline_capture")
 )
 
 
 def _toplevel_sglang_imports(path):
-    """Module-level `import sglang…` / `from sglang… import` names (level 0)."""
-    with open(path, "r", encoding="utf-8") as f:
-        tree = ast.parse(f.read(), filename=path)
+    """Return module-level imports rooted at ``sglang``."""
+    with open(path, "r", encoding="utf-8") as source:
+        tree = ast.parse(source.read(), filename=path)
     hits = []
-    for node in tree.body:  # module level only — lazy imports inside defs are OK
+    for node in tree.body:
         if isinstance(node, ast.Import):
-            hits += [n.name for n in node.names if n.name.split(".")[0] == "sglang"]
+            hits.extend(
+                name.name for name in node.names if name.name.split(".")[0] == "sglang"
+            )
         elif isinstance(node, ast.ImportFrom):
-            if (
-                node.level == 0
-                and node.module
-                and node.module.split(".")[0] == "sglang"
-            ):
-                hits.append(node.module)
+            if node.level == 0 and node.module:
+                if node.module.split(".")[0] == "sglang":
+                    hits.append(node.module)
     return hits
 
 
-class EngineSglangDecouplingTest(unittest.TestCase):
-    """The engines are sglang-version-agnostic; the backend owns sglang."""
-
-    def test_eagle3_engine_has_no_toplevel_sglang_import(self):
-        hits = _toplevel_sglang_imports(
-            os.path.join(_TARGET_DIR, "eagle3_target_model.py")
+class OfflineSglangBoundaryTest(unittest.TestCase):
+    def test_package_import_does_not_load_torch_or_sglang(self):
+        repo_root = os.path.dirname(os.path.dirname(_CAPTURE_DIR))
+        code = (
+            "import sys; "
+            "import specforge.offline_capture; "
+            "import specforge.offline_capture.sglang_backend; "
+            "assert 'torch' not in sys.modules; "
+            "assert 'sglang' not in sys.modules; "
+            "assert 'specforge.offline_capture.sglang_backend.capture' "
+            "not in sys.modules"
         )
-        self.assertEqual(hits, [], f"eagle3 engine leaks sglang imports: {hits}")
-
-    def test_dflash_engine_has_no_toplevel_sglang_import(self):
-        hits = _toplevel_sglang_imports(
-            os.path.join(_TARGET_DIR, "dflash_target_model.py")
+        subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        self.assertEqual(hits, [], f"dflash engine leaks sglang imports: {hits}")
+
+    def test_backend_package_does_not_eagerly_import_capture(self):
+        path = os.path.join(_CAPTURE_DIR, "sglang_backend", "__init__.py")
+        with open(path, encoding="utf-8") as source:
+            tree = ast.parse(source.read(), filename=path)
+        eager_capture_imports = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom) and node.module == "capture"
+        ]
+        self.assertEqual(eager_capture_imports, [])
+
+    def test_public_wrapper_has_no_toplevel_sglang_import(self):
+        path = os.path.join(_CAPTURE_DIR, "sglang.py")
+        self.assertEqual(_toplevel_sglang_imports(path), [])
 
     def test_capture_backend_is_the_single_sglang_boundary(self):
-        # The backend is *allowed* (and expected) to import sglang directly.
-        hits = _toplevel_sglang_imports(
-            os.path.join(_TARGET_DIR, "sglang_backend", "capture.py")
-        )
+        path = os.path.join(_CAPTURE_DIR, "sglang_backend", "capture.py")
+        hits = _toplevel_sglang_imports(path)
         self.assertTrue(
             hits,
-            "SGLangCaptureBackend is the version-pinned boundary; it should "
-            "import sglang internals directly",
+            "OfflineSGLangCaptureBackend is the version-pinned boundary and should "
+            "own direct SGLang imports",
         )
-
-
-class SglangServerBackendTest(unittest.TestCase):
-    """sglang_server is selectable via the factory (capture gated by O1.3)."""
-
-    def test_server_backend_tag_and_gated_construction(self):
-        try:
-            import torch  # noqa: F401
-        except Exception:
-            self.skipTest("torch unavailable")
-        from specforge.inference.target_engine import (
-            SGLangServerEagle3TargetEngine,
-            get_eagle3_target_model,
-        )
-
-        self.assertEqual(SGLangServerEagle3TargetEngine.backend, "sglang_server")
-        # Selectable, but gated: construction raises an actionable NotImplementedError.
-        with self.assertRaises(NotImplementedError):
-            get_eagle3_target_model("some/model", backend="sglang_server")
 
 
 if __name__ == "__main__":

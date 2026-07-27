@@ -10,7 +10,6 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
-from yunchang.comm import SeqAllToAll4D
 
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
@@ -104,6 +103,24 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         batch, num_key_value_heads, n_rep, slen, head_dim
     )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def get_rope_config(config):
+    """Get (rope_theta, rope_params) from config, supporting both v4 and v5.
+
+    Trust-remote-code configs or parent configs passed to sub-models may not
+    have the v5 ``rope_parameters`` property, so we fall back to the v4-style
+    ``config.rope_theta`` / ``config.rope_scaling`` attributes.
+
+    Returns:
+        (rope_theta, rope_params): In v5, rope_params is the full
+        rope_parameters dict (which subsumes rope_scaling and includes
+        rope_theta). In v4, rope_params is the rope_scaling dict or None.
+    """
+    rope_params = getattr(config, "rope_parameters", None)
+    if rope_params is not None:
+        return rope_params["rope_theta"], rope_params
+    return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
 
 
 def rotate_half(x):
@@ -382,8 +399,8 @@ class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
         self.scaling_factor = scaling_factor
 
     def forward(self, x, position_ids):
-        # In contrast to other models, Qwen2_5_VL has different position ids for the grids
-        # So we expand the inv_freq to shape (3, ...)
+        # Generic three-axis rotary inputs carry independent position IDs for
+        # each axis, so expand the inverse frequencies to match that layout.
         inv_freq_expanded = (
             self.inv_freq[None, None, :, None]
             .float()
@@ -550,14 +567,16 @@ class LlamaAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        rope_theta, rope_scaling = get_rope_config(self.config)
+        self.rope_scaling = rope_scaling
+
+        if rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
-                base=getattr(self.config, "rope_theta", 10000),
+                base=rope_theta,
             )
         else:
-            rope_scaling = self.config.rope_scaling
 
             def rope_get(key, default=None):
                 if isinstance(rope_scaling, dict):
@@ -571,7 +590,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=rope_theta,
                 )
                 return
             elif scaling_type == "linear":
@@ -582,6 +601,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "dynamic":
@@ -592,6 +612,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "llama3":
@@ -599,7 +620,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=rope_theta,
                     scaling_factor=(
                         scaling_factor if scaling_factor is not None else 1.0
                     ),
@@ -609,12 +630,15 @@ class LlamaAttention(nn.Module):
                 )
             elif scaling_type == "mrope":
                 self.rotary_emb = LlamaMutiRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                 )
             elif scaling_type == "yarn":
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=rope_theta,
                     original_max_position_embeddings=rope_get(
                         "original_max_position_embeddings"
                     ),
@@ -669,7 +693,7 @@ class LlamaAttention(nn.Module):
                     key_states,
                     cos,
                     sin,
-                    self.config.rope_scaling["mrope_section"],
+                    self.rope_scaling["mrope_section"],
                 )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len)
@@ -700,7 +724,7 @@ class LlamaAttention(nn.Module):
                     key_states,
                     cos,
                     sin,
-                    self.config.rope_scaling["mrope_section"],
+                    self.rope_scaling["mrope_section"],
                 )
             else:
                 cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
@@ -810,7 +834,7 @@ class LlamaFlexAttention(LlamaAttention):
                 key_states,
                 cos,
                 sin,
-                self.config.rope_scaling["mrope_section"],
+                self.rope_scaling["mrope_section"],
             )
         else:
             cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
@@ -1300,7 +1324,7 @@ class LlamaFlashAttention(LlamaAttention):
                 key_states,
                 cos,
                 sin,
-                self.config.rope_scaling["mrope_section"],
+                self.rope_scaling["mrope_section"],
                 unsqueeze_dim=2,
             )
         else:
@@ -1370,6 +1394,7 @@ class LlamaUSPFlashAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        from yunchang.comm import SeqAllToAll4D
 
         bsz, q_len, _ = hidden_states.size()
         local_q_len = q_len
@@ -1642,16 +1667,27 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
-        if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(
-                config.target_hidden_size * 3, config.hidden_size, bias=False
+        self.target_hidden_size = getattr(
+            config, "target_hidden_size", config.hidden_size
+        )
+
+        self.fc = torch.nn.Linear(
+            self.target_hidden_size * 3,
+            config.hidden_size,
+            bias=False,
+        )
+        if getattr(config, "fc_norm", False):
+            self.fc_norm = nn.ModuleList(
+                [
+                    LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(3)
+                ]
             )
         else:
-            self.fc = torch.nn.Linear(
-                config.hidden_size * 3, config.hidden_size, bias=False
-            )
+            self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_output = getattr(config, "norm_output", True)
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
@@ -1703,7 +1739,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
 
         # fc
-        hidden_states = self.fc(hidden_states)
+        hidden_states = self.project_hidden_states(hidden_states)
         hidden_states = self.midlayer(
             input_emb=inputs_embeds,
             hidden_states=hidden_states,
@@ -1724,12 +1760,20 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.embed_tokens(input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # eagle 3 requires hidden states from 3 layers
-        assert hidden_states.size(-1) == self.config.hidden_size * 3
+        assert hidden_states.size(-1) == self.target_hidden_size * 3
+        if self.fc_norm is not None:
+            chunks = hidden_states.chunk(3, dim=-1)
+            hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                dim=-1,
+            )
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        norm_hidden_states = self.norm(hidden_states)
+        if self.norm_output:
+            norm_hidden_states = self.norm(hidden_states)
+        else:
+            norm_hidden_states = hidden_states
         return self.lm_head(norm_hidden_states)
 
     def backbone(

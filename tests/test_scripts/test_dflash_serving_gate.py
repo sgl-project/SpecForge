@@ -1,49 +1,12 @@
 import importlib.util
-import json
-import subprocess
-import sys
-import tempfile
-import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-
-import torch
-from safetensors.torch import save_file
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "gates" / "run_dflash_chat_serving_gate.py"
 SPEC = importlib.util.spec_from_file_location("dflash_serving_gate", SCRIPT)
 gate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gate)
-
-
-def load_hf_exporter():
-    names = ("specforge", "specforge.export", "specforge.export.checkpoint_io")
-    saved = {name: sys.modules.get(name) for name in names}
-    try:
-        for name in names[:2]:
-            package = types.ModuleType(name)
-            package.__path__ = []
-            sys.modules[name] = package
-        checkpoint_io = types.ModuleType(names[2])
-        checkpoint_io.materialize_draft = None
-        checkpoint_io.resolve_training_state = None
-        sys.modules[names[2]] = checkpoint_io
-        path = ROOT / "specforge" / "export" / "to_hf.py"
-        spec = importlib.util.spec_from_file_location("_test_to_hf", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        for name, module in saved.items():
-            if module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = module
-
-
-hf_exporter = load_hf_exporter()
 
 
 def encode(text):
@@ -95,6 +58,7 @@ class TestDflashServingGate(unittest.TestCase):
                 ]
             }
         )
+
         self.assertTrue(result["passed"])
         self.assertEqual(result["target_prefix_match_tokens"], 16)
         self.assertEqual(result["clean_block_tokens"], 16)
@@ -128,6 +92,7 @@ class TestDflashServingGate(unittest.TestCase):
             encode=encode,
             block_size=16,
         )
+
         self.assertTrue(result["passed"])
         self.assertTrue(payload["chat_template_kwargs"]["enable_thinking"])
 
@@ -140,6 +105,7 @@ class TestDflashServingGate(unittest.TestCase):
                 ],
             }
         )
+
         self.assertFalse(result["passed"])
         self.assertIn(
             "missing choices[0].meta_info.spec_accept_length", result["errors"]
@@ -157,62 +123,12 @@ class TestDflashServingGate(unittest.TestCase):
             },
             {"speculative_algorithm": None},
         )
+
         self.assertFalse(result["passed"])
         self.assertTrue(any("expected 'DFLASH'" in error for error in result["errors"]))
         self.assertTrue(
             any("target prefix match" in error for error in result["errors"])
         )
-
-    def test_shell_launcher_uses_matching_dflash_block_flags(self):
-        launcher = ROOT / "examples/disagg/run_domino_dflash_serving_gate.sh"
-        subprocess.run(["bash", "-n", str(launcher)], check=True)
-        text = launcher.read_text()
-        self.assertIn('--speculative-num-draft-tokens "$BLOCK_SIZE"', text)
-        self.assertIn('--speculative-dflash-block-size "$BLOCK_SIZE"', text)
-        self.assertIn('--tp-size "$SERVING_TP"', text)
-        self.assertIn("REASONING_PARSER_ARGS=(--reasoning-parser", text)
-        self.assertIn("SERVING_PORT is already occupied", text)
-
-
-class TestDominoHfExport(unittest.TestCase):
-    def test_model_without_load_embedding_gets_target_embedding_in_state(self):
-        embedding = torch.arange(12, dtype=torch.bfloat16).reshape(4, 3)
-        source_key = "model.embed_tokens.weight"
-        state = {"draft_state_dict": {"draft.weight": torch.ones(1)}}
-        saved_state = {}
-
-        class DominoLikeModel:
-            def state_dict(self):
-                return {"draft.weight": torch.zeros(1)}
-
-            def save_pretrained(self, output_dir, *, state_dict):
-                saved_state.update(state_dict)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            shard = Path(tmp) / "model-00001-of-00001.safetensors"
-            save_file({source_key: embedding}, shard)
-            (Path(tmp) / "model.safetensors.index.json").write_text(
-                json.dumps({"weight_map": {source_key: shard.name}}),
-                encoding="utf-8",
-            )
-            with (
-                patch.object(hf_exporter, "resolve_training_state", return_value=state),
-                patch.object(
-                    hf_exporter,
-                    "materialize_draft",
-                    return_value=DominoLikeModel(),
-                ),
-            ):
-                hf_exporter.export_to_hf(
-                    "checkpoint",
-                    "config",
-                    str(Path(tmp) / "out"),
-                    embedding_source=tmp,
-                    embedding_key=source_key,
-                )
-
-        torch.testing.assert_close(saved_state["embed_tokens.weight"], embedding)
-        torch.testing.assert_close(saved_state["draft.weight"], torch.ones(1))
 
 
 if __name__ == "__main__":

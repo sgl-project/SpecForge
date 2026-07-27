@@ -1,4 +1,5 @@
-from .core import *  # noqa
-from .modeling import *  # noqa
+"""SpecForge package.
 
-__all__ = ["modeling", "core"]
+Training is configured through :mod:`specforge.cli`; implementation types live
+in their owning subpackages and are not re-exported through a compatibility API.
+"""

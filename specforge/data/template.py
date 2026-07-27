@@ -130,16 +130,6 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
-    name="qwen2-vl",
-    template=ChatTemplate(
-        assistant_header="<|im_start|>assistant\n",
-        user_header="<|im_start|>user\n",
-        system_prompt="You are a helpful assistant.",
-        end_of_turn_token="<|im_end|>\n",
-    ),
-)
-
-TEMPLATE_REGISTRY.register(
     name="phi3",
     template=ChatTemplate(
         assistant_header="<|assistant|>\n",
@@ -269,6 +259,19 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# DeepSeek-V2-Lite's tokenizer renders plain-text role headers. They must not
+# reuse DeepSeek-V3's special-token headers or the assistant loss mask will be
+# anchored at text that never appears in the rendered conversation.
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v2",
+    template=ChatTemplate(
+        assistant_header="Assistant: ",
+        user_header="User: ",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="ling-flash-2.0",
     template=ChatTemplate(
@@ -288,6 +291,19 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<｜end▁of▁sentence｜>",
         parser_type="thinking",
         enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="glm-5.2",
+    template=ChatTemplate(
+        assistant_header="<|assistant|><think>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+        parser_type="glm",
+        assistant_pattern_type="glm",
+        ignore_token=["<|user|>"],
     ),
 )
 
@@ -332,5 +348,23 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>\n",
         parser_type="thinking",
         enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="inkling-thinking",
+    template=ChatTemplate(
+        assistant_header="<|message_model|>",
+        user_header="<|message_user|>",
+        system_prompt=None,
+        end_of_turn_token="<|message_user|>",
+        parser_type="thinking",
+        assistant_pattern_type="inkling",
+        enable_thinking=True,
+        ignore_token=[
+            "<|message_user|>",
+            "<|message_tool|>",
+            "<|message_system|>",
+        ],
     ),
 )

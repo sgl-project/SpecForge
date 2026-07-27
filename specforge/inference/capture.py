@@ -8,9 +8,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """CaptureConfig: the typed contract for what a rollout must extract (B7/B8).
 
-``capture`` is NOT an untyped ``dict[str, Any]``. It is a frozen config *derived
-from the active strategy* (``feature_names == DraftTrainStrategy.required_features``,
-``aux_hidden_state_layer_ids`` == the layers the draft config requested). Before
+``capture`` is NOT an untyped ``dict[str, Any]``. It is a frozen config derived
+from the resolved algorithm feature contract and draft capture layers. Before
 any ``FeatureStore.put`` the rollout runs :func:`verify_capture`, which fails
 loudly on a name / aux-layer-id / width / target-dim mismatch — turning what
 would otherwise be a confusing downstream trainer bug into an immediate,
@@ -35,7 +34,7 @@ class CaptureMismatchError(AssertionError):
 class CaptureConfig:
     feature_names: FrozenSet[str]
     aux_hidden_state_layer_ids: Tuple[int, ...]
-    target_repr: TargetRepr
+    target_repr: Optional[TargetRepr]
     target_hidden_size: int
     target_vocab_size: Optional[int] = None
     draft_vocab_size: Optional[int] = None
@@ -48,7 +47,7 @@ class CaptureConfig:
         required_features,
         aux_hidden_state_layer_ids,
         *,
-        target_repr: TargetRepr,
+        target_repr: Optional[TargetRepr],
         target_hidden_size: int,
         target_vocab_size: Optional[int] = None,
         draft_vocab_size: Optional[int] = None,

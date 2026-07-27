@@ -8,10 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Draft-architecture registry: the extension point for new draft model classes.
 
-A draft *architecture* (the model class) is a separate axis from the
-per-algorithm training strategy (``specforge.training.strategies.registry``):
-one architecture can train under several algorithms and vice versa. Registering
-a class here makes it constructible from a draft-config JSON whose
+A draft *architecture* (the model class) is a separate axis from an immutable
+algorithm registration: one architecture can train under several algorithms
+and vice versa. Registering a class here makes it constructible from a
+draft-config JSON whose
 ``architectures[0]`` names it — adding an architecture is a new file plus
 ``@register_draft``, not an edit to ``modeling/auto.py``.
 """

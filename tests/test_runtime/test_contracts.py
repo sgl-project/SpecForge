@@ -3,6 +3,7 @@
 
 import dataclasses
 import unittest
+from unittest import mock
 
 import torch
 
@@ -59,6 +60,21 @@ class TestContracts(unittest.TestCase):
                 max_length=8,
             )
         )
+
+    def test_assert_no_tensors_skips_primitive_sequence_recursion(self):
+        with mock.patch(
+            "specforge.runtime.contracts.assert_no_tensors",
+            wraps=assert_no_tensors,
+        ) as guarded:
+            guarded(list(range(4096)))
+
+        self.assertEqual(guarded.call_count, 1)
+
+    def test_assert_no_tensors_checks_nonprimitive_sequence_elements(self):
+        payload = [*range(4096), torch.zeros(1)]
+
+        with self.assertRaisesRegex(TypeError, r"<root>\[4096\]"):
+            assert_no_tensors(payload)
 
     def test_assert_no_tensors_catches_tensor_in_metadata(self):
         ref = self._sample_ref()

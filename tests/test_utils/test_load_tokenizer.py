@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from specforge import utils
+import specforge.utils as utils
 
 
 class LoadTokenizerFallbackTest(unittest.TestCase):

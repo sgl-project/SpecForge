@@ -286,7 +286,32 @@ class DSparkDraftModel(DFlashDraftModel):
     expected_projector_type = "dspark"
 
     def __init__(self, config) -> None:
-        dflash_config = getattr(config, "dflash_config", None) or {}
+        dflash_config = dict(getattr(config, "dflash_config", None) or {})
+        num_heads = int(config.num_attention_heads)
+        num_kv_heads = int(config.num_key_value_heads)
+        if num_heads % num_kv_heads:
+            raise ValueError(
+                "DSpark requires num_key_value_heads to divide "
+                f"num_attention_heads, got {num_kv_heads} and {num_heads}"
+            )
+        attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
+        if attention_mode not in {"gqa", "mha"}:
+            raise ValueError(
+                "DSpark dflash_config.attention_mode must be 'gqa' or 'mha', "
+                f"got {attention_mode!r}"
+            )
+        if attention_mode == "gqa" and num_kv_heads >= num_heads:
+            raise ValueError(
+                "DSpark defaults to GQA and requires num_key_value_heads < "
+                "num_attention_heads; set dflash_config.attention_mode='mha' "
+                "to opt into equal query/KV head counts"
+            )
+        if attention_mode == "mha" and num_kv_heads != num_heads:
+            raise ValueError(
+                "DSpark MHA opt-in requires num_key_value_heads == "
+                f"num_attention_heads, got {num_kv_heads} and {num_heads}"
+            )
+        dflash_config["attention_mode"] = attention_mode
         projector_type = dflash_config.get("projector_type")
         if projector_type is None:
             dflash_config["projector_type"] = self.expected_projector_type
@@ -295,7 +320,27 @@ class DSparkDraftModel(DFlashDraftModel):
             raise ValueError(
                 "DSparkDraftModel requires " "dflash_config.projector_type='dspark'."
             )
+        config.dflash_config = dflash_config
         super().__init__(config)
+
+    def _sample_draft_tokens(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.LongTensor:
+        """Generate a block with the same Markov correction used in training."""
+
+        proposal_hidden = draft_hidden[:, -self.block_size + 1 :, :]
+        base_logits = target.lm_head(proposal_hidden)
+        if self.markov_head is None:
+            return _sample(base_logits)
+        sampled_tokens, _ = self.markov_head.sample_block_tokens(
+            base_logits,
+            first_prev_token_ids=block_output_ids[:, 0],
+            hidden_states=proposal_hidden,
+        )
+        return sampled_tokens
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.markov_head = build_markov_head(config, dflash_config)

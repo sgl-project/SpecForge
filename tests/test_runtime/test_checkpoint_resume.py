@@ -11,7 +11,6 @@ import contextlib
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -167,6 +166,11 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         run_id="rz",
         seen=None,
         model=None,
+        checkpoint_extra=None,
+        strategy_kwargs=None,
+        spec_name="eagle3",
+        max_grad_norm=1.0,
+        total_steps=100,
     ):
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane import DataFlowController
@@ -178,20 +182,23 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         seen = [] if seen is None else seen
         model = Composite() if model is None else model
         refs = OfflineManifestReader(feat_dir, run_id="data").read()
-        spec = SimpleNamespace(
-            name="eagle3",
-            make_strategy=lambda wrapped, *, target_head: Strategy(wrapped, seen),
-        )
         with _no_fsdp_wrap():
             trainer = Trainer(
-                spec=spec,
+                algorithm_name=spec_name,
+                make_step_strategy=lambda wrapped, *, target_head: Strategy(
+                    wrapped, seen
+                ),
                 controller=DataFlowController(run_id),
                 store=LocalFeatureStore("st"),
                 ref_source={"refs": refs},
                 model=model,
                 target_head=None,
                 optimizer_factory=lambda m: BF16Optimizer(
-                    m, lr=0.05, max_grad_norm=1.0, warmup_ratio=0.0, total_steps=100
+                    m,
+                    lr=0.05,
+                    max_grad_norm=max_grad_norm,
+                    warmup_ratio=0.0,
+                    total_steps=(total_steps if total_steps is not None else max_steps),
                 ),
                 run_id=run_id,
                 output_dir=out_dir,
@@ -199,20 +206,21 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 accumulation_steps=1,
                 num_epochs=1,
                 max_steps=max_steps,
+                total_steps=total_steps,
                 save_interval=0,
-                eval_interval=0,
-                tp_size=1,
-                sp_ulysses_size=1,
-                sp_ring_size=1,
                 logger=None,
                 log_interval=50,
                 collate_fn=_x_collate,
                 per_sample_transform=_x_transform,
                 resume_from=resume_from,
+                checkpoint_extra=checkpoint_extra,
+                strategy_kwargs=strategy_kwargs,
             )
         return trainer, model, seen
 
     def test_resume_continues_where_the_run_stopped(self):
+        from specforge.training.checkpoint import CheckpointManager
+
         workdir = tempfile.mkdtemp(prefix="trainer_resume_cpu_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
 
@@ -227,9 +235,14 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         out = os.path.join(workdir, "out")
         t1, model1, seen1 = self._make_trainer(out, feat_dir=feat_dir, max_steps=2)
         self.assertEqual(t1.fit(), 2)
-        self.assertEqual(t1.controller._epoch_batch, 2)
-        ck = t1.save_checkpoint()
-        self.assertEqual(ck.global_step, 2)
+        self.assertEqual(t1._controller._epoch_batch, 2)
+        self.assertEqual(t1.last_checkpoint_step, 2)
+        # Pin the immutable step-2 directory. ``rz-latest`` advances to step 4
+        # when phase 2 completes, so retaining that mutable symlink would make
+        # the later no-op check resume a different checkpoint than ``w_cut``.
+        checkpoint_uri = f"file://{os.path.realpath(os.path.join(out, 'rz-latest'))}"
+        checkpoint_state = CheckpointManager.read_resume_state(checkpoint_uri)
+        self.assertEqual(checkpoint_state["effective_total_steps"], 100)
         w_cut = model1.draft_model.w.detach().clone()
         masters_cut = [
             t.detach().cpu().clone() for t in t1.backend.optimizer.fp32_params
@@ -237,7 +250,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
 
         # Phase 2: resume through the production entrypoint (file:// URI).
         t2, model2, seen2 = self._make_trainer(
-            out, feat_dir=feat_dir, max_steps=4, resume_from=ck.checkpoint_uri
+            out, feat_dir=feat_dir, max_steps=4, resume_from=checkpoint_uri
         )
         self.assertTrue(torch.equal(model2.draft_model.w.detach(), w_cut))
         # exact fp32 masters restored, not re-cloned from the trained weights
@@ -246,7 +259,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         # scheduler position survived — a reset would read 0 (warmup 0: the
         # cosine after_scheduler carries the position, not the outer wrapper)
         self.assertEqual(t2.backend.optimizer.scheduler.after_scheduler.last_epoch, 2)
-        ctrl = t2.controller
+        ctrl = t2._controller
         self.assertEqual(
             (ctrl.global_step, ctrl._epoch_batch, ctrl._epoch_samples), (2, 2, 4)
         )
@@ -270,7 +283,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             os.path.join(workdir, "noop"),
             feat_dir=feat_dir,
             max_steps=2,
-            resume_from=ck.checkpoint_uri,
+            resume_from=checkpoint_uri,
         )
         self.assertEqual(t3.fit(), 2)
         self.assertEqual(seen3, [])
@@ -292,6 +305,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 "strategy": "eagle3",
                 "run_id": "rz",
                 "world_size": 1,
+                "effective_total_steps": 100,
             }
             payload.update(overrides)
             torch.save(payload, os.path.join(d, "training_state.pt"))
@@ -309,6 +323,19 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 {"accumulation_steps": 4},
                 "accumulation_steps=4 but this run has",
             ),
+            ("batch", {"batch_size": 1}, "batch_size=1 but this run has"),
+            ("epochs", {"num_epochs": 2}, "num_epochs=2 but this run has"),
+            ("tp", {"tp_size": 2}, "tp_size=2 but this run has"),
+            (
+                "ulysses",
+                {"sp_ulysses_size": 2},
+                "sp_ulysses_size=2 but this run has",
+            ),
+            (
+                "ring",
+                {"sp_ring_size": 2},
+                "sp_ring_size=2 but this run has",
+            ),
             (
                 "weights",
                 {"draft_state_dict": {"bogus.weight": torch.zeros(1)}},
@@ -325,6 +352,549 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                         resume_from=write_ckpt(name, **overrides),
                     )
 
+        peagle_semantics = (
+            ("peagle_num_draft_layers", 2, 4),
+            ("peagle_norm_before_residual", False, True),
+            ("peagle_num_depths", 5, 6),
+            ("peagle_down_sample_ratio", 0.7, 0.8),
+            ("peagle_down_sample_ratio_min", 0.3, 0.2),
+            ("peagle_mask_token_id", 0, 31),
+        )
+        for key, saved, current in peagle_semantics:
+            with self.subTest(key):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"{key}={saved} but this run has {key}={current}",
+                ):
+                    self._make_trainer(
+                        os.path.join(workdir, f"out_{key}"),
+                        feat_dir=feat_dir,
+                        max_steps=4,
+                        resume_from=write_ckpt(key, **{key: saved}),
+                        checkpoint_extra={key: current},
+                    )
+
+        required_peagle_contract = {
+            key: current for key, _saved, current in peagle_semantics
+        }
+        with self.assertRaisesRegex(
+            ValueError, "does not record required algorithm resume semantic"
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "out_peagle_missing_contract"),
+                feat_dir=feat_dir,
+                max_steps=4,
+                resume_from=write_ckpt(
+                    "peagle_missing_contract",
+                    strategy="peagle",
+                ),
+                checkpoint_extra=required_peagle_contract,
+                spec_name="peagle",
+            )
+
+    def test_resume_rejects_a_changed_implicit_schedule_horizon(self):
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_horizon_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
+        source_dir = os.path.join(workdir, "source")
+        source, _, _ = self._make_trainer(
+            source_dir,
+            feat_dir=feat_dir,
+            max_steps=1,
+            total_steps=None,
+        )
+        self.assertEqual(source.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(source_dir, "rz-latest"))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "effective_total_steps=1 but this run has effective_total_steps=2",
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "changed"),
+                feat_dir=feat_dir,
+                max_steps=2,
+                total_steps=None,
+                resume_from=checkpoint,
+            )
+
+    def test_legacy_checkpoint_recovers_horizon_from_scheduler_state(self):
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_legacy_horizon_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
+        source_dir = os.path.join(workdir, "source")
+        source, _, _ = self._make_trainer(
+            source_dir,
+            feat_dir=feat_dir,
+            max_steps=1,
+            total_steps=6,
+        )
+        self.assertEqual(source.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(source_dir, "rz-latest"))
+        state_path = os.path.join(checkpoint, "training_state.pt")
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        state.pop("effective_total_steps")
+        torch.save(state, state_path)
+
+        resumed, _, _ = self._make_trainer(
+            os.path.join(workdir, "same"),
+            feat_dir=feat_dir,
+            max_steps=2,
+            total_steps=6,
+            resume_from=checkpoint,
+        )
+        self.assertEqual(resumed._controller.total_steps, 6)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "effective_total_steps=6 but this run has effective_total_steps=7",
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "changed"),
+                feat_dir=feat_dir,
+                max_steps=2,
+                total_steps=7,
+                resume_from=checkpoint,
+            )
+
+    def test_resume_rejects_partial_weights_except_provider_owned_omissions(self):
+        import torch.nn as nn
+
+        from specforge.algorithms.common.providers import (
+            OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+            StepRuntimeConfig,
+            checkpoint_key_fingerprint,
+        )
+
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(1))
+                self.bias = nn.Parameter(torch.ones(1))
+                self.embed_tokens = nn.Embedding(4, 1)
+                self.embed_tokens.requires_grad_(False)
+
+        class Composite(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.draft_model = Draft()
+
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_keys_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        allowed_missing = {"embed_tokens.weight"}
+
+        bogus_model = Composite()
+        bogus_runtime = StepRuntimeConfig(
+            options={},
+            resume_contract={
+                OMITTED_STATE_FINGERPRINT_CONTRACT_KEY: "caller-supplied-placeholder"
+            },
+            allowed_missing_checkpoint_keys=allowed_missing,
+        )
+        with self.assertRaisesRegex(ValueError, "does not match the live draft model"):
+            self._make_trainer(
+                os.path.join(workdir, "bogus-fingerprint"),
+                feat_dir=feat_dir,
+                max_steps=1,
+                model=bogus_model,
+                strategy_kwargs=bogus_runtime,
+            )
+
+        def runtime(model):
+            return StepRuntimeConfig(
+                options={},
+                resume_contract={
+                    OMITTED_STATE_FINGERPRINT_CONTRACT_KEY: (
+                        checkpoint_key_fingerprint(
+                            model.draft_model,
+                            allowed_missing,
+                        )
+                    )
+                },
+                allowed_missing_checkpoint_keys=allowed_missing,
+            )
+
+        source_model = Composite()
+        initial, _, _ = self._make_trainer(
+            os.path.join(workdir, "source"),
+            feat_dir=feat_dir,
+            max_steps=1,
+            model=source_model,
+            strategy_kwargs=runtime(source_model),
+        )
+        self.assertEqual(initial.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(workdir, "source", "rz-latest"))
+        state_path = os.path.join(checkpoint, "training_state.pt")
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+
+        # EAGLE3 deliberately rebuilds its frozen target-copied embedding.
+        state["draft_state_dict"].pop("embed_tokens.weight")
+        torch.save(state, state_path)
+        resumed_model = Composite()
+        with torch.no_grad():
+            resumed_model.draft_model.embed_tokens.weight.copy_(
+                source_model.draft_model.embed_tokens.weight
+            )
+        resumed, _, _ = self._make_trainer(
+            os.path.join(workdir, "allowed"),
+            feat_dir=feat_dir,
+            max_steps=2,
+            resume_from=checkpoint,
+            model=resumed_model,
+            strategy_kwargs=runtime(resumed_model),
+        )
+        self.assertEqual(resumed.global_step, 1)
+
+        # The same policy must not hide an unrelated missing trainable weight.
+        state["draft_state_dict"].pop("bias")
+        torch.save(state, state_path)
+        corrupt_model = Composite()
+        with torch.no_grad():
+            corrupt_model.draft_model.embed_tokens.weight.copy_(
+                source_model.draft_model.embed_tokens.weight
+            )
+        with self.assertRaisesRegex(ValueError, r"missing=\['bias'\]"):
+            self._make_trainer(
+                os.path.join(workdir, "corrupt"),
+                feat_dir=feat_dir,
+                max_steps=2,
+                resume_from=checkpoint,
+                model=corrupt_model,
+                strategy_kwargs=runtime(corrupt_model),
+            )
+
+    def test_bound_algorithm_resume_contract_is_saved_and_validated(self):
+        from specforge.algorithms.common.providers import StepRuntimeConfig
+
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_contract_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        source_runtime = StepRuntimeConfig(
+            options={},
+            resume_contract={
+                "eagle3_test_objective": 0.8,
+                "eagle3_optional_setting": None,
+            },
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+        source, _, _ = self._make_trainer(
+            os.path.join(workdir, "source"),
+            feat_dir=feat_dir,
+            max_steps=1,
+            strategy_kwargs=source_runtime,
+        )
+        self.assertEqual(source.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(workdir, "source", "rz-latest"))
+        state = torch.load(
+            os.path.join(checkpoint, "training_state.pt"),
+            map_location="cpu",
+            weights_only=False,
+        )
+        self.assertEqual(state["eagle3_test_objective"], 0.8)
+        self.assertIn("eagle3_optional_setting", state)
+        self.assertIsNone(state["eagle3_optional_setting"])
+
+        resumed, _, _ = self._make_trainer(
+            os.path.join(workdir, "resumed"),
+            feat_dir=feat_dir,
+            max_steps=2,
+            resume_from=checkpoint,
+            strategy_kwargs=source_runtime,
+        )
+        self.assertEqual(resumed._controller.global_step, 1)
+
+        changed_runtime = StepRuntimeConfig(
+            options={},
+            resume_contract={
+                "eagle3_test_objective": 0.9,
+                "eagle3_optional_setting": None,
+            },
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "eagle3_test_objective=0.8 but this run has eagle3_test_objective=0.9",
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "changed"),
+                feat_dir=feat_dir,
+                max_steps=2,
+                resume_from=checkpoint,
+                strategy_kwargs=changed_runtime,
+            )
+
+        changed_optional_runtime = StepRuntimeConfig(
+            options={},
+            resume_contract={
+                "eagle3_test_objective": 0.8,
+                "eagle3_optional_setting": 512,
+            },
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "eagle3_optional_setting=None but this run has "
+            "eagle3_optional_setting=512",
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "changed_optional"),
+                feat_dir=feat_dir,
+                max_steps=2,
+                resume_from=checkpoint,
+                strategy_kwargs=changed_optional_runtime,
+            )
+
+    def test_direct_builder_requires_bound_provenance_for_omitted_embedding(self):
+        from types import SimpleNamespace
+
+        import torch.nn as nn
+
+        from specforge.algorithms.common.providers import (
+            MODEL_PROVENANCE_CONTRACT_KEY,
+            OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+            STEP_OPTIONS_CONTRACT_KEY,
+            StepRuntimeConfig,
+            checkpoint_key_fingerprint,
+        )
+        from specforge.launch import _assemble_trainer
+        from specforge.optimizer import BF16Optimizer
+        from specforge.runtime.control_plane import DataFlowController
+        from specforge.runtime.data_plane.feature_store import LocalFeatureStore
+        from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+        _, BaseStrategy, _ = _fake_seam()
+
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(1))
+                self.embed_tokens = nn.Embedding(4, 1)
+                self.embed_tokens.requires_grad_(False)
+
+        class Composite(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.draft_model = Draft()
+
+        class EagleStrategy(BaseStrategy):
+            def checkpoint_state_filter(self, state_dict):
+                state = super().checkpoint_state_filter(state_dict)
+                return {
+                    key: value for key, value in state.items() if "embed" not in key
+                }
+
+        step = SimpleNamespace(
+            build=lambda wrapped, *, target_head=None, **_options: EagleStrategy(
+                wrapped
+            ),
+            allowed_missing_checkpoint_keys=lambda _cfg, draft, _model: {
+                key for key in draft.state_dict() if "embed" in key
+            },
+        )
+        algorithm = SimpleNamespace(
+            name="eagle3",
+            providers=SimpleNamespace(step=step),
+        )
+        workdir = tempfile.mkdtemp(prefix="direct_builder_eagle_resume_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        refs = OfflineManifestReader(feat_dir, run_id="data").read()
+
+        def runtime(model, *, objective_scale=1.0):
+            allowed_missing = {"embed_tokens.weight"}
+            return StepRuntimeConfig(
+                options={"objective_scale": objective_scale},
+                resume_contract={
+                    OMITTED_STATE_FINGERPRINT_CONTRACT_KEY: (
+                        checkpoint_key_fingerprint(
+                            model.draft_model,
+                            allowed_missing,
+                        )
+                    ),
+                    MODEL_PROVENANCE_CONTRACT_KEY: (
+                        ("test_model_source", "fixture-v1"),
+                    ),
+                },
+                allowed_missing_checkpoint_keys=allowed_missing,
+            )
+
+        def runtime_without_provenance(model):
+            allowed_missing = {"embed_tokens.weight"}
+            return StepRuntimeConfig(
+                options={},
+                resume_contract={
+                    OMITTED_STATE_FINGERPRINT_CONTRACT_KEY: (
+                        checkpoint_key_fingerprint(
+                            model.draft_model,
+                            allowed_missing,
+                        )
+                    )
+                },
+                allowed_missing_checkpoint_keys=allowed_missing,
+            )
+
+        def assemble(
+            model,
+            *,
+            output_dir,
+            max_steps,
+            resume_from=None,
+            strategy_runtime=None,
+        ):
+            with _no_fsdp_wrap():
+                return _assemble_trainer(
+                    algorithm=algorithm,
+                    controller=DataFlowController("direct"),
+                    store=LocalFeatureStore("direct-store"),
+                    ref_source={"refs": refs},
+                    model=model,
+                    target_head=None,
+                    optimizer_factory=lambda module: BF16Optimizer(
+                        module,
+                        lr=0.05,
+                        max_grad_norm=1.0,
+                        warmup_ratio=0.0,
+                        total_steps=100,
+                    ),
+                    run_id="direct",
+                    output_dir=output_dir,
+                    batch_size=2,
+                    accumulation_steps=1,
+                    num_epochs=1,
+                    max_steps=max_steps,
+                    total_steps=100,
+                    save_interval=0,
+                    logger=None,
+                    log_interval=50,
+                    collate_fn=_x_collate,
+                    per_sample_transform=_x_transform,
+                    resume_from=resume_from,
+                    strategy_kwargs=strategy_runtime,
+                )
+
+        output_dir = os.path.join(workdir, "out")
+        source_model = Composite()
+        first = assemble(
+            source_model,
+            output_dir=output_dir,
+            max_steps=1,
+            strategy_runtime=runtime(source_model),
+        )
+        self.assertEqual(first.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(output_dir, "direct-latest"))
+        state = torch.load(
+            os.path.join(checkpoint, "training_state.pt"),
+            map_location="cpu",
+            weights_only=False,
+        )
+        self.assertNotIn("embed_tokens.weight", state["draft_state_dict"])
+
+        with self.assertRaisesRegex(ValueError, "provider-bound StepRuntimeConfig"):
+            assemble(
+                Composite(),
+                output_dir=output_dir,
+                max_steps=2,
+                resume_from=checkpoint,
+            )
+
+        with self.assertRaisesRegex(ValueError, MODEL_PROVENANCE_CONTRACT_KEY):
+            assemble(
+                source_model,
+                output_dir=output_dir,
+                max_steps=2,
+                resume_from=checkpoint,
+                strategy_runtime=runtime_without_provenance(source_model),
+            )
+
+        unchanged_model = Composite()
+        with torch.no_grad():
+            unchanged_model.draft_model.embed_tokens.weight.copy_(
+                source_model.draft_model.embed_tokens.weight
+            )
+        with self.assertRaisesRegex(ValueError, STEP_OPTIONS_CONTRACT_KEY):
+            assemble(
+                unchanged_model,
+                output_dir=output_dir,
+                max_steps=2,
+                resume_from=checkpoint,
+                strategy_runtime=runtime(
+                    unchanged_model,
+                    objective_scale=2.0,
+                ),
+            )
+
+        changed_model = Composite()
+        with torch.no_grad():
+            changed_model.draft_model.embed_tokens.weight.fill_(123.0)
+        with self.assertRaisesRegex(
+            ValueError,
+            OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+        ):
+            assemble(
+                changed_model,
+                output_dir=output_dir,
+                max_steps=2,
+                resume_from=checkpoint,
+                strategy_runtime=runtime(changed_model),
+            )
+
+        resumed_model = Composite()
+        with torch.no_grad():
+            resumed_model.draft_model.embed_tokens.weight.copy_(
+                source_model.draft_model.embed_tokens.weight
+            )
+        resumed = assemble(
+            resumed_model,
+            output_dir=output_dir,
+            max_steps=2,
+            resume_from=checkpoint,
+            strategy_runtime=runtime(resumed_model),
+        )
+        self.assertEqual(resumed.global_step, 1)
+        self.assertEqual(resumed.fit(), 2)
+
+    def test_resume_rejects_gradient_clip_drift(self):
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_grad_clip_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        source, _, _ = self._make_trainer(
+            os.path.join(workdir, "source"),
+            feat_dir=feat_dir,
+            max_steps=1,
+            max_grad_norm=1.0,
+        )
+        self.assertEqual(source.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(workdir, "source", "rz-latest"))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "max_grad_norm=1.0 but this run has max_grad_norm=2.0",
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "changed"),
+                feat_dir=feat_dir,
+                max_steps=2,
+                max_grad_norm=2.0,
+                resume_from=checkpoint,
+            )
+
+    def test_completed_checkpoint_resume_is_a_checkpoint_noop(self):
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_complete_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        out = os.path.join(workdir, "out")
+        complete, model, _ = self._make_trainer(out, feat_dir=feat_dir, max_steps=None)
+        self.assertEqual(complete.fit(), 2)
+        self.assertEqual(complete._controller.epoch, 1)
+        checkpoint_uri = f"file://{os.path.realpath(os.path.join(out, 'rz-latest'))}"
+        saved_weight = model.draft_model.w.detach().clone()
+
+        resumed, resumed_model, seen = self._make_trainer(
+            os.path.join(workdir, "resumed"),
+            feat_dir=feat_dir,
+            max_steps=None,
+            resume_from=checkpoint_uri,
+        )
+        with mock.patch.object(resumed, "save_checkpoint") as save:
+            self.assertEqual(resumed.fit(), 2)
+        save.assert_not_called()
+        self.assertEqual(seen, [])
+        self.assertTrue(torch.equal(resumed_model.draft_model.w, saved_weight))
+
 
 class TestFitReentry(unittest.TestCase):
     """fit() at/after max_steps and re-entry after a mid-epoch return (CPU fakes)."""
@@ -332,6 +902,7 @@ class TestFitReentry(unittest.TestCase):
     def _controller(self, seen, max_steps, out_dir, **kw):
         from specforge.training.controller import TrainerController, TrainerCore
 
+        num_epochs = kw.pop("num_epochs", 1)
         Composite, Strategy, Backend = _fake_seam()
         model = Composite()
         backend = Backend(model)
@@ -341,7 +912,7 @@ class TestFitReentry(unittest.TestCase):
             run_id="r",
             output_dir=out_dir,
             max_steps=max_steps,
-            num_epochs=1,
+            num_epochs=num_epochs,
             **kw,
         )
         return ctrl, backend
@@ -374,6 +945,86 @@ class TestFitReentry(unittest.TestCase):
             self.assertEqual(seen, [])
             self.assertEqual(backend.steps, 0)
 
+    def test_completed_epoch_returns_without_consuming(self):
+        class Explode:
+            def __iter__(self):
+                raise AssertionError("completed resume consumed its online queue")
+
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            ctrl, backend = self._controller(seen, None, d, start_step=3, start_epoch=1)
+            self.assertEqual(ctrl.fit(Explode()), 3)
+            self.assertEqual(seen, [])
+            self.assertEqual(backend.steps, 0)
+
+    def test_prepositioned_online_queue_is_not_skipped_twice(self):
+        class PrepositionedQueue:
+            def __init__(self, batches):
+                self.batches = batches
+
+            def __iter__(self):
+                return iter(self.batches)
+
+            def seek(self, _):
+                raise AssertionError("prepositioned online queue was sought again")
+
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            ctrl, backend = self._controller(
+                seen,
+                3,
+                d,
+                start_step=1,
+                start_batch=1,
+                start_samples=1,
+                data_prepositioned=True,
+            )
+            queue = PrepositionedQueue(self._batches(3)[1:])
+            self.assertEqual(ctrl.fit(queue), 3)
+            self.assertEqual(seen, ["b1", "b2"])
+            self.assertEqual(backend.steps, 2)
+
+    def test_offline_resume_sets_saved_epoch_before_seeking_samples(self):
+        class EpochData:
+            def __init__(self, batches):
+                self.batches = batches
+                self.current = []
+                self.skip = 0
+                self.calls = []
+
+            def set_epoch(self, epoch):
+                self.calls.append(("set_epoch", epoch))
+                self.current = self.batches[epoch]
+
+            def seek(self, batches):
+                self.calls.append(("seek", batches))
+                self.skip = batches
+
+            def __iter__(self):
+                skip, self.skip = self.skip, 0
+                return iter(self.current[skip:])
+
+        epoch0 = self._batches(2)
+        epoch1 = self._batches(2)
+        for index, batch in enumerate(epoch1):
+            batch.sample_ids = [f"epoch1-{index}"]
+        data = EpochData({0: epoch0, 1: epoch1})
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            ctrl, _ = self._controller(
+                seen,
+                2,
+                d,
+                num_epochs=2,
+                start_step=1,
+                start_epoch=1,
+                start_batch=1,
+                start_samples=1,
+            )
+            self.assertEqual(ctrl.fit(data), 2)
+        self.assertEqual(data.calls[:2], [("set_epoch", 1), ("seek", 1)])
+        self.assertEqual(seen, ["epoch1-1"])
+
     def test_refit_after_midepoch_return_does_not_retrain_prefix(self):
         with tempfile.TemporaryDirectory() as d:
             seen = []
@@ -387,6 +1038,28 @@ class TestFitReentry(unittest.TestCase):
             self.assertEqual(seen, ["b0", "b1", "b2", "b3"])
             self.assertEqual(backend.steps, 4)
 
+    def test_flattened_online_epochs_checkpoint_as_one_midstream_epoch(self):
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            ctrl, _ = self._controller(seen, 2, d, num_epochs=1)
+            # Assembly has already expanded and independently truncated all
+            # logical prompt epochs; TrainerController intentionally sees one
+            # deterministic queue epoch.
+            self.assertEqual(ctrl.fit(self._batches(4)), 2)
+            checkpoint = ctrl.save_checkpoint(2)
+            state = torch.load(
+                os.path.join(
+                    checkpoint.checkpoint_uri.removeprefix("file://"),
+                    "training_state.pt",
+                ),
+                map_location="cpu",
+                weights_only=False,
+            )
+        self.assertEqual(state["epoch"], 0)
+        self.assertEqual(state["epoch_batch"], 2)
+        self.assertEqual(state["epoch_samples"], 2)
+        self.assertEqual(state["global_step"], 2)
+
 
 @unittest.skipUnless(CUDA, "checkpoint resume requires CUDA")
 class TestCheckpointResume(unittest.TestCase):
@@ -396,16 +1069,10 @@ class TestCheckpointResume(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29563")
 
-        from specforge import (
-            AutoDraftModelConfig,
-            AutoEagle3DraftModel,
-            OnlineEagle3Model,
-        )
-        from specforge.data.preprocessing import OfflineEagle3Dataset
-        from specforge.data.utils import DataCollatorWithPadding
-        from specforge.modeling.target import TargetHead
+        from specforge.algorithms.eagle3.model import OnlineEagle3Model
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
@@ -421,7 +1088,7 @@ class TestCheckpointResume(unittest.TestCase):
         draft_config = AutoDraftModelConfig.from_file(cfg)
 
         def build_model():
-            dm = AutoEagle3DraftModel.from_config(
+            dm = AutoDraftModel.from_config(
                 draft_config,
                 attention_backend="flex_attention",
                 torch_dtype=torch.bfloat16,
@@ -433,24 +1100,13 @@ class TestCheckpointResume(unittest.TestCase):
             ).cuda()
 
         head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
-        ds = OfflineEagle3Dataset(
-            sorted(os.path.join(feat_dir, f) for f in os.listdir(feat_dir)), max_len=512
+        loader = fx.build_offline_eagle3_loader(
+            feat_dir,
+            batch_size=BS,
+            run_id="checkpoint-data",
+            ttt_length=TTT,
+            max_len=512,
         )
-        collate = DataCollatorWithPadding()
-
-        def make_batches():
-            out = []
-            for s in range(0, N, BS):
-                data = collate([ds[j] for j in range(s, s + BS)])
-                out.append(
-                    TrainBatch(
-                        sample_ids=[str(j) for j in range(s, s + BS)],
-                        strategy="eagle3",
-                        tensors=dict(data),
-                        metadata={"target_repr": "hidden_state", "ttt_length": TTT},
-                    )
-                )
-            return out
 
         model = build_model()
         opt = BF16Optimizer(
@@ -468,7 +1124,7 @@ class TestCheckpointResume(unittest.TestCase):
         ctrl = TrainerController(
             core, run_id="r", output_dir=out_dir, max_steps=3, num_epochs=2
         )
-        step = ctrl.fit(make_batches())
+        step = ctrl.fit(loader)
         self.assertEqual(step, 3)
         ck = ctrl.save_checkpoint(step)
 
@@ -510,9 +1166,11 @@ class TestCheckpointResume(unittest.TestCase):
             self.assertEqual(t.dtype, torch.float32)
             self.assertEqual(t.device.type, "cpu")
         rng = ckpt["backend"]["rng"]
-        self.assertEqual(set(rng), {"torch", "cuda"})
+        self.assertEqual(set(rng), {"torch", "device_type", "cuda", "npu"})
         # single bound-device CUDA state, not the legacy per-device list
+        self.assertEqual(rng["device_type"], "cuda")
         self.assertIsInstance(rng["cuda"], torch.Tensor)
+        self.assertIsNone(rng["npu"])
 
         # Filter contract, checked against the LIVE trained module (not by
         # re-applying the filter): frozen-embed keys and nothing else dropped.
@@ -543,10 +1201,7 @@ class TestCheckpointResume(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29564")
 
-        from specforge.data.preprocessing import OfflineEagle3Dataset
-        from specforge.data.utils import DataCollatorWithPadding
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
@@ -557,19 +1212,14 @@ class TestCheckpointResume(unittest.TestCase):
         feat_dir = fx.write_offline_files(
             os.path.join(workdir, "features"), n=BS * TOTAL
         )
-        files = sorted(os.path.join(feat_dir, f) for f in os.listdir(feat_dir))
-        ds = OfflineEagle3Dataset(files, max_len=512)
-        collate = DataCollatorWithPadding()
-        batches = []
-        for i in range(TOTAL):
-            data = collate([ds[j] for j in range(i * BS, (i + 1) * BS)])
-            batches.append(
-                TrainBatch(
-                    sample_ids=[str(j) for j in range(i * BS, (i + 1) * BS)],
-                    strategy="eagle3",
-                    tensors=dict(data),
-                    metadata={"target_repr": "hidden_state", "ttt_length": TTT},
-                )
+
+        def build_loader():
+            return fx.build_offline_eagle3_loader(
+                feat_dir,
+                batch_size=BS,
+                run_id="continuity-data",
+                ttt_length=TTT,
+                max_len=512,
             )
 
         def build_run():
@@ -605,7 +1255,7 @@ class TestCheckpointResume(unittest.TestCase):
             ),
         )
         torch.manual_seed(0)
-        ctrl_r.fit(batches)
+        ctrl_r.fit(build_loader())
         self.assertEqual(len(losses_ref), TOTAL)
 
         # Interrupted phase 1: CUT steps, then save.
@@ -621,7 +1271,7 @@ class TestCheckpointResume(unittest.TestCase):
             logger=lambda m, s: losses_a.append(m["loss"]),
         )
         torch.manual_seed(0)
-        ctrl_a.fit(batches)
+        ctrl_a.fit(build_loader())
         ck = ctrl_a.save_checkpoint(CUT)
         self.assertEqual(ctrl_a._epoch_batch, CUT)  # data position at the cut
         # phase 1 mirrors the reference exactly for the first CUT steps
@@ -688,7 +1338,7 @@ class TestCheckpointResume(unittest.TestCase):
         )
         # No reseed: the RNG came from the checkpoint. fit skips the first CUT
         # batches of the interrupted epoch and trains the rest.
-        ctrl_b.fit(batches)
+        ctrl_b.fit(build_loader())
         self.assertEqual(len(losses_b), TOTAL - CUT)
 
         # Weights, fp32 masters, optimizer, scheduler, RNG and data position are

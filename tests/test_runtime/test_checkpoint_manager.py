@@ -12,6 +12,7 @@ import socket
 import tempfile
 import unittest
 from datetime import timedelta
+from unittest import mock
 
 import torch
 
@@ -264,6 +265,26 @@ class TestBestApi(unittest.TestCase):
 
 
 class TestReadResumeState(unittest.TestCase):
+    def test_replicated_optimizer_is_restored_from_shared_state(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_replicated_")
+        state = _state(
+            3,
+            world_size=1,
+            replicated_optimizer_state={"moment": torch.tensor([7.0])},
+        )
+        ckpt = _mgr(out).save(
+            state,
+            3,
+            rank_state={"optimizer": None, "rng": {"torch": torch.tensor([1])}},
+        )
+
+        loaded = CheckpointManager.read_resume_state(ckpt)
+
+        self.assertEqual(loaded["backend"]["optimizer"]["moment"].item(), 7.0)
+        self.assertEqual(loaded["backend"]["rng"]["torch"].item(), 1)
+
     def test_backend_passthrough_and_path_forms(self):
         from specforge.training.checkpoint import STATE_FILE, CheckpointManager
 
@@ -280,6 +301,32 @@ class TestReadResumeState(unittest.TestCase):
             self.assertTrue(torch.equal(st["backend"]["rng"]["torch"], rng))
             self.assertNotIn("optimizer_state_dict", st)
             self.assertNotIn("rng_state", st)
+
+        root_state = CheckpointManager.read_resume_state(out)
+        self.assertEqual(root_state["global_step"], 3)
+
+    def test_run_root_without_symlinks_uses_latest_complete_step(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_root_")
+        mgr = _mgr(out)
+        mgr.save(_state(2, world_size=1), 2, rank_state={"optimizer": {}})
+        mgr.save(_state(7, world_size=1), 7, rank_state={"optimizer": {}})
+        os.remove(os.path.join(out, "run-latest"))
+
+        state = CheckpointManager.read_resume_state(out)
+        self.assertEqual(state["global_step"], 7)
+
+    def test_ambiguous_multi_run_root_is_rejected(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_ambiguous_")
+        _mgr(out, "alpha").save(
+            _state(2, world_size=1), 2, rank_state={"optimizer": {}}
+        )
+        _mgr(out, "beta").save(_state(3, world_size=1), 3, rank_state={"optimizer": {}})
+        with self.assertRaisesRegex(ValueError, "multiple complete.*latest"):
+            CheckpointManager.read_resume_state(out)
 
     def test_require_full_state_raises_without_rank_file(self):
         from specforge.training.checkpoint import CheckpointManager
@@ -311,6 +358,55 @@ class TestReadResumeState(unittest.TestCase):
             CheckpointManager.read_resume_state(ckpt)
         st = CheckpointManager.read_resume_state(ckpt, require_full_state=False)
         self.assertEqual(st["backend"], {})
+
+    def test_resume_fails_world_wide_when_any_rank_cannot_read(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_world_read_")
+        ckpt = _mgr(out).save(
+            _state(4, world_size=2, run_id="run", strategy="dspark"),
+            4,
+            rank_state={"optimizer": {}, "rng": {}},
+        )
+
+        def gather(descriptors, local):
+            descriptors[0] = local
+            descriptors[1] = {
+                **local,
+                "error": "FileNotFoundError: rank-local checkpoint missing",
+            }
+
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.get_rank", return_value=0),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+            self.assertRaisesRegex(RuntimeError, "not readable on every rank"),
+        ):
+            CheckpointManager.read_resume_state(ckpt)
+
+    def test_resume_rejects_different_checkpoint_identity_across_ranks(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_world_identity_")
+        ckpt = _mgr(out).save(
+            _state(4, world_size=2, run_id="run", strategy="dspark"),
+            4,
+            rank_state={"optimizer": {}, "rng": {}},
+        )
+
+        def gather(descriptors, local):
+            descriptors[0] = local
+            descriptors[1] = {**local, "global_step": 3}
+
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.get_rank", return_value=0),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+            self.assertRaisesRegex(ValueError, "different training states"),
+        ):
+            CheckpointManager.read_resume_state(ckpt)
 
 
 def _dist_worker(rank, world, port, out_dir, results_dir):

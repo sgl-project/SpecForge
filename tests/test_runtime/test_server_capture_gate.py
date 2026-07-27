@@ -14,11 +14,15 @@ What is pinned here:
   agnostic), within the documented bf16 tolerance;
 - strategy-agnosticism: the same server serves eagle3 (aux + last_hidden) and
   dflash (aux only) requests, named per strategy by the client schema.
+- cache isolation: radix cache stays enabled and sequential identical prompts
+  still capture every token because each request attempt has a fresh
+  ``extra_key`` namespace.
 
-OPT-IN: needs a GPU, sglang patched with
+The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
+GPU, sglang patched with
 ``patches/sglang/v0.5.14/spec-capture.patch`` (see
 ``scripts/apply_sglang_spec_capture_patch.sh``), the ``mooncake`` package, and
-a reachable/spawnable ``mooncake_master``. Enable with
+a reachable/spawnable ``mooncake_master``; opt in locally with
 ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
 """
 
@@ -33,11 +37,27 @@ import unittest
 
 import torch
 
+from tests.utils import terminate_process_trees
+
 CUDA = torch.cuda.is_available()
 ENABLED = os.environ.get("SPECFORGE_RUN_SERVER_CAPTURE_TESTS") == "1"
 PORT = 30989
 AUX_LAYER_IDS = [1, 3, 4]
 H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
+
+
+def _capture_schema(algorithm: str):
+    from specforge.algorithms.builtin import builtin_algorithm_registry
+    from specforge.inference.adapters.server_capture import ServerCaptureSchema
+
+    registration = builtin_algorithm_registry().resolve(algorithm)
+    layout = registration.providers.server_streaming_for("text").layout
+    return ServerCaptureSchema(
+        aux_feature=layout.aux_feature,
+        last_hidden_feature=layout.last_hidden_feature,
+        passthrough=layout.passthrough,
+        attention_mask_feature=layout.attention_mask_feature,
+    )
 
 
 def _patched_sglang() -> bool:
@@ -72,6 +92,10 @@ class TestServerCaptureGate(unittest.TestCase):
         from transformers import LlamaConfig, LlamaForCausalLM
 
         cls.workdir = tempfile.mkdtemp(prefix="spec_capture_gate_")
+        cls.addClassCleanup(shutil.rmtree, cls.workdir, True)
+        # Class cleanups still run when setUpClass raises. Register process
+        # cleanup last so it runs before the temporary log directory is removed.
+        cls.addClassCleanup(cls._cleanup_processes)
         cfg = LlamaConfig(
             hidden_size=H,
             intermediate_size=128,
@@ -127,7 +151,6 @@ class TestServerCaptureGate(unittest.TestCase):
                 "0.3",
                 "--chunked-prefill-size",
                 "-1",
-                "--disable-radix-cache",
                 "--enable-spec-capture",
                 "--spec-capture-aux-layer-ids",
                 *[str(i) for i in AUX_LAYER_IDS],
@@ -137,6 +160,7 @@ class TestServerCaptureGate(unittest.TestCase):
             stdout=open(os.path.join(cls.workdir, "server.log"), "w"),
             stderr=subprocess.STDOUT,
             env=env,
+            start_new_session=True,
         )
         import requests
 
@@ -169,6 +193,7 @@ class TestServerCaptureGate(unittest.TestCase):
             [binary, "--enable-http-metadata-server=true"],
             stdout=open(os.path.join(cls.workdir, "mooncake_master.log"), "w"),
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         time.sleep(3)
         if cls.master.poll() is not None:
@@ -184,14 +209,8 @@ class TestServerCaptureGate(unittest.TestCase):
         os.environ.setdefault("MOONCAKE_PROTOCOL", "tcp")
 
     @classmethod
-    def tearDownClass(cls):
-        for proc in (cls.server, cls.master):
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+    def _cleanup_processes(cls):
+        terminate_process_trees(cls.server, cls.master, grace_s=30)
 
     # -- helpers ---------------------------------------------------------------
     def _store(self, store_id):
@@ -263,10 +282,14 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.inference.capture import CaptureConfig
         from specforge.runtime.contracts import SampleRef
 
-        rows = [[5, 6, 7, 8, 9, 10], [11, 12, 13, 14]]
+        rows = [[5, 6, 7, 8, 9, 10], [5, 6, 7, 8, 9, 10]]
         store = self._store("gate-eagle3")
         adapter = SGLangServerCaptureAdapter(
-            f"http://localhost:{PORT}", store, run_id="gate0", strategy="eagle3"
+            f"http://localhost:{PORT}",
+            store,
+            run_id="gate0",
+            algorithm="eagle3",
+            schema=_capture_schema("eagle3"),
         )
         contract = CaptureConfig.from_strategy(
             required_features={
@@ -280,7 +303,11 @@ class TestServerCaptureGate(unittest.TestCase):
             target_repr="hidden_state",
             target_hidden_size=H,
         )
-        refs = adapter.produce_refs(self._tasks(rows), capture=contract)
+        # Submit sequentially so the second identical prompt would hit the
+        # first request's radix entry if the adapter did not isolate attempts.
+        refs = []
+        for task in self._tasks(rows):
+            refs.extend(adapter.produce_refs([task], capture=contract))
         for ref in refs:
             self.assertIsInstance(ref, SampleRef, f"expected a ref, got failure: {ref}")
 
@@ -318,11 +345,8 @@ class TestServerCaptureGate(unittest.TestCase):
         self._train_step(fetched, head)
 
     def _train_step(self, fetched, head):
-        from specforge import (
-            AutoDraftModelConfig,
-            AutoEagle3DraftModel,
-            OnlineEagle3Model,
-        )
+        from specforge.algorithms.eagle3.model import OnlineEagle3Model
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -335,7 +359,7 @@ class TestServerCaptureGate(unittest.TestCase):
         draft_cfg = AutoDraftModelConfig.from_file(
             fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
         )
-        dm = AutoEagle3DraftModel.from_config(
+        dm = AutoDraftModel.from_config(
             draft_cfg, attention_backend="sdpa", torch_dtype=torch.bfloat16
         ).cuda()
         dm.load_vocab_mapping(
@@ -378,7 +402,11 @@ class TestServerCaptureGate(unittest.TestCase):
         rows = [[3, 1, 4, 1, 5]]
         store = self._store("gate-dflash")
         adapter = SGLangServerCaptureAdapter(
-            f"http://localhost:{PORT}", store, run_id="gate1", strategy="dflash"
+            f"http://localhost:{PORT}",
+            store,
+            run_id="gate1",
+            algorithm="dflash",
+            schema=_capture_schema("dflash"),
         )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},

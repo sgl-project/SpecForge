@@ -1,0 +1,34 @@
+model:
+  target_model_path: "inclusionAI/Ling-flash-2.0"
+  draft_model_config: "configs/ling-flash-2.0-eagle3.json"
+  target_backend: "sglang"
+  trust_remote_code: true
+  embedding_key: "model.word_embeddings.weight"
+  vocab_mapping_path: "./cache/vocab_mapping/ling-flash-2.0-eagle3.pt"
+  torch_dtype: "bfloat16"
+data:
+  hidden_states_path: "./cache/hidden_states/perfect-blend-ling-flash-2.0"
+  max_length: 2048
+  chat_template: "ling-flash-2.0"
+  cache_dir: "./cache"
+training:
+  strategy: "eagle3"
+  num_epochs: 10
+  batch_size: 1
+  learning_rate: 0.00005
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  tp_size: 1
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 20
+  seed: 0
+run_id: "ling-flash-2.0-eagle3-offline"
+output_dir: "./outputs/ling-flash-2.0-eagle3-offline"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

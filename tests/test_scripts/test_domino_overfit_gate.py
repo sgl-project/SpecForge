@@ -1,12 +1,9 @@
 import importlib.util
 import json
 import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-
-import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -24,6 +21,14 @@ check_overfit = load_script("check_overfit_metrics.py")
 
 
 def fake_processing_stack(loss_tokens=40):
+    class FakeScalar:
+        def item(self):
+            return loss_tokens
+
+    class FakeMask:
+        def sum(self):
+            return FakeScalar()
+
     class FakeTokenizer:
         def encode(self, text, *, add_special_tokens):
             del add_special_tokens
@@ -46,7 +51,7 @@ def fake_processing_stack(loss_tokens=40):
         max_length,
     ):
         del max_length
-        return {"loss_mask": [torch.ones(1, loss_tokens)]}
+        return {"loss_mask": [FakeMask()]}
 
     return FakeTokenizer(), object(), preprocess
 
@@ -247,6 +252,34 @@ class TestDominoOverfitGate(unittest.TestCase):
                 result["checkpoint"], str(checkpoint / "training_state.pt")
             )
 
+    def test_accepts_unified_trainer_log_and_selects_latest_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "train.log"
+            log.write_text(
+                "step 2: {'loss': 0.2, 'accuracy': 0.8}\n"
+                "step 10: {'loss': 0.0, 'accuracy': 1.0}\n",
+                encoding="utf-8",
+            )
+            checkpoint_root = Path(tmp) / "checkpoints"
+            for step in (2, 10):
+                checkpoint = checkpoint_root / f"run-step{step}"
+                checkpoint.mkdir(parents=True)
+                (checkpoint / "training_state.pt").touch()
+
+            result = check_overfit.check_overfit(
+                str(log),
+                str(checkpoint_root),
+                expected_step=10,
+                max_loss=1e-4,
+                min_accuracy=1.0,
+            )
+
+            self.assertTrue(result["passed"])
+            self.assertEqual(
+                result["checkpoint"],
+                str(checkpoint_root / "run-step10" / "training_state.pt"),
+            )
+
     def test_fails_when_any_gate_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, "train.log")
@@ -263,32 +296,6 @@ class TestDominoOverfitGate(unittest.TestCase):
                     max_loss=1e-4,
                     min_accuracy=1.0,
                 )
-
-
-class TestDominoOverfitLauncher(unittest.TestCase):
-    def test_shared_launcher_contract_and_syntax(self):
-        launcher = ROOT / "examples/disagg/run_domino_disagg_overfit_gate.sh"
-        subprocess.run(["bash", "-n", str(launcher)], check=True)
-        text = launcher.read_text()
-        for required in (
-            "${TARGET_MODEL_PATH:?set TARGET_MODEL_PATH to the target model}",
-            "${DRAFT_CONFIG_PATH:?set DRAFT_CONFIG_PATH to a Domino draft config}",
-            "${SOURCE_DATA_PATH:?set SOURCE_DATA_PATH to validated ShareGPT JSONL}",
-            "DISAGG_MAX_PROMPTS=${DISAGG_MAX_PROMPTS:-1}",
-            "DISAGG_MAX_STEPS=${DISAGG_MAX_STEPS:-400}",
-            "MIN_LOSS_TOKENS=$((2 * BLOCK_SIZE))",
-            '--reasoning-policy "$REASONING_POLICY"',
-            '--embedding-key "$EMBEDDING_KEY"',
-            '--mask-token-id "$MASK_TOKEN_ID"',
-            '--block-size "$BLOCK_SIZE"',
-            '--context-length "$MAX_LENGTH"',
-            '--prompt-output-path "$PROMPT_ARTIFACT_PATH"',
-            'if [[ -e "$WORK_DIR" ]]',
-            "scripts/gates/check_overfit_metrics.py",
-            'LATEST_CHECKPOINT="$CONSUMER_OUTPUT_DIR/$DISAGG_STORE_ID-step$DISAGG_MAX_STEPS"',
-            '[[ ! -f "$LATEST_CHECKPOINT/training_state.pt" ]]',
-        ):
-            self.assertIn(required, text)
 
 
 if __name__ == "__main__":

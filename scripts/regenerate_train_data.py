@@ -37,8 +37,15 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
-from openai import OpenAI
 from tqdm import tqdm
+
+try:
+    from openai import OpenAI
+except ModuleNotFoundError as exc:
+    OpenAI = None
+    _OPENAI_IMPORT_ERROR = exc
+else:
+    _OPENAI_IMPORT_ERROR = None
 
 try:
     from scripts.conversation_validation import has_think_marker, validate_conversation
@@ -244,6 +251,11 @@ def call_sglang(
     max_tokens=None,
 ) -> str:
     """Send a batch of prompts to sglang /v1/completions."""
+    if OpenAI is None:
+        raise ModuleNotFoundError(
+            "dataset regeneration requires the OpenAI client; install "
+            "SpecForge's data extra with `pip install 'specforge[data]'`"
+        ) from _OPENAI_IMPORT_ERROR
     client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
 
     messages = data["conversations"]

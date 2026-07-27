@@ -1,55 +1,71 @@
-"""
-This script will generate the hidden states for the dataset use transformer as the target model backend.
-By generating hidden states in advance, we can avoid:
-- the memory overhead of loading target model
-- the latency overhead of generating hidden states for each request.
+"""Generate offline draft-training features with local SGLang capture.
 
-Optimized for lower memory usage and higher efficiency.
+The local target exists only for this preprocessing command. Online training
+consumes features from an external server and never loads a target model in the
+trainer process. Precomputing target features removes the target model's memory
+and latency cost from the later offline training run. ``--strategy`` selects
+the algorithm-owned capture layers and persisted tensor schema.
+The hidden states are saved in ${output_path} and the vocabulary mapping is saved
+in ${output_path}/vocab_mapping/vocab_mapping.pt
+which is used for the offline training.
 
 Usage:
-torchrun --nproc_per_node=8 \
+torchrun --nproc_per_node=2 \
     scripts/prepare_hidden_states.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --enable-aux-hidden-states \
+    --target-model-path Qwen/Qwen3-8B \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
-    --chat-template llama3 \
-    --max-length 2048 \
+    --output-path ./cache/hidden_states/sharegpt_qwen3-8b \
+    --chat-template qwen \
+    --max-length 4096 \
     --tp-size 1 \
     --batch-size 32 \
-    --num-samples 1000 \
-    --output-path ./cache/hidden_states
+    --num-samples 10000 \
+    --strategy dspark \
+    --draft-model-config configs/qwen3-8b-dspark.json
+
 
 For pre-formatted data (with chat template already applied), add --is-preformatted:
-torchrun --nproc_per_node=8 \
+torchrun --nproc_per_node=2 \
     scripts/prepare_hidden_states.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --enable-aux-hidden-states \
-    --data-path ./cache/dataset/preformatted_data.jsonl \
-    --output-path ./cache/hidden_states \
-    --chat-template llama3 \
-    --is-preformatted \
-    --max-length 2048
+    --target-model-path Qwen/Qwen3-8B \
+    --data-path ./cache/dataset/sharegpt_train.jsonl \
+    --output-path ./cache/hidden_states/sharegpt_qwen3-8b \
+    --chat-template qwen \
+    --max-length 4096 \
+    --tp-size 1 \
+    --batch-size 32 \
+    --num-samples 10000 \
+    --strategy dspark \
+    --draft-model-config configs/qwen3-8b-dspark.json \
+    --is-performatted
 """
 
 import argparse
 import gc
 import gzip
 import hashlib
+import json
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional
 
 import torch
 import torch.distributed as dist
-from tqdm import tqdm
-from transformers import AutoConfig, AutoProcessor
-
 from datasets import Dataset
-from specforge.args import SGLangBackendArgs
-from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
+from tqdm import tqdm
+from transformers import AutoConfig
+
+from specforge.algorithms.common.providers import OfflineCaptureLayout
+from specforge.application import resolve_offline_capture
+from specforge.config import Config
+from specforge.data.preprocessing import (
+    build_eagle3_dataset,
+    generate_vocab_mapping_file,
+)
+from specforge.data.utils import prepare_dp_dataloaders
 from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
@@ -57,7 +73,7 @@ from specforge.distributed import (
     init_distributed,
     is_tp_rank_0,
 )
-from specforge.modeling.target import Eagle3TargetModel, get_eagle3_target_model
+from specforge.offline_capture import OfflineSGLangCapture, load_offline_capture
 from specforge.utils import (
     load_tokenizer,
     print_args_with_dots,
@@ -67,12 +83,15 @@ from specforge.utils import (
 )
 
 
-@dataclass
-class DataPoint:
-    input_ids: torch.Tensor
-    loss_mask: torch.Tensor
-    hidden_state: torch.Tensor
-    aux_hidden_state: Optional[torch.Tensor] = None
+@dataclass(frozen=True)
+class OfflineCapturePlan:
+    """Resolved algorithm-owned feature schema for one preparation run."""
+
+    strategy: str
+    draft_config: object
+    capture_method: str
+    capture_layers: tuple[int, ...]
+    layout: OfflineCaptureLayout
 
 
 def parse_args():
@@ -82,16 +101,25 @@ def parse_args():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
     model_group.add_argument(
+        "--strategy",
+        type=str,
+        default="eagle3",
+        help="Offline draft strategy (default: eagle3)",
+    )
+    model_group.add_argument(
+        "--draft-model-config",
+        type=str,
+        default=None,
+        help=(
+            "Draft config used to resolve capture layers; required by strategies "
+            "without target-derived defaults"
+        ),
+    )
+    model_group.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading models",
     )
-    model_group.add_argument(
-        "--is-vlm", action="store_true", help="Whether the target model is a VLM"
-    )
-    model_group.add_argument("--enable-aux-hidden-states", action="store_true")
-    model_group.add_argument("--aux-hidden-states-layers", type=str, default=None)
-
     data_group = parser.add_argument_group("data")
     data_group.add_argument("--data-path", type=str, required=True)
     data_group.add_argument("--max-length", type=int, default=2048)
@@ -111,12 +139,6 @@ def parse_args():
     others_group = parser.add_argument_group("others")
     others_group.add_argument("--cache-dir", type=str, default="./cache")
     others_group.add_argument("--output-path", type=str, default=None)
-    others_group.add_argument(
-        "--model-download-dir",
-        type=str,
-        default=None,
-        help="The directory to download the target model to",
-    )
     others_group.add_argument(
         "--dist-timeout",
         type=int,
@@ -157,59 +179,193 @@ def parse_args():
     )
 
     sglang_group = parser.add_argument_group("sglang")
-    SGLangBackendArgs.add_args(sglang_group)
+    sglang_group.add_argument(
+        "--sglang-attention-backend",
+        default="flashinfer",
+        help="Attention backend used by the offline SGLang capture",
+    )
+    sglang_group.add_argument("--sglang-mem-fraction-static", type=float, default=0.4)
+    sglang_group.add_argument("--sglang-context-length", type=int, default=None)
+    sglang_group.add_argument("--sglang-enable-nccl-nvls", action="store_true")
+    sglang_group.add_argument("--sglang-enable-symm-mem", action="store_true")
+    sglang_group.add_argument("--sglang-enable-torch-compile", action="store_true")
+    sglang_group.add_argument("--sglang-enable-dp-attention", action="store_true")
+    sglang_group.add_argument("--sglang-enable-dp-lm-head", action="store_true")
+    sglang_group.add_argument("--sglang-ep-size", type=int, default=1)
     return parser.parse_args()
 
 
-def build_target_model(
-    args: argparse.Namespace, model_config: AutoConfig
-) -> Tuple[Eagle3TargetModel, Optional[AutoProcessor]]:
-    """
-    Build the target model according to the arguments.
+def _resolve_draft_vocab_size(source: str) -> int:
+    """Load ``draft_vocab_size`` from one existing local JSON file."""
 
-    For VLM models (Qwen2.5-VL) without TP, load directly from transformers.
-    Otherwise, use the Eagle3 target model wrapper.
-    """
-    if args.is_vlm and model_config.model_type == "qwen2_5_vl" and args.tp_size == 1:
-        # TODO: replace with sglang
-        from transformers import Qwen2_5_VLForConditionalGeneration
+    expanded = Path(source).expanduser()
+    if not expanded.is_file():
+        raise FileNotFoundError(
+            "--draft-model-config must point to an existing local JSON file: "
+            f"{source}"
+        )
+    if expanded.suffix.lower() != ".json":
+        raise ValueError(
+            f"--draft-model-config must point to a local .json file: {source}"
+        )
+    try:
+        with expanded.open(encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid draft config JSON {expanded}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"draft config JSON {expanded} must contain an object")
+    value = payload.get("draft_vocab_size", payload.get("vocab_size"))
 
-        target_model = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                pretrained_model_name_or_path=args.target_model_path,
-                torch_dtype=(
-                    model_config.dtype
-                    if hasattr(model_config, "dtype")
-                    else model_config.torch_dtype
-                ),
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(
+            f"draft model config {source!r} must define a positive "
+            f"draft_vocab_size (or vocab_size fallback), got {value!r}"
+        )
+    return value
+
+
+def _generate_shared_vocab_mapping(
+    dataset,
+    *,
+    output_path: str,
+    target_vocab_size: int,
+    draft_vocab_size: int,
+) -> str:
+    """Generate one mapping on global rank 0 and propagate failures to peers."""
+
+    mapping_dir = os.path.join(output_path, "vocab_mapping")
+    mapping_path = os.path.join(mapping_dir, "vocab_mapping.pt")
+    result = [None]
+    if dist.get_rank() == 0:
+        temporary_path = None
+        try:
+            temporary_key = f".vocab_mapping.{uuid.uuid4().hex}"
+            temporary_path = generate_vocab_mapping_file(
+                dataset=dataset,
+                target_vocab_size=target_vocab_size,
+                draft_vocab_size=draft_vocab_size,
+                cache_dir=mapping_dir,
+                cache_key=temporary_key,
             )
-            .eval()
-            .cuda()
-        )
-    else:
-        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
-        target_model = get_eagle3_target_model(
-            pretrained_model_name_or_path=args.target_model_path,
-            backend="sglang",  # we set this as the default backend to minimize precision mismatch in training and serving
-            torch_dtype=(
-                model_config.dtype
-                if hasattr(model_config, "dtype")
-                else model_config.torch_dtype
-            ),
-            device="cuda",
-            cache_dir=args.model_download_dir,
-            trust_remote_code=args.trust_remote_code,
-            **target_model_kwargs,
-        )
-    # Set auxiliary hidden states layers if specified
-    target_model.set_aux_hidden_states_layers(args.aux_hidden_states_layers)
+            mapping = torch.load(
+                temporary_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            d2t = mapping.get("d2t")
+            t2d = mapping.get("t2d")
+            if not isinstance(d2t, torch.Tensor) or tuple(d2t.shape) != (
+                draft_vocab_size,
+            ):
+                raise ValueError(
+                    f"{temporary_path} has invalid d2t shape; expected "
+                    f"({draft_vocab_size},), got {getattr(d2t, 'shape', None)}"
+                )
+            if not isinstance(t2d, torch.Tensor) or tuple(t2d.shape) != (
+                target_vocab_size,
+            ):
+                raise ValueError(
+                    f"{temporary_path} has invalid t2d shape; expected "
+                    f"({target_vocab_size},), got {getattr(t2d, 'shape', None)}"
+                )
+            os.replace(temporary_path, mapping_path)
+            temporary_path = None
+            result[0] = {"path": mapping_path}
+        except BaseException as exc:
+            result[0] = {
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
 
-    if args.is_vlm:
-        processor = AutoProcessor.from_pretrained(args.target_model_path)
-    else:
-        processor = None
+    dist.broadcast_object_list(result, src=0)
+    if result[0] is None or "error" in result[0]:
+        reason = "rank 0 did not publish a result"
+        if result[0] is not None:
+            reason = result[0]["error"]
+        raise RuntimeError(f"failed to generate vocabulary mapping: {reason}")
+    if result[0]["path"] != mapping_path:
+        raise RuntimeError(
+            "vocabulary mapping generator returned an unexpected path: "
+            f"{result[0]['path']} != {mapping_path}"
+        )
+    return mapping_path
 
-    return target_model, processor
+
+def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
+    return {
+        "attention_backend": args.sglang_attention_backend,
+        "mem_fraction_static": args.sglang_mem_fraction_static,
+        "context_length": args.sglang_context_length,
+        "enable_nccl_nvls": args.sglang_enable_nccl_nvls,
+        "enable_symm_mem": args.sglang_enable_symm_mem,
+        "enable_torch_compile": args.sglang_enable_torch_compile,
+        "enable_dp_attention": args.sglang_enable_dp_attention,
+        "enable_dp_lm_head": args.sglang_enable_dp_lm_head,
+        "ep_size": args.sglang_ep_size,
+        "max_running_requests": args.batch_size,
+        "max_total_tokens": args.batch_size * args.max_length,
+    }
+
+
+def resolve_offline_capture_plan(
+    args: argparse.Namespace,
+    target_config: AutoConfig,
+) -> OfflineCapturePlan:
+    """Resolve capture layers and output keys through the algorithm registry."""
+
+    strategy = getattr(args, "strategy", "eagle3")
+    model = {
+        "target_model_path": args.target_model_path,
+        "draft_model_config": getattr(args, "draft_model_config", None),
+        "trust_remote_code": args.trust_remote_code,
+        "cache_dir": getattr(args, "cache_dir", None),
+    }
+    cfg = Config(
+        model=model,
+        data={
+            "hidden_states_path": args.output_path or "__offline_capture__",
+            "max_length": args.max_length,
+        },
+        training={"strategy": strategy},
+    )
+    resolved = resolve_offline_capture(cfg, target_config=target_config)
+    return OfflineCapturePlan(
+        strategy=resolved.run.algorithm.name,
+        draft_config=resolved.draft_config,
+        capture_method=resolved.capture_method,
+        capture_layers=resolved.capture_layers,
+        layout=resolved.layout,
+    )
+
+
+def build_target_model(
+    args: argparse.Namespace,
+    model_config: AutoConfig,
+    capture_layers: List[int],
+    capture_method: str = "eagle3",
+) -> OfflineSGLangCapture:
+    """Build the local target used only by this preprocessing command."""
+    target_model = load_offline_capture(
+        args.target_model_path,
+        torch_dtype=(
+            model_config.dtype
+            if hasattr(model_config, "dtype")
+            else model_config.torch_dtype
+        ),
+        trust_remote_code=args.trust_remote_code,
+        **_sglang_kwargs(args),
+    )
+    target_model.set_capture_layers(
+        capture_layers,
+        capture_method=capture_method,
+    )
+    return target_model
 
 
 class HiddenStatesGenerator:
@@ -225,7 +381,7 @@ class HiddenStatesGenerator:
     def __init__(
         self,
         target_model,
-        enable_aux_hidden_states: bool = True,
+        capture_layout: Optional[OfflineCaptureLayout] = None,
         num_io_threads: int = 4,
         io_queue_size: int = 50,
         file_group_size: int = 2000,
@@ -235,13 +391,21 @@ class HiddenStatesGenerator:
         """
         Args:
             target_model: The model for inference.
-            enable_aux_hidden_states: Whether to save auxiliary hidden states.
+            capture_layout: Algorithm-owned mapping from captured states to files.
             num_io_threads: Number of threads for async I/O.
             io_queue_size: Max number of pending I/O futures before cleanup.
             file_group_size: Number of files per subdirectory.
         """
         self.model = target_model
-        self.enable_aux_hidden_states = enable_aux_hidden_states
+        self.capture_layout = capture_layout or OfflineCaptureLayout(
+            capture_method="eagle3",
+            aux_feature="aux_hidden_state",
+            last_hidden_feature="hidden_state",
+            passthrough=(
+                ("input_ids", "input_ids"),
+                ("loss_mask", "loss_mask"),
+            ),
+        )
 
         # --- Configurable parameters ---
         self.num_io_threads = num_io_threads
@@ -277,44 +441,52 @@ class HiddenStatesGenerator:
         # Final barrier to ensure all processes exit generate() cleanly
         dist.barrier()
 
-    def _save_tensor_sync(self, data_point: DataPoint, output_file: str) -> None:
+    def _save_tensor_sync(
+        self,
+        record: Mapping[str, torch.Tensor],
+        output_file: str,
+    ) -> None:
         """
-        Save a data point to a file synchronously. If there is any NaN value in the data, this datapoint will be skipped.
+        Save a feature record synchronously, skipping records containing NaNs.
 
         Args:
-            data_point (DataPoint): The data point to save.
+            record: The algorithm-specific feature record to save.
             output_file (str): The path to the output file.
         """
-        if data_point.hidden_state is not None and torch.any(
-            torch.isnan(data_point.hidden_state)
-        ):
-            print(
-                f"Warning: NaN found in hidden_state for {output_file}. Skipping save."
-            )
-            return
-
-        if data_point.aux_hidden_state is not None and torch.any(
-            torch.isnan(data_point.aux_hidden_state)
-        ):
-            print(
-                f"Warning: NaN found in aux_hidden_state for {output_file}. Skipping save."
-            )
-            return
+        persisted = dict(record)
+        for feature_name, tensor in persisted.items():
+            if not torch.is_tensor(tensor):
+                raise TypeError(
+                    f"offline feature {feature_name!r} must be a tensor, got "
+                    f"{type(tensor).__name__}"
+                )
+            if (torch.is_floating_point(tensor) or torch.is_complex(tensor)) and bool(
+                torch.isnan(tensor).any()
+            ):
+                print(
+                    f"Warning: NaN found in {feature_name} for {output_file}. "
+                    "Skipping save."
+                )
+                return
 
         if self.compress:
             with gzip.open(
                 output_file, "wb", compresslevel=self.compression_level
             ) as f:
-                torch.save(asdict(data_point), f)
+                torch.save(persisted, f)
         else:
-            torch.save(asdict(data_point), output_file)
+            torch.save(persisted, output_file)
 
-    def _save_tensor_async(self, data_point: DataPoint, output_file: str) -> None:
+    def _save_tensor_async(
+        self,
+        record: Mapping[str, torch.Tensor],
+        output_file: str,
+    ) -> None:
         """
         Submit a job to the io_executor to save the data point asynchronously.
 
         Args:
-            data_point (DataPoint): The data point to save.
+            record: The algorithm-specific feature record to save.
             output_file (str): The path to the output file.
         """
         assert is_tp_rank_0(), "Only tp_rank=0 should call _save_tensor_async"
@@ -328,9 +500,7 @@ class HiddenStatesGenerator:
             if len(self.pending_futures) >= self.io_queue_size:
                 self.pending_futures.pop(0).result()
 
-        future = self.io_executor.submit(
-            self._save_tensor_sync, data_point, output_file
-        )
+        future = self.io_executor.submit(self._save_tensor_sync, record, output_file)
         self.pending_futures.append(future)
 
     def _wait_all_saves(self):
@@ -392,11 +562,11 @@ class HiddenStatesGenerator:
         def check_single_file(idx):
             if os.path.exists(self._get_file_path(output_path, idx)):
                 return True
-            legacy_ckpt = self._get_file_path(output_path, idx, extension=".ckpt")
+            uncompressed_ckpt = self._get_file_path(output_path, idx, extension=".ckpt")
             compressed_ckpt = self._get_file_path(
                 output_path, idx, extension=".ckpt.gz"
             )
-            return os.path.exists(legacy_ckpt) or os.path.exists(compressed_ckpt)
+            return os.path.exists(uncompressed_ckpt) or os.path.exists(compressed_ckpt)
 
         # Parallel file existence check
         with ThreadPoolExecutor(max_workers=self.num_io_threads) as executor:
@@ -507,11 +677,15 @@ class HiddenStatesGenerator:
             filtered_batch_gpu = {
                 k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
             }
-            _, _, aux_hidden_states_list, last_hidden_states_list = self.model.extend(
+            captured = self.model.capture(
                 **filtered_batch_gpu,
-                return_last_hidden_states=True,
-                return_logits=False,
             )
+            aux_hidden_states_list = captured.hidden_states
+            last_hidden_states_list = captured.last_hidden_states
+            if aux_hidden_states_list is None:
+                aux_hidden_states_list = [None] * num_valid
+            if last_hidden_states_list is None:
+                last_hidden_states_list = [None] * num_valid
 
             del filtered_batch_gpu
 
@@ -540,16 +714,18 @@ class HiddenStatesGenerator:
                         if last_hidden_states is not None
                         else None
                     )
-                    data_point = DataPoint(
-                        input_ids=filtered_batch["input_ids"][i].clone(),
-                        loss_mask=filtered_batch["loss_mask"][i].clone(),
-                        hidden_state=last_hidden_states,
-                        aux_hidden_state=aux_hidden_states,
+                    record = self.capture_layout.materialize(
+                        {
+                            "input_ids": filtered_batch["input_ids"][i].clone(),
+                            "loss_mask": filtered_batch["loss_mask"][i].clone(),
+                            "aux_hidden_states": aux_hidden_states,
+                            "last_hidden_states": last_hidden_states,
+                        }
                     )
 
                     # 3. Save asynchronously (the backpressure logic is still crucial)
                     output_file = self._get_file_path(output_path, current_global_idx)
-                    self._save_tensor_async(data_point, output_file)
+                    self._save_tensor_async(record, output_file)
 
                     # 4. Immediately clean up the single-sample CPU tensors
                     del last_hidden_states, aux_hidden_states
@@ -583,32 +759,55 @@ class HiddenStatesGenerator:
 
 def main():
     args = parse_args()
-    if args.aux_hidden_states_layers is not None:
-        args.aux_hidden_states_layers = [
-            int(x) for x in args.aux_hidden_states_layers.split(",")
-        ]
     if args.num_io_threads is None:
         cpu_cores = os.cpu_count() or 1
         args.num_io_threads = max(1, cpu_cores)
+    if args.output_path is None:
+        args.output_path = os.path.join(
+            Path(__file__).parent.parent, "cache", "hidden_states"
+        )
+
+    target_model_config = AutoConfig.from_pretrained(
+        args.target_model_path,
+        cache_dir=args.cache_dir,
+        trust_remote_code=args.trust_remote_code,
+    )
+    capture_plan = resolve_offline_capture_plan(args, target_model_config)
+    draft_vocab_size = _resolve_draft_vocab_size(args.draft_model_config)
+
     # Initialize distributed environment (TP + DP)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_args_with_dots(args)
+    if dist.get_rank() == 0:
+        print("Resolved draft model config:")
+        print(capture_plan.draft_config.to_json_string(use_diff=False))
+    print_with_rank(
+        f"Resolved {capture_plan.strategy} offline "
+        f"capture method {capture_plan.capture_method!r}, layers: "
+        f"{list(capture_plan.capture_layers)}"
+    )
 
     # Build target model (with TP)
-    target_model_config = AutoConfig.from_pretrained(
-        args.target_model_path, trust_remote_code=args.trust_remote_code
+    target_model = build_target_model(
+        args,
+        target_model_config,
+        capture_layers=list(capture_plan.capture_layers),
+        capture_method=capture_plan.capture_method,
     )
-    target_model, processor = build_target_model(args, target_model_config)
+    target_text_config = getattr(
+        target_model_config, "text_config", target_model_config
+    )
+    target_vocab_size = int(target_text_config.vocab_size)
+    if draft_vocab_size > target_vocab_size:
+        raise ValueError(
+            f"draft_vocab_size={draft_vocab_size} exceeds target "
+            f"vocab_size={target_vocab_size}"
+        )
 
     print_with_rank(
         f"DP Rank {dist.get_rank(get_dp_group())}, TP Rank {dist.get_rank(get_tp_group())}, "
         f"DP Size {dist.get_world_size(get_dp_group())}, TP Size {dist.get_world_size(get_tp_group())}"
     )
-
-    if args.output_path is None:
-        args.output_path = os.path.join(
-            Path(__file__).parent.parent, "cache", "hidden_states"
-        )
 
     # Load complete dataset
     assert os.path.exists(
@@ -630,7 +829,9 @@ def main():
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     # Tokenizer and cache key
-    tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
+    tokenizer = load_tokenizer(
+        args.target_model_path, trust_remote_code=args.trust_remote_code
+    )
     cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
@@ -644,12 +845,19 @@ def main():
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
-            is_vlm=args.is_vlm,
             is_preformatted=args.is_preformatted,
-            processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
+
+    vocab_mapping_path = _generate_shared_vocab_mapping(
+        eagle3_dataset,
+        output_path=args.output_path,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+    )
+    if dist.get_rank() == 0:
+        print(f"Vocabulary mapping ready at {vocab_mapping_path}")
 
     # Create DP-sharded dataloader
     data_loader = prepare_dp_dataloaders(
@@ -658,7 +866,6 @@ def main():
         num_workers=args.num_workers,
         shuffle=False,
         process_group=get_dp_group(),
-        is_vlm=args.is_vlm,
     )
 
     print_with_rank(
@@ -692,7 +899,7 @@ def main():
         # Pass configurable arguments from args if needed
         with HiddenStatesGenerator(
             target_model,
-            enable_aux_hidden_states=args.enable_aux_hidden_states,
+            capture_layout=capture_plan.layout,
             num_io_threads=args.num_io_threads,
             io_queue_size=args.io_queue_size,
             file_group_size=args.file_group_size,

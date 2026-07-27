@@ -10,14 +10,12 @@
 
 Weight-name compatibility is the silent-failure risk here: a key the serving
 loader does not expect is skipped (or zero-filled) without an error. The
-per-architecture trainer-key -> serving-key map therefore lives in ONE
-documented place — ``WEIGHT_MAPS`` below plus ``docs/export_weight_map_mla.md``
-— and this exporter validates the produced state against it instead of hoping.
+per-architecture trainer-key -> serving-key map therefore lives in
+``WEIGHT_MAPS`` below, and this exporter validates the produced state against it.
 
 For ``LlamaForCausalLMEagle3`` the map is the identity: SpecForge's draft module
 names (``midlayer.*`` / ``fc`` / ``norm`` / ``lm_head`` + the ``t2d``/``d2t``
-buffers) are exactly what sglang's EAGLE3 draft loader reads. The MLA draft adds
-real renames when it lands (see the doc).
+buffers) are exactly what SGLang's EAGLE3 draft loader reads.
 """
 
 from __future__ import annotations
@@ -67,6 +65,12 @@ def export_to_sglang(
     checkpoint predates them.
     """
     state = resolve_training_state(checkpoint_path)
+    if state.get("strategy") != "eagle3":
+        raise ValueError(
+            "the specialized SGLang exporter currently supports EAGLE3 "
+            f"checkpoints only, got strategy={state.get('strategy')!r}; use "
+            "--to hf for DFlash-family and P-EAGLE draft model directories"
+        )
     model = materialize_draft(
         state, draft_config_path, vocab_mapping_path=vocab_mapping_path
     )

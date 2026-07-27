@@ -1,9 +1,8 @@
 # coding=utf-8
-"""Gate: `specforge train` config builds the same Trainer the programmatic path does.
+"""Gate: the typed config builds the unified ``TrainingRun`` lifecycle.
 
-A tiny offline fixture world + a YAML config through ``cli.build_from_config``
-must produce a TrainerController wired exactly as ``build_offline_runtime``
-called directly — and it must actually train.
+A tiny offline fixture world + a YAML config through package-level assembly
+must produce the same ``TrainingRun`` the CLI executes, and it must train.
 
 GPU-only. Run on the H200 box via rcli.
 """
@@ -11,6 +10,7 @@ GPU-only. Run on the H200 box via rcli.
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -27,9 +27,9 @@ class TestCliConfigBuild(unittest.TestCase):
 
         import yaml
 
-        from specforge.cli import build_from_config
+        from specforge.application import build_application_run, resolve_run
         from specforge.config import load_config
-        from specforge.training.controller import TrainerController
+        from specforge.training import Trainer
 
         workdir = tempfile.mkdtemp(prefix="cli_cfg_")
         cfg_path = fx.write_draft_config(os.path.join(workdir, "draft.json"))
@@ -62,25 +62,31 @@ class TestCliConfigBuild(unittest.TestCase):
             yaml.safe_dump(run_config, f)
 
         cfg = load_config(yaml_path, ["training.max_steps=2"])  # override applies
-        trainer, loader, drive_rollout = build_from_config(cfg)
+        run = build_application_run(resolve_run(cfg))
+        trainer = run.trainer
 
-        # same wiring the programmatic path produces
-        self.assertIsInstance(trainer, TrainerController)
-        self.assertIsNone(drive_rollout)  # offline
+        # package-level assembly is the single wiring the CLI executes
+        self.assertIsInstance(trainer, Trainer)
         self.assertEqual(trainer.run_id, "cli-gate")
         self.assertEqual(trainer.max_steps, 2)
-        self.assertEqual(trainer._checkpoint_manager().max_checkpoints, 2)
+        self.assertEqual(trainer.max_checkpoints, 2)
         self.assertEqual(trainer.output_dir, run_config["output_dir"])
+        self.assertEqual(trainer.batch_size, 2)
         self.assertEqual(trainer.core.accumulation_steps, 1)
         self.assertEqual(trainer.core.strategy.name, "eagle3")
-        self.assertEqual(loader.batch_size, 2)
 
         # and it actually trains to the configured step cap
-        step = trainer.fit(loader)
+        step = run.run()
         self.assertEqual(step, 2)
+        self.assertTrue(
+            os.path.islink(os.path.join(run_config["output_dir"], "cli-gate-latest"))
+        )
 
-    def test_non_eagle3_strategy_points_to_dedicated_script(self):
-        from specforge.cli import build_from_config
+
+class TestCliDispatch(unittest.TestCase):
+    def test_train_command_dispatches_one_resolved_run(self):
+        from specforge.application import ResolvedRun
+        from specforge.cli import main
         from specforge.config import Config
 
         cfg = Config.model_validate(
@@ -90,8 +96,17 @@ class TestCliConfigBuild(unittest.TestCase):
                 "training": {"strategy": "dflash"},
             }
         )
-        with self.assertRaises(NotImplementedError):
-            build_from_config(cfg)
+        with (
+            mock.patch("specforge.cli.load_config", return_value=cfg) as load,
+            mock.patch("specforge.cli._train", return_value=3) as train,
+        ):
+            self.assertEqual(main(["train", "--config", "run.yaml"]), 0)
+        load.assert_called_once_with("run.yaml", [])
+        train.assert_called_once()
+        resolved = train.call_args.args[0]
+        self.assertIsInstance(resolved, ResolvedRun)
+        self.assertEqual(resolved.config, cfg)
+        self.assertEqual(resolved.algorithm.name, "dflash")
 
 
 if __name__ == "__main__":

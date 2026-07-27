@@ -16,7 +16,7 @@ concurrency:
 jobs:
   deploy-github-pages:
     runs-on: ubuntu-latest
-    if: github.repository == 'sgl-project/specforge' || github.repository == 'sleepcoo/SpecForge'
+    if: github.repository == 'sgl-project/SpecForge' || github.repository == 'sleepcoo/SpecForge'
     permissions:
       contents: write
     steps:
@@ -37,7 +37,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y pandoc parallel retry
           pip install -r docs/requirements.txt
 
       - name: Build spec bundle dashboard
@@ -55,7 +54,6 @@ jobs:
       - name: Build documentation
         run: |
           cd docs
-          make compile
           make html
           # Copy SpecBundle to root of output directory
           mkdir -p _build/html/SpecBundle
