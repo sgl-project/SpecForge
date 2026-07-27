@@ -723,17 +723,13 @@ class LaunchPlanTest(unittest.TestCase):
         from specforge.launch_plan import _device_visibility_env_var
 
         with mock.patch.dict(os.environ, {"SPECFORGE_DEVICE": "npu"}):
-            self.assertEqual(
-                _device_visibility_env_var(), "ASCEND_RT_VISIBLE_DEVICES"
-            )
+            self.assertEqual(_device_visibility_env_var(), "ASCEND_RT_VISIBLE_DEVICES")
         with mock.patch.dict(os.environ, {"SPECFORGE_DEVICE": "cuda"}):
             self.assertEqual(_device_visibility_env_var(), "CUDA_VISIBLE_DEVICES")
         with mock.patch.dict(
             os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "0,1"}, clear=True
         ):
-            self.assertEqual(
-                _device_visibility_env_var(), "ASCEND_RT_VISIBLE_DEVICES"
-            )
+            self.assertEqual(_device_visibility_env_var(), "ASCEND_RT_VISIBLE_DEVICES")
         with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True):
             self.assertEqual(_device_visibility_env_var(), "CUDA_VISIBLE_DEVICES")
         with (
@@ -870,6 +866,62 @@ class LaunchPlanTest(unittest.TestCase):
                     projected = _config_for_role(cfg, role)
                     self.assertEqual(projected.training.role, role)
                     self.assertIsNone(projected.deployment.disaggregated.managed_local)
+
+    def test_cli_managed_child_worker_unsets_hidden_npu_devices(self):
+        """The in-process worker path honors the None-as-unset env contract.
+
+        The managed producer child hides devices on Ascend by removing
+        ASCEND_RT_VISIBLE_DEVICES (the driver rejects an empty value), so
+        cli.main must unset the variable rather than crash on the None.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            control_dir = os.path.join(root, "attempt")
+            cfg = _managed_config(control_dir)
+            with (
+                mock.patch(
+                    "specforge.training.capture_contract.resolve_server_capture_contract",
+                    return_value=CAPTURE_CONTRACT,
+                ),
+                mock.patch(
+                    "specforge.launch_plan._device_visibility_env_var",
+                    return_value="ASCEND_RT_VISIBLE_DEVICES",
+                ),
+            ):
+                parent = build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env={},
+                )
+            os.makedirs(os.path.join(control_dir, "logs"))
+            path = os.path.join(root, "run.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(cfg.model_dump(mode="json"), stream)
+
+            # The environment the supervisor's _spawn_command would produce:
+            # None entries are removed, never passed through as values.
+            spawned_env = {
+                key: value
+                for key, value in parent.commands[0].env.items()
+                if value is not None
+            }
+            # A value leaked from the launching shell must still be removed.
+            spawned_env["ASCEND_RT_VISIBLE_DEVICES"] = "4,5"
+            with (
+                mock.patch.dict(os.environ, spawned_env, clear=True),
+                mock.patch(
+                    "specforge.launch_plan._device_visibility_env_var",
+                    return_value="ASCEND_RT_VISIBLE_DEVICES",
+                ),
+                mock.patch("specforge.cli._train", return_value=0) as train,
+            ):
+                self.assertEqual(
+                    main(["train", "-c", path, "--role", "producer"]),
+                    0,
+                )
+                self.assertNotIn("ASCEND_RT_VISIBLE_DEVICES", os.environ)
+            train.assert_called_once()
 
     def test_online_disaggregation_forces_server_owned_client_segments(self):
         raw = _config(mode="disaggregated").model_dump()

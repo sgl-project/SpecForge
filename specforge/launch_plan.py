@@ -145,7 +145,9 @@ class LaunchPlan:
     kind: PlanKind
     role: Literal["all", "producer", "consumer", "both"]
     commands: tuple[CommandSpec, ...] = ()
-    worker_env: Mapping[str, str] = field(default_factory=dict)
+    #: In-process environment overrides for kind="worker". Shares the
+    #: CommandSpec.env contract: a None value unsets the variable.
+    worker_env: Mapping[str, Optional[str]] = field(default_factory=dict)
     services: tuple[ServiceSpec, ...] = ()
     managed_root: Optional[str] = None
     managed_ports: tuple[int, ...] = ()
