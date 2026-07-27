@@ -35,6 +35,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
+from specforge.modeling.draft.registry import register_draft
 
 
 class Qwen3_5RMSNorm(nn.Module):
@@ -391,6 +392,7 @@ class Qwen3_5MTPModel(nn.Module):
         return hidden_states
 
 
+@register_draft
 class Qwen3_5MTPDraftModel(Qwen3PreTrainedModel):
     """
     Qwen3.5 MTP draft model for SpecForge training.

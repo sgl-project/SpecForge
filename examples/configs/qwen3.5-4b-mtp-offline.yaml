@@ -1,0 +1,38 @@
+model:
+  target_model_path: Qwen/Qwen3.5-4B
+  draft_model_config: configs/qwen3.5-4b-mtp.json
+  target_backend: sglang
+  # Qwen3.5-4B nests its text decoder under model.language_model and ties
+  # lm_head to the embedding, so both keys point at the same tensor.
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: model.language_model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/qwen3.5-4b-mtp-open-perfectblend
+  max_length: 3072
+  chat_template: qwen3.5
+  cache_dir: ./cache
+
+training:
+  strategy: mtp
+  num_epochs: 10
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+run_id: qwen3.5-4b-mtp-offline
+output_dir: ./outputs/qwen3.5-4b-mtp-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

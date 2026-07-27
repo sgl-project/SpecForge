@@ -8,6 +8,7 @@ from specforge.algorithms.common.collation import pad_and_concatenate_features
 
 NORMALIZER_ID = "dflash_family_offline_v1"
 DSPARK_NORMALIZER_ID = "dspark_offline_v1"
+MTP_NORMALIZER_ID = "mtp_offline_v1"
 
 
 def _normalize_hidden_states(
@@ -180,15 +181,99 @@ def build_dspark_collator():
     return collate
 
 
+def normalize_mtp_offline_sample(raw, max_len: int):
+    """Normalize MTP capture tensors (no aux-layer concat, final hidden only)."""
+
+    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)
+    target_last_hidden_states = _normalize_hidden_states(
+        raw,
+        "target_last_hidden_states",
+        max_len,
+        description="MTP target_last_hidden_states",
+    )
+    lengths = {
+        input_ids.shape[1],
+        loss_mask.shape[1],
+        target_last_hidden_states.shape[1],
+    }
+    if len(lengths) != 1:
+        raise ValueError(
+            "offline MTP features have mismatched sequence lengths after "
+            f"truncation: input_ids={input_ids.shape[1]}, "
+            f"loss_mask={loss_mask.shape[1]}, "
+            f"target_last_hidden_states={target_last_hidden_states.shape[1]}"
+        )
+    return {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "target_last_hidden_states": target_last_hidden_states,
+    }
+
+
+def build_mtp_offline_reader(
+    strategy,
+    hidden_states_path,
+    *,
+    run_id,
+    ttt_length,
+    max_len,
+):
+    # Transitional runtime import; the composition root will inject this port.
+    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+    return OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        strategy=strategy,
+        feature_keys=(
+            "input_ids",
+            "loss_mask",
+            "target_last_hidden_states",
+        ),
+        target_repr="hidden_state",
+        ttt_length=ttt_length,
+        max_len=max_len,
+    )
+
+
+def build_mtp_offline_normalizer(max_len, **_topology):
+    return partial(normalize_mtp_offline_sample, max_len=max_len)
+
+
+def build_mtp_collator():
+    def collate(features):
+        return pad_and_concatenate_features(
+            features,
+            sequence_axes={
+                "input_ids": 1,
+                "loss_mask": 1,
+                "target_last_hidden_states": 1,
+            },
+            required_keys=(
+                "input_ids",
+                "loss_mask",
+                "target_last_hidden_states",
+            ),
+        )
+
+    return collate
+
+
 __all__ = [
     "DSPARK_NORMALIZER_ID",
+    "MTP_NORMALIZER_ID",
     "NORMALIZER_ID",
     "build_collator",
     "build_dspark_collator",
     "build_dspark_offline_normalizer",
     "build_dspark_offline_reader",
+    "build_mtp_collator",
+    "build_mtp_offline_normalizer",
+    "build_mtp_offline_reader",
     "build_offline_normalizer",
     "build_offline_reader",
     "normalize_dspark_offline_sample",
+    "normalize_mtp_offline_sample",
     "normalize_offline_sample",
 ]

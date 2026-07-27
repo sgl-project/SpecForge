@@ -51,6 +51,16 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 {"sdpa", "flex_attention", "fa", "usp"},
                 None,
             ),
+            "mtp": (
+                "Qwen3_5MTPDraftModel",
+                {
+                    "input_ids",
+                    "loss_mask",
+                    "target_last_hidden_states",
+                },
+                {"eager", "sdpa"},
+                None,
+            ),
             "peagle": (
                 "PEagleDraftModel",
                 {
@@ -108,6 +118,12 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
                 "attention_mask",
             ),
+            "mtp": (
+                "hidden_states",
+                "target_last_hidden_states",
+                (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
+                None,
+            ),
             "peagle": (
                 "hidden_state",
                 "target",
@@ -150,6 +166,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
             "dflash": "DFlashTrainStrategy",
             "domino": "DominoTrainStrategy",
             "dspark": "DSparkTrainStrategy",
+            "mtp": "MTPTrainStrategy",
         }
         model = object()
         for name, class_name in expected.items():
