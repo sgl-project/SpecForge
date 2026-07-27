@@ -200,18 +200,6 @@ Managed capture derives SGLang `--context-length` as `data.max_length + 7` to
 reserve the request headroom required by the capture endpoint. An explicit
 `model.sglang_context_length` must be at least that value.
 
-On Ascend NPU hosts the launcher injects device ordinals through
-`ASCEND_RT_VISIBLE_DEVICES` instead of `CUDA_VISIBLE_DEVICES`, and a capture
-server without an explicit `attention_backend` falls back from the
-CUDA-oriented default (`flashinfer`) to `ascend`. A complete single-node NPU
-example — Mooncake, one capture server on device 0, and a 14-rank trainer on
-devices 2–15 of a 16-card A3 node (8-card hosts: devices 1–7, 7 ranks) — is:
-
-```bash
-specforge train -c \
-  examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml
-```
-
 ## Split pools and multi-node consumers
 
 The same YAML launches either role explicitly:
