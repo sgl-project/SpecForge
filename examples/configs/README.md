@@ -42,7 +42,8 @@ The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-multiserver-disaggregated.yaml`,
 `qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml`, and
-`qwen3.6-27b-dflash-multiserver-disaggregated.yaml` recipes are opt-in local
+`qwen3.6-27b-dflash-multiserver-disaggregated.yaml`, and
+`qwen3.6-27b-dspark-disaggregated.yaml` recipes are opt-in local
 full-stack examples. Their typed `managed_local` blocks own Mooncake, one or
 two patched SGLang capture servers, and the trainer GPU allocation; the same
 `specforge train -c ...` command starts and cleans up each complete stack.

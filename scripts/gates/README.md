@@ -1,142 +1,175 @@
-# Training and serving gates
+# One-sample overfit validation
 
-These generic gates exercise the unified runtime without adding another
-training entry. Training is launched only through the canonical
-`examples/disagg/run_online.sh` wrapper, which invokes `specforge train`.
-Method-specific Python trainers are not required.
+This guide contains only two stages:
 
-## One-command disaggregated overfit and serving gate
+1. overfit Dspark on one Qwen3-8B training sample with `specforge train`;
+2. export the checkpoint, serve it with SGLang, and verify that one complete
+   16-token draft block is accepted.
 
-Run the full Domino-compatible DFlash-family gate with one local command:
+The commands below use GPU 0 for target capture and GPU 1 for training and
+serving. We use Qwen3.6-27B-Dspark as an example. You can test other models and speculative algorithms such as Dspark、DFlash and so on.
 
-```bash
-CONFIG=examples/configs/qwen3-8b-domino-disaggregated.yaml \
-TARGET_MODEL_PATH=Qwen/Qwen3-8B \
-DRAFT_CONFIG_PATH=configs/qwen3-8b-domino.json \
-SOURCE_DATA_PATH=./cache/dataset/sharegpt_train.jsonl \
-REASONING_POLICY=forbidden ENABLE_THINKING=false \
-NPROC_PER_NODE=7 \
-CAPTURE_GPUS=0 \
-CONSUMER_GPUS=1,2,3,4,5,6,7 \
-bash scripts/gates/run_disaggregated_overfit_gate.sh
-```
+## Validate the ports
 
-The gate selects one untruncated sample, starts Mooncake and a patched SGLang
-capture server, launches the canonical producer and consumer roles, checks the
-strict loss/accuracy target and exact final checkpoint, releases the capture
-stack, exports through `specforge export --to hf`, starts real DFLASH serving,
-and validates acceptance metadata plus target-prefix agreement. EXIT, INT, and
-TERM traps stop every process owned by the gate; externally supervised services
-are never registered for cleanup.
-
-## Model and reasoning contracts
-
-The gate is model-parameterized, but the dataset contract must match the target
-chat template and the selected reasoning mode:
-
-| Target | Dataset contract | `CHAT_TEMPLATE` | Reasoning controls |
-| --- | --- | --- | --- |
-| Qwen3-8B | Non-reasoning responses | `qwen` | `REASONING_POLICY=forbidden`, `ENABLE_THINKING=false` |
-| Qwen3.6-27B | Structured reasoning responses | `qwen3.5` | `REASONING_POLICY=required`, `ENABLE_THINKING=true` |
-
-For example, the Qwen3.6 reasoning gate still uses the same canonical training
-entry; the selected YAML supplies the disaggregated topology while the gate
-passes the model, draft, data, and bounded-run values as typed overrides:
+Run this check from the SpecForge repository before preparing data. It checks
+only whether the capture, serving, and Mooncake ports are available.
 
 ```bash
-CONFIG=examples/configs/qwen3-8b-domino-disaggregated.yaml \
-TARGET_MODEL_PATH=Qwen/Qwen3.6-27B \
-DRAFT_CONFIG_PATH=configs/qwen3.6-27b-domino-full-attention.json \
-SOURCE_DATA_PATH=/path/to/validated_qwen36_reasoning.jsonl \
-CHAT_TEMPLATE=qwen3.5 \
-EMBEDDING_KEY=model.language_model.embed_tokens.weight \
-REASONING_POLICY=required ENABLE_THINKING=true MAX_LENGTH=2048 \
-CAPTURE_GPUS=0 CAPTURE_TP=1 \
-CONSUMER_GPUS=1,2,3,4,5,6,7 NPROC_PER_NODE=7 \
-bash scripts/gates/run_disaggregated_overfit_gate.sh
+source scripts/gates/_e2e_common.sh
+
+gate_report_tcp_ports python 127.0.0.1 \
+  capture_port 32000 \
+  serving_port 32001 \
+  mooncake_rpc_port 37551 \
+  mooncake_metadata_port 37880 \
+  mooncake_metrics_port 37903
 ```
 
-Mask token, block size, and auxiliary capture layers are read from the draft
-config. The selector rejects rows that violate the requested reasoning policy,
-would be truncated, or have fewer than `2 * block_size` trainable tokens after
-the real tokenizer and preprocessing path. It writes a prompt artifact with the
-exact rendered target suffix; the serving check consumes that artifact rather
-than trying to reconstruct structured reasoning from visible content.
+The check always returns to the shell. If one or more ports are occupied, it
+prints every conflict without stopping or killing the owning processes.
 
-The training stage repeats exactly one selected row for the bounded optimizer
-run and succeeds only when all of these conditions hold:
+## Prepare one sample
 
-- the log reaches exactly `MAX_STEPS`;
-- final loss is at most `MAX_LOSS` (`0.0001` by default);
-- final token accuracy is at least `MIN_ACCURACY` (`1.0` by default);
-- the exact final `training_state.pt` checkpoint exists.
-
-The real-serving stage then exports that checkpoint, launches SGLang with the
-`DFLASH` speculative algorithm, and checks one `/v1/chat/completions` response.
-Request history must contain no `reasoning_content`, per-choice metadata must
-report `spec_accept_length >= block_size`, and generated output (reasoning plus
-visible content) must match at least the first `block_size` target tokens. The
-auditable response, request, server metadata, and prefix counts are written to
-`serving-gate.json`; aggregate server statistics are not accepted in place of
-per-request metadata.
-
-The required environment is `CONFIG`, `TARGET_MODEL_PATH`,
-`DRAFT_CONFIG_PATH`, and `SOURCE_DATA_PATH`. Common controls are:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `WORK_DIR` | Fresh directory for all artifacts; an existing path is rejected | `outputs/<run-id>` |
-| `RUN_ID` | Producer/consumer run ID and checkpoint prefix | timestamped |
-| `MAX_STEPS` | Exact optimizer-step and checkpoint target | `400` |
-| `NPROC_PER_NODE` | Local consumer DP ranks | `1` |
-| `CAPTURE_GPUS`, `CAPTURE_TP`, `CAPTURE_PORT` | Capture server placement and topology | `0`, `1`, `30000` |
-| `CONSUMER_GPUS` | Consumer CUDA devices | `1` |
-| `START_MOONCAKE` | Reuse an external Mooncake endpoint when `false` | `true` |
-| `START_CAPTURE_SERVER` | Reuse an external capture server when `false` | `true` |
-| `RUN_SERVING_GATE` | Chain export and real serving after overfit | `true` |
-| `REASONING_POLICY` | Require, forbid, or allow structured reasoning rows | `allow` |
-| `ENABLE_THINKING` | Preserve thinking mode in the prompt artifact and serving request | `false` |
-| `MAX_LOSS`, `MIN_ACCURACY` | Strict final training thresholds | `0.0001`, `1.0` |
-
-Mooncake addresses, disaggregated store paths, health polling, serving ports,
-GPU placement, and SGLang extra arguments can also be overridden through the
-environment; use `--help` for the primary contract and inspect the named
-variables in the script for deployment-specific tuning.
-
-Use dry-run mode to validate paths and inspect shell-safe command construction
-without creating directories or starting services:
+### Stage 1: train with SpecForge
 
 ```bash
-GATE_DRY_RUN=1 \
-CONFIG=examples/configs/qwen3-8b-domino-disaggregated.yaml \
-TARGET_MODEL_PATH=Qwen/Qwen3-8B \
-DRAFT_CONFIG_PATH=configs/qwen3-8b-domino.json \
-SOURCE_DATA_PATH=./cache/dataset/sharegpt_train.jsonl \
-bash scripts/gates/run_disaggregated_overfit_gate.sh
+export TRAIN_DATA_PATH=/sgl-workspace/perfectblend/full_1.jsonl
+export MODEL_NAME=Qwen3.6-27B
+export SPEC_METHOD=Dspark
+export DRAFT_MODEL_CONFIG=configs/qwen3.6-27b-dspark.json
+export MODEL=Qwen/Qwen3.6-27B
+
+specforge train \
+  --config examples/configs/qwen3.6-27b-dspark-disaggregated.yaml \
+  model.target_model_path=${MODEL} \
+  model.draft_model_config=${DRAFT_MODEL_CONFIG} \
+  model.sglang_context_length=4200 \
+  data.train_data_path=${TRAIN_DATA_PATH} \
+  data.max_prompts=1 \
+  data.max_length=4096 \
+  data.chat_template=qwen3.5 \
+  training.num_epochs=600 \
+  training.max_steps=600 \
+  training.total_steps=600 \
+  training.batch_size=1 \
+  training.accumulation_steps=1 \
+  training.eval_interval=0 \
+  training.save_interval=600 \
+  training.log_interval=1 \
+  deployment.trainer.nproc_per_node=1 \
+  deployment.disaggregated.control_dir=outputs/${MODEL_NAME}-${SPEC_METHOD}-one-sample/control \
+  deployment.disaggregated.consumer_state_dir=outputs/${MODEL_NAME}-${SPEC_METHOD}-one-sample/consumer-state \
+  'deployment.disaggregated.managed_local.trainer_cuda_visible_devices=["1"]' \
+  'deployment.disaggregated.managed_local.capture_servers=[{"port":32000,"cuda_visible_devices":["0"],"tp_size":1,"mem_fraction_static":0.7}]' \
+  deployment.disaggregated.managed_local.mooncake.rpc_port=37551 \
+  deployment.disaggregated.managed_local.mooncake.metadata_port=37880 \
+  deployment.disaggregated.managed_local.mooncake.metrics_port=37903 \
+  tracking.report_to=none \
+  runtime.in_flight_high_watermark=64 \
+  runtime.in_flight_low_watermark=32 \
+  runtime.producer_lease=1 \
+  run_id=${MODEL_NAME}-${SPEC_METHOD}-one-sample \
+  output_dir=outputs/${MODEL_NAME}-${SPEC_METHOD}-one-sample/consumer \
+  model.embedding_key="model.language_model.embed_tokens.weight" \
+  model.mask_token_id=248070
+```
+<span style="color: red;"><strong>Note:</strong></span>The training data must be inferenced by the target model use temperature=0 and corresponding thinking mode.</span>
+This single command owns Mooncake, the SGLang capture server, the producer, and
+the trainer. It also assigns the capture server to GPU 0 and the trainer to GPU
+1 from the typed configuration.
+
+After step 600, the checkpoint should be:
+
+```text
+outputs/${MODEL_NAME}-${SPEC_METHOD}-one-sample/consumer/${MODEL_NAME}-${SPEC_METHOD}-one-sample-step600
 ```
 
-## Standalone real DFLASH serving gate
+The `control` and `consumer-state` directories must be fresh. To repeat the
+experiment, use a new suffix consistently in `run_id`, `output_dir`,
+`control_dir`, `consumer_state_dir`, and the sample paths.
 
-An existing DFlash-family checkpoint and prompt artifact can be gated
-independently:
+### Stage 2: serve with SGLang and check accept length
+
+First export the trained draft:
 
 ```bash
-CHECKPOINT_PATH=./outputs/run/run-step400 \
-TARGET_MODEL_PATH=Qwen/Qwen3-8B \
-DRAFT_CONFIG_PATH=configs/qwen3-8b-domino.json \
-PROMPT_ARTIFACT_PATH=./outputs/run/prompt.json \
-SERVING_GPUS=0 \
-bash scripts/gates/run_dflash_serving_gate.sh
+# Export the draft model to HF format
+specforge export \
+  --to hf \
+  --checkpoint outputs/${MODEL_NAME}-${SPEC_METHOD}-one-sample/consumer/${MODEL_NAME}-${SPEC_METHOD}-one-sample-step600 \
+  --draft-config ${DRAFT_MODEL_CONFIG} \
+  --output-dir outputs/${MODEL_NAME}-${SPEC_METHOD}-one-sample/draft_hf \
+  --embedding-source ${MODEL} \
+  --embedding-key model.language_model.embed_tokens.weight
+
+# Normalize the config
+python scripts/gates/normalize_dflash_export.py \
+  --config outputs/${MODEL_NAME}-${SPEC_METHOD}-one-sample/draft_hf/config.json \
+  --block-size 16
 ```
 
-This orchestration owns unified export, export-config normalization, SGLang
-launch and health checking, strict endpoint validation, and cleanup. Set
-`GATE_DRY_RUN=1` to print the export, server, and checker commands without side
-effects.
+The normalizer preserves DFlash/Domino exports as ``DFlashDraftModel``. For a
+DSpark export it selects SGLang's ``Qwen3DSparkModel`` architecture and promotes
+the Markov/confidence settings required by the SGLang loader to the top level.
 
-## Reusable leaf checks
+Start SGLang in the first terminal:
 
-`select_overfit_sample.py`, `check_overfit_metrics.py`, and
-`run_dflash_chat_serving_gate.py` remain dependency-light leaf helpers for
-targeted debugging. The chat checker itself does not manage services; the two
-shell orchestrators above own service launch, health checks, and cleanup.
+```bash
+python -m sglang.launch_server \
+  --model-path ${MODEL} \
+  --served-model-name ${MODEL_NAME}-${SPEC_METHOD}-overfit \
+  --tp-size 1 \
+  --dtype bfloat16 \
+  --attention-backend triton \
+  --context-length 2100 \
+  --max-running-requests 1 \
+  --max-total-tokens 1024 \
+  --chunked-prefill-size -1 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --trust-remote-code \
+  --port 32001 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path outputs/${MODEL_NAME}-${SPEC_METHOD}-one-sample/draft_hf \
+  --reasoning-parser qwen3
+```
+
+After SGLang is ready, run the validation in a second terminal:
+
+```bash
+
+python scripts/gates/run_dflash_chat_serving_gate.py \
+  --server-url http://127.0.0.1:32001 \
+  --model-path ${MODEL} \
+  --served-model ${MODEL_NAME}-${SPEC_METHOD}-overfit \
+  --data-path ${TRAIN_DATA_PATH} \
+  --output-path outputs/${MODEL_NAME}-${SPEC_METHOD}-one-sample/serving-gate.json \
+  --enable-thinking \
+  --system-prompt "" \
+  --block-size 16 \
+  --max-tokens 16
+```
+
+The terminal prints a concise summary. The complete request, SGLang response,
+and server information remain in `serving-gate.json`; add `--verbose` only when
+the full result is needed in the terminal.
+
+The validation passes only when the result contains:
+
+```json
+{
+  "passed": true,
+  "input_format": "training_jsonl",
+  "spec_accept_length": 16.0,
+  "target_prefix_match_tokens": 16,
+  "generated_tokens": 16,
+  "target_tokens": 59,
+  "clean_block_tokens": 16,
+  "errors": [],
+  "result_path": ""
+}
+```
+
+`spec_accept_length >= 16` and `target_prefix_match_tokens >= 16` mean that the
+complete DFlash block was accepted and agrees with the target continuation.
+Stop the SGLang server with `Ctrl-C` after validation.

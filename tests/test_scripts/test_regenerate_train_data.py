@@ -30,7 +30,7 @@ class TestRegenerateTrainData(unittest.TestCase):
         """,
             disable_proxy=True,
             enable_hf_mirror=False,
-            sglang_use_modelscope=True,
+            sglang_use_modelscope=False,
             start_new_session=True,
         )
         try:

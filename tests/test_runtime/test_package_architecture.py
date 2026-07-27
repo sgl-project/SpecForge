@@ -136,11 +136,11 @@ OPERATIONAL_EXAMPLE_REPLACEMENTS = {
         "examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml",
     ),
     "examples/disagg/run_domino_dflash_serving_gate.sh": (
-        "scripts/gates/run_dflash_serving_gate.sh",
+        "scripts/gates/README.md",
+        "scripts/gates/normalize_dflash_export.py",
+        "scripts/gates/run_dflash_chat_serving_gate.py",
     ),
-    "examples/disagg/run_domino_disagg_overfit_gate.sh": (
-        "scripts/gates/run_disaggregated_overfit_gate.sh",
-    ),
+    "examples/disagg/run_domino_disagg_overfit_gate.sh": ("scripts/gates/README.md",),
 }
 
 REMOVED_PACKAGE_DIRECTORIES = (
@@ -715,6 +715,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "inkling-dspark.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
+                "qwen3.6-27b-dspark.json",
             },
         )
         for name, payload in dspark_configs.items():
