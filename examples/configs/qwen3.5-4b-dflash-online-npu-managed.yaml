@@ -42,13 +42,16 @@ deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 7
+    nproc_per_node: 14
   disaggregated:
     control_dir: outputs/qwen3.5-4b-dflash-npu-managed/control
     consumer_state_dir: outputs/qwen3.5-4b-dflash-npu-managed/consumer-state
     backend: mooncake
     managed_local:
-      trainer_cuda_visible_devices: ["1", "2", "3", "4", "5", "6", "7"]
+      # 16-card A3 layout: capture server owns device 0, trainer owns 2-15.
+      # On 8-card hosts use devices 1-7 with trainer.nproc_per_node: 7.
+      trainer_cuda_visible_devices:
+        ["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]
       mooncake:
         # Host segment mounted by the capture-server sink for feature storage.
         # 16 GiB fits a 64GB-card host next to the target model and KV cache.
