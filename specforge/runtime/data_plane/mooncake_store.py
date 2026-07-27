@@ -719,8 +719,8 @@ class MooncakeFeatureStore(FeatureStore):
     def drain_pending_removals(
         self,
         *,
-        max_attempts: int = 8,
-        retry_interval_s: float = 0.25,
+        max_attempts: int = 40,
+        retry_interval_s: float = 0.5,
         sleep: Callable[[float], None] = time.sleep,
     ) -> Dict[str, int]:
         """Retry deferred removes at lifecycle shutdown or fail loudly.
