@@ -66,7 +66,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.5-35b-a3b-eagle3-offline.yaml": 4,
     "qwen3.5-35b-a3b-eagle3-online.yaml": 2,
     "qwen3.5-4b-dflash-online-npu.yaml": 8,
-    "qwen3.5-4b-dflash-online-npu-managed.yaml": 14,
+    "qwen3.5-4b-dflash-disaggregated-npu.yaml": 14,
     "qwen3.5-4b-domino-online-npu.yaml": 8,
     "qwen3.6-27b-dflash-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml": 2,
@@ -226,7 +226,7 @@ EXPECTED_DISAGGREGATED = {
         "server_urls": ["http://127.0.0.1:30000"],
         **LOCAL_MOONCAKE_ENDPOINTS,
     },
-    "qwen3.5-4b-dflash-online-npu-managed.yaml": {
+    "qwen3.5-4b-dflash-disaggregated-npu.yaml": {
         "control_dir": "outputs/qwen3.5-4b-dflash-npu-managed/control",
         "consumer_state_dir": "outputs/qwen3.5-4b-dflash-npu-managed/consumer-state",
         "backend": "mooncake",

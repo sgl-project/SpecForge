@@ -209,7 +209,7 @@ devices 2–15 of a 16-card A3 node (8-card hosts: devices 1–7, 7 ranks) — i
 
 ```bash
 specforge train -c \
-  examples/configs/qwen3.5-4b-dflash-online-npu-managed.yaml
+  examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml
 ```
 
 ## Split pools and multi-node consumers

@@ -43,13 +43,13 @@ The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-multiserver-disaggregated.yaml`,
 `qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml`,
 `qwen3.6-27b-dflash-multiserver-disaggregated.yaml`, and
-`qwen3.5-4b-dflash-online-npu-managed.yaml` recipes are opt-in local
+`qwen3.5-4b-dflash-disaggregated-npu.yaml` recipes are opt-in local
 full-stack examples. Their typed `managed_local` blocks own Mooncake, one or
 two patched SGLang capture servers, and the trainer GPU allocation; the same
 `specforge train -c ...` command starts and cleans up each complete stack.
 On Ascend NPU hosts device ordinals are injected via
 `ASCEND_RT_VISIBLE_DEVICES` (see
-`qwen3.5-4b-dflash-online-npu-managed.yaml`). Disaggregated recipes without
+`qwen3.5-4b-dflash-disaggregated-npu.yaml`). Disaggregated recipes without
 `managed_local` keep Mooncake and SGLang external for scheduler- or
 service-managed deployments.
 
