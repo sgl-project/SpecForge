@@ -173,54 +173,49 @@ SpecForge began with a strong focus on EAGLE3. The current release turns the run
 
 
 ## Draft Model Performance
+We have use lateset Specforge to train these draft models: [Qwen3.6-27B-Domino](https://huggingface.co/Huang2020/qwen3.6-27B-domino)、[GLM-5.2-Dspark]()、[Kimi-K3-Dspark]() and so on. The partial models' performance are listed Below.
 
-> **This section is intentionally left as a publication-ready template.** We will replace the placeholders below after the final trained-model measurements are provided. No model-quality or serving numbers are inferred from the preliminary 10% training-throughput result above.
+### Qwen3.6-27B-Domino（2 x A100）:
+#### 1. Concurrency = 1
+| Dataset | AR | MTP-S3 | MTP-S7 | DFlash-B8 | DFlash-B16 | Domino-B8 | Domino-B16 |
+  |:--|--:|--:|--:|--:|--:|--:|--:|
+  | GSM8K | 1.00× | 2.68× | 3.22× | 3.79× | 4.25× | 4.36× | <font color="red"><b>5.25×</b></font> |
+  | MATH500 | 1.00× | 2.80× | 3.55× | 4.29× | 5.07× | 4.60× | <font color="red"><b>5.72×</b></font> |
+  | HumanEval | 1.00× | 2.65× | 3.18× | 3.98× | 4.47× | 4.20× | <font color="red"><b>4.98×</b></font> |
+  | MBPP | 1.00× | 2.57× | 2.98× | 3.73× | 3.91× | 3.97× | <font color="red"><b>4.49×</b></font> |
+  | MT-Bench | 1.00× | 2.44× | 2.65× | 3.00× | 3.05× | 3.31× | <font color="red"><b>3.44×</b></font> |
+  | Alpaca | 1.00× | 2.38× | 2.54× | 2.87× | 2.84× | 3.18× | <font color="red"><b>3.34×</b></font> |
 
-### Evaluation setup
+#### 2. Concurrency = 32
+  | Dataset | AR | MTP-S3 | MTP-S7 | DFlash-B8 | DFlash-B16 | Domino-B8 | Domino-B16 |
+  |:--|--:|--:|--:|--:|--:|--:|--:|
+  | GSM8K | 1.00× | 1.80× | 1.73× | 1.86× | 1.41× | <font color="red"><b>2.11×</b></font> | 1.82× |
+  | MATH500 | 1.00× | 1.90× | 1.86× | 1.99× | 1.54× | <font color="red"><b>2.10×</b></font> | 1.78× |
+  | HumanEval | 1.00× | 1.78× | 1.69× | 1.88× | 1.42× | <font color="red"><b>1.97×</b></font> | 1.62× |
+  | MBPP | 1.00× | 1.72× | 1.57× | <font color="red"><b>1.73×</b></font> | 1.33× | 1.68× | 1.46× |
+  | MT-Bench | 1.00× | <font color="red"><b>1.56×</b></font> | 1.32× | 1.35× | 0.94× | 1.48× | 1.06× |
+  | Alpaca | 1.00× | <font color="red"><b>1.76×</b></font> | 1.43× | 1.43× | 1.00× | 1.67× | 1.13× |
 
-| Item | Value |
-| --- | --- |
-| Target model(s) | **[TBD]** |
-| Draft method and checkpoint(s) | **[TBD]** |
-| Training dataset and sample count | **[TBD]** |
-| Evaluation datasets | **[TBD]** |
-| Hardware and GPU count | **[TBD]** |
-| SGLang and SpecForge commits | **[TBD]** |
-| Precision / quantization | **[TBD]** |
-| Batch size / concurrency | **[TBD]** |
-| Speculative decoding parameters | **[TBD]** |
 
-### Draft-model quality
+### GLM5.2（）:
 
-| Target model | Draft method | Benchmark | Average accepted length |
-| --- | --- | --- | ---: |
-| **[TBD]** | **[TBD]** | **[TBD]** | **[TBD]** |
 
-### End-to-end serving performance
+## How to verify your draft training is true?
 
-| Benchmark | Batch | Target-only | DFlash | **[Method]** | **[Method] / DFlash** |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **[TBD]** | **[TBD]** | **[TBD]** | **[TBD]** | **[TBD]** | **[TBD]** |
-
-For the final comparison, we will report both acceptance metrics and end-to-end serving throughput. Acceptance alone does not include draft overhead, while throughput alone can hide differences in concurrency, sequence lengths, and speculative parameters. Reporting both makes the trade-off visible and the result reproducible.
 
 
 ## What's next
 
 This release changes the unit of scaling in SpecForge. A run is no longer a trainer process that happens to contain a target model; it is a coordinated pipeline whose inference capacity, storage, and optimization capacity can be sized independently.
 
-Our next steps are to publish the full checkpoint evaluation above, add more reproducible topology studies, and continue expanding the algorithm and model catalog. We are especially interested in how different drafting families shift the optimal server-to-trainer ratio—and how the runtime can adapt that ratio automatically as workloads change.
+Our next steps are to publish the more draft models of popular models above, and continue expanding the algorithm and model catalog. Besides, we will conduct testing and adaptation across various hardware platforms, including but not limited to AMD and Ascend.
 
 ## Acknowledgements
 
-We thank the SGLang and SpecForge communities, the authors of the supported speculative decoding methods, and all contributors who helped test the new runtime and algorithm integrations. **[Add release-specific contributors, partner teams, and infrastructure acknowledgements before publication.]**
+We thank the SGLang and SpecForge communities, the authors of the supported speculative decoding methods, and all contributors who helped test the new runtime and algorithm integrations. 
 
-## References
+**SpecForge Team**: Jiaping Wang, Shenggui Li, Xiaoming Dong,
 
-1. SpecForge Team. [SpecForge: A Flexible and Efficient Open-Source Training Framework for Speculative Decoding](https://arxiv.org/abs/2603.18567), 2026.
-2. Yuhui Li et al. [EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test](https://arxiv.org/abs/2503.01840), 2025.
-3. Mude Hui et al. [P-EAGLE: Parallel-Drafting EAGLE with Scalable Training](https://arxiv.org/abs/2602.01469), 2026.
-4. Jian Chen et al. [DFlash: Block Diffusion for Flash Speculative Decoding](https://arxiv.org/abs/2602.06036), 2026.
-5. Tianyu Wu et al. [D-PACE: Dynamic Position-Aware Cross-Entropy for Parallel Speculative Drafting](https://arxiv.org/abs/2605.18810), 2026.
-6. Jianuo Huang et al. [Domino: Decoupling Causal Modeling from Autoregressive Drafting in Speculative Decoding](https://arxiv.org/abs/2605.29707), 2026.
-7. Xin Cheng et al. [DSpark: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation](https://arxiv.org/abs/2607.05147), 2026.
+**Radixark Team**: Cheng Mao,
+
+**Domino**: Jianuo, Huang
