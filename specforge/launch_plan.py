@@ -78,12 +78,12 @@ def _redacted(value: str) -> str:
     return f"{name}={raw}" if name is not None else raw
 
 
-def _redacted_env(values: Mapping[str, str]) -> dict[str, str]:
+def _redacted_env(values: Mapping[str, Optional[str]]) -> dict[str, Optional[str]]:
     return {
         name: (
             "<redacted>"
             if any(fragment in name.lower() for fragment in _SECRET_NAMES)
-            else _redacted(value)
+            else (_redacted(value) if value is not None else None)
         )
         for name, value in sorted(values.items())
     }
@@ -93,7 +93,10 @@ def _redacted_env(values: Mapping[str, str]) -> dict[str, str]:
 class CommandSpec:
     label: str
     argv: tuple[str, ...]
-    env: Mapping[str, str] = field(default_factory=dict)
+    #: Child environment overrides. A None value removes the variable from
+    #: the inherited environment (e.g. Ascend rejects an empty
+    #: ASCEND_RT_VISIBLE_DEVICES, so hiding devices must unset the variable).
+    env: Mapping[str, Optional[str]] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -383,6 +386,16 @@ def _device_visibility_env_var() -> str:
     return "CUDA_VISIBLE_DEVICES"
 
 
+def _hidden_devices_env_value(visibility_env: str) -> Optional[str]:
+    """Env value that hides accelerators from a managed child process.
+
+    CUDA hides devices with an empty list; the Ascend driver rejects an
+    empty ``ASCEND_RT_VISIBLE_DEVICES``, so the variable must be unset
+    (``None``, removed by ``_spawn_command``) instead.
+    """
+    return "" if visibility_env == "CUDA_VISIBLE_DEVICES" else None
+
+
 def _sglang_argv(
     model: ModelConfig,
     *,
@@ -442,7 +455,7 @@ def _managed_local_services(
                 f"--http_metadata_server_port={mooncake.metadata_port}",
                 f"--metrics_port={mooncake.metrics_port}",
             ),
-            {visibility_env: ""},
+            {visibility_env: _hidden_devices_env_value(visibility_env)},
         ),
         readiness=ReadinessSpec(
             "mooncake",
@@ -753,7 +766,7 @@ def build_launch_plan(
         if managed_local is not None:
             visibility_env = _device_visibility_env_var()
             producer_env.update(managed_environment)
-            producer_env[visibility_env] = ""
+            producer_env[visibility_env] = _hidden_devices_env_value(visibility_env)
             producer_env[_MANAGED_CHILD_ENV] = "1"
             consumer_env.update(managed_environment)
             consumer_env[visibility_env] = ",".join(
@@ -1027,7 +1040,12 @@ def _spawn_command(
     stderr=None,
 ) -> subprocess.Popen:
     child_env = os.environ.copy()
-    child_env.update(command.env)
+    child_env.update(
+        {key: value for key, value in command.env.items() if value is not None}
+    )
+    for key, value in command.env.items():
+        if value is None:
+            child_env.pop(key, None)
     kwargs = {"env": child_env, "start_new_session": True}
     if stdout is not None:
         kwargs["stdout"] = stdout

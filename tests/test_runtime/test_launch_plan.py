@@ -703,7 +703,9 @@ class LaunchPlanTest(unittest.TestCase):
                 )
 
         mooncake_env = plan.services[0].command.env
-        self.assertEqual(mooncake_env["ASCEND_RT_VISIBLE_DEVICES"], "")
+        # Ascend rejects an empty ASCEND_RT_VISIBLE_DEVICES, so hiding
+        # devices must unset the variable (None) rather than set "".
+        self.assertIsNone(mooncake_env["ASCEND_RT_VISIBLE_DEVICES"])
         self.assertNotIn("CUDA_VISIBLE_DEVICES", mooncake_env)
         server_env = plan.services[1].command.env
         self.assertEqual(server_env["ASCEND_RT_VISIBLE_DEVICES"], "0,1")
@@ -712,7 +714,7 @@ class LaunchPlanTest(unittest.TestCase):
         # No explicit backend and the default flashinfer -> Ascend fallback.
         self.assertEqual(argv[argv.index("--attention-backend") + 1], "ascend")
         producer, consumer = plan.commands
-        self.assertEqual(producer.env["ASCEND_RT_VISIBLE_DEVICES"], "")
+        self.assertIsNone(producer.env["ASCEND_RT_VISIBLE_DEVICES"])
         self.assertEqual(consumer.env["ASCEND_RT_VISIBLE_DEVICES"], "4,5")
         self.assertNotIn("CUDA_VISIBLE_DEVICES", producer.env)
         self.assertNotIn("CUDA_VISIBLE_DEVICES", consumer.env)
@@ -739,6 +741,36 @@ class LaunchPlanTest(unittest.TestCase):
             mock.patch("importlib.util.find_spec", return_value=None),
         ):
             self.assertEqual(_device_visibility_env_var(), "CUDA_VISIBLE_DEVICES")
+
+    def test_hidden_devices_env_value(self):
+        from specforge.launch_plan import _hidden_devices_env_value
+
+        self.assertEqual(_hidden_devices_env_value("CUDA_VISIBLE_DEVICES"), "")
+        self.assertIsNone(_hidden_devices_env_value("ASCEND_RT_VISIBLE_DEVICES"))
+
+    def test_spawn_command_unsets_none_env_values(self):
+        from specforge.launch_plan import CommandSpec, _spawn_command
+
+        captured = {}
+
+        def fake_popen(argv, **kwargs):
+            captured["env"] = kwargs["env"]
+            return object()
+
+        with mock.patch.dict(
+            os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "0,1", "KEEP_ME": "1"}
+        ):
+            _spawn_command(
+                CommandSpec(
+                    "child",
+                    ("true",),
+                    {"ASCEND_RT_VISIBLE_DEVICES": None, "EXTRA": "x"},
+                ),
+                popen=fake_popen,
+            )
+        self.assertNotIn("ASCEND_RT_VISIBLE_DEVICES", captured["env"])
+        self.assertEqual(captured["env"]["KEEP_ME"], "1")
+        self.assertEqual(captured["env"]["EXTRA"], "x")
 
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (
