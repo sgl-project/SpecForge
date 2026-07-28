@@ -360,18 +360,29 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
         return sample(draft_logits)
 
+    def encode_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """Project captured target layers into the draft attention width.
+
+        Offline USP gathers this lower-width representation instead of the
+        concatenated capture tensor.  Keeping the projection here preserves the
+        same parameters and numerics as the ordinary DFlash forward path.
+        """
+        return self.hidden_norm(self.fc(target_hidden))
+
     def forward(
         self,
         position_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
+        target_hidden_is_projected: bool = False,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
+        if not target_hidden_is_projected:
+            target_hidden = self.encode_target_hidden(target_hidden)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(

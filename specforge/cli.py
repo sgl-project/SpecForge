@@ -134,6 +134,12 @@ def _train(resolved) -> int:
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
+        # DSpark USP uses the typed draft-SP mesh plus HCCL collectives; it
+        # intentionally does not import CUDA-only yunchang Flash Attention.
+        enable_sequence_parallel=not (
+            cfg.training.strategy == "dspark"
+            and cfg.training.attention_backend == "usp"
+        ),
     )
     try:
         import torch.distributed as dist
