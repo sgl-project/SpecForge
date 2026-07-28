@@ -4,15 +4,20 @@
 
 When we first released [SpecForge](https://www.lmsys.org/blog/2025-07-25-spec-forge/), a training job owned both the frozen target model and the draft model being optimized. This made EAGLE3 draft-model training practical and directly compatible with SGLang, but it also tied two very different workloads to the same process lifecycle and resource topology.
 
-The new SpecForge introduces a clean boundary between **target-feature production** and **draft-model optimization**. Patched SGLang servers generate tokens and capture target features; SpecForge trainers consume those features through lightweight references backed by Mooncake.
+The new SpecForge introduces a clean boundary between **target-feature production** and **draft-model optimization**. Patched SGLang servers capture target features over the training conversations; SpecForge trainers consume those features through lightweight references backed by Mooncake.
 
-This one architectural change has two important consequences. First, inference and training capacity can be configured and deployed independently. Second, different speculative-drafting algorithms can reuse the same scheduling, dataflow, distributed-training, checkpointing, and failure-handling runtime. EAGLE3, EAGLE3.1, P-EAGLE, DFlash, Domino, and DSpark now share one typed configuration and one public training entry point.
+This one architectural change has two important consequences:
+
+- **Inference and training capacity can be configured and deployed independently.** On the same 8×H20 budget, moving Qwen3-8B Domino training to a three-server, five-trainer split improved end-to-end training throughput by approximately 10% over the previous colocated implementation.
+- **Different speculative-drafting algorithms can reuse the same runtime** — the same scheduling, dataflow, distributed training, checkpointing, and failure handling. EAGLE3, EAGLE3.1, P-EAGLE, DFlash, Domino, and DSpark now share one typed configuration and one public training entry point.
+
+This release also ships a training-serving consistency gate that verifies capture, training, export, and SGLang serving agree on a controlled example — a fast correctness check before investing in a full training run.
 
 ## From a Coupled Trainer to a Training Pipeline
 
 Online draft-model training contains two distinct workloads:
 
-- The **target side** runs a large, frozen model to generate tokens and capture hidden states. It is inference-heavy, often uses tensor parallelism, and benefits from a production inference engine.
+- The **target side** runs a large, frozen model over training conversations to capture hidden states. It is inference-heavy, often uses tensor parallelism, and benefits from a production inference engine.
 - The **draft side** trains a much smaller model with forward and backward passes. It scales through data or sequence parallelism and has a different memory and compute profile.
 
 In the previous colocated design, both sides shared one lifecycle and one fixed resource layout. This created three practical limitations:
@@ -34,6 +39,8 @@ The new online runtime has a producer pool and a consumer pool. Producers schedu
 ### 1. The capture contract
 
 Every URL in `deployment.disaggregated.server_urls` creates a rollout worker connected to a patched SGLang server. Workers lease disjoint prompts from a shared controller, so capture capacity can change without changing the trainer topology.
+
+The capture support is a small patch on top of the pinned `sglang==0.5.14`: [`patches/sglang/v0.5.14/spec-capture.patch`](https://github.com/sgl-project/SpecForge/blob/main/patches/sglang/v0.5.14/spec-capture.patch) adds an `--enable-spec-capture` flag and a server-side sink that writes captured tensors directly into Mooncake using the feature store's key layout. A capture server is a stock SGLang server with this patch applied.
 
 This creates a clear ownership boundary: SGLang owns target-model parallelism and feature capture, while SpecForge owns prompt scheduling, reference publication, and draft-model optimization.
 
@@ -119,7 +126,11 @@ Online and offline describe where target features come from. Local and disaggreg
 
 Every online run uses the producer/consumer topology; the trainer never initializes a colocated target model. Offline EAGLE3, DFlash, Domino, and DSpark training can run locally or with separate ingestion and consumer pools. P-EAGLE currently supports online training only.
 
-See the [training guide](../docs/basic_usage/training.md) for the complete strategy matrix and the [disaggregated training guide](../docs/basic_usage/disaggregated_training.md) for deployment details.
+### Feature source is not data policy
+
+One further distinction matters in practice. Capture servers execute a full prefill over the conversations you provide and never generate the training responses, so online capture does not choose whose text the draft learns from — the dataset does. This choice matters more than any topology decision: when dataset responses were written by humans or by a different model, the draft learns to continue text the target itself would rarely produce, and acceptance saturates well below what the same draft reaches on target-generated data. In our training runs, regenerating dataset responses with the target model — greedily, in the reasoning mode that will be served — has been the single largest lever on final acceptance. We recommend target-generated data for every strategy. The consistency gate described below rests on the same property: its serving stage can only pass when the trained sample is text the target reproduces at temperature 0.
+
+See the [training guide](https://github.com/sgl-project/SpecForge/blob/main/docs/basic_usage/training.md) for the complete strategy matrix and the [disaggregated training guide](https://github.com/sgl-project/SpecForge/blob/main/docs/basic_usage/disaggregated_training.md) for deployment details.
 
 ## One Configuration, One Entry Point
 
@@ -160,7 +171,7 @@ specforge train --config run.yaml --role producer
 specforge train --config run.yaml --role consumer
 ```
 
-There are no method-specific Python training entry points. Full, runnable configurations are available under [`examples/configs`](../examples/configs/).
+There are no method-specific Python training entry points. Full, runnable configurations are available under [`examples/configs`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs).
 
 ## Draft-Model Serving Performance
 
@@ -198,7 +209,7 @@ At concurrency 32, the optimal configuration depends on the workload. Domino-B8 
 
 Model-quality benchmarks and correctness gates serve different purposes. A benchmark measures generalization; a gate checks that training, export, and serving implement the same algorithmic contract.
 
-SpecForge provides an end-to-end [training and serving gate](../scripts/gates/README.md) for DFlash-family models, including Domino. It performs three stages:
+SpecForge provides an end-to-end [training and serving gate](https://github.com/sgl-project/SpecForge/blob/main/scripts/gates/README.md) for DFlash-family models, including Domino. It performs three stages:
 
 1. **Select a valid sample.** The gate checks the target chat template, reasoning mode, tokenizer behavior, sequence length, and minimum trainable suffix before producing an auditable prompt artifact.
 2. **Overfit through the public training path.** It repeats that sample for a bounded run launched through `specforge train`, then requires the configured loss and token-accuracy thresholds and the exact final checkpoint.
