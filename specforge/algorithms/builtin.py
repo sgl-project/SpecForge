@@ -14,9 +14,7 @@ from specforge.algorithms.registry import AlgorithmRegistry
 def builtin_algorithm_registry() -> AlgorithmRegistry:
     """Return a fresh immutable catalog without module-level mutation."""
 
-    return AlgorithmRegistry(
-        (eagle3(), peagle(), dflash(), domino(), dspark(), mtp())
-    )
+    return AlgorithmRegistry((eagle3(), peagle(), dflash(), domino(), dspark(), mtp()))
 
 
 __all__ = ["builtin_algorithm_registry"]
