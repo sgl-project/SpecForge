@@ -433,10 +433,14 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
+        # Multimodal capture additionally stores server-produced mRoPE
+        # position ids (B, S, 3); text runs do not carry the tensor at all.
+        position_ids = t.get("position_ids")
         loss, accuracy, model_metrics = self.dflash_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
+            position_ids=None if position_ids is None else position_ids.to(device),
         )
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:

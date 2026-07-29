@@ -141,12 +141,19 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertIsNone(policy.target_defaults)
                 self.assertIsNone(policy.apply_overrides)
 
-    def test_vlm_is_not_registered_as_a_builtin(self):
+    def test_builtin_modalities_are_pinned_per_algorithm(self):
+        expected = {
+            "dflash": {"text", "multimodal"},
+            "domino": {"text"},
+            "dspark": {"text"},
+            "eagle3": {"text"},
+            "peagle": {"text"},
+        }
         for registration in self.registry:
             modalities = {
                 contract.modality for contract in registration.spec.feature_contracts
             }
-            self.assertEqual({"text"}, modalities, registration.name)
+            self.assertEqual(expected[registration.name], modalities, registration.name)
 
     def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
         training = SimpleNamespace(

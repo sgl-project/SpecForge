@@ -146,7 +146,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 62)
+        self.assertEqual(len(paths), 63)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths
@@ -199,7 +199,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             with self.subTest(config=filename, contract="server-only online"):
                 self.assertEqual(config.deployment.mode, "disaggregated")
                 self.assertEqual(config.model.target_backend, "sglang")
-                self.assertEqual(config.model.input_modality, "text")
+                self.assertIn(config.model.input_modality, {"text", "multimodal"})
 
     def test_compact_teacher_reaches_the_eagle3_step_provider(self):
         cfg = Config.model_validate(

@@ -36,7 +36,10 @@ The filename is the index: `*-online.yaml` performs SGLang server capture while
 training, `*-offline.yaml` consumes precomputed features, and
 `*-disaggregated.yaml` highlights a producer/consumer topology. Every online
 recipe is disaggregated even when its historical filename only says `online`.
-VLM training is not supported, so the catalog contains text-only recipes.
+Multimodal (image+text) training is supported for `training.strategy=dflash`
+via `model.input_modality: multimodal` (see
+`qwen3.5-4b-vl-dflash-disaggregated.yaml`); the remaining catalog is
+text-only.
 
 The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
@@ -143,7 +146,7 @@ should make their training strategy and topology explicit.
 | `model.draft_num_hidden_layers` | `null` | Positive fresh-architecture override where the strategy permits it. EAGLE3 remains one layer; P-EAGLE and DFlash may override their generated defaults. |
 | `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
 | `model.target_backend` | `sglang` | `sglang` is the only accepted value; retired `hf`/`custom` names fail at config load. Offline feature consumers do not instantiate a target inference backend. |
-| `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
+| `model.input_modality` | `text` | The provider modality. Built-ins support `text`; DFlash additionally supports `multimodal` (image+text server capture). Other identifiers are rejected at application resolution. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the server-only online path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
@@ -409,9 +412,12 @@ unless tuning throughput or memory pressure.
   `sp_ulysses_size * sp_ring_size > 1`. Non-USP runs keep both SP sizes at 1.
 - P-EAGLE reuses the EAGLE3 server feature schema, uses `flex_attention`, and
   requires batch size 1.
-- VLM training, including Qwen2.5-VL, is not supported. Online capture accepts
-  text inputs only.
 - `training.compact_teacher` is offline text EAGLE3 only.
+- Multimodal (image+text) training requires `training.strategy=dflash` with
+  `model.input_modality: multimodal`, a VLM draft config
+  (`configs/*-dflash-vlm-*.json`), and the v0.5.14 spec-capture patch with the
+  `position_ids` artifact. Vendor modalities such as `qwen2_5_vl` remain
+  unsupported.
 - Online evaluation is not supported. Offline `data.eval_hidden_states_path`
   and `training.eval_interval` must be configured together.
 
