@@ -34,9 +34,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("_decompress_spec_capture_reqs", patch)
         self.assertIn("SpecForge capture IPC send complete", patch)
         self.assertIn("SpecForge capture IPC receive", patch)
-        self.assertIn(
-            "if batch.return_logprob or batch.return_hidden_states:", patch
-        )
+        self.assertIn("if batch.return_logprob or batch.return_hidden_states:", patch)
         self.assertEqual(
             patch.count("capture_len=extend_input_len_per_req[i]"),
             2,

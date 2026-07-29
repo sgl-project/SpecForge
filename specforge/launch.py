@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, List, Mapping, Optional
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.runtime.contracts import SampleRef
