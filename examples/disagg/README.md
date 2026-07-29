@@ -90,6 +90,28 @@ The consumer's SQLite/WAL and rank inboxes default to the trainer-node-local
 `DISAGG_CONSUMER_STATE_DIR` or `LOCAL_SCRATCH` when `/tmp` is unsuitable.
 Node-local consumer state currently supports one trainer node only.
 
+For the GLM-5.2 DSpark 120K recipe, use TP8 on the target node and USP8/FSDP
+on the trainer node. H200 needs a lower SGLang static-memory fraction than the
+Qwen default so decode-graph capture and the long-context feature payload both
+retain headroom:
+
+```bash
+export CONFIG=examples/configs/glm-5.2-dspark-online-120k-usp.yaml
+export TARGET_MODEL_PATH=zai-org/GLM-5.2-FP8
+export SERVER_GPUS=0,1,2,3,4,5,6,7 SERVER_TP=8
+export SERVER_MEM_FRACTION=0.75
+export SERVER_CUDA_GRAPH_MAX_BS_DECODE=16
+export CAPTURE_LAYER_IDS="1 19 38 57 76"
+export TRAINER_GPUS=0,1,2,3,4,5,6,7 TRAINER_NPROC=8
+export MOONCAKE_GLOBAL_SEGMENT_SIZE=137438953472
+export MOONCAKE_DEFAULT_KV_LEASE_TTL=600000
+```
+
+Then invoke `run_qwen3_8b_dflash_disagg_2node.sh` once per node as above. The
+wrapper name is historical; `CONFIG`, `TARGET_MODEL_PATH`, and the topology
+variables select the GLM/DSpark stack. The decode-graph cap preserves the
+120K KV-cache capacity while releasing graph memory for the capture payload.
+
 ## External and managed-local services
 
 By default, online capture requires an already-running Mooncake deployment and
