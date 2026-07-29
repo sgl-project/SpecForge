@@ -25,6 +25,11 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         )
         self.assertIn("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1", patch)
         self.assertIn("await self.send_to_scheduler.send_pyobj(", patch)
+        self.assertIn("async def _send_one_request(", patch)
+        self.assertEqual(
+            patch.count("await self._send_one_request(tokenized_obj)"),
+            4,
+        )
         self.assertIn("__specforge_spec_capture_zlib_v1__", patch)
         self.assertIn("_decompress_spec_capture_reqs", patch)
 
