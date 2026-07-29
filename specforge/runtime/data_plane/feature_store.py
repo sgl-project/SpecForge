@@ -134,6 +134,15 @@ class FeatureStore(abc.ABC):
     @abc.abstractmethod
     def abort(self, sample_id: str, *, reason: str) -> None: ...
 
+    def abort_after_durable_ack(self, sample_id: str, *, reason: str) -> None:
+        """Free a sample after every consumer rank crossed a durable boundary.
+
+        Local stores need no special handling. Remote stores may override this
+        hook when their ordinary removal honors read leases that are no longer
+        needed after the distributed optimizer-boundary acknowledgement.
+        """
+        self.abort(sample_id, reason=reason)
+
     def estimate_bytes(self, specs: Dict[str, FeatureSpec]) -> int:
         total = 0
         for spec in specs.values():

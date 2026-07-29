@@ -36,6 +36,11 @@ MOONCAKE_DEFAULT_KV_LEASE_TTL="${MOONCAKE_DEFAULT_KV_LEASE_TTL:-600000}"
 START_TIMEOUT_S="${START_TIMEOUT_S:-1800}"
 PEER_TIMEOUT_S="${PEER_TIMEOUT_S:-1800}"
 
+# EXIT traps run after function-local variables leave scope. Keep the training
+# child and status in script scope so ``set -u`` cannot mask its real result.
+TRAINING_CONSUMER_PID=""
+TRAINING_RESULT=1
+
 log() {
     printf '[qwen3-8b-dflash-2node][rank=%s] %s\n' "${NODE_RANK:-?}" "$*"
 }
@@ -281,8 +286,6 @@ run_inference_node() {
 }
 
 run_training_node() {
-    local consumer_pid=""
-    local result=1
     local peer_result=""
 
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -297,13 +300,13 @@ run_training_node() {
     export MOONCAKE_LOCAL_HOSTNAME="${TRAINER_NODE_IP:-$(local_ip)}"
 
     finish() {
-        kill_group "$consumer_pid"
-        write_status "$RUN_ROOT/consumer.done" "$result"
+        kill_group "$TRAINING_CONSUMER_PID"
+        write_status "$RUN_ROOT/consumer.done" "$TRAINING_RESULT"
     }
     trap finish EXIT
-    trap 'result=129; exit 129' HUP
-    trap 'result=130; exit 130' INT
-    trap 'result=143; exit 143' TERM
+    trap 'TRAINING_RESULT=129; exit 129' HUP
+    trap 'TRAINING_RESULT=130; exit 130' INT
+    trap 'TRAINING_RESULT=143; exit 143' TERM
 
     mkdir -p "$(dirname "$CONSUMER_STATE_DIR")"
     mkdir "$CONSUMER_STATE_DIR" 2>/dev/null || \
@@ -313,24 +316,24 @@ run_training_node() {
         specforge train -c "$CONFIG" --role consumer \
         "${COMMON_OVERRIDES[@]}" "$@" \
         > >(tee "$RUN_ROOT/consumer.log") 2>&1 &
-    consumer_pid="$!"
+    TRAINING_CONSUMER_PID="$!"
 
-    while kill -0 "$consumer_pid" 2>/dev/null; do
+    while kill -0 "$TRAINING_CONSUMER_PID" 2>/dev/null; do
         if [[ -e "$RUN_ROOT/inference.done" ]] && \
             [[ "$(read_status "$RUN_ROOT/inference.done")" != "0" ]]; then
             peer_result="$(read_status "$RUN_ROOT/inference.done")"
-            kill_group "$consumer_pid"
+            kill_group "$TRAINING_CONSUMER_PID"
             break
         fi
         sleep 2
     done
     set +e
-    wait "$consumer_pid"
+    wait "$TRAINING_CONSUMER_PID"
     local process_result="$?"
     set -e
-    consumer_pid=""
-    result="${peer_result:-$process_result}"
-    return "$result"
+    TRAINING_CONSUMER_PID=""
+    TRAINING_RESULT="${peer_result:-$process_result}"
+    return "$TRAINING_RESULT"
 }
 
 main() {

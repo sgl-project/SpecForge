@@ -40,7 +40,10 @@ RPC, ``release()`` parks a failed free in ``_release_pending`` and ``gc()``
 retries up to ``max_release_attempts`` during steady state. Lifecycle shutdown
 calls :meth:`drain_pending_removals`, a separate bounded retry that raises if
 physical removal never succeeds; failed hard-pinned objects are never silently
-dropped from bookkeeping.
+dropped from bookkeeping. Online durable acknowledgement is stronger: after
+every DP/SP rank crosses the optimizer-boundary collective, the consumer uses
+Mooncake's force-remove option so a deliberately long transfer lease does not
+delay safe reclamation.
 
 Concurrency: ``release``/``abort``/``gc`` hold ``self._lock`` across the
 ``remove()`` RPC. The lock is what makes consume-once free race-free against a
@@ -314,10 +317,10 @@ class MooncakeFeatureStore(FeatureStore):
                 f"mooncake get_into short read for {key}: got {rc} of {nb} bytes"
             )
 
-    def _store_remove(self, key: str) -> bool:
+    def _store_remove(self, key: str, *, force: bool = False) -> bool:
         """Best-effort physical free. Returns True on confirmed removal."""
         try:
-            rc = self._store.remove(key)
+            rc = self._store.remove(key, force)
         except Exception:  # pragma: no cover - transient RPC failure
             return False
         return rc is None or int(rc) == 0
@@ -565,6 +568,7 @@ class MooncakeFeatureStore(FeatureStore):
         sample_id: str,
         *,
         confirm_absent_on_failure: bool = True,
+        force: bool = False,
     ) -> bool:
         """Remove all tensor objects. False on a retryable RPC failure.
 
@@ -581,7 +585,7 @@ class MooncakeFeatureStore(FeatureStore):
         ok = True
         for name in self._sample_names.get(sample_id, []):
             key = self._tkey(sample_id, gen, name)
-            if self._store_remove(key):
+            if self._store_remove(key, force=force):
                 continue
             if confirm_absent_on_failure and not self._store_exists(key):
                 continue  # already gone (freed remotely) counts as freed
@@ -632,6 +636,27 @@ class MooncakeFeatureStore(FeatureStore):
             if gen is not None:
                 self._freed.add((sample_id, gen))  # immediate logical free
             if self._try_physical_free(sample_id):
+                self._free_bookkeeping_locked(sample_id)
+            else:
+                self._release_pending.setdefault(sample_id, 0)
+
+    def abort_after_durable_ack(
+        self, sample_id: str, *, reason: str = "optimizer-boundary-durable-ack"
+    ) -> None:
+        """Force-remove an object after all consumer ranks finished reading it.
+
+        Mooncake protects ordinary removal with the same lease that bounds a
+        potentially long ``get_into`` transfer. The distributed durable-ack
+        collective proves every rank has completed that transfer and the
+        optimizer boundary, so retaining the read lease only delays safe
+        reclamation. ``force=True`` skips that expired safety window without
+        racing an active reader.
+        """
+        with self._lock:
+            gen = self._generation.get(sample_id)
+            if gen is not None:
+                self._freed.add((sample_id, gen))
+            if self._try_physical_free(sample_id, force=True):
                 self._free_bookkeeping_locked(sample_id)
             else:
                 self._release_pending.setdefault(sample_id, 0)

@@ -172,9 +172,14 @@ class DPAckController(DataFlowController):
         cleanup_error = None
         if optimizer_durable and self.feature_store is not None and self.cleanup_local:
             failures = []
+            abort_after_durable_ack = getattr(
+                self.feature_store,
+                "abort_after_durable_ack",
+                self.feature_store.abort,
+            )
             for sample_id in local_ids:
                 try:
-                    self.feature_store.abort(
+                    abort_after_durable_ack(
                         sample_id, reason="optimizer-boundary-durable-ack"
                     )
                 except BaseException as exc:

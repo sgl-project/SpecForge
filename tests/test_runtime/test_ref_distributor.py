@@ -761,6 +761,32 @@ class TestDPAckController(unittest.TestCase):
         self.assertEqual(reason, "optimizer-boundary-durable-ack")
         controller.store.close()
 
+    def test_durable_ack_prefers_completed_reader_cleanup_hook(self):
+        calls = []
+
+        class FeatureStore:
+            def abort(self, sample_id, *, reason):
+                calls.append(("ordinary", sample_id, reason))
+
+            def abort_after_durable_ack(self, sample_id, *, reason):
+                calls.append(("durable", sample_id, reason))
+
+        controller = DPAckController(
+            "run0",
+            is_authority=True,
+            feature_store=FeatureStore(),
+            metadata_store=SQLiteMetadataStore(os.path.join(self.dir, "force.db")),
+        )
+        controller.commit_samples("w0", [_ref("s0")])
+
+        controller.ack_train_refs("t0", ["s0"], global_step=1, optimizer_durable=True)
+
+        self.assertEqual(
+            calls,
+            [("durable", "s0", "optimizer-boundary-durable-ack")],
+        )
+        controller.store.close()
+
     def test_non_authority_participates_but_records_nothing(self):
         calls = []
 
