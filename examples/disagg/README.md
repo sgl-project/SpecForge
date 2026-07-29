@@ -101,6 +101,7 @@ export TARGET_MODEL_PATH=zai-org/GLM-5.2-FP8
 export SERVER_GPUS=0,1,2,3,4,5,6,7 SERVER_TP=8
 export SERVER_MEM_FRACTION=0.75
 export SERVER_CUDA_GRAPH_MAX_BS_DECODE=16
+export SERVER_MAX_TOTAL_TOKENS=125000
 export CAPTURE_LAYER_IDS="1 19 38 57 76"
 export TRAINER_GPUS=0,1,2,3,4,5,6,7 TRAINER_NPROC=8
 export MOONCAKE_GLOBAL_SEGMENT_SIZE=137438953472
@@ -109,8 +110,8 @@ export MOONCAKE_DEFAULT_KV_LEASE_TTL=600000
 
 Then invoke `run_qwen3_8b_dflash_disagg_2node.sh` once per node as above. The
 wrapper name is historical; `CONFIG`, `TARGET_MODEL_PATH`, and the topology
-variables select the GLM/DSpark stack. The decode-graph cap preserves the
-120K KV-cache capacity while releasing graph memory for the capture payload.
+variables select the GLM/DSpark stack. The decode-graph and token-cap settings
+preserve a 5K KV-cache margin while releasing memory for the capture payload.
 
 ## External and managed-local services
 

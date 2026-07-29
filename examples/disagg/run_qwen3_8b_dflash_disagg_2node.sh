@@ -28,6 +28,7 @@ SERVER_TP="${SERVER_TP:-1}"
 SERVER_PORT="${SERVER_PORT:-30000}"
 SERVER_MEM_FRACTION="${SERVER_MEM_FRACTION:-0.85}"
 SERVER_CUDA_GRAPH_MAX_BS_DECODE="${SERVER_CUDA_GRAPH_MAX_BS_DECODE:-}"
+SERVER_MAX_TOTAL_TOKENS="${SERVER_MAX_TOTAL_TOKENS:-}"
 CAPTURE_LAYER_IDS="${CAPTURE_LAYER_IDS:-1 9 17 25 33}"
 TRAINER_GPUS="${TRAINER_GPUS:-0,1,2,3}"
 TRAINER_NPROC="${TRAINER_NPROC:-4}"
@@ -138,6 +139,9 @@ validate_identity() {
     [[ -z "$SERVER_CUDA_GRAPH_MAX_BS_DECODE" || \
         "$SERVER_CUDA_GRAPH_MAX_BS_DECODE" =~ ^[1-9][0-9]*$ ]] || \
         fail "SERVER_CUDA_GRAPH_MAX_BS_DECODE must be empty or positive"
+    [[ -z "$SERVER_MAX_TOTAL_TOKENS" || \
+        "$SERVER_MAX_TOTAL_TOKENS" =~ ^[1-9][0-9]*$ ]] || \
+        fail "SERVER_MAX_TOTAL_TOKENS must be empty or positive"
     [[ "$TRAINER_NPROC" =~ ^[1-9][0-9]*$ ]] || \
         fail "TRAINER_NPROC must be positive"
     [[ "$(count_devices "$SERVER_GPUS")" == "$SERVER_TP" ]] || \
@@ -176,10 +180,14 @@ COMMON_OVERRIDES=(
 run_inference_node() {
     local producer_result=1
     local -a decode_graph_args=()
+    local -a max_total_tokens_args=()
     if [[ -n "$SERVER_CUDA_GRAPH_MAX_BS_DECODE" ]]; then
         decode_graph_args=(
             --cuda-graph-max-bs-decode "$SERVER_CUDA_GRAPH_MAX_BS_DECODE"
         )
+    fi
+    if [[ -n "$SERVER_MAX_TOTAL_TOKENS" ]]; then
+        max_total_tokens_args=(--max-total-tokens "$SERVER_MAX_TOTAL_TOKENS")
     fi
 
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -194,6 +202,7 @@ run_inference_node() {
             --model-path "$TARGET_MODEL_PATH" --tp-size "$SERVER_TP" \
             --mem-fraction-static "$SERVER_MEM_FRACTION" \
             "${decode_graph_args[@]}" \
+            "${max_total_tokens_args[@]}" \
             --enable-spec-capture --spec-capture-method dflash \
             --spec-capture-aux-layer-ids $CAPTURE_LAYER_IDS \
             --port "$SERVER_PORT"
@@ -262,6 +271,7 @@ run_inference_node() {
         --tp-size "$SERVER_TP" \
         --mem-fraction-static "$SERVER_MEM_FRACTION" \
         "${decode_graph_args[@]}" \
+        "${max_total_tokens_args[@]}" \
         --chunked-prefill-size -1 \
         --enable-spec-capture \
         --spec-capture-method dflash \

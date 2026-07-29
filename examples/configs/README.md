@@ -54,9 +54,10 @@ lease to reach every sequence-parallel rank. Start an external Mooncake master
 with a suitably long lease, for example
 `--default_kv_lease_ttl=600000` for the 120k DSpark recipe. With the checked-in
 two-node wrapper on H200, also set `SERVER_MEM_FRACTION=0.75` and
-`SERVER_CUDA_GRAPH_MAX_BS_DECODE=16`; the generic 0.85 memory fraction and
-512-batch decode graph do not leave enough headroom for GLM-5.2's long-context
-capture payload.
+`SERVER_CUDA_GRAPH_MAX_BS_DECODE=16`, and cap the otherwise auto-sized KV cache
+with `SERVER_MAX_TOTAL_TOKENS=125000`. The generic 0.85 memory fraction,
+512-batch decode graph, and full remaining-memory KV cache do not leave enough
+headroom for GLM-5.2's long-context capture payload.
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
