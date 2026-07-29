@@ -28,6 +28,7 @@ SERVER_TP="${SERVER_TP:-1}"
 SERVER_PORT="${SERVER_PORT:-30000}"
 SERVER_MEM_FRACTION="${SERVER_MEM_FRACTION:-0.85}"
 SERVER_DISABLE_CUDA_GRAPH="${SERVER_DISABLE_CUDA_GRAPH:-0}"
+SERVER_DISABLE_OVERLAP_SCHEDULE="${SERVER_DISABLE_OVERLAP_SCHEDULE:-0}"
 SERVER_CUDA_GRAPH_MAX_BS_DECODE="${SERVER_CUDA_GRAPH_MAX_BS_DECODE:-}"
 SERVER_MAX_TOTAL_TOKENS="${SERVER_MAX_TOTAL_TOKENS:-}"
 CAPTURE_LAYER_IDS="${CAPTURE_LAYER_IDS:-1 9 17 25 33}"
@@ -140,6 +141,9 @@ validate_identity() {
     [[ "$SERVER_DISABLE_CUDA_GRAPH" == "0" || \
         "$SERVER_DISABLE_CUDA_GRAPH" == "1" ]] || \
         fail "SERVER_DISABLE_CUDA_GRAPH must be 0 or 1"
+    [[ "$SERVER_DISABLE_OVERLAP_SCHEDULE" == "0" || \
+        "$SERVER_DISABLE_OVERLAP_SCHEDULE" == "1" ]] || \
+        fail "SERVER_DISABLE_OVERLAP_SCHEDULE must be 0 or 1"
     [[ -z "$SERVER_CUDA_GRAPH_MAX_BS_DECODE" || \
         "$SERVER_CUDA_GRAPH_MAX_BS_DECODE" =~ ^[1-9][0-9]*$ ]] || \
         fail "SERVER_CUDA_GRAPH_MAX_BS_DECODE must be empty or positive"
@@ -184,10 +188,14 @@ COMMON_OVERRIDES=(
 run_inference_node() {
     local producer_result=1
     local -a cuda_graph_args=()
+    local -a overlap_schedule_args=()
     local -a decode_graph_args=()
     local -a max_total_tokens_args=()
     if [[ "$SERVER_DISABLE_CUDA_GRAPH" == "1" ]]; then
         cuda_graph_args=(--disable-cuda-graph)
+    fi
+    if [[ "$SERVER_DISABLE_OVERLAP_SCHEDULE" == "1" ]]; then
+        overlap_schedule_args=(--disable-overlap-schedule)
     fi
     if [[ -n "$SERVER_CUDA_GRAPH_MAX_BS_DECODE" ]]; then
         decode_graph_args=(
@@ -210,6 +218,7 @@ run_inference_node() {
             --model-path "$TARGET_MODEL_PATH" --tp-size "$SERVER_TP" \
             --mem-fraction-static "$SERVER_MEM_FRACTION" \
             "${cuda_graph_args[@]}" \
+            "${overlap_schedule_args[@]}" \
             "${decode_graph_args[@]}" \
             "${max_total_tokens_args[@]}" \
             --enable-spec-capture --spec-capture-method dflash \
@@ -280,6 +289,7 @@ run_inference_node() {
         --tp-size "$SERVER_TP" \
         --mem-fraction-static "$SERVER_MEM_FRACTION" \
         "${cuda_graph_args[@]}" \
+        "${overlap_schedule_args[@]}" \
         "${decode_graph_args[@]}" \
         "${max_total_tokens_args[@]}" \
         --chunked-prefill-size -1 \

@@ -101,6 +101,7 @@ export TARGET_MODEL_PATH=zai-org/GLM-5.2-FP8
 export SERVER_GPUS=0,1,2,3,4,5,6,7 SERVER_TP=8
 export SERVER_MEM_FRACTION=0.75
 export SERVER_DISABLE_CUDA_GRAPH=1
+export SERVER_DISABLE_OVERLAP_SCHEDULE=1
 export SERVER_MAX_TOTAL_TOKENS=120064
 export CAPTURE_LAYER_IDS="1 19 38 57 76"
 export TRAINER_GPUS=0,1,2,3,4,5,6,7 TRAINER_NPROC=8
@@ -113,7 +114,9 @@ wrapper name is historical; `CONFIG`, `TARGET_MODEL_PATH`, and the topology
 variables select the GLM/DSpark stack. The token cap preserves one 64-token
 page of KV-cache margin. Disabling CUDA graphs releases the prefill/decode
 graph state for the much larger capture payload; this one-step validation
-recipe does not need graph amortization.
+recipe does not need graph amortization. Disabling the overlapping scheduler
+also keeps all TP ranks on the same CPU request-broadcast round for the 120K
+tokenized request.
 
 ## External and managed-local services
 
