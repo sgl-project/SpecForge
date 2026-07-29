@@ -155,6 +155,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
                 "DRY_RUN": "1",
                 "SERVER_DISABLE_CUDA_GRAPH": "1",
                 "SERVER_DISABLE_OVERLAP_SCHEDULE": "1",
+                "SERVER_SKIP_WARMUP": "1",
                 "SERVER_MAX_TOTAL_TOKENS": "120064",
             }
         )
@@ -178,6 +179,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("sglang.launch_server", outputs["0"])
         self.assertIn("--disable-cuda-graph", outputs["0"])
         self.assertIn("--disable-overlap-schedule", outputs["0"])
+        self.assertIn("--skip-server-warmup", outputs["0"])
         self.assertIn("--max-total-tokens 120064", outputs["0"])
         self.assertIn("specforge train", outputs["0"])
         self.assertIn("--role producer", outputs["0"])

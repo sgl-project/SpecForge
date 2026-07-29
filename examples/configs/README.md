@@ -55,12 +55,15 @@ with a suitably long lease, for example
 `--default_kv_lease_ttl=600000` for the 120k DSpark recipe. With the checked-in
 two-node wrapper on H200, also set `SERVER_MEM_FRACTION=0.75` and
 `SERVER_DISABLE_CUDA_GRAPH=1`, disable SGLang's overlapping scheduler with
-`SERVER_DISABLE_OVERLAP_SCHEDULE=1`, and cap the otherwise auto-sized KV cache
+`SERVER_DISABLE_OVERLAP_SCHEDULE=1`, skip its synthetic decode warmup with
+`SERVER_SKIP_WARMUP=1`, and cap the otherwise auto-sized KV cache
 with `SERVER_MAX_TOTAL_TOKENS=120064`. This one-step validation does not benefit
 from graph or scheduler-overlap amortization, and the released graph state is
 needed by the 120K capture. The generic 0.85 memory fraction, decode/prefill
 graphs, and full remaining-memory KV cache do not leave enough headroom for
-GLM-5.2's long-context capture payload.
+GLM-5.2's long-context capture payload. Skipping the synthetic warmup also
+ensures the first request through the capture-enabled TP scheduler is the exact
+120K validation sample.
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes

@@ -29,6 +29,7 @@ SERVER_PORT="${SERVER_PORT:-30000}"
 SERVER_MEM_FRACTION="${SERVER_MEM_FRACTION:-0.85}"
 SERVER_DISABLE_CUDA_GRAPH="${SERVER_DISABLE_CUDA_GRAPH:-0}"
 SERVER_DISABLE_OVERLAP_SCHEDULE="${SERVER_DISABLE_OVERLAP_SCHEDULE:-0}"
+SERVER_SKIP_WARMUP="${SERVER_SKIP_WARMUP:-0}"
 SERVER_CUDA_GRAPH_MAX_BS_DECODE="${SERVER_CUDA_GRAPH_MAX_BS_DECODE:-}"
 SERVER_MAX_TOTAL_TOKENS="${SERVER_MAX_TOTAL_TOKENS:-}"
 CAPTURE_LAYER_IDS="${CAPTURE_LAYER_IDS:-1 9 17 25 33}"
@@ -144,6 +145,8 @@ validate_identity() {
     [[ "$SERVER_DISABLE_OVERLAP_SCHEDULE" == "0" || \
         "$SERVER_DISABLE_OVERLAP_SCHEDULE" == "1" ]] || \
         fail "SERVER_DISABLE_OVERLAP_SCHEDULE must be 0 or 1"
+    [[ "$SERVER_SKIP_WARMUP" == "0" || "$SERVER_SKIP_WARMUP" == "1" ]] || \
+        fail "SERVER_SKIP_WARMUP must be 0 or 1"
     [[ -z "$SERVER_CUDA_GRAPH_MAX_BS_DECODE" || \
         "$SERVER_CUDA_GRAPH_MAX_BS_DECODE" =~ ^[1-9][0-9]*$ ]] || \
         fail "SERVER_CUDA_GRAPH_MAX_BS_DECODE must be empty or positive"
@@ -189,6 +192,7 @@ run_inference_node() {
     local producer_result=1
     local -a cuda_graph_args=()
     local -a overlap_schedule_args=()
+    local -a warmup_args=()
     local -a decode_graph_args=()
     local -a max_total_tokens_args=()
     if [[ "$SERVER_DISABLE_CUDA_GRAPH" == "1" ]]; then
@@ -196,6 +200,9 @@ run_inference_node() {
     fi
     if [[ "$SERVER_DISABLE_OVERLAP_SCHEDULE" == "1" ]]; then
         overlap_schedule_args=(--disable-overlap-schedule)
+    fi
+    if [[ "$SERVER_SKIP_WARMUP" == "1" ]]; then
+        warmup_args=(--skip-server-warmup)
     fi
     if [[ -n "$SERVER_CUDA_GRAPH_MAX_BS_DECODE" ]]; then
         decode_graph_args=(
@@ -219,6 +226,7 @@ run_inference_node() {
             --mem-fraction-static "$SERVER_MEM_FRACTION" \
             "${cuda_graph_args[@]}" \
             "${overlap_schedule_args[@]}" \
+            "${warmup_args[@]}" \
             "${decode_graph_args[@]}" \
             "${max_total_tokens_args[@]}" \
             --enable-spec-capture --spec-capture-method dflash \
@@ -290,6 +298,7 @@ run_inference_node() {
         --mem-fraction-static "$SERVER_MEM_FRACTION" \
         "${cuda_graph_args[@]}" \
         "${overlap_schedule_args[@]}" \
+        "${warmup_args[@]}" \
         "${decode_graph_args[@]}" \
         "${max_total_tokens_args[@]}" \
         --chunked-prefill-size -1 \
