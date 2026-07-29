@@ -114,10 +114,8 @@ wrapper name is historical; `CONFIG`, `TARGET_MODEL_PATH`, and the topology
 variables select the GLM/DSpark stack. The token cap preserves one 64-token
 page of KV-cache margin. Disabling CUDA graphs releases the prefill/decode
 graph state for the much larger capture payload; this one-step validation
-recipe does not need graph amortization. The patched SGLang request receiver
-uses its bounded same-node message queue for TP spec-capture traffic. Pair it
-with non-overlap scheduling so every TP rank consumes the same queue round, and
-keep `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1` (the v0.5.14 default) for TP8.
+recipe does not need graph amortization. Non-overlap scheduling keeps the
+one-step TP validation on SGLang's simplest execution path.
 
 ## External and managed-local services
 

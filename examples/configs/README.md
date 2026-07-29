@@ -60,12 +60,7 @@ with `SERVER_MAX_TOTAL_TOKENS=120064`. This one-step validation does not benefit
 from graph or scheduler-overlap amortization, and the released graph state is
 needed by the 120K capture. The generic 0.85 memory fraction, decode/prefill
 graphs, and full remaining-memory KV cache do not leave enough headroom for
-GLM-5.2's long-context capture payload. The checked-in SGLang capture patch
-also routes TP spec-capture requests through SGLang's bounded same-node message
-queue. Pairing that queue with non-overlap scheduling keeps every TP rank on
-the same receive round and avoids serializing the 120K token list through the
-CPU/Gloo polling collective. Keep `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1`
-(the SGLang v0.5.14 default) when `SERVER_TP` is greater than one.
+GLM-5.2's long-context capture payload.
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
