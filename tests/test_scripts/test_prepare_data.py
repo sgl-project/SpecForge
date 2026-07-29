@@ -32,6 +32,11 @@ class TestPrepareData(unittest.TestCase):
             prepare_data.UNSUPPORTED_VLM_DATASETS.isdisjoint(dataset_action.choices)
         )
 
+    def test_parser_help_renders_literal_eval_split_percentage(self):
+        help_text = prepare_data.build_parser().format_help()
+
+        self.assertIn("Write a deterministic 5% evaluation split.", help_text)
+
     def test_vlm_presets_are_explicitly_unsupported(self):
         for dataset_name in prepare_data.UNSUPPORTED_VLM_DATASETS:
             with (
