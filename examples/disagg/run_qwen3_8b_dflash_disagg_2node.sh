@@ -36,8 +36,12 @@ MOONCAKE_DEFAULT_KV_LEASE_TTL="${MOONCAKE_DEFAULT_KV_LEASE_TTL:-600000}"
 START_TIMEOUT_S="${START_TIMEOUT_S:-1800}"
 PEER_TIMEOUT_S="${PEER_TIMEOUT_S:-1800}"
 
-# EXIT traps run after function-local variables leave scope. Keep the training
-# child and status in script scope so ``set -u`` cannot mask its real result.
+# EXIT traps run after function-local variables leave scope. Keep child PIDs and
+# statuses in script scope so ``set -u`` cannot mask their real results.
+INFERENCE_MASTER_PID=""
+INFERENCE_SERVER_PID=""
+INFERENCE_PRODUCER_PID=""
+INFERENCE_RESULT=1
 TRAINING_CONSUMER_PID=""
 TRAINING_RESULT=1
 
@@ -160,10 +164,6 @@ COMMON_OVERRIDES=(
 )
 
 run_inference_node() {
-    local master_pid=""
-    local server_pid=""
-    local producer_pid=""
-    local result=1
     local producer_result=1
 
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -181,7 +181,7 @@ run_inference_node() {
             --port "$SERVER_PORT"
         print_command env CUDA_VISIBLE_DEVICES= specforge train -c "$CONFIG" \
             --role producer "${COMMON_OVERRIDES[@]}" "$@"
-        result=0
+        INFERENCE_RESULT=0
         return
     fi
 
@@ -190,15 +190,15 @@ run_inference_node() {
         fail "run root already exists; choose a fresh DISAGG_STORE_ID/RUN_ROOT"
 
     cleanup() {
-        kill_group "$producer_pid"
-        kill_group "$server_pid"
-        kill_group "$master_pid"
-        write_status "$RUN_ROOT/inference.done" "$result"
+        kill_group "$INFERENCE_PRODUCER_PID"
+        kill_group "$INFERENCE_SERVER_PID"
+        kill_group "$INFERENCE_MASTER_PID"
+        write_status "$RUN_ROOT/inference.done" "$INFERENCE_RESULT"
     }
     trap cleanup EXIT
-    trap 'result=129; exit 129' HUP
-    trap 'result=130; exit 130' INT
-    trap 'result=143; exit 143' TERM
+    trap 'INFERENCE_RESULT=129; exit 129' HUP
+    trap 'INFERENCE_RESULT=130; exit 130' INT
+    trap 'INFERENCE_RESULT=143; exit 143' TERM
 
     command -v mooncake_master >/dev/null || fail "mooncake_master is not on PATH"
     command -v curl >/dev/null || fail "curl is not on PATH"
@@ -215,7 +215,7 @@ run_inference_node() {
         --metrics_port="$MOONCAKE_METRICS_PORT" \
         --default_kv_lease_ttl="$MOONCAKE_DEFAULT_KV_LEASE_TTL" \
         > "$RUN_ROOT/mooncake.log" 2>&1 &
-    master_pid="$!"
+    INFERENCE_MASTER_PID="$!"
 
     local started
     started="$(date +%s)"
@@ -227,7 +227,7 @@ run_inference_node() {
                 "$HEAD_IP" "$MOONCAKE_RPC_PORT"; then
             break
         fi
-        kill -0 "$master_pid" 2>/dev/null || \
+        kill -0 "$INFERENCE_MASTER_PID" 2>/dev/null || \
             fail "Mooncake exited; see $RUN_ROOT/mooncake.log"
         (( $(date +%s) - started < START_TIMEOUT_S )) || \
             fail "Mooncake readiness timed out"
@@ -249,11 +249,11 @@ run_inference_node() {
         --spec-capture-aux-layer-ids "${capture_layers[@]}" \
         --port "$SERVER_PORT" \
         > "$RUN_ROOT/sglang-server.log" 2>&1 &
-    server_pid="$!"
+    INFERENCE_SERVER_PID="$!"
 
     started="$(date +%s)"
     until curl -fsS "http://$HEAD_IP:$SERVER_PORT/health" >/dev/null; do
-        kill -0 "$server_pid" 2>/dev/null || \
+        kill -0 "$INFERENCE_SERVER_PID" 2>/dev/null || \
             fail "SGLang exited; see $RUN_ROOT/sglang-server.log"
         (( $(date +%s) - started < START_TIMEOUT_S )) || \
             fail "SGLang readiness timed out"
@@ -264,14 +264,14 @@ run_inference_node() {
     setsid env CUDA_VISIBLE_DEVICES= specforge train -c "$CONFIG" \
         --role producer "${COMMON_OVERRIDES[@]}" "$@" \
         > >(tee "$RUN_ROOT/producer.log") 2>&1 &
-    producer_pid="$!"
+    INFERENCE_PRODUCER_PID="$!"
     set +e
-    wait "$producer_pid"
+    wait "$INFERENCE_PRODUCER_PID"
     producer_result="$?"
     set -e
-    producer_pid=""
+    INFERENCE_PRODUCER_PID=""
     [[ "$producer_result" == "0" ]] || {
-        result="$producer_result"
+        INFERENCE_RESULT="$producer_result"
         fail "producer exited with status $producer_result"
     }
 
@@ -279,10 +279,10 @@ run_inference_node() {
     local consumer_result
     consumer_result="$(read_status "$RUN_ROOT/consumer.done")"
     [[ "$consumer_result" == "0" ]] || {
-        result="$consumer_result"
+        INFERENCE_RESULT="$consumer_result"
         fail "consumer exited with status $consumer_result"
     }
-    result=0
+    INFERENCE_RESULT=0
 }
 
 run_training_node() {
