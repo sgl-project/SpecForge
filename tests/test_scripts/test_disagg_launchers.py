@@ -24,6 +24,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
             patch,
         )
         self.assertIn("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1", patch)
+        self.assertIn("await self.send_to_scheduler.send_pyobj(batch_req)", patch)
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="disagg_wrapper_")

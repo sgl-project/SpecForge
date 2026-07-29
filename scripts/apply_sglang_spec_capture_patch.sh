@@ -23,12 +23,22 @@ SGL_VERSION="$(python -c 'import sglang; print(sglang.__version__)')"
 APPLIED_COPY="$SGL_PARENT/sglang/.spec_capture_patch.applied"
 SINK="$SGL_PARENT/sglang/srt/spec_capture_sink.py"
 
+if ! command -v git > /dev/null; then
+    echo "ERROR: git is required to apply the spec-capture patch exactly" >&2
+    exit 1
+fi
+
 if [[ "$SGL_VERSION" != 0.5.14* ]]; then
     echo "WARNING: installed sglang is $SGL_VERSION; the patch targets v0.5.14" >&2
 fi
 
 if [[ "${1:-}" == "--reverse" ]]; then
-    patch --reverse -p2 --batch -N -d "$SGL_PARENT" < "$PATCH"
+    REVERSE_PATCH="$PATCH"
+    if [[ -f "$APPLIED_COPY" ]]; then
+        REVERSE_PATCH="$APPLIED_COPY"
+    fi
+    git -C "$SGL_PARENT" apply --reverse --check -p2 "$REVERSE_PATCH"
+    git -C "$SGL_PARENT" apply --reverse -p2 "$REVERSE_PATCH"
     rm -f "$APPLIED_COPY"
     echo "spec-capture patch --reverse at $SGL_PARENT/sglang (sglang $SGL_VERSION)"
     exit 0
@@ -40,16 +50,13 @@ if [[ -f "$APPLIED_COPY" ]]; then
         exit 0
     fi
     echo "spec-capture patch changed; reversing the recorded version first"
-    patch --reverse -p2 --batch -d "$SGL_PARENT" < "$APPLIED_COPY"
+    git -C "$SGL_PARENT" apply --reverse --check -p2 "$APPLIED_COPY"
+    git -C "$SGL_PARENT" apply --reverse -p2 "$APPLIED_COPY"
 elif [[ -f "$SINK" ]]; then
     # Patched before the applied-copy record existed. Adopt only a tree that
     # provably matches the current patch; otherwise demand a clean reinstall.
     # git apply verifies exact content on reverse; BSD patch dry-runs do not.
-    if command -v git > /dev/null; then
-        matches() { git -C "$SGL_PARENT" apply --reverse --check -p2 "$PATCH" 2> /dev/null; }
-    else
-        matches() { patch --reverse --dry-run -p2 --batch -d "$SGL_PARENT" < "$PATCH" > /dev/null; }
-    fi
+    matches() { git -C "$SGL_PARENT" apply --reverse --check -p2 "$PATCH" 2> /dev/null; }
     if matches; then
         cp "$PATCH" "$APPLIED_COPY"
         echo "spec-capture patch already applied at $SGL_PARENT/sglang (adopted)"
@@ -60,6 +67,7 @@ elif [[ -f "$SINK" ]]; then
     exit 1
 fi
 
-patch -p2 --batch -N -d "$SGL_PARENT" < "$PATCH"
+git -C "$SGL_PARENT" apply --check -p2 "$PATCH"
+git -C "$SGL_PARENT" apply -p2 "$PATCH"
 cp "$PATCH" "$APPLIED_COPY"
 echo "spec-capture patch applied at $SGL_PARENT/sglang (sglang $SGL_VERSION)"

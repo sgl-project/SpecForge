@@ -266,6 +266,30 @@ index bf932611a..f0e821ec4 100644
              )
          elif isinstance(obj, EmbeddingReqInput):
              # Resolve unresolved embed overrides now that input_ids are available
+@@ -1328,5 +1329,5 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+-    def _send_batch_request(
++    async def _send_batch_request(
+         self,
+         tokenized_objs: List[
+             Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+         ],
+@@ -1340,3 +1341,3 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+-        self.send_to_scheduler.send_pyobj(batch_req)
++        await self.send_to_scheduler.send_pyobj(batch_req)
+         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+@@ -1542,9 +1543,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         generators = []
+         rids = []
+         if getattr(obj, "parallel_sample_num", 1) == 1:
+             if self._should_use_batch_tokenization(batch_size, obj):
+                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+-                self._send_batch_request(tokenized_objs)
+-
++                await self._send_batch_request(tokenized_objs)
++
+                 # Set up generators for each request in the batch
+                 for i in range(batch_size):
 @@ -1922,6 +1923,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  hidden_states = recv_obj.output_hidden_states[i]
                  if hidden_states is not None:
