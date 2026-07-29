@@ -315,7 +315,7 @@ index bf932611a..1af01da90 100644
              )
          elif isinstance(obj, EmbeddingReqInput):
              # Resolve unresolved embed overrides now that input_ids are available
-@@ -1316,16 +1340,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1316,16 +1340,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
              )
          )
  
@@ -330,6 +330,7 @@ index bf932611a..1af01da90 100644
 +        await self.send_to_scheduler.send_pyobj(
 +            _compress_spec_capture_request(tokenized_obj)
 +        )
++        logger.info("SpecForge capture IPC send complete")
          tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
  
 -    def _send_batch_request(
@@ -337,7 +338,7 @@ index bf932611a..1af01da90 100644
          self,
          tokenized_objs: List[
              Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
-@@ -1338,7 +1364,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1338,7 +1365,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
              batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
  
          set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
@@ -348,7 +349,7 @@ index bf932611a..1af01da90 100644
          set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
  
      def _coalesce_streaming_chunks(
-@@ -1544,7 +1572,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1544,7 +1573,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
          if getattr(obj, "parallel_sample_num", 1) == 1:
              if self._should_use_batch_tokenization(batch_size, obj):
                  tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
@@ -357,7 +358,7 @@ index bf932611a..1af01da90 100644
  
                  # Set up generators for each request in the batch
                  for i in range(batch_size):
-@@ -1566,7 +1594,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1566,7 +1595,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                          state = self.rid_to_state[tmp_obj.rid]
                          if tmp_obj.return_prompt_token_ids:
                              state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -366,7 +367,7 @@ index bf932611a..1af01da90 100644
                          generators.append(self._wait_one_response(tmp_obj, request))
                          rids.append(tmp_obj.rid)
          else:
-@@ -1598,7 +1626,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1598,7 +1627,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  tokenized_obj.sampling_params.max_new_tokens = 0
                  tokenized_obj.stream = False
                  self._init_req_state(tmp_obj)
@@ -375,7 +376,7 @@ index bf932611a..1af01da90 100644
                  await self._wait_one_response(tmp_obj, request).__anext__()
  
              # Expand requests, assign new rids for them, and send them
-@@ -1619,7 +1647,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1619,7 +1648,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                      tokenized_obj.time_stats = state.time_stats
                      if tmp_obj.return_prompt_token_ids:
                          state.prompt_token_ids = list(tokenized_objs[i].input_ids)
@@ -384,7 +385,7 @@ index bf932611a..1af01da90 100644
                      generators.append(self._wait_one_response(tmp_obj, request))
                      rids.append(tmp_obj.rid)
  
-@@ -1922,6 +1950,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1922,6 +1951,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  hidden_states = recv_obj.output_hidden_states[i]
                  if hidden_states is not None:
                      meta_info["hidden_states"] = hidden_states
@@ -702,24 +703,26 @@ diff --git a/python/sglang/srt/managers/scheduler_components/request_receiver.py
 index 4c0f6fa91..9941402ea 100644
 --- a/python/sglang/srt/managers/scheduler_components/request_receiver.py
 +++ b/python/sglang/srt/managers/scheduler_components/request_receiver.py
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,8 @@
  from __future__ import annotations
  
++import logging
 +import pickle
 +import zlib
  from dataclasses import dataclass
  from http import HTTPStatus
  from typing import (
-@@ -31,6 +33,8 @@ from sglang.srt.utils import (
+@@ -31,6 +34,9 @@ from sglang.srt.utils import (
  )
  from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
  
 +_SPEC_CAPTURE_COMPRESSED_REQUEST = "__specforge_spec_capture_zlib_v1__"
++logger = logging.getLogger(__name__)
 +
  if TYPE_CHECKING:
      from sglang.srt.configs.model_config import ModelConfig
      from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-@@ -87,7 +91,8 @@ class SchedulerRequestReceiver:
+@@ -87,7 +93,8 @@ class SchedulerRequestReceiver:
              recv_reqs = self.input_blocker.handle(recv_reqs)
  
          recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
@@ -728,7 +731,7 @@ index 4c0f6fa91..9941402ea 100644
          recv_reqs = self._apply_mm_receiver(recv_reqs)
  
          self._finalize_shm_features(recv_reqs)
-@@ -94,6 +99,17 @@ class SchedulerRequestReceiver:
+@@ -94,6 +101,18 @@ class SchedulerRequestReceiver:
  
          return recv_reqs
  
@@ -740,13 +743,14 @@ index 4c0f6fa91..9941402ea 100644
 +                and len(req) == 2
 +                and req[0] == _SPEC_CAPTURE_COMPRESSED_REQUEST
 +            ):
++                logger.info("SpecForge capture IPC receive: compressed_bytes=%d", len(req[1]))
 +                recv_reqs[index] = pickle.loads(zlib.decompress(req[1]))
 +        return recv_reqs
 +
      def _pull_raw_reqs(self) -> Optional[List]:
          if self.ps.pp_rank == 0:
              if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-@@ -185,11 +201,23 @@ class SchedulerRequestReceiver:
+@@ -185,11 +204,23 @@ class SchedulerRequestReceiver:
                      src=self.tp_group.ranks[0],
                  )
              recv_reqs = work_reqs + control_reqs

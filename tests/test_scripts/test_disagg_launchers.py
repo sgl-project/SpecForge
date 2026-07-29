@@ -32,6 +32,8 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         )
         self.assertIn("__specforge_spec_capture_zlib_v1__", patch)
         self.assertIn("_decompress_spec_capture_reqs", patch)
+        self.assertIn("SpecForge capture IPC send complete", patch)
+        self.assertIn("SpecForge capture IPC receive", patch)
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="disagg_wrapper_")
