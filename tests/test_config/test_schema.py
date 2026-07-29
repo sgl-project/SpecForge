@@ -610,8 +610,13 @@ class ConfigSchemaTest(unittest.TestCase):
         online_usp["training"].update(
             {"attention_backend": "usp", "sp_ulysses_size": 2}
         )
-        with self.assertRaisesRegex(ValidationError, "offline features"):
-            Config.model_validate(online_usp)
+        with self.assertRaisesRegex(ValueError, "only for DSpark"):
+            resolve_run(Config.model_validate(online_usp))
+        online_dspark_usp = _online_payload("dspark")
+        online_dspark_usp["training"].update(
+            {"attention_backend": "usp", "sp_ulysses_size": 2}
+        )
+        resolve_run(Config.model_validate(online_dspark_usp))
         with self.assertRaisesRegex(ValidationError, "attention_backend=usp"):
             Config.model_validate(
                 {

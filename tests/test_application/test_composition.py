@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.contracts import FeatureMode
 from specforge.application import resolve_run
 from specforge.application.planning import _validate_training_topology
@@ -113,6 +114,22 @@ class ApplicationCompositionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Ulysses.*only"):
             resolve_run(Config.model_validate(payload))
 
+    def test_dspark_online_supports_ulysses_but_other_strategies_do_not(self):
+        payload = _payload("dspark")
+        payload["training"].update(
+            {
+                "attention_backend": "usp",
+                "sp_ulysses_size": 2,
+                "sp_ring_size": 1,
+            }
+        )
+        resolved = resolve_run(Config.model_validate(payload))
+        self.assertEqual(resolved.algorithm.name, "dspark")
+
+        payload["training"]["strategy"] = "dflash"
+        with self.assertRaisesRegex(ValueError, "does not support attention_backend"):
+            resolve_run(Config.model_validate(payload))
+
     def test_application_planning_defends_offline_data_parallelism(self):
         config = Config.model_validate(_payload(mode="offline"))
         invalid_training = config.training.model_copy(update={"tp_size": 2})
@@ -121,7 +138,11 @@ class ApplicationCompositionTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "do not implement trainer tensor parallelism"
         ):
-            _validate_training_topology(invalid_config, FeatureMode.OFFLINE)
+            _validate_training_topology(
+                invalid_config,
+                builtin_algorithm_registry().resolve("eagle3"),
+                FeatureMode.OFFLINE,
+            )
 
     def test_peagle_remains_server_streaming_capable(self):
         resolved = resolve_run(Config.model_validate(_payload("peagle")))

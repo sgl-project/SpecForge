@@ -162,6 +162,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
                 outputs[rank] = result.stdout
 
         self.assertIn("mooncake_master", outputs["0"])
+        self.assertIn("--default_kv_lease_ttl=600000", outputs["0"])
         self.assertIn("sglang.launch_server", outputs["0"])
         self.assertIn("specforge train", outputs["0"])
         self.assertIn("--role producer", outputs["0"])

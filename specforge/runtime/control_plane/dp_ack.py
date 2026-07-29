@@ -6,9 +6,10 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""DP-aware durable ack: gather every rank's sample_ids, record ONCE.
+"""DP/SP-aware durable ack: gather every rank's sample_ids, record ONCE.
 
-With data-parallel consumers each rank trains a disjoint shard, but the durable
+With data-parallel consumers each rank trains a disjoint shard; sequence-
+parallel peers instead train different shards of the same sample. The durable
 ``{acked, global_step, optimizer_durable}`` marker must have a single writer —
 otherwise N ranks interleave partial ack sets into one ledger.
 :class:`DPAckController` keeps the write single-authority without giving up the
@@ -108,11 +109,12 @@ class DPAckController(DataFlowController):
       in-memory store.
 
     Every rank owns a separate feature-store client and may have materialized
-    only its own DP shard.  Once rank 0 commits the union and broadcasts success,
-    each rank deletes only its local ``sample_ids`` through its own store.  A
-    second all-rank error collective completes before any caller may advance its
-    inbox acknowledgement; the distributor then mirrors those
-    optimizer-boundary counts onto the source counter.
+    only its own DP/SP shard. Once rank 0 commits the union and broadcasts
+    success, one rank per SP group deletes its local ``sample_ids`` through its
+    store so the shared remote object is not deleted repeatedly. A second
+    all-rank error collective completes before any caller may advance its inbox
+    acknowledgement; the distributor then mirrors those optimizer-boundary
+    counts onto the source counter.
     """
 
     def __init__(
@@ -128,6 +130,7 @@ class DPAckController(DataFlowController):
             [Optional[str]], Optional[str]
         ] = _gather_cleanup_errors,
         feature_store=None,
+        cleanup_local: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(run_id, **kwargs)
@@ -136,6 +139,7 @@ class DPAckController(DataFlowController):
         self._sync_error = sync_error
         self._sync_cleanup_error = sync_cleanup_error
         self.feature_store = feature_store
+        self.cleanup_local = bool(cleanup_local)
 
     def ack_train_refs(
         self,
@@ -166,7 +170,7 @@ class DPAckController(DataFlowController):
             raise RuntimeError(f"durable DP acknowledgement failed: {commit_error}")
 
         cleanup_error = None
-        if optimizer_durable and self.feature_store is not None:
+        if optimizer_durable and self.feature_store is not None and self.cleanup_local:
             failures = []
             for sample_id in local_ids:
                 try:

@@ -13,6 +13,7 @@ from specforge.algorithms.common.dflash_family_data import (
     build_dspark_collator,
     build_dspark_offline_normalizer,
     build_dspark_offline_reader,
+    build_dspark_streaming_transform,
 )
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
@@ -196,6 +197,7 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                 ),
                 build_collator=build_dspark_collator,
+                build_sample_transform=build_dspark_streaming_transform,
             ),
         ),
     )

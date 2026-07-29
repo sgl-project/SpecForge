@@ -538,6 +538,7 @@ class ServerStreamingProvider:
     layout: ServerCaptureLayout
     build_collator: Factory
     build_input_adapter: Factory | None = None
+    build_sample_transform: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.modality, field_name="modality")
@@ -555,6 +556,10 @@ class ServerStreamingProvider:
             self.build_input_adapter
         ):
             raise TypeError("build_input_adapter must be callable or None")
+        if self.build_sample_transform is not None and not callable(
+            self.build_sample_transform
+        ):
+            raise TypeError("build_sample_transform must be callable or None")
 
     def create_input_adapter(self, config: Any) -> ServerInputAdapter | None:
         """Construct and validate the optional modality-owned input adapter."""
@@ -576,6 +581,18 @@ class ServerStreamingProvider:
                 f"missing callable methods: {missing}"
             )
         return adapter
+
+    def create_sample_transform(self, config: Any):
+        """Construct an optional rank-local transform for captured samples."""
+
+        if self.build_sample_transform is None:
+            return None
+        transform = self.build_sample_transform(config)
+        if transform is not None and not callable(transform):
+            raise TypeError(
+                "build_sample_transform must return a callable transform or None"
+            )
+        return transform
 
 
 @dataclass(frozen=True)

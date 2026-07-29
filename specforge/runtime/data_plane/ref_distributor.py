@@ -6,34 +6,39 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""RefDistributor: the centralized dispatcher for DP online consumers.
+"""RefDistributor: the centralized dispatcher for DP/SP online consumers.
 
-One distributor per run (it lives on trainer DP rank 0). It is the ONLY reader
-of the producer's ref channel and the only holder of consume book-keeping:
+One distributor per run (it lives on physical trainer rank 0). It is the ONLY
+reader of the producer's ref channel and the only holder of consume
+book-keeping:
 
     source channel -> commit (ONE ledger, dedup) -> optimizer-step windows -> per-rank inbox
 
-Each rank reads a private inbox (a plain consume-once :class:`StreamingRefQueue`)
-and holds no channel offset, no partition math, no ledger — the design goal is a
-single book-keeping authority, not N. Refs are released one complete DP
-micro-batch round at a time, but an optimizer window is OPENED only once the
-whole window is already committed locally: a released round obligates every
-rank to a full accumulation window, and durable acknowledgements only advance
-in whole windows, so a window that could not complete would strand refs that no
-resume can ever acknowledge. An end-of-stream therefore always lands on a
-window boundary; the sub-window leftover (fewer refs than one global window)
-is settled without dispatch — drop_last-style, matching the floor semantics of
-``resolve_online_total_steps`` — and the stream closes cleanly. Note the
-cold-start consequence: ranks receive their first micro-batch only after the
-whole first window is captured, so rank-side idle timeouts must cover
+Each physical rank reads a private inbox (a plain consume-once
+:class:`StreamingRefQueue`) and holds no channel offset, no partition math, no
+ledger — the design goal is a single book-keeping authority, not N. Logical DP
+replicas receive disjoint refs; every SP peer inside one replica receives the
+same refs and applies its rank-local sequence transform. Refs are released one
+complete DP micro-batch round at a time, but an optimizer window is OPENED only
+once the whole window is already committed locally: a released round obligates
+every rank to a full accumulation window, and durable acknowledgements only
+advance in whole windows, so a window that could not complete would strand refs
+that no resume can ever acknowledge. An end-of-stream therefore always lands
+on a window boundary; the sub-window leftover (fewer refs than one global
+window) is settled without dispatch — drop_last-style, matching the floor
+semantics of ``resolve_online_total_steps`` — and the stream closes cleanly.
+Note the cold-start consequence: ranks receive their first micro-batch only
+after the whole first window is captured, so rank-side idle timeouts must cover
 full-window capture latency, not a single round.
 
 The consumed counter on the source channel (the producer's backpressure signal)
 mirrors optimizer-durable work: each rank acknowledges its OWN inbox only after
-the gathered SQLite ack/marker succeeds, and the distributor forwards the sum
-of the inbox sidecars to the source counter. The consumer publishes the global
-dispatch quantum before capture begins, and the producer rejects a watermark
-smaller than that first window. Dispatch itself does not count as consumption.
+the gathered SQLite ack/marker succeeds. The distributor takes the minimum
+consumed count within each SP group, then sums those logical-DP counts onto the
+source counter, so replicated SP refs count once. The consumer publishes the
+global dispatch quantum before capture begins, and the producer rejects a
+watermark smaller than that first window. Dispatch itself does not count as
+consumption.
 
 If the distributor dies it drops a ``.failed`` sentinel (with the traceback)
 into every inbox; :class:`InboxChannel` readers raise on it at the next poll —
@@ -101,6 +106,7 @@ class RefDistributor:
         feature_store,
         refs_per_rank_step: int,
         refs_per_rank_batch: Optional[int] = None,
+        sp_size: int = 1,
         skip_ids: Optional[Iterable[str]] = None,
         requeued_ids: Optional[Iterable[str]] = None,
         worker_id: str = "ref-distributor",
@@ -111,6 +117,8 @@ class RefDistributor:
     ) -> None:
         if dp_size < 1:
             raise ValueError(f"dp_size must be >= 1, got {dp_size}")
+        if sp_size < 1:
+            raise ValueError(f"sp_size must be >= 1, got {sp_size}")
         if refs_per_rank_step < 1:
             raise ValueError(
                 f"refs_per_rank_step must be >= 1, got {refs_per_rank_step}"
@@ -129,6 +137,8 @@ class RefDistributor:
         self.source = source
         self.controller = controller
         self.dp_size = dp_size
+        self.sp_size = sp_size
+        self.world_size = dp_size * sp_size
         self.feature_store = feature_store
         self.refs_per_rank_step = refs_per_rank_step
         self.refs_per_rank_batch = refs_per_rank_batch
@@ -145,7 +155,7 @@ class RefDistributor:
         # fresh so a restarted run cannot replay a previous attempt's dispatch.
         # Rank 0 broadcasts setup success before any rank opens a reader.
         os.makedirs(inbox_dir, exist_ok=True)
-        for rank in range(dp_size):
+        for rank in range(self.world_size):
             base = self.inbox_path(inbox_dir, rank)
             for suffix in _INBOX_SUFFIXES:
                 try:
@@ -154,7 +164,7 @@ class RefDistributor:
                     pass
         self._inboxes = [
             StreamingRefChannel(self.inbox_path(inbox_dir, rank))
-            for rank in range(dp_size)
+            for rank in range(self.world_size)
         ]
         # Continue the producer-visible counter instead of rewinding it after a
         # consumer restart. A crash can occur after SQLite commit/feature abort
@@ -183,7 +193,13 @@ class RefDistributor:
 
     def _forward_consumed(self) -> bool:
         """Mirror optimizer-durable inbox acks onto source backpressure."""
-        consumed = sum(inbox.consumed_remote() for inbox in self._inboxes)
+        rank_counts = [inbox.consumed_remote() for inbox in self._inboxes]
+        # Each logical DP replica owns one SP group. A source ref is consumed
+        # only after every peer has durably trained its sequence shard.
+        consumed = sum(
+            min(rank_counts[start : start + self.sp_size])
+            for start in range(0, self.world_size, self.sp_size)
+        )
         delta = consumed - self._inbox_consumed
         if delta <= 0:
             return False
@@ -268,9 +284,12 @@ class RefDistributor:
                 self._window.extend(queue.get(need, timeout_s=0.0))
             if len(self._window) < self.dispatch_round_quantum:
                 break
-            rank_batches: List[List[SampleRef]] = [[] for _ in range(self.dp_size)]
+            rank_batches: List[List[SampleRef]] = [[] for _ in range(self.world_size)]
             for index, ref in enumerate(self._window):
-                rank_batches[index % self.dp_size].append(ref)
+                dp_rank = index % self.dp_size
+                start = dp_rank * self.sp_size
+                for rank in range(start, start + self.sp_size):
+                    rank_batches[rank].append(ref)
             for inbox, refs in zip(self._inboxes, rank_batches):
                 inbox.publish_batch(refs)
             self.stats["dispatched"] += self.dispatch_round_quantum

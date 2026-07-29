@@ -10,6 +10,18 @@ NORMALIZER_ID = "dflash_family_offline_v1"
 DSPARK_NORMALIZER_ID = "dspark_offline_v1"
 
 
+def _normalize_token_row(raw, key: str, max_len: int, *, description: str):
+    tensor = raw[key]
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    elif tensor.dim() != 2 or tensor.shape[0] != 1:
+        raise ValueError(
+            f"{description} must have shape [seq] or [1, seq], "
+            f"got {tuple(tensor.shape)}"
+        )
+    return tensor[:, :max_len]
+
+
 def _normalize_hidden_states(
     raw,
     key: str,
@@ -36,8 +48,18 @@ def _normalize_hidden_states(
 def normalize_offline_sample(raw, max_len: int):
     """Normalize raw DFlash/Domino capture tensors without target projection."""
 
-    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
-    loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)
+    input_ids = _normalize_token_row(
+        raw,
+        "input_ids",
+        max_len,
+        description="DFlash-family input_ids",
+    )
+    loss_mask = _normalize_token_row(
+        raw,
+        "loss_mask",
+        max_len,
+        description="DFlash-family loss_mask",
+    )
     hidden_states = _normalize_hidden_states(
         raw,
         "hidden_states",
@@ -227,6 +249,30 @@ def build_dspark_offline_normalizer(
     )
 
 
+def build_dspark_streaming_transform(config):
+    """Shard a server-captured DSpark sample across its online SP peers."""
+
+    if config.training.attention_backend != "usp":
+        return None
+
+    import torch.distributed as dist
+
+    from specforge.distributed import get_draft_sp_group
+
+    group = get_draft_sp_group()
+    if not dist.is_available() or not dist.is_initialized() or group is None:
+        raise RuntimeError(
+            "DSpark online USP transform requires initialized draft sequence "
+            "parallelism"
+        )
+    return partial(
+        normalize_dspark_offline_sample_usp,
+        max_len=config.data.max_length,
+        sp_rank=dist.get_rank(group),
+        sp_size=dist.get_world_size(group),
+    )
+
+
 def build_collator():
     def collate(features):
         return pad_and_concatenate_features(
@@ -283,6 +329,7 @@ __all__ = [
     "build_dspark_offline_reader",
     "build_offline_normalizer",
     "build_offline_reader",
+    "build_dspark_streaming_transform",
     "normalize_dspark_offline_sample",
     "normalize_dspark_offline_sample_usp",
     "normalize_offline_sample",

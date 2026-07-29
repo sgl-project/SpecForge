@@ -236,7 +236,7 @@ The unified runtime supports text training in these combinations:
 | EAGLE3 | Yes, consumer DP | Yes, DP + USP | Yes, consumer DP |
 | DFlash | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | Domino | Yes, consumer DP | Yes, DP | Yes, consumer DP |
-| DSpark | Yes, consumer DP | Yes, DP + Ulysses SP | Yes, consumer DP + Ulysses SP |
+| DSpark | Yes, consumer DP + Ulysses SP | Yes, DP + Ulysses SP | Yes, consumer DP + Ulysses SP |
 | P-EAGLE | Yes, consumer DP, batch size 1 | No | No |
 
 Unsupported combinations fail explicitly during config validation or run
@@ -249,7 +249,7 @@ assembly. In particular:
 - attention backends are strategy-specific: EAGLE3 accepts `sdpa`,
   `flex_attention`, `fa`, or offline `usp`; P-EAGLE requires
   `flex_attention`; DFlash and Domino accept `eager`, `sdpa`, or
-  `flex_attention`; DSpark additionally accepts offline Ulysses-only `usp`;
+  `flex_attention`; DSpark additionally accepts offline and online Ulysses-only `usp`;
 - P-EAGLE requires `training.batch_size=1` and reuses EAGLE3's server capture
   schema;
 - offline feature training supports EAGLE3, DFlash, Domino, and DSpark;
@@ -274,8 +274,9 @@ publishes the exact schedule horizon and the consumer trains to EOF.
 The launcher creates every process group from the typed run config:
 
 - Online target TP/EP belongs to each external SGLang capture server, not the
-  trainer. Online consumers keep `training.tp_size` and both SP sizes at 1;
-  every trainer rank receives a disjoint feature stream.
+  trainer. Online consumers keep `training.tp_size` at 1. Non-USP ranks receive
+  disjoint feature streams; DSpark Ulysses peers receive the same reference and
+  transform it into rank-local sequence shards before collation.
 - Offline consumers also keep `training.tp_size` at 1. Without USP, every
   trainer rank receives a disjoint reference shard and participates as data
   parallelism.
@@ -283,11 +284,12 @@ The launcher creates every process group from the typed run config:
   `training.sp_ulysses_size` and `training.sp_ring_size`. Their product must be
   greater than one, USP currently uses `training.batch_size: 1`, and SP peers
   share one sequence while draft-DP groups receive disjoint references.
-- DSpark offline can set `training.attention_backend: usp` and
+- DSpark offline or online can set `training.attention_backend: usp` and
   `training.sp_ulysses_size > 1`; it currently requires
   `training.sp_ring_size: 1`. Query and KV head counts must both be divisible
-  by the Ulysses degree. The 120K example uses Ulysses-SP8 with full-shard FSDP:
-  [`glm-5.2-dspark-offline-120k-usp.yaml`](../../examples/configs/glm-5.2-dspark-offline-120k-usp.yaml).
+  by the Ulysses degree. The 120K examples use Ulysses-SP8 with full-shard
+  FSDP: [`offline`](../../examples/configs/glm-5.2-dspark-offline-120k-usp.yaml)
+  and [`online`](../../examples/configs/glm-5.2-dspark-online-120k-usp.yaml).
 
 The world size must be divisible by
 `training.sp_ulysses_size * training.sp_ring_size`. Use a shared `output_dir`

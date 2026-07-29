@@ -32,6 +32,7 @@ MOONCAKE_RPC_PORT="${MOONCAKE_RPC_PORT:-35551}"
 MOONCAKE_HTTP_PORT="${MOONCAKE_HTTP_PORT:-35880}"
 MOONCAKE_METRICS_PORT="${MOONCAKE_METRICS_PORT:-35903}"
 MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-tcp}"
+MOONCAKE_DEFAULT_KV_LEASE_TTL="${MOONCAKE_DEFAULT_KV_LEASE_TTL:-600000}"
 START_TIMEOUT_S="${START_TIMEOUT_S:-1800}"
 PEER_TIMEOUT_S="${PEER_TIMEOUT_S:-1800}"
 
@@ -165,7 +166,8 @@ run_inference_node() {
             --http_metadata_server_host=0.0.0.0 \
             --rpc_port="$MOONCAKE_RPC_PORT" \
             --http_metadata_server_port="$MOONCAKE_HTTP_PORT" \
-            --metrics_port="$MOONCAKE_METRICS_PORT"
+            --metrics_port="$MOONCAKE_METRICS_PORT" \
+            --default_kv_lease_ttl="$MOONCAKE_DEFAULT_KV_LEASE_TTL"
         print_command env "CUDA_VISIBLE_DEVICES=$SERVER_GPUS" \
             python -m sglang.launch_server --host 0.0.0.0 \
             --model-path "$TARGET_MODEL_PATH" --tp-size "$SERVER_TP" \
@@ -206,6 +208,7 @@ run_inference_node() {
         --rpc_port="$MOONCAKE_RPC_PORT" \
         --http_metadata_server_port="$MOONCAKE_HTTP_PORT" \
         --metrics_port="$MOONCAKE_METRICS_PORT" \
+        --default_kv_lease_ttl="$MOONCAKE_DEFAULT_KV_LEASE_TTL" \
         > "$RUN_ROOT/mooncake.log" 2>&1 &
     master_pid="$!"
 

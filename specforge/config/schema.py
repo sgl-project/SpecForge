@@ -281,6 +281,7 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
+    default_kv_lease_ttl_ms: int = Field(default=600_000, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
 
     @model_validator(mode="after")
@@ -831,9 +832,6 @@ class Config(StrictConfigModel):
                 )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
-        if self.training.attention_backend == "usp":
-            if mode != "offline":
-                raise ValueError("USP attention currently requires offline features")
         if mode == "offline" and self.training.tp_size != 1:
             raise ValueError(
                 "offline feature consumers do not implement trainer tensor "
@@ -843,16 +841,12 @@ class Config(StrictConfigModel):
         if (
             mode == "online"
             and deployment == "disaggregated"
-            and (
-                self.training.tp_size != 1
-                or self.training.sp_ulysses_size != 1
-                or self.training.sp_ring_size != 1
-            )
+            and self.training.tp_size != 1
         ):
             raise ValueError(
-                "the disaggregated online consumer uses every trainer rank for "
-                "data parallelism; configure target TP on the external server and "
-                "keep training.tp_size/sp sizes at 1"
+                "the disaggregated online consumer does not implement trainer "
+                "tensor parallelism; configure target TP on the external server "
+                "and keep training.tp_size=1"
             )
         return self
 
