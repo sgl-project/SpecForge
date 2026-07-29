@@ -54,16 +54,18 @@ lease to reach every sequence-parallel rank. Start an external Mooncake master
 with a suitably long lease, for example
 `--default_kv_lease_ttl=600000` for the 120k DSpark recipe. With the checked-in
 two-node wrapper on H200, also set `SERVER_MEM_FRACTION=0.75` and
-`SERVER_DISABLE_CUDA_GRAPH=1`, and cap the otherwise auto-sized KV cache with
-`SERVER_MAX_TOTAL_TOKENS=120064`. This one-step validation does not benefit
-from graph amortization, and the released graph state is needed by the 120K
-capture. The generic 0.85 memory fraction, decode/prefill graphs, and full
-remaining-memory KV cache do not leave enough headroom for GLM-5.2's
-long-context capture payload. The checked-in SGLang capture patch also routes
-TP spec-capture requests through SGLang's bounded same-node message queue. This
-avoids repeatedly serializing the 120K token list through the CPU/Gloo polling
-collective; keep `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1` (the SGLang v0.5.14
-default) when `SERVER_TP` is greater than one.
+`SERVER_DISABLE_CUDA_GRAPH=1`, disable SGLang's overlapping scheduler with
+`SERVER_DISABLE_OVERLAP_SCHEDULE=1`, and cap the otherwise auto-sized KV cache
+with `SERVER_MAX_TOTAL_TOKENS=120064`. This one-step validation does not benefit
+from graph or scheduler-overlap amortization, and the released graph state is
+needed by the 120K capture. The generic 0.85 memory fraction, decode/prefill
+graphs, and full remaining-memory KV cache do not leave enough headroom for
+GLM-5.2's long-context capture payload. The checked-in SGLang capture patch
+also routes TP spec-capture requests through SGLang's bounded same-node message
+queue. Pairing that queue with non-overlap scheduling keeps every TP rank on
+the same receive round and avoids serializing the 120K token list through the
+CPU/Gloo polling collective. Keep `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1`
+(the SGLang v0.5.14 default) when `SERVER_TP` is greater than one.
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
