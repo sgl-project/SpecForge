@@ -165,6 +165,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
                 "SERVER_DISABLE_OVERLAP_SCHEDULE": "1",
                 "SERVER_SKIP_WARMUP": "1",
                 "SERVER_MAX_TOTAL_TOKENS": "120064",
+                "SERVER_MAX_PREFILL_TOKENS": "120064",
             }
         )
         outputs = {}
@@ -189,6 +190,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("--disable-overlap-schedule", outputs["0"])
         self.assertIn("--skip-server-warmup", outputs["0"])
         self.assertIn("--max-total-tokens 120064", outputs["0"])
+        self.assertIn("--max-prefill-tokens 120064", outputs["0"])
         self.assertIn("specforge train", outputs["0"])
         self.assertIn("--role producer", outputs["0"])
         self.assertIn("specforge train", outputs["1"])

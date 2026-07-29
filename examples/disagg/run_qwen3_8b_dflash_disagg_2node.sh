@@ -32,6 +32,7 @@ SERVER_DISABLE_OVERLAP_SCHEDULE="${SERVER_DISABLE_OVERLAP_SCHEDULE:-0}"
 SERVER_SKIP_WARMUP="${SERVER_SKIP_WARMUP:-0}"
 SERVER_CUDA_GRAPH_MAX_BS_DECODE="${SERVER_CUDA_GRAPH_MAX_BS_DECODE:-}"
 SERVER_MAX_TOTAL_TOKENS="${SERVER_MAX_TOTAL_TOKENS:-}"
+SERVER_MAX_PREFILL_TOKENS="${SERVER_MAX_PREFILL_TOKENS:-}"
 CAPTURE_LAYER_IDS="${CAPTURE_LAYER_IDS:-1 9 17 25 33}"
 TRAINER_GPUS="${TRAINER_GPUS:-0,1,2,3}"
 TRAINER_NPROC="${TRAINER_NPROC:-4}"
@@ -153,6 +154,9 @@ validate_identity() {
     [[ -z "$SERVER_MAX_TOTAL_TOKENS" || \
         "$SERVER_MAX_TOTAL_TOKENS" =~ ^[1-9][0-9]*$ ]] || \
         fail "SERVER_MAX_TOTAL_TOKENS must be empty or positive"
+    [[ -z "$SERVER_MAX_PREFILL_TOKENS" || \
+        "$SERVER_MAX_PREFILL_TOKENS" =~ ^[1-9][0-9]*$ ]] || \
+        fail "SERVER_MAX_PREFILL_TOKENS must be empty or positive"
     [[ "$TRAINER_NPROC" =~ ^[1-9][0-9]*$ ]] || \
         fail "TRAINER_NPROC must be positive"
     [[ "$(count_devices "$SERVER_GPUS")" == "$SERVER_TP" ]] || \
@@ -196,6 +200,7 @@ run_inference_node() {
     local -a warmup_args=()
     local -a decode_graph_args=()
     local -a max_total_tokens_args=()
+    local -a max_prefill_tokens_args=()
     if [[ "$SERVER_DISABLE_CUDA_GRAPH" == "1" ]]; then
         cuda_graph_args=(--disable-cuda-graph)
     fi
@@ -212,6 +217,9 @@ run_inference_node() {
     fi
     if [[ -n "$SERVER_MAX_TOTAL_TOKENS" ]]; then
         max_total_tokens_args=(--max-total-tokens "$SERVER_MAX_TOTAL_TOKENS")
+    fi
+    if [[ -n "$SERVER_MAX_PREFILL_TOKENS" ]]; then
+        max_prefill_tokens_args=(--max-prefill-tokens "$SERVER_MAX_PREFILL_TOKENS")
     fi
 
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -230,6 +238,7 @@ run_inference_node() {
             "${warmup_args[@]}" \
             "${decode_graph_args[@]}" \
             "${max_total_tokens_args[@]}" \
+            "${max_prefill_tokens_args[@]}" \
             --enable-spec-capture --spec-capture-method dflash \
             --spec-capture-aux-layer-ids $CAPTURE_LAYER_IDS \
             --port "$SERVER_PORT"
@@ -302,6 +311,7 @@ run_inference_node() {
         "${warmup_args[@]}" \
         "${decode_graph_args[@]}" \
         "${max_total_tokens_args[@]}" \
+        "${max_prefill_tokens_args[@]}" \
         --chunked-prefill-size -1 \
         --enable-spec-capture \
         --spec-capture-method dflash \
