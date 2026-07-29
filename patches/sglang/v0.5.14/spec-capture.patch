@@ -580,3 +580,36 @@ index 000000000..d317b2801
 +
 +def get_sink() -> Optional[SpecCaptureSink]:
 +    return _SINK
+diff --git a/python/sglang/srt/managers/scheduler_components/request_receiver.py b/python/sglang/srt/managers/scheduler_components/request_receiver.py
+--- a/python/sglang/srt/managers/scheduler_components/request_receiver.py
++++ b/python/sglang/srt/managers/scheduler_components/request_receiver.py
+@@ -185,11 +185,23 @@ class SchedulerRequestReceiver:
+                     src=self.tp_group.ranks[0],
+                 )
+             recv_reqs = work_reqs + control_reqs
+         elif self.ps.tp_size != 1:
+-            recv_reqs = broadcast_pyobj(
+-                recv_reqs,
+-                self.tp_group.rank,
+-                self.tp_cpu_group,
+-                src=self.tp_group.ranks[0],
+-            )
++            if self.server_args.enable_spec_capture:
++                # Keep polling traffic off the TP CPU process group: model
++                # initialization can leave its collective sequence out of sync.
++                # The same-node queue has one read flag per TP rank and carries
++                # overflow messages over its local socket.
++                if self.tp_group.mq_broadcaster is None:
++                    raise RuntimeError(
++                        "TP spec capture requires SGLang's message-queue "
++                        "broadcaster (set SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1)"
++                    )
++                recv_reqs = self.tp_group.broadcast_object(recv_reqs, src=0)
++            else:
++                recv_reqs = broadcast_pyobj(
++                    recv_reqs,
++                    self.tp_group.rank,
++                    self.tp_cpu_group,
++                    src=self.tp_group.ranks[0],
++                )
+         return recv_reqs

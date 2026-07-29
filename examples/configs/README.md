@@ -63,7 +63,9 @@ needed by the 120K capture. The generic 0.85 memory fraction, decode/prefill
 graphs, and full remaining-memory KV cache do not leave enough headroom for
 GLM-5.2's long-context capture payload. Skipping the synthetic warmup also
 ensures the first request through the capture-enabled TP scheduler is the exact
-120K validation sample.
+120K validation sample. The capture patch routes scheduler polling and request
+payloads over SGLang's bounded same-node message queue instead of the TP CPU
+process group; keep `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1` for TP8.
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes

@@ -118,6 +118,8 @@ graph state for the much larger capture payload; this one-step validation
 recipe does not need graph amortization. Non-overlap scheduling keeps the
 one-step TP validation on SGLang's simplest execution path, while skipping its
 synthetic decode warmup makes the exact 120K capture the first served request.
+The checked-in capture patch uses SGLang's bounded same-node message queue for
+TP scheduler traffic; keep `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1` for TP8.
 
 ## External and managed-local services
 

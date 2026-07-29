@@ -17,13 +17,13 @@ SGLANG_PATCH = ROOT / "patches" / "sglang" / "v0.5.14" / "spec-capture.patch"
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):
-    def test_tp_server_capture_keeps_native_sglang_request_broadcast(self):
+    def test_tp_server_capture_uses_dedicated_message_queue_broadcast(self):
         patch = SGLANG_PATCH.read_text(encoding="utf-8")
-        self.assertNotIn(
-            "scheduler_components/request_receiver.py",
+        self.assertIn(
+            "self.tp_group.broadcast_object(recv_reqs, src=0)",
             patch,
         )
-        self.assertNotIn("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", patch)
+        self.assertIn("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1", patch)
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="disagg_wrapper_")
