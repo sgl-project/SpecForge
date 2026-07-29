@@ -320,7 +320,10 @@ class MooncakeFeatureStore(FeatureStore):
     def _store_remove(self, key: str, *, force: bool = False) -> bool:
         """Best-effort physical free. Returns True on confirmed removal."""
         try:
-            rc = self._store.remove(key, force)
+            # Preserve compatibility with injected/older backends whose
+            # ordinary remove accepts only ``key``. The durable-ack force path
+            # intentionally requires a Mooncake build that exposes ``force``.
+            rc = self._store.remove(key, True) if force else self._store.remove(key)
         except Exception:  # pragma: no cover - transient RPC failure
             return False
         return rc is None or int(rc) == 0
