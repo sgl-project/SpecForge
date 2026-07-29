@@ -13,6 +13,7 @@ from specforge.algorithms.common.hidden_states_data import (
     build_collator,
     build_offline_normalizer,
     build_offline_reader,
+    build_vlm_collator,
 )
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
@@ -26,6 +27,7 @@ from specforge.algorithms.common.providers import (
     TargetDerivedDraftDefaults,
     make_registration,
 )
+from specforge.algorithms.common.vlm_input import build_vlm_input_adapter
 from specforge.algorithms.contracts import (
     AlgorithmCapabilities,
     AlgorithmSpec,
@@ -133,6 +135,7 @@ def needs_input_tools(config, draft_model):
 
 def algorithm_spec() -> AlgorithmSpec:
     ready = {"input_ids", "loss_mask", "hidden_states"}
+    vlm_ready = {"input_ids", "loss_mask", "hidden_states", "position_ids"}
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
@@ -155,6 +158,11 @@ def algorithm_spec() -> AlgorithmSpec:
                 mode=FeatureMode.STREAMING,
                 modality="text",
                 required_tensors=ready,
+            ),
+            FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="multimodal",
+                required_tensors=vlm_ready,
             ),
         ),
         capabilities=AlgorithmCapabilities(
@@ -225,6 +233,22 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                 ),
                 build_collator=collator,
+            ),
+            ServerStreamingProvider(
+                modality="multimodal",
+                capture_method="dflash",
+                target_representation=None,
+                layout=ServerCaptureLayout(
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                    position_ids_feature="position_ids",
+                ),
+                build_collator=build_vlm_collator,
+                build_input_adapter=build_vlm_input_adapter,
             ),
         ),
     )
