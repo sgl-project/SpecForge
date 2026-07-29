@@ -145,7 +145,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
                 "DISAGG_CONSUMER_STATE_DIR": str(consumer_state),
                 "DRY_RUN": "1",
                 "SERVER_CUDA_GRAPH_MAX_BS_DECODE": "16",
-                "SERVER_MAX_TOTAL_TOKENS": "125000",
+                "SERVER_MAX_TOTAL_TOKENS": "120064",
             }
         )
         outputs = {}
@@ -167,7 +167,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("--default_kv_lease_ttl=600000", outputs["0"])
         self.assertIn("sglang.launch_server", outputs["0"])
         self.assertIn("--cuda-graph-max-bs-decode 16", outputs["0"])
-        self.assertIn("--max-total-tokens 125000", outputs["0"])
+        self.assertIn("--max-total-tokens 120064", outputs["0"])
         self.assertIn("specforge train", outputs["0"])
         self.assertIn("--role producer", outputs["0"])
         self.assertIn("specforge train", outputs["1"])
