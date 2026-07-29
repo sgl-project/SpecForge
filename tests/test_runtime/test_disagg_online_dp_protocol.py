@@ -38,6 +38,43 @@ _GLOO_AVAILABLE = bool(
 )
 
 
+@unittest.skipUnless(dist is not None, "requires torch")
+class TestOnlineConsumerLayout(unittest.TestCase):
+    def test_ulysses_groups_physical_ranks_into_logical_dp_replicas(self):
+        from specforge.launch import _online_consumer_layout
+
+        with mock.patch.object(dist, "is_initialized", return_value=False):
+            layout = _online_consumer_layout(
+                dp_rank=6,
+                dp_size=8,
+                tp_size=1,
+                sp_ulysses_size=4,
+                sp_ring_size=1,
+            )
+
+        self.assertEqual(layout.rank, 6)
+        self.assertEqual(layout.world_size, 8)
+        self.assertEqual(layout.dp_rank, 1)
+        self.assertEqual(layout.dp_size, 2)
+        self.assertEqual(layout.sp_rank, 2)
+        self.assertEqual(layout.sp_size, 4)
+
+    def test_online_consumer_still_rejects_trainer_tensor_parallelism(self):
+        from specforge.launch import _online_consumer_layout
+
+        with (
+            mock.patch.object(dist, "is_initialized", return_value=False),
+            self.assertRaisesRegex(NotImplementedError, "tensor parallelism"),
+        ):
+            _online_consumer_layout(
+                dp_rank=0,
+                dp_size=2,
+                tp_size=2,
+                sp_ulysses_size=1,
+                sp_ring_size=1,
+            )
+
+
 class _PathOnlyChannel:
     """The setup-failure case only needs the channel's inbox path default."""
 

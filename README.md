@@ -34,11 +34,12 @@ Every method uses the same typed training entry point:
 specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
-The typed `deployment.trainer` topology self-launches trainer DP and EAGLE3
-offline USP process groups. A single-node disaggregated config also supervises
-its SpecForge producer and consumer; Mooncake and SGLang remain externally
-managed services, and online target parallelism belongs to SGLang. There are no
-method-specific Python training entry points.
+The typed `deployment.trainer` topology self-launches trainer DP and
+EAGLE3/DSpark offline USP process groups, plus DSpark online Ulysses groups. A
+single-node disaggregated config also supervises its SpecForge producer and
+consumer; Mooncake and SGLang remain externally managed services, and online
+target parallelism belongs to SGLang. There are no method-specific Python
+training entry points.
 
 | Method | Description | Example config | Optimization |
 | --- | --- | --- | --- |

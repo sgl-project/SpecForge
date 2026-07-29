@@ -484,6 +484,12 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
             target_last_hidden_states=t["target_last_hidden_states"].to(device),
+            position_ids=(
+                t["position_ids"].to(device) if "position_ids" in t else None
+            ),
+            attention_mask=(
+                t["attention_mask"].to(device) if "attention_mask" in t else None
+            ),
         )
         metrics = {
             "accuracy": accuracy.detach(),

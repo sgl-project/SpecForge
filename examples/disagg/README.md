@@ -90,6 +90,41 @@ The consumer's SQLite/WAL and rank inboxes default to the trainer-node-local
 `DISAGG_CONSUMER_STATE_DIR` or `LOCAL_SCRATCH` when `/tmp` is unsuitable.
 Node-local consumer state currently supports one trainer node only.
 
+For the GLM-5.2 DSpark 120K recipe, use TP8 on the target node and USP8/FSDP
+on the trainer node. H200 needs a lower SGLang static-memory fraction than the
+Qwen default so decode-graph capture and the long-context feature payload both
+retain headroom:
+
+```bash
+export CONFIG=examples/configs/glm-5.2-dspark-online-120k-usp.yaml
+export TARGET_MODEL_PATH=zai-org/GLM-5.2-FP8
+export SERVER_GPUS=0,1,2,3,4,5,6,7 SERVER_TP=8
+export SERVER_MEM_FRACTION=0.75
+export SERVER_DISABLE_CUDA_GRAPH=1
+export SERVER_DISABLE_OVERLAP_SCHEDULE=1
+export SERVER_SKIP_WARMUP=1
+export SERVER_MAX_TOTAL_TOKENS=120128
+export SERVER_MAX_PREFILL_TOKENS=120128
+export SERVER_CHUNKED_PREFILL_SIZE=8192
+export CAPTURE_LAYER_IDS="1 19 38 57 76"
+export TRAINER_GPUS=0,1,2,3,4,5,6,7 TRAINER_NPROC=8
+export MOONCAKE_GLOBAL_SEGMENT_SIZE=137438953472
+export MOONCAKE_DEFAULT_KV_LEASE_TTL=600000
+```
+
+Then invoke `run_qwen3_8b_dflash_disagg_2node.sh` once per node as above. The
+wrapper name is historical; `CONFIG`, `TARGET_MODEL_PATH`, and the topology
+variables select the GLM/DSpark stack. The token cap covers SGLang's reserved
+64-token KV-cache page plus its admission sentinel. Chunked prefill bounds the
+capture's activation peak while the patch concatenates all chunks before the
+Mooncake write. Disabling CUDA graphs releases the prefill/decode
+graph state for the much larger capture payload; this one-step validation
+recipe does not need graph amortization. Non-overlap scheduling keeps the
+one-step TP validation on SGLang's simplest execution path, while skipping its
+synthetic decode warmup makes the exact 120K capture the first served request.
+The checked-in capture patch uses SGLang's bounded same-node message queue for
+TP scheduler traffic; keep `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1` for TP8.
+
 ## External and managed-local services
 
 By default, online capture requires an already-running Mooncake deployment and

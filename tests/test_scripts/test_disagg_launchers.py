@@ -13,9 +13,34 @@ ONLINE = ROOT / "examples" / "disagg" / "run_online.sh"
 OFFLINE = ROOT / "examples" / "disagg" / "run_offline.sh"
 OFFLINE_TWO_NODE = ROOT / "examples" / "disagg" / "run_offline_2node.sh"
 TWO_NODE = ROOT / "examples" / "disagg" / "run_qwen3_8b_dflash_disagg_2node.sh"
+SGLANG_PATCH = ROOT / "patches" / "sglang" / "v0.5.14" / "spec-capture.patch"
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):
+    def test_tp_server_capture_uses_dedicated_message_queue_broadcast(self):
+        patch = SGLANG_PATCH.read_text(encoding="utf-8")
+        self.assertIn(
+            "self.tp_group.broadcast_object(recv_reqs, src=0)",
+            patch,
+        )
+        self.assertIn("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1", patch)
+        self.assertIn("await self.send_to_scheduler.send_pyobj(", patch)
+        self.assertIn("async def _send_one_request(", patch)
+        self.assertEqual(
+            patch.count("await self._send_one_request(tokenized_obj)"),
+            4,
+        )
+        self.assertIn("__specforge_spec_capture_zlib_v1__", patch)
+        self.assertIn("_decompress_spec_capture_reqs", patch)
+        self.assertIn("SpecForge capture IPC send complete", patch)
+        self.assertIn("SpecForge capture IPC receive", patch)
+        self.assertIn("if batch.return_logprob or batch.return_hidden_states:", patch)
+        self.assertEqual(
+            patch.count("capture_len=extend_input_len_per_req[i]"),
+            2,
+        )
+        self.assertIn("if self.output_streamer.ps.attn_tp_rank == 0:", patch)
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="disagg_wrapper_")
         self.root = Path(self._tmp.name)
@@ -144,6 +169,12 @@ class DisaggregatedWrapperTest(unittest.TestCase):
                 "DISAGG_RUN_ROOT": str(shared_root),
                 "DISAGG_CONSUMER_STATE_DIR": str(consumer_state),
                 "DRY_RUN": "1",
+                "SERVER_DISABLE_CUDA_GRAPH": "1",
+                "SERVER_DISABLE_OVERLAP_SCHEDULE": "1",
+                "SERVER_SKIP_WARMUP": "1",
+                "SERVER_MAX_TOTAL_TOKENS": "120064",
+                "SERVER_MAX_PREFILL_TOKENS": "120064",
+                "SERVER_CHUNKED_PREFILL_SIZE": "8192",
             }
         )
         outputs = {}
@@ -162,11 +193,19 @@ class DisaggregatedWrapperTest(unittest.TestCase):
                 outputs[rank] = result.stdout
 
         self.assertIn("mooncake_master", outputs["0"])
+        self.assertIn("--default_kv_lease_ttl=600000", outputs["0"])
         self.assertIn("sglang.launch_server", outputs["0"])
+        self.assertIn("--disable-cuda-graph", outputs["0"])
+        self.assertIn("--disable-overlap-schedule", outputs["0"])
+        self.assertIn("--skip-server-warmup", outputs["0"])
+        self.assertIn("--max-total-tokens 120064", outputs["0"])
+        self.assertIn("--max-prefill-tokens 120064", outputs["0"])
+        self.assertIn("--chunked-prefill-size 8192", outputs["0"])
         self.assertIn("specforge train", outputs["0"])
         self.assertIn("--role producer", outputs["0"])
         self.assertIn("specforge train", outputs["1"])
         self.assertIn("--role consumer", outputs["1"])
+        self.assertIn("unset NODE_RANK", TWO_NODE.read_text())
         self.assertIn(
             "deployment.disaggregated.consumer_state_dir=" + str(consumer_state),
             outputs["1"],

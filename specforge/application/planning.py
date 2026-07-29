@@ -85,6 +85,15 @@ def _validate_algorithm_capabilities(
             f"{sorted(capabilities.attention_backends)}"
         )
     if (
+        algorithm.name == "dspark"
+        and training.attention_backend == "usp"
+        and training.sp_ring_size != 1
+    ):
+        raise ValueError(
+            "DSpark USP currently supports Ulysses sequence parallelism only; "
+            "set training.sp_ring_size=1"
+        )
+    if (
         capabilities.required_batch_size is not None
         and training.batch_size != capabilities.required_batch_size
     ):
@@ -123,6 +132,7 @@ def _validate_algorithm_capabilities(
 
 def _validate_training_topology(
     cfg: Config,
+    algorithm: AlgorithmRegistration,
     mode: FeatureMode,
 ) -> None:
     deployment_mode = cfg.deployment.mode
@@ -154,19 +164,27 @@ def _validate_training_topology(
                 "model.shard_target_output is unavailable with external server "
                 "capture"
             )
-        if (
-            cfg.training.tp_size != 1
-            or cfg.training.sp_ulysses_size != 1
-            or cfg.training.sp_ring_size != 1
-        ):
+        if cfg.training.tp_size != 1:
             raise ValueError(
-                "the disaggregated online consumer uses every trainer rank for "
-                "data parallelism; configure target TP on the external server and "
-                "keep training.tp_size/sp sizes at 1"
+                "the disaggregated online consumer does not implement trainer "
+                "tensor parallelism; configure target TP on the external server "
+                "and keep training.tp_size=1"
+            )
+        sp_size = cfg.training.sp_ulysses_size * cfg.training.sp_ring_size
+        if sp_size > 1 and algorithm.name != "dspark":
+            raise ValueError(
+                "online sequence parallelism is currently implemented only for "
+                "DSpark"
             )
 
-    if cfg.training.attention_backend == "usp" and mode is not FeatureMode.OFFLINE:
-        raise ValueError("USP attention currently requires offline features")
+    if (
+        cfg.training.attention_backend == "usp"
+        and mode is FeatureMode.STREAMING
+        and algorithm.name != "dspark"
+    ):
+        raise ValueError(
+            "online USP attention is currently implemented only for DSpark"
+        )
 
 
 def _validate_vocab_mapping(
@@ -201,7 +219,7 @@ def validate_resolved_run(
     _validate_feature_provider(cfg, algorithm, mode)
     _validate_draft_options(cfg, algorithm)
     _validate_algorithm_capabilities(cfg, algorithm, mode)
-    _validate_training_topology(cfg, mode)
+    _validate_training_topology(cfg, algorithm, mode)
     _validate_vocab_mapping(cfg, algorithm, mode)
 
 

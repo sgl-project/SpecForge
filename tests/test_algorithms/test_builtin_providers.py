@@ -408,6 +408,36 @@ class BuiltinProviderContractTest(unittest.TestCase):
             ):
                 provider.create_input_adapter(object())
 
+    def test_streaming_provider_validates_rank_local_sample_transform(self):
+        def transform(sample):
+            return sample
+
+        provider = ServerStreamingProvider(
+            modality="text",
+            capture_method="dflash",
+            target_representation="hidden_state",
+            layout=ServerCaptureLayout(
+                aux_feature="hidden_states",
+                last_hidden_feature="target_last_hidden_states",
+                passthrough=(),
+            ),
+            build_collator=lambda: None,
+            build_sample_transform=lambda _config: transform,
+        )
+
+        self.assertIs(transform, provider.create_sample_transform(object()))
+
+        invalid = ServerStreamingProvider(
+            modality="text",
+            capture_method="dflash",
+            target_representation="hidden_state",
+            layout=provider.layout,
+            build_collator=lambda: None,
+            build_sample_transform=lambda _config: object(),
+        )
+        with self.assertRaisesRegex(TypeError, "callable transform"):
+            invalid.create_sample_transform(object())
+
     def test_building_catalog_does_not_import_training_or_torch(self):
         code = (
             "import sys; "

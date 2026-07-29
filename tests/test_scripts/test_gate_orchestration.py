@@ -381,7 +381,7 @@ fi
             training,
         )
         self.assertIn(
-            "every trainer rank receives a disjoint feature stream",
+            "DSpark Ulysses peers receive the same reference",
             training,
         )
         self.assertIn(

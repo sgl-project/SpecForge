@@ -32,6 +32,8 @@ NPU, offline, and managed/external-service variants, is in
 | `examples/configs/qwen3-8b-peagle-disaggregated.yaml` | Disaggregated SGLang server capture | P-EAGLE |
 | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` | Disaggregated server capture | DSpark |
 | `examples/configs/qwen3-4b-dspark-offline.yaml` | Precomputed features | DSpark |
+| `examples/configs/glm-5.2-dspark-offline-120k-usp.yaml` | 120K precomputed features with Ulysses-SP8 + FSDP | DSpark |
+| `examples/configs/glm-5.2-dspark-online-120k-usp.yaml` | Live SGLang/Mooncake 120K capture with Ulysses-SP8 + FSDP | DSpark |
 | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
 | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` | Managed local one capture server + DP2 | DFlash |
 | `examples/configs/qwen3.5-4b-dflash-online-npu.yaml` | Disaggregated NPU SGLang capture | DFlash |
@@ -49,9 +51,10 @@ and the HF/custom online backends are intentionally unsupported. Online capture
 is text-only: VLM training, including Qwen2.5-VL, is not supported. Online
 evaluation is also not supported.
 
-The same CLI owns offline DP, EAGLE3 offline USP, and managed capture-server
-topology. Trainer `tp_size` remains 1; target TP belongs to SGLang capture
-servers, and non-USP trainer ranks consume disjoint data. The optional
+The same CLI owns offline DP, EAGLE3/DSpark offline USP, DSpark online USP, and
+managed capture-server topology. Trainer `tp_size` remains 1; target TP belongs to SGLang capture
+servers. Online DSpark USP peers consume rank-local shards of the same captured
+sequence; non-USP trainer ranks consume disjoint data. The optional
 [`run_online.sh`](./disagg/run_online.sh) and
 [`run_offline.sh`](./disagg/run_offline.sh) scripts are thin single-node
 delegates to `specforge train`. The

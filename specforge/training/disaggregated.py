@@ -726,6 +726,9 @@ def _build_online(
     if total_steps is None and cfg.training.max_steps is None:
         total_steps = _read_online_total_steps(cfg, channel_path)
     bundle = build_model_bundle(cfg)
+    accumulation_steps = cfg.training.accumulation_steps
+    if cfg.training.attention_backend == "usp":
+        accumulation_steps *= cfg.training.sp_ulysses_size * cfg.training.sp_ring_size
     trainer = build_disagg_online_consumer(
         algorithm=algorithm,
         modality=modality,
@@ -737,7 +740,7 @@ def _build_online(
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=cfg.training.batch_size,
-        accumulation_steps=cfg.training.accumulation_steps,
+        accumulation_steps=accumulation_steps,
         max_steps=cfg.training.max_steps,
         total_steps=total_steps,
         save_interval=cfg.training.save_interval,
@@ -750,6 +753,7 @@ def _build_online(
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
+        per_sample_transform=streaming.create_sample_transform(cfg),
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
         resume_from=cfg.training.resume_from,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),

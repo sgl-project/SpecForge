@@ -49,6 +49,26 @@ two patched SGLang capture servers, and the trainer GPU allocation; the same
 Disaggregated recipes without `managed_local` keep Mooncake and SGLang external
 for scheduler- or service-managed deployments.
 
+Long-context online captures can take more than Mooncake's 5-second default KV
+lease to reach every sequence-parallel rank. Start an external Mooncake master
+with a suitably long lease, for example
+`--default_kv_lease_ttl=600000` for the 120k DSpark recipe. With the checked-in
+two-node wrapper on H200, also set `SERVER_MEM_FRACTION=0.75` and
+`SERVER_DISABLE_CUDA_GRAPH=1`, disable SGLang's overlapping scheduler with
+`SERVER_DISABLE_OVERLAP_SCHEDULE=1`, skip its synthetic decode warmup with
+`SERVER_SKIP_WARMUP=1`, and cap the otherwise auto-sized KV cache
+with `SERVER_MAX_TOTAL_TOKENS=120064`. This one-step validation does not benefit
+from graph or scheduler-overlap amortization, and the released graph state is
+needed by the 120K capture. The generic 0.85 memory fraction, decode/prefill
+graphs, and full remaining-memory KV cache do not leave enough headroom for
+GLM-5.2's long-context capture payload. Skipping the synthetic warmup also
+ensures the first request through the capture-enabled TP scheduler is the exact
+120K validation sample. The capture patch routes scheduler polling and request
+payloads over SGLang's bounded same-node message queue instead of the TP CPU
+process group. Capture control objects are compressed before tokenizer IPC and
+decompressed on every TP rank after broadcast, while batched delivery is
+awaited; keep `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=1` for TP8.
+
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
 intentionally record their GPU allocation and loopback services. External
@@ -221,8 +241,8 @@ Common fields:
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
-| `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
-| `training.sp_ring_size` | `1` | Ring sequence-parallel factor for offline EAGLE3 USP. |
+| `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3/DSpark or online DSpark USP. |
+| `training.sp_ring_size` | `1` | Ring sequence-parallel factor for offline EAGLE3 USP. DSpark remains Ulysses-only. |
 | `training.dist_timeout` | `10` | Positive distributed-operation timeout in minutes. |
 | `training.save_interval` | `0` | Save every N optimizer steps; 0 disables periodic saves. A final checkpoint is still written. |
 | `training.eval_interval` | `0` | Evaluate every N optimizer steps; 0 disables evaluation. |
@@ -338,6 +358,7 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.mooncake.rdma_devices` | `null` | RDMA-device selection when using RDMA. |
 | `deployment.disaggregated.managed_local.mooncake.global_segment_size_bytes` | `34359738368` | Owned global segment size. |
 | `deployment.disaggregated.managed_local.mooncake.local_buffer_size_bytes` | `1073741824` | Owned local client buffer. |
+| `deployment.disaggregated.managed_local.mooncake.default_kv_lease_ttl_ms` | `600000` | Default Mooncake object-read lease in milliseconds; long captures must remain leased until every consumer rank finishes its transfer. |
 | `deployment.disaggregated.managed_local.mooncake.startup_timeout_s` | `60` | Positive Mooncake readiness timeout. |
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
@@ -402,11 +423,12 @@ unless tuning throughput or memory pressure.
   the finite prompt plan's optimizer horizon and the consumer trains to EOF;
   `max_steps` remains an optional hard cap. Every trainer rank is data parallel,
   so
-  `training.tp_size`, `training.sp_ulysses_size`, and
-  `training.sp_ring_size` must remain 1; configure target TP on each capture
-  server.
-- USP is offline EAGLE3 only, requires `training.batch_size: 1`, and requires
-  `sp_ulysses_size * sp_ring_size > 1`. Non-USP runs keep both SP sizes at 1.
+  `training.tp_size` must remain 1; configure target TP on each capture server.
+  Non-USP ranks are data parallel. Online DSpark may instead group ranks with
+  `sp_ulysses_size > 1`; each group consumes one captured sequence.
+- USP requires `training.batch_size: 1` and
+  `sp_ulysses_size * sp_ring_size > 1`. DSpark supports Ulysses only and keeps
+  `sp_ring_size: 1`. Non-USP runs keep both SP sizes at 1.
 - P-EAGLE reuses the EAGLE3 server feature schema, uses `flex_attention`, and
   requires batch size 1.
 - VLM training, including Qwen2.5-VL, is not supported. Online capture accepts
@@ -441,7 +463,7 @@ For deeper lifecycle and recovery semantics, see the
 | EAGLE3 | consumer DP | DP + USP | consumer DP |
 | DFlash | consumer DP | DP | consumer DP |
 | Domino | consumer DP | DP | consumer DP |
-| DSpark | consumer DP | DP | consumer DP |
+| DSpark | consumer DP + Ulysses SP | DP + Ulysses SP | consumer DP + Ulysses SP |
 | P-EAGLE | consumer DP, batch size 1 | No | No |
 
 `qwen3-8b-dpace-online.yaml` is the D-PACE recipe. It deliberately uses the

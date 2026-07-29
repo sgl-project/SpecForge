@@ -161,7 +161,16 @@ def _finish_registered_draft(
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
 
-    draft_config._attn_implementation = cfg.training.attention_backend
+    attention_backend = cfg.training.attention_backend
+    method_config = dict(getattr(draft_config, "dflash_config", None) or {})
+    method_config["attention_backend"] = attention_backend
+    draft_config.dflash_config = method_config
+    # Ulysses redistributes Q/K/V before invoking the regular local attention
+    # kernel.  It is a SpecForge topology, not a Transformers attention
+    # implementation registered in ALL_ATTENTION_FUNCTIONS.
+    draft_config._attn_implementation = (
+        "flex_attention" if attention_backend == "usp" else attention_backend
+    )
     draft_model = AutoDraftModel.from_config(
         draft_config,
         torch_dtype=_torch_dtype(cfg),

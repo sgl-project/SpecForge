@@ -11,7 +11,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, List, Mapping, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, List, Mapping, Optional
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.runtime.contracts import SampleRef
@@ -333,35 +334,59 @@ def _checkpoint_global_step(resume_from: str) -> int:
     return int(state.get("global_step", 0) or 0)
 
 
-def _dp_consumer_layout(
+@dataclass(frozen=True)
+class _OnlineConsumerLayout:
+    rank: int
+    world_size: int
+    dp_rank: int
+    dp_size: int
+    sp_rank: int
+    sp_size: int
+
+
+def _online_consumer_layout(
     dp_rank: Optional[int],
     dp_size: Optional[int],
     tp_size: int,
     sp_ulysses_size: int,
     sp_ring_size: int,
-) -> Tuple[int, int]:
-    """Resolve the online consumer's (dp_rank, dp_size), defaulting from dist.
-
-    The DP online consumer shards DATA across ranks (one inbox each), so its DP
-    width is the whole trainer world.
-    """
+) -> _OnlineConsumerLayout:
+    """Resolve physical ranks and logical draft-DP/SP groups for streaming."""
     import torch.distributed as dist
 
     initialized = dist.is_available() and dist.is_initialized()
-    if dp_size is None:
-        dp_size = dist.get_world_size() if initialized else 1
-    if dp_rank is None:
-        dp_rank = dist.get_rank() if initialized else 0
-    if dp_size > 1 and (tp_size != 1 or sp_ulysses_size != 1 or sp_ring_size != 1):
-        raise NotImplementedError(
-            "the online disaggregated consumer assigns one inbox to every "
-            "trainer rank; nested target TP or draft SP is not supported "
-            f"(tp={tp_size}, sp_ulysses={sp_ulysses_size}, "
-            f"sp_ring={sp_ring_size})"
+    world_size = dist.get_world_size() if initialized else int(dp_size or 1)
+    rank = dist.get_rank() if initialized else int(dp_rank or 0)
+    if dp_size is not None and int(dp_size) != world_size:
+        raise ValueError(
+            f"online consumer: dp_size={dp_size} but the process group has "
+            f"{world_size} ranks"
         )
-    if not 0 <= dp_rank < dp_size:
-        raise ValueError(f"dp_rank {dp_rank} out of range for dp_size {dp_size}")
-    return dp_rank, dp_size
+    if dp_rank is not None and int(dp_rank) != rank:
+        raise ValueError(
+            f"online consumer: dp_rank={dp_rank} but process-group rank is {rank}"
+        )
+    if tp_size != 1:
+        raise NotImplementedError(
+            "the online disaggregated consumer does not implement trainer "
+            f"tensor parallelism (tp={tp_size})"
+        )
+    sp_size = int(sp_ulysses_size) * int(sp_ring_size)
+    if world_size % sp_size:
+        raise ValueError(
+            f"online consumer world_size={world_size} is not divisible by "
+            f"draft SP size {sp_size}"
+        )
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank {rank} out of range for world_size {world_size}")
+    return _OnlineConsumerLayout(
+        rank=rank,
+        world_size=world_size,
+        dp_rank=rank // sp_size,
+        dp_size=world_size // sp_size,
+        sp_rank=rank % sp_size,
+        sp_size=sp_size,
+    )
 
 
 def _normalize_prompt_epochs(prompt_epochs: int) -> int:
@@ -1327,6 +1352,7 @@ def build_disagg_online_consumer(
     eval_interval: int = 0,
     eval_data_factory=None,
     collate_fn=None,
+    per_sample_transform=None,
     idle_timeout_s: Optional[float] = None,
     metadata_store: Optional[MetadataStore] = None,
     metadata_db_path: Optional[str] = None,
@@ -1372,7 +1398,7 @@ def build_disagg_online_consumer(
     actual_rank = dist.get_rank() if distributed else 0
     preflight_exc = None
     try:
-        dp_rank, dp_size = _dp_consumer_layout(
+        layout = _online_consumer_layout(
             dp_rank,
             dp_size,
             tp_size,
@@ -1389,14 +1415,14 @@ def build_disagg_online_consumer(
                 "online consumer feature_store must set retain_on_release=True; "
                 "features are deleted only after an optimizer-boundary durable ack"
             )
-        if distributed and world != dp_size:
+        if distributed and world != layout.world_size:
             raise ValueError(
-                f"online consumer: dp_size={dp_size} but the process group has "
+                f"online consumer: world_size={layout.world_size} but the process group has "
                 f"{world} ranks — every rank must own exactly one inbox"
             )
-        if distributed and actual_rank != dp_rank:
+        if distributed and actual_rank != layout.rank:
             raise ValueError(
-                f"online consumer: dp_rank={dp_rank} but process-group rank is "
+                f"online consumer: rank={layout.rank} but process-group rank is "
                 f"{actual_rank}"
             )
     except BaseException as exc:
@@ -1420,7 +1446,7 @@ def build_disagg_online_consumer(
     distributor = None
     store = None
     setup_exc = None
-    if dp_rank == 0:
+    if layout.rank == 0:
         try:
             store = _resolve_metadata_store(metadata_store, metadata_db_path)
             if store is None or isinstance(store, NoOpMetadataStore):
@@ -1430,6 +1456,7 @@ def build_disagg_online_consumer(
                 is_authority=True,
                 metadata_store=store,
                 feature_store=feature_store,
+                cleanup_local=True,
             )
             skip_ids = None
             requeued_ids = None
@@ -1481,16 +1508,17 @@ def build_disagg_online_consumer(
                 channel,
                 controller,
                 inbox_dir,
-                dp_size,
+                layout.dp_size,
                 feature_store=feature_store,
                 refs_per_rank_step=batch_size * accumulation_steps,
                 refs_per_rank_batch=batch_size,
+                sp_size=layout.sp_size,
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
             )
             channel.publish_consumer_quantum(
-                dp_size * batch_size * accumulation_steps,
+                layout.dp_size * batch_size * accumulation_steps,
                 allow_existing=resume_from is not None,
             )
         except BaseException as exc:
@@ -1502,23 +1530,24 @@ def build_disagg_online_consumer(
         dist.broadcast_object_list(payload, src=0)
         setup_error = payload[0]
     if setup_error is not None:
-        if dp_rank == 0 and store is not None and hasattr(store, "close"):
+        if layout.rank == 0 and store is not None and hasattr(store, "close"):
             store.close()
         if not distributed or world == 1:
             raise setup_exc
         raise RuntimeError(f"online consumer rank-0 setup failed: {setup_error}")
 
-    if dp_rank != 0:
+    if layout.rank != 0:
         controller = DPAckController(
             run_id,
             is_authority=False,
             metadata_store=InMemoryMetadataStore(),
             feature_store=feature_store,
+            cleanup_local=layout.sp_rank == 0,
         )
 
     # The successful rank-0 setup broadcast guarantees inbox recreation and the
     # optimizer-window sidecar are visible before any rank opens its reader.
-    inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
+    inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, layout.rank))
     queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
 
     drain_state = {"attempted": False}
@@ -1551,7 +1580,7 @@ def build_disagg_online_consumer(
                 "online consumer could not drain rank-local feature removals: "
                 f"{cleanup_error}"
             )
-        if dp_rank == 0:
+        if layout.rank == 0:
             channel.mark_consumer_done()
 
     def mark_consumer_failed(exc: BaseException) -> None:
@@ -1625,7 +1654,7 @@ def build_disagg_online_consumer(
             log_interval=log_interval,
             collate_fn=_streaming_collate(algorithm, modality, collate_fn),
             strategy_kwargs=strategy_kwargs,
-            per_sample_transform=None,
+            per_sample_transform=per_sample_transform,
             max_checkpoints=max_checkpoints,
             tp_size=tp_size,
             sp_ulysses_size=sp_ulysses_size,

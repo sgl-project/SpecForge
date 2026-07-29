@@ -441,6 +441,35 @@ class TestRefDistributor(unittest.TestCase):
         _pump_until_quiet(dist)
         self.assertEqual(self.producer.consumed_remote(), 4)
 
+    def test_sp_groups_receive_shared_refs_and_ack_each_source_ref_once(self):
+        dist = self._distributor(dp_size=2, sp_size=2)
+        for i in range(4):
+            self.producer.publish(_ref(f"s{i}"))
+        _pump_until_quiet(dist)
+
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s2"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s0", "s2"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 2), ["s1", "s3"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 3), ["s1", "s3"])
+
+        queues = [
+            StreamingRefQueue(
+                StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            )
+            for rank in range(4)
+        ]
+        queues[0].ack(queues[0].get(2))
+        _pump_until_quiet(dist)
+        self.assertEqual(self.producer.consumed_remote(), 0)
+        queues[1].ack(queues[1].get(2))
+        _pump_until_quiet(dist)
+        self.assertEqual(self.producer.consumed_remote(), 2)
+        queues[2].ack(queues[2].get(2))
+        queues[3].ack(queues[3].get(2))
+        _pump_until_quiet(dist)
+        self.assertEqual(self.producer.consumed_remote(), 4)
+        self.assertEqual(self.producer.in_flight_remote(), 0)
+
     def test_stale_inbox_files_recreated_fresh(self):
         os.makedirs(self.inbox_dir, exist_ok=True)
         stale = RefDistributor.inbox_path(self.inbox_dir, 0)
@@ -732,6 +761,32 @@ class TestDPAckController(unittest.TestCase):
         self.assertEqual(reason, "optimizer-boundary-durable-ack")
         controller.store.close()
 
+    def test_durable_ack_prefers_completed_reader_cleanup_hook(self):
+        calls = []
+
+        class FeatureStore:
+            def abort(self, sample_id, *, reason):
+                calls.append(("ordinary", sample_id, reason))
+
+            def abort_after_durable_ack(self, sample_id, *, reason):
+                calls.append(("durable", sample_id, reason))
+
+        controller = DPAckController(
+            "run0",
+            is_authority=True,
+            feature_store=FeatureStore(),
+            metadata_store=SQLiteMetadataStore(os.path.join(self.dir, "force.db")),
+        )
+        controller.commit_samples("w0", [_ref("s0")])
+
+        controller.ack_train_refs("t0", ["s0"], global_step=1, optimizer_durable=True)
+
+        self.assertEqual(
+            calls,
+            [("durable", "s0", "optimizer-boundary-durable-ack")],
+        )
+        controller.store.close()
+
     def test_non_authority_participates_but_records_nothing(self):
         calls = []
 
@@ -743,6 +798,21 @@ class TestDPAckController(unittest.TestCase):
         controller.ack_train_refs("t0", ["s0"], global_step=1, optimizer_durable=True)
         self.assertEqual(calls, [["s0"]])  # joined the collective
         self.assertEqual(controller.store.durable_marker()["acked"], set())
+
+    def test_non_leader_sp_peer_skips_duplicate_feature_cleanup(self):
+        feature_store = _AbortStore()
+        controller = DPAckController(
+            "run0",
+            is_authority=False,
+            feature_store=feature_store,
+            cleanup_local=False,
+        )
+
+        controller.ack_train_refs(
+            "t0", ["shared"], global_step=1, optimizer_durable=True
+        )
+
+        self.assertEqual(feature_store.aborted, [])
 
     def test_gather_id_union_without_dist_is_identity(self):
         self.assertEqual(gather_id_union(["a", "b"]), ["a", "b"])

@@ -36,7 +36,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
                     "hidden_states",
                     "target_last_hidden_states",
                 },
-                {"eager", "sdpa", "flex_attention"},
+                {"eager", "sdpa", "flex_attention", "usp"},
                 None,
             ),
             "eagle3": (
@@ -258,6 +258,61 @@ class BuiltinProviderParityTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "mismatched sequence lengths"):
             normalize(raw)
+
+    def test_dspark_usp_normalizer_shards_and_pads_absolute_positions(self):
+        from specforge.algorithms.common.dflash_family_data import (
+            normalize_dspark_offline_sample_usp,
+        )
+
+        raw = {
+            "input_ids": torch.arange(1, 8),
+            "loss_mask": torch.ones(7, dtype=torch.long),
+            "hidden_states": torch.arange(28).reshape(1, 7, 4),
+            "target_last_hidden_states": torch.arange(35).reshape(1, 7, 5),
+        }
+        rank0 = normalize_dspark_offline_sample_usp(raw, 7, sp_rank=0, sp_size=2)
+        rank1 = normalize_dspark_offline_sample_usp(raw, 7, sp_rank=1, sp_size=2)
+
+        self.assertEqual((1, 4), tuple(rank0["input_ids"].shape))
+        self.assertEqual([1, 2, 3, 4], rank0["input_ids"][0].tolist())
+        self.assertEqual([5, 6, 7, 0], rank1["input_ids"][0].tolist())
+        self.assertEqual([1, 1, 1, 0], rank1["attention_mask"][0].tolist())
+        self.assertEqual([4, 5, 6, 7], rank1["position_ids"][0].tolist())
+        self.assertEqual((1, 4, 5), tuple(rank1["target_last_hidden_states"].shape))
+
+        batch = (
+            self.registry.resolve("dspark")
+            .providers.offline_for("text")
+            .build_collator()([rank1])
+        )
+        self.assertEqual(
+            {
+                "input_ids",
+                "loss_mask",
+                "hidden_states",
+                "target_last_hidden_states",
+                "attention_mask",
+                "position_ids",
+            },
+            set(batch),
+        )
+
+    def test_dspark_usp_normalizer_accepts_server_batched_token_rows(self):
+        from specforge.algorithms.common.dflash_family_data import (
+            normalize_dspark_offline_sample_usp,
+        )
+
+        raw = {
+            "input_ids": torch.arange(1, 8).unsqueeze(0),
+            "loss_mask": torch.ones(1, 7, dtype=torch.long),
+            "hidden_states": torch.arange(28).reshape(1, 7, 4),
+            "target_last_hidden_states": torch.arange(35).reshape(1, 7, 5),
+        }
+
+        rank1 = normalize_dspark_offline_sample_usp(raw, 7, sp_rank=1, sp_size=2)
+
+        self.assertEqual([5, 6, 7, 0], rank1["input_ids"][0].tolist())
+        self.assertEqual([1, 1, 1, 0], rank1["attention_mask"][0].tolist())
 
     def test_dspark_offline_reader_exposes_both_target_feature_sets(self):
         provider = self.registry.resolve("dspark").providers.offline_for("text")

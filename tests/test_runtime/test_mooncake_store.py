@@ -38,6 +38,7 @@ class _FakeMooncakeStore:
         self.lease_defer = False  # remove() returns ok but keeps bytes (Mooncake lease)
         self.put_calls = 0
         self.remove_calls = 0
+        self.force_remove_calls = 0
 
     def is_exist(self, key):
         return 1 if key in self._d else 0
@@ -63,11 +64,12 @@ class _FakeMooncakeStore:
         ctypes.memmove(ptr, data, n)  # DMA-equivalent write into dst
         return n
 
-    def remove(self, key):
+    def remove(self, key, force=False):
         self.remove_calls += 1
+        self.force_remove_calls += int(force)
         if self.fail_remove:
             return -1
-        if self.lease_defer:
+        if self.lease_defer and not force:
             return 0  # report success but keep the object (lease-deferred free)
         self._d.pop(key, None)
         return 0
@@ -406,6 +408,18 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertTrue(_phys_resident(fake))  # bytes physically linger
         with self.assertRaises(KeyError):
             fs.get(ref)  # logically aborted -> KeyError (no use-after-free)
+
+    def test_durable_ack_force_remove_bypasses_completed_read_lease(self):
+        fake = _FakeMooncakeStore()
+        fake.lease_defer = True
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        fs.abort_after_durable_ack("s0")
+
+        self.assertFalse(_phys_resident(fake))
+        self.assertEqual(fake.force_remove_calls, len(ref.feature_specs))
+        self.assertEqual(fs.health()["release_pending"], 0)
 
 
 class TestMooncakeFeatureStoreWireContract(unittest.TestCase):
