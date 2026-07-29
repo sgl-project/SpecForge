@@ -11,7 +11,11 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-NODE_RANK="${NODE_RANK:-${RCLI_NODE_RANK:-}}"
+# NODE_RANK is also consumed by the unified training launch plan. Capture the
+# physical orchestration rank, then remove it from child environments because
+# this wrapper intentionally starts a single-node trainer on physical rank 1.
+ORCHESTRATION_NODE_RANK="${NODE_RANK:-${RCLI_NODE_RANK:-}}"
+unset NODE_RANK
 NUM_NODES="${NUM_NODES:-${RCLI_NUM_NODES:-}}"
 HEAD_IP="${HEAD_IP:-${RCLI_HEAD_IP:-}}"
 RUN_ID="${DISAGG_STORE_ID:-}"
@@ -46,7 +50,8 @@ TRAINING_CONSUMER_PID=""
 TRAINING_RESULT=1
 
 log() {
-    printf '[qwen3-8b-dflash-2node][rank=%s] %s\n' "${NODE_RANK:-?}" "$*"
+    printf '[qwen3-8b-dflash-2node][rank=%s] %s\n' \
+        "${ORCHESTRATION_NODE_RANK:-?}" "$*"
 }
 
 fail() {
@@ -117,7 +122,8 @@ print_command() {
 
 validate_identity() {
     [[ "$NUM_NODES" == "2" ]] || fail "NUM_NODES/RCLI_NUM_NODES must be 2"
-    [[ "$NODE_RANK" == "0" || "$NODE_RANK" == "1" ]] || \
+    [[ "$ORCHESTRATION_NODE_RANK" == "0" || \
+        "$ORCHESTRATION_NODE_RANK" == "1" ]] || \
         fail "NODE_RANK/RCLI_NODE_RANK must be 0 or 1"
     [[ -n "$HEAD_IP" ]] || fail "HEAD_IP/RCLI_HEAD_IP is required"
     [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || \
@@ -340,7 +346,7 @@ main() {
     validate_identity
     export_common_environment
     cd "$ROOT_DIR"
-    case "$NODE_RANK" in
+    case "$ORCHESTRATION_NODE_RANK" in
         0) run_inference_node "$@" ;;
         1) run_training_node "$@" ;;
     esac

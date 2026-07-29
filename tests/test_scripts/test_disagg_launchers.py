@@ -168,6 +168,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("--role producer", outputs["0"])
         self.assertIn("specforge train", outputs["1"])
         self.assertIn("--role consumer", outputs["1"])
+        self.assertIn("unset NODE_RANK", TWO_NODE.read_text())
         self.assertIn(
             "deployment.disaggregated.consumer_state_dir=" + str(consumer_state),
             outputs["1"],
