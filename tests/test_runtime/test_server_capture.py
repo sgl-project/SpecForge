@@ -106,7 +106,12 @@ class _StubCaptureServer:
     def __call__(self, url: str, json_body: Dict[str, Any], timeout: float):
         assert url.endswith("/generate")
         rows: List[Dict[str, Any]] = []
-        for input_ids, spec in zip(json_body["input_ids"], json_body["spec_capture"]):
+        input_rows = json_body["input_ids"]
+        capture_specs = json_body["spec_capture"]
+        if isinstance(capture_specs, dict):
+            input_rows = [input_rows]
+            capture_specs = [capture_specs]
+        for input_ids, spec in zip(input_rows, capture_specs):
             sid, gen = spec["sample_id"], int(spec["gen"])
             if sid in self.error_sample_ids:
                 rows.append(
@@ -287,6 +292,26 @@ def _mk(
 
 
 class TestServerCaptureAdapter(unittest.TestCase):
+    def test_one_item_default_request_uses_sglang_single_shape(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+        posted = []
+
+        def recording_server(url, json_body, timeout):
+            posted.append(json_body)
+            return server(url, json_body, timeout)
+
+        _, _, _, adapter = _mk(server=recording_server, backend=backend)
+        task = _task(0, 5)
+
+        (ref,) = adapter.produce_refs([task], capture=_eagle3_contract())
+
+        self.assertIsInstance(ref, SampleRef)
+        request = posted[0]
+        self.assertEqual(task.payload["input_ids"], request["input_ids"])
+        self.assertIsInstance(request["spec_capture"], dict)
+        self.assertIsInstance(request["extra_key"], str)
+
     def test_generic_adapter_inputs_merge_with_runtime_owned_request_fields(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend)
@@ -564,8 +589,8 @@ class TestServerCaptureAdapter(unittest.TestCase):
         cache_keys = []
 
         def lose_first_response(url, json_body, timeout):
-            requests.append(json_body["spec_capture"][0])
-            cache_keys.append(json_body["extra_key"][0])
+            requests.append(json_body["spec_capture"])
+            cache_keys.append(json_body["extra_key"])
             response = original_post(url, json_body, timeout)
             if len(requests) == 1:
                 raise ConnectionError("response lost after server write")

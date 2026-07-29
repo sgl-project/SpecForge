@@ -181,7 +181,11 @@ class SGLangServerCaptureAdapter:
         """Build only model-input fields, keeping transport keys runtime-owned."""
 
         if self.request_input_adapter is None:
-            return {"input_ids": [list(task.payload["input_ids"]) for task in tasks]}
+            input_rows = [list(task.payload["input_ids"]) for task in tasks]
+            # Preserve SGLang's single-request representation for a one-item
+            # lease.  Wrapping it in another list selects the batch IPC path,
+            # even though there is no batch to amortize.
+            return {"input_ids": input_rows[0] if len(input_rows) == 1 else input_rows}
         request_inputs = self.request_input_adapter.build_request_inputs(tasks)
         if not isinstance(request_inputs, Mapping):
             raise TypeError(
@@ -322,10 +326,14 @@ class SGLangServerCaptureAdapter:
         # leaving SGLang free to use the radix data structure required by hybrid
         # targets. Retries need a new key because the prior attempt may have
         # populated its namespace before the response was lost.
-        body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
+        single_request = len(tasks) == 1 and self.request_input_adapter is None
+        cache_keys = [uuid.uuid4().hex for _ in tasks]
+        body["extra_key"] = cache_keys[0] if single_request else cache_keys
         body["sampling_params"] = {"temperature": 0.0, "max_new_tokens": 1}
         capture_payloads = [self._spec_capture_payload(t) for t in tasks]
-        body["spec_capture"] = capture_payloads
+        body["spec_capture"] = (
+            capture_payloads[0] if single_request else capture_payloads
+        )
         for payload in capture_payloads:
             feature_names = list(payload["features"].values())
             feature_names.extend(
