@@ -34,6 +34,14 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("_decompress_spec_capture_reqs", patch)
         self.assertIn("SpecForge capture IPC send complete", patch)
         self.assertIn("SpecForge capture IPC receive", patch)
+        self.assertIn(
+            "if batch.return_logprob or batch.return_hidden_states:", patch
+        )
+        self.assertEqual(
+            patch.count("capture_len=extend_input_len_per_req[i]"),
+            2,
+        )
+        self.assertIn("if self.output_streamer.ps.attn_tp_rank == 0:", patch)
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="disagg_wrapper_")
@@ -168,6 +176,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
                 "SERVER_SKIP_WARMUP": "1",
                 "SERVER_MAX_TOTAL_TOKENS": "120064",
                 "SERVER_MAX_PREFILL_TOKENS": "120064",
+                "SERVER_CHUNKED_PREFILL_SIZE": "8192",
             }
         )
         outputs = {}
@@ -193,6 +202,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("--skip-server-warmup", outputs["0"])
         self.assertIn("--max-total-tokens 120064", outputs["0"])
         self.assertIn("--max-prefill-tokens 120064", outputs["0"])
+        self.assertIn("--chunked-prefill-size 8192", outputs["0"])
         self.assertIn("specforge train", outputs["0"])
         self.assertIn("--role producer", outputs["0"])
         self.assertIn("specforge train", outputs["1"])
