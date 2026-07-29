@@ -1,0 +1,194 @@
+"""Shared DFlash-family normalization and padding adapters."""
+
+from __future__ import annotations
+
+from functools import partial
+
+from specforge.algorithms.common.collation import pad_and_concatenate_features
+
+NORMALIZER_ID = "dflash_family_offline_v1"
+DSPARK_NORMALIZER_ID = "dspark_offline_v1"
+
+
+def _normalize_hidden_states(
+    raw,
+    key: str,
+    max_len: int,
+    *,
+    description: str,
+):
+    hidden_states = raw[key]
+    if hidden_states.dim() == 3:
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                f"offline {description} must have shape [seq, width] or "
+                f"[1, seq, width], got {tuple(hidden_states.shape)}"
+            )
+        hidden_states = hidden_states.squeeze(0)
+    if hidden_states.dim() != 2:
+        raise ValueError(
+            f"offline {description} must have shape [seq, width] or "
+            f"[1, seq, width], got {tuple(hidden_states.shape)}"
+        )
+    return hidden_states[:max_len].unsqueeze(0)
+
+
+def normalize_offline_sample(raw, max_len: int):
+    """Normalize raw DFlash/Domino capture tensors without target projection."""
+
+    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)
+    hidden_states = _normalize_hidden_states(
+        raw,
+        "hidden_states",
+        max_len,
+        description="DFlash-family hidden_states",
+    )
+    lengths = {
+        input_ids.shape[1],
+        loss_mask.shape[1],
+        hidden_states.shape[1],
+    }
+    if len(lengths) != 1:
+        raise ValueError(
+            "offline DFlash-family features have mismatched sequence lengths "
+            f"after truncation: input_ids={input_ids.shape[1]}, "
+            f"loss_mask={loss_mask.shape[1]}, "
+            f"hidden_states={hidden_states.shape[1]}"
+        )
+    return {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "hidden_states": hidden_states,
+    }
+
+
+def normalize_dspark_offline_sample(raw, max_len: int):
+    """Normalize DSpark capture tensors, including target final-layer states."""
+
+    normalized = normalize_offline_sample(raw, max_len)
+    target_last_hidden_states = _normalize_hidden_states(
+        raw,
+        "target_last_hidden_states",
+        max_len,
+        description="DSpark target_last_hidden_states",
+    )
+    expected_length = normalized["input_ids"].shape[1]
+    if target_last_hidden_states.shape[1] != expected_length:
+        raise ValueError(
+            "offline DSpark features have mismatched sequence lengths after "
+            f"truncation: input_ids={expected_length}, "
+            "target_last_hidden_states="
+            f"{target_last_hidden_states.shape[1]}"
+        )
+    return {
+        **normalized,
+        "target_last_hidden_states": target_last_hidden_states,
+    }
+
+
+def build_offline_reader(
+    strategy,
+    hidden_states_path,
+    *,
+    run_id,
+    ttt_length,
+    max_len,
+):
+    # Transitional runtime import; the composition root will inject this port.
+    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+    return OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        strategy=strategy,
+        feature_keys=("input_ids", "loss_mask", "hidden_states"),
+        target_repr=None,
+        ttt_length=ttt_length,
+        max_len=max_len,
+    )
+
+
+def build_dspark_offline_reader(
+    strategy,
+    hidden_states_path,
+    *,
+    run_id,
+    ttt_length,
+    max_len,
+):
+    # Transitional runtime import; the composition root will inject this port.
+    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+    return OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        strategy=strategy,
+        feature_keys=(
+            "input_ids",
+            "loss_mask",
+            "hidden_states",
+            "target_last_hidden_states",
+        ),
+        target_repr="hidden_state",
+        ttt_length=ttt_length,
+        max_len=max_len,
+    )
+
+
+def build_offline_normalizer(max_len, **_topology):
+    return partial(normalize_offline_sample, max_len=max_len)
+
+
+def build_dspark_offline_normalizer(max_len, **_topology):
+    return partial(normalize_dspark_offline_sample, max_len=max_len)
+
+
+def build_collator():
+    def collate(features):
+        return pad_and_concatenate_features(
+            features,
+            sequence_axes={
+                "input_ids": 1,
+                "loss_mask": 1,
+                "hidden_states": 1,
+            },
+            required_keys=("input_ids", "loss_mask", "hidden_states"),
+        )
+
+    return collate
+
+
+def build_dspark_collator():
+    def collate(features):
+        return pad_and_concatenate_features(
+            features,
+            sequence_axes={
+                "input_ids": 1,
+                "loss_mask": 1,
+                "hidden_states": 1,
+                "target_last_hidden_states": 1,
+            },
+            required_keys=(
+                "input_ids",
+                "loss_mask",
+                "hidden_states",
+                "target_last_hidden_states",
+            ),
+        )
+
+    return collate
+
+
+__all__ = [
+    "DSPARK_NORMALIZER_ID",
+    "NORMALIZER_ID",
+    "build_collator",
+    "build_dspark_collator",
+    "build_dspark_offline_normalizer",
+    "build_dspark_offline_reader",
+    "build_offline_normalizer",
+    "build_offline_reader",
+    "normalize_dspark_offline_sample",
+    "normalize_offline_sample",
+]

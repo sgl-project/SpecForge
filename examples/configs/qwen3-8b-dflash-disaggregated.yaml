@@ -1,0 +1,44 @@
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-dflash.json
+  target_backend: sglang
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 3072
+  chat_template: qwen
+  cache_dir: cache
+  build_dataset_num_proc: 32
+training:
+  strategy: dflash
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 4
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  save_interval: 1000
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: none
+  wandb_project: qwen3-8b-dflash-disagg
+  wandb_name: qwen3-8b-dflash-disagg-dp4
+run_id: qwen3-8b-dflash-disaggregated
+output_dir: outputs/qwen3-8b-dflash-disaggregated
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/qwen3-8b-dflash-disaggregated/control
+    consumer_state_dir: outputs/qwen3-8b-dflash-disaggregated/consumer-state
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp

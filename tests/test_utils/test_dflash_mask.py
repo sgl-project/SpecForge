@@ -2,7 +2,10 @@ import unittest
 
 import torch
 
-from specforge.core.dflash import create_dflash_block_mask, create_dflash_sdpa_mask
+from specforge.algorithms.common.dflash_family_model import (
+    create_dflash_block_mask,
+    create_dflash_sdpa_mask,
+)
 
 
 def _reference_dflash_mask(anchor_positions, block_keep_mask, S, block_size, device):

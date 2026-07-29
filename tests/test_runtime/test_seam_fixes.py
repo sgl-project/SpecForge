@@ -1,21 +1,26 @@
 # coding=utf-8
-"""CPU tests for do-now seam fixes.
+"""CPU tests for runtime and training seams.
 
-Covered here: durable ack, MetadataStore, TrainLease, partition_key,
-ParallelConfig handles, checkpoint record shape, and DFlash plug-in wiring.
+Covered here: durable ack, MetadataStore, ParallelConfig handles,
+checkpoint record shape, and DFlash plug-in wiring.
 """
 
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn as nn
 
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.control_plane import DataFlowController, InMemoryMetadataStore
-from specforge.runtime.training.backend import ParallelConfig, TrainingBackend
-from specforge.runtime.training.strategy import DFlashTrainStrategy
-from specforge.runtime.training.trainer import TrainerController, TrainerCore
+from specforge.training.backend import (
+    FSDPTrainingBackend,
+    ParallelConfig,
+    TrainingBackend,
+)
+from specforge.training.controller import TrainerController, TrainerCore
+from specforge.training.strategies.base import DFlashTrainStrategy
 
 
 def _ref(i):
@@ -33,8 +38,9 @@ def _ref(i):
 class TestDurableAckTransaction(unittest.TestCase):
     def test_ack_records_durable_marker(self):
         ctrl = DataFlowController("run")
-        ctrl.enqueue_offline_refs([_ref(0), _ref(1)])
-        leased = ctrl.lease_train_refs("t0", 8)
+        refs = [_ref(0), _ref(1)]
+        ctrl.commit_samples("ref-distributor", refs)
+        leased = ctrl.sample_queue.get(2)
         ctrl.ack_train_refs(
             "t0", [r.sample_id for r in leased], global_step=7, optimizer_durable=True
         )
@@ -45,14 +51,16 @@ class TestDurableAckTransaction(unittest.TestCase):
         st = ctrl.status()
         self.assertEqual(st["durable_global_step"], 7)
         self.assertEqual(st["durable_acked"], 2)
-        self.assertEqual(ctrl.sample_queue.in_flight(), 0)  # queue released too
+        self.assertEqual(ctrl.sample_queue.depth(), 0)
 
-    def test_ack_without_step_still_releases(self):
+    def test_ack_without_step_records_ids_only(self):
         ctrl = DataFlowController("run")
-        ctrl.enqueue_offline_refs([_ref(0)])
-        leased = ctrl.lease_train_refs("t0", 8)
-        ctrl.ack_train_refs("t0", [r.sample_id for r in leased])  # no global_step
-        self.assertEqual(ctrl.sample_queue.in_flight(), 0)
+        ctrl.commit_samples("ref-distributor", [_ref(0)])
+        ctrl.sample_queue.get(1)
+        ctrl.ack_train_refs("t0", ["s0"])
+        marker = ctrl.store.durable_marker()
+        self.assertEqual(marker["acked"], {"s0"})
+        self.assertIsNone(marker["global_step"])
 
 
 class TestMetadataStore(unittest.TestCase):
@@ -63,47 +71,40 @@ class TestMetadataStore(unittest.TestCase):
         self.assertEqual(s.committed_count(), 1)
 
 
-class TestTrainLease(unittest.TestCase):
-    def test_lease_ack_route_through_controller(self):
-        ctrl = DataFlowController("run")
-        ctrl.enqueue_offline_refs([_ref(0), _ref(1)])
-        lease = ctrl.train_lease("t0")
-        refs = lease.get(8)
-        self.assertEqual({r.sample_id for r in refs}, {"s0", "s1"})
-        lease.ack(refs, global_step=3)
-        self.assertEqual(ctrl.store.durable_marker()["global_step"], 3)
-        self.assertEqual(ctrl.sample_queue.in_flight(), 0)
-
-
-class TestQueuePartitionKey(unittest.TestCase):
-    def test_partition_key_accepted(self):
-        from specforge.runtime.data_plane import SampleRefQueue
-
-        q = SampleRefQueue()
-        q.put([_ref(0)], partition_key="dp0")  # reserved seam, no-op
-        got = q.get(4, timeout_s=0.0, partition_key="dp0")
-        self.assertEqual(len(got), 1)
-
-
 class TestParallelConfigHandles(unittest.TestCase):
-    def test_carries_all_parallel_fields(self):
-        pc = ParallelConfig()
-        for f in (
-            "tp_group",
-            "sp_ulysses_group",
-            "sp_ring_group",
-            "draft_sp_group",
-            "device_mesh",
-            "dp_group",
-            "draft_dp_group",
-        ):
-            self.assertTrue(hasattr(pc, f), f"ParallelConfig missing {f}")
+    def test_carries_target_and_draft_parallel_state(self):
+        pc = ParallelConfig(tp_size=2, sp_ulysses_size=2, sp_ring_size=2)
+        self.assertIsNone(pc.fsdp_process_group)
+        self.assertEqual(pc.sharding_strategy, "SHARD_GRAD_OP")
+        self.assertEqual(pc.tp_size, 2)
+        self.assertEqual(pc.sp_size, 4)
 
     def test_from_distributed_no_dist(self):
-        pc = ParallelConfig.from_distributed(tp_size=2, sp_ulysses_size=2)
-        self.assertEqual(pc.world_size, 1)  # no dist -> safe defaults
+        # Keep this test independent of process groups initialized by earlier
+        # GPU launcher tests in the same unittest process.
+        with mock.patch(
+            "specforge.training.backend.dist.is_initialized", return_value=False
+        ):
+            pc = ParallelConfig.from_distributed(tp_size=2, sp_ulysses_size=2)
+        self.assertIsNone(pc.fsdp_process_group)
+        self.assertEqual(pc.world_size, 1)
         self.assertEqual(pc.tp_size, 2)
         self.assertEqual(pc.sp_size, 2)
+
+    def test_frozen_target_tables_are_ignored_by_fsdp(self):
+        class Composite(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 8, bias=False)
+                self.embed_tokens = nn.Embedding(8, 4)
+                self.draft = nn.Linear(4, 4, bias=False)
+                self.lm_head.requires_grad_(False)
+                self.embed_tokens.requires_grad_(False)
+
+        model = Composite()
+        ignored = FSDPTrainingBackend._frozen_target_modules(model)
+
+        self.assertEqual(ignored, (model.lm_head, model.embed_tokens))
 
 
 class _FakeBackend(TrainingBackend):
@@ -117,7 +118,7 @@ class _FakeBackend(TrainingBackend):
         self.module = model
         return model
 
-    def backward(self, loss):
+    def backward(self, loss, *, is_boundary=True):
         loss.backward()
 
     def step(self):
@@ -125,7 +126,11 @@ class _FakeBackend(TrainingBackend):
         return torch.tensor(1.0)
 
     def state_dict(self):
-        return {"draft_model.w": self.model.w.detach().clone()}
+        return {
+            "model": {"draft_model.w": self.model.w.detach().clone()},
+            "optimizer": None,
+            "rng": {},
+        }
 
     def load_state_dict(self, state):
         pass
@@ -137,9 +142,10 @@ class _FakeDFlashModel(nn.Module):
         self.w = nn.Parameter(torch.ones(1))
 
     def forward(self, input_ids, hidden_states, loss_mask):
+        # mirrors OnlineDFlashModel's (loss, accuracy, metrics) contract
         loss = (self.w * hidden_states.float().sum()).abs()
         acc = torch.tensor(0.5)
-        return loss, acc
+        return loss, acc, {"accuracy_denom": loss_mask.sum()}
 
 
 class TestDFlashSharesLifecycle(unittest.TestCase):
@@ -162,6 +168,9 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
         self.assertTrue(rep.optimizer_stepped)  # optimizer stepped via the shared core
         self.assertEqual(backend.steps, 1)
         self.assertAlmostEqual(rep.metrics["acc"], 0.5)
+        out = strat.forward_loss(batch)
+        self.assertAlmostEqual(float(out.metrics["accuracy"]), 0.5)
+        self.assertEqual(float(out.metrics["accuracy_denom"]), 4.0)
 
     def test_dflash_validate_batch_rejects_missing(self):
         strat = DFlashTrainStrategy(_FakeDFlashModel())

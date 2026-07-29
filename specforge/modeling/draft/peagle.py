@@ -13,8 +13,10 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaMLP,
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
+    get_rope_config,
     rotate_half,
 )
+from specforge.modeling.draft.registry import register_draft
 
 
 class PEagleAttention(nn.Module):
@@ -170,6 +172,7 @@ class PEagleStandardLayer(nn.Module):
         return hidden_states
 
 
+@register_draft
 class PEagleDraftModel(Eagle3DraftModel):
     """P-EAGLE draft model with multi-layer architecture.
 
@@ -184,9 +187,14 @@ class PEagleDraftModel(Eagle3DraftModel):
     def __init__(
         self,
         config: LlamaConfig,
-        norm_before_residual: bool = False,
+        norm_before_residual: Optional[bool] = None,
     ) -> None:
         super().__init__(config)
+        if norm_before_residual is None:
+            norm_before_residual = getattr(config, "norm_before_residual", False)
+        norm_before_residual = bool(norm_before_residual)
+        config.architectures = [type(self).__name__]
+        config.norm_before_residual = norm_before_residual
         self.config = config
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
@@ -212,12 +220,13 @@ class PEagleDraftModel(Eagle3DraftModel):
             layers.append(PEagleStandardLayer(config))
         self.layers = nn.ModuleList(layers)
 
+        rope_theta, _ = get_rope_config(config)
         self.rotary_emb = LlamaRotaryEmbedding(
             dim=getattr(
                 config, "head_dim", config.hidden_size // config.num_attention_heads
             ),
             max_position_embeddings=config.max_position_embeddings,
-            base=getattr(config, "rope_theta", 10000),
+            base=rope_theta,
         )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -227,6 +236,31 @@ class PEagleDraftModel(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+    def _rebuild_rotary_embedding(self) -> None:
+        """Recreate non-persistent RoPE buffers after low-memory HF loading."""
+        reference = self.fc.weight
+        rope_theta, _ = get_rope_config(self.config)
+        rotary_emb = LlamaRotaryEmbedding(
+            dim=getattr(
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            ),
+            max_position_embeddings=self.config.max_position_embeddings,
+            base=rope_theta,
+            device=reference.device,
+        )
+        self.rotary_emb = rotary_emb.to(
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        model = super().from_pretrained(*args, **kwargs)
+        model._rebuild_rotary_embedding()
+        return model
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

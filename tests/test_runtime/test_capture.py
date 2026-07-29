@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from specforge.runtime.inference.capture import (
+from specforge.inference.capture import (
     CaptureConfig,
     CaptureMismatchError,
     verify_capture,

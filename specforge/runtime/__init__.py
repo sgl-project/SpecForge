@@ -6,9 +6,10 @@ A DataFlow-centered layer over the existing SpecForge model/data code:
     PromptTask -> RolloutWorker -> SampleRef -> FeatureDataLoader -> TrainBatch -> Trainer
 
 The control plane (controller, queues) moves only metadata; large tensors move
-only through the data plane (FeatureStore). This top-level module re-exports the
-dependency-light contracts. The ``training`` and ``inference`` subpackages pull
-in the model code and are imported explicitly by callers, not at package load.
+only through the data plane (FeatureStore). This module re-exports the
+dependency-light contracts. The compute planes live in the top-level
+``specforge.training`` and ``specforge.inference`` packages and are imported
+explicitly by callers, not at runtime package load.
 """
 
 from specforge.runtime.contracts import (  # noqa: F401

@@ -5,10 +5,11 @@ import unittest
 
 import torch
 
+from specforge.inference.batch_partition import TargetBatchPartition
+from specforge.inference.capture import CaptureConfig
+from specforge.inference.rollout_worker import RolloutWorker
 from specforge.runtime.control_plane import DataFlowController
 from specforge.runtime.data_plane import LocalFeatureStore
-from specforge.runtime.inference.capture import CaptureConfig
-from specforge.runtime.inference.rollout_worker import RolloutWorker
 
 H = 8
 
@@ -30,15 +31,17 @@ def _capture(layer_ids=(1, 2, 3)):
 
 
 class FakeSource:
-    """Stand-in for SGLangAdapter: returns per-sample feature dicts."""
+    """Stand-in for a FeatureSource: returns per-sample feature dicts."""
 
     def __init__(self, seq=4, target_dim=32, aux_layers=3, bad_layers=False):
         self.seq = seq
         self.target_dim = target_dim
         self.aux_layers = aux_layers
         self.bad_layers = bad_layers
+        self.task_batches = []
 
     def generate_features(self, tasks, *, capture):
+        self.task_batches.append([task.task_id for task in tasks])
         out = []
         for _ in tasks:
             feats = {
@@ -71,6 +74,15 @@ class MixedLayerSource(FakeSource):
         return out
 
 
+class ShardedSource(FakeSource):
+    def __init__(self, partition):
+        super().__init__()
+        self.partition = partition
+
+    def generate_features(self, tasks, *, capture):
+        return super().generate_features(self.partition.select(tasks), capture=capture)
+
+
 class TestRolloutWorker(unittest.TestCase):
     def test_run_once_commits_refs(self):
         ctrl = DataFlowController("run")
@@ -98,7 +110,7 @@ class TestRolloutWorker(unittest.TestCase):
             ctrl, store, FakeSource(bad_layers=True), _capture(), run_id="run"
         )
         w.start()
-        from specforge.runtime.inference.capture import CaptureMismatchError
+        from specforge.inference.capture import CaptureMismatchError
 
         with self.assertRaises(CaptureMismatchError):
             w.run_once(max_tasks=8)
@@ -113,7 +125,7 @@ class TestRolloutWorker(unittest.TestCase):
         store = LocalFeatureStore("st")
         w = RolloutWorker(ctrl, store, MixedLayerSource(), _capture(), run_id="run")
         w.start()
-        from specforge.runtime.inference.capture import CaptureMismatchError
+        from specforge.inference.capture import CaptureMismatchError
 
         with self.assertRaises(CaptureMismatchError):
             w.run_once(max_tasks=8)
@@ -154,6 +166,88 @@ class TestRolloutWorker(unittest.TestCase):
         w = RolloutWorker(ctrl, store, FakeSource(), _capture(), run_id="run")
         w.start()
         self.assertEqual(w.run_once(8), [])
+
+    def test_target_tp_ranks_capture_same_batch_and_commit_disjoint_shards(self):
+        prompts = [
+            {"task_id": f"task-{index}", "payload": {"text": str(index)}}
+            for index in range(8)
+        ]
+        committed = []
+        captured = []
+        for rank in range(4):
+            ctrl = DataFlowController("run")
+            ctrl.ingest_prompts(prompts)
+            store = LocalFeatureStore(f"st-{rank}")
+            source = FakeSource()
+            worker = RolloutWorker(
+                ctrl,
+                store,
+                source,
+                _capture(),
+                run_id="run",
+                batch_partition=TargetBatchPartition(rank=rank, size=4),
+            )
+            worker.start()
+            refs = worker.run_once(max_tasks=8)
+            captured.append(source.task_batches[0])
+            committed.extend(ref.source_task_id for ref in refs)
+            self.assertEqual(len(refs), 2)
+            self.assertEqual(ctrl.status()["prompts"], 0)
+            self.assertEqual(ctrl.status()["prompts_failed"], 0)
+
+        self.assertEqual(captured, [captured[0]] * 4)
+        self.assertEqual(sorted(committed), [f"task-{index}" for index in range(8)])
+
+    def test_backend_sharded_source_returns_only_local_records(self):
+        partition = TargetBatchPartition(rank=1, size=2)
+        ctrl = DataFlowController("run")
+        ctrl.ingest_prompts(
+            [
+                {"task_id": f"task-{index}", "payload": {"text": str(index)}}
+                for index in range(4)
+            ]
+        )
+        store = LocalFeatureStore("st")
+        source = ShardedSource(partition)
+        worker = RolloutWorker(
+            ctrl,
+            store,
+            source,
+            _capture(),
+            run_id="run",
+            batch_partition=partition,
+            feature_source_returns_local_batch=True,
+        )
+        worker.start()
+
+        refs = worker.run_once(max_tasks=4)
+
+        self.assertEqual([ref.source_task_id for ref in refs], ["task-2", "task-3"])
+        self.assertEqual(ctrl.status()["prompts"], 0)
+
+    def test_target_tp_drops_incomplete_capture_batch_on_every_rank(self):
+        ctrl = DataFlowController("run")
+        ctrl.ingest_prompts(
+            [
+                {"task_id": f"task-{index}", "payload": {"text": str(index)}}
+                for index in range(3)
+            ]
+        )
+        source = FakeSource()
+        worker = RolloutWorker(
+            ctrl,
+            LocalFeatureStore("st"),
+            source,
+            _capture(),
+            run_id="run",
+            batch_partition=TargetBatchPartition(rank=0, size=4),
+        )
+        worker.start()
+
+        self.assertEqual(worker.run_once(max_tasks=8), [])
+        self.assertEqual(source.task_batches, [])
+        self.assertEqual(ctrl.status()["prompts"], 0)
+        self.assertEqual(ctrl.status()["prompts_failed"], 0)
 
 
 if __name__ == "__main__":

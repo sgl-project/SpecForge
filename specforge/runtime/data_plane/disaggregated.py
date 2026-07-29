@@ -6,29 +6,27 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Disaggregated FeatureStore over a shared directory (M6 seam).
+"""Shared-directory FeatureStore for disaggregated offline training.
 
-Producer (rollout) and consumer (trainer) run as separate processes that share
+Producer (ingest) and consumer (trainer) run as separate processes that share
 only a directory. The control plane still carries only ``SampleRef`` metadata;
 ``get()`` resolves a sample from the ref + filesystem alone, with no shared
-in-process state. A real ``MooncakeFeatureStore`` later swaps the shared-dir
-transport for RDMA behind this same API.
+in-process state. ``MooncakeFeatureStore`` provides the cross-node RDMA backend
+behind the same API; this module is the CPU-testable shared-filesystem backend.
 
-Scope: this is the CPU-testable *reference* backend that pins the contract, not
-the fast path. The read/data path is genuinely cross-process, but the
-generation/lease index is in-process — so the B5 guarantees below hold for the
-single-host (single-producer) case. True multi-node liveness needs that index
-lifted into a shared/durable metadata store (a later milestone).
+The read/data path is cross-process, while the generation and lease index is
+process-local. Use one producer per store id; cross-node online runs use the
+Mooncake backend instead.
 
 Contract this backend locks down:
 
-* **B5 — no use-after-free.** Each generation is a distinct file
+* **No use-after-free.** Each generation is a distinct file
   (``{sample_id}.g{gen}.ckpt``) published by a single atomic rename, and a
   re-``put`` removes superseded generations — so a stale ref's file is gone and
   its ``get()`` raises ``KeyError`` rather than aliasing fresh data. ``release()``
   is generation-aware (frees only the generation its lease held); clone-on-fetch
   is the default.
-* **B9 — auth in disaggregated mode.** A missing/mismatched shared credential is
+* **Authentication.** A missing or mismatched shared credential is
   a ``PermissionError`` at attach time and on the data path.
 """
 
@@ -52,7 +50,7 @@ from specforge.runtime.data_plane.feature_store import (
 
 
 class AuthPolicy:
-    """Shared-secret auth (B9). ``token=None`` means auth disabled (colocated)."""
+    """Shared-secret auth; ``token=None`` disables authentication."""
 
     def __init__(self, token: Optional[str] = None) -> None:
         self.token = token
@@ -193,8 +191,7 @@ class SharedDirFeatureStore(FeatureStore):
             gen = self._current_gen(sid)
         data_path = self._data_path(sid, gen) if gen is not None else None
         # A missing file means: freed (release/abort), superseded by a re-put, or
-        # never written. In every case refuse to hand back data (B5: no
-        # use-after-free, no stale generation).
+        # never written. In every case refuse to hand back stale data.
         if data_path is None or not os.path.exists(data_path):
             raise KeyError(
                 f"sample {sid} generation {gen} not available in store {self.store_id} "
@@ -208,7 +205,7 @@ class SharedDirFeatureStore(FeatureStore):
             raw_key = raw_key.split("/")[-1] if "/" in raw_key else raw_key
             if raw_key not in raw:
                 raise KeyError(f"{data_path} missing key {raw_key!r} for feature {n!r}")
-            # clone-on-fetch (B5): the returned tensor is independent of the store
+            # Clone-on-fetch keeps the returned tensor independent of the store.
             out[n] = raw[raw_key].clone()
         if str(device) != "cpu":
             out = {k: v.to(device) for k, v in out.items()}
@@ -260,9 +257,8 @@ class SharedDirFeatureStore(FeatureStore):
             self._put_time.pop(sample_id, None)
 
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
-        # Max-hold force-free uses this instance's _put_time (single-host). A
-        # true cross-node sweeper reads the durable index / file mtime; that is
-        # the documented disaggregated follow-up.
+        # Max-hold force-free tracks puts made by this process. Other processes
+        # observe disk residency through health(), but do not share lease ages.
         now = self._clock() if now is None else now
         freed = freed_bytes = 0
         with self._lock:

@@ -1,10 +1,9 @@
-# Use the PyTorch ROCm wheel index (choose the stream that matches your system)
---extra-index-url https://download.pytorch.org/whl/rocm6.3
+# PyTorch 2.11 publishes Linux ROCm 7.2 wheels on this index.
+--extra-index-url https://download.pytorch.org/whl/rocm7.2
 
 pre-commit
-torch==2.8.0+rocm6.3
-transformers==4.57.1
-qwen-vl-utils==0.0.11
+torch==2.11.0+rocm7.2
+transformers==5.8.1
 datasets
 setuptools
 tqdm
@@ -13,6 +12,11 @@ psutil
 numpy
 accelerate
 pydantic
-sglang[all]==0.5.4
+pyyaml
+requests
+safetensors
+sglang[all]==0.5.14
 openai-harmony
 tensorboard
+typing-extensions
+yunchang

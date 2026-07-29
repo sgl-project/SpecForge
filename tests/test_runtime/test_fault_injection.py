@@ -1,10 +1,7 @@
 # coding=utf-8
-"""Fault-injection: rollout + data-plane failure paths and cleanup (M5).
+"""Fault-injection tests for active rollout and data-plane failure contracts.
 
-Covers the scenarios in ``testing/fault_injection.md`` that Phase 1 must exercise
-(rollout/data-plane failures + idempotent cleanup). Trainer- and controller-death
-recovery is covered by ``test_recovery.py`` (durable reconciliation). Expected
-behavior asserted here, per that doc:
+Expected behavior asserted here:
 
 * retryable failures replay within budget; terminal failures are visible with
   reason + sample_id;

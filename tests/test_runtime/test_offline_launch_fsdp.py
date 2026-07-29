@@ -1,7 +1,7 @@
 # coding=utf-8
 """Launcher path: FSDP is in the forward path + global_step is optimizer steps.
 
-Exercises build_offline_eagle3_runtime end to end (single rank) with
+Exercises ``build_offline_runtime(algorithm=eagle3_registration)`` end to end with
 accumulation_steps=2, which the equivalence tests (wrap=False) do not cover:
 - the strategy must run forward through the FSDP-wrapped module (Issue 1);
 - fit's global_step counts OPTIMIZER steps, micro_step counts micro-batches (Issue 2).
@@ -15,7 +15,10 @@ import unittest
 
 import torch
 
+from specforge.algorithms.builtin import builtin_algorithm_registry
+
 CUDA = torch.cuda.is_available()
+ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
 
 @unittest.skipUnless(CUDA, "launcher FSDP path requires CUDA")
@@ -28,8 +31,8 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+        from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
-        from specforge.runtime.launch import build_offline_eagle3_runtime
 
         TTT, ACC, MAX_OPT_STEPS, N = 3, 2, 2, 8
         workdir = tempfile.mkdtemp(prefix="launch_fsdp_")
@@ -45,9 +48,10 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
                 total_steps=10,
             )
 
-        trainer, loader = build_offline_eagle3_runtime(
+        trainer = build_offline_runtime(
+            algorithm=ALGORITHM,
             hidden_states_path=feat_dir,
-            eagle3_model=eagle3_model,
+            draft_model=eagle3_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
             run_id="launch",
@@ -67,17 +71,15 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
         )
         self.assertIsNotNone(trainer.core.backend.optimizer)
 
-        step = trainer.fit(loader)
+        step = trainer.fit()
 
         # Issue 2: global_step == optimizer steps; micro_step == ACC * optimizer steps
         self.assertEqual(step, MAX_OPT_STEPS)
         self.assertEqual(trainer.global_step, MAX_OPT_STEPS)
         self.assertEqual(trainer.micro_step, ACC * MAX_OPT_STEPS)
 
-        # a checkpoint can be written through the FSDP FULL_STATE_DICT path
-        ckpt = trainer.save_checkpoint(trainer.global_step)
-        self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
-        self.assertEqual(ckpt.global_step, MAX_OPT_STEPS)
+        # The unified Trainer lifecycle writes the final FSDP checkpoint.
+        self.assertEqual(trainer.last_checkpoint_step, MAX_OPT_STEPS)
 
 
 if __name__ == "__main__":

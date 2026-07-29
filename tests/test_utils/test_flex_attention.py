@@ -16,8 +16,7 @@ from specforge.modeling.draft.llama3_eagle import (
     prepare_decoder_attention_mask,
 )
 from specforge.utils import padding
-
-from .utils import norm_tensor
+from tests.test_utils.utils import norm_tensor
 
 dynamo.config.recompile_limit = 64
 TTT_LENGTH = 7
