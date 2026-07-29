@@ -583,7 +583,7 @@ index 000000000..d317b2801
 diff --git a/python/sglang/srt/managers/scheduler_components/request_receiver.py b/python/sglang/srt/managers/scheduler_components/request_receiver.py
 --- a/python/sglang/srt/managers/scheduler_components/request_receiver.py
 +++ b/python/sglang/srt/managers/scheduler_components/request_receiver.py
-@@ -185,11 +185,22 @@ class SchedulerRequestReceiver:
+@@ -185,13 +185,24 @@ class SchedulerRequestReceiver:
                      src=self.tp_group.ranks[0],
                  )
              recv_reqs = work_reqs + control_reqs
@@ -612,3 +612,5 @@ diff --git a/python/sglang/srt/managers/scheduler_components/request_receiver.py
 +                    src=self.tp_group.ranks[0],
 +                )
          return recv_reqs
+ 
+     def _apply_mm_receiver(self, recv_reqs: List) -> List:
