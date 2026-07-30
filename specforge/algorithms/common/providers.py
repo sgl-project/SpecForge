@@ -361,6 +361,7 @@ class ModelProvider:
     needs_input_tools: Factory
     default_dataloader_num_workers: int
     allow_missing_warm_start_embedding: bool = False
+    loss_mask_filter: Factory | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.draft_config, DraftConfigProvider):
@@ -384,6 +385,8 @@ class ModelProvider:
             )
         if not isinstance(self.allow_missing_warm_start_embedding, bool):
             raise TypeError("allow_missing_warm_start_embedding must be a bool")
+        if self.loss_mask_filter is not None and not callable(self.loss_mask_filter):
+            raise TypeError("loss_mask_filter must be callable or None")
 
 
 @dataclass(frozen=True)

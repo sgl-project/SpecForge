@@ -132,6 +132,12 @@ class TrainingBackend(abc.ABC):
     @abc.abstractmethod
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None: ...
 
+    def scale_gradients(self, factor: torch.Tensor) -> None:
+        """Scale synchronized gradients before clipping and stepping."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement gradient scaling"
+        )
+
     @abc.abstractmethod
     def step(self) -> Optional[torch.Tensor]: ...
 
@@ -312,6 +318,14 @@ class FSDPTrainingBackend(TrainingBackend):
         else:
             with self.module.no_sync():
                 loss.backward()
+
+    def scale_gradients(self, factor: torch.Tensor) -> None:
+        if self.module is None:
+            raise RuntimeError("scale_gradients called before prepare_model")
+        with torch.no_grad():
+            for parameter in self.module.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(factor)
 
     def step(self) -> Optional[torch.Tensor]:
         """Run the optimizer step, which clips and returns the global grad norm."""

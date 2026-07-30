@@ -12,7 +12,7 @@ import json
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from numbers import Integral
-from typing import Any
+from typing import Any, Callable
 
 PromptTaskDict = dict[str, Any]
 
@@ -30,6 +30,7 @@ def prepare_prompt_tasks(
     num_proc: int | None,
     min_loss_tokens: int = 1,
     max_prompts: int | None = None,
+    loss_mask_filter: Callable[[Sequence[int]], bool] | None = None,
 ) -> list[PromptTaskDict]:
     """Prepare runtime prompt dictionaries from a JSONL file.
 
@@ -48,6 +49,7 @@ def prepare_prompt_tasks(
         max_prompts=max_prompts,
         cache_dir=cache_dir,
         cache_key=cache_key,
+        loss_mask_filter=loss_mask_filter,
     )
     path_string = os.fspath(path)
     first_record = next(_iter_records(path_string), None)
@@ -75,6 +77,7 @@ def prepare_prompt_tasks(
             max_length=max_length,
             min_loss_tokens=min_loss_tokens,
             limit=limit,
+            loss_mask_filter=loss_mask_filter,
         )
 
     return _prepare_raw_prompts(
@@ -89,6 +92,7 @@ def prepare_prompt_tasks(
         num_proc=num_proc,
         min_loss_tokens=min_loss_tokens,
         limit=limit,
+        loss_mask_filter=loss_mask_filter,
     )
 
 
@@ -105,6 +109,7 @@ def _prepare_raw_prompts(
     num_proc: int | None,
     min_loss_tokens: int,
     limit: int | None,
+    loss_mask_filter: Callable[[Sequence[int]], bool] | None,
 ) -> list[PromptTaskDict]:
     try:
         from datasets import load_dataset
@@ -116,7 +121,7 @@ def _prepare_raw_prompts(
     from .preprocessing import build_eagle3_dataset
 
     dataset = load_dataset("json", data_files=path, split="train")
-    if limit is not None and limit < len(dataset):
+    if loss_mask_filter is None and limit is not None and limit < len(dataset):
         dataset = dataset.select(range(limit))
 
     processed_dataset = build_eagle3_dataset(
@@ -130,6 +135,7 @@ def _prepare_raw_prompts(
         is_preformatted=is_preformatted,
         train_only_last_turn=train_only_last_turn,
         minimum_valid_tokens=min_loss_tokens,
+        loss_mask_filter=loss_mask_filter,
     )
     rows = (
         (record, f"processed dataset row {index}")
@@ -140,6 +146,7 @@ def _prepare_raw_prompts(
         max_length=max_length,
         min_loss_tokens=min_loss_tokens,
         limit=limit,
+        loss_mask_filter=None,
     )
 
 
@@ -149,6 +156,7 @@ def _materialize_prompt_tasks(
     max_length: int,
     min_loss_tokens: int,
     limit: int | None,
+    loss_mask_filter: Callable[[Sequence[int]], bool] | None,
 ) -> list[PromptTaskDict]:
     prompts: list[PromptTaskDict] = []
     for record, source in rows:
@@ -172,6 +180,8 @@ def _materialize_prompt_tasks(
         input_ids = input_ids[:max_length]
         loss_mask = loss_mask[:max_length]
         if sum(loss_mask) < min_loss_tokens:
+            continue
+        if loss_mask_filter is not None and not loss_mask_filter(loss_mask):
             continue
 
         prompts.append(
@@ -275,6 +285,7 @@ def _validate_options(
     max_prompts: int | None,
     cache_dir: str | None,
     cache_key: str | None,
+    loss_mask_filter: Callable[[Sequence[int]], bool] | None,
 ) -> None:
     if (
         not isinstance(max_length, int)
@@ -300,6 +311,8 @@ def _validate_options(
         )
     if (cache_dir is None) != (cache_key is None):
         raise ValueError("cache_dir and cache_key must be provided together")
+    if loss_mask_filter is not None and not callable(loss_mask_filter):
+        raise TypeError("loss_mask_filter must be callable or None")
 
 
 __all__ = ["PromptTaskDict", "prepare_prompt_tasks"]

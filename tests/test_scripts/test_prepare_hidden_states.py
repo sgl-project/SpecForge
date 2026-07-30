@@ -115,6 +115,11 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 )
                 self.assertEqual(layers, plan.capture_layers)
                 self.assertEqual(feature_names, set(plan.layout.output_names))
+                if strategy == "eagle3":
+                    self.assertIsNone(plan.loss_mask_filter)
+                else:
+                    self.assertTrue(plan.loss_mask_filter([0, 1, 1]))
+                    self.assertFalse(plan.loss_mask_filter([1, 0, 1]))
 
     def test_build_uses_dedicated_offline_loader(self):
         config = SimpleNamespace(num_hidden_layers=32, dtype=None)

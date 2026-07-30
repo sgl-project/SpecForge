@@ -50,7 +50,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional
+from typing import Callable, Dict, List, Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -92,6 +92,7 @@ class OfflineCapturePlan:
     capture_method: str
     capture_layers: tuple[int, ...]
     layout: OfflineCaptureLayout
+    loss_mask_filter: Optional[Callable[[object], bool]]
 
 
 def parse_args():
@@ -341,6 +342,7 @@ def resolve_offline_capture_plan(
         capture_method=resolved.capture_method,
         capture_layers=resolved.capture_layers,
         layout=resolved.layout,
+        loss_mask_filter=resolved.loss_mask_filter,
     )
 
 
@@ -826,7 +828,7 @@ def main():
             ),
             num_proc=min(args.build_dataset_num_proc, 32),
         )
-    if args.num_samples is not None:
+    if args.num_samples is not None and capture_plan.loss_mask_filter is None:
         dataset = dataset.select(range(args.num_samples))
     # Tokenizer and cache key
     tokenizer = load_tokenizer(
@@ -847,6 +849,15 @@ def main():
             cache_key=cache_key,
             is_preformatted=args.is_preformatted,
             num_proc=args.build_dataset_num_proc,
+            loss_mask_filter=capture_plan.loss_mask_filter,
+        )
+    if capture_plan.loss_mask_filter is not None and args.num_samples is not None:
+        eagle3_dataset = eagle3_dataset.select(
+            range(min(args.num_samples, len(eagle3_dataset)))
+        )
+    if not len(eagle3_dataset):
+        raise ValueError(
+            f"no samples satisfy {capture_plan.strategy} training eligibility"
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
 

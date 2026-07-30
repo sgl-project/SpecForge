@@ -211,6 +211,22 @@ def resolve_eagle_capture_layers(
     return layers
 
 
+def _validate_dflash_block_size(draft_config: Any) -> None:
+    block_size = (
+        draft_config.get("block_size")
+        if isinstance(draft_config, dict)
+        else getattr(draft_config, "block_size", None)
+    )
+    if (
+        not isinstance(block_size, int)
+        or isinstance(block_size, bool)
+        or block_size < 2
+    ):
+        raise ValueError(
+            "DFlash-family draft config must define an integer block_size >= 2"
+        )
+
+
 def resolve_dflash_capture_layers(
     _cfg: Config, draft_config: Any, _target_config: Any
 ) -> List[int]:
@@ -318,6 +334,7 @@ def _build_dflash_family_model(
 ) -> AlgorithmModelParts:
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
+    _validate_dflash_block_size(draft_model)
     mask_token_id = _resolve_mask_token_id(cfg, draft_model, tokenizer)
     draft_model.mask_token_id = mask_token_id
     method_config = getattr(draft_model.config, "dflash_config", None)
@@ -432,16 +449,8 @@ def domino_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
 
 
 def dflash_min_loss_tokens(_cfg: Config, draft_config: Any) -> int:
-    block_size = getattr(draft_config, "block_size", None)
-    if (
-        not isinstance(block_size, int)
-        or isinstance(block_size, bool)
-        or block_size < 1
-    ):
-        raise ValueError(
-            "DFlash-family draft config must define a positive integer block_size"
-        )
-    return 2 * block_size
+    _validate_dflash_block_size(draft_config)
+    return 2
 
 
 def populate_dflash_generated_config(

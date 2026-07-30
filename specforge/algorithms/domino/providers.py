@@ -30,6 +30,7 @@ from specforge.algorithms.contracts import (
     FeatureMode,
     OfflineStorageContract,
 )
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "domino"
 DRAFT_ARCHITECTURE = "DominoDraftModel"
@@ -169,6 +170,7 @@ def algorithm_providers() -> AlgorithmProviders:
             minimum_loss_tokens=minimum_loss_tokens,
             needs_input_tools=needs_input_tools,
             default_dataloader_num_workers=8,
+            loss_mask_filter=has_consecutive_supervised_tokens,
         ),
         offline=(
             OfflineDataProvider(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from specforge.algorithms.common.providers import OfflineCaptureLayout
 from specforge.algorithms.registry import AlgorithmRegistration, AlgorithmRegistry
@@ -26,6 +27,7 @@ class ResolvedOfflineCapture:
     capture_method: str
     capture_layers: tuple[int, ...]
     layout: OfflineCaptureLayout
+    loss_mask_filter: Callable[[object], bool] | None
 
 
 def bind_run(cfg: Config, algorithm: AlgorithmRegistration) -> ResolvedRun:
@@ -127,6 +129,7 @@ def resolve_offline_capture(
         capture_method=offline.capture_layout.capture_method,
         capture_layers=layers,
         layout=offline.capture_layout,
+        loss_mask_filter=model_provider.loss_mask_filter,
     )
 
 

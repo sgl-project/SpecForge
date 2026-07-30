@@ -561,6 +561,10 @@ def _build_online(
                 input_tools,
                 draft_config=draft_config,
             )
+        if not prompts:
+            raise ValueError(
+                f"no prompts satisfy {algorithm.name} training eligibility"
+            )
         if cfg.training.total_steps is None and cfg.training.max_steps is None:
             schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
             _write_control(
