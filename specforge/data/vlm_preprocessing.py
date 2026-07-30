@@ -19,7 +19,7 @@ The multimodal online path needs, per sample:
   (``SGLANG_MM_AVOID_RETOKENIZE=1``), which is guaranteed to reproduce the
   client expansion because both sides run the target model's own HF processor
   on the same image.
-- ``image_data``: a base64 image string for the capture request (the image
+- ``image_data``: a ``data:``-URI image string for the capture request (the image
   itself never enters the feature store; only text tokens and captured hidden
   states do).
 
@@ -100,8 +100,19 @@ def _extract_image_field(record: Dict[str, Any], *, source: str) -> Optional[str
     return first
 
 
+def _as_data_uri(raw: bytes, *, media_type: str = "image/jpeg") -> str:
+    """Wrap raw image bytes as a data URI.
+
+    Some SGLang builds (e.g. the Ascend 0.5.14 line) only route ``data:``
+    URIs through base64 decoding and treat every other string as a file
+    path; the data-URI form is accepted by all supported server versions.
+    """
+
+    return f"data:{media_type};base64," + base64.b64encode(raw).decode("ascii")
+
+
 def _load_image(image_field: Any, *, source: str):
-    """Return (pil_image, base64_str) from a path / base64 / data-URI field."""
+    """Return (pil_image, data_uri) from a path / base64 / data-URI field."""
 
     from PIL import Image
 
@@ -113,19 +124,23 @@ def _load_image(image_field: Any, *, source: str):
     if os.path.isfile(image_field):
         with open(image_field, "rb") as image_file:
             raw = image_file.read()
-        return Image.open(io.BytesIO(raw)).convert("RGB"), base64.b64encode(raw).decode(
-            "ascii"
-        )
+        return Image.open(io.BytesIO(raw)).convert("RGB"), _as_data_uri(raw)
     encoded = image_field
     if encoded.startswith("data:"):
+        media_type = encoded[5 : encoded.index(";")] if ";" in encoded else "image/jpeg"
         encoded = encoded.split(",", 1)[-1]
+    else:
+        media_type = "image/jpeg"
     try:
         raw = base64.b64decode(encoded, validate=True)
     except Exception as exc:
         raise ImageDataError(
             f"{source}: image field is neither an existing file nor valid base64"
         ) from exc
-    return Image.open(io.BytesIO(raw)).convert("RGB"), encoded
+    return (
+        Image.open(io.BytesIO(raw)).convert("RGB"),
+        _as_data_uri(raw, media_type=media_type),
+    )
 
 
 def _render_conversation_text(

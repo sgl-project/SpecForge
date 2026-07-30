@@ -121,6 +121,31 @@ class ExtractImageFieldTest(unittest.TestCase):
         with self.assertRaises(ImageDataError):
             _load_image("not-valid-base64!!!", source="t")
 
+    def test_load_image_returns_data_uri(self):
+        import base64 as b64mod
+
+        from specforge.data.vlm_preprocessing import _load_image
+
+        # 1x1 white PNG
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4"
+            "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+        )
+        _, uri = _load_image(png_b64, source="t")
+        self.assertTrue(uri.startswith("data:image/jpeg;base64,"))
+        raw = b64mod.b64decode(uri.split(",", 1)[1])
+        self.assertEqual(raw, b64mod.b64decode(png_b64))
+
+    def test_load_image_preserves_input_media_type(self):
+        from specforge.data.vlm_preprocessing import _load_image
+
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4"
+            "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+        )
+        _, uri = _load_image(f"data:image/png;base64,{png_b64}", source="t")
+        self.assertTrue(uri.startswith("data:image/png;base64,"))
+
 
 class VlmRequestInputsTest(unittest.TestCase):
     def test_build_request_inputs_uses_collapsed_ids_and_image_data(self):
