@@ -68,6 +68,7 @@ class _FixedDraft(nn.Module):
     def __init__(self, hidden_size: int):
         super().__init__()
         self.hidden_size = hidden_size
+        self.sliding_window = None
 
     def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
         bsz, draft_len = noise_embedding.shape[:2]

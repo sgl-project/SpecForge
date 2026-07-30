@@ -44,7 +44,15 @@ def compute_accept_len(
     return accept_prefix.sum(dim=2).float()
 
 
-def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, device):
+def create_dflash_sdpa_mask(
+    anchor_positions,
+    block_keep_mask,
+    S,
+    block_size,
+    device,
+    sliding_window: Optional[int] = None,
+):
+    """Construct a full or sliding dense boolean DFlash mask."""
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
@@ -55,16 +63,24 @@ def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, de
     )  # (1, 1, 1, KV_LEN)
 
     q_block_ids = q_indices // block_size
+    q_block_offsets = q_indices % block_size
 
     anchor_expanded = anchor_positions.view(B, 1, N, 1).repeat_interleave(
         block_size, dim=2
     )
 
     mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+    if sliding_window is not None:
+        # The current draft token occupies one slot in the window.
+        context_lower_bound = anchor_expanded + q_block_offsets - (sliding_window - 1)
+        mask_context = mask_context & (kv_indices >= context_lower_bound)
 
     is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
+    if sliding_window is not None:
+        kv_block_offsets = (kv_indices - S) % block_size
+        mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
 
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
@@ -78,21 +94,13 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
+    sliding_window: Optional[int] = None,
 ):
-    """Construct Flex Attention BlockMask for DFlash training.
-
-    KV: [Context (S tokens) | Block_0 | Block_1 | ... | Block_{n-1}]
-    Q:  [Block_0 | Block_1 | ... | Block_{n-1}]
-
-    Rules:
-      1. Each block sees context strictly before its anchor (kv_idx < anchor_pos).
-      2. Intra-block attention is bidirectional.
-      3. Different blocks are invisible to each other.
-      4. Invalid blocks (block_keep_mask=False) see nothing.
-    """
+    """Construct a full or sliding Flex Attention mask for DFlash training."""
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
+        q_block_offset = q_idx % block_size
         safe_q_block_id = q_block_id.clamp(max=N - 1)
         anchor_pos = anchor_positions[b, safe_q_block_id]
 
@@ -100,10 +108,17 @@ def create_dflash_block_mask(
         # Strictly less than: matches inference where target_hidden[anchor_pos]
         # is not available as context.
         mask_context = is_context & (kv_idx < anchor_pos)
+        if sliding_window is not None:
+            # The current draft token occupies one slot in the window.
+            context_lower_bound = anchor_pos + q_block_offset - (sliding_window - 1)
+            mask_context = mask_context & (kv_idx >= context_lower_bound)
 
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
+        if sliding_window is not None:
+            kv_block_offset = (kv_idx - S) % block_size
+            mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < N
@@ -287,22 +302,29 @@ class OnlineDFlashModel(nn.Module):
         draft_position_ids = self._create_position_ids(anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
-        if self.attention_backend == "flex_attention":
-            dflash_attn_mask = create_dflash_block_mask(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                S=seq_len,
-                block_size=self.block_size,
-                device=device,
-            )
-        else:
-            dflash_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                S=seq_len,
-                block_size=self.block_size,
-                device=device,
-            )
+        mask_builder = (
+            create_dflash_block_mask
+            if self.attention_backend == "flex_attention"
+            else create_dflash_sdpa_mask
+        )
+        mask_args = {
+            "anchor_positions": anchor_positions,
+            "block_keep_mask": block_keep_mask,
+            "S": seq_len,
+            "block_size": self.block_size,
+            "device": device,
+        }
+        full_attn_mask = mask_builder(**mask_args)
+        sliding_window = self.draft_model.sliding_window
+        dflash_attn_mask = full_attn_mask
+        if sliding_window is not None:
+            dflash_attn_mask = {
+                "full_attention": full_attn_mask,
+                "sliding_attention": mask_builder(
+                    **mask_args,
+                    sliding_window=sliding_window,
+                ),
+            }
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,

@@ -157,6 +157,9 @@ assert not torch.cuda.is_initialized()
                     self.assertEqual(resolved.block_size, block_size)
                     self.assertEqual(resolved.num_target_layers, 12)
                     self.assertEqual(len(resolved.dflash_config["target_layer_ids"]), 1)
+                    self.assertEqual(resolved.layer_types, ["full_attention"])
+                    self.assertIsNone(resolved.sliding_window)
+                    self.assertFalse(resolved.use_sliding_window)
                 else:
                     self.assertEqual(resolved.draft_vocab_size, 32000)
 
@@ -180,6 +183,36 @@ assert not torch.cuda.is_initialized()
         self.assertEqual(resolved.num_hidden_layers, 2)
         self.assertEqual(resolved.block_size, 8)
         self.assertEqual(len(resolved.dflash_config["target_layer_ids"]), 2)
+        self.assertEqual(
+            resolved.layer_types,
+            ["full_attention", "full_attention"],
+        )
+
+    def test_dflash_layer_override_rejects_ambiguous_hybrid_resize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "draft.json")
+            payload = _draft_payload("DFlashDraftModel", layers=3, block_size=16)
+            payload.update(
+                layer_types=[
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                sliding_window=128,
+                use_sliding_window=True,
+            )
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+            cfg = _run_config(
+                "dflash",
+                draft_model_config=path,
+                draft_num_hidden_layers=2,
+            )
+            with self.assertRaisesRegex(ValueError, "mixed DFlash layer_types"):
+                resolve_draft_config(
+                    cfg,
+                    provider=_draft_config_provider("dflash"),
+                )
 
     def test_local_json_and_directory_are_equivalent_sources(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -457,22 +457,41 @@ def populate_dflash_generated_config(
         )
     payload["num_target_layers"] = target_layers
     payload["block_size"] = 16
+    payload["layer_types"] = ["full_attention"] * int(payload["num_hidden_layers"])
+    payload["sliding_window"] = None
+    payload["use_sliding_window"] = False
     payload["dflash_config"] = {
         "target_layer_ids": build_target_layer_ids(target_layers, 1)
     }
 
 
 def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
-    if cfg.model.draft_num_hidden_layers is None:
-        return
-    from specforge.modeling.draft.dflash import build_target_layer_ids
-
-    target_layers = int(draft_config.num_target_layers)
-    method_config = dict(getattr(draft_config, "dflash_config", None) or {})
-    method_config["target_layer_ids"] = build_target_layer_ids(
-        target_layers, cfg.model.draft_num_hidden_layers
+    from specforge.modeling.draft.dflash import (
+        build_target_layer_ids,
+        resolve_dflash_attention_layout,
     )
-    draft_config.dflash_config = method_config
+
+    requested_layers = cfg.model.draft_num_hidden_layers
+    if requested_layers is not None:
+        layer_types = draft_config.layer_types
+        if len(layer_types) != requested_layers:
+            if len(set(layer_types)) > 1:
+                raise ValueError(
+                    "model.draft_num_hidden_layers cannot resize a mixed "
+                    "DFlash layer_types layout; provide a draft config with "
+                    "exactly the requested per-layer layout"
+                )
+            draft_config.layer_types = [layer_types[0]] * requested_layers
+
+        draft_config.dflash_config = {
+            **dict(getattr(draft_config, "dflash_config", None) or {}),
+            "target_layer_ids": build_target_layer_ids(
+                int(draft_config.num_target_layers),
+                requested_layers,
+            ),
+        }
+
+    resolve_dflash_attention_layout(draft_config)
 
 
 __all__ = [
