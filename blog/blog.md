@@ -173,6 +173,13 @@ specforge train --config run.yaml --role consumer
 
 There are no method-specific Python training entry points. Full, runnable configurations are available under [`examples/configs`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs).
 
+### Training Example: Qwen3.6-27B
+Start training and inference on a single node using a single command:
+```
+specforge train --config examples/configs/qwen3.6-27b-dspark-disaggregated.yaml
+```
+
+
 ## Draft-Model Serving Performance
 
 Training-system throughput and draft-model serving speedup answer different questions. The H20 result above measures the efficiency of the training pipeline. The following evaluation measures the end-to-end serving speedup of a draft checkpoint trained with SpecForge; it is not used as evidence for the 10% training-runtime result.
