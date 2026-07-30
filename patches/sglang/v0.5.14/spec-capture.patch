@@ -53,17 +53,14 @@ diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/manager
 index 951f35495..2359c31b7 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -284,6 +284,10 @@ class GenerateReqInput(BaseReq):
-     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
-     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
- 
+@@ -283,3 +283,7 @@ class GenerateReqInput(BaseReq):
 +    # Spec-training capture sink instructions (see spec_capture_sink.py).
 +    # Batch-level: List[Optional[dict]]; per-request after __getitem__.
 +    spec_capture: Optional[Union[List[Optional[Dict]], Dict]] = None
 +
-     def contains_mm_input(self) -> bool:
-         return (
-             has_valid_data(self.image_data)
+     # Pre-computed delimiter indices for multi-item scoring.
+     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 @@ -743,6 +747,11 @@ class GenerateReqInput(BaseReq):
                  if self.multi_item_delimiter_indices is not None
                  else None
@@ -76,48 +73,31 @@ index 951f35495..2359c31b7 100644
          )
          cache[i] = sub
          return sub
-@@ -842,6 +851,9 @@ class TokenizedGenerateReqInput(BaseReq):
-     # Pre-computed delimiter indices for multi-item scoring
-     multi_item_delimiter_indices: Optional[List[int]] = None
- 
+@@ -842,2 +851,5 @@ class TokenizedGenerateReqInput(BaseReq):
 +    # Spec-training capture sink instructions (see GenerateReqInput.spec_capture)
 +    spec_capture: Optional[Dict] = None
 +
-     # For observability
-     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
- 
-@@ -1179,6 +1191,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
-     # The trainer step id. Used to know which step's weights are used for sampling.
-     token_steps: List[List[int]] = None
- 
+     # Pre-computed delimiter indices for multi-item scoring
+     multi_item_delimiter_indices: Optional[List[int]] = None
+@@ -1179,1 +1191,4 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 +    # Spec-training capture: one result dict per request (see spec_capture_sink).
 +    spec_capture: Optional[List[Any]] = None
 +
-     # Customized info
-     customized_info: Optional[Dict[str, List[Any]]] = None
-     # Detailed breakdown of cached tokens by source (device/host/storage)
-@@ -1247,6 +1262,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
      # The trainer step id. Used to know which step's weights are used for sampling.
-     token_steps: List[List[int]] = None
- 
+@@ -1247,1 +1262,4 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 +    # Spec-training capture: one result dict per request (see spec_capture_sink).
 +    spec_capture: Optional[List[Any]] = None
 +
-     # Customized info
-     customized_info: Optional[Dict[str, List[Any]]] = None
-     # Detailed breakdown of cached tokens by source (device/host/storage)
+     # The trainer step id. Used to know which step's weights are used for sampling.
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
 index f1dc81d17..a93a466b7 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -708,6 +708,7 @@ class Req(ReqDllmMixin):
+@@ -708,3 +708,4 @@ class Req(ReqDllmMixin):
          ] = None,
          return_pooled_hidden_states: bool = False,
-         multi_item_delimiter_indices: Optional[List[int]] = None,
 +        spec_capture: Optional[Dict[str, Any]] = None,
-     ):
-         # Input and output info
-         self.rid = rid
+         multi_item_delimiter_indices: Optional[List[int]] = None,
 @@ -771,7 +772,13 @@ class Req(ReqDllmMixin):
              }
          self.sampling_params = sampling_params
@@ -137,7 +117,7 @@ diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/manager
 index abba37441..3018b8247 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -576,6 +576,25 @@ class Scheduler(
+@@ -576,6 +576,19 @@ class Scheduler(
  
          self.init_batch_result_processor()
  
@@ -150,12 +130,6 @@ index abba37441..3018b8247 100644
 +                    "(single-pass prefill) so captured hidden states cover the "
 +                    "whole sequence"
 +                )
-+            if not server_args.disable_radix_cache:
-+                raise ValueError(
-+                    "--enable-spec-capture requires --disable-radix-cache: a "
-+                    "prefix-cache hit skips prefilling (and capturing) the "
-+                    "cached tokens, silently truncating the stored hidden states"
-+                )
 +            from sglang.srt import spec_capture_sink
 +
 +            spec_capture_sink.maybe_init_sink(server_args)
@@ -163,7 +137,7 @@ index abba37441..3018b8247 100644
          self.is_initializing = False
  
      def init_zbal_on_npu(self):
-@@ -2054,6 +2067,7 @@ class Scheduler(
+@@ -2054,6 +2061,7 @@ class Scheduler(
                  dllm_config=self.dllm_config,
                  time_stats=recv_req.time_stats,
                  multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
@@ -261,14 +235,11 @@ diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py 
 index f95c59f6f..9e64326a1 100644
 --- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
 +++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-@@ -273,6 +273,7 @@ class _GenerationStreamAccumulator:
-     spec_correct_drafts_histogram: list = field(default_factory=list)
+@@ -274,3 +274,4 @@ class _GenerationStreamAccumulator:
      retraction_counts: list = field(default_factory=list)
      output_hidden_states: Optional[list] = None
 +    spec_capture: list = field(default_factory=list)
      routed_experts: Optional[list] = None
-     indexer_topk: Optional[list] = None
-     customized_info: dict = field(default_factory=dict)
 @@ -482,6 +483,8 @@ class _GenerationStreamAccumulator:
                  self.output_hidden_states.append(hs)
              else:
@@ -278,14 +249,11 @@ index f95c59f6f..9e64326a1 100644
          if self.return_routed_experts:
              self.routed_experts.append(
                  req.routed_experts if req.return_routed_experts else None
-@@ -540,6 +543,7 @@ class _GenerationStreamAccumulator:
-             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
+@@ -541,3 +544,4 @@ class _GenerationStreamAccumulator:
              output_token_entropy_val=None,
              output_hidden_states=self.output_hidden_states,
 +            spec_capture=self.spec_capture or None,
              routed_experts=self.routed_experts,
-             indexer_topk=self.indexer_topk,
-             customized_info=self.customized_info,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
 index bf932611a..f0e821ec4 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
@@ -313,10 +281,7 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
 index 1cff5c983..a5935fa3c 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -471,6 +471,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
-                     # if there is no aux layer, set to None
-                     self.eagle_aux_hidden_state_layer_ids = None
- 
+@@ -518,3 +518,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 +        if server_args.enable_spec_capture and not self.is_draft_worker:
 +            # Aux capture without a draft worker, routed to the strategy's own
 +            # capture method (they wire different submodules — e.g. VL models
@@ -324,15 +289,18 @@ index 1cff5c983..a5935fa3c 100644
 +            if getattr(server_args, "spec_capture_method", "eagle3") == "dflash":
 +                self.dflash_use_aux_hidden_state = True
 +                self.dflash_target_layer_ids = server_args.spec_capture_aux_layer_ids
++                self.dflash_family_use_aux_hidden_state = True
++                self.dflash_family_target_layer_ids = (
++                    server_args.spec_capture_aux_layer_ids
++                )
 +            else:
 +                self.eagle_use_aux_hidden_state = True
 +                self.eagle_aux_hidden_state_layer_ids = (
 +                    server_args.spec_capture_aux_layer_ids
 +                )
-+
-         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
-             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
- 
+         # Apply the rank zero filter to logger
+         if server_args.show_time_cost:
+             enable_show_time_cost()
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
 index c7162c16d..d515b3c69 100644
 --- a/python/sglang/srt/server_args.py

@@ -235,15 +235,67 @@ class CheckpointManager:
         Accepts a checkpoint dir, its ``training_state.pt``, a ``file://`` URI,
         or an output/run root containing exactly one checkpoint lineage.
         """
-        path = cls.resolve_resume_dir(path)
-        state = torch.load(
-            os.path.join(path, STATE_FILE),
-            map_location=map_location,
-            weights_only=False,
-        )
         initialized = torch.distributed.is_initialized()
-        rank = torch.distributed.get_rank() if initialized else 0
+        original_path = path
+        local_error = None
+        state = None
+        try:
+            path = cls.resolve_resume_dir(path)
+            state = torch.load(
+                os.path.join(path, STATE_FILE),
+                map_location=map_location,
+                weights_only=False,
+            )
+        except Exception as exc:
+            local_error = exc
+
         world = torch.distributed.get_world_size() if initialized else 1
+        if initialized and world > 1:
+            descriptor = {
+                "error": (
+                    None
+                    if local_error is None
+                    else f"{type(local_error).__name__}: {local_error}"
+                ),
+                "checkpoint": (
+                    None if local_error is not None else os.path.basename(path)
+                ),
+                "run_id": None if state is None else state.get("run_id"),
+                "global_step": None if state is None else state.get("global_step"),
+                "strategy": None if state is None else state.get("strategy"),
+            }
+            descriptors = [None] * world
+            torch.distributed.all_gather_object(descriptors, descriptor)
+            failures = [
+                (rank, item["error"])
+                for rank, item in enumerate(descriptors)
+                if item["error"] is not None
+            ]
+            if failures:
+                raise RuntimeError(
+                    f"resume checkpoint {original_path!r} is not readable on "
+                    "every rank: "
+                    + "; ".join(f"rank {rank}: {error}" for rank, error in failures)
+                )
+            identities = {
+                (
+                    item["checkpoint"],
+                    item["run_id"],
+                    item["global_step"],
+                    item["strategy"],
+                )
+                for item in descriptors
+            }
+            if len(identities) != 1:
+                raise ValueError(
+                    f"resume checkpoint {original_path!r} resolves to different "
+                    f"training states across ranks: {descriptors}"
+                )
+        if local_error is not None:
+            raise local_error
+        assert state is not None
+
+        rank = torch.distributed.get_rank() if initialized else 0
         saved_world = state.get("world_size")
         rank_path = os.path.join(path, cls._rank_file(rank))
         if os.path.exists(rank_path) and (saved_world is None or saved_world == world):

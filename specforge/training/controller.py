@@ -67,7 +67,9 @@ def _scalar(x: Any) -> float:
     return float(x)
 
 
-def _dp_mean_scalars(values: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def _dp_mean_scalars(
+    values: Dict[str, torch.Tensor], *, process_group: Any = None
+) -> Dict[str, torch.Tensor]:
     """Average scalar metrics across DP ranks with one collective.
 
     Uses the established DFlash metric convention (DP mean):
@@ -82,14 +84,82 @@ def _dp_mean_scalars(values: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]
 
     if not values or not (dist.is_available() and dist.is_initialized()):
         return values
-    world = dist.get_world_size()
+    world = (
+        dist.get_world_size()
+        if process_group is None
+        else dist.get_world_size(group=process_group)
+    )
     if world <= 1:
         return values
     names = list(values)
     packed = torch.stack([values[name].detach().float().reshape(()) for name in names])
-    dist.all_reduce(packed)
+    if process_group is None:
+        dist.all_reduce(packed)
+    else:
+        dist.all_reduce(packed, group=process_group)
     packed /= world
     return {name: packed[index] for index, name in enumerate(names)}
+
+
+def _reduce_ratio_metrics(
+    values: Dict[str, Any],
+    *,
+    device: torch.device,
+    process_group: Any,
+    reduce: bool,
+) -> Dict[str, float]:
+    """Form telemetry ratios only after summing their numerators and counts."""
+
+    if not values:
+        return {}
+    normalized = []
+    for name in sorted(values):
+        pair = values[name]
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise TypeError(
+                f"ratio metric {name!r} must be a (numerator, denominator) pair"
+            )
+        numerator = torch.as_tensor(pair[0]).detach().float().flatten().to(device)
+        denominator = torch.as_tensor(pair[1]).detach().float().flatten().to(device)
+        if numerator.shape != denominator.shape:
+            raise ValueError(
+                f"ratio metric {name!r} shape mismatch: "
+                f"{tuple(numerator.shape)} vs {tuple(denominator.shape)}"
+            )
+        normalized.append((name, numerator, denominator))
+
+    packed = torch.cat(
+        [
+            tensor
+            for _, numerator, denominator in normalized
+            for tensor in (numerator, denominator)
+        ]
+    )
+    if reduce:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            if process_group is None:
+                dist.all_reduce(packed)
+            else:
+                dist.all_reduce(packed, group=process_group)
+
+    output: Dict[str, float] = {}
+    cursor = 0
+    for name, numerator, _denominator in normalized:
+        width = numerator.numel()
+        summed_numerator = packed[cursor : cursor + width]
+        cursor += width
+        summed_denominator = packed[cursor : cursor + width]
+        cursor += width
+        ratios = summed_numerator / summed_denominator.clamp_min(1e-12)
+        if width == 1:
+            output[name] = float(ratios.item())
+        else:
+            output.update(
+                {f"{name}_{index}": float(value) for index, value in enumerate(ratios)}
+            )
+    return output
 
 
 _EAGLE3_STRUCTURED_METRIC_KEYS = frozenset(
@@ -281,10 +351,18 @@ class TrainerCore:
         # scalar diagnostics are DP-averaged in a single collective at optimizer
         # boundaries; non-boundary results stay rank-local.
         metrics: Dict[str, Any] = dict(structured or {})
+        metrics.update(
+            _reduce_ratio_metrics(
+                out.ratio_metrics,
+                device=metric_device,
+                process_group=process_group,
+                reduce=stepped,
+            )
+        )
         scalar_metrics: Dict[str, torch.Tensor] = {}
         if "loss" not in metrics:
             scalar_metrics["loss"] = out.loss
-        if "accuracy" in out.metrics:
+        if "accuracy" in out.metrics and "acc" not in metrics:
             accuracy = out.metrics["accuracy"]
             if isinstance(accuracy, torch.Tensor):
                 scalar_metrics["acc"] = (
@@ -310,7 +388,10 @@ class TrainerCore:
                 continue
             scalar_metrics[key] = scalar
         if stepped:
-            scalar_metrics = _dp_mean_scalars(scalar_metrics)
+            scalar_metrics = _dp_mean_scalars(
+                scalar_metrics,
+                process_group=process_group,
+            )
         metrics.update({key: _scalar(value) for key, value in scalar_metrics.items()})
         gn = _scalar(grad_norm) if grad_norm is not None else None
         if gn is not None:

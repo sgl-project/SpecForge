@@ -18,7 +18,9 @@ point:
 ```bash
 torchrun --standalone --nproc_per_node 8 \
   scripts/prepare_hidden_states.py \
+  --strategy eagle3 \
   --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+  --draft-model-config configs/llama3.1-8b-eagle3.json \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
   --chat-template llama3 \
@@ -28,7 +30,8 @@ torchrun --standalone --nproc_per_node 8 \
 ```
 
 The output directory now matches the hidden-state path in the checked-in
-recipe and contains the feature checkpoints consumed by the unified trainer.
+recipe. It contains the feature checkpoints consumed by the unified trainer
+and `vocab_mapping/vocab_mapping.pt`, derived from the same processed corpus.
 
 ## 3. Use the checked-in run config
 
@@ -50,7 +53,7 @@ no mapping.
 ```bash
 specforge train \
   --config examples/configs/llama3.1-8b-eagle3-offline.yaml \
-  model.vocab_mapping_path=
+  model.vocab_mapping_path=./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct/vocab_mapping/vocab_mapping.pt
 ```
 
 Omit the final override when the mapping file named by the recipe already
@@ -60,8 +63,8 @@ exists. The same recipe supports offline data parallelism through the typed
 For long sequences, EAGLE3 offline can instead use USP by setting
 `training.attention_backend=usp` and choosing
 `training.sp_ulysses_size`/`training.sp_ring_size`. Offline feature training
-also supports DFlash and Domino when the feature checkpoints and draft config
-use that strategy's contract. `training.compact_teacher: true` enables the
-exact lower-memory teacher projection for offline text EAGLE3. See
+also supports DFlash, Domino, and DSpark when the feature checkpoints and draft
+config use that strategy's contract. `training.compact_teacher: true` enables
+the exact lower-memory teacher projection for offline text EAGLE3. See
 [Parallel topologies](../basic_usage/training.md#parallel-topologies) for the
 multi-process launch contract.

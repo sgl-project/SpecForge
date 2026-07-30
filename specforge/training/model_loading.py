@@ -217,19 +217,24 @@ def _generate_draft_config(
             "or a pretrained model.draft_checkpoint_path containing config.json"
         )
 
-    from transformers import AutoConfig
+    from specforge.modeling.target.target_utils import (
+        load_target_config,
+        target_text_config,
+        target_vocab_size,
+    )
 
-    target_config = AutoConfig.from_pretrained(
+    target_config = load_target_config(
         cfg.model.target_model_path,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
-    target_config = _target_text_config(target_config)
+    target_config = target_text_config(target_config)
     payload: Dict[str, Any] = {}
     for field in _TARGET_ARCHITECTURE_FIELDS:
         value = getattr(target_config, field, None)
         if value is not None:
             payload[field] = _serializable_config_value(value)
+    payload["vocab_size"] = target_vocab_size(target_config)
 
     required = [name for name in ("vocab_size", "hidden_size") if name not in payload]
     if required:

@@ -18,6 +18,7 @@ from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
     ModelProvider,
+    OfflineCaptureLayout,
     OfflineDataProvider,
     ServerCaptureLayout,
     ServerStreamingProvider,
@@ -194,6 +195,15 @@ def algorithm_providers() -> AlgorithmProviders:
             OfflineDataProvider(
                 modality="text",
                 normalizer_id=NORMALIZER_ID,
+                capture_layout=OfflineCaptureLayout(
+                    capture_method="dflash",
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids"),
+                        ("loss_mask", "loss_mask"),
+                    ),
+                ),
                 build_reader=partial(build_offline_reader, ALGORITHM_NAME),
                 build_normalizer=build_offline_normalizer,
                 build_collator=collator,

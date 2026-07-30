@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
 
 import torch
@@ -192,14 +194,121 @@ class BuiltinProviderParityTest(unittest.TestCase):
             "hidden_states": torch.ones(1, 3, 4),
             "target_last_hidden_states": torch.ones(1, 3, 3),
         }
-        collate = (
-            self.registry.resolve("dspark")
-            .providers.server_streaming_for("text")
-            .build_collator()
+        providers = self.registry.resolve("dspark").providers
+        for provider in (
+            providers.offline_for("text"),
+            providers.server_streaming_for("text"),
+        ):
+            with self.subTest(provider=type(provider).__name__):
+                batch = provider.build_collator()([short, long])
+                self.assertEqual(
+                    (2, 3, 3),
+                    tuple(batch["target_last_hidden_states"].shape),
+                )
+                self.assertTrue(
+                    torch.all(batch["target_last_hidden_states"][0, 2:] == 0)
+                )
+
+    def test_dspark_offline_contract_and_normalizer_preserve_target_hidden(self):
+        registration = self.registry.resolve("dspark")
+        contract = registration.spec.feature_contract("offline", "text")
+        required = {
+            "input_ids",
+            "loss_mask",
+            "hidden_states",
+            "target_last_hidden_states",
+        }
+        self.assertEqual(required, contract.required_tensors)
+        self.assertEqual(required, contract.storage.required_tensors)
+        self.assertEqual("hidden_state", contract.default_target_representation)
+
+        raw = {
+            "input_ids": torch.tensor([1, 2, 3, 4]),
+            "loss_mask": torch.ones(4, dtype=torch.long),
+            "hidden_states": torch.arange(24).reshape(1, 4, 6),
+            "target_last_hidden_states": torch.arange(20).reshape(4, 5),
+        }
+        normalized = registration.providers.offline_for("text").build_normalizer(3)(raw)
+
+        self.assertEqual(required, set(normalized))
+        self.assertEqual((1, 3, 6), tuple(normalized["hidden_states"].shape))
+        self.assertEqual(
+            (1, 3, 5),
+            tuple(normalized["target_last_hidden_states"].shape),
         )
-        batch = collate([short, long])
-        self.assertEqual((2, 3, 3), tuple(batch["target_last_hidden_states"].shape))
-        self.assertTrue(torch.all(batch["target_last_hidden_states"][0, 2:] == 0))
+        self.assertTrue(
+            torch.equal(
+                raw["target_last_hidden_states"][:3],
+                normalized["target_last_hidden_states"][0],
+            )
+        )
+
+    def test_dspark_offline_normalizer_rejects_mismatched_target_length(self):
+        raw = {
+            "input_ids": torch.tensor([1, 2, 3, 4]),
+            "loss_mask": torch.ones(4, dtype=torch.long),
+            "hidden_states": torch.ones(1, 4, 6),
+            "target_last_hidden_states": torch.ones(1, 2, 5),
+        }
+        normalize = (
+            self.registry.resolve("dspark")
+            .providers.offline_for("text")
+            .build_normalizer(4)
+        )
+
+        with self.assertRaisesRegex(ValueError, "mismatched sequence lengths"):
+            normalize(raw)
+
+    def test_dspark_offline_reader_exposes_both_target_feature_sets(self):
+        provider = self.registry.resolve("dspark").providers.offline_for("text")
+        with tempfile.TemporaryDirectory(prefix="dspark-offline-reader-") as path:
+            torch.save(
+                {
+                    "input_ids": torch.tensor([1, 2, 3]),
+                    "loss_mask": torch.ones(3, dtype=torch.long),
+                    "hidden_states": torch.ones(1, 3, 4),
+                    "target_last_hidden_states": torch.ones(1, 3, 2),
+                },
+                os.path.join(path, "0000.ckpt"),
+            )
+
+            ref = provider.build_reader(
+                path,
+                run_id="dspark-offline-reader",
+                ttt_length=4,
+                max_len=3,
+            ).read()[0]
+
+        self.assertEqual(
+            {
+                "input_ids",
+                "loss_mask",
+                "hidden_states",
+                "target_last_hidden_states",
+            },
+            set(ref.feature_keys),
+        )
+        self.assertEqual("hidden_state", ref.metadata["target_repr"])
+
+    def test_dspark_offline_reader_rejects_missing_target_last_hidden(self):
+        provider = self.registry.resolve("dspark").providers.offline_for("text")
+        with tempfile.TemporaryDirectory(prefix="dspark-offline-reader-") as path:
+            torch.save(
+                {
+                    "input_ids": torch.tensor([1, 2, 3]),
+                    "loss_mask": torch.ones(3, dtype=torch.long),
+                    "hidden_states": torch.ones(1, 3, 4),
+                },
+                os.path.join(path, "0000.ckpt"),
+            )
+
+            with self.assertRaisesRegex(KeyError, "target_last_hidden_states"):
+                provider.build_reader(
+                    path,
+                    run_id="dspark-offline-reader",
+                    ttt_length=4,
+                    max_len=3,
+                ).read()
 
     def test_small_normalizers_match_retained_implementations(self):
         from specforge.data.preprocessing import (

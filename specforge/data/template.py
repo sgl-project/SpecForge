@@ -295,6 +295,19 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="glm-5.2",
+    template=ChatTemplate(
+        assistant_header="<|assistant|><think>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+        parser_type="glm",
+        assistant_pattern_type="glm",
+        ignore_token=["<|user|>"],
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="gemma",
     template=ChatTemplate(
         assistant_header="<start_of_turn>model\n",
@@ -335,5 +348,23 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>\n",
         parser_type="thinking",
         enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="inkling-thinking",
+    template=ChatTemplate(
+        assistant_header="<|message_model|>",
+        user_header="<|message_user|>",
+        system_prompt=None,
+        end_of_turn_token="<|message_user|>",
+        parser_type="thinking",
+        assistant_pattern_type="inkling",
+        enable_thinking=True,
+        ignore_token=[
+            "<|message_user|>",
+            "<|message_tool|>",
+            "<|message_system|>",
+        ],
     ),
 )

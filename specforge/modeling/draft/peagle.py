@@ -13,6 +13,7 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaMLP,
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
+    get_rope_config,
     rotate_half,
 )
 from specforge.modeling.draft.registry import register_draft
@@ -219,12 +220,13 @@ class PEagleDraftModel(Eagle3DraftModel):
             layers.append(PEagleStandardLayer(config))
         self.layers = nn.ModuleList(layers)
 
+        rope_theta, _ = get_rope_config(config)
         self.rotary_emb = LlamaRotaryEmbedding(
             dim=getattr(
                 config, "head_dim", config.hidden_size // config.num_attention_heads
             ),
             max_position_embeddings=config.max_position_embeddings,
-            base=getattr(config, "rope_theta", 10000),
+            base=rope_theta,
         )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -238,6 +240,7 @@ class PEagleDraftModel(Eagle3DraftModel):
     def _rebuild_rotary_embedding(self) -> None:
         """Recreate non-persistent RoPE buffers after low-memory HF loading."""
         reference = self.fc.weight
+        rope_theta, _ = get_rope_config(self.config)
         rotary_emb = LlamaRotaryEmbedding(
             dim=getattr(
                 self.config,
@@ -245,7 +248,7 @@ class PEagleDraftModel(Eagle3DraftModel):
                 self.config.hidden_size // self.config.num_attention_heads,
             ),
             max_position_embeddings=self.config.max_position_embeddings,
-            base=getattr(self.config, "rope_theta", 10000),
+            base=rope_theta,
             device=reference.device,
         )
         self.rotary_emb = rotary_emb.to(

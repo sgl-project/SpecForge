@@ -236,7 +236,6 @@ run_inference_node() {
         --tp-size "$SERVER_TP" \
         --mem-fraction-static "$SERVER_MEM_FRACTION" \
         --chunked-prefill-size -1 \
-        --disable-radix-cache \
         --enable-spec-capture \
         --spec-capture-method dflash \
         --spec-capture-aux-layer-ids "${capture_layers[@]}" \

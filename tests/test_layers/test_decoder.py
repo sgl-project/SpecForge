@@ -12,7 +12,7 @@ from specforge.distributed import destroy_distributed, init_distributed
 from specforge.layers.ring import ring_flash_attn_func
 from specforge.modeling.draft.llama3_eagle import LlamaDecoderLayer
 from specforge.utils import padding
-from tests.utils import get_available_port
+from tests.utils import get_available_port, is_port_in_use
 
 
 def _standard_flash_attn_available() -> bool:
@@ -140,8 +140,10 @@ def _assert_adapter_contract(
     assert state.position_ids.shape[1] == local_seq_len * sp_ulysses_size
 
 
-def _run_decoder_parity(rank: int, world_size: int, port: int) -> None:
-    device = _setup_worker(rank, world_size, port)
+def _run_decoder_parity(
+    rank: int, world_size: int, rendezvous_ports: tuple[int, int]
+) -> None:
+    device = _setup_worker(rank, world_size, rendezvous_ports[0])
     config = _model_config()
     seq_len = 128
     ttt_length = 3
@@ -188,8 +190,15 @@ def _run_decoder_parity(rank: int, world_size: int, port: int) -> None:
     golden_state_dict = golden_decoder.state_dict()
     del golden_decoder
 
-    for sp_ulysses_size, sp_ring_size in ((2, 1), (1, 2)):
+    topologies = ((2, 1), (1, 2))
+    for (sp_ulysses_size, sp_ring_size), rendezvous_port in zip(
+        topologies, rendezvous_ports, strict=True
+    ):
         try:
+            # Each topology creates and destroys a complete default process
+            # group. Reusing one TCPStore endpoint is racy, especially when
+            # TORCH_DISTRIBUTED_DEBUG=DETAIL adds its Gloo wrapper group.
+            os.environ["MASTER_PORT"] = str(rendezvous_port)
             init_distributed(
                 timeout=2,
                 tp_size=1,
@@ -236,7 +245,9 @@ def _run_decoder_parity(rank: int, world_size: int, port: int) -> None:
                 f"rank={rank} USP U{sp_ulysses_size}R{sp_ring_size} decoder "
                 f"mismatch; max_diff={max_diff}"
             )
-            dist.barrier()
+            # This is a device-less NCCL collective, so identify the GPU
+            # explicitly instead of asking NCCL to infer it from global rank.
+            dist.barrier(device_ids=[rank])
         finally:
             destroy_distributed()
 
@@ -249,10 +260,16 @@ class TestDecoderParity(unittest.TestCase):
     @unittest.skipUnless(_HAS_2_GPUS, "requires at least two CUDA devices")
     def test_two_gpu_usp_decoder_matches_flash_attention(self):
         world_size = 2
+        first_port = get_available_port()
+        second_port = first_port + 1
+        while second_port < 65535 and is_port_in_use(second_port):
+            second_port += 1
+        if second_port == 65535:
+            self.fail("could not find a second rendezvous port")
         mp.spawn(
             _run_decoder_parity,
             nprocs=world_size,
-            args=(world_size, get_available_port()),
+            args=(world_size, (first_port, second_port)),
             join=True,
         )
 

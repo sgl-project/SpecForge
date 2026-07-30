@@ -20,22 +20,26 @@ NPU, offline, and managed/external-service variants, is in
 | `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
 | `examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml` | Disaggregated SGLang server capture with normalized EAGLE3 inputs | EAGLE3.1 |
 | `examples/configs/qwen3-8b-dflash-online.yaml` | Disaggregated SGLang server capture | DFlash |
+| `examples/configs/qwen3-8b-dflash-offline.yaml` | Precomputed features | DFlash |
 | `examples/configs/qwen3-8b-dpace-online.yaml` | Online D-PACE objective | DFlash |
 | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` | Disaggregated server capture | DFlash |
 | `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | DFlash |
 | `examples/configs/qwen3-8b-domino-online.yaml` | Disaggregated SGLang server capture | Domino |
+| `examples/configs/qwen3-8b-domino-offline.yaml` | Precomputed features | Domino |
 | `examples/configs/qwen3-8b-domino-disaggregated.yaml` | Disaggregated server capture | Domino |
 | `examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | Domino |
 | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | Domino |
 | `examples/configs/qwen3-8b-peagle-disaggregated.yaml` | Disaggregated SGLang server capture | P-EAGLE |
 | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` | Disaggregated server capture | DSpark |
+| `examples/configs/qwen3-4b-dspark-offline.yaml` | Precomputed features | DSpark |
 | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
 | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` | Managed local one capture server + DP2 | DFlash |
 | `examples/configs/qwen3.5-4b-dflash-online-npu.yaml` | Disaggregated NPU SGLang capture | DFlash |
 | `examples/configs/qwen3.5-4b-domino-online-npu.yaml` | Disaggregated NPU SGLang capture | Domino |
 
-Online configs point `data.train_data_path` at raw conversation data. The
-offline config expects hidden-state checkpoints in `data.hidden_states_path`.
+Online configs point `data.train_data_path` at raw conversation data. Offline
+configs expect strategy-specific feature checkpoints in
+`data.hidden_states_path`.
 Local offline EAGLE3 derives and caches its vocabulary map when no path is set;
 disaggregated EAGLE3 requires one explicit shared `model.vocab_mapping_path`.
 
@@ -57,12 +61,12 @@ topology remains in YAML. The complete
 environment contract is in the [disaggregated training
 guide](../docs/basic_usage/disaggregated_training.md).
 
-Offline feature training supports EAGLE3, DFlash, and Domino, including local
-and disaggregated consumers. Optional config sections provide online/offline
-evaluation with `<run_id>-best` selection, compact teacher projection for
-offline text EAGLE3, and W&B, TensorBoard, SwanLab, or MLflow tracking. See the
-[training guide](../docs/basic_usage/training.md) for the full capability
-matrix, ROCm installation, and Ascend NPU/HCCL launch example.
+Offline feature training supports EAGLE3, DFlash, Domino, and DSpark, including
+local and disaggregated consumers. Optional config sections provide
+online/offline evaluation with `<run_id>-best` selection, compact teacher
+projection for offline text EAGLE3, and W&B, TensorBoard, SwanLab, or MLflow
+tracking. See the [training guide](../docs/basic_usage/training.md) for the full
+capability matrix, ROCm installation, and Ascend NPU/HCCL launch example.
 
 Local offline and disaggregated offline resume are supported.
 Disaggregated online resume is consumer-only and requires the retained SQLite
