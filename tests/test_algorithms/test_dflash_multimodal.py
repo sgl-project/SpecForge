@@ -78,6 +78,50 @@ class VlmExpansionMathTest(unittest.TestCase):
             )
 
 
+class ExtractImageFieldTest(unittest.TestCase):
+    def _extract(self, record):
+        from specforge.data.vlm_preprocessing import _extract_image_field
+
+        return _extract_image_field(record, source="t")
+
+    def test_image_and_image_path_fields(self):
+        self.assertEqual(self._extract({"image": "a.jpg"}), "a.jpg")
+        self.assertEqual(self._extract({"image_path": "b.jpg"}), "b.jpg")
+        self.assertIsNone(self._extract({}))
+
+    def test_images_list_takes_the_single_element(self):
+        self.assertEqual(self._extract({"images": ["a.jpg"]}), "a.jpg")
+        self.assertIsNone(self._extract({"images": []}))
+
+    def test_multi_image_sample_is_fatal(self):
+        from specforge.data.vlm_preprocessing import ImageDataError
+
+        with self.assertRaises(ImageDataError):
+            self._extract({"images": ["a.jpg", "b.jpg"]})
+
+    def test_non_list_images_and_non_string_element_are_fatal(self):
+        from specforge.data.vlm_preprocessing import ImageDataError
+
+        with self.assertRaises(ImageDataError):
+            self._extract({"images": "a.jpg"})
+        with self.assertRaises(ImageDataError):
+            self._extract({"images": [123]})
+
+    def test_conflicting_image_fields_are_fatal(self):
+        from specforge.data.vlm_preprocessing import ImageDataError
+
+        with self.assertRaises(ImageDataError):
+            self._extract({"image": "a.jpg", "images": ["b.jpg"]})
+
+    def test_unreadable_image_is_fatal_not_skipped(self):
+        from specforge.data.vlm_preprocessing import ImageDataError, _load_image
+
+        with self.assertRaises(ImageDataError):
+            _load_image("/nonexistent/path/to/image.jpg", source="t")
+        with self.assertRaises(ImageDataError):
+            _load_image("not-valid-base64!!!", source="t")
+
+
 class VlmRequestInputsTest(unittest.TestCase):
     def test_build_request_inputs_uses_collapsed_ids_and_image_data(self):
         adapter = VlmServerInputAdapter(config=SimpleNamespace())
