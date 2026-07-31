@@ -79,6 +79,11 @@ class ModelConfig(StrictConfigModel):
     tokenizer_pad_token_id: Optional[int] = Field(default=None, ge=0)
     #: SGLang target-engine tuning. Ignored by hf/custom backends.
     sglang_attention_backend: str = "flashinfer"
+    #: Multimodal (vision encoder) attention backend for capture servers. On
+    #: Ascend NPU with a non-text input_modality it defaults to ascend_attn
+    #: (fused vision attention); sdpa materializes N^2 scores and OOMs on
+    #: large images.
+    sglang_mm_attention_backend: Optional[str] = None
     sglang_mem_fraction_static: float = Field(default=0.4, gt=0.0, le=1.0)
     sglang_context_length: Optional[int] = Field(default=None, gt=0)
     sglang_enable_nccl_nvls: bool = False
