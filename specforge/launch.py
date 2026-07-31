@@ -778,6 +778,7 @@ def build_disagg_online_producer(
     num_rollout_workers: int = 1,
     feature_source=None,
     lease: int = 8,
+    producer_concurrency: int = 1,
     in_flight_high_watermark: int = 256,
     in_flight_low_watermark: Optional[int] = None,
     resident_high_watermark_bytes: Optional[int] = None,
@@ -795,9 +796,11 @@ def build_disagg_online_producer(
 
     Workers put() into a cross-node ``feature_store``; committed refs stream to
     the consumer via ``channel``. ``feature_source`` is an injected SGLang
-    server-capture transport; a *sequence* of sources fans out to one worker
-    per source (the multi-server topology; each worker drives its own server
-    concurrently).  There is intentionally no in-process target-model path.
+    server-capture transport; a *sequence* of sources fans out to one logical
+    worker per source (the multi-server topology). Each logical worker keeps
+    ``producer_concurrency`` capture calls in flight and replenishes a slot as
+    soon as that call completes. There is intentionally no in-process
+    target-model path.
     The producer has no training ledger or local ref queue; the consumer owns
     deduplication and durable acknowledgements. Returns ``(workers,
     drive_producer)``:
@@ -822,9 +825,11 @@ def build_disagg_online_producer(
     ``max_prompt_attempts`` (a poisoned prompt goes terminal, not infinite).
     The pool counts as drained only when no prompt is pending *or leased* —
     an all-failed round no longer reads as end-of-data. With N workers the
-    watermark can overshoot by up to N * lease (each worker checks it
-    independently before leasing).
+    watermark can overshoot by up to N * ``producer_concurrency`` * lease
+    because each logical worker checks it independently before filling its
+    request slots.
     """
+    import concurrent.futures
     import os
     import threading
     import time
@@ -862,6 +867,9 @@ def build_disagg_online_producer(
             f"consume a target representation, got {target_repr!r}"
         )
     sleep = sleep or time.sleep
+    producer_concurrency = int(producer_concurrency)
+    if producer_concurrency < 1:
+        raise ValueError("producer_concurrency must be >= 1")
     flow_control = ProducerFlowControl(
         FlowControlLimits(
             high_watermark_refs=in_flight_high_watermark,
@@ -897,6 +905,7 @@ def build_disagg_online_producer(
         f"base_prompts={base_prompt_count} "
         f"prompt_epochs={prompt_epochs} "
         f"lease={worker_lease} workers={num_rollout_workers} "
+        f"concurrency={producer_concurrency} "
         f"watermarks={in_flight_high_watermark}/"
         f"{flow_control.limits.resolved_low_watermark_refs}"
     )
@@ -948,7 +957,8 @@ def build_disagg_online_producer(
         )
         producer_timing(
             "drive_producer enter "
-            f"workers={len(workers)} lease={worker_lease} max_rounds={max_rounds} "
+            f"workers={len(workers)} lease={worker_lease} "
+            f"concurrency={producer_concurrency} max_rounds={max_rounds} "
             f"watermarks={in_flight_high_watermark}/"
             f"{flow_control.limits.resolved_low_watermark_refs} "
             f"progress_interval={progress_interval}"
@@ -1043,146 +1053,210 @@ def build_disagg_online_producer(
             with publish_lock:
                 return reconcile_consumed_locked()
 
-        def run_worker(w) -> None:
-            failures = 0
-            last_backpressure_log = 0.0
-            for _ in range(max_rounds):
-                if should_stop is not None and should_stop():
-                    return
-                _infl = channel.in_flight_remote()
-                _resident = resident_bytes()
-                # backpressure: in_flight = published - consumer-acked
-                backpressure_started = time.monotonic()
-                while flow_control.should_pause(
-                    in_flight_refs=_infl,
-                    resident_bytes=_resident,
+        def publish_refs(w, refs, run_once_start: float) -> None:
+            if not refs:
+                return
+            with publish_lock:
+                current_bytes = reconcile_consumed_locked()
+                ref_sizes = [max(0, int(ref.estimated_bytes or 0)) for ref in refs]
+                projected_bytes = current_bytes + sum(ref_sizes)
+                if (
+                    feature_store_max_resident_bytes is not None
+                    and projected_bytes > feature_store_max_resident_bytes
                 ):
-                    now = time.perf_counter()
-                    if (
-                        progress_interval > 0
-                        and now - last_backpressure_log >= progress_interval
-                    ):
-                        st = controller.status()
-                        producer_timing(
-                            "backpressure wait "
-                            f"worker={w.worker_id} produced={state['produced']} "
-                            f"in_flight={channel.in_flight_remote()} "
-                            f"resident_bytes={resident_bytes()} "
-                            f"pending={st['prompts_pending']} "
-                            f"leased={st['prompts_leased']} "
-                            f"elapsed={elapsed(drive_start)}"
-                        )
-                        last_backpressure_log = now
-                    if should_stop is not None and should_stop():
-                        return
-                    if (
-                        peer_wait_timeout_s is not None
-                        and time.monotonic() - backpressure_started
-                        > peer_wait_timeout_s
-                    ):
-                        raise TimeoutError(
-                            "producer backpressure timed out after "
-                            f"{peer_wait_timeout_s:.0f}s waiting for consumer "
-                            f"progress (in_flight={_infl})"
-                        )
-                    sleep(backpressure_poll_s)
-                    _infl = channel.in_flight_remote()
-                    _resident = resident_bytes()
-                try:
-                    run_once_start = time.perf_counter()
-                    refs = w.run_once(max_tasks=worker_lease)
-                except Exception as exc:
-                    # the worker already failed its leases retryable; peers
-                    # (or this worker, next round) will re-lease them.
-                    failures += 1
-                    logger.warning(
-                        "rollout worker %s failed (%d/%d): %s",
-                        w.worker_id,
-                        failures,
-                        max_worker_failures,
-                        exc,
+                    cleanup_errors = []
+                    for ref in refs:
+                        try:
+                            feature_store.abort(
+                                ref.sample_id,
+                                reason="producer-resident-byte-hard-cap",
+                            )
+                        except Exception as exc:
+                            cleanup_errors.append(
+                                f"{ref.sample_id}: {type(exc).__name__}: {exc}"
+                            )
+                    message = (
+                        "producer feature-store hard cap exceeded: "
+                        f"projected={projected_bytes} > "
+                        f"limit={feature_store_max_resident_bytes} bytes"
                     )
-                    if failures >= max_worker_failures:
-                        dead[w.worker_id] = str(exc)
-                        logger.error(
-                            "dropping rollout worker %s after %d consecutive "
-                            "failures; health=%s",
-                            w.worker_id,
-                            failures,
-                            w.health(),
-                        )
-                        return
-                    sleep(backpressure_poll_s)
-                    continue
-                failures = 0
-                if refs:
-                    with publish_lock:
-                        current_bytes = reconcile_consumed_locked()
-                        ref_sizes = [
-                            max(0, int(ref.estimated_bytes or 0)) for ref in refs
-                        ]
-                        projected_bytes = current_bytes + sum(ref_sizes)
-                        if (
-                            feature_store_max_resident_bytes is not None
-                            and projected_bytes > feature_store_max_resident_bytes
-                        ):
-                            cleanup_errors = []
-                            for ref in refs:
-                                try:
-                                    feature_store.abort(
-                                        ref.sample_id,
-                                        reason="producer-resident-byte-hard-cap",
-                                    )
-                                except Exception as exc:
-                                    cleanup_errors.append(
-                                        f"{ref.sample_id}: {type(exc).__name__}: {exc}"
-                                    )
-                            message = (
-                                "producer feature-store hard cap exceeded: "
-                                f"projected={projected_bytes} > "
-                                f"limit={feature_store_max_resident_bytes} bytes"
-                            )
-                            if cleanup_errors:
-                                message += f"; cleanup errors={cleanup_errors}"
-                            raise MemoryError(message)
-                        _publish_refs_with_cleanup(
-                            channel=channel,
-                            feature_store=feature_store,
-                            refs=refs,
-                        )
-                        published_sizes.extend(ref_sizes)
-                        state["resident_bytes"] = projected_bytes
-                        state["produced"] += len(refs)
-                        now = time.perf_counter()
-                        should_log = not state["first_ref_logged"]
-                        should_log = should_log or (
-                            progress_interval > 0
-                            and now - last_publish_log["t"] >= progress_interval
-                        )
-                        if should_log:
-                            st = controller.status()
-                            producer_timing(
-                                "published refs "
-                                f"worker={w.worker_id} batch={len(refs)} "
-                                f"produced={state['produced']} "
-                                f"in_flight={channel.in_flight_remote()} "
-                                f"pending={st['prompts_pending']} "
-                                f"leased={st['prompts_leased']} "
-                                f"run_once_elapsed={elapsed(run_once_start)} "
-                                f"elapsed={elapsed(drive_start)}"
-                            )
-                            state["first_ref_logged"] = True
-                            last_publish_log["t"] = now
-                elif pool_drained():
+                    if cleanup_errors:
+                        message += f"; cleanup errors={cleanup_errors}"
+                    raise MemoryError(message)
+                _publish_refs_with_cleanup(
+                    channel=channel,
+                    feature_store=feature_store,
+                    refs=refs,
+                )
+                published_sizes.extend(ref_sizes)
+                state["resident_bytes"] = projected_bytes
+                state["produced"] += len(refs)
+                now = time.perf_counter()
+                should_log = not state["first_ref_logged"]
+                should_log = should_log or (
+                    progress_interval > 0
+                    and now - last_publish_log["t"] >= progress_interval
+                )
+                if should_log:
+                    st = controller.status()
                     producer_timing(
-                        f"pool drained worker={w.worker_id} produced={state['produced']} "
+                        "published refs "
+                        f"worker={w.worker_id} batch={len(refs)} "
+                        f"produced={state['produced']} "
+                        f"in_flight={channel.in_flight_remote()} "
+                        f"pending={st['prompts_pending']} "
+                        f"leased={st['prompts_leased']} "
+                        f"request_elapsed={elapsed(run_once_start)} "
                         f"elapsed={elapsed(drive_start)}"
                     )
-                    return
-                else:
-                    # leased nothing: peers hold the remaining prompts (their
-                    # leases may yet fail back into the pool) — wait, retry.
-                    sleep(backpressure_poll_s)
+                    state["first_ref_logged"] = True
+                    last_publish_log["t"] = now
+
+        def abort_unpublished(futures) -> None:
+            """Drain active capture calls and free refs after a fatal driver error."""
+            for future in futures:
+                try:
+                    refs = future.result()
+                except BaseException:
+                    continue
+                for ref in refs:
+                    try:
+                        feature_store.abort(
+                            ref.sample_id,
+                            reason="producer-driver-failed-before-publication",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "failed to abort unpublished ref %s", ref.sample_id
+                        )
+
+        def run_worker(w) -> None:
+            failures = 0
+            submitted = 0
+            accepting = True
+            backpressure_started = None
+            last_backpressure_log = 0.0
+            futures = {}
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=producer_concurrency,
+                thread_name_prefix=f"capture-{w.worker_id}",
+            ) as executor:
+                try:
+                    while True:
+                        stopped = should_stop is not None and should_stop()
+                        if stopped:
+                            accepting = False
+
+                        in_flight = channel.in_flight_remote()
+                        current_resident_bytes = resident_bytes()
+                        paused = flow_control.should_pause(
+                            in_flight_refs=in_flight,
+                            resident_bytes=current_resident_bytes,
+                        )
+                        if paused:
+                            if backpressure_started is None:
+                                backpressure_started = time.monotonic()
+                            now = time.perf_counter()
+                            if (
+                                progress_interval > 0
+                                and now - last_backpressure_log >= progress_interval
+                            ):
+                                st = controller.status()
+                                producer_timing(
+                                    "backpressure wait "
+                                    f"worker={w.worker_id} "
+                                    f"active_requests={len(futures)} "
+                                    f"produced={state['produced']} "
+                                    f"in_flight={in_flight} "
+                                    f"resident_bytes={current_resident_bytes} "
+                                    f"pending={st['prompts_pending']} "
+                                    f"leased={st['prompts_leased']} "
+                                    f"elapsed={elapsed(drive_start)}"
+                                )
+                                last_backpressure_log = now
+                            if (
+                                peer_wait_timeout_s is not None
+                                and time.monotonic() - backpressure_started
+                                > peer_wait_timeout_s
+                            ):
+                                raise TimeoutError(
+                                    "producer backpressure timed out after "
+                                    f"{peer_wait_timeout_s:.0f}s waiting for "
+                                    "consumer progress "
+                                    f"(in_flight={in_flight})"
+                                )
+                        else:
+                            backpressure_started = None
+
+                        status = controller.status()
+                        while (
+                            accepting
+                            and not paused
+                            and submitted < max_rounds
+                            and len(futures) < producer_concurrency
+                            and status["prompts_pending"] > 0
+                        ):
+                            request_start = time.perf_counter()
+                            future = executor.submit(
+                                w.run_once,
+                                max_tasks=worker_lease,
+                            )
+                            futures[future] = request_start
+                            submitted += 1
+                            status = controller.status()
+
+                        if not futures:
+                            if pool_drained():
+                                producer_timing(
+                                    "pool drained "
+                                    f"worker={w.worker_id} "
+                                    f"produced={state['produced']} "
+                                    f"elapsed={elapsed(drive_start)}"
+                                )
+                                return
+                            if not accepting or submitted >= max_rounds:
+                                return
+                            sleep(backpressure_poll_s)
+                            continue
+
+                        done, _pending = concurrent.futures.wait(
+                            futures,
+                            timeout=backpressure_poll_s,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            request_start = futures.pop(future)
+                            try:
+                                refs = future.result()
+                            except Exception as exc:
+                                # The worker already failed this call's leases
+                                # retryable. Other active calls keep draining.
+                                failures += 1
+                                logger.warning(
+                                    "rollout worker %s capture call failed "
+                                    "(%d/%d): %s",
+                                    w.worker_id,
+                                    failures,
+                                    max_worker_failures,
+                                    exc,
+                                )
+                                if failures >= max_worker_failures:
+                                    accepting = False
+                                    dead[w.worker_id] = str(exc)
+                                    logger.error(
+                                        "dropping rollout worker %s after %d "
+                                        "consecutive capture failures; health=%s",
+                                        w.worker_id,
+                                        failures,
+                                        w.health(),
+                                    )
+                                continue
+                            failures = 0
+                            publish_refs(w, refs, request_start)
+                except BaseException:
+                    abort_unpublished(futures)
+                    raise
 
         def ingest_epoch(epoch: int) -> None:
             epoch_prompts = _epoch_online_prompts(

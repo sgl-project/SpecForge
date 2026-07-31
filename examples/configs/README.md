@@ -362,6 +362,7 @@ unless tuning throughput or memory pressure.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `runtime.producer_lease` | `8` | Prompts leased to a rollout worker at once. |
+| `runtime.producer_concurrency` | `1` | Concurrent capture calls maintained by each server's logical producer. Increase to keep ingress full without duplicating producers. |
 | `runtime.in_flight_high_watermark` | `256` | Pause production at this many committed, unacknowledged refs. |
 | `runtime.in_flight_low_watermark` | `192` | Resume production at or below this count; it cannot exceed the high watermark. |
 | `runtime.resident_high_watermark_bytes` | `null` | Optional byte-level pause threshold. |
