@@ -539,7 +539,7 @@ class LaunchPlanTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, message):
                     Config.model_validate(raw)
 
-    def test_managed_local_accepts_minimum_context_and_leaves_radix_enabled(self):
+    def test_managed_local_accepts_minimum_context_and_disables_radix_cache(self):
         with tempfile.TemporaryDirectory() as root:
             cfg = _managed_config(os.path.join(root, "attempt"))
             raw = cfg.model_dump()
@@ -554,7 +554,7 @@ class LaunchPlanTest(unittest.TestCase):
 
         argv = plan.services[1].command.argv
         self.assertEqual(argv[argv.index("--context-length") + 1], "135")
-        self.assertNotIn("--disable-radix-cache", argv)
+        self.assertIn("--disable-radix-cache", argv)
 
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [
@@ -632,6 +632,7 @@ class LaunchPlanTest(unittest.TestCase):
         for index, service in enumerate(plan.services[1:]):
             argv = service.command.argv
             self.assertIn("--enable-spec-capture", argv)
+            self.assertIn("--disable-radix-cache", argv)
             self.assertEqual(argv[argv.index("--dtype") + 1], "float32")
             self.assertEqual(argv[argv.index("--download-dir") + 1], "/models/cache")
             self.assertEqual(argv[argv.index("--spec-capture-method") + 1], "dflash")
