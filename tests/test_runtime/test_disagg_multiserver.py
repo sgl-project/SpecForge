@@ -4,9 +4,11 @@
 The multi-server topology: ``build_disagg_online_producer(feature_source=[...])``
 builds one RolloutWorker per SGLangServerCaptureAdapter (1 server : 1 adapter :
 1 worker), all leasing DISJOINT prompts from the one controller and publishing
-into the one channel, concurrently. Each stub ``post_fn`` stands in for one
-patched SGLang server writing into the shared fake Mooncake backend — the same
-topology configured through ``specforge train`` producer and consumer roles.
+into the one channel, concurrently. A logical worker can continuously maintain
+multiple capture calls without duplicating worker/controller state. Each stub
+``post_fn`` stands in for one patched SGLang server writing into the shared fake
+Mooncake backend — the same topology configured through ``specforge train``
+producer and consumer roles.
 
 Covers the failure matrix the single-server path never hits:
 - disjoint + complete production across two live servers;
@@ -139,6 +141,82 @@ class _TrackingMooncakeFeatureStore(MooncakeFeatureStore):
 class TestMultiServerProducer(unittest.TestCase):
     def _workdir(self):
         return tempfile.mkdtemp(prefix="disagg_multisrv_")
+
+    def test_single_worker_refills_capture_slots_continuously(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        call_lock = threading.Lock()
+        server_lock = threading.Lock()
+        first_call_started = threading.Event()
+        release_first_call = threading.Event()
+        refilled_while_first_active = threading.Event()
+        calls = 0
+        active_calls = 0
+        max_active_calls = 0
+
+        def controlled_post(url, json_body, timeout):
+            nonlocal calls, active_calls, max_active_calls
+            with call_lock:
+                call_index = calls
+                calls += 1
+                active_calls += 1
+                max_active_calls = max(max_active_calls, active_calls)
+            try:
+                if call_index == 0:
+                    first_call_started.set()
+                    if not release_first_call.wait(5):
+                        raise TimeoutError("test did not release first capture call")
+                elif call_index >= 2:
+                    refilled_while_first_active.set()
+                # The fake sink uses process-global torch RNG state; serialize
+                # only that test implementation, not the request lifecycle.
+                with server_lock:
+                    return stub(url, json_body, timeout)
+            finally:
+                with call_lock:
+                    active_calls -= 1
+
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        workers, drive = _build(
+            [_adapter(store, controlled_post)],
+            _prompts(6),
+            store,
+            channel,
+            lease=1,
+            producer_concurrency=2,
+        )
+        outcome = {}
+
+        def run_producer():
+            try:
+                outcome["produced"] = drive()
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run_producer, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(first_call_started.wait(5))
+            self.assertTrue(
+                refilled_while_first_active.wait(5),
+                "producer waited for the slow call instead of refilling its free slot",
+            )
+            self.assertEqual(workers[0].health()["in_flight"], 2)
+        finally:
+            release_first_call.set()
+        thread.join(10)
+
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome.get("produced"), 6)
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(max_active_calls, 2)
+        self.assertEqual(workers[0].health()["in_flight"], 0)
+        self.assertEqual(workers[0].health()["committed"], 6)
+        ids = _published_sample_ids(channel.path)
+        self.assertEqual(len(ids), 6)
+        self.assertEqual(len(set(ids)), 6)
 
     def test_two_servers_disjoint_and_complete(self):
         backend = _FakeMooncakeStore()
@@ -314,6 +392,36 @@ class TestMultiServerProducer(unittest.TestCase):
         )
         self.assertEqual(backend._d, {})
         self.assertIn("OSError", channel.failure())
+
+    def test_publish_failure_aborts_other_concurrent_capture_results(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = _TrackingMooncakeFeatureStore(store=backend, store_id="run0")
+        channel = _FailingPublishChannel(
+            os.path.join(self._workdir(), "refs.jsonl"), fail_after=0
+        )
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(4),
+            store,
+            channel,
+            lease=1,
+            producer_concurrency=2,
+        )
+
+        with self.assertRaisesRegex(OSError, "after 0 durable ref"):
+            drive()
+
+        self.assertEqual(channel.published, 0)
+        self.assertEqual(len(store.abort_calls), 2)
+        self.assertEqual(
+            {reason for _sample_id, reason in store.abort_calls},
+            {
+                "producer-ref-publication-failed",
+                "producer-driver-failed-before-publication",
+            },
+        )
+        self.assertEqual(backend._d, {})
 
     def test_partial_publish_aborts_only_the_non_durable_suffix(self):
         backend = _FakeMooncakeStore()
@@ -556,6 +664,21 @@ class TestMultiServerProducer(unittest.TestCase):
         channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
         with self.assertRaises(ValueError):
             _build(adapters, _prompts(2), store, channel, num_rollout_workers=3)
+
+    def test_producer_concurrency_must_be_positive(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        stub = _StubCaptureServer(backend)
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+
+        with self.assertRaisesRegex(ValueError, "producer_concurrency"):
+            _build(
+                [_adapter(store, stub)],
+                _prompts(2),
+                store,
+                channel,
+                producer_concurrency=0,
+            )
 
 
 if __name__ == "__main__":

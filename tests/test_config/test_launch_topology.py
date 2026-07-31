@@ -72,6 +72,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.6-27b-dflash-multiserver-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-online.yaml": 8,
     "qwen3.6-27b-domino-online.yaml": 8,
+    "qwen3.6-27b-dspark-disaggregated.yaml": 1,
     "qwq-32b-eagle3-online.yaml": 4,
 }
 
@@ -277,6 +278,26 @@ EXPECTED_DISAGGREGATED = {
             ],
         },
     },
+    "qwen3.6-27b-dspark-disaggregated.yaml": {
+        "control_dir": "outputs/qwen3.6-27b-dspark-disaggregated/control",
+        "backend": "mooncake",
+        "managed_local": {
+            "trainer_cuda_visible_devices": ["1"],
+            "mooncake": {
+                "protocol": "tcp",
+                "global_segment_size_bytes": 68719476736,
+                "local_buffer_size_bytes": 1073741824,
+            },
+            "capture_servers": [
+                {
+                    "port": 30000,
+                    "cuda_visible_devices": ["0"],
+                    "tp_size": 1,
+                    "mem_fraction_static": 0.7,
+                }
+            ],
+        },
+    },
 }
 
 
@@ -291,7 +312,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 62)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 63)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():

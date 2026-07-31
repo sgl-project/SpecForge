@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split-eval",
         action="store_true",
-        help="Write a deterministic 5% evaluation split.",
+        help="Write a deterministic 5%% evaluation split.",
     )
     parser.add_argument(
         "--opc-subset",

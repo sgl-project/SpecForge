@@ -615,6 +615,7 @@ def _build_online(
             channel=channel,
             feature_source=adapters if len(adapters) > 1 else adapters[0],
             num_rollout_workers=len(adapters),
+            producer_concurrency=cfg.runtime.producer_concurrency,
             run_id=cfg.run_id,
             target_hidden_size=hidden_size,
             target_vocab_size=target_vocab,
