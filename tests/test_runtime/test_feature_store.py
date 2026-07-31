@@ -161,7 +161,7 @@ class TestLocalFeatureStore(unittest.TestCase):
                 "aux_hidden_state": torch.randn(1, 8, 12),
             }
             torch.save(raw, os.path.join(d, "000.ckpt"))
-            refs = OfflineManifestReader(d, run_id="off").read()
+            refs = OfflineManifestReader(d, run_id="off", validate_files=True).read()
             self.assertEqual(len(refs), 1)
             self.assertTrue(refs[0].feature_store_uri.startswith("file://"))
             self.assertEqual(set(refs[0].feature_specs), set(raw))
@@ -176,10 +176,12 @@ class TestLocalFeatureStore(unittest.TestCase):
             store.release(handle)
 
     def test_offline_reader_rejects_missing_required_key(self):
+        # Eager validation is opt-in; by default a missing key surfaces on the
+        # first store.get() instead of during assembly.
         with tempfile.TemporaryDirectory() as d:
             torch.save({"input_ids": torch.arange(4)}, os.path.join(d, "bad.ckpt"))
             with self.assertRaises(KeyError):
-                OfflineManifestReader(d, run_id="off").read()
+                OfflineManifestReader(d, run_id="off", validate_files=True).read()
 
     def test_mem_ref_carries_generation_and_rejects_stale_ref(self):
         # The mem:// ref carries the generation it was minted for; once a sample
