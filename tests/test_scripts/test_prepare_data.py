@@ -131,7 +131,7 @@ class TestPrepareData(unittest.TestCase):
             {"question": "1 + 1?", "answer": "2"}
         )
         code_row, code_skipped = prepare_data.process_codealpaca_row(
-            {"instruction": "return one", "output": "return 1"}
+            {"instruction": "return one", "input": "", "output": "return 1"}
         )
 
         self.assertEqual(0, skipped)
@@ -140,6 +140,40 @@ class TestPrepareData(unittest.TestCase):
         self.assertEqual("2", math_row["conversations"][1]["content"])
         self.assertEqual("return one", code_row["conversations"][0]["content"])
         self.assertEqual("return 1", code_row["conversations"][1]["content"])
+
+    def test_codealpaca_conversion_keeps_the_non_empty_input(self):
+        empty_input_row, _ = prepare_data.process_codealpaca_row(
+            {
+                "instruction": "Count the characters.",
+                "input": "",
+                "output": "12",
+            }
+        )
+        filled_input_row, _ = prepare_data.process_codealpaca_row(
+            {
+                "instruction": "Count the characters.",
+                "input": 'text = "Hello World!"',
+                "output": "12",
+            }
+        )
+        repeated_row, _ = prepare_data.process_codealpaca_row(
+            {
+                "instruction": "Count the characters.",
+                "input": 'text = "Hello World!"',
+                "output": "12",
+            }
+        )
+
+        self.assertEqual(
+            "Count the characters.",
+            empty_input_row["conversations"][0]["content"],
+        )
+        self.assertEqual(
+            'Count the characters.\n\ntext = "Hello World!"',
+            filled_input_row["conversations"][0]["content"],
+        )
+        self.assertNotEqual(empty_input_row["id"], filled_input_row["id"])
+        self.assertEqual(filled_input_row["id"], repeated_row["id"])
 
     def test_gsm8k_preset_dispatches_to_its_hosted_dataset(self):
         sentinel_dataset = object()
