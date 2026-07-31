@@ -54,6 +54,9 @@ def create_dflash_sdpa_mask(
     sliding_window: Optional[int] = None,
 ):
     """Construct a full or sliding dense boolean DFlash mask."""
+
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError("sliding_window must be > 0")
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
@@ -99,6 +102,9 @@ def create_dflash_block_mask(
     sliding_window: Optional[int] = None,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training."""
+
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError("sliding_window must be > 0")
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size

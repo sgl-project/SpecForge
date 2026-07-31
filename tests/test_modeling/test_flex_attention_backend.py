@@ -6,13 +6,155 @@ import torch
 from torch.nn.attention.flex_attention import flex_attention
 from transformers import Qwen3Config
 
-from specforge.algorithms.common.dflash_family_model import create_dflash_block_mask
-from specforge.modeling.draft.dflash import Qwen3DFlashAttention
+from specforge.algorithms.common.dflash_family_model import (
+    create_dflash_block_mask,
+    create_dflash_sdpa_mask,
+)
+from specforge.modeling.draft.dflash import DFlashDraftModel, Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 
 class FlexAttentionBackendTest(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "FlexAttention requires CUDA")
+    def test_sliding_block_mask_matches_sdpa(self):
+        torch.manual_seed(0)
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        context_len, draft_block_size = 16, 4
+        anchors = torch.tensor([[8, 12]], device=device)
+        keep_blocks = torch.ones(1, 2, dtype=torch.bool, device=device)
+        query_len = anchors.shape[1] * draft_block_size
+        kv_len = context_len + query_len
+        query = torch.randn(1, 2, query_len, 64, device=device, dtype=dtype)
+        key = torch.randn(1, 2, kv_len, 64, device=device, dtype=dtype)
+        value = torch.randn(1, 2, kv_len, 64, device=device, dtype=dtype)
+
+        block_mask = create_dflash_block_mask(
+            anchor_positions=anchors,
+            block_keep_mask=keep_blocks,
+            S=context_len,
+            block_size=draft_block_size,
+            device=device,
+            sliding_window=8,
+        )
+        dense_mask = create_dflash_sdpa_mask(
+            anchor_positions=anchors,
+            block_keep_mask=keep_blocks,
+            S=context_len,
+            block_size=draft_block_size,
+            device=device,
+            sliding_window=8,
+        )
+        compiled_attention = torch.compile(
+            lambda q, k, v, mask: flex_attention(
+                q,
+                k,
+                v,
+                block_mask=mask,
+            ),
+            fullgraph=True,
+        )
+
+        flex_output = compiled_attention(query, key, value, block_mask)
+        sdpa_output = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=dense_mask,
+        )
+        torch.testing.assert_close(
+            flex_output,
+            sdpa_output,
+            atol=3e-3,
+            rtol=2e-2,
+        )
+
+    def test_mixed_layer_types_select_their_own_masks(self):
+        config = Qwen3Config(
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_hidden_layers=2,
+            num_target_layers=4,
+            head_dim=8,
+            layer_types=["sliding_attention", "full_attention"],
+            use_sliding_window=True,
+            sliding_window=8,
+            attention_dropout=0.0,
+            block_size=2,
+            dflash_config={"target_layer_ids": [1, 2]},
+        )
+        config._attn_implementation = "eager"
+        model = DFlashDraftModel(config)
+        sliding_mask = torch.ones(1, 1, 2, 5, dtype=torch.bool)
+        full_mask = torch.ones(1, 1, 2, 5, dtype=torch.bool)
+
+        for layer in model.layers:
+            layer.self_attn.forward = mock.Mock(
+                side_effect=lambda hidden_states, **kwargs: (hidden_states, None)
+            )
+
+        model(
+            position_ids=torch.arange(5).unsqueeze(0),
+            noise_embedding=torch.randn(1, 2, config.hidden_size),
+            target_hidden=torch.randn(1, 3, 2 * config.hidden_size),
+            attention_mask={
+                "sliding_attention": sliding_mask,
+                "full_attention": full_mask,
+            },
+        )
+
+        self.assertIs(
+            model.layers[0].self_attn.forward.call_args.kwargs["attention_mask"],
+            sliding_mask,
+        )
+        self.assertIs(
+            model.layers[1].self_attn.forward.call_args.kwargs["attention_mask"],
+            full_mask,
+        )
+
+    def test_eager_converts_boolean_mask_to_additive_mask(self):
+        config = Qwen3Config(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            num_hidden_layers=1,
+            head_dim=8,
+            layer_types=["sliding_attention"],
+            sliding_window=8,
+            attention_dropout=0.0,
+        )
+        config._attn_implementation = "eager"
+        attention = Qwen3DFlashAttention(
+            config,
+            layer_idx=0,
+            kernels=DEFAULT_DFLASH_KERNELS,
+        )
+        boolean_mask = torch.tensor([[[[True, False]]]])
+        cos = torch.ones(1, 2, config.head_dim)
+        sin = torch.zeros_like(cos)
+
+        with mock.patch(
+            "specforge.modeling.draft.dflash.eager_attention_forward",
+            return_value=(torch.zeros(1, 1, 1, config.head_dim), None),
+        ) as eager:
+            attention(
+                hidden_states=torch.randn(1, 1, config.hidden_size),
+                target_hidden=torch.randn(1, 1, config.hidden_size),
+                position_embeddings=(cos, sin),
+                attention_mask=boolean_mask,
+            )
+
+        additive_mask = eager.call_args.args[4]
+        self.assertEqual(additive_mask[0, 0, 0, 0].item(), 0.0)
+        self.assertEqual(
+            additive_mask[0, 0, 0, 1].item(),
+            torch.finfo(additive_mask.dtype).min,
+        )
+
     # This correctness regression test can be deleted when we require
     # torch>=2.13; it tests the Torch 2.11 Inductor monkeypatch for CuteDSL
     # operations in patch_inductor_cutedsl_lowerings().
@@ -69,6 +211,7 @@ class FlexAttentionBackendTest(unittest.TestCase):
                 block_size=draft_block_size,
                 device=device,
                 flex_block_size=flex_block_size,
+                sliding_window=128,
             )
 
             compiled_attention = torch.compile(
