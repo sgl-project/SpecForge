@@ -434,13 +434,17 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         # Multimodal capture additionally stores server-produced mRoPE
-        # position ids (B, S, 3); text runs do not carry the tensor at all.
+        # position ids (B, S, 3); text runs do not carry the tensor at all,
+        # and wrapped models without mRoPE support must not see the kwarg.
+        forward_kwargs: Dict[str, Any] = {}
         position_ids = t.get("position_ids")
+        if position_ids is not None:
+            forward_kwargs["position_ids"] = position_ids.to(device)
         loss, accuracy, model_metrics = self.dflash_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
-            position_ids=None if position_ids is None else position_ids.to(device),
+            **forward_kwargs,
         )
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:
