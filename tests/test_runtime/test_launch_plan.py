@@ -539,7 +539,7 @@ class LaunchPlanTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, message):
                     Config.model_validate(raw)
 
-    def test_managed_local_accepts_minimum_context_and_disables_radix_cache(self):
+    def test_managed_local_accepts_minimum_context_and_configures_radix_cache(self):
         with tempfile.TemporaryDirectory() as root:
             cfg = _managed_config(os.path.join(root, "attempt"))
             raw = cfg.model_dump()
@@ -555,6 +555,19 @@ class LaunchPlanTest(unittest.TestCase):
         argv = plan.services[1].command.argv
         self.assertEqual(argv[argv.index("--context-length") + 1], "135")
         self.assertIn("--disable-radix-cache", argv)
+
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"))
+            raw = cfg.model_dump()
+            raw["model"]["sglang_disable_radix_cache"] = False
+            validated = Config.model_validate(raw)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                plan = build_launch_plan(validated, config_path="run.yaml", env={})
+
+        self.assertNotIn("--disable-radix-cache", plan.services[1].command.argv)
 
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [

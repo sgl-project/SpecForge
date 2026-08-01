@@ -451,7 +451,6 @@ def _managed_local_services(
                 str(server.tp_size),
                 "--chunked-prefill-size",
                 "-1",
-                "--disable-radix-cache",
                 "--enable-spec-capture",
                 "--spec-capture-method",
                 contract.method,
