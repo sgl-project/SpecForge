@@ -45,5 +45,5 @@ beyond the original context. Ship checkpoints with BOTH schemas present.
 Evaluate accept length bucketed by prompt length on held-out long data
 (full conversation prefixes, not synthetic fill). A successful adaptation
 is FLAT across buckets. Reference run (Inkling-Small v2, block 7,
-temperature 0): 3.59 at 8–16K, 3.56 at 16–32K, 3.53 at ≥32K — within
-noise of each other; see `docs/inkling_small_dspark_v2_results.md`.
+temperature 0): 3.59 at 8–16K, 3.56 at 16–32K, and 3.53 at ≥32K — within
+noise of each other.

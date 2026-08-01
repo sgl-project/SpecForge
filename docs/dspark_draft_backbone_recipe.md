@@ -2,8 +2,7 @@
 
 Design rules for sizing a DSpark/DFlash draft against a new target,
 distilled from the Inkling-Small v2 program (+17.6% mean accept length
-over a v1 draft trained on identical data; see
-`docs/inkling_small_dspark_v2_results.md`).
+over a v1 draft trained on identical data).
 
 ## Attention geometry: match the target
 
