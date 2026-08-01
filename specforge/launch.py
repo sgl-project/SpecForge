@@ -409,28 +409,55 @@ def _epoch_online_prompts(
     seed: int = 0,
 ):
     """Build one deterministic, epoch-specific online prompt plan."""
+    return [
+        _epoch_online_prompt(prompts[index], index, epoch, prompt_epochs)
+        for index in _epoch_prompt_indices(prompts, epoch, seed=seed)
+    ]
+
+
+def _epoch_prompt_indices(prompts, epoch: int, *, seed: int = 0):
+    """Return the legacy deterministic shuffle without materializing payloads."""
     import random
 
-    indexed_prompts = list(enumerate(prompts))
-    random.Random(int(seed) + int(epoch)).shuffle(indexed_prompts)
-    if prompt_epochs == 1:
-        return [prompt for _idx, prompt in indexed_prompts]
+    indices = list(range(len(prompts)))
+    random.Random(int(seed) + int(epoch)).shuffle(indices)
+    return indices
 
-    out = []
-    for idx, prompt in indexed_prompts:
-        item = dict(prompt)
-        metadata = dict(prompt.get("metadata") or {})
-        if "task_id" in prompt:
-            metadata.setdefault("base_task_id", str(prompt["task_id"]))
-        metadata["prompt_index"] = idx
-        metadata["epoch"] = epoch
-        metadata["prompt_epochs"] = prompt_epochs
-        item["metadata"] = metadata
-        # The online feature store is consume-once and commit dedups by
-        # sample_id, so every epoch pass must mint distinct task/sample ids.
-        item["task_id"] = f"epoch{epoch:04d}-prompt{idx:012d}"
-        out.append(item)
-    return out
+
+def _epoch_online_prompt(prompt, index: int, epoch: int, prompt_epochs: int):
+    """Apply epoch identity while preserving the single-epoch prompt shape."""
+    if prompt_epochs == 1:
+        return prompt
+
+    item = dict(prompt)
+    metadata = dict(prompt.get("metadata") or {})
+    if "task_id" in prompt:
+        metadata.setdefault("base_task_id", str(prompt["task_id"]))
+    metadata["prompt_index"] = index
+    metadata["epoch"] = epoch
+    metadata["prompt_epochs"] = prompt_epochs
+    item["metadata"] = metadata
+    # The online feature store is consume-once and commit dedups by
+    # sample_id, so every epoch pass must mint distinct task/sample ids.
+    item["task_id"] = f"epoch{epoch:04d}-prompt{index:012d}"
+    return item
+
+
+def _iter_epoch_online_prompt_batches(
+    prompts,
+    epoch: int,
+    prompt_epochs: int,
+    *,
+    seed: int = 0,
+    batch_size: int = 4096,
+):
+    """Yield a shuffled epoch while bounding expanded token-list residency."""
+    indices = _epoch_prompt_indices(prompts, epoch, seed=seed)
+    for start in range(0, len(indices), batch_size):
+        yield [
+            _epoch_online_prompt(prompts[index], index, epoch, prompt_epochs)
+            for index in indices[start : start + batch_size]
+        ]
 
 
 def _assemble_server_rollout_workers(
@@ -791,6 +818,7 @@ def build_disagg_online_producer(
     sleep=None,
     prompt_epochs: int = 1,
     prompt_seed: int = 0,
+    prompt_ingest_batch_size: int = 4096,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -814,7 +842,9 @@ def build_disagg_online_producer(
     ``prompt_epochs`` repeats the prompt stream on the producer side by minting
     epoch-tagged task/sample ids. Each pass uses the deterministic
     ``prompt_seed + epoch`` order, matching sampler-style epoch semantics while
-    keeping a reconstructed plan stable across restarts.
+    keeping a reconstructed plan stable across restarts. Prompt payloads are
+    normalized and ingested in ``prompt_ingest_batch_size`` chunks so a large
+    memory-mapped dataset does not expand every token list before rollout.
 
     Failure semantics: a worker whose source raises (dead/unreachable server)
     has already failed its leases retryable — the surviving workers re-lease
@@ -870,6 +900,9 @@ def build_disagg_online_producer(
     producer_concurrency = int(producer_concurrency)
     if producer_concurrency < 1:
         raise ValueError("producer_concurrency must be >= 1")
+    prompt_ingest_batch_size = int(prompt_ingest_batch_size)
+    if prompt_ingest_batch_size < 1:
+        raise ValueError("prompt_ingest_batch_size must be >= 1")
     flow_control = ProducerFlowControl(
         FlowControlLimits(
             high_watermark_refs=in_flight_high_watermark,
@@ -896,14 +929,15 @@ def build_disagg_online_producer(
     worker_lease = flow_control.prompt_lease(lease)
     build_start = time.perf_counter()
     prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
-    if prompt_epochs > 1:
+    if not hasattr(prompts, "__len__") or not hasattr(prompts, "__getitem__"):
         prompts = list(prompts)
-    base_prompt_count = len(prompts) if hasattr(prompts, "__len__") else "unknown"
+    base_prompt_count = len(prompts)
     producer_timing(
         "build_disagg_online_producer enter "
         f"algorithm={algorithm.name} modality={modality} "
         f"base_prompts={base_prompt_count} "
         f"prompt_epochs={prompt_epochs} "
+        f"prompt_ingest_batch_size={prompt_ingest_batch_size} "
         f"lease={worker_lease} workers={num_rollout_workers} "
         f"concurrency={producer_concurrency} "
         f"watermarks={in_flight_high_watermark}/"
@@ -1265,26 +1299,19 @@ def build_disagg_online_producer(
                     abort_unpublished(futures)
                     raise
 
-        def ingest_epoch(epoch: int) -> None:
-            epoch_prompts = _epoch_online_prompts(
-                prompts,
-                epoch,
-                prompt_epochs,
-                seed=prompt_seed,
-            )
-            epoch_count = (
-                len(epoch_prompts) if hasattr(epoch_prompts, "__len__") else "unknown"
-            )
+        def ingest_prompt_batch(epoch: int, batch_index: int, epoch_prompts) -> None:
             phase = time.perf_counter()
             producer_timing(
                 "controller.ingest_prompts start "
-                f"epoch={epoch + 1}/{prompt_epochs} prompts={epoch_count}"
+                f"epoch={epoch + 1}/{prompt_epochs} batch={batch_index + 1} "
+                f"prompts={len(epoch_prompts)}"
             )
             task_ids = controller.ingest_prompts(epoch_prompts)
             status = controller.status()
             producer_timing(
                 "controller.ingest_prompts done "
-                f"epoch={epoch + 1}/{prompt_epochs} tasks={len(task_ids)} "
+                f"epoch={epoch + 1}/{prompt_epochs} batch={batch_index + 1} "
+                f"tasks={len(task_ids)} "
                 f"pending={status['prompts_pending']} elapsed={elapsed(phase)}"
             )
 
@@ -1321,21 +1348,35 @@ def build_disagg_online_producer(
             for epoch in range(prompt_epochs):
                 if should_stop is not None and should_stop():
                     break
-                ingest_epoch(epoch)
-                if not live_workers:
-                    raise RuntimeError(
-                        f"all rollout workers were already dropped before "
-                        f"epoch {epoch + 1}/{prompt_epochs} could run — "
-                        f"dead workers: {dead}"
-                    )
-                run_epoch_workers(live_workers)
-                stopped = should_stop is not None and should_stop()
-                live_workers = [w for w in live_workers if w.worker_id not in dead]
-                if dead and not stopped and not pool_drained():
-                    raise RuntimeError(
-                        f"all rollout workers exited with {len(dead)} dropped as "
-                        f"dead and prompts remaining — dead workers: {dead}"
-                    )
+                epoch_batches = _iter_epoch_online_prompt_batches(
+                    prompts,
+                    epoch,
+                    prompt_epochs,
+                    seed=prompt_seed,
+                    batch_size=prompt_ingest_batch_size,
+                )
+                stopped = False
+                for batch_index, prompt_batch in enumerate(epoch_batches):
+                    if should_stop is not None and should_stop():
+                        stopped = True
+                        break
+                    ingest_prompt_batch(epoch, batch_index, prompt_batch)
+                    if not live_workers:
+                        raise RuntimeError(
+                            f"all rollout workers were already dropped before "
+                            f"epoch {epoch + 1}/{prompt_epochs} batch "
+                            f"{batch_index + 1} could run — dead workers: {dead}"
+                        )
+                    run_epoch_workers(live_workers)
+                    stopped = should_stop is not None and should_stop()
+                    live_workers = [w for w in live_workers if w.worker_id not in dead]
+                    if dead and not stopped and not pool_drained():
+                        raise RuntimeError(
+                            f"all rollout workers exited with {len(dead)} dropped "
+                            f"as dead and prompts remaining — dead workers: {dead}"
+                        )
+                    if stopped:
+                        break
                 if stopped:
                     break
                 st = controller.status()

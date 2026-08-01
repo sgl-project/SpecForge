@@ -12,12 +12,17 @@ from specforge.data.prompt_builder import prepare_prompt_tasks
 class _FakeDataset:
     def __init__(self, rows):
         self.rows = list(rows)
+        self.getitem_calls = 0
 
     def __iter__(self):
         return iter(self.rows)
 
     def __len__(self):
         return len(self.rows)
+
+    def __getitem__(self, index):
+        self.getitem_calls += 1
+        return self.rows[index]
 
     def select(self, indices):
         return _FakeDataset(self.rows[index] for index in indices)
@@ -141,8 +146,11 @@ class TestPreparePromptTasks(unittest.TestCase):
                     max_prompts=1,
                 )
 
+        self.assertEqual(processed_dataset.getitem_calls, 0)
+        materialized_prompts = list(prompts)
+        self.assertEqual(processed_dataset.getitem_calls, 1)
         self.assertEqual(
-            prompts,
+            materialized_prompts,
             [
                 {
                     "payload": {

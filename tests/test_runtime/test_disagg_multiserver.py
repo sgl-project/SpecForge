@@ -596,6 +596,35 @@ class TestMultiServerProducer(unittest.TestCase):
         )
         self.assertTrue(channel.is_closed())
 
+    def test_prompt_ingest_chunks_preserve_epoch_ids_and_release_payloads(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        N, E = 5, 2
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(N),
+            store,
+            channel,
+            lease=2,
+            prompt_epochs=E,
+            prompt_ingest_batch_size=2,
+        )
+
+        produced = drive()
+
+        self.assertEqual(produced, N * E)
+        self.assertEqual(workers[0].controller.status()["prompts"], 0)
+        self.assertEqual(
+            set(_published_sample_ids(channel.path)),
+            {
+                f"run0:epoch{epoch:04d}-prompt{idx:012d}"
+                for epoch in range(E)
+                for idx in range(N)
+            },
+        )
+
     def test_prompt_epoch_order_is_seeded_and_reconstruction_stable(self):
         prompts = _prompts(12)
 

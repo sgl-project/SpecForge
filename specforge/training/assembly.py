@@ -30,7 +30,7 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
@@ -360,7 +360,7 @@ def _prepare_prompts(
     draft_config,
     path: Optional[str] = None,
     cache_key: Optional[str] = None,
-) -> List[dict]:
+) -> Sequence[dict]:
     """Prepare one prompt source with an optional path/cache namespace override.
 
     Training keeps the configured cache key. Evaluation supplies its own path
