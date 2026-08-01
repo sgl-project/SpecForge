@@ -179,6 +179,7 @@ class WandbTracker(Tracker):
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
+        self._run = None
         if wandb is None:
             raise RuntimeError(
                 "To use --report-to wandb, install the W&B client: "
@@ -199,16 +200,22 @@ class WandbTracker(Tracker):
             }
             if args.wandb_offline:
                 init_kwargs["mode"] = "offline"
-            wandb.init(**init_kwargs)
-            self.is_initialized = True
+            # Keep the run handle owned by this tracker.  The module-level
+            # ``wandb.run`` singleton is mutable process-global state; relying
+            # on it after a multiprocessing-heavy setup can silently detach
+            # explicit training history from the initialized run.
+            self._run = wandb.init(**init_kwargs)
+            self.is_initialized = self._run is not None
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
-        if self.rank == 0 and self.is_initialized:
-            wandb.log(log_dict, step=step)
+        if self.rank == 0 and self.is_initialized and self._run is not None:
+            self._run.log(log_dict, step=step)
 
     def close(self):
-        if self.rank == 0 and self.is_initialized and wandb.run:
-            wandb.finish()
+        if self.rank == 0 and self.is_initialized:
+            if self._run is not None:
+                self._run.finish()
+            self._run = None
             self.is_initialized = False
 
 
