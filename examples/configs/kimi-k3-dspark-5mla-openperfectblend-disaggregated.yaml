@@ -29,7 +29,7 @@ training:
   strategy: dspark
   num_epochs: 10
   batch_size: 8
-  accumulation_steps: 32
+  accumulation_steps: 16
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1
@@ -56,11 +56,11 @@ tracking:
 runtime:
   producer_lease: 1
   producer_concurrency: 8
-  in_flight_high_watermark: 64
-  in_flight_low_watermark: 32
-  resident_high_watermark_bytes: 34359738368
-  resident_low_watermark_bytes: 17179869184
-  feature_store_max_resident_bytes: 68719476736
+  in_flight_high_watermark: 576
+  in_flight_low_watermark: 512
+  resident_high_watermark_bytes: 206158430208
+  resident_low_watermark_bytes: 180388626432
+  feature_store_max_resident_bytes: 240518168576
 
 run_id: kimi-k3-dspark-5mla-openperfectblend-disaggregated
 output_dir: /workspace/k3_dspark/runs/kimi-k3-5mla-openperfectblend/output

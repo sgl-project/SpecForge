@@ -107,13 +107,29 @@ def test_training_recipes_preserve_reference_run_contract(filename):
     config = Config.from_file(str(ROOT / "examples" / "configs" / filename))
     assert config.data.max_length == 4096
     assert config.training.batch_size == 8
-    assert config.training.accumulation_steps == 32
+    assert config.training.accumulation_steps == 16
+    assert (
+        config.deployment.trainer.nnodes
+        * config.deployment.trainer.nproc_per_node
+        * config.training.batch_size
+        * config.training.accumulation_steps
+        == 512
+    )
     assert config.training.num_epochs == 10
     assert config.training.learning_rate == pytest.approx(6e-4)
     assert config.training.warmup_ratio == pytest.approx(0.04)
     assert config.training.num_anchors == 512
     assert config.training.save_interval == 250
     assert config.training.log_interval == 10
+    assert config.runtime.in_flight_high_watermark >= 512
+    assert config.runtime.in_flight_low_watermark >= 512
+    # A worst-case 4,096-token optimizer window carries about 168 GiB of
+    # captured features; do not reintroduce byte backpressure below it.
+    assert config.runtime.resident_high_watermark_bytes >= 180388626432
+    assert (
+        config.runtime.feature_store_max_resident_bytes
+        >= config.runtime.resident_high_watermark_bytes
+    )
     assert config.tracking.report_to == "wandb"
     assert config.tracking.wandb_offline is False
     assert config.data.chat_template in TEMPLATE_REGISTRY.get_all_template_names()
