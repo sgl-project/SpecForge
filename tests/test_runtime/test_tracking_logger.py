@@ -184,7 +184,7 @@ class TrackingLoggerTest(unittest.TestCase):
             tracker.close()
             tracker.close()
 
-        run.log.assert_called_once_with({"train/loss": 1.25}, step=10)
+        run.log.assert_called_once_with({"train/loss": 1.25}, step=10, commit=True)
         run.finish.assert_called_once_with()
         wandb.log.assert_not_called()
         wandb.finish.assert_not_called()

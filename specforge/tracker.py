@@ -209,7 +209,10 @@ class WandbTracker(Tracker):
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
         if self.rank == 0 and self.is_initialized and self._run is not None:
-            self._run.log(log_dict, step=step)
+            # W&B defaults ``commit`` to False whenever an explicit step is
+            # supplied.  Finalize each trainer record so live runs publish the
+            # point immediately instead of keeping the newest step buffered.
+            self._run.log(log_dict, step=step, commit=True)
 
     def close(self):
         if self.rank == 0 and self.is_initialized:
