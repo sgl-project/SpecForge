@@ -1,14 +1,18 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
+import logging
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing_extensions import final, override
 
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
+
+logger = logging.getLogger(__name__)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -161,42 +165,77 @@ class OnlineDFlashModel(nn.Module):
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
+    def _anchor_candidates(
+        self, seq_len: int, loss_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Return (candidate_mask, per-sample counts, sample width).
+
+        Hook for subclasses with different candidate rules. A position
+        qualifies when it is supervised and leaves room for a full block.
+        """
+        max_anchor = max(seq_len - self.block_size, 0)
+        valid = loss_mask[:, : max_anchor + 1] > 0.5
+        valid_counts = valid.sum(dim=1)
+        width = min(self.num_anchors, int(valid_counts.max().item()) - 1)
+        return valid, valid_counts, width
+
+    @final
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Randomly sample anchor positions per sample; returns (anchors, keep_mask)."""
-        bs = self.block_size
-        bsz = loss_mask.shape[0]
-        max_anchor = max(seq_len - bs, 0)
+        """Randomly sample anchor positions per sample; returns (anchors, keep_mask).
 
-        valid = loss_mask[:, : max_anchor + 1] > 0.5
-        valid_counts = valid.sum(dim=1)
-        max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
+        Step 1: candidate selection, configurable through `_anchor_candidates`;
+        Step 2: select anchors from the candidates, through `_select_anchors`.
+        """
+        valid, valid_counts, width = self._anchor_candidates(seq_len, loss_mask)
+        if width <= 0:
+            # Raising here would skip this rank past the all-reduce of the
+            # loss denominator and hang every peer until the NCCL timeout, so
+            # degrade to a fully-masked micro-batch that contributes nothing
+            # but still reaches the collective.
+            logger.warning(
+                "%s: no valid anchor positions in this micro-batch; "
+                "contributing zero supervision for this step.",
+                type(self).__name__,
+            )
+            bsz = loss_mask.shape[0]
+            anchors = torch.zeros((bsz, 1), dtype=torch.long, device=device)
+            keep_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=device)
+            return anchors, keep_mask
+        return self._select_anchors(valid, valid_counts, width, device)
 
-        if max_n <= 0:
-            raise ValueError("should preprocess the data.")
-
-        indices = (
-            torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
+    @final
+    def _select_anchors(
+        self,
+        valid: torch.Tensor,
+        valid_counts: torch.Tensor,
+        width: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Randomly pick up to ``width`` candidates per sample, sorted ascending."""
+        bsz, num_candidates = valid.shape
+        indices = torch.arange(num_candidates, device=device).expand(bsz, -1)
+        random_values = torch.rand(valid.shape, device=device)
+        random_values = torch.where(
+            valid, random_values, torch.tensor(2.0, device=device)
         )
-        masked_indices = torch.where(
-            valid, indices, torch.tensor(seq_len + 1, device=device)
-        )
-
-        random_vals = torch.rand(bsz, max_anchor + 1, device=device)
-        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
-
-        _, sorted_idx = random_vals.sort(dim=1)
-        gathered = torch.gather(masked_indices, 1, sorted_idx)
-        anchors = gathered[:, :max_n].sort(dim=1).values
-
-        keep_mask = torch.arange(max_n, device=device).unsqueeze(
+        order = random_values.argsort(dim=1)
+        candidates = torch.gather(indices, 1, order)[:, :width]
+        keep_mask = torch.arange(width, device=device).unsqueeze(
             0
-        ) < valid_counts.unsqueeze(1).clamp(max=max_n)
-        anchors = torch.where(
-            keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device)
+        ) < valid_counts.clamp(max=width).unsqueeze(1)
+        anchors = (
+            torch.where(
+                keep_mask,
+                candidates,
+                torch.full_like(candidates, num_candidates),
+            )
+            .sort(dim=1)
+            .values
         )
-
+        keep_mask = anchors < num_candidates
+        anchors = torch.where(keep_mask, anchors, torch.zeros_like(anchors))
         return anchors, keep_mask
 
     def _create_position_ids(self, anchor_positions: torch.Tensor) -> torch.Tensor:
@@ -466,41 +505,6 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_type="dflash",
         )
         self.shift_label = shift_label
-
-    def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Randomly sample anchor positions per sample; returns (anchors, keep_mask)."""
-        bs = self.block_size
-        bsz = loss_mask.shape[0]
-        max_anchor = max(seq_len - bs, 0)
-
-        valid = loss_mask[:, : max_anchor + 1] > 0.5
-        valid_counts = valid.sum(dim=1)
-        max_n = max(1, min(self.num_anchors, int(valid_counts.max().item()) - 1))
-
-        indices = (
-            torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
-        )
-        masked_indices = torch.where(
-            valid, indices, torch.tensor(seq_len + 1, device=device)
-        )
-
-        random_vals = torch.rand(bsz, max_anchor + 1, device=device)
-        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
-
-        _, sorted_idx = random_vals.sort(dim=1)
-        gathered = torch.gather(masked_indices, 1, sorted_idx)
-        anchors = gathered[:, :max_n].sort(dim=1).values
-
-        keep_mask = torch.arange(max_n, device=device).unsqueeze(
-            0
-        ) < valid_counts.unsqueeze(1).clamp(max=max_n)
-        anchors = torch.where(
-            keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device)
-        )
-
-        return anchors, keep_mask
 
     def _build_domino_head_inputs(
         self,
@@ -775,42 +779,24 @@ class OnlineDSparkModel(OnlineDFlashModel):
         first_target_valid = loss_mask[:, 1 : num_candidates + 1] > 0.5
         return anchor_valid & first_target_valid
 
-    def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample only anchors with a valid first target, without dummy width."""
+    @override
+    def _anchor_candidates(
+        self, seq_len: int, loss_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Stricter candidate rule than the base class.
 
+        DSpark labels start strictly after the anchor (offsets 1..block_size,
+        see ``_build_dspark_labels_and_mask``), so a position only qualifies
+        when both the anchor token and its first target are supervised.
+        Because the mask already guarantees every candidate a trainable first
+        label, ``width`` spends the full candidate count -- unlike the base
+        class, whose mask checks the anchor position only and therefore keeps
+        one candidate of headroom (the ``- 1``).
+        """
         valid = self._build_anchor_candidate_mask(seq_len, loss_mask)
-        if valid.shape[1] == 0:
-            raise ValueError("DSpark needs sequences with at least two tokens")
         valid_counts = valid.sum(dim=1)
         width = min(self.num_anchors, int(valid_counts.max().item()))
-        if width <= 0:
-            raise ValueError(
-                "DSpark found no valid anchor with two consecutive loss tokens"
-            )
-        indices = torch.arange(valid.shape[1], device=device).expand(
-            loss_mask.shape[0], -1
-        )
-        random_values = torch.rand(valid.shape, device=device)
-        random_values.masked_fill_(~valid, 2.0)
-        order = random_values.argsort(dim=1)
-        candidates = torch.gather(indices, 1, order)[:, :width]
-        keep_mask = torch.arange(width, device=device).unsqueeze(
-            0
-        ) < valid_counts.clamp(max=width).unsqueeze(1)
-        anchors = (
-            torch.where(
-                keep_mask,
-                candidates,
-                torch.full_like(candidates, valid.shape[1]),
-            )
-            .sort(dim=1)
-            .values
-        )
-        keep_mask = anchors < valid.shape[1]
-        anchors = torch.where(keep_mask, anchors, torch.zeros_like(anchors))
-        return anchors, keep_mask
+        return valid, valid_counts, width
 
     def _build_dspark_labels_and_mask(
         self,
