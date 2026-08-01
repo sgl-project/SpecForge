@@ -94,6 +94,7 @@ class TestResolveTotalSteps(unittest.TestCase):
             training=SimpleNamespace(
                 num_epochs=3,
                 seed=17,
+                prompt_seed=None,
                 batch_size=2,
                 accumulation_steps=4,
             ),
@@ -114,6 +115,35 @@ class TestResolveTotalSteps(unittest.TestCase):
             self.assertEqual(_read_online_total_steps(cfg, channel_path), 9)
 
             cfg.training.seed = 18
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                _read_online_total_steps(cfg, channel_path)
+
+    def test_online_prompt_seed_is_independent_from_model_seed(self):
+        cfg = SimpleNamespace(
+            training=SimpleNamespace(
+                num_epochs=3,
+                seed=17,
+                prompt_seed=5,
+                batch_size=2,
+                accumulation_steps=4,
+            ),
+            deployment=SimpleNamespace(
+                trainer=SimpleNamespace(nnodes=2, nproc_per_node=2)
+            ),
+        )
+        payload = _online_schedule_payload(cfg, num_prompts=100)
+        self.assertEqual(payload["prompt_seed"], 5)
+
+        with tempfile.TemporaryDirectory() as directory:
+            channel_path = f"{directory}/refs.jsonl"
+            _write_control(
+                channel_path + _ONLINE_SCHEDULE_SUFFIX,
+                json.dumps(payload),
+            )
+            cfg.training.seed = 18
+            self.assertEqual(_read_online_total_steps(cfg, channel_path), 9)
+
+            cfg.training.prompt_seed = 6
             with self.assertRaisesRegex(ValueError, "does not match"):
                 _read_online_total_steps(cfg, channel_path)
 

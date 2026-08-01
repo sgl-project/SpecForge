@@ -547,6 +547,9 @@ class TrainingConfig(StrictConfigModel):
     #: and different roles.
     role: Literal["auto", "all", "producer", "consumer"] = "all"
     seed: int = 42
+    #: Deterministic online prompt ordering. ``None`` preserves the historical
+    #: behavior of using the run RNG seed for both model and prompt sampling.
+    prompt_seed: Optional[int] = None
 
     @model_validator(mode="after")
     def _validate_training_shape(self):

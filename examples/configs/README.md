@@ -236,6 +236,7 @@ Common fields:
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.role` | `all` | Use `all` for local offline training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
+| `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
 
 Strategy-specific fields should be written only when tuning that objective:
 
