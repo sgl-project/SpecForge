@@ -905,13 +905,24 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
         node = raw
         keys = path.split(".")
         for key in keys[:-1]:
-            if not isinstance(node.get(key), dict):
+            child = node.get(key)
+            if child is None:
+                # Optional sections default to None (e.g. disaggregated
+                # .managed_local on a server_urls recipe); create them so
+                # their declared fields can be overridden. Re-validation with
+                # extra="forbid" still rejects typo'd paths, so this stays safe.
+                child = {}
+                node[key] = child
+            if not isinstance(child, dict):
                 raise ValueError(f"override path {path!r} does not exist")
-            node = node[key]
-        if keys[-1] not in node:
-            raise ValueError(f"override path {path!r} does not exist")
-        current = node[keys[-1]]
-        if isinstance(current, (dict, list)) and value.lstrip().startswith(("[", "{")):
+            node = child
+        current = node.get(keys[-1])
+        # Structured (YAML) values are parsed when the target is a dict/list
+        # or a yet-unset leaf (None); schema re-validation does the final
+        # type check either way.
+        if (current is None or isinstance(current, (dict, list))) and (
+            value.lstrip().startswith(("[", "{"))
+        ):
             import yaml
 
             try:

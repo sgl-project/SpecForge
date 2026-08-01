@@ -641,6 +641,48 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             apply_overrides(cfg, ["not-an-assignment"])
 
+    def test_override_creates_none_optional_sections(self):
+        payload = {
+            "model": {
+                "target_model_path": "some/target",
+                "draft_model_config": "draft.json",
+            },
+            "data": {"train_data_path": "train.jsonl"},
+            "deployment": {
+                "mode": "disaggregated",
+                "trainer": {"nnodes": 1, "nproc_per_node": 2},
+                "disaggregated": {
+                    "control_dir": "outputs/x/control",
+                    "backend": "mooncake",
+                    "server_urls": ["http://127.0.0.1:30000"],
+                },
+            },
+        }
+        cfg = Config.model_validate(payload)
+        out = apply_overrides(
+            cfg,
+            [
+                # managed_local and server_urls are mutually exclusive.
+                "deployment.disaggregated.server_urls=[]",
+                'deployment.disaggregated.managed_local.trainer_cuda_visible_devices=["8","9"]',
+                'deployment.disaggregated.managed_local.capture_servers=[{port: 40000, cuda_visible_devices: ["0"], tp_size: 1}]',
+            ],
+        )
+        self.assertEqual(out.deployment.disaggregated.server_urls, [])
+        managed = out.deployment.disaggregated.managed_local
+        self.assertIsNotNone(managed)
+        self.assertEqual(managed.trainer_cuda_visible_devices, ["8", "9"])
+        self.assertEqual(len(managed.capture_servers), 1)
+        self.assertEqual(managed.capture_servers[0].port, 40000)
+        # Defaults fill in untouched managed sub-configs.
+        self.assertGreater(managed.mooncake.rpc_port, 0)
+        # Typo'd paths are still rejected by re-validation.
+        with self.assertRaises(Exception):
+            apply_overrides(
+                cfg,
+                ["deployment.disaggregated.managed_local.no_such_field=1"],
+            )
+
     def test_load_config_applies_overrides(self):
         path = _write(MINIMAL, ".json")
         self.addCleanup(os.unlink, path)
