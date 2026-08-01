@@ -3,6 +3,7 @@
 import abc
 import netrc
 import os
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 import torch.distributed as dist
@@ -40,15 +41,35 @@ except ImportError:
 # --- End Lazy Imports ---
 
 
+def _is_secret_field(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in {
+        "key",
+        "token",
+        "password",
+        "secret",
+        "wandb_key",
+        "swanlab_key",
+        "hf_key",
+    } or lowered.endswith(("_api_key", "_auth_token", "_token", "_password", "_secret"))
+
+
+def _redact_config(value: Any, *, field: str | None = None) -> Any:
+    if field is not None and _is_secret_field(field):
+        return None if value is None else "<redacted>"
+    if isinstance(value, Mapping):
+        return {
+            str(name): _redact_config(item, field=str(name))
+            for name, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_config(item) for item in value]
+    return value
+
+
 def _public_config(args) -> Dict[str, Any]:
-    """Return tracker metadata without copying credentials into run logs."""
-    config = dict(vars(args))
-    for name in list(config):
-        lowered = name.lower()
-        if any(secret in lowered for secret in ("key", "token", "password")):
-            if config[name] is not None:
-                config[name] = "<redacted>"
-    return config
+    """Return recursively redacted tracker metadata safe for run logs."""
+    return _redact_config(vars(args))
 
 
 class Tracker(abc.ABC):

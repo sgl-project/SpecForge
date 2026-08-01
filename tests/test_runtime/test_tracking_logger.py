@@ -73,11 +73,31 @@ class TrackingLoggerTest(unittest.TestCase):
                 wandb_key="secret",
                 auth_token="also-secret",
                 wandb_project="specforge",
+                specforge_config={
+                    "tracking": {"wandb_key": "nested-secret"},
+                    "model": {
+                        "embedding_key": "language_model.embed_tokens.weight",
+                        "lm_head_key": "language_model.lm_head.weight",
+                    },
+                    "data": {"cache_key": "reproduction-cache"},
+                },
             )
         )
         self.assertEqual(config["wandb_key"], "<redacted>")
         self.assertEqual(config["auth_token"], "<redacted>")
         self.assertEqual(config["wandb_project"], "specforge")
+        self.assertEqual(
+            config["specforge_config"]["tracking"]["wandb_key"],
+            "<redacted>",
+        )
+        self.assertEqual(
+            config["specforge_config"]["model"]["embedding_key"],
+            "language_model.embed_tokens.weight",
+        )
+        self.assertEqual(
+            config["specforge_config"]["data"]["cache_key"],
+            "reproduction-cache",
+        )
 
     def test_normalizes_scalars_and_expands_vectors(self):
         self.assertEqual(

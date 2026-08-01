@@ -307,6 +307,11 @@ def _configured_logger(cfg: Config):
     options["swanlab_name"] = options["swanlab_name"] or cfg.run_id
     options["mlflow_experiment_name"] = options["mlflow_experiment_name"] or "specforge"
     options["mlflow_run_name"] = options["mlflow_run_name"] or cfg.run_id
+    if cfg.tracking.report_to == "wandb":
+        # W&B is the canonical reproduction record for the disaggregated K3
+        # runs. Keep the complete resolved config next to the metric stream;
+        # tracker._public_config recursively redacts credentials before init.
+        options["specforge_config"] = cfg.model_dump(mode="json")
     return create_tracker_logger(
         SimpleNamespace(**options), cfg.output_dir, console_logger=_logger
     )

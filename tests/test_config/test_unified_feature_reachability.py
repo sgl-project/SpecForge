@@ -337,6 +337,11 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         self.assertEqual(args.wandb_name, "experiment")
         self.assertTrue(args.wandb_offline)
         self.assertEqual(args.wandb_dir, "/tmp/wandb")
+        self.assertEqual(args.specforge_config["run_id"], "run")
+        self.assertEqual(
+            args.specforge_config["training"]["strategy"],
+            cfg.training.strategy,
+        )
         self.assertEqual(output_dir, "/tmp/output")
         self.assertIs(create.call_args.kwargs["console_logger"], _logger)
 
