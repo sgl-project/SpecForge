@@ -463,6 +463,11 @@ def _managed_local_services(
                 str(server.port),
             ]
         )
+        visibility_env = (
+            "ASCEND_RT_VISIBLE_DEVICES"
+            if "ASCEND_RT_VISIBLE_DEVICES" in os.environ
+            else "CUDA_VISIBLE_DEVICES"
+        )
         mm_attention_backend = cfg.model.sglang_mm_attention_backend
         if (
             mm_attention_backend is None
