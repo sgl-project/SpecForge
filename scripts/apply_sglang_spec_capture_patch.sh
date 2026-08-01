@@ -13,11 +13,12 @@
 # anything else fails loudly rather than testing against unknown server code.
 #
 # Usage: scripts/apply_sglang_spec_capture_patch.sh
-#          [--target v0.5.14|kimi-k3-f8493a4] [--reverse]
+#          [--target v0.5.14|kimi-k3-9acd9cb|kimi-k3-f8493a4] [--reverse]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="v0.5.14"
+PATCH_TARGET=""
 REVERSE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -43,19 +44,23 @@ done
 case "$TARGET" in
     v0.5.14)
         EXPECTED_VERSION_PREFIX="0.5.14"
+        PATCH_TARGET="$TARGET"
         ;;
-    kimi-k3-f8493a4)
+    kimi-k3-9acd9cb|kimi-k3-f8493a4)
         # Kimi K3's SGLang fork currently reports a base-package version that
         # does not uniquely identify this source revision, so patch --check is
         # the authoritative compatibility gate below.
         EXPECTED_VERSION_PREFIX=""
+        # The patch remains byte-identical and applies cleanly to both the
+        # original f8493a4 integration point and current K3 tip 9acd9cb.
+        PATCH_TARGET="kimi-k3-f8493a4"
         ;;
     *)
         echo "ERROR: unsupported SGLang patch target: $TARGET" >&2
         exit 2
         ;;
 esac
-PATCH="$HERE/patches/sglang/$TARGET/spec-capture.patch"
+PATCH="$HERE/patches/sglang/$PATCH_TARGET/spec-capture.patch"
 
 SGL_PARENT="$(python -c 'import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))')"
 SGL_VERSION="$(python -c 'import sglang; print(sglang.__version__)')"

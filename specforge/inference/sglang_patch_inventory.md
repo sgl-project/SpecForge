@@ -2,8 +2,9 @@
 
 SpecForge pins `sglang==0.5.14` by default. The online patch is also kept
 compatible with SGLang's public `inkling-support` layout, and a separately
-versioned patch supports the Kimi K3 SGLang fork at revision `f8493a4`. There
-are two deliberately separate SGLang integration surfaces.
+versioned patch supports the Kimi K3 SGLang fork at the current validated
+`kimi-k3` branch tip `9acd9cb` (and its original `f8493a4` integration point).
+There are two deliberately separate SGLang integration surfaces.
 
 ## Online: external spec-capture server
 
@@ -12,7 +13,7 @@ Online training uses one of these source-specific patches:
 | Target | Patch | Capture methods |
 |---|---|---|
 | SGLang v0.5.14 / `inkling-support` | [`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch) | EAGLE3, DFlash |
-| Kimi K3 SGLang `f8493a4` | [`patches/sglang/kimi-k3-f8493a4/spec-capture.patch`](../../patches/sglang/kimi-k3-f8493a4/spec-capture.patch) | EAGLE3, DFlash, DSpark |
+| Kimi K3 SGLang `9acd9cb` (`f8493a4` compatible) | [`patches/sglang/kimi-k3-f8493a4/spec-capture.patch`](../../patches/sglang/kimi-k3-f8493a4/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 
 The patch adds `--enable-spec-capture` and a server-side sink that:
 
@@ -36,7 +37,7 @@ for hybrid targets that require the unified radix tree.
 
 Apply the default patch with `scripts/apply_sglang_spec_capture_patch.sh`, or
 the K3 patch with
-`scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-f8493a4`.
+`scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb`.
 The K3 patch routes `--spec-capture-method dspark` to the model's dedicated
 `set_dspark_layers_to_capture` hook. It also keeps 64K capture correct by using
 64-bit Triton pointer arithmetic, scale-stable residual scoring, and a generic

@@ -145,9 +145,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
         self.assertTrue(peagle.step.uses_external_target_head)
 
     def test_dspark_uses_the_dedicated_server_capture_method(self):
-        stream = self.registry.resolve("dspark").providers.server_streaming_for(
-            "text"
-        )
+        stream = self.registry.resolve("dspark").providers.server_streaming_for("text")
 
         self.assertEqual("dspark", stream.capture_method)
 

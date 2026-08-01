@@ -63,7 +63,10 @@ runtime:
   # One 64K K3 sample is roughly 5.25 GiB of BF16 DSpark features. A complete
   # optimizer quantum is 128 samples, so the server segment must exceed 672 GiB.
   in_flight_high_watermark: 128
-  in_flight_low_watermark: 96
+  # Consumers dispatch complete optimizer windows. Keep the resume threshold
+  # at least one global quantum to avoid a producer/consumer backpressure
+  # deadlock while a window is still incomplete.
+  in_flight_low_watermark: 128
   resident_high_watermark_bytes: 858993459200
   resident_low_watermark_bytes: 697932185600
   feature_store_max_resident_bytes: 966367641600

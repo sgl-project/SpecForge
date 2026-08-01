@@ -9,14 +9,16 @@ effective global batch, constant learning rate, and DSpark loss weights.
 
 - SpecForge with configurable LR scheduling, an independent online prompt
   seed, and dedicated DSpark capture support.
-- Kimi K3 SGLang revision `f8493a43a6a30d2a1cad6b0034e2c1b362d920d5`.
+- Kimi K3 SGLang revision `9acd9cba39f522da71c6d9b9695f2ceb41d36b18`
+  (the current public `kimi-k3` branch tip validated by this recipe).
 - The K3 SGLang tree patched with:
 
   ```bash
-  scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-f8493a4
+  scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb
   ```
 
-The patch makes `--spec-capture-method dspark` call K3's
+The patch was originally authored against `f8493a4`, remains byte-identical,
+and applies cleanly to `9acd9cb`. It makes `--spec-capture-method dspark` call K3's
 `set_dspark_layers_to_capture` hook. The generic DFlash capture method is not
 equivalent for K3. The same versioned patch carries the three required 64K
 correctness guards: 64-bit Triton token offsets, scale-stable residual scoring,
@@ -42,6 +44,8 @@ server. Replace `CAPTURE_IP` with the routable address used by both nodes.
 
 ```bash
 export MOONCAKE_LOCAL_HOSTNAME="$CAPTURE_IP"
+export MC_TCP_BIND_ADDRESS="$CAPTURE_IP"
+export MC_TRANSFER_TIMEOUT=300
 export MOONCAKE_GLOBAL_SEGMENT_SIZE=1099511627776
 export MOONCAKE_LOCAL_BUFFER_SIZE=1073741824
 mooncake_master \
@@ -49,7 +53,8 @@ mooncake_master \
   --http_metadata_server_host=0.0.0.0 \
   --rpc_port=35551 \
   --http_metadata_server_port=35880 \
-  --metrics_port=35903
+  --metrics_port=35903 \
+  --default_kv_lease_ttl=5m
 ```
 
 In a second process:
@@ -58,7 +63,11 @@ In a second process:
 export MOONCAKE_MASTER_SERVER_ADDR="$CAPTURE_IP:35551"
 export MOONCAKE_METADATA_SERVER="http://$CAPTURE_IP:35880/metadata"
 export MOONCAKE_LOCAL_HOSTNAME="$CAPTURE_IP"
+export MC_TCP_BIND_ADDRESS="$CAPTURE_IP"
+export MC_TRANSFER_TIMEOUT=300
 export MOONCAKE_PROTOCOL=tcp
+export MOONCAKE_GLOBAL_SEGMENT_SIZE=1099511627776
+export MOONCAKE_LOCAL_BUFFER_SIZE=1073741824
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m sglang.launch_server \
   --host 0.0.0.0 \
   --port 30000 \
@@ -88,8 +97,11 @@ four-rank FSDP consumer on the same trainer host.
 
 ```bash
 export MOONCAKE_LOCAL_HOSTNAME="$TRAINER_IP"
+export MC_TCP_BIND_ADDRESS="$TRAINER_IP"
+export MC_TRANSFER_TIMEOUT=300
 export WANDB_API_KEY="$(< /protected/path/wandb-api-key)"
 export WANDB_ENTITY=your-entity
+unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT NODE_RANK
 CUDA_VISIBLE_DEVICES=0,1,2,3 specforge train \
   -c examples/configs/kimi-k3-dspark-v1c-disaggregated.yaml \
   --role both \
@@ -97,6 +109,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 specforge train \
   "deployment.disaggregated.mooncake_metadata_server=http://$CAPTURE_IP:35880/metadata" \
   "deployment.disaggregated.mooncake_master_server_addr=$CAPTURE_IP:35551"
 ```
+
+`MC_TCP_BIND_ADDRESS` is required on multi-interface or containerized hosts.
+Without it Mooncake may publish a Docker bridge address even when
+`MOONCAKE_LOCAL_HOSTNAME` names the routable inter-node address, causing remote
+`get_into` operations to fail. The five-minute master lease and matching
+transfer timeout cover a 5.25 GiB 64K feature object over a shared TCP link;
+Mooncake's short default lease can expire while that object is still in flight.
+The rendezvous variables are cleared because cluster base images sometimes
+inject a partial multi-node environment; SpecForge intentionally rejects that
+instead of guessing which world the four trainer ranks should join.
 
 For a one-update smoke run, additionally override the pre-tokenized four-row
 fixture and shrink the optimizer quantum:
@@ -112,8 +134,12 @@ specforge train \
   training.accumulation_steps=1 \
   tracking.report_to=none \
   runtime.in_flight_high_watermark=4 \
-  runtime.in_flight_low_watermark=2
+  runtime.in_flight_low_watermark=4
 ```
+
+The smoke low watermark must stay at least as large as the four-rank global
+optimizer-step quantum. A lower value is rejected before capture starts so a
+producer cannot pause while consumers are waiting for an incomplete step.
 
 Validate in order: config plan, patch dry-run, server health, one captured
 sample's tensor shapes/dtypes, one finite optimizer update and checkpoint, then
