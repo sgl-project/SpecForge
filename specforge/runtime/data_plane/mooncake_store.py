@@ -650,6 +650,26 @@ class MooncakeFeatureStore(FeatureStore):
             else:
                 self._release_pending.setdefault(sample_id, 0)
 
+    def drain_sample_removals(
+        self,
+        sample_ids: List[str],
+        *,
+        max_attempts: int = 8,
+        retry_interval_s: float = 0.25,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> Dict[str, int]:
+        """Force-remove only the named optimizer-durable samples.
+
+        Other pending samples may belong to prefetched, not-yet-durable
+        batches and must remain available for crash replay.
+        """
+        return self._drain_removals(
+            sample_ids=sample_ids,
+            max_attempts=max_attempts,
+            retry_interval_s=retry_interval_s,
+            sleep=sleep,
+        )
+
     def drain_pending_removals(
         self,
         *,
@@ -666,17 +686,37 @@ class MooncakeFeatureStore(FeatureStore):
         ``sleep`` is injectable so protocol tests can advance a fake lease clock
         without wall-clock delays.
         """
+        return self._drain_removals(
+            sample_ids=None,
+            max_attempts=max_attempts,
+            retry_interval_s=retry_interval_s,
+            sleep=sleep,
+        )
+
+    def _drain_removals(
+        self,
+        *,
+        sample_ids: Optional[List[str]],
+        max_attempts: int,
+        retry_interval_s: float,
+        sleep: Callable[[float], None],
+    ) -> Dict[str, int]:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if retry_interval_s < 0:
             raise ValueError("retry_interval_s must be >= 0")
+        target_ids = None if sample_ids is None else set(sample_ids)
         removed = removed_bytes = 0
         last_errors: Dict[str, str] = {}
         attempts_run = 0
         for attempt in range(max_attempts):
             attempts_run = attempt + 1
             with self._lock:
-                pending = list(self._release_pending)
+                pending = [
+                    sample_id
+                    for sample_id in self._release_pending
+                    if target_ids is None or sample_id in target_ids
+                ]
                 if not pending:
                     return {
                         "removed": removed,
@@ -716,7 +756,11 @@ class MooncakeFeatureStore(FeatureStore):
                             self.max_release_attempts,
                             self._release_pending.get(sample_id, 0) + 1,
                         )
-                remaining = list(self._release_pending)
+                remaining = [
+                    sample_id
+                    for sample_id in self._release_pending
+                    if target_ids is None or sample_id in target_ids
+                ]
             if not remaining:
                 return {
                     "removed": removed,
@@ -728,7 +772,11 @@ class MooncakeFeatureStore(FeatureStore):
                 sleep(retry_interval_s)
 
         with self._lock:
-            remaining = list(self._release_pending)
+            remaining = [
+                sample_id
+                for sample_id in self._release_pending
+                if target_ids is None or sample_id in target_ids
+            ]
         preview = remaining[:16]
         detail = f"; last errors={last_errors}" if last_errors else ""
         raise RuntimeError(

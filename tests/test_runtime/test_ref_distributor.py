@@ -732,6 +732,32 @@ class TestDPAckController(unittest.TestCase):
         self.assertEqual(reason, "optimizer-boundary-durable-ack")
         controller.store.close()
 
+    def test_selective_drain_failure_is_reported_after_durable_commit(self):
+        class FeatureStore:
+            def abort(self, sample_id, *, reason):
+                pass
+
+            def drain_sample_removals(self, sample_ids, **kwargs):
+                raise OSError(f"remove stayed pinned for {sample_ids}")
+
+        controller = DPAckController(
+            "run0",
+            is_authority=True,
+            feature_store=FeatureStore(),
+            metadata_store=SQLiteMetadataStore(os.path.join(self.dir, "drain.db")),
+        )
+        controller.commit_samples("w0", [_ref("s0")])
+        with self.assertRaisesRegex(
+            RuntimeError, "optimizer-boundary selective drain.*remove stayed pinned"
+        ):
+            controller.ack_train_refs(
+                "t0", ["s0"], global_step=1, optimizer_durable=True
+            )
+        marker = controller.store.durable_marker()
+        self.assertEqual(marker["global_step"], 1)
+        self.assertTrue(marker["optimizer_durable"])
+        controller.store.close()
+
     def test_non_authority_participates_but_records_nothing(self):
         calls = []
 
