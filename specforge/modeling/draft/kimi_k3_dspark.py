@@ -191,39 +191,56 @@ class KimiK3DraftMLAAttention(nn.Module):
             self.kv_lora_rank,
         )
         w_kc, w_vc = kv_b.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
-        q_absorbed = torch.einsum("bqhd,hdk->bqhk", q_nope, w_kc)
-        q_attn = torch.cat((q_absorbed, q_rope), dim=-1).transpose(1, 2)
-        k_attn = torch.cat((kv_latent.unsqueeze(1), k_rope), dim=-1)
-        v_attn = kv_latent.unsqueeze(1)
-
-        if isinstance(attention_mask, BlockMask):
-            # Eager FlexAttention falls back to the O(N^2) math kernel. At the
-            # production 4K sequence length that materializes tens of GiB of
-            # score tensors per sample. Match the established Eagle3 path and
-            # compile the block-sparse kernel for long sequences.
-            flex_attention_func = (
-                flex_attention if query_len <= 128 else compile_friendly_flex_attention
+        if isinstance(attention_mask, BlockMask) and query_len > 128:
+            # The absorbed MLA form has q/k head dim kv_lora_rank + rope_dim
+            # (576 for K3), which exceeds Triton's shared-memory budget for the
+            # fused FlexAttention kernel. Expand the two linear projections
+            # around attention instead. This is algebraically equivalent:
+            #   (q W_k) @ c == q @ (W_k c)
+            #   softmax(scores) c W_v == softmax(scores) (c W_v)
+            # and reduces the fused q/k head dim to K3's native 192 while
+            # retaining a 128-dim value. It allocates linear K/V projections,
+            # but never the quadratic score matrix used by eager FlexAttention.
+            q_attn = torch.cat((q_nope, q_rope), dim=-1).transpose(1, 2)
+            k_nope = torch.einsum("bsk,hdk->bshd", kv_latent, w_kc).transpose(1, 2)
+            k_attn = torch.cat(
+                (k_nope, k_rope.expand(-1, self.num_heads, -1, -1)),
+                dim=-1,
             )
-            latent_out = flex_attention_func(
+            v_attn = torch.einsum("bsk,hvk->bshv", kv_latent, w_vc).transpose(1, 2)
+            attn_out = compile_friendly_flex_attention(
                 q_attn,
                 k_attn,
                 v_attn,
                 block_mask=attention_mask,
                 scale=self.scaling,
-                enable_gqa=True,
-            )
+            ).transpose(1, 2)
         else:
-            latent_out = F.scaled_dot_product_attention(
-                q_attn,
-                k_attn,
-                v_attn,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                scale=self.scaling,
-                enable_gqa=True,
-            )
+            q_absorbed = torch.einsum("bqhd,hdk->bqhk", q_nope, w_kc)
+            q_attn = torch.cat((q_absorbed, q_rope), dim=-1).transpose(1, 2)
+            k_attn = torch.cat((kv_latent.unsqueeze(1), k_rope), dim=-1)
+            v_attn = kv_latent.unsqueeze(1)
+            if isinstance(attention_mask, BlockMask):
+                latent_out = flex_attention(
+                    q_attn,
+                    k_attn,
+                    v_attn,
+                    block_mask=attention_mask,
+                    scale=self.scaling,
+                    enable_gqa=True,
+                )
+            else:
+                latent_out = F.scaled_dot_product_attention(
+                    q_attn,
+                    k_attn,
+                    v_attn,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    scale=self.scaling,
+                    enable_gqa=True,
+                )
+            attn_out = torch.einsum("bhqk,hvk->bqhv", latent_out, w_vc)
 
-        attn_out = torch.einsum("bhqk,hvk->bqhv", latent_out, w_vc)
         attn_out = attn_out.reshape(batch, query_len, -1)
         if self.use_output_gate:
             attn_out = attn_out * torch.sigmoid(self.g_proj(hidden_states))

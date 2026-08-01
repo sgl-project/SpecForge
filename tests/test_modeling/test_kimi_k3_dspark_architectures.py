@@ -178,6 +178,29 @@ def test_tiny_5mla_forward_and_backward():
     assert all(layer.self_attn.use_output_gate for layer in model.layers)
 
 
+def test_mla_absorbed_and_expanded_attention_are_algebraically_equivalent():
+    torch.manual_seed(7)
+    batch, queries, keys, heads = 2, 3, 5, 4
+    nope_dim, latent_dim, value_dim = 6, 8, 7
+    q_nope = torch.randn(batch, queries, heads, nope_dim, dtype=torch.float64)
+    kv_latent = torch.randn(batch, keys, latent_dim, dtype=torch.float64)
+    w_kc = torch.randn(heads, nope_dim, latent_dim, dtype=torch.float64)
+    w_vc = torch.randn(heads, value_dim, latent_dim, dtype=torch.float64)
+
+    q_absorbed = torch.einsum("bqhd,hdk->bqhk", q_nope, w_kc)
+    absorbed_scores = torch.einsum("bqhk,bsk->bhqs", q_absorbed, kv_latent)
+    k_expanded = torch.einsum("bsk,hdk->bshd", kv_latent, w_kc)
+    expanded_scores = torch.einsum("bqhd,bshd->bhqs", q_nope, k_expanded)
+    torch.testing.assert_close(absorbed_scores, expanded_scores)
+
+    probabilities = absorbed_scores.softmax(dim=-1)
+    latent_output = torch.einsum("bhqs,bsk->bhqk", probabilities, kv_latent)
+    absorbed_output = torch.einsum("bhqk,hvk->bqhv", latent_output, w_vc)
+    v_expanded = torch.einsum("bsk,hvk->bshv", kv_latent, w_vc)
+    expanded_output = torch.einsum("bhqs,bshv->bqhv", probabilities, v_expanded)
+    torch.testing.assert_close(absorbed_output, expanded_output)
+
+
 def test_tiny_4kda_1mla_forward_and_backward():
     model = KimiK3DSpark4KDA1MLADraftModel(
         _tiny_config("KimiK3DSpark4KDA1MLADraftModel")
