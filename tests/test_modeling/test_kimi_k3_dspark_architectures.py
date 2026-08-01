@@ -6,6 +6,7 @@ import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from specforge.config import Config
+from specforge.data.template import TEMPLATE_REGISTRY
 from specforge.modeling.draft.kimi_k3_dspark import (
     KimiK3DraftKDAAttention,
     KimiK3DSpark4KDA1MLADraftModel,
@@ -115,7 +116,20 @@ def test_training_recipes_preserve_reference_run_contract(filename):
     assert config.training.log_interval == 10
     assert config.tracking.report_to == "wandb"
     assert config.tracking.wandb_offline is False
+    assert config.data.chat_template in TEMPLATE_REGISTRY.get_all_template_names()
     assert "kimi-k3-openperfectblend-regen-439c2fdc" in (config.data.train_data_path)
+
+
+def test_kimi_k3_template_matches_target_xtml_contract():
+    template = TEMPLATE_REGISTRY.get("kimi-k3-thinking")
+    assert template.assistant_header == (
+        '<|open|>message role="assistant"<|sep|><|open|>think<|sep|>'
+    )
+    assert template.user_header == '<|open|>message role="user"<|sep|>'
+    assert template.end_of_turn_token == "<|end_of_msg|>"
+    assert template.parser_type == "thinking"
+    assert template.enable_thinking is False
+    assert template.ignore_token == ["<|end_of_msg|>"]
 
 
 def _forward_backward(model):
