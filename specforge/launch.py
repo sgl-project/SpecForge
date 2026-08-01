@@ -1150,10 +1150,17 @@ def build_disagg_online_producer(
 
                         in_flight = channel.in_flight_remote()
                         current_resident_bytes = resident_bytes()
-                        paused = flow_control.should_pause(
+                        # The consumer cannot acknowledge anything until one
+                        # complete optimizer window is available. Byte
+                        # backpressure below that ref quantum would deadlock
+                        # both roles; allow the required window to fill while
+                        # the explicit hard byte cap remains enforced by
+                        # publish_refs().
+                        policy_paused = flow_control.should_pause(
                             in_flight_refs=in_flight,
                             resident_bytes=current_resident_bytes,
                         )
+                        paused = in_flight >= consumer_quantum and policy_paused
                         if paused:
                             if backpressure_started is None:
                                 backpressure_started = time.monotonic()
