@@ -38,6 +38,12 @@ from .dspark import DSparkDraftModel
 from .flex_attention import compile_friendly_flex_attention
 from .registry import register_draft
 
+# CUDA limits gridDim.z to 65,535.  FLA's KDA gate kernel maps one program to
+# every (independent proposal block, head) pair on that dimension, so a full
+# DSpark optimizer microbatch can exceed the launch limit even though each
+# proposal block is only a few tokens long.
+_CUDA_MAX_GRID_DIM_Z = 65_535
+
 
 def _rotate_half(x: torch.Tensor, *, interleaved: bool) -> torch.Tensor:
     if interleaved:
@@ -359,6 +365,17 @@ def _reference_kda(
     return torch.stack(outputs, dim=1)
 
 
+def _load_fla_chunk_kda() -> Callable[..., tuple[torch.Tensor, object]]:
+    try:
+        from fla.ops.kda import chunk_kda
+    except ImportError as exc:
+        raise ImportError(
+            "Kimi-K3 KDA training requires fla-core==0.5.1; install "
+            "SpecForge with the 'kda' extra"
+        ) from exc
+    return chunk_kda
+
+
 def _fla_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -369,30 +386,36 @@ def _fla_kda(
     dt_bias: torch.Tensor,
     lower_bound: Optional[float],
 ) -> torch.Tensor:
-    try:
-        from fla.ops.kda import chunk_kda
-    except ImportError as exc:
-        raise ImportError(
-            "Kimi-K3 KDA training requires fla-core==0.5.1; install "
-            "SpecForge with the 'kda' extra"
-        ) from exc
+    chunk_kda = _load_fla_chunk_kda()
 
-    output, _ = chunk_kda(
-        q=q,
-        k=k,
-        v=v,
-        g=raw_gate,
-        beta=beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        safe_gate=lower_bound is not None,
-        lower_bound=lower_bound,
-    )
-    return output
+    # FLA's kda_gate_chunk_cumsum launch uses grid_z = batch * num_heads.
+    # DSpark flattens anchors into the batch because recurrent KDA state must
+    # reset for every proposal block.  At the production shape this is
+    # 8 * 512 * 96 = 393,216, beyond CUDA's grid-z limit.  Splitting only the
+    # independent block dimension is algebraically exact; concatenation also
+    # lets autograd sum the shared A_log and dt_bias gradients across slices.
+    num_heads = int(q.shape[2])
+    max_blocks_per_launch = max(1, _CUDA_MAX_GRID_DIM_Z // num_heads)
+    outputs = []
+    for start in range(0, int(q.shape[0]), max_blocks_per_launch):
+        end = start + max_blocks_per_launch
+        output, _ = chunk_kda(
+            q=q[start:end],
+            k=k[start:end],
+            v=v[start:end],
+            g=raw_gate[start:end],
+            beta=beta[start:end],
+            A_log=A_log,
+            dt_bias=dt_bias,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=lower_bound is not None,
+            lower_bound=lower_bound,
+        )
+        outputs.append(output)
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
 
 class KimiK3DraftKDAAttention(nn.Module):

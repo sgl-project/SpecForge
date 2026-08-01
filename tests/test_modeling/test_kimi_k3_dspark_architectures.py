@@ -7,6 +7,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from specforge.config import Config
 from specforge.data.template import TEMPLATE_REGISTRY
+from specforge.modeling.draft import kimi_k3_dspark
 from specforge.modeling.draft.kimi_k3_dspark import (
     KimiK3DraftKDAAttention,
     KimiK3DSpark4KDA1MLADraftModel,
@@ -216,6 +217,55 @@ def test_tiny_4kda_1mla_forward_and_backward():
     first_kda = model.layers[0].self_attn
     assert "q_conv1d.weight" in first_kda.state_dict()
     assert "q_conv1d.bias" not in first_kda.state_dict()
+
+
+def test_fla_kda_splits_independent_blocks_below_cuda_grid_z_limit(monkeypatch):
+    calls = []
+
+    def fake_chunk_kda(**kwargs):
+        q = kwargs["q"]
+        calls.append(int(q.shape[0]))
+        assert q.shape[0] * q.shape[2] <= 8
+        assert kwargs["output_final_state"] is False
+        assert kwargs["use_qk_l2norm_in_kernel"] is True
+        assert kwargs["use_gate_in_kernel"] is True
+        assert kwargs["use_beta_sigmoid_in_kernel"] is True
+        output = (
+            q
+            + kwargs["k"]
+            + kwargs["v"]
+            + kwargs["g"]
+            + kwargs["beta"].unsqueeze(-1)
+            + kwargs["A_log"].view(1, 1, -1, 1)
+            + kwargs["dt_bias"].view(1, 1, q.shape[2], q.shape[3])
+        )
+        return output, None
+
+    monkeypatch.setattr(kimi_k3_dspark, "_CUDA_MAX_GRID_DIM_Z", 8)
+    monkeypatch.setattr(kimi_k3_dspark, "_load_fla_chunk_kda", lambda: fake_chunk_kda)
+
+    shape = (5, 2, 3, 4)
+    q, k, v, gate = (torch.randn(shape, requires_grad=True) for _ in range(4))
+    beta = torch.randn(shape[:-1], requires_grad=True)
+    A_log = torch.randn(shape[2], requires_grad=True)
+    dt_bias = torch.randn(shape[2] * shape[3], requires_grad=True)
+    output = kimi_k3_dspark._fla_kda(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        A_log,
+        dt_bias,
+        lower_bound=-5.0,
+    )
+
+    assert calls == [2, 2, 1]
+    assert output.shape == shape
+    output.sum().backward()
+    for tensor in (q, k, v, gate, beta, A_log, dt_bias):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
 
 
 def test_kda_resets_state_between_proposal_blocks():
