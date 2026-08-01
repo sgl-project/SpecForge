@@ -106,6 +106,26 @@ def _draft_payload(architecture: str, *, layers: int = 1, block_size=None):
 
 
 class DraftConfigResolutionTest(unittest.TestCase):
+    def test_dspark_accepts_registered_kimi_k3_backbones(self):
+        provider = _draft_config_provider("dspark")
+        for architecture in (
+            "KimiK3DSpark5MLADraftModel",
+            "KimiK3DSpark4KDA1MLADraftModel",
+        ):
+            with (
+                self.subTest(architecture=architecture),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = os.path.join(directory, "draft.json")
+                payload = _draft_payload(architecture, layers=5, block_size=7)
+                with open(path, "w", encoding="utf-8") as stream:
+                    json.dump(payload, stream)
+                resolved = resolve_draft_config(
+                    _run_config("dspark", draft_model_config=path),
+                    provider=provider,
+                )
+                self.assertEqual(resolved.architectures, [architecture])
+
     def test_config_resolution_does_not_initialize_cuda_model_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "draft.json")

@@ -36,6 +36,13 @@ from specforge.algorithms.contracts import (
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
+COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
+    {
+        DRAFT_ARCHITECTURE,
+        "KimiK3DSpark5MLADraftModel",
+        "KimiK3DSpark4KDA1MLADraftModel",
+    }
+)
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
@@ -112,7 +119,7 @@ def algorithm_spec() -> AlgorithmSpec:
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
-            compatible_architectures={DRAFT_ARCHITECTURE},
+            compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
             default_architecture=DRAFT_ARCHITECTURE,
         ),
         feature_contracts=(
@@ -155,6 +162,7 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
+                compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
                 expected_auto_map_model="dspark.DSparkDraftModel",
             ),
             build_draft=build_draft,

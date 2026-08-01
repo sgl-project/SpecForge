@@ -21,6 +21,8 @@ EXPECTED_NPROC_PER_NODE = {
     "lfm2.5-1.2b-instruct-dflash-online.yaml": 8,
     "inkling-dspark-disaggregated.yaml": 1,
     "kimi-k3-dspark-v1c-disaggregated.yaml": 4,
+    "kimi-k3-dspark-5mla-openperfectblend-disaggregated.yaml": 4,
+    "kimi-k3-dspark-4kda-1mla-openperfectblend-disaggregated.yaml": 4,
     "ling-flash-2.0-eagle3-offline.yaml": 8,
     "ling-flash-2.0-eagle3-online.yaml": 8,
     "llama3.1-8b-eagle3-offline.yaml": 1,
@@ -313,7 +315,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 64)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 66)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
