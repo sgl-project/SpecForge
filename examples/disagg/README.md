@@ -90,6 +90,27 @@ The consumer's SQLite/WAL and rank inboxes default to the trainer-node-local
 `DISAGG_CONSUMER_STATE_DIR` or `LOCAL_SCRATCH` when `/tmp` is unsuitable.
 Node-local consumer state currently supports one trainer node only.
 
+The Inkling DSpark variant uses the same two-node lifecycle with the target
+settings validated against SGLang
+[#31847](https://github.com/sgl-project/sglang/pull/31847):
+
+```bash
+export DISAGG_STORE_ID=inkling-two-node-attempt-001
+export DISAGG_RUN_ROOT=/shared/specforge/$DISAGG_STORE_ID
+
+rcli exec --per-node <job> \
+  'bash examples/disagg/run_inkling_dspark_disagg_2node.sh'
+```
+
+Rank 0 uses four GPUs for TP4 ModelOpt-FP4 capture; rank 1 defaults to four
+FSDP trainer ranks. Override `TARGET_MODEL_PATH`, `SERVER_GPUS`,
+`TRAINER_GPUS`, or `TRAINER_NPROC` for another allocation. The launcher keeps
+the unified radix tree enabled and does not pass `--disable-radix-cache`.
+Until #31847 is available in a supported SGLang release, install that PR's
+checkout into both nodes' environment. The wrapper applies SpecForge's
+checked-in capture patch before starting the server; the patch is dry-run
+validated against both v0.5.14 and #31847 commit `b7252cc`.
+
 ## External and managed-local services
 
 By default, online capture requires an already-running Mooncake deployment and

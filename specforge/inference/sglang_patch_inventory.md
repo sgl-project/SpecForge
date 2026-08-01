@@ -22,8 +22,8 @@ providers map generic server artifacts (`aux`, `last_hidden`, passthrough
 inputs) to training feature names. No trainer or producer process imports
 SGLang model-runner internals or loads a target model.
 
-The same patch is dry-run validated against the v0.5.14 tag and the public
-Inkling integration. Capture requests carry a unique `extra_key`, so every
+The same patch is dry-run validated against the v0.5.14 tag and SGLang #31847
+commit `b7252cc`. Capture requests carry a unique `extra_key`, so every
 training sample executes a full prefill even when radix cache support is
 present. Managed-local launch preserves the historical disabled-cache default;
 hybrid targets that require the unified radix tree set
