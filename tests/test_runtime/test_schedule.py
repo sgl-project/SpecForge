@@ -1,10 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from specforge.training.disaggregated import (
     _ONLINE_SCHEDULE_SUFFIX,
+    _online_flow_window,
     _online_schedule_payload,
     _read_online_total_steps,
     _write_control,
@@ -17,6 +20,44 @@ from specforge.training.schedule import (
 
 
 class TestResolveTotalSteps(unittest.TestCase):
+    @staticmethod
+    def _online_flow_config(*, high=1152, low=1024):
+        return SimpleNamespace(
+            runtime=SimpleNamespace(
+                in_flight_high_watermark=high,
+                in_flight_low_watermark=low,
+                producer_lease=8,
+            ),
+            training=SimpleNamespace(batch_size=8, accumulation_steps=32),
+            deployment=SimpleNamespace(
+                trainer=SimpleNamespace(nnodes=1, nproc_per_node=4)
+            ),
+        )
+
+    def test_online_flow_window_accepts_one_global_optimizer_window(self):
+        self.assertEqual(
+            _online_flow_window(self._online_flow_config()),
+            (1152, 1024),
+        )
+
+    def test_online_flow_window_rejects_small_watermarks_before_data_build(self):
+        cfg = self._online_flow_config(high=64, low=32)
+        with self.assertRaisesRegex(ValueError, "high watermark 64.*quantum 1024"):
+            _online_flow_window(cfg)
+
+        cfg = self._online_flow_config(high=1152, low=32)
+        with self.assertRaisesRegex(ValueError, "low watermark 32.*quantum 1024"):
+            _online_flow_window(cfg)
+
+    def test_online_flow_window_preserves_high_only_environment_override(self):
+        cfg = self._online_flow_config(high=64, low=32)
+        environment = {
+            "DISAGG_IN_FLIGHT_HIGH_WATERMARK": "1024",
+        }
+        with mock.patch.dict(os.environ, environment, clear=False):
+            os.environ.pop("DISAGG_IN_FLIGHT_LOW_WATERMARK", None)
+            self.assertEqual(_online_flow_window(cfg), (1024, None))
+
     def test_finite_data_horizon_counts_optimizer_steps(self):
         self.assertEqual(
             resolve_total_steps(
