@@ -20,6 +20,7 @@ schema, not here.
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Dict, List, Optional, Protocol
 
 from specforge.inference.batch_partition import TargetBatchPartition
@@ -76,6 +77,7 @@ class RolloutWorker:
         self.feature_source_returns_local_batch = bool(
             feature_source_returns_local_batch
         )
+        self._health_lock = threading.Lock()
         self._state = "starting"
         self._inflight = 0
         self._recent_failures: List[str] = []
@@ -85,23 +87,50 @@ class RolloutWorker:
         )
 
     def start(self) -> None:
-        self._state = "ready"
+        with self._health_lock:
+            self._state = "ready"
 
     def stop(self, reason: str = "stopped") -> None:
         # graceful: finish in-flight, then mark stopped (drain happens in run_once)
-        self._state = "stopped"
+        with self._health_lock:
+            self._state = "stopped"
+
+    def _begin_batch(self, count: int) -> None:
+        with self._health_lock:
+            self._inflight += count
+            if self._state not in ("stopped", "draining"):
+                self._state = "ready"
+
+    def _finish_batch(self, count: int) -> None:
+        with self._health_lock:
+            self._inflight = max(0, self._inflight - count)
+
+    def _mark_unhealthy(self, reason: Optional[str] = None) -> None:
+        with self._health_lock:
+            if self._state not in ("stopped", "draining"):
+                self._state = "unhealthy"
+            if reason is not None:
+                self._recent_failures.append(reason)
+
+    def _record_failure(self, reason: str) -> None:
+        with self._health_lock:
+            self._recent_failures.append(reason)
+
+    def _record_commit(self, count: int) -> None:
+        with self._health_lock:
+            self._last_commit_count += count
 
     def _sample_id(self, task: PromptTask) -> str:
         return f"{self.run_id}:{task.task_id}"
 
     def run_once(self, max_tasks: int) -> List[SampleRef]:
-        if self._state in ("stopped", "draining"):
-            return []
+        with self._health_lock:
+            if self._state in ("stopped", "draining"):
+                return []
         tasks = self.controller.lease_prompt_tasks(self.worker_id, max_tasks)
         if not tasks:
             return []
-        self._inflight = len(tasks)
-        self._state = "ready"
+        self._begin_batch(len(tasks))
         # Legacy colocated target-TP training used a drop-last target batch.
         # A partial target batch would give ranks different local batch sizes
         # and break the all-rank draft/FSDP step contract.
@@ -109,7 +138,7 @@ class RolloutWorker:
             self.controller.complete_prompt_tasks(
                 self.worker_id, [task.task_id for task in tasks]
             )
-            self._inflight = 0
+            self._finish_batch(len(tasks))
             return []
 
         local_slice = self.batch_partition.local_slice(len(tasks))
@@ -129,15 +158,14 @@ class RolloutWorker:
                 tasks, capture=self.capture
             )
         except Exception as exc:  # rollout failure before any feature write
-            self._state = "unhealthy"
-            self._recent_failures.append(f"generate_features: {exc}")
+            self._mark_unhealthy(f"generate_features: {exc}")
             self.controller.fail_prompt_tasks(
                 self.worker_id,
                 [t.task_id for t in tasks],
                 reason=f"generate_features:{exc}",
                 retryable=True,
             )
-            self._inflight = 0
+            self._finish_batch(len(tasks))
             raise
         expected_count = (
             len(local_tasks) if self.feature_source_returns_local_batch else len(tasks)
@@ -147,15 +175,14 @@ class RolloutWorker:
                 f"generate_features returned {len(feats_list)} feature records "
                 f"for {expected_count} expected records"
             )
-            self._state = "unhealthy"
-            self._recent_failures.append(reason)
+            self._mark_unhealthy(reason)
             self.controller.fail_prompt_tasks(
                 self.worker_id,
                 [t.task_id for t in tasks],
                 reason=reason,
                 retryable=False,
             )
-            self._inflight = 0
+            self._finish_batch(len(tasks))
             raise ValueError(reason)
 
         local_feats = (
@@ -184,7 +211,7 @@ class RolloutWorker:
             except CaptureMismatchError as exc:
                 # Loud failure: do not persist a corrupt sample, but keep this
                 # batch's other prompt leases moving so no lease is stranded.
-                self._recent_failures.append(str(exc))
+                self._record_failure(str(exc))
                 self.controller.fail_prompt_tasks(
                     self.worker_id, [task.task_id], reason=str(exc), retryable=False
                 )
@@ -214,13 +241,13 @@ class RolloutWorker:
 
         if refs:
             self.controller.commit_samples(self.worker_id, refs)
-            self._last_commit_count += len(refs)
-        self._inflight = 0
+            self._record_commit(len(refs))
+        self._finish_batch(len(tasks))
         if capture_error is not None:
-            self._state = "unhealthy"
+            self._mark_unhealthy()
             raise capture_error
         if put_error is not None:
-            self._state = "unhealthy"
+            self._mark_unhealthy()
             raise RuntimeError("target-TP local feature write failed") from put_error
         return refs
 
@@ -228,29 +255,27 @@ class RolloutWorker:
         try:
             results = produce_refs(tasks, capture=self.capture)
         except Exception as exc:
-            self._state = "unhealthy"
-            self._recent_failures.append(f"produce_refs: {exc}")
+            self._mark_unhealthy(f"produce_refs: {exc}")
             self.controller.fail_prompt_tasks(
                 self.worker_id,
                 [t.task_id for t in tasks],
                 reason=f"produce_refs:{exc}",
                 retryable=True,
             )
-            self._inflight = 0
+            self._finish_batch(len(tasks))
             raise
         if len(results) != len(tasks):
             reason = (
                 f"produce_refs returned {len(results)} records for {len(tasks)} tasks"
             )
-            self._state = "unhealthy"
-            self._recent_failures.append(reason)
+            self._mark_unhealthy(reason)
             self.controller.fail_prompt_tasks(
                 self.worker_id,
                 [t.task_id for t in tasks],
                 reason=reason,
                 retryable=False,
             )
-            self._inflight = 0
+            self._finish_batch(len(tasks))
             raise ValueError(reason)
 
         refs: List[SampleRef] = []
@@ -267,25 +292,24 @@ class RolloutWorker:
             )
             retryable = bool(getattr(result, "retryable", True))
             if task_id is None:
-                self._state = "unhealthy"
-                self._recent_failures.append(reason)
+                self._mark_unhealthy(reason)
                 self.controller.fail_prompt_tasks(
                     self.worker_id,
                     [t.task_id for t in tasks],
                     reason=reason,
                     retryable=False,
                 )
-                self._inflight = 0
+                self._finish_batch(len(tasks))
                 raise TypeError(reason)
-            self._recent_failures.append(str(reason))
+            self._record_failure(str(reason))
             self.controller.fail_prompt_tasks(
                 self.worker_id, [task_id], reason=str(reason), retryable=retryable
             )
 
         if refs:
             self.controller.commit_samples(self.worker_id, refs)
-            self._last_commit_count += len(refs)
-        self._inflight = 0
+            self._record_commit(len(refs))
+        self._finish_batch(len(tasks))
         return refs
 
     def _put_metadata(self, task: PromptTask) -> Dict[str, Any]:
@@ -304,21 +328,23 @@ class RolloutWorker:
 
     def drain(self) -> None:
         """Stop leasing new work; in-flight is finished by the active run_once."""
-        self._state = "draining"
+        with self._health_lock:
+            self._state = "draining"
 
     # Draft-weight hot update (update_weights -> adapter) is not yet supported.
     # draft_weight_version is still recorded as rollout provenance on each sample.
 
     def health(self) -> Dict[str, Any]:
-        return {
-            "worker_id": self.worker_id,
-            "state": self._state,
-            "strategy": self.strategy,
-            "draft_weight_version": self.draft_weight_version,
-            "in_flight": self._inflight,
-            "recent_failures": self._recent_failures[-5:],
-            "committed": self._last_commit_count,
-        }
+        with self._health_lock:
+            return {
+                "worker_id": self.worker_id,
+                "state": self._state,
+                "strategy": self.strategy,
+                "draft_weight_version": self.draft_weight_version,
+                "in_flight": self._inflight,
+                "recent_failures": self._recent_failures[-5:],
+                "committed": self._last_commit_count,
+            }
 
 
 __all__ = ["RolloutWorker", "FeatureSource", "RefSource", "HEALTH_STATES"]

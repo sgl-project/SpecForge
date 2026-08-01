@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split-eval",
         action="store_true",
-        help="Write a deterministic 5% evaluation split.",
+        help="Write a deterministic 5%% evaluation split.",
     )
     parser.add_argument(
         "--opc-subset",
@@ -213,7 +213,19 @@ def process_opc_sft_stage1(
 def process_codealpaca_row(
     row: Mapping[str, Any], dataset_name: str | None = None
 ) -> ProcessedRow:
-    return process_opc_sft_stage1(row, dataset_name)
+    del dataset_name
+    instruction = row["instruction"]
+    prompt_input = row["input"]
+    output = row["output"]
+    user_content = f"{instruction}\n\n{prompt_input}" if prompt_input else instruction
+    return (
+        _conversation_row(
+            _stable_id(user_content, output),
+            user_content,
+            output,
+        ),
+        0,
+    )
 
 
 def process_opencodeinstruct_row(

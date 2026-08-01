@@ -73,6 +73,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.6-27b-dflash-multiserver-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-online.yaml": 8,
     "qwen3.6-27b-domino-online.yaml": 8,
+    "qwen3.6-27b-dspark-disaggregated.yaml": 1,
     "qwq-32b-eagle3-online.yaml": 4,
 }
 
@@ -282,6 +283,26 @@ EXPECTED_DISAGGREGATED = {
                     "tp_size": 2,
                     "mem_fraction_static": 0.85,
                 },
+            ],
+        },
+    },
+    "qwen3.6-27b-dspark-disaggregated.yaml": {
+        "control_dir": "outputs/qwen3.6-27b-dspark-disaggregated/control",
+        "backend": "mooncake",
+        "managed_local": {
+            "trainer_cuda_visible_devices": ["1"],
+            "mooncake": {
+                "protocol": "tcp",
+                "global_segment_size_bytes": 68719476736,
+                "local_buffer_size_bytes": 1073741824,
+            },
+            "capture_servers": [
+                {
+                    "port": 30000,
+                    "cuda_visible_devices": ["0"],
+                    "tp_size": 1,
+                    "mem_fraction_static": 0.7,
+                }
             ],
         },
     },
