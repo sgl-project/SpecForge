@@ -169,7 +169,7 @@ def algorithm_providers() -> AlgorithmProviders:
                 modality="text",
                 normalizer_id=DSPARK_NORMALIZER_ID,
                 capture_layout=OfflineCaptureLayout(
-                    capture_method="dflash",
+                    capture_method="dspark",
                     aux_feature="hidden_states",
                     last_hidden_feature="target_last_hidden_states",
                     passthrough=(
@@ -185,7 +185,7 @@ def algorithm_providers() -> AlgorithmProviders:
         server_streaming=(
             ServerStreamingProvider(
                 modality="text",
-                capture_method="dflash",
+                capture_method="dspark",
                 target_representation="hidden_state",
                 layout=ServerCaptureLayout(
                     aux_feature="hidden_states",
