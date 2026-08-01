@@ -314,10 +314,23 @@ class MooncakeFeatureStore(FeatureStore):
                 f"mooncake get_into short read for {key}: got {rc} of {nb} bytes"
             )
 
-    def _store_remove(self, key: str) -> bool:
-        """Best-effort physical free. Returns True on confirmed removal."""
+    def _store_remove(self, key: str, *, force: bool = False) -> bool:
+        """Best-effort physical free. Returns True on confirmed removal.
+
+        Recent Mooncake bindings expose ``remove(key, force=True)`` so a
+        lifecycle authority can reclaim an object after all application-level
+        leases have closed without waiting for Mooncake's (potentially
+        minutes-long) KV lease TTL.  Older bindings only accept ``key``; keep
+        those usable and let their normal bounded retry behavior apply.
+        """
         try:
-            rc = self._store.remove(key)
+            if force:
+                try:
+                    rc = self._store.remove(key, force=True)
+                except TypeError:
+                    rc = self._store.remove(key)
+            else:
+                rc = self._store.remove(key)
         except Exception:  # pragma: no cover - transient RPC failure
             return False
         return rc is None or int(rc) == 0
@@ -565,6 +578,7 @@ class MooncakeFeatureStore(FeatureStore):
         sample_id: str,
         *,
         confirm_absent_on_failure: bool = True,
+        force: bool = False,
     ) -> bool:
         """Remove all tensor objects. False on a retryable RPC failure.
 
@@ -581,7 +595,7 @@ class MooncakeFeatureStore(FeatureStore):
         ok = True
         for name in self._sample_names.get(sample_id, []):
             key = self._tkey(sample_id, gen, name)
-            if self._store_remove(key):
+            if self._store_remove(key, force=force):
                 continue
             if confirm_absent_on_failure and not self._store_exists(key):
                 continue  # already gone (freed remotely) counts as freed
@@ -675,6 +689,12 @@ class MooncakeFeatureStore(FeatureStore):
                     try:
                         physically_removed = self._try_physical_free(
                             sample_id,
+                            # The application lease has already been released
+                            # before a sample enters _release_pending.  Use the
+                            # lifecycle-authority path in current Mooncake so
+                            # its default multi-minute KV lease does not turn a
+                            # clean trainer shutdown into a false failure.
+                            force=True,
                             # Intermediate retries must not renew Mooncake's
                             # read lease. The final probe only classifies an
                             # already-absent key and has no following retry to

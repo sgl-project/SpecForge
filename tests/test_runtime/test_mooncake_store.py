@@ -267,6 +267,38 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(fs.health()["force_freed_total"], 1)
         self.assertFalse(_phys_resident(fake))
 
+    def test_lifecycle_drain_forces_removal_after_application_lease_closes(self):
+        class ForceAwareFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.force_values = []
+
+            def remove(self, key, force=False):
+                self.remove_calls += 1
+                self.force_values.append(force)
+                if not force:
+                    return -706
+                self._d.pop(key, None)
+                return 0
+
+        fake = ForceAwareFake()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, handle = fs.get(ref)
+
+        fs.release(handle)
+        self.assertEqual(fs.health()["release_pending"], 1)
+        self.assertTrue(_phys_resident(fake))
+
+        report = drain_feature_store_removals(fs)
+
+        self.assertEqual(report["attempts"], 1)
+        self.assertEqual(fs.health()["release_pending"], 0)
+        self.assertFalse(_phys_resident(fake))
+        num_features = len(ref.feature_keys)
+        self.assertEqual(fake.force_values[:num_features], [False] * num_features)
+        self.assertEqual(fake.force_values[num_features:], [True] * num_features)
+
     def test_lifecycle_drain_does_not_renew_read_lease_between_retries(self):
         clock = _FakeClock()
         lease_ttl = 1.0
