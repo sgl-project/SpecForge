@@ -337,6 +337,30 @@ def _disaggregated_env(
     return values
 
 
+def _device_visibility_env_var() -> str:
+    """Name of the visible-devices env var for the active accelerator.
+
+    CUDA hosts use ``CUDA_VISIBLE_DEVICES``; Ascend NPU hosts use
+    ``ASCEND_RT_VISIBLE_DEVICES``. Kept torch-free so launch planning works
+    in supervisor processes without torch: ``torch_npu`` is detected by
+    module availability (no import) after explicit env markers.
+    """
+    forced = os.environ.get("SPECFORGE_DEVICE")
+    if forced == "npu":
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    if forced == "cuda":
+        return "CUDA_VISIBLE_DEVICES"
+    if os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
+        "ASCEND_VISIBLE_DEVICES"
+    ):
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return "CUDA_VISIBLE_DEVICES"
+    if importlib.util.find_spec("torch_npu") is not None:
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    return "CUDA_VISIBLE_DEVICES"
+
+
 def _managed_local_environment(cfg: Config) -> dict[str, str]:
     deployment = cfg.deployment.disaggregated
     assert deployment is not None and deployment.managed_local is not None
@@ -400,6 +424,7 @@ def _managed_local_services(
     control_dir = Path(deployment.control_dir)
     log_dir = control_dir / "logs"
     shared_env = _managed_local_environment(cfg)
+    visibility_env = _device_visibility_env_var()
     capture_context_length = cfg.model.sglang_context_length or (
         cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
     )
@@ -415,7 +440,10 @@ def _managed_local_services(
                 f"--http_metadata_server_port={mooncake.metadata_port}",
                 f"--metrics_port={mooncake.metrics_port}",
             ),
-            {"CUDA_VISIBLE_DEVICES": ""},
+            # Hide accelerators from the mooncake process. The Ascend driver
+            # rejects an empty ASCEND_RT_VISIBLE_DEVICES, so only CUDA hosts
+            # get the (empty) variable.
+            ({visibility_env: ""} if visibility_env == "CUDA_VISIBLE_DEVICES" else {}),
         ),
         readiness=ReadinessSpec(
             "mooncake",
@@ -497,7 +525,7 @@ def _managed_local_services(
         )
         service_env = {
             **shared_env,
-            "CUDA_VISIBLE_DEVICES": ",".join(server.cuda_visible_devices),
+            visibility_env: ",".join(server.cuda_visible_devices),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
