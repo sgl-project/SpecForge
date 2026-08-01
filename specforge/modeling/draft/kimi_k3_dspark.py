@@ -35,6 +35,7 @@ from typing_extensions import Tuple, Unpack
 
 from .dflash import build_target_layer_ids, normalize_draft_head_checkpoint_keys
 from .dspark import DSparkDraftModel
+from .flex_attention import compile_friendly_flex_attention
 from .registry import register_draft
 
 
@@ -196,7 +197,14 @@ class KimiK3DraftMLAAttention(nn.Module):
         v_attn = kv_latent.unsqueeze(1)
 
         if isinstance(attention_mask, BlockMask):
-            latent_out = flex_attention(
+            # Eager FlexAttention falls back to the O(N^2) math kernel. At the
+            # production 4K sequence length that materializes tens of GiB of
+            # score tensors per sample. Match the established Eagle3 path and
+            # compile the block-sparse kernel for long sequences.
+            flex_attention_func = (
+                flex_attention if query_len <= 128 else compile_friendly_flex_attention
+            )
+            latent_out = flex_attention_func(
                 q_attn,
                 k_attn,
                 v_attn,
