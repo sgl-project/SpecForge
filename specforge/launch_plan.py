@@ -769,7 +769,7 @@ def build_launch_plan(
             producer_env["CUDA_VISIBLE_DEVICES"] = ""
             producer_env[_MANAGED_CHILD_ENV] = "1"
             consumer_env.update(managed_environment)
-            consumer_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            consumer_env[_device_visibility_env_var()] = ",".join(
                 managed_local.trainer_cuda_visible_devices
             )
             consumer_env[_MANAGED_CHILD_ENV] = "1"
