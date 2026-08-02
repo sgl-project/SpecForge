@@ -241,7 +241,7 @@ Our next steps are to publish more ready-to-serve draft checkpoints for popular 
 We thank the SGLang and SpecForge communities, the authors of the supported speculative-decoding methods, and all contributors who helped test the new runtime and algorithm integrations.
 
 - **SpecForge Team:** Jiaping Wang, Shenggui Li, and Xiaoming Dong
-- **RadixArk Team:** Cheng Mao, Yi Sun, and Kan Wu
+- **RadixArk Team:** Mao Cheng, Yi Sun, and Kan Wu
 - **Meta/Pytorch:** Richard Zou
 - **Domino:** Jianuo Huang
 - **Modal Team** 
