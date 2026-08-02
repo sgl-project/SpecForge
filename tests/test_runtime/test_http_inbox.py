@@ -11,10 +11,7 @@ from unittest import mock
 from urllib.request import Request, urlopen
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
-from specforge.runtime.data_plane.http_inbox import (
-    InboxHTTPServer,
-    RemoteInboxChannel,
-)
+from specforge.runtime.data_plane.http_inbox import InboxHTTPServer, RemoteInboxChannel
 from specforge.runtime.data_plane.ref_distributor import RefDistributor
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 

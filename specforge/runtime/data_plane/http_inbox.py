@@ -313,9 +313,7 @@ class RemoteInboxChannel:
                     time.sleep(0.05 * (attempt + 1))
                 continue
             if int(payload.get("consumed", -1)) != target:
-                raise RuntimeError(
-                    "inbox HTTP server did not confirm consumed target"
-                )
+                raise RuntimeError("inbox HTTP server did not confirm consumed target")
             self._consumed_target = target
             return
         raise RuntimeError(

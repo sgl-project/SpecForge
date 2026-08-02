@@ -26,9 +26,9 @@ from specforge.launch_plan import (
     ReadinessSpec,
     ServiceSpec,
     _http_ready,
-    run_commands,
 )
 from specforge.launch_plan import build_launch_plan as _build_launch_plan
+from specforge.launch_plan import run_commands
 from specforge.training.capture_contract import ServerCaptureContract
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
@@ -75,9 +75,9 @@ def _offline_disaggregated_config(*, backend="mooncake", producer_segment_size=N
     if backend == "shared_dir":
         raw["deployment"]["disaggregated"]["store_root"] = "/shared/features"
     if producer_segment_size is not None:
-        raw["deployment"]["disaggregated"]["producer_segment_size"] = (
-            producer_segment_size
-        )
+        raw["deployment"]["disaggregated"][
+            "producer_segment_size"
+        ] = producer_segment_size
     return Config.model_validate(raw)
 
 
@@ -332,9 +332,9 @@ class LaunchPlanTest(unittest.TestCase):
 
     def test_consumer_state_dir_keeps_refs_shared_and_state_node_local(self):
         raw = _config(mode="disaggregated", nproc=2).model_dump()
-        raw["deployment"]["disaggregated"]["consumer_state_dir"] = (
-            "/local/attempt-state"
-        )
+        raw["deployment"]["disaggregated"][
+            "consumer_state_dir"
+        ] = "/local/attempt-state"
         plan = build_launch_plan(
             Config.model_validate(raw),
             config_path="run.yaml",
@@ -374,9 +374,9 @@ class LaunchPlanTest(unittest.TestCase):
         for name, (mutate, message) in invalid_cases.items():
             with self.subTest(case=name):
                 raw = cfg.model_dump()
-                raw["deployment"]["disaggregated"]["consumer_state_dir"] = (
-                    "/local/attempt-state"
-                )
+                raw["deployment"]["disaggregated"][
+                    "consumer_state_dir"
+                ] = "/local/attempt-state"
                 mutate(raw)
                 with self.assertRaisesRegex(ValidationError, message):
                     Config.model_validate(raw)
@@ -392,9 +392,9 @@ class LaunchPlanTest(unittest.TestCase):
 
     def test_multi_node_keeps_wal_local_and_inboxes_shared(self):
         raw = _config(mode="disaggregated", nproc=2, nnodes=2).model_dump()
-        raw["deployment"]["disaggregated"]["inbox_server_url"] = (
-            "http://trainer-0:35900"
-        )
+        raw["deployment"]["disaggregated"][
+            "inbox_server_url"
+        ] = "http://trainer-0:35900"
         plan = build_launch_plan(
             Config.model_validate(raw),
             config_path="run.yaml",
@@ -427,9 +427,9 @@ class LaunchPlanTest(unittest.TestCase):
                     Config.model_validate(raw)
 
         raw = _config(mode="disaggregated", nproc=2, nnodes=1).model_dump()
-        raw["deployment"]["disaggregated"]["inbox_server_url"] = (
-            "http://trainer-0:35900"
-        )
+        raw["deployment"]["disaggregated"][
+            "inbox_server_url"
+        ] = "http://trainer-0:35900"
         with self.assertRaisesRegex(ValidationError, "multi-node trainer"):
             Config.model_validate(raw)
 

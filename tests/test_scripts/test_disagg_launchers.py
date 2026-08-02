@@ -13,9 +13,7 @@ ONLINE = ROOT / "examples" / "disagg" / "run_online.sh"
 OFFLINE = ROOT / "examples" / "disagg" / "run_offline.sh"
 OFFLINE_TWO_NODE = ROOT / "examples" / "disagg" / "run_offline_2node.sh"
 TWO_NODE = ROOT / "examples" / "disagg" / "run_qwen3_8b_dflash_disagg_2node.sh"
-KIMI_K3_CAPTURE = (
-    ROOT / "examples" / "disagg" / "run_kimi_k3_dspark_capture_server.sh"
-)
+KIMI_K3_CAPTURE = ROOT / "examples" / "disagg" / "run_kimi_k3_dspark_capture_server.sh"
 KIMI_K3_CAPTURE_PATCH = (
     ROOT / "patches" / "sglang" / "kimi-k3-f8493a4" / "spec-capture.patch"
 )
@@ -132,15 +130,13 @@ class DisaggregatedWrapperTest(unittest.TestCase):
     def test_kimi_k3_capture_launcher_keeps_prefill_on_the_fast_path(self):
         source = KIMI_K3_CAPTURE.read_text(encoding="utf-8")
         self.assertIn('--max-running-requests "$MAX_RUNNING_REQUESTS"', source)
-        self.assertIn('MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-16}', source)
-        self.assertIn('MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-73728}', source)
-        self.assertIn('MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-40960}', source)
-        self.assertIn('MAX_MAMBA_CACHE_SIZE=${MAX_MAMBA_CACHE_SIZE:-80}', source)
+        self.assertIn("MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-16}", source)
+        self.assertIn("MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-73728}", source)
+        self.assertIn("MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-40960}", source)
+        self.assertIn("MAX_MAMBA_CACHE_SIZE=${MAX_MAMBA_CACHE_SIZE:-80}", source)
         self.assertIn('--max-prefill-tokens "$MAX_PREFILL_TOKENS"', source)
         self.assertIn('--max-mamba-cache-size "$MAX_MAMBA_CACHE_SIZE"', source)
-        self.assertIn(
-            "SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES:-2", source
-        )
+        self.assertIn("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES:-2", source)
         self.assertIn("--disable-cuda-graph", source)
         self.assertNotIn("--enable-symm-mem", source)
 
@@ -148,24 +144,18 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         source = KIMI_K3_CAPTURE_PATCH.read_text(encoding="utf-8")
         self.assertIn("self.output_streamer.ps.attn_tp_rank != 0", source)
         self.assertNotIn(".cpu().clone()", source)
-        self.assertIn(
-            'getattr(logits_output, "_spec_capture_aux_cpu", None)', source
-        )
+        self.assertIn('getattr(logits_output, "_spec_capture_aux_cpu", None)', source)
         self.assertIn("logits_output.hidden_states.cpu()", source)
         self.assertIn('"aux" in features', source)
         self.assertIn('"last_hidden" in features', source)
         self.assertIn("_should_copy_hidden_states_to_cpu", source)
         self.assertIn("self.ps.attn_tp_rank == 0", source)
-        self.assertIn(
-            "self.logits_output.last_hidden_states = _async_d2h(", source
-        )
+        self.assertIn("self.logits_output.last_hidden_states = _async_d2h(", source)
         self.assertIn("len(chunks) == 1", source)
         self.assertIn("ThreadPoolExecutor(", source)
         self.assertIn('getattr(store, "batch_put_from", None)', source)
         self.assertIn("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", source)
-        self.assertIn(
-            "req.finished() and req.spec_capture_result is None", source
-        )
+        self.assertIn("req.finished() and req.spec_capture_result is None", source)
 
     def test_two_node_wrapper_keeps_training_on_the_unified_cli(self):
         self.assertTrue(os.access(TWO_NODE, os.X_OK))

@@ -181,9 +181,7 @@ class CheckpointRelay:
         checkpoint_dirs = self._checkpoint_dirs()[-self.max_archives :]
         for step, checkpoint_dir in checkpoint_dirs:
             sources = [checkpoint_dir / name for name in local_names]
-            if not all(
-                path.is_file() and path.stat().st_size > 0 for path in sources
-            ):
+            if not all(path.is_file() and path.stat().st_size > 0 for path in sources):
                 continue
             archive = self.relay_dir / self._archive_name(step)
             sha_path = archive.with_name(archive.name + ".sha256")
@@ -314,9 +312,7 @@ class CheckpointRelay:
         entries = sorted(
             manifest.get("entries", ()), key=lambda item: int(item["step"])
         )[-self.max_archives :]
-        self._prune_peer_archives(
-            {str(entry["archive"]) for entry in entries}
-        )
+        self._prune_peer_archives({str(entry["archive"]) for entry in entries})
         for entry in entries:
             self._install_peer_archive(entry)
 

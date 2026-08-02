@@ -75,12 +75,8 @@ class DistributedCheckpointRelayTest(unittest.TestCase):
             self._checkpoint(node0, step, range(0, 2))
             self._checkpoint(node1, step, range(2, 4))
 
-        relay0 = self._relay(
-            node0, local_ranks=range(0, 2), peer_ranks=range(2, 4)
-        )
-        relay1 = self._relay(
-            node1, local_ranks=range(2, 4), peer_ranks=range(0, 2)
-        )
+        relay0 = self._relay(node0, local_ranks=range(0, 2), peer_ranks=range(2, 4))
+        relay1 = self._relay(node1, local_ranks=range(2, 4), peer_ranks=range(0, 2))
         relay0.peer_url = relay1.relay_dir.as_uri()
         relay1.peer_url = relay0.relay_dir.as_uri()
 
@@ -93,9 +89,7 @@ class DistributedCheckpointRelayTest(unittest.TestCase):
             for step in (2, 3):
                 checkpoint = root / "output" / f"{self.run_id}-step{step}"
                 expected = {"training_state.pt"}
-                expected.update(
-                    f"training_state_rank{rank}.pt" for rank in range(4)
-                )
+                expected.update(f"training_state_rank{rank}.pt" for rank in range(4))
                 self.assertTrue(
                     expected.issubset(path.name for path in checkpoint.iterdir())
                 )
@@ -104,9 +98,7 @@ class DistributedCheckpointRelayTest(unittest.TestCase):
             manifest = json.loads(
                 (relay.relay_dir / "manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(
-                [entry["step"] for entry in manifest["entries"]], [2, 3]
-            )
+            self.assertEqual([entry["step"] for entry in manifest["entries"]], [2, 3])
             local_archives = [
                 path
                 for path in relay.relay_dir.glob("*.tar")
@@ -139,9 +131,7 @@ class DistributedCheckpointRelayTest(unittest.TestCase):
             manifest = json.loads(
                 (relay.relay_dir / "manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(
-                [entry["step"] for entry in manifest["entries"]], [3, 4]
-            )
+            self.assertEqual([entry["step"] for entry in manifest["entries"]], [3, 4])
 
     def test_rank_ranges_and_archive_retention_are_validated(self):
         self.assertTrue(os.access(SCRIPT, os.X_OK))
