@@ -242,4 +242,6 @@ We thank the SGLang and SpecForge communities, the authors of the supported spec
 
 - **SpecForge Team:** Jiaping Wang, Shenggui Li, and Xiaoming Dong
 - **RadixArk Team:** Cheng Mao, Yi Sun, and Kan Wu
+- **Meta/Pytorch:** Richard Zou
 - **Domino:** Jianuo Huang
+- **Modal Team** 
