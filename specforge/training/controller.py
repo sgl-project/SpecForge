@@ -20,6 +20,7 @@ import itertools
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -540,6 +541,12 @@ class TrainerController:
             self.eval_interval > 0 and self.eval_data_factory is not None
         )
         pending_ack: List[str] = []
+        perf_window_started = time.perf_counter()
+        perf_window_steps = 0
+        perf_window_samples = 0
+        perf_data_wait_s = 0.0
+        perf_train_compute_s = 0.0
+        perf_durable_ack_s = 0.0
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
@@ -563,32 +570,40 @@ class TrainerController:
                     stream = it
             _it = iter(stream)
             while True:
+                data_wait_started = time.perf_counter()
                 try:
                     batch = next(_it)
                 except StopIteration:
                     break
+                perf_data_wait_s += time.perf_counter() - data_wait_started
+                perf_window_samples += len(batch.sample_ids)
                 self._epoch_batch += 1
                 self._epoch_samples += len(batch.sample_ids)
                 self.micro_step += 1
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
                 self._step_profiler.before_micro_step(self.global_step)
+                train_compute_started = time.perf_counter()
                 result = self.core.train_step(
                     batch,
                     ctx=StepContext(
                         global_step=self.global_step, total_steps=self.total_steps
                     ),
                 )
+                perf_train_compute_s += time.perf_counter() - train_compute_started
                 self.last_metrics = result.metrics
                 # grad accumulated but optimizer has not stepped yet; everything
                 # keyed on optimizer steps fires only at the boundary.
                 if not result.optimizer_stepped:
                     continue
                 self.global_step += 1
+                perf_window_steps += 1
                 self._step_profiler.after_optimizer_step(self.global_step)
                 if self.ack_fn is not None:
                     # durable ack transaction at the optimizer-step boundary
+                    durable_ack_started = time.perf_counter()
                     self.ack_fn(pending_ack, self.global_step)
+                    perf_durable_ack_s += time.perf_counter() - durable_ack_started
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     log_metrics = dict(result.metrics)
@@ -596,7 +611,46 @@ class TrainerController:
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
+                    perf_elapsed_s = max(
+                        time.perf_counter() - perf_window_started,
+                        1e-12,
+                    )
+                    parallel = getattr(self.core.backend, "parallel_config", None)
+                    world_size = int(getattr(parallel, "world_size", 1))
+                    tp_size = int(getattr(parallel, "tp_size", 1))
+                    sp_size = int(getattr(parallel, "sp_size", 1))
+                    data_parallel_size = max(1, world_size // (tp_size * sp_size))
+                    log_metrics.update(
+                        {
+                            "perf/optimizer_steps_per_hour": (
+                                perf_window_steps * 3600.0 / perf_elapsed_s
+                            ),
+                            "perf/optimizer_step_time_s": (
+                                perf_elapsed_s / max(1, perf_window_steps)
+                            ),
+                            "perf/data_wait_time_s": (
+                                perf_data_wait_s / max(1, perf_window_steps)
+                            ),
+                            "perf/train_compute_time_s": (
+                                perf_train_compute_s / max(1, perf_window_steps)
+                            ),
+                            "perf/durable_ack_time_s": (
+                                perf_durable_ack_s / max(1, perf_window_steps)
+                            ),
+                            "perf/global_samples_per_second": (
+                                perf_window_samples
+                                * data_parallel_size
+                                / perf_elapsed_s
+                            ),
+                        }
+                    )
                     self.logger(log_metrics, self.global_step)
+                    perf_window_started = time.perf_counter()
+                    perf_window_steps = 0
+                    perf_window_samples = 0
+                    perf_data_wait_s = 0.0
+                    perf_train_compute_s = 0.0
+                    perf_durable_ack_s = 0.0
                 eval_metrics: Optional[Dict[str, Any]] = None
                 if eval_enabled and self.global_step % self.eval_interval == 0:
                     eval_metrics = self.evaluate_configured()

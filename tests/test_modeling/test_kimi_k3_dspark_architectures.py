@@ -108,7 +108,7 @@ def test_training_recipes_preserve_reference_run_contract(filename):
     config = Config.from_file(str(ROOT / "examples" / "configs" / filename))
     assert config.data.max_length == 4096
     assert config.training.batch_size == 8
-    assert config.training.accumulation_steps == 16
+    assert config.training.accumulation_steps == 8
     assert (
         config.deployment.trainer.nnodes
         * config.deployment.trainer.nproc_per_node
@@ -122,11 +122,34 @@ def test_training_recipes_preserve_reference_run_contract(filename):
     assert config.training.num_anchors == 512
     assert config.training.save_interval == 250
     assert config.training.log_interval == 10
-    assert config.runtime.in_flight_high_watermark >= 512
-    assert config.runtime.in_flight_low_watermark >= 512
-    # A worst-case 4,096-token optimizer window carries about 168 GiB of
-    # captured features; do not reintroduce byte backpressure below it.
-    assert config.runtime.resident_high_watermark_bytes >= 180388626432
+    optimizer_quantum = (
+        config.deployment.trainer.nnodes
+        * config.deployment.trainer.nproc_per_node
+        * config.training.batch_size
+        * config.training.accumulation_steps
+    )
+    max_capture_overshoot = (
+        len(config.deployment.disaggregated.server_urls)
+        * config.runtime.producer_concurrency
+        * config.runtime.producer_lease
+    )
+    # Two windows are required for capture and training to overlap.  Once one
+    # window is acknowledged, hysteresis must resume capture even at the
+    # maximum number of concurrently leased refs.
+    assert config.runtime.in_flight_high_watermark >= 2 * optimizer_quantum
+    assert (
+        config.runtime.in_flight_low_watermark
+        >= config.runtime.in_flight_high_watermark
+        + max_capture_overshoot
+        - optimizer_quantum
+    )
+    assert config.runtime.producer_lease == config.training.batch_size
+    assert config.runtime.producer_concurrency == 1
+    assert len(config.deployment.disaggregated.server_urls) >= 2
+    # Two worst-case 4,096-token optimizer windows carry about 336 GiB of
+    # captured features; byte throttling must not serialize the pipeline.
+    assert config.runtime.resident_high_watermark_bytes >= 360777252864
+    assert config.runtime.resident_low_watermark_bytes >= 180388626432
     assert (
         config.runtime.feature_store_max_resident_bytes
         >= config.runtime.resident_high_watermark_bytes

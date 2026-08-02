@@ -29,7 +29,7 @@ training:
   strategy: dspark
   num_epochs: 10
   batch_size: 8
-  accumulation_steps: 16
+  accumulation_steps: 8
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1
@@ -54,13 +54,22 @@ tracking:
   wandb_dir: /workspace/k3_dspark/runs/kimi-k3-5mla-openperfectblend/wandb
 
 runtime:
-  producer_lease: 1
-  producer_concurrency: 8
-  in_flight_high_watermark: 576
-  in_flight_low_watermark: 512
-  resident_high_watermark_bytes: 206158430208
-  resident_low_watermark_bytes: 180388626432
-  feature_store_max_resident_bytes: 240518168576
+  # Submit the same batch of eight prompts used by the reference target path.
+  # Scalar HTTP calls leave the large K3 TP8 engine scheduler-bound.
+  producer_lease: 8
+  producer_concurrency: 1
+  # Keep two complete global-batch windows resident.  A single-window buffer
+  # makes capture and training alternate because source refs are acknowledged
+  # only after the optimizer step is durable.  The 64-ref margin covers both
+  # TP8 capture workers' outstanding leases; low=640 resumes capture after one
+  # 512-ref optimizer acknowledgement while another window stays available.
+  in_flight_high_watermark: 1088
+  in_flight_low_watermark: 640
+  # Two worst-case 4K windows are about 336 GiB.  Pause at 352 GiB, resume
+  # after one window at 192 GiB, and leave 32 GiB for leased-request overshoot.
+  resident_high_watermark_bytes: 377957122048
+  resident_low_watermark_bytes: 206158430208
+  feature_store_max_resident_bytes: 412316860416
 
 run_id: kimi-k3-dspark-5mla-openperfectblend-disaggregated
 output_dir: /workspace/k3_dspark/runs/kimi-k3-5mla-openperfectblend/output
@@ -69,14 +78,15 @@ deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 4
+    nproc_per_node: 8
   disaggregated:
     control_dir: /workspace/k3_dspark/runs/kimi-k3-5mla-openperfectblend/control
     consumer_state_dir: /workspace/k3_dspark/runs/kimi-k3-5mla-openperfectblend/consumer-state
     backend: mooncake
     store_id: kimi-k3-dspark-5mla-openperfectblend-disaggregated
     server_urls:
-      - http://10.65.0.2:30000
+      - http://capture-node-0:30000
+      - http://capture-node-1:30000
     mooncake_metadata_server: http://10.65.0.2:35880/metadata
     mooncake_master_server_addr: 10.65.0.2:35551
     mooncake_protocol: tcp

@@ -327,6 +327,39 @@ class TestTrainerCore(unittest.TestCase):
 
 
 class TestTrainerController(unittest.TestCase):
+    def test_training_log_reports_pipeline_throughput_breakdown(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        logged = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=2,
+                num_epochs=1,
+                log_interval=2,
+                logger=lambda metrics, step: logged.append((dict(metrics), step)),
+            )
+            self.assertEqual(ctrl.fit([_batch(), _batch()]), 2)
+
+        self.assertEqual(len(logged), 1)
+        metrics, step = logged[0]
+        self.assertEqual(step, 2)
+        for name in (
+            "perf/optimizer_steps_per_hour",
+            "perf/optimizer_step_time_s",
+            "perf/data_wait_time_s",
+            "perf/train_compute_time_s",
+            "perf/durable_ack_time_s",
+            "perf/global_samples_per_second",
+        ):
+            self.assertIn(name, metrics)
+            self.assertGreaterEqual(metrics[name], 0.0)
+        self.assertGreater(metrics["perf/optimizer_steps_per_hour"], 0.0)
+        self.assertGreater(metrics["perf/global_samples_per_second"], 0.0)
+
     def test_progress_bar_tracks_optimizer_steps_on_rank_zero(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
