@@ -256,15 +256,25 @@ The full per-workload numbers, including the other block sizes and the MTP and D
 
 #### DSpark
 
-
-
 *Results to be added.*
+
+## Verifying Training-Serving Consistency
+
+Model-quality benchmarks and correctness gates serve different purposes. A benchmark measures generalization; a gate checks that training, export, and serving implement the same algorithmic contract.
+
+SpecForge provides an end-to-end [training and serving gate](https://github.com/sgl-project/SpecForge/blob/main/scripts/gates/README.md) for DFlash-family models, including Domino. It performs three stages:
+
+1. **Select a valid sample.** The gate checks the target chat template, reasoning mode, tokenizer behavior, sequence length, and minimum trainable suffix before producing an auditable prompt artifact.
+2. **Overfit through the public training path.** It repeats that sample for a bounded run launched through `specforge train`, then requires the configured loss and token-accuracy thresholds and the exact final checkpoint.
+3. **Export and serve the checkpoint.** It exports through `specforge export`, launches SGLang with DFlash speculative decoding, and verifies per-request acceptance metadata and agreement with the target-token prefix.
+
+This gate is intentionally strict and narrow. Passing it shows that capture, training, export, and serving agree on one controlled example; it does not replace held-out model-quality or serving-performance evaluation.
 
 ## What's Next
 
 This release changes the unit of scaling in SpecForge. A run is no longer a trainer process that happens to contain a target model; it is a coordinated pipeline whose inference capacity, storage, and optimization capacity can be sized independently.
 
-Our next steps are to finish releasing the draft models for the remaining target models above, and to continue expanding the algorithm and model catalog. We will also conduct testing and adaptation across additional hardware platforms, including but not limited to AMD and Ascend.
+Our next steps are to finish releasing the draft models for the remaining target models above, and to continue expanding the algorithm and model catalog. We will also conduct testing and adaptation across different modalities such as VLM and additional hardware platforms, including but not limited to AMD and Ascend.
 
 ## Acknowledgements
 
