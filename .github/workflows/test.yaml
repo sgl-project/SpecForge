@@ -28,6 +28,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Cancelled or timed-out runs can leave processes behind which keep GPU
+      # memory allocated and make this run OOM. --pid=host above is what makes
+      # those leftovers visible from inside the container.
+      - name: Kill leftover GPU processes
+        timeout-minutes: 5
+        shell: bash
+        run: bash .github/workflows/scripts/kill_gpu_procs.sh
+
       - name: Restore cache
         run: |
           if [ -d /github/home/cache ] && [ ! -z "$(ls -A /github/home/cache/)" ]; then
