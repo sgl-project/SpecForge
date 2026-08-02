@@ -278,9 +278,10 @@ For `deployment.mode: disaggregated`, also write:
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `deployment.disaggregated.control_dir` | required | Fresh attempt-scoped shared directory for refs/manifest and lifecycle markers. |
+| `deployment.disaggregated.control_dir` | required | Fresh attempt-scoped directory for refs/manifest and lifecycle markers. Shared by default; with `inbox_server_url`, only producer and consumer rank 0 must share it. |
 | `deployment.disaggregated.backend` | required | `mooncake` or `shared_dir`. Online disaggregated runs require Mooncake. |
 | `deployment.disaggregated.consumer_state_dir` | `null` | Node-local rank-0 SQLite/WAL root. Required for multi-node online consumers; their rank inboxes remain under shared `control_dir`. |
+| `deployment.disaggregated.inbox_server_url` | `null` | Optional private `http://host:port` rank-0 relay for tensor-free inbox refs when remote trainer ranks cannot share `control_dir`. Online multi-node only; no credentials, path, query, TLS, or built-in authentication. |
 | `deployment.disaggregated.store_root` | `null` | Shared feature directory; required when `backend: shared_dir`. |
 | `deployment.disaggregated.store_id` | `null` | Feature-store namespace; defaults to `run_id`. |
 | `deployment.disaggregated.server_urls` | `[]` | External patched SGLang capture endpoints. One rollout worker is created per entry. Do not set with `managed_local`. |

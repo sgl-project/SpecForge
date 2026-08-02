@@ -10,12 +10,14 @@ model:
   sglang_attention_backend: flashinfer
   sglang_mem_fraction_static: 0.76
   sglang_context_length: 4608
-  sglang_max_running_requests: 8
-  sglang_max_total_tokens: 40960
+  sglang_max_running_requests: 16
+  sglang_max_total_tokens: 73728
   sglang_moe_runner_backend: marlin
-  sglang_enable_symm_mem: true
+  # Latest K3 uses its faster fused CustomAllReduceV2 path only when the
+  # generic symmetric-memory allocator is disabled.
+  sglang_enable_symm_mem: false
   sglang_mamba_radix_cache_strategy: extra_buffer
-  sglang_max_mamba_cache_size: 40
+  sglang_max_mamba_cache_size: 80
 
 data:
   train_data_path: /workspace/k3_dspark/data/kimi-k3-openperfectblend-regen-439c2fdc/data.jsonl
@@ -28,8 +30,10 @@ data:
 training:
   strategy: dspark
   num_epochs: 10
-  batch_size: 8
-  accumulation_steps: 8
+  # Source TP8x2 capture produced 16 samples per optimizer microbatch.  DP8
+  # consumes the same shape as 2 samples per rank; 8 * 2 * 32 = 512.
+  batch_size: 2
+  accumulation_steps: 32
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1
@@ -54,8 +58,9 @@ tracking:
   wandb_dir: /workspace/k3_dspark/runs/kimi-k3-4kda-1mla-openperfectblend/wandb
 
 runtime:
-  producer_lease: 8
-  producer_concurrency: 1
+  producer_lease: 16
+  # Per endpoint: publish batch N while TP8 prefills batch N+1.
+  producer_concurrency: 2
   # Two optimizer windows remove the capture/train bubble.  The low watermark
   # lets both batched capture workers resume after one 512-ref durable ack.
   in_flight_high_watermark: 1088

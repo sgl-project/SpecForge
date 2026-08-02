@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/layers/attn_residual.py b/python/sglang/srt/layers/attn_residual.py
-index 266d2f2..2a75af7 100644
+index 266d2f2cd..2a75af790 100644
 --- a/python/sglang/srt/layers/attn_residual.py
 +++ b/python/sglang/srt/layers/attn_residual.py
 @@ -115,10 +115,28 @@ def _score_kernel(
@@ -44,8 +44,8 @@ index 266d2f2..2a75af7 100644
 +        dotv += tl.sum(v_scaled * cw)
 +    rrms = 1.0 / tl.sqrt(sumsq / H + eps / scale / scale)
      tl.store(scores_ptr + pid_t * stride_sm + j, dotv * rrms)
- 
- 
+
+
 @@ -159,7 +178,8 @@ def _combine_kernel(
      Softmax is redundantly computed by each H-chunk CTA (≤16 elements, trivial).
      This gives full H-parallelism: 7 CTAs for H=7168/1024.
@@ -55,22 +55,22 @@ index 266d2f2..2a75af7 100644
 +    pid_t = tl.program_id(0).to(tl.int64)
      pid_h = tl.program_id(1)
      h0 = pid_h * BLOCK_H
- 
+
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index cf55b97..51a1872 100644
+index 480ed81a5..f84d489a1 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
-@@ -159,6 +159,9 @@ class LogitsProcessorOutput:
+@@ -163,6 +163,9 @@ class LogitsProcessorOutput:
      # Used by speculative decoding (EAGLE)
      # The last hidden layers
      hidden_states: Optional[torch.Tensor] = None
 +    # Spec-training capture: under FULL+aux, `hidden_states` is the aux
 +    # concatenation, so the post-norm last hidden is exposed here separately.
 +    last_hidden_states: Optional[torch.Tensor] = None
- 
+
      ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
      # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
-@@ -443,6 +446,16 @@ class LogitsProcessor(nn.Module):
+@@ -447,6 +450,16 @@ class LogitsProcessor(nn.Module):
              sample_indices,
              logits_metadata,
          )
@@ -85,9 +85,9 @@ index cf55b97..51a1872 100644
 +            else None
 +        )
          del hidden_states
- 
+
          if not logits_metadata.extend_return_logprob:
-@@ -456,6 +469,7 @@ class LogitsProcessor(nn.Module):
+@@ -460,6 +473,7 @@ class LogitsProcessor(nn.Module):
              return LogitsProcessorOutput(
                  next_token_logits=sampled_logits,
                  hidden_states=hidden_states_to_store,
@@ -96,7 +96,7 @@ index cf55b97..51a1872 100644
                  # workaround since ForwardBatch is local to forward_batch_generation().
                  # They should be moved to GenerationBatchResult to keep this class clean.
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
-index 1bf6aa7..e7a3030 100644
+index 1bf6aa7d2..e7a303074 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
 @@ -402,6 +402,9 @@ def fused_marlin_moe(
@@ -108,12 +108,12 @@ index 1bf6aa7..e7a3030 100644
 +            and intermediate_cache3.shape[0] <= 65_535
          ):
              from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
- 
+
 diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
-index 7b3ca52..84e0ae6 100644
+index 19a7f4938..b3c5220f3 100644
 --- a/python/sglang/srt/managers/detokenizer_manager.py
 +++ b/python/sglang/srt/managers/detokenizer_manager.py
-@@ -472,6 +472,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+@@ -475,6 +475,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
              output_token_sampling_mask=recv_obj.output_token_sampling_mask,
              output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
              output_hidden_states=recv_obj.output_hidden_states,
@@ -122,13 +122,13 @@ index 7b3ca52..84e0ae6 100644
              indexer_topk=indexer_topk,
              customized_info=recv_obj.customized_info,
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index fa359c5..d9881c0 100644
+index 06282f331..4675de4ef 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -303,6 +303,10 @@ class GenerateReqInput:
+@@ -309,6 +309,10 @@ class GenerateReqInput:
      # For Unlimited-OCR
      images_config: Optional[dict] = None
- 
+
 +    # Spec-training capture sink instructions (see spec_capture_sink.py).
 +    # Batch-level: List[Optional[dict]]; per-request after __getitem__.
 +    spec_capture: Optional[Union[List[Optional[Dict]], Dict]] = None
@@ -136,7 +136,7 @@ index fa359c5..d9881c0 100644
      # Pre-computed delimiter indices for multi-item scoring.
      # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
      multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
-@@ -780,6 +784,11 @@ class GenerateReqInput:
+@@ -804,6 +808,11 @@ class GenerateReqInput:
                  if self.multi_item_delimiter_indices is not None
                  else None
              ),
@@ -148,41 +148,41 @@ index fa359c5..d9881c0 100644
          )
          cache[i] = sub
          return sub
-@@ -874,6 +883,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+@@ -902,6 +911,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
      # Internal IPC only.
      encoder_urls: Optional[List[str]] = None
- 
+
 +    # Spec-training capture sink instructions (see GenerateReqInput.spec_capture)
 +    spec_capture: Optional[Dict] = None
 +
      # Pre-computed delimiter indices for multi-item scoring
      multi_item_delimiter_indices: Optional[List[int]] = None
- 
-@@ -1267,6 +1279,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
+
+@@ -1328,6 +1340,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
      # Number of times each request was retracted.
      retraction_counts: Optional[List[int]] = None
- 
+
 +    # Spec-training capture: one result dict per request (see spec_capture_sink).
 +    spec_capture: Optional[List[Any]] = None
 +
      # The trainer step id. Used to know which step's weights are used for sampling.
      token_steps: Optional[List[List[int]]] = None
- 
-@@ -1349,6 +1364,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
+
+@@ -1419,6 +1434,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
      # Number of times each request was retracted.
      retraction_counts: Optional[List[int]] = None
- 
+
 +    # Spec-training capture: one result dict per request (see spec_capture_sink).
 +    spec_capture: Optional[List[Any]] = None
 +
      # The trainer step id. Used to know which step's weights are used for sampling.
      token_steps: Optional[List[List[int]]] = None
- 
+
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index af2eca5..1b50341 100755
+index 0ef94dd95..d3cada1fa 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -759,6 +759,7 @@ class Req(ReqDllmMixin):
+@@ -768,6 +768,7 @@ class Req(ReqDllmMixin):
              Union[APIServerReqTimeStats, DPControllerReqTimeStats]
          ] = None,
          return_pooled_hidden_states: bool = False,
@@ -190,7 +190,7 @@ index af2eca5..1b50341 100755
          multi_item_delimiter_indices: Optional[List[int]] = None,
          session_id: Optional[str] = None,
      ):
-@@ -821,7 +822,13 @@ class Req(ReqDllmMixin):
+@@ -832,7 +833,13 @@ class Req(ReqDllmMixin):
              }
          self.sampling_params = sampling_params
          self.custom_logit_processor = custom_logit_processor
@@ -202,17 +202,17 @@ index af2eca5..1b50341 100755
 +        self.spec_capture_aux: List[torch.Tensor] = []
 +        self.spec_capture_last_hidden: List[torch.Tensor] = []
 +        self.spec_capture_result = None  # per-request sink result -> output field
- 
+
          # extra key for classifying the request (e.g. cache_salt)
          if lora_id is not None:
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index ef024da..6ab1dce 100644
+index 6589c6a78..d31be1b92 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -585,6 +585,19 @@ class Scheduler(
- 
+@@ -637,6 +637,19 @@ class Scheduler(
+
          self.init_batch_result_processor()
- 
+
 +        if server_args.enable_spec_capture:
 +            # Capture needs single-pass prefill; chunking would drop all but the
 +            # final chunk's hidden rows.
@@ -227,23 +227,148 @@ index ef024da..6ab1dce 100644
 +            spec_capture_sink.maybe_init_sink(server_args)
 +
          self.is_initializing = False
- 
+
      def init_zbal_on_npu(self):
-@@ -2196,6 +2209,7 @@ class Scheduler(
+@@ -2283,6 +2296,7 @@ class Scheduler(
                  dllm_config=self.dllm_config,
                  time_stats=recv_req.time_stats,
                  multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
 +                spec_capture=recv_req.spec_capture,
              )
              req.tokenizer = self.tokenizer
- 
+
+@@ -3385,6 +3399,13 @@ class Scheduler(
+         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
+         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+
++    def _should_copy_hidden_states_to_cpu(self, batch: ScheduleBatch) -> bool:
++        """Avoid redundant multi-GiB capture D2H on non-writer TP ranks."""
++        return batch.return_hidden_states and (
++            self.ps.attn_tp_rank == 0
++            or any(req.spec_capture is None for req in batch.reqs)
++        )
++
+     @contextmanager
+     def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
+         """Make SB transactional across one forward (overlap and non-overlap).
+@@ -3531,7 +3552,9 @@ class Scheduler(
+                                 # overlaps.
+                                 batch_result.copy_to_cpu(
+                                     return_logprob=batch.return_logprob,
+-                                    return_hidden_states=batch.return_hidden_states,
++                                    return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                                        batch
++                                    ),
+                                 )
+                             else:
+                                 # Result D2H on copy_stream overlaps the next forward
+@@ -3541,7 +3564,9 @@ class Scheduler(
+                                 with self.copy_stream_ctx:
+                                     batch_result.copy_to_cpu(
+                                         return_logprob=batch.return_logprob,
+-                                        return_hidden_states=batch.return_hidden_states,
++                                        return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                                            batch
++                                        ),
+                                     )
+                         else:
+                             batch_result.future_indices = future_indices
+@@ -3580,7 +3605,9 @@ class Scheduler(
+                 batch_result.copy_done = self.device_module.Event()
+                 batch_result.copy_to_cpu(
+                     return_logprob=batch.return_logprob,
+-                    return_hidden_states=batch.return_hidden_states,
++                    return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                        batch
++                    ),
+                 )
+             else:
+                 kwargs = (
+@@ -3699,7 +3726,9 @@ class Scheduler(
+             self._relay_forward_payload(batch_result.future_indices, batch_result)
+             batch_result.copy_to_cpu(
+                 return_logprob=cur_batch.return_logprob,
+-                return_hidden_states=cur_batch.return_hidden_states,
++                return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                    cur_batch
++                ),
+             )
+
+         # Release the closure and large GPU tensors that are no longer needed.
+@@ -3718,6 +3747,10 @@ class Scheduler(
+         batch: ScheduleBatch,
+         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+     ):
++        # Complete capture transfers on the scheduler thread before processing
++        # any kind of next result (prefill, decode, or idle).  This preserves
++        # the output socket's single-thread ownership under mixed traffic.
++        self.batch_result_processor.drain_spec_captures()
+         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+
+         if batch.forward_mode.is_decode():
+@@ -3826,6 +3859,15 @@ class Scheduler(
+
+     def on_idle(self):
+         """Idle housekeeping: guard, check, metrics, reset, sleep."""
++        # A capture response is intentionally delayed until its background
++        # Mooncake batch write completes.  Poll it on the scheduler thread so
++        # the ZeroMQ output socket remains single-threaded.  Do not enter the
++        # idle sleeper while a future is outstanding or the producer waiting
++        # for that response could deadlock.
++        self.batch_result_processor.drain_spec_captures()
++        if self.batch_result_processor.has_pending_spec_captures():
++            time.sleep(0.001)
++            return
+         if not self.is_fully_idle():
+             return
+
+@@ -3879,6 +3921,7 @@ class Scheduler(
+             and not self.dllm_manager.any_staging_reqs()
+             and (self.last_batch is None or self.last_batch.is_empty())
+             and (not self.enable_overlap or len(self.result_queue) == 0)
++            and not self.batch_result_processor.has_pending_spec_captures()
+             and self._pp_microbatches_drained()
+         )
+
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 248a929..b2d8f42 100644
+index f75eab004..5af4c1d6b 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-@@ -263,6 +263,18 @@ class SchedulerBatchResultProcessor:
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+
+ import logging
+-from dataclasses import dataclass
++import os
++import time
++from dataclasses import dataclass, field
+ from typing import (
+     TYPE_CHECKING,
+     Callable,
+@@ -87,6 +89,12 @@ class SchedulerBatchResultProcessor:
+     logprob_result_processor: SchedulerLogprobResultProcessor
+     output_streamer: SchedulerOutputStreamer
+     abort_request: Callable
++    _spec_capture_batches: List = field(
++        default_factory=list,
++        init=False,
++        repr=False,
++        compare=False,
++    )
+
+     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
+         assert self.disaggregation_mode == DisaggregationMode.DECODE
+@@ -190,6 +198,7 @@ class SchedulerBatchResultProcessor:
+         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+     ):
+         skip_stream_req = None
++        pending_spec_captures = []
+
+         if self.is_generation:
+             if result.copy_done is not None:
+@@ -269,6 +278,20 @@ class SchedulerBatchResultProcessor:
                          self.add_sampling_mask_return_values(i, req, logits_output)
- 
+
                      if (
 +                        req.spec_capture is not None
 +                        and logits_output.hidden_states is not None
@@ -255,15 +380,46 @@ index 248a929..b2d8f42 100644
 +                            hidden_state_offset=hidden_state_offset,
 +                        )
 +                        if req.finished():
-+                            self._sink_spec_capture(req)
++                            pending = self._sink_spec_capture(req)
++                            if pending is not None:
++                                pending_spec_captures.append(pending)
 +                    elif (
                          req.return_hidden_states
                          and logits_output.hidden_states is not None
                      ):
-@@ -470,6 +482,62 @@ class SchedulerBatchResultProcessor:
+@@ -343,9 +366,25 @@ class SchedulerBatchResultProcessor:
+                     req.inflight_middle_chunks -= 1
+                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+-        self.output_streamer.stream_output(
+-            batch.reqs, batch.return_logprob, skip_stream_req
+-        )
++        if pending_spec_captures:
++            self._queue_spec_captures(
++                pending_spec_captures,
++                return_logprob=batch.return_logprob,
++            )
++            capture_req_ids = {id(item[0]) for item in pending_spec_captures}
++            ready_reqs = [
++                req
++                for req in batch.reqs
++                if id(req) not in capture_req_ids and req is not skip_stream_req
++            ]
++            if ready_reqs:
++                self.output_streamer.stream_output(
++                    ready_reqs, batch.return_logprob
++                )
++        else:
++            self.output_streamer.stream_output(
++                batch.reqs, batch.return_logprob, skip_stream_req
++            )
+
+         can_run_cuda_graph = result.can_run_cuda_graph
+         self.metrics_reporter.report_prefill_stats(
+@@ -476,6 +515,181 @@ class SchedulerBatchResultProcessor:
                      f"Placeholder zeros would be appended to output_ids."
                  )
- 
+
 +    def _append_spec_capture_states(
 +        self,
 +        *,
@@ -279,16 +435,37 @@ index 248a929..b2d8f42 100644
 +        """
 +        start = hidden_state_offset
 +        end = start + len(req.origin_input_ids)
-+        req.spec_capture_aux.append(
-+            logits_output.hidden_states[start:end].cpu().clone()
++        # Only attention-TP rank 0 owns the Mooncake sink.  Copying these very
++        # large tensors to host on every TP rank creates eight identical D2H
++        # transfers and seven immediately-discarded CPU copies on TP8.
++        if self.output_streamer.ps.attn_tp_rank != 0:
++            return end
++        # Materialize each scheduler result on host once, rather than issuing
++        # one synchronous D2H transfer per request.  In overlap mode the writer
++        # rank has already copied both tensors asynchronously on copy_stream;
++        # ``.cpu()`` is then a no-op.  The fallback keeps non-overlap correct.
++        features = dict(req.spec_capture.get("features") or {})
++        aux_cpu = getattr(logits_output, "_spec_capture_aux_cpu", None)
++        if "aux" in features and aux_cpu is None:
++            aux_cpu = logits_output.hidden_states.cpu()
++            logits_output._spec_capture_aux_cpu = aux_cpu
++        last_hidden_cpu = getattr(
++            logits_output, "_spec_capture_last_hidden_cpu", None
 +        )
-+        if logits_output.last_hidden_states is not None:
-+            req.spec_capture_last_hidden.append(
-+                logits_output.last_hidden_states[start:end].cpu().clone()
-+            )
++        if (
++            "last_hidden" in features
++            and logits_output.last_hidden_states is not None
++            and last_hidden_cpu is None
++        ):
++            last_hidden_cpu = logits_output.last_hidden_states.cpu()
++            logits_output._spec_capture_last_hidden_cpu = last_hidden_cpu
++        if "aux" in features and aux_cpu is not None:
++            req.spec_capture_aux.append(aux_cpu[start:end])
++        if "last_hidden" in features and last_hidden_cpu is not None:
++            req.spec_capture_last_hidden.append(last_hidden_cpu[start:end])
 +        return end
 +
-+    def _sink_spec_capture(self, req: Req) -> None:
++    def _sink_spec_capture(self, req: Req):
 +        """Write a finished capture request's tensors to the Mooncake sink.
 +
 +        Runs on the attention-TP rank that streams output; the per-request result
@@ -300,34 +477,147 @@ index 248a929..b2d8f42 100644
 +
 +        sink = spec_capture_sink.get_sink()
 +        if sink is None or self.output_streamer.ps.attn_tp_rank != 0:
-+            return
-+        aux = torch.cat(req.spec_capture_aux, dim=0) if req.spec_capture_aux else None
-+        last_hidden = (
-+            torch.cat(req.spec_capture_last_hidden, dim=0)
-+            if req.spec_capture_last_hidden
-+            else None
++            return None
++        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
++        cat_start = time.perf_counter()
++        # With chunked prefill disabled (the K3 training configuration), each
++        # request owns exactly one contiguous view into the batch-level pinned
++        # D2H buffer.  torch.cat([view]) needlessly copied the whole capture a
++        # second time on CPU -- about 18 GiB per 128 reference samples.  Keep
++        # that view zero-copy; concatenate only the genuinely chunked case.
++        aux = self._coalesce_spec_capture_chunks(req.spec_capture_aux)
++        last_hidden = self._coalesce_spec_capture_chunks(
++            req.spec_capture_last_hidden
 +        )
-+        try:
-+            req.spec_capture_result = sink.put_sample(
-+                req.spec_capture, aux=aux, last_hidden=last_hidden
-+            )
-+        except Exception as e:
-+            logger.error("spec-capture sink failed for %s: %s", req.rid, e)
-+            req.spec_capture_result = {
-+                "sample_id": req.spec_capture.get("sample_id"),
-+                "error": str(e),
-+            }
++        cat_ms = (time.perf_counter() - cat_start) * 1000.0
 +        req.spec_capture_aux = []
 +        req.spec_capture_last_hidden = []
++        return req, req.spec_capture, aux, last_hidden, timing_enabled, cat_ms
++
++    def _queue_spec_captures(self, pending, *, return_logprob: bool) -> None:
++        """Queue one batch transfer while the scheduler runs the next prefill."""
++        if not pending:
++            return
++        from sglang.srt import spec_capture_sink
++
++        sink = spec_capture_sink.get_sink()
++        samples = [
++            (spec, aux, last_hidden)
++            for _, spec, aux, last_hidden, _, _ in pending
++        ]
++        self._spec_capture_batches.append(
++            (
++                pending,
++                sink.submit_samples(samples),
++                return_logprob,
++                time.perf_counter(),
++            )
++        )
++        # Bound retained D2H buffers.  With producer concurrency=2, reaching
++        # this point means target prefill N+1 already overlapped host transfer
++        # N; wait only if N is still finishing before admitting N+2.
++        max_pending = int(
++            os.environ.get("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", "2")
++        )
++        if max_pending < 1:
++            raise ValueError("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES must be >= 1")
++        if len(self._spec_capture_batches) >= max_pending:
++            self.drain_spec_captures(block=True, max_batches=1)
++
++    def has_pending_spec_captures(self) -> bool:
++        return bool(self._spec_capture_batches)
++
++    def drain_spec_captures(
++        self, *, block: bool = False, max_batches: Optional[int] = None
++    ) -> int:
++        """Finish ready transfers and stream their responses on this thread."""
++        completed = 0
++        while self._spec_capture_batches:
++            if max_batches is not None and completed >= max_batches:
++                break
++            pending, future, return_logprob, queued_at = self._spec_capture_batches[0]
++            if not block and not future.done():
++                break
++            self._spec_capture_batches.pop(0)
++            self._complete_spec_capture_batch(
++                pending,
++                future,
++                return_logprob=return_logprob,
++                queued_at=queued_at,
++            )
++            completed += 1
++        return completed
++
++    def _complete_spec_capture_batch(
++        self, pending, future, *, return_logprob: bool, queued_at: float
++    ) -> None:
++        try:
++            results = future.result()
++            if len(results) != len(pending):
++                raise RuntimeError(
++                    f"spec-capture sink returned {len(results)} results for "
++                    f"{len(pending)} samples"
++                )
++        except Exception as e:
++            logger.error(
++                "spec-capture batch sink failed for %d requests: %s", len(pending), e
++            )
++            for req, spec, _, _, _, _ in pending:
++                req.spec_capture_result = {
++                    "sample_id": spec.get("sample_id"),
++                    "error": str(e),
++                }
++        else:
++            for pending_item, result in zip(pending, results):
++                req, _, _, _, _, _ = pending_item
++                req.spec_capture_result = result
++
++        timing_enabled = any(item[4] for item in pending)
++        if timing_enabled:
++            logger.info(
++                "[spec-capture-timing] async_batch_complete samples=%d "
++                "queue_to_stream_ms=%.3f cat_ms=%.3f",
++                len(pending),
++                (time.perf_counter() - queued_at) * 1000.0,
++                sum(item[5] for item in pending),
++            )
++        self.output_streamer.stream_output(
++            [item[0] for item in pending], return_logprob
++        )
++
++    @staticmethod
++    def _coalesce_spec_capture_chunks(
++        chunks: List[torch.Tensor],
++    ) -> Optional[torch.Tensor]:
++        if not chunks:
++            return None
++        if len(chunks) == 1:
++            return chunks[0]
++        return torch.cat(chunks, dim=0)
 +
      def _append_prefill_hidden_states(
          self,
          *,
 diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-index 278ccf4..7a9d8d5 100644
+index 9f5b2329a..cce5b4afe 100644
 --- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
 +++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-@@ -289,6 +289,7 @@ class _GenerationStreamAccumulator:
+@@ -162,6 +162,14 @@ class SchedulerOutputStreamer:
+         for req in reqs:
+             if req is skip_req:
+                 continue
++            if self.server_args.enable_spec_capture and req.spec_capture is not None:
++                # Capture requests are not complete until the background sink
++                # has durably published every feature object.  Several
++                # scheduler paths can ask the common streamer to emit a
++                # finished request; centralize the completion barrier here so
++                # none of them can win the race and send a metadata-less 200.
++                if req.finished() and req.spec_capture_result is None:
++                    continue
+             if req.finished() and req.finished_output:
+                 # With the overlap schedule, a request will try to output twice and hit this line twice
+                 # because of the one additional delayed token. This "continue" prevented the dummy output.
+@@ -302,6 +310,7 @@ class _GenerationStreamAccumulator:
      spec_cap_lens_histogram: list = field(default_factory=list)
      retraction_counts: list = field(default_factory=list)
      output_hidden_states: Optional[list] = None
@@ -335,7 +625,7 @@ index 278ccf4..7a9d8d5 100644
      routed_experts: Optional[list] = None
      indexer_topk: Optional[list] = None
      customized_info: dict = field(default_factory=dict)
-@@ -525,6 +526,8 @@ class _GenerationStreamAccumulator:
+@@ -571,6 +580,8 @@ class _GenerationStreamAccumulator:
                  self.output_hidden_states.append(hs)
              else:
                  self.output_hidden_states.append(None)
@@ -344,7 +634,7 @@ index 278ccf4..7a9d8d5 100644
          if self.return_routed_experts:
              self.routed_experts.append(
                  req.routed_experts if req.return_routed_experts else None
-@@ -600,6 +603,7 @@ class _GenerationStreamAccumulator:
+@@ -663,6 +674,7 @@ class _GenerationStreamAccumulator:
              output_token_sampling_mask=self.output_token_sampling_mask,
              output_token_sampling_logprobs=self.output_token_sampling_logprobs,
              output_hidden_states=self.output_hidden_states,
@@ -353,10 +643,10 @@ index 278ccf4..7a9d8d5 100644
              indexer_topk=self.indexer_topk,
              customized_info=(
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 2228008..15cb30a 100644
+index 41cc4c246..5d429a91f 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1231,6 +1231,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1337,6 +1337,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                  mm_data_mooncake=obj.mm_data_mooncake,
                  encoder_urls=obj.encoder_urls,
@@ -364,7 +654,7 @@ index 2228008..15cb30a 100644
              )
          elif isinstance(obj, EmbeddingReqInput):
              # Resolve unresolved embed overrides now that input_ids are available
-@@ -2018,6 +2019,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -2124,6 +2125,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  hidden_states = recv_obj.output_hidden_states[i]
                  if hidden_states is not None:
                      meta_info["hidden_states"] = hidden_states
@@ -375,11 +665,26 @@ index 2228008..15cb30a 100644
              if getattr(recv_obj, "routed_experts", None):
                  val = recv_obj.routed_experts[i]
                  if val is not None:
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+index fe883c264..2b7206a13 100644
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -148,6 +148,10 @@ class GenerationBatchResult:
+             self.logits_output.hidden_states = _async_d2h(
+                 self.logits_output.hidden_states
+             )
++            if self.logits_output.last_hidden_states is not None:
++                self.logits_output.last_hidden_states = _async_d2h(
++                    self.logits_output.last_hidden_states
++                )
+         self.next_token_ids = _async_d2h(self.next_token_ids)
+
+         if self.accept_lens is not None:
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 3d668b2..7d1f889 100644
+index 661bd5ad1..e1fce6365 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -487,6 +487,26 @@ class ModelRunner:
+@@ -489,6 +489,26 @@ class ModelRunner:
                  is_draft_worker=self.is_draft_worker,
              )
          )
@@ -403,10 +708,10 @@ index 3d668b2..7d1f889 100644
 +                    "--spec-capture-method must be one of: eagle3, dflash, dspark; "
 +                    f"got {capture_method!r}"
 +                )
- 
+
      def init_weight_exporter(self):
          self.weight_exporter = WeightExporter(
-@@ -863,7 +883,13 @@ class ModelRunner:
+@@ -866,7 +886,13 @@ class ModelRunner:
              eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
              dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
              dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
@@ -422,10 +727,10 @@ index 3d668b2..7d1f889 100644
          backends = build_attention_backends(model_runner=self)
          self.attn_backend = backends.attn_backend
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 62a0177..3f40061 100644
+index e9f84cb17..dd64be9f1 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
-@@ -3333,6 +3333,26 @@ class ServerArgs:
+@@ -3349,6 +3349,26 @@ class ServerArgs:
      enable_return_hidden_states: A[
          bool, "Enable returning hidden states with responses.", NS("exec.features")
      ] = False
@@ -454,10 +759,10 @@ index 62a0177..3f40061 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000..038a084
+index 000000000..8ab06e25d
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,388 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -493,7 +798,9 @@ index 0000000..038a084
 +import logging
 +import os
 +import threading
-+from typing import Any, Dict, List, Optional
++import time
++from concurrent.futures import Future, ThreadPoolExecutor
++from typing import Any, Dict, List, Optional, Tuple
 +
 +import torch
 +
@@ -527,9 +834,13 @@ index 0000000..038a084
 +        self._store = None
 +        self._put_config = None
 +        self._lock = threading.Lock()
-+        # Retried HTTP requests reuse deterministic keys.  Striped locks keep
-+        # replacement atomic per key without retaining one lock per sample.
-+        self._write_locks = [threading.Lock() for _ in range(256)]
++        # One store writer is sufficient: Mooncake already stripes a batched
++        # transfer internally.  The executor decouples that host transfer from
++        # the scheduler so the next target prefill can run concurrently.
++        self._executor = ThreadPoolExecutor(
++            max_workers=1,
++            thread_name_prefix="spec-capture-batch-put",
++        )
 +
 +    # -- connection ---------------------------------------------------------
 +    def _connect(self):
@@ -576,39 +887,234 @@ index 0000000..038a084
 +    def _tkey(store_id: str, sample_id: str, gen: int, name: str) -> str:
 +        return f"{store_id}/{sample_id}/g{gen}/{name}"
 +
-+    def _put_tensor(
-+        self, key: str, t: torch.Tensor, *, replace: bool = False
-+    ) -> None:
-+        store = self._connect()
-+        t = t.detach().to("cpu").contiguous()
-+        nbytes = t.element_size() * t.numel()
-+        lock = self._write_locks[hash(key) % len(self._write_locks)]
-+        with lock:
-+            if replace:
-+                # Do not probe with is_exist(): Mooncake existence checks can
-+                # acquire a read lease that prevents the following removal.
-+                self._remove_quiet(key)
-+            try:
-+                store.register_buffer(t.data_ptr(), nbytes)
-+            except Exception:
-+                pass  # some builds auto-register
-+            try:
-+                rc = store.put_from(key, t.data_ptr(), nbytes, self._put_config)
-+            finally:
-+                try:
-+                    store.unregister_buffer(t.data_ptr())
-+                except Exception:
-+                    pass
-+        if rc is not None and int(rc) < 0:
-+            raise RuntimeError(f"spec-capture put_from failed (status {rc}) for {key}")
-+
 +    def _remove_quiet(self, key: str) -> None:
 +        try:
 +            self._connect().remove(key)
 +        except Exception:
 +            pass
 +
-+    # -- the one entry point --------------------------------------------------
++    def _remove_many_quiet(self, keys: List[str]) -> None:
++        if not keys:
++            return
++        store = self._connect()
++        batch_remove = getattr(store, "batch_remove", None)
++        if batch_remove is not None:
++            try:
++                batch_remove(keys)
++                return
++            except Exception:
++                pass
++        for key in keys:
++            self._remove_quiet(key)
++
++    # -- the batch entry point ------------------------------------------------
++    def submit_samples(
++        self,
++        samples: List[
++            Tuple[
++                Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]
++            ]
++        ],
++    ) -> Future[List[Dict[str, Any]]]:
++        """Queue one scheduler batch without blocking the scheduler thread."""
++        return self._executor.submit(self.put_samples, samples)
++
++    def put_samples(
++        self,
++        samples: List[
++            Tuple[
++                Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]
++            ]
++        ],
++    ) -> List[Dict[str, Any]]:
++        """Publish a scheduler batch with one native Mooncake batch RPC.
++
++        A K3 prefill normally finishes 16 samples together.  Calling
++        ``put_from`` four times per sample paid 64 metadata/transport round
++        trips on the writer rank and serialized the response behind them.
++        ``batch_put_from`` preserves the existing per-feature keys and raw
++        tensor layout while amortizing that fixed cost across the whole
++        scheduler batch.  The response is still emitted only after every
++        status succeeds, so refs can never point at incomplete samples.
++        """
++        if not samples:
++            return []
++
++        store = self._connect()
++        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
++        started = time.perf_counter()
++        keys: List[str] = []
++        tensors: List[torch.Tensor] = []
++        sizes: List[int] = []
++        replace_keys: List[str] = []
++        results: List[Dict[str, Any]] = []
++
++        def _stage(
++            result_feats: Dict[str, Dict[str, Any]],
++            *,
++            store_id: str,
++            sample_id: str,
++            gen: int,
++            replace: bool,
++            name: str,
++            tensor: torch.Tensor,
++        ) -> None:
++            tensor = tensor.detach().to("cpu").contiguous()
++            key = self._tkey(store_id, sample_id, gen, name)
++            keys.append(key)
++            tensors.append(tensor)
++            sizes.append(tensor.element_size() * tensor.numel())
++            if replace:
++                replace_keys.append(key)
++            result_feats[name] = {
++                "shape": list(tensor.shape),
++                "dtype": _DTYPE_STR.get(
++                    tensor.dtype, str(tensor.dtype).replace("torch.", "")
++                ),
++            }
++
++        for spec, aux, last_hidden in samples:
++            store_id = str(spec["store_id"])
++            sample_id = str(spec["sample_id"])
++            gen = int(spec.get("gen", 1))
++            replace = bool(spec.get("replace", False))
++            features: Dict[str, str] = dict(spec.get("features") or {})
++            result_feats: Dict[str, Dict[str, Any]] = {}
++
++            aux_name = features.get(_ARTIFACT_AUX)
++            if aux_name is not None:
++                if aux is None:
++                    raise RuntimeError(
++                        "spec_capture requested 'aux' but no aux hidden states were "
++                        "captured -- launch the server with --enable-spec-capture "
++                        "(and optionally --spec-capture-aux-layer-ids)"
++                    )
++                _stage(
++                    result_feats,
++                    store_id=store_id,
++                    sample_id=sample_id,
++                    gen=gen,
++                    replace=replace,
++                    name=aux_name,
++                    tensor=aux.unsqueeze(0),
++                )
++            lh_name = features.get(_ARTIFACT_LAST_HIDDEN)
++            if lh_name is not None:
++                if last_hidden is None:
++                    raise RuntimeError(
++                        "spec_capture requested 'last_hidden' but the logits "
++                        "processor did not return it (is aux capture enabled?)"
++                    )
++                _stage(
++                    result_feats,
++                    store_id=store_id,
++                    sample_id=sample_id,
++                    gen=gen,
++                    replace=replace,
++                    name=lh_name,
++                    tensor=last_hidden.unsqueeze(0),
++                )
++            for item in spec.get("passthrough") or []:
++                dtype = _STR_DTYPE.get(str(item.get("dtype", "int64")))
++                if dtype is None:
++                    raise RuntimeError(
++                        f"spec_capture passthrough {item.get('name')!r}: "
++                        f"unsupported dtype {item.get('dtype')!r}"
++                    )
++                tensor = torch.tensor(item["data"], dtype=dtype).reshape(
++                    [int(d) for d in item["shape"]]
++                )
++                _stage(
++                    result_feats,
++                    store_id=store_id,
++                    sample_id=sample_id,
++                    gen=gen,
++                    replace=replace,
++                    name=str(item["name"]),
++                    tensor=tensor,
++                )
++            results.append(
++                {
++                    "sample_id": sample_id,
++                    "store_id": store_id,
++                    "gen": gen,
++                    "aux_layer_ids": self.aux_layer_ids,
++                    "features": result_feats,
++                }
++            )
++
++        materialize_ms = (time.perf_counter() - started) * 1000.0
++        self._remove_many_quiet(replace_keys)
++        registered: List[torch.Tensor] = []
++        register_started = time.perf_counter()
++        try:
++            for tensor, nbytes in zip(tensors, sizes):
++                try:
++                    store.register_buffer(tensor.data_ptr(), nbytes)
++                    registered.append(tensor)
++                except Exception:
++                    pass  # TCP and some Mooncake builds auto-register
++            register_ms = (time.perf_counter() - register_started) * 1000.0
++            put_started = time.perf_counter()
++            batch_put = getattr(store, "batch_put_from", None)
++            if batch_put is None:
++                statuses = [
++                    store.put_from(key, tensor.data_ptr(), nbytes, self._put_config)
++                    for key, tensor, nbytes in zip(keys, tensors, sizes)
++                ]
++            else:
++                statuses = batch_put(
++                    keys,
++                    [tensor.data_ptr() for tensor in tensors],
++                    sizes,
++                    self._put_config,
++                )
++            put_ms = (time.perf_counter() - put_started) * 1000.0
++        except Exception:
++            self._remove_many_quiet(keys)
++            raise
++        finally:
++            for tensor in registered:
++                try:
++                    store.unregister_buffer(tensor.data_ptr())
++                except Exception:
++                    pass
++
++        if statuses is None:
++            statuses = [0] * len(keys)
++        if len(statuses) != len(keys):
++            self._remove_many_quiet(keys)
++            raise RuntimeError(
++                "spec-capture batch_put_from returned "
++                f"{len(statuses)} statuses for {len(keys)} keys"
++            )
++        failed = [
++            (key, status)
++            for key, status in zip(keys, statuses)
++            if status is not None and int(status) < 0
++        ]
++        if failed:
++            self._remove_many_quiet(keys)
++            raise RuntimeError(
++                "spec-capture batch_put_from failed for "
++                f"{len(failed)}/{len(keys)} keys; first={failed[0]}"
++            )
++
++        if timing_enabled:
++            logger.info(
++                "[spec-capture-timing] batch_sink samples=%d objects=%d "
++                "bytes=%d materialize_ms=%.3f register_ms=%.3f put_ms=%.3f "
++                "total_ms=%.3f",
++                len(samples),
++                len(keys),
++                sum(sizes),
++                materialize_ms,
++                register_ms,
++                put_ms,
++                (time.perf_counter() - started) * 1000.0,
++            )
++        return results
++
 +    def put_sample(
 +        self,
 +        spec: Dict[str, Any],
@@ -622,65 +1128,9 @@ index 0000000..038a084
 +        stored with a leading batch dim of 1. On any failure the keys already
 +        written are best-effort removed (no partial sample is consumable).
 +        """
-+        store_id = str(spec["store_id"])
-+        sample_id = str(spec["sample_id"])
-+        gen = int(spec.get("gen", 1))
-+        replace = bool(spec.get("replace", False))
-+        features: Dict[str, str] = dict(spec.get("features") or {})
-+
-+        written: List[str] = []
-+        result_feats: Dict[str, Dict[str, Any]] = {}
-+
-+        def _write(name: str, t: torch.Tensor) -> None:
-+            key = self._tkey(store_id, sample_id, gen, name)
-+            self._put_tensor(key, t, replace=replace)
-+            written.append(key)
-+            result_feats[name] = {
-+                "shape": list(t.shape),
-+                "dtype": _DTYPE_STR.get(t.dtype, str(t.dtype).replace("torch.", "")),
-+            }
-+
-+        try:
-+            aux_name = features.get(_ARTIFACT_AUX)
-+            if aux_name is not None:
-+                if aux is None:
-+                    raise RuntimeError(
-+                        "spec_capture requested 'aux' but no aux hidden states were "
-+                        "captured — launch the server with --enable-spec-capture "
-+                        "(and optionally --spec-capture-aux-layer-ids)"
-+                    )
-+                _write(aux_name, aux.unsqueeze(0))
-+            lh_name = features.get(_ARTIFACT_LAST_HIDDEN)
-+            if lh_name is not None:
-+                if last_hidden is None:
-+                    raise RuntimeError(
-+                        "spec_capture requested 'last_hidden' but the logits "
-+                        "processor did not return it (is aux capture enabled?)"
-+                    )
-+                _write(lh_name, last_hidden.unsqueeze(0))
-+            for item in spec.get("passthrough") or []:
-+                dtype = _STR_DTYPE.get(str(item.get("dtype", "int64")))
-+                if dtype is None:
-+                    raise RuntimeError(
-+                        f"spec_capture passthrough {item.get('name')!r}: "
-+                        f"unsupported dtype {item.get('dtype')!r}"
-+                    )
-+                t = torch.tensor(item["data"], dtype=dtype).reshape(
-+                    [int(d) for d in item["shape"]]
-+                )
-+                _write(str(item["name"]), t)
-+        except Exception:
-+            for key in written:
-+                self._remove_quiet(key)
-+            raise
-+
-+        return {
-+            "sample_id": sample_id,
-+            "store_id": store_id,
-+            "gen": gen,
-+            "aux_layer_ids": self.aux_layer_ids,
-+            "features": result_feats,
-+        }
++        # Keep the single-sample entry point for compatibility with tests and
++        # callers outside the scheduler; production uses put_samples().
++        return self.put_samples([(spec, aux, last_hidden)])[0]
 +
 +
 +_SINK: Optional[SpecCaptureSink] = None

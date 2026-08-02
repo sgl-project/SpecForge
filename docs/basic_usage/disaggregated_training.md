@@ -58,9 +58,12 @@ The control directory is attempt-scoped. The launcher deterministically derives
 the online reference channel and lifecycle markers, or the offline manifest,
 beneath that root. Online consumers put the rank-0 SQLite/WAL under
 `consumer_state_dir`; that path should be node-local and is required for
-multi-node trainers. Rank inboxes stay under the shared `control_dir` when
-`deployment.trainer.nnodes > 1`, so remote ranks never need to access the
-SQLite filesystem. A fresh attempt requires fresh control and consumer-state
+multi-node trainers. By default rank inboxes stay under the shared
+`control_dir`. When a cluster cannot mount that path on every trainer node, set
+`inbox_server_url` to a private rank-0 HTTP origin: rank 0 keeps the inbox files
+locally and relays only tensor-free references and consumed counters to remote
+ranks. The producer and consumer rank 0 must still resolve `control_dir` to the
+same path. A fresh attempt requires fresh control and consumer-state
 directories. `store_id` defaults to `run_id` and can be set explicitly when the
 Mooncake deployment requires another namespace.
 
@@ -236,7 +239,11 @@ deployment:
     master_addr: trainer-0.example
     master_port: 29500
   disaggregated:
-    control_dir: /shared/control/attempt-001
+    # With inbox_server_url, only the producer and consumer rank 0 need this
+    # path; remote ranks receive their tensor-free reference stream over HTTP.
+    control_dir: /local/rank0/control/attempt-001
+    consumer_state_dir: /local/rank0/consumer-state/attempt-001
+    inbox_server_url: http://trainer-0.example:35900
     backend: mooncake
     server_urls: [http://capture-server:30000]
 ```
@@ -256,6 +263,13 @@ hosts or impersonate a cluster scheduler. An existing torchrun environment is
 detected and used as the worker environment rather than nesting another
 torchrun. A producer is rejected inside a multi-rank torchrun to prevent
 duplicate capture/ingestion roles.
+
+`inbox_server_url` is optional; omit it when every trainer rank shares
+`control_dir`. When set, rank 0 binds the configured port on all interfaces and
+remote ranks pull only their private metadata stream. The endpoint has no
+built-in authentication or TLS, so expose it only on a trusted cluster network.
+The producer must run on the rank-0 host (or otherwise share rank 0's
+`control_dir`); payload tensors never traverse this HTTP service.
 
 The separate-inference-node Qwen3-8B example keeps that scheduler boundary but
 restores full development-stack orchestration:

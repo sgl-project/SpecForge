@@ -13,7 +13,8 @@
 # anything else fails loudly rather than testing against unknown server code.
 #
 # Usage: scripts/apply_sglang_spec_capture_patch.sh
-#          [--target v0.5.14|kimi-k3-9acd9cb|kimi-k3-f8493a4] [--reverse]
+#          [--target v0.5.14|kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4]
+#          [--reverse]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,13 +47,15 @@ case "$TARGET" in
         EXPECTED_VERSION_PREFIX="0.5.14"
         PATCH_TARGET="$TARGET"
         ;;
-    kimi-k3-9acd9cb|kimi-k3-f8493a4)
+    kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4)
         # Kimi K3's SGLang fork currently reports a base-package version that
         # does not uniquely identify this source revision, so patch --check is
         # the authoritative compatibility gate below.
         EXPECTED_VERSION_PREFIX=""
-        # The patch remains byte-identical and applies cleanly to both the
-        # original f8493a4 integration point and current K3 tip 9acd9cb.
+        # One patch is generated against ee560a2 and compatibility-checked
+        # against the original f8493a4 integration point and the 9acd9cb tip.
+        # Keep the historical directory name so existing automation remains
+        # source-compatible.
         PATCH_TARGET="kimi-k3-f8493a4"
         ;;
     *)

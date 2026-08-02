@@ -88,7 +88,43 @@ directory, while the wrapper's lifecycle markers stay at the shared run root.
 The consumer's SQLite/WAL and rank inboxes default to the trainer-node-local
 `/tmp/specforge/$DISAGG_STORE_ID/consumer-state`; override
 `DISAGG_CONSUMER_STATE_DIR` or `LOCAL_SCRATCH` when `/tmp` is unsuitable.
-Node-local consumer state currently supports one trainer node only.
+For a multi-node trainer, set `deployment.disaggregated.inbox_server_url` to a
+private HTTP origin on trainer node 0. Rank 0 owns the SQLite/WAL and relays
+only tensor-free `SampleRef` metadata to the other trainer nodes; feature
+tensors continue to move directly through the selected feature store.
+
+## Checkpoints without shared storage
+
+Each distributed rank writes its own `training_state_rankN.pt`. If every
+trainer node resolves `output_dir` to the same shared filesystem, no extra
+step is required. If `output_dir` is node-local, run the checked-in relay on
+both trainer nodes before training. It exchanges rank-local archives over the
+private trainer network, verifies SHA-256, and atomically assembles a complete
+checkpoint directory on each node:
+
+```bash
+# Trainer node 0 (ranks 0-7)
+python examples/disagg/sync_distributed_checkpoints.py \
+  --run-root /workspace/runs/$RUN_ID \
+  --run-id "$RUN_ID" \
+  --local-ranks 0-7 --peer-ranks 8-15 \
+  --serve-host 10.0.0.3 --serve-port 35914 \
+  --peer-url http://10.0.0.4:35915 \
+  --max-archives 3
+
+# Trainer node 1 (ranks 8-15)
+python examples/disagg/sync_distributed_checkpoints.py \
+  --run-root /workspace/runs/$RUN_ID \
+  --run-id "$RUN_ID" \
+  --local-ranks 8-15 --peer-ranks 0-7 \
+  --serve-host 10.0.0.4 --serve-port 35915 \
+  --peer-url http://10.0.0.3:35914 \
+  --max-archives 3
+```
+
+The relay has no authentication or TLS; bind it only to a trusted private
+interface. Set `--max-archives` to the same retention window as
+`training.max_checkpoints` so relay archives cannot grow without bound.
 
 ## External and managed-local services
 
@@ -162,4 +198,7 @@ URL userinfo are redacted.
 
 See the [disaggregated training guide](../../docs/basic_usage/disaggregated_training.md)
 for service prerequisites, recovery rules, and the online/offline data-plane
-contracts.
+contracts. Kimi-K3's two-replica production recipes use
+`run_kimi_k3_dspark_capture_server.sh` on each TP8 capture node; set the
+node-local model path and routable capture/Mooncake addresses through the
+script's required environment variables.

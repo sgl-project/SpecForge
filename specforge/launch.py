@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, List, Mapping, Optional, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
@@ -923,8 +924,7 @@ def build_disagg_online_producer(
         and feature_store_max_resident_bytes < resident_high_watermark_bytes
     ):
         raise ValueError(
-            "feature_store_max_resident_bytes must be >= "
-            "resident_high_watermark_bytes"
+            "feature_store_max_resident_bytes must be >= resident_high_watermark_bytes"
         )
     worker_lease = flow_control.prompt_lease(lease)
     build_start = time.perf_counter()
@@ -1275,8 +1275,7 @@ def build_disagg_online_producer(
                                 # retryable. Other active calls keep draining.
                                 failures += 1
                                 logger.warning(
-                                    "rollout worker %s capture call failed "
-                                    "(%d/%d): %s",
+                                    "rollout worker %s capture call failed (%d/%d): %s",
                                     w.worker_id,
                                     failures,
                                     max_worker_failures,
@@ -1540,6 +1539,7 @@ def build_disagg_online_consumer(
         inbox_dir = channel.path + ".inboxes"
 
     distributor = None
+    inbox_server = None
     store = None
     setup_exc = None
     if dp_rank == 0:
@@ -1611,6 +1611,18 @@ def build_disagg_online_consumer(
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
             )
+            inbox_server_url = os.environ.get("DISAGG_INBOX_SERVER_URL")
+            if inbox_server_url:
+                from specforge.runtime.data_plane.http_inbox import InboxHTTPServer
+
+                inbox_server = InboxHTTPServer(
+                    inbox_dir,
+                    dp_size,
+                    inbox_server_url,
+                    bind_host=os.environ.get(
+                        "DISAGG_INBOX_SERVER_BIND_HOST", "0.0.0.0"
+                    ),
+                ).start()
             channel.publish_consumer_quantum(
                 dp_size * batch_size * accumulation_steps,
                 allow_existing=resume_from is not None,
@@ -1624,6 +1636,8 @@ def build_disagg_online_consumer(
         dist.broadcast_object_list(payload, src=0)
         setup_error = payload[0]
     if setup_error is not None:
+        if dp_rank == 0 and inbox_server is not None:
+            inbox_server.stop()
         if dp_rank == 0 and store is not None and hasattr(store, "close"):
             store.close()
         if not distributed or world == 1:
@@ -1640,7 +1654,16 @@ def build_disagg_online_consumer(
 
     # The successful rank-0 setup broadcast guarantees inbox recreation and the
     # optimizer-window sidecar are visible before any rank opens its reader.
-    inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
+    # An optional rank-0 HTTP relay removes the shared-mount requirement for
+    # non-authority ranks; rank 0 remains local so the durable authority never
+    # depends on its own network service.
+    inbox_server_url = os.environ.get("DISAGG_INBOX_SERVER_URL")
+    if inbox_server_url and dp_rank != 0:
+        from specforge.runtime.data_plane.http_inbox import RemoteInboxChannel
+
+        inbox = RemoteInboxChannel(inbox_server_url, dp_rank)
+    else:
+        inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
     queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
 
     drain_state = {"attempted": False}
@@ -1689,6 +1712,8 @@ def build_disagg_online_consumer(
     def stop_distributor_and_drain() -> None:
         if distributor is not None:
             distributor.stop()
+        if inbox_server is not None:
+            inbox_server.stop()
         # The success hook already drained before publishing consumer_done. On
         # an exception, finalization still makes one bounded local attempt and
         # reports a cleanup failure loudly without replacing the primary fit
@@ -1711,7 +1736,7 @@ def build_disagg_online_consumer(
                     )
                 except Exception as signal_exc:
                     print(
-                        "failed to publish consumer cleanup failure: " f"{signal_exc}",
+                        f"failed to publish consumer cleanup failure: {signal_exc}",
                         flush=True,
                     )
                 logging.getLogger(__name__).error("%s", combined)

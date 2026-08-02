@@ -109,10 +109,11 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             with self.subTest(strategy=strategy):
                 plan = resolve_offline_capture_plan(args, target_config)
                 self.assertEqual(strategy, plan.strategy)
-                self.assertEqual(
-                    "eagle3" if strategy == "eagle3" else "dflash",
-                    plan.capture_method,
-                )
+                expected_capture_method = {
+                    "eagle3": "eagle3",
+                    "dspark": "dspark",
+                }.get(strategy, "dflash")
+                self.assertEqual(expected_capture_method, plan.capture_method)
                 self.assertEqual(layers, plan.capture_layers)
                 self.assertEqual(feature_names, set(plan.layout.output_names))
 

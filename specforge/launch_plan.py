@@ -203,7 +203,7 @@ def _resolve_role(
         raise ValueError("--role producer/consumer/both requires disaggregated mode")
     if requested == "both" and cfg.training.resume_from:
         raise ValueError(
-            "--role both cannot resume a disaggregated producer; use " "--role consumer"
+            "--role both cannot resume a disaggregated producer; use --role consumer"
         )
     if distributed and requested == "both":
         raise ValueError(
@@ -222,7 +222,7 @@ def _resolved_node_rank(
         node_rank = int(env["NODE_RANK"])
     if node_rank is not None and not 0 <= node_rank < cfg.deployment.trainer.nnodes:
         raise ValueError(
-            f"node_rank={node_rank} must be in [0, " f"{cfg.deployment.trainer.nnodes})"
+            f"node_rank={node_rank} must be in [0, {cfg.deployment.trainer.nnodes})"
         )
     return node_rank
 
@@ -265,6 +265,8 @@ def _disaggregated_env(
         "DISAGG_BACKEND": deployment.backend,
         "DISAGG_STORE_ID": deployment.store_id or cfg.run_id,
     }
+    if deployment.inbox_server_url:
+        values["DISAGG_INBOX_SERVER_URL"] = deployment.inbox_server_url
     if cfg.mode == "online":
         if deployment.backend != "mooncake":
             raise ValueError("online disaggregated training requires Mooncake")
@@ -275,9 +277,9 @@ def _disaggregated_env(
             {
                 "DISAGG_REF_CHANNEL": str(control_dir / "refs.jsonl"),
                 "DISAGG_DB": str(consumer_state_dir / "consumer.sqlite"),
-                # SQLite/WAL stays on rank 0's local filesystem.  Inboxes are
-                # ordinary append-only channels and must remain visible to
-                # ranks on every trainer node.
+                # SQLite/WAL stays on rank 0's local filesystem. Inboxes are
+                # shared normally or served by rank 0 when the HTTP relay is
+                # configured.
                 "DISAGG_INBOX_DIR": str(
                     (
                         control_dir
@@ -593,8 +595,7 @@ def _validate_consumer_database(
     if cfg.training.resume_from:
         if state_owner and not os.path.exists(database):
             raise ValueError(
-                "consumer resume requires the retained metadata database: "
-                f"{database}"
+                f"consumer resume requires the retained metadata database: {database}"
             )
         return
     stale = [

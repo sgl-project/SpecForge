@@ -50,60 +50,129 @@ renders the conversation schema and right-truncates to 4096 tokens.
 
 ## Reference training settings
 
-The full recipes preserve the K3 reference run's training settings:
+The exact full-attention recipe preserves the K3 reference run's training
+settings and trainer shape:
 
-- 4096 token examples, batch size 8, accumulation 32;
+- 4096 token examples, per-rank batch size 1, accumulation 32, DP16;
+- four-batch feature prefetch to overlap Mooncake TCP transfer with trainer
+  compute;
 - 10 epochs, learning rate `6e-4`, warmup ratio `0.04`;
+- 9,173 optimizer steps (`469,695 * 10 // 512`), explicitly pinned so all
+  roles share one schedule horizon at startup;
 - 512 anchors, block size 7, Markov rank 256;
 - CE/L1/confidence weights `0.1/0.9/1.0`;
 - log every 10 steps and save every 250 steps;
+- retain the latest three assembled checkpoints on each trainer node;
 - online W&B project `specforge-dspark`.
 
-The supplied topology is one TP8 K3 capture server and a separate four-rank
-trainer. Because the trainer world size is part of the effective global batch,
-record any topology override in the W&B run config.
+The supplied exact topology is two TP8 K3 capture replicas and a separate
+two-node, 16-rank trainer. The source job's `BATCH_SIZE=8` was per TP8 target
+replica, not per FSDP rank: its two replicas formed a 16-sample optimizer
+microbatch. One sample on each of 16 trainer GPUs with accumulation 32 restores
+the source global batch of 512 and its per-GPU draft compute. The experimental
+MLA/KDA recipes remain portable one-node DP8 configurations with two samples
+per rank and the same global batch. Two optimizer windows stay in Mooncake so
+target capture for the next update overlaps draft training; record any topology
+override in the W&B run config.
 
 ## Smoke then full training
 
 Start Mooncake as described in
-[the K3 V1C runbook](kimi-k3-dspark-v1c-disaggregated.md), then launch the
-patched latest K3 SGLang server. The capture layer ids are part of this recipe's
-contract and intentionally differ from the V1C reproduction:
+[the K3 V1C runbook](kimi-k3-dspark-v1c-disaggregated.md), then apply the K3
+patch to revision `ee560a2b2df5dafe18fd835d2e546eff019ca5ba`. Launch
+`run_kimi_k3_dspark_capture_server.sh` on each of the two capture nodes. The
+capture layer ids are part of this recipe's contract and intentionally differ
+from the V1C reproduction:
 
 ```bash
-export CAPTURE_IP=10.65.0.2
-export TARGET_MODEL=/workspace/models/Kimi-K3
-export MOONCAKE_MASTER_SERVER_ADDR="$CAPTURE_IP:35551"
-export MOONCAKE_METADATA_SERVER="http://$CAPTURE_IP:35880/metadata"
-export MOONCAKE_LOCAL_HOSTNAME="$CAPTURE_IP"
-export MC_TCP_BIND_ADDRESS="$CAPTURE_IP"
-export MOONCAKE_PROTOCOL=tcp
-export MOONCAKE_GLOBAL_SEGMENT_SIZE=1099511627776
-export MOONCAKE_LOCAL_BUFFER_SIZE=1073741824
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m sglang.launch_server \
-  --host 0.0.0.0 \
-  --port 30000 \
-  --model-path "$TARGET_MODEL" \
-  --trust-remote-code \
-  --skip-tokenizer-init \
-  --tp-size 8 \
-  --mem-fraction-static 0.76 \
-  --context-length 4608 \
-  --max-running-requests 8 \
-  --max-total-tokens 40960 \
-  --prefill-attention-backend flashinfer \
-  --decode-attention-backend trtllm_mla \
-  --moe-runner-backend marlin \
-  --enable-symm-mem \
-  --mamba-radix-cache-strategy extra_buffer \
-  --max-mamba-cache-size 40 \
-  --chunked-prefill-size -1 \
-  --enable-spec-capture \
-  --spec-capture-method dspark \
-  --spec-capture-aux-layer-ids 11 23 47 71 83
+export MODEL_PATH=/workspace/models/Kimi-K3-cdd2e49a
+export MOONCAKE_MASTER_IP=10.65.0.2
+export SGLANG_ROOT=/workspace/sglang-kimi-k3-ee560a2-spec-capture
+export CAPTURE_IP=10.65.0.5  # use the current node's routable address
+examples/disagg/run_kimi_k3_dspark_capture_server.sh
 ```
 
 Use capture IP/ports that match the selected YAML.
+
+For the exact five-layer full-attention reference architecture, use capture
+layers `[7, 23, 51, 67, 83]` and the checked-in full-attention recipe. Run the
+producer beside trainer rank 0 so both can use the rank-0 local `control_dir`.
+The rank-0 inbox HTTP relay serves only tensor-free `SampleRef` metadata to the
+second trainer node; feature tensors still move directly through Mooncake.
+Override the placeholder host names with private, trusted-network addresses:
+
+```bash
+export AUX_LAYER_IDS="7 23 51 67 83"
+specforge train \
+  --config examples/configs/kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml \
+  --role producer \
+  deployment.trainer.master_addr=10.65.0.3 \
+  deployment.disaggregated.inbox_server_url=http://10.65.0.3:35900
+
+# Trainer node 0
+WANDB_MODE=online MOONCAKE_LOCAL_HOSTNAME=10.65.0.3 specforge train \
+  --config examples/configs/kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml \
+  --role consumer --node-rank 0 \
+  deployment.trainer.master_addr=10.65.0.3 \
+  deployment.disaggregated.inbox_server_url=http://10.65.0.3:35900
+
+# Trainer node 1
+WANDB_MODE=online MOONCAKE_LOCAL_HOSTNAME=10.65.0.4 specforge train \
+  --config examples/configs/kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml \
+  --role consumer --node-rank 1 \
+  deployment.trainer.master_addr=10.65.0.3 \
+  deployment.disaggregated.inbox_server_url=http://10.65.0.3:35900
+```
+
+When the two trainer nodes do not share `output_dir`, start
+`examples/disagg/sync_distributed_checkpoints.py` on both nodes with local rank
+ranges `0-7` and `8-15`, respectively. The
+[disaggregated examples guide](../../examples/disagg/README.md#checkpoints-without-shared-storage)
+contains the complete commands and private-network boundary.
+
+## Capture throughput contract
+
+The source run used two independent TP8 target replicas. A normal TP8 prefill
+and a capture-enabled TP8 prefill should have comparable model-compute speed,
+but one replica still provides only half of the source job's aggregate sample
+rate. The capture patch therefore:
+
+- performs D2H only on the output TP rank and reuses contiguous per-request
+  views instead of concatenating every single-chunk tensor;
+- publishes the scheduler batch through Mooncake `batch_put_from` rather than
+  one RPC per feature object;
+- gives each target endpoint two producer request slots, overlapping one
+  bounded background publish with the next TP8 prefill; and
+- holds the HTTP completion response until every feature key is durable.
+
+The exact 4,096-token validation captured 128 unique samples (211,715 tokens,
+18,214,264,880 feature bytes) in 25.010 seconds after the first request began:
+5.118 samples/s per TP8 replica. Two replicas project to 10.236 samples/s, or
+71.97 optimizer steps/hour at global batch 512. The source W&B run measured
+71.50 steps/hour. Steady target prefill remained approximately 10.9–11.2k
+tokens/s, so the remaining scale factor is replica count rather than an SGLang
+compute regression.
+
+A DP16 end-to-end smoke completed with finite losses and gradient norms across
+all 16 ranks. Both trainer nodes assembled and opened the portable checkpoint:
+one shared training-state file plus rank files 0--15. Before prefetch, its warm
+step took 56.44 seconds: 35--39 seconds of trainer compute plus up to 21 seconds
+waiting for Mooncake TCP feature materialization.
+
+With `data.dataloader_num_workers: 4`, four subsequent warm steps took 49.61,
+47.70, 48.52, and 49.25 seconds. Their mean was 48.77 seconds, or 73.82
+steps/hour and 10.50 samples/s at global batch 512. This is 3.1% faster than
+the source W&B run's 50.35 seconds/step (71.50 steps/hour). The prefetch smoke
+is recorded in W&B as run `npia5q21`. Keep prefetch enabled when Mooncake uses
+TCP; it overlaps feature transfer with the current optimizer step without
+changing capture outputs or the training objective.
+
+The resulting 9,173-step full run is recorded in W&B as run `fth4aze4`. Steps
+20 through 70 reported finite losses and gradient norms. Step time fell from
+45.53 to approximately 40.3 seconds as feature prefetch warmed; steps 60 and
+70 sustained 89.28 and 88.85 steps/hour (about 12.7 samples/s), roughly 24%
+above the source run. These measurements are early-run validation; use the W&B
+performance panels and assembled checkpoints to monitor the remaining run.
 
 Keep the W&B API key in a protected file and export it only in the trainer
 shell; do not put it in YAML or a command transcript.
@@ -132,5 +201,6 @@ WANDB_MODE=online specforge train \
 
 Use the corresponding
 `kimi-k3-dspark-4kda-1mla-openperfectblend-disaggregated.yaml` config for the
-hybrid. The two full jobs need separate output/control directories and should
-not share one four-rank trainer allocation concurrently.
+hybrid, or the full-attention config above for the exact old architecture. The
+full jobs need separate output/control directories and should not share one
+trainer allocation concurrently.

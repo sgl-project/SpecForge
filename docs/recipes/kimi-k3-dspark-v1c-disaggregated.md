@@ -9,16 +9,17 @@ effective global batch, constant learning rate, and DSpark loss weights.
 
 - SpecForge with configurable LR scheduling, an independent online prompt
   seed, and dedicated DSpark capture support.
-- Kimi K3 SGLang revision `9acd9cba39f522da71c6d9b9695f2ceb41d36b18`
+- Kimi K3 SGLang revision `ee560a2b2df5dafe18fd835d2e546eff019ca5ba`
   (the current public `kimi-k3` branch tip validated by this recipe).
 - The K3 SGLang tree patched with:
 
   ```bash
-  scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb
+  scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-ee560a2
   ```
 
-The patch was originally authored against `f8493a4`, remains byte-identical,
-and applies cleanly to `9acd9cb`. It makes `--spec-capture-method dspark` call K3's
+The patch is generated against `ee560a2` and compatibility-checked against
+`f8493a4`, `9acd9cb`, and `ee560a2`; its historical directory name is retained
+for existing automation. It makes `--spec-capture-method dspark` call K3's
 `set_dspark_layers_to_capture` hook. The generic DFlash capture method is not
 equivalent for K3. The same versioned patch carries the three required 64K
 correctness guards: 64-bit Triton token offsets, scale-stable residual scoring,
@@ -83,6 +84,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m sglang.launch_server \
   --moe-runner-backend marlin \
   --mamba-radix-cache-strategy extra_buffer \
   --max-mamba-cache-size 5 \
+  --disable-cuda-graph \
   --chunked-prefill-size -1 \
   --enable-spec-capture \
   --spec-capture-method dspark \

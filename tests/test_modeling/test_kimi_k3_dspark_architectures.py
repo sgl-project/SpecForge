@@ -97,6 +97,66 @@ def test_production_configs_match_k3_target(filename, architecture):
     }
 
 
+def test_reference_full_attention_config_is_exact_old_architecture():
+    config = json.loads(
+        (ROOT / "configs" / "kimi-k3-dspark-fullattn-gqa16.json").read_text()
+    )
+    assert config["architectures"] == ["DSparkDraftModel"]
+    assert config["block_size"] == 7
+    assert config["num_hidden_layers"] == 5
+    assert config["layer_types"] == ["full_attention"] * 5
+    assert config["num_attention_heads"] == 64
+    assert config["num_key_value_heads"] == 16
+    assert config["dflash_config"]["target_layer_ids"] == [7, 23, 51, 67, 83]
+    assert config["rope_scaling"] is None
+
+
+def test_reference_full_attention_recipe_preserves_exact_old_contract():
+    config = Config.from_file(
+        str(
+            ROOT
+            / "examples"
+            / "configs"
+            / "kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml"
+        )
+    )
+    assert config.model.target_model_path == "/workspace/models/Kimi-K3"
+    assert config.data.max_length == 4096
+    assert config.data.dataloader_num_workers == 4
+    assert config.training.batch_size == 1
+    assert config.training.accumulation_steps == 32
+    assert config.deployment.trainer.nnodes == 2
+    assert config.deployment.trainer.nproc_per_node == 8
+    assert (
+        config.deployment.trainer.nnodes
+        * config.deployment.trainer.nproc_per_node
+        * config.training.batch_size
+        == 16
+    )
+    assert (
+        config.deployment.trainer.nnodes
+        * config.deployment.trainer.nproc_per_node
+        * config.training.batch_size
+        * config.training.accumulation_steps
+        == 512
+    )
+    assert config.training.num_epochs == 10
+    assert config.training.total_steps == 9173
+    assert config.training.learning_rate == pytest.approx(6e-4)
+    assert config.training.lr_scheduler == "cosine"
+    assert config.training.warmup_ratio == pytest.approx(0.04)
+    assert config.training.num_anchors == 512
+    assert config.training.max_checkpoints == 3
+    assert config.runtime.producer_lease == 16
+    assert len(config.deployment.disaggregated.server_urls) == 2
+    assert (
+        config.deployment.disaggregated.inbox_server_url
+        == "http://trainer-node-0:35900"
+    )
+    assert "openperfectblend-regen-9caaf705" in config.data.train_data_path
+    assert config.tracking.report_to == "wandb"
+
+
 @pytest.mark.parametrize(
     "filename",
     [
@@ -107,8 +167,14 @@ def test_production_configs_match_k3_target(filename, architecture):
 def test_training_recipes_preserve_reference_run_contract(filename):
     config = Config.from_file(str(ROOT / "examples" / "configs" / filename))
     assert config.data.max_length == 4096
-    assert config.training.batch_size == 8
-    assert config.training.accumulation_steps == 8
+    assert config.training.batch_size == 2
+    assert config.training.accumulation_steps == 32
+    assert (
+        config.deployment.trainer.nnodes
+        * config.deployment.trainer.nproc_per_node
+        * config.training.batch_size
+        == 16
+    )
     assert (
         config.deployment.trainer.nnodes
         * config.deployment.trainer.nproc_per_node
@@ -143,8 +209,16 @@ def test_training_recipes_preserve_reference_run_contract(filename):
         + max_capture_overshoot
         - optimizer_quantum
     )
-    assert config.runtime.producer_lease == config.training.batch_size
-    assert config.runtime.producer_concurrency == 1
+    # Each capture HTTP request uses the source job's complete 16-sample
+    # optimizer microbatch to amortize auxiliary-state aggregation.  This is a
+    # producer request size, independent of the DP8 consumer's per-rank batch.
+    assert config.runtime.producer_lease == 16
+    assert config.runtime.producer_concurrency == 2
+    assert config.model.sglang_enable_symm_mem is False
+    assert config.model.sglang_max_running_requests == 16
+    # K3 consumes five linear-attention cache entries per live request; 40
+    # silently caps SGLang at eight even when max_running_requests is 16.
+    assert config.model.sglang_max_mamba_cache_size == 80
     assert len(config.deployment.disaggregated.server_urls) >= 2
     # Two worst-case 4,096-token optimizer windows carry about 336 GiB of
     # captured features; byte throttling must not serialize the pipeline.

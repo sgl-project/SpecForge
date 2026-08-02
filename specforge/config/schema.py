@@ -20,6 +20,7 @@ import copy
 import json
 import os
 from typing import List, Literal, Optional
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -383,9 +384,13 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: Attempt-scoped shared directory. The launcher derives refs, manifest,
     #: and lifecycle markers beneath it.
     control_dir: str
-    #: Optional node-local root for online consumer SQLite/WAL and rank inboxes.
-    #: When omitted, the historical control_dir-derived paths remain in use.
+    #: Optional node-local root for the online consumer SQLite/WAL. When
+    #: omitted, the historical control_dir-derived path remains in use.
     consumer_state_dir: Optional[str] = None
+    #: Optional rank-0 HTTP relay for per-rank online inboxes.  This removes the
+    #: shared-filesystem requirement between trainer nodes while keeping the
+    #: authority-owned source channel and SQLite/WAL on trainer node 0.
+    inbox_server_url: Optional[str] = None
     backend: Literal["shared_dir", "mooncake"]
     store_root: Optional[str] = None
     store_id: Optional[str] = None
@@ -423,6 +428,24 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
                 "deployment.disaggregated.consumer_state_dir must be non-empty "
                 "and must not contain surrounding whitespace"
             )
+        if self.inbox_server_url is not None:
+            parsed = urlparse(self.inbox_server_url)
+            if (
+                parsed.scheme != "http"
+                or not parsed.hostname
+                or parsed.port is None
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in ("", "/")
+                or parsed.params
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "deployment.disaggregated.inbox_server_url must be an "
+                    "http://host:port origin without credentials, path, query, "
+                    "or fragment"
+                )
         if self.backend == "shared_dir" and not self.store_root:
             raise ValueError(
                 "deployment.disaggregated.store_root is required for shared_dir"
@@ -447,8 +470,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
             explicit = [name for name, value in configured_endpoints.items() if value]
             if explicit:
                 raise ValueError(
-                    "managed_local derives Mooncake endpoints; do not set "
-                    f"{explicit}"
+                    f"managed_local derives Mooncake endpoints; do not set {explicit}"
                 )
             if self.producer_segment_size is not None:
                 raise ValueError(
@@ -726,8 +748,7 @@ class Config(StrictConfigModel):
             )
         if self.data.eval_hidden_states_path and mode != "offline":
             raise ValueError(
-                "data.eval_hidden_states_path requires an offline training data "
-                "source"
+                "data.eval_hidden_states_path requires an offline training data source"
             )
         if (
             not self.training.compact_teacher
@@ -757,11 +778,27 @@ class Config(StrictConfigModel):
             if self.deployment.disaggregated is not None
             else None
         )
+        inbox_server_url = (
+            self.deployment.disaggregated.inbox_server_url
+            if self.deployment.disaggregated is not None
+            else None
+        )
         if consumer_state_dir is not None:
             if mode != "online" or deployment != "disaggregated":
                 raise ValueError(
                     "deployment.disaggregated.consumer_state_dir is valid only "
                     "for online disaggregated training"
+                )
+        if inbox_server_url is not None:
+            if mode != "online" or deployment != "disaggregated":
+                raise ValueError(
+                    "deployment.disaggregated.inbox_server_url is valid only "
+                    "for online disaggregated training"
+                )
+            if self.deployment.trainer.nnodes < 2:
+                raise ValueError(
+                    "deployment.disaggregated.inbox_server_url requires a "
+                    "multi-node trainer"
                 )
         if (
             mode == "online"
