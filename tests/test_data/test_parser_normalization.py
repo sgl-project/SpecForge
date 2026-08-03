@@ -1,6 +1,6 @@
 import unittest
 
-from specforge.data.parse import GeneralParser
+from specforge.data.parse import GeneralParser, ThinkingParser
 from specforge.data.template import ChatTemplate
 
 
@@ -82,6 +82,32 @@ class TestParserNormalization(unittest.TestCase):
                 {"role": "assistant", "content": "answer"},
             ],
         )
+
+    def test_thinking_parser_sanitize_keeps_tool_identity_and_drops_extras(self):
+        # Tool-result rendering needs `name`/`tool_call_id` to survive
+        # sanitization; chat templates place the tool name inside the block.
+        parser = ThinkingParser(
+            DummyTokenizer(),
+            ChatTemplate(
+                assistant_header="<assistant>",
+                user_header="<user>",
+                system_prompt=None,
+                end_of_turn_token="</eot>",
+                parser_type="thinking",
+            ),
+        )
+        cleaned = parser._sanitize_message(
+            {
+                "role": "tool",
+                "content": "sunny",
+                "name": "weather",
+                "tool_call_id": "call-7",
+                "private": "discard",
+            }
+        )
+        self.assertEqual(cleaned["name"], "weather")
+        self.assertEqual(cleaned["tool_call_id"], "call-7")
+        self.assertNotIn("private", cleaned)
 
 
 if __name__ == "__main__":
