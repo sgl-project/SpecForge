@@ -317,7 +317,18 @@ def _close_configured_logger(logger) -> None:
         close()
 
 
-def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
+def _tokenizer_chat_template_hash(tokenizer) -> Optional[str]:
+    """Hash the tokenizer's effective chat template so cached tokenizations
+    are invalidated when the model repository updates its template."""
+    template = getattr(tokenizer, "chat_template", None)
+    if not template:
+        return None
+    return hashlib.sha256(str(template).encode("utf-8")).hexdigest()[:12]
+
+
+def _prompt_cache_key(
+    cfg: Config, *, tokenizer=None, path: Optional[str] = None
+) -> str:
     source_path = path or cfg.data.prompts_path or cfg.data.train_data_path
     content_hash = None
     if source_path and os.path.isfile(source_path):
@@ -332,6 +343,7 @@ def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
         "content_hash": content_hash,
         "max_length": cfg.data.max_length,
         "chat_template": cfg.data.chat_template,
+        "tokenizer_chat_template_hash": _tokenizer_chat_template_hash(tokenizer),
         "is_preformatted": cfg.data.is_preformatted,
         "train_only_last_turn": cfg.data.train_only_last_turn,
         "max_prompts": cfg.data.max_prompts,
@@ -376,7 +388,7 @@ def _prepare_prompts(
         cache_key = (
             cfg.data.cache_key
             if path is None and cfg.data.cache_key is not None
-            else _prompt_cache_key(cfg, path=source_path)
+            else _prompt_cache_key(cfg, tokenizer=tokenizer, path=source_path)
         )
     min_loss_tokens = algorithm.providers.model.minimum_loss_tokens(cfg, draft_config)
     return prepare_prompt_tasks(
