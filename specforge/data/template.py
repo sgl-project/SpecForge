@@ -250,6 +250,21 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="kimi-k3-thinking",
+    template=ChatTemplate(
+        assistant_header=(
+            '<|open|>message role="assistant"<|sep|><|open|>think<|sep|>'
+        ),
+        user_header='<|open|>message role="user"<|sep|>',
+        system_prompt=None,
+        end_of_turn_token="<|end_of_msg|>",
+        parser_type="thinking",
+        enable_thinking=False,
+        ignore_token=["<|end_of_msg|>"],
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="deepseek-v3",
     template=ChatTemplate(
         assistant_header="<｜Assistant｜>",
