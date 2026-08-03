@@ -20,7 +20,6 @@ KIMI_K3_CAPTURE_PATCH = (
 )
 
 
-
 class DisaggregatedWrapperTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="disagg_wrapper_")

@@ -144,17 +144,25 @@ def _prepare_raw_prompts(
         max_length=max_length,
         min_loss_tokens=min_loss_tokens,
         limit=limit,
-        loss_mask_filter=None,
+        loss_mask_filter=loss_mask_filter,
     )
 
 
 class _ProcessedPromptSequence(Sequence[PromptTaskDict]):
     """Normalize memory-mapped processed rows only when the producer ingests them."""
 
-    def __init__(self, dataset, *, max_length: int, min_loss_tokens: int) -> None:
+    def __init__(
+        self,
+        dataset,
+        *,
+        max_length: int,
+        min_loss_tokens: int,
+        loss_mask_filter: Callable[[Sequence[int]], bool] | None,
+    ) -> None:
         self._dataset = dataset
         self._max_length = max_length
         self._min_loss_tokens = min_loss_tokens
+        self._loss_mask_filter = loss_mask_filter
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -199,7 +207,9 @@ def _materialize_prompt_tasks(
         )
         if prompt is None:
             continue
-        if loss_mask_filter is not None and not loss_mask_filter(loss_mask):
+        if loss_mask_filter is not None and not loss_mask_filter(
+            prompt["payload"]["loss_mask"]
+        ):
             continue
         prompts.append(prompt)
         if limit is not None and len(prompts) >= limit:
