@@ -49,6 +49,7 @@ class TestRoPEConfigCompatibility(unittest.TestCase):
             config["rope_scaling"],
             {"rope_type": "yarn", "factor": 128.0},
         )
+        self.assertEqual(config["rope_theta"], 8_000_000)
 
     def test_legacy_rope_scaling_is_mirrored_for_modern_readers(self):
         from specforge.export.checkpoint_io import apply_legacy_rope_scaling

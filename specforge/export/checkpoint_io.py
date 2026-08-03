@@ -59,6 +59,8 @@ def apply_legacy_rope_scaling(output_dir: str) -> bool:
         config["rope_scaling"] = {
             key: value for key, value in rope_parameters.items() if key != "rope_theta"
         }
+        if "rope_theta" in rope_parameters:
+            config["rope_theta"] = rope_parameters["rope_theta"]
     elif (
         rope_scaling
         and not rope_parameters
