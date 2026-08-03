@@ -256,7 +256,9 @@ The full per-workload numbers, including the other block sizes and the MTP and D
 
 #### DSpark
 
-*Results to be added.*
+![Kimi-K3 DSpark output throughput vs. baseline](./dspark-speedup.svg)
+
+*Figure 6. Kimi-K3 on 8 × B300: output throughput of DSpark against the autoregressive baseline across five workloads, with the speedup labelled above each bar. The gain is largest at concurrency 1 — up to 3.14× on GSM8K — and narrows to 1.37–2.36× at concurrency 16, where the target model is already better utilized. MT-Bench, the most open-ended of the five, benefits least at every concurrency level. Full numbers are on the [model card](https://huggingface.co/RadixArk/Kimi-K3-DSpark).*
 
 ## Verifying Training-Serving Consistency
 
