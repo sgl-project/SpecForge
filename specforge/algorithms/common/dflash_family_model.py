@@ -474,31 +474,34 @@ class OnlineDominoModel(OnlineDFlashModel):
         bs = self.block_size
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - bs, 0)
+        max_n = max(1, self.num_anchors)
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
         valid_counts = valid.sum(dim=1)
-        max_n = max(1, min(self.num_anchors, int(valid_counts.max().item()) - 1))
 
         indices = (
             torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
         )
-        masked_indices = torch.where(
-            valid, indices, torch.tensor(seq_len + 1, device=device)
-        )
+        masked_indices = torch.where(valid, indices, seq_len + 1)
 
         random_vals = torch.rand(bsz, max_anchor + 1, device=device)
-        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
+        random_vals = torch.where(valid, random_vals, 2.0)
 
         _, sorted_idx = random_vals.sort(dim=1)
         gathered = torch.gather(masked_indices, 1, sorted_idx)
-        anchors = gathered[:, :max_n].sort(dim=1).values
+        take_n = min(max_n, max_anchor + 1)
+        anchors = gathered[:, :take_n]
+        if take_n < max_n:
+            anchors = F.pad(anchors, (0, max_n - take_n), value=seq_len + 1)
 
+        batch_anchor_limit = (valid_counts.max() - 1).clamp(min=1, max=max_n)
+        anchor_limits = torch.minimum(valid_counts, batch_anchor_limit)
         keep_mask = torch.arange(max_n, device=device).unsqueeze(
             0
-        ) < valid_counts.unsqueeze(1).clamp(max=max_n)
-        anchors = torch.where(
-            keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device)
-        )
+        ) < anchor_limits.unsqueeze(1)
+        anchors = torch.where(keep_mask, anchors, seq_len + 1)
+        anchors = anchors.sort(dim=1).values
+        anchors = torch.where(keep_mask, anchors, 0)
 
         return anchors, keep_mask
 
@@ -715,7 +718,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             "base_accuracy": (base_correct_num / (accuracy_denom + 1e-6)).detach(),
             "accept_len": (accept_num / (accept_den + 1e-6)).detach(),
             "base_accept_len": (base_accept_num / (accept_den + 1e-6)).detach(),
-            "lambda_base": torch.tensor(lambda_base, device=loss.device),
+            "lambda_base": loss.new_full((), lambda_base),
             "accuracy_denom": accuracy_denom.detach(),
         }
 

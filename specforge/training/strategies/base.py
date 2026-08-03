@@ -563,10 +563,8 @@ class DominoTrainStrategy(DraftTrainStrategy):
         )
         metrics = dict(model_metrics)
         metrics["accuracy"] = accuracy.detach()
-        metrics.setdefault(
-            "lambda_base",
-            torch.tensor(float(lambda_base), device=loss.device),
-        )
+        if "lambda_base" not in metrics:
+            metrics["lambda_base"] = loss.new_full((), lambda_base)
         return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

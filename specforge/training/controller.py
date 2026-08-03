@@ -51,11 +51,15 @@ class Checkpoint:
 @dataclass(frozen=True)
 class StepResult:
     """Result of one TrainerCore step; ``optimizer_stepped`` is the authoritative
-    grad-accumulation boundary signal."""
+    grad-accumulation boundary signal.
+
+    Tensor-valued metrics remain detached until a logging boundary so ordinary
+    training steps do not force device-to-host synchronization.
+    """
 
     optimizer_stepped: bool
-    loss: float
-    grad_norm: Optional[float]
+    loss: Any
+    grad_norm: Optional[Any]
     metrics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -65,6 +69,10 @@ def _scalar(x: Any) -> float:
     if isinstance(x, (list, tuple)) and x:
         return float(torch.stack([t.detach().float() for t in x]).mean().item())
     return float(x)
+
+
+def _scalar_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
+    return {key: _scalar(value) for key, value in metrics.items()}
 
 
 def _dp_mean_scalars(
@@ -392,8 +400,8 @@ class TrainerCore:
                 scalar_metrics,
                 process_group=process_group,
             )
-        metrics.update({key: _scalar(value) for key, value in scalar_metrics.items()})
-        gn = _scalar(grad_norm) if grad_norm is not None else None
+        metrics.update({key: value.detach() for key, value in scalar_metrics.items()})
+        gn = grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else grad_norm
         if gn is not None:
             metrics["grad_norm"] = gn
         return StepResult(
@@ -580,6 +588,7 @@ class TrainerController:
                     ),
                 )
                 self.last_metrics = result.metrics
+                scalar_train_metrics: Optional[Dict[str, float]] = None
                 # grad accumulated but optimizer has not stepped yet; everything
                 # keyed on optimizer steps fires only at the boundary.
                 if not result.optimizer_stepped:
@@ -591,11 +600,13 @@ class TrainerController:
                     self.ack_fn(pending_ack, self.global_step)
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
-                    log_metrics = dict(result.metrics)
+                    log_metrics = _scalar_metrics(result.metrics)
                     optimizer = getattr(self.core.backend, "optimizer", None)
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
+                    scalar_train_metrics = log_metrics
+                    self.last_metrics = log_metrics
                     self.logger(log_metrics, self.global_step)
                 eval_metrics: Optional[Dict[str, Any]] = None
                 if eval_enabled and self.global_step % self.eval_interval == 0:
@@ -604,7 +615,9 @@ class TrainerController:
                     if eval_metrics:
                         if self.logger:
                             self.logger(eval_metrics, self.global_step)
-                        self.last_metrics = {**self.last_metrics, **eval_metrics}
+                        if scalar_train_metrics is None:
+                            scalar_train_metrics = _scalar_metrics(result.metrics)
+                        self.last_metrics = {**scalar_train_metrics, **eval_metrics}
                 # ``is_better`` is collective (rank0 verdict broadcast inside
                 # the manager); its guard is rank-identical because eval metrics
                 # are DP-reduced. Empty eval metrics skip best tracking.

@@ -54,6 +54,56 @@ class _TinyTarget(nn.Module):
 
 
 class TestDominoDraftModel(unittest.TestCase):
+    def test_anchor_sampling_uses_fixed_width_without_scalar_sync(self):
+        from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
+
+        draft = _bare_domino(block_size=2)
+        model = OnlineDominoModel(
+            draft_model=draft,
+            target_lm_head=nn.Linear(4, 7, bias=False),
+            target_embed_tokens=nn.Embedding(7, 4),
+            mask_token_id=0,
+            block_size=2,
+            attention_backend="sdpa",
+            num_anchors=4,
+        )
+        loss_mask = torch.tensor(
+            [
+                [1, 1, 1, 1, 1, 0],
+                [1, 1, 0, 0, 0, 0],
+            ],
+            dtype=torch.float32,
+        )
+
+        with patch.object(
+            torch.Tensor,
+            "item",
+            side_effect=AssertionError("anchor sampling forced a scalar sync"),
+        ):
+            anchors, keep_mask = model._sample_anchor_positions(
+                seq_len=6,
+                loss_mask=loss_mask,
+                device=torch.device("cpu"),
+            )
+
+        self.assertEqual(anchors.shape, (2, 4))
+        self.assertEqual(keep_mask.sum(dim=1).tolist(), [4, 2])
+        self.assertTrue(
+            torch.equal(
+                anchors.masked_select(~keep_mask),
+                torch.zeros(2, dtype=anchors.dtype),
+            )
+        )
+
+        short_mask = torch.tensor([[1, 1, 0]], dtype=torch.float32)
+        short_anchors, short_keep_mask = model._sample_anchor_positions(
+            seq_len=3,
+            loss_mask=short_mask,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(short_anchors.shape, (1, 4))
+        self.assertEqual(short_keep_mask.sum().item(), 1)
+
     def test_training_loss_updates_gru_and_projection(self):
         from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
 
