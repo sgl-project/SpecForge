@@ -596,6 +596,10 @@ class TrainerController:
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
+                    get_learning_rates = getattr(optimizer, "get_learning_rates", None)
+                    if callable(get_learning_rates):
+                        for name, learning_rate in get_learning_rates().items():
+                            log_metrics[f"lr_{name}"] = float(learning_rate)
                     self.logger(log_metrics, self.global_step)
                 eval_metrics: Optional[Dict[str, Any]] = None
                 if eval_enabled and self.global_step % self.eval_interval == 0:

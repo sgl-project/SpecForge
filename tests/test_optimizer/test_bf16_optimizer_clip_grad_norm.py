@@ -71,6 +71,34 @@ class TestClipGradNormSingleProcess(unittest.TestCase):
         backend.set_optimizer(replicated)
         self.assertFalse(replicated.config["enabled"])
 
+    def test_backend_captures_optimizer_metadata_before_factory_call(self):
+        events = []
+
+        class RecordingOptimizer:
+            def configure_grad_norm_reduction(self, **_kwargs):
+                pass
+
+        class RecordingFactory:
+            def capture_parameter_metadata(self, target):
+                events.append(("capture", target.weight.shape))
+
+            def __call__(self, target):
+                events.append(("create", target.weight.shape))
+                return RecordingOptimizer()
+
+        model = torch.nn.Linear(8, 8, bias=False)
+        backend = FSDPTrainingBackend(
+            ParallelConfig(sharding_strategy="NO_SHARD"),
+            optimizer_factory=RecordingFactory(),
+        )
+
+        backend.prepare_model(model, wrap=False, optimizer_target=model)
+
+        self.assertEqual(
+            events,
+            [("capture", torch.Size([8, 8])), ("create", torch.Size([8, 8]))],
+        )
+
     def test_cpu_offload_matches_resident_optimizer_update(self):
         resident_model, resident = _make_optimizer(seed=7, offload_master=False)
         offload_model, offload = _make_optimizer(seed=7, offload_master=True)

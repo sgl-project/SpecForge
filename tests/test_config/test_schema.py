@@ -105,6 +105,20 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Config.model_validate(payload)
 
+    def test_muon_optimizer_is_typed_and_rejects_cpu_offload(self):
+        payload = copy.deepcopy(MINIMAL)
+        payload["training"] = {
+            "optimizer": "muon",
+            "muon_learning_rate": 0.02,
+        }
+        training = Config.model_validate(payload).training
+        self.assertEqual(training.optimizer, "muon")
+        self.assertEqual(training.muon_learning_rate, 0.02)
+
+        payload["training"]["optimizer_cpu_offload"] = True
+        with self.assertRaisesRegex(ValidationError, "not supported with Muon"):
+            Config.model_validate(payload)
+
     def test_removed_vlm_pixel_knobs_are_rejected(self):
         for field in ("min_pixels", "max_pixels"):
             payload = copy.deepcopy(MINIMAL)

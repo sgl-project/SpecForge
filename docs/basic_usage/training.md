@@ -88,6 +88,33 @@ specforge train \
 Unknown config fields and unknown override paths are errors. This keeps a
 misspelled or retired option from being silently ignored.
 
+## Hybrid Muon optimizer
+
+Set `training.optimizer: muon` to apply PyTorch Muon to hidden
+`nn.Linear.weight` matrices. Embeddings, embedding projections, output and
+confidence heads, normalization parameters, and biases remain on an auxiliary
+AdamW optimizer. AdamW remains the default, so existing recipes are unchanged.
+
+```yaml
+training:
+  strategy: dspark
+  optimizer: muon
+  learning_rate: 1.0e-4       # auxiliary AdamW
+  muon_learning_rate: 2.0e-2  # null reuses learning_rate
+  weight_decay: 0.0
+  muon_weight_decay: 0.1
+```
+
+Both groups use the configured cosine-warmup schedule and global gradient
+clipping. Tracking reports `lr_muon` and `lr_adamw` in addition to the existing
+primary `lr` metric. Under FSDP, FP32 master weights and momentum stay sharded;
+only one BF16 matrix update is temporarily gathered for each Newton--Schulz
+transform. Optimizer CPU offload is therefore unavailable in Muon mode.
+
+Muon and AdamW checkpoints are deliberately type-checked and are not
+interchangeable. The hybrid checkpoint also records the parameter partition so
+a changed model cannot silently load order-dependent optimizer state.
+
 ## Run config
 
 A run config has seven typed sections (`model`, `data`, `training`, `tracking`,
