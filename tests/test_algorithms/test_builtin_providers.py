@@ -22,7 +22,7 @@ from specforge.algorithms.common.providers import (
 from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
@@ -135,7 +135,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertEqual(vocab_size, defaults.draft_vocab_size)
                 self.assertEqual(has_override, policy.apply_overrides is not None)
 
-        for name in ("domino", "dspark"):
+        for name in ("domino", "dspark", "mtp"):
             with self.subTest(algorithm=name):
                 policy = self.registry.resolve(name).providers.model.draft_config
                 self.assertIsNone(policy.target_defaults)
@@ -194,6 +194,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "dflash": dflash_family,
             "domino": dflash_family,
             "dspark": dflash_family,
+            "mtp": SimpleNamespace(),
         }
         expected_keys = {
             "eagle3": {
@@ -227,6 +228,12 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
+            },
+            "mtp": {
+                "mtp_draft_num_hidden_layers",
+                "mtp_draft_vocab_size",
+                "mtp_share_lm_head",
+                "mtp_attention_backend",
             },
         }
 
@@ -412,7 +419,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==5; "
+            "r=builtin_algorithm_registry(); assert len(r)==6; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

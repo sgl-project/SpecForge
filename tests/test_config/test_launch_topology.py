@@ -67,6 +67,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.5-35b-a3b-eagle3-online.yaml": 2,
     "qwen3.5-4b-dflash-online-npu.yaml": 8,
     "qwen3.5-4b-domino-online-npu.yaml": 8,
+    "qwen3.5-4b-mtp-online-npu.yaml": 8,
     "qwen3.6-27b-dflash-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-multiserver-disaggregated.yaml": 2,
