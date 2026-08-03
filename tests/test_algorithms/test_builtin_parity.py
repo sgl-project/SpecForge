@@ -144,6 +144,11 @@ class BuiltinProviderParityTest(unittest.TestCase):
         self.assertEqual("hidden_state", peagle_stream.target_representation)
         self.assertTrue(peagle.step.uses_external_target_head)
 
+    def test_dspark_uses_the_dedicated_server_capture_method(self):
+        stream = self.registry.resolve("dspark").providers.server_streaming_for("text")
+
+        self.assertEqual("dspark", stream.capture_method)
+
     def test_step_factories_preserve_concrete_strategy_types(self):
         expected = {
             "eagle3": "Eagle3TrainStrategy",

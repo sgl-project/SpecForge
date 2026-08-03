@@ -166,9 +166,24 @@ class DraftConfigProvider:
     target_defaults: TargetDerivedDraftDefaults | None = None
     expected_auto_map_model: str | None = None
     apply_overrides: Factory | None = None
+    compatible_architectures: FrozenSet[str] | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.architecture, field_name="architecture")
+        compatible = self.compatible_architectures
+        if compatible is None:
+            compatible = frozenset({self.architecture})
+        else:
+            compatible = frozenset(compatible)
+            if not compatible:
+                raise ValueError("compatible_architectures must not be empty")
+            for item in compatible:
+                _non_empty(item, field_name="compatible_architectures item")
+            if self.architecture not in compatible:
+                raise ValueError(
+                    "architecture must be included in compatible_architectures"
+                )
+        object.__setattr__(self, "compatible_architectures", compatible)
         if self.expected_auto_map_model is not None:
             _non_empty(
                 self.expected_auto_map_model,
@@ -361,6 +376,7 @@ class ModelProvider:
     needs_input_tools: Factory
     default_dataloader_num_workers: int
     allow_missing_warm_start_embedding: bool = False
+    loss_mask_filter: Factory | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.draft_config, DraftConfigProvider):
@@ -384,6 +400,8 @@ class ModelProvider:
             )
         if not isinstance(self.allow_missing_warm_start_embedding, bool):
             raise TypeError("allow_missing_warm_start_embedding must be a bool")
+        if self.loss_mask_filter is not None and not callable(self.loss_mask_filter):
+            raise TypeError("loss_mask_filter must be callable or None")
 
 
 @dataclass(frozen=True)

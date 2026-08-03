@@ -29,11 +29,17 @@ from specforge.runtime.contracts import TrainBatch
 @dataclass(frozen=True)
 class StepOutput:
     """Per-step result: loss + strategy-specific metrics, kept generic so
-    per-position (TTT) and single-scalar strategies share one trainer loop."""
+    per-position (TTT) and single-scalar strategies share one trainer loop.
+
+    ``loss_terms`` carries an additive objective numerator and denominator when
+    gradients and reported loss must be normalized across the full optimizer
+    window.
+    """
 
     loss: torch.Tensor
     metrics: Dict[str, Any]
     ratio_metrics: Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
+    loss_terms: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
 
 @dataclass(frozen=True)
@@ -441,7 +447,12 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:
             metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
-        return StepOutput(loss=loss, metrics=metrics)
+        return StepOutput(
+            loss=loss,
+            metrics=metrics,
+            ratio_metrics=model_metrics.get("ratio_metrics", {}),
+            loss_terms=model_metrics.get("loss_terms"),
+        )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Everything trainable lives under draft_model.; the target

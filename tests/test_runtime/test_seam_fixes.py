@@ -106,6 +106,16 @@ class TestParallelConfigHandles(unittest.TestCase):
 
         self.assertEqual(ignored, (model.lm_head, model.embed_tokens))
 
+    def test_backend_scales_gradients_before_optimizer_step(self):
+        model = nn.Linear(2, 1, bias=False)
+        backend = FSDPTrainingBackend(ParallelConfig())
+        backend.prepare_model(model, wrap=False)
+        model.weight.grad = torch.tensor([[4.0, 8.0]])
+
+        backend.scale_gradients(torch.tensor(0.25))
+
+        torch.testing.assert_close(model.weight.grad, torch.tensor([[1.0, 2.0]]))
+
 
 class _FakeBackend(TrainingBackend):
     name = "fake"

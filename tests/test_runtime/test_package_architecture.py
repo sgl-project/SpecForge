@@ -713,6 +713,8 @@ class TestPackageArchitecture(unittest.TestCase):
             {
                 "glm-5.2-dspark.json",
                 "inkling-dspark.json",
+                "kimi-k3-dspark-fullattn-gqa16.json",
+                "kimi-k3-dspark-v1c.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
                 "qwen3.6-27b-dspark.json",
@@ -751,6 +753,7 @@ class TestPackageArchitecture(unittest.TestCase):
             Path("examples/disagg/run_offline.sh"),
             Path("examples/disagg/run_offline_2node.sh"),
             Path("examples/disagg/run_qwen3_8b_dflash_disagg_2node.sh"),
+            Path("examples/disagg/run_inkling_dspark_disagg_2node.sh"),
         }
         bypasses = []
         train_command = re.compile(r"\btrain\s+(?:--config|-c)\b")

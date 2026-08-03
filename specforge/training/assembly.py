@@ -30,7 +30,7 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
@@ -268,6 +268,7 @@ class _ConfiguredOptimizerFactory:
             lr=t.learning_rate,
             max_grad_norm=t.max_grad_norm,
             warmup_ratio=t.warmup_ratio,
+            lr_scheduler=t.lr_scheduler,
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
         )
@@ -306,6 +307,11 @@ def _configured_logger(cfg: Config):
     options["swanlab_name"] = options["swanlab_name"] or cfg.run_id
     options["mlflow_experiment_name"] = options["mlflow_experiment_name"] or "specforge"
     options["mlflow_run_name"] = options["mlflow_run_name"] or cfg.run_id
+    if cfg.tracking.report_to == "wandb":
+        # W&B is the canonical reproduction record for the disaggregated K3
+        # runs. Keep the complete resolved config next to the metric stream;
+        # tracker._public_config recursively redacts credentials before init.
+        options["specforge_config"] = cfg.model_dump(mode="json")
     return create_tracker_logger(
         SimpleNamespace(**options), cfg.output_dir, console_logger=_logger
     )
@@ -317,7 +323,18 @@ def _close_configured_logger(logger) -> None:
         close()
 
 
-def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
+def _tokenizer_chat_template_hash(tokenizer) -> Optional[str]:
+    """Hash the tokenizer's effective chat template so cached tokenizations
+    are invalidated when the model repository updates its template."""
+    template = getattr(tokenizer, "chat_template", None)
+    if not template:
+        return None
+    return hashlib.sha256(str(template).encode("utf-8")).hexdigest()[:12]
+
+
+def _prompt_cache_key(
+    cfg: Config, *, tokenizer=None, path: Optional[str] = None
+) -> str:
     source_path = path or cfg.data.prompts_path or cfg.data.train_data_path
     content_hash = None
     if source_path and os.path.isfile(source_path):
@@ -332,6 +349,7 @@ def _prompt_cache_key(cfg: Config, *, path: Optional[str] = None) -> str:
         "content_hash": content_hash,
         "max_length": cfg.data.max_length,
         "chat_template": cfg.data.chat_template,
+        "tokenizer_chat_template_hash": _tokenizer_chat_template_hash(tokenizer),
         "is_preformatted": cfg.data.is_preformatted,
         "train_only_last_turn": cfg.data.train_only_last_turn,
         "max_prompts": cfg.data.max_prompts,
@@ -354,7 +372,7 @@ def _prepare_prompts(
     draft_config,
     path: Optional[str] = None,
     cache_key: Optional[str] = None,
-) -> List[dict]:
+) -> Sequence[dict]:
     """Prepare one prompt source with an optional path/cache namespace override.
 
     Training keeps the configured cache key. Evaluation supplies its own path
@@ -376,7 +394,7 @@ def _prepare_prompts(
         cache_key = (
             cfg.data.cache_key
             if path is None and cfg.data.cache_key is not None
-            else _prompt_cache_key(cfg, path=source_path)
+            else _prompt_cache_key(cfg, tokenizer=tokenizer, path=source_path)
         )
     min_loss_tokens = algorithm.providers.model.minimum_loss_tokens(cfg, draft_config)
     return prepare_prompt_tasks(
@@ -391,6 +409,7 @@ def _prepare_prompts(
         num_proc=cfg.data.build_dataset_num_proc,
         min_loss_tokens=min_loss_tokens,
         max_prompts=cfg.data.max_prompts,
+        loss_mask_filter=algorithm.providers.model.loss_mask_filter,
     )
 
 

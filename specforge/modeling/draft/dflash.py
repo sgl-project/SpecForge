@@ -20,6 +20,10 @@ from typing_extensions import Tuple, Unpack
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .registry import register_draft
 
+FULL_ATTENTION = "full_attention"
+SLIDING_ATTENTION = "sliding_attention"
+_VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
+
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
@@ -31,6 +35,39 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
+def resolve_dflash_attention_layout(
+    config: Qwen3Config,
+) -> tuple[tuple[str, ...], Optional[int]]:
+    """Validate and return the configured per-layer DFlash attention layout."""
+
+    num_hidden_layers = config.num_hidden_layers
+    layer_types = tuple(config.layer_types)
+
+    if len(layer_types) != num_hidden_layers:
+        raise ValueError(
+            "DFlash config.layer_types must contain exactly "
+            f"num_hidden_layers={num_hidden_layers} entries, got "
+            f"{len(layer_types)}"
+        )
+    invalid = set(layer_types) - _VALID_DFLASH_LAYER_TYPES
+    if invalid:
+        raise ValueError(
+            "DFlash config.layer_types supports only full_attention and "
+            f"sliding_attention, got {sorted(invalid)}"
+        )
+
+    if SLIDING_ATTENTION not in layer_types:
+        return layer_types, None
+
+    sliding_window = config.sliding_window
+    if sliding_window is None or sliding_window <= 0:
+        raise ValueError(
+            "DFlash sliding_attention layers require use_sliding_window=true "
+            "and a positive config.sliding_window"
+        )
+    return layer_types, sliding_window
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -38,6 +75,23 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def _prepare_dflash_eager_mask(
+    attention_mask: Optional[torch.Tensor],
+    dtype: torch.dtype,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Convert a boolean allow-mask to eager's additive representation."""
+
+    if attention_mask is None or attention_mask.dtype != torch.bool:
+        return attention_mask, None
+
+    valid_queries = attention_mask.any(dim=-1, keepdim=True)
+    # A finite minimum keeps eager softmax stable. Fully masked query rows are
+    # explicitly zeroed after attention so they cannot average forbidden values.
+    additive_mask = torch.zeros_like(attention_mask, dtype=dtype)
+    additive_mask.masked_fill_(~attention_mask, torch.finfo(dtype).min)
+    return additive_mask, valid_queries
 
 
 class Qwen3DFlashAttention(nn.Module):
@@ -85,7 +139,7 @@ class Qwen3DFlashAttention(nn.Module):
         self.k_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
         self.sliding_window = (
             config.sliding_window
-            if config.layer_types[layer_idx] == "sliding_attention"
+            if config.layer_types[layer_idx] == SLIDING_ATTENTION
             else None
         )
 
@@ -121,8 +175,14 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        valid_queries = None
         attn_fn: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if self.config._attn_implementation == "eager":
+            attention_mask, valid_queries = _prepare_dflash_eager_mask(
+                attention_mask,
+                q.dtype,
+            )
+        else:
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         attn_output, attn_weights = attn_fn(
             self,
@@ -135,8 +195,15 @@ class Qwen3DFlashAttention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
+        if valid_queries is not None and attn_weights is not None:
+            attn_weights = attn_weights.masked_fill(~valid_queries, 0)
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
+        if valid_queries is not None:
+            attn_output = attn_output.masked_fill(
+                ~valid_queries.any(dim=1),
+                0,
+            )
         return attn_output, attn_weights
 
 
@@ -277,6 +344,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> None:
         super().__init__(config)
         self.config = config
+        self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         self.layers = nn.ModuleList(
             [
@@ -363,7 +431,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     def forward(
         self,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[object] = None,
         noise_embedding: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -373,11 +441,16 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
+        for layer_type, layer in zip(self.layer_types, self.layers):
+            layer_attention_mask = (
+                attention_mask[layer_type]
+                if isinstance(attention_mask, dict)
+                else attention_mask
+            )
             hidden_states = layer(
                 hidden_states=hidden_states,
                 target_hidden=target_hidden,
-                attention_mask=attention_mask,
+                attention_mask=layer_attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
                 use_cache=use_cache,

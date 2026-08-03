@@ -201,6 +201,62 @@ def _consumer_database_path(cfg: Config) -> Optional[str]:
     return os.path.join(state_dir, "consumer.sqlite")
 
 
+def _online_prompt_seed(cfg: Config) -> int:
+    """Resolve prompt ordering independently while preserving old configs."""
+    configured = getattr(cfg.training, "prompt_seed", None)
+    return cfg.training.seed if configured is None else configured
+
+
+def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
+    """Resolve and validate producer ref watermarks before prompt preparation.
+
+    The consumer dispatches one complete global optimizer window at a time.
+    Validating this contract only after tokenizing/materializing prompts can
+    waste tens of minutes and many GiB for a large online dataset.
+    """
+    from specforge.runtime.control_plane.flow_control import FlowControlLimits
+
+    high_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
+    high = int(high_override or cfg.runtime.in_flight_high_watermark)
+    low_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
+    # Preserve the legacy one-watermark environment override: when only the
+    # old high value is supplied, resume at that same threshold.
+    low = (
+        int(low_override)
+        if low_override is not None
+        else (
+            None if high_override is not None else cfg.runtime.in_flight_low_watermark
+        )
+    )
+    limits = FlowControlLimits(
+        high_watermark_refs=high,
+        low_watermark_refs=low,
+        max_prompt_lease_per_worker=cfg.runtime.producer_lease,
+    )
+    trainer = cfg.deployment.trainer
+    consumer_quantum = (
+        trainer.nnodes
+        * trainer.nproc_per_node
+        * cfg.training.batch_size
+        * cfg.training.accumulation_steps
+    )
+    if high < consumer_quantum:
+        raise ValueError(
+            "producer in-flight high watermark "
+            f"{high} is smaller than the consumer's global optimizer-step "
+            f"quantum {consumer_quantum}; set "
+            "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
+        )
+    if limits.resolved_low_watermark_refs < consumer_quantum:
+        raise ValueError(
+            "producer in-flight low watermark "
+            f"{limits.resolved_low_watermark_refs} is smaller than the "
+            f"consumer's global optimizer-step quantum {consumer_quantum}; "
+            "set DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
+        )
+    return high, low
+
+
 def _online_schedule_payload(cfg: Config, *, num_prompts: int) -> dict:
     """Describe the exact finite online schedule prepared by the producer."""
     from specforge.training.schedule import resolve_online_total_steps
@@ -219,7 +275,7 @@ def _online_schedule_payload(cfg: Config, *, num_prompts: int) -> dict:
         "total_steps": total_steps,
         "num_prompts": num_prompts,
         "prompt_epochs": cfg.training.num_epochs,
-        "prompt_seed": cfg.training.seed,
+        "prompt_seed": _online_prompt_seed(cfg),
         "dp_size": dp_size,
         "batch_size": cfg.training.batch_size,
         "accumulation_steps": cfg.training.accumulation_steps,
@@ -246,7 +302,7 @@ def _read_online_total_steps(cfg: Config, channel_path: str) -> int:
     expected = {
         "version": 1,
         "prompt_epochs": cfg.training.num_epochs,
-        "prompt_seed": cfg.training.seed,
+        "prompt_seed": _online_prompt_seed(cfg),
         "dp_size": trainer.nnodes * trainer.nproc_per_node,
         "batch_size": cfg.training.batch_size,
         "accumulation_steps": cfg.training.accumulation_steps,
@@ -539,6 +595,9 @@ def _build_online(
         from specforge.launch import build_disagg_online_producer
         from specforge.training.model_loading import resolve_draft_config
 
+        # This check is independent of dataset size. Keep it before tokenizer
+        # loading and prompt preparation so an invalid window fails cheaply.
+        in_flight_high_watermark, in_flight_low_watermark = _online_flow_window(cfg)
         input_adapter = streaming.create_input_adapter(cfg)
         input_tools = _load_input_tools(
             cfg,
@@ -560,6 +619,10 @@ def _build_online(
                 cfg,
                 input_tools,
                 draft_config=draft_config,
+            )
+        if not prompts:
+            raise ValueError(
+                f"no prompts satisfy {algorithm.name} training eligibility"
             )
         if cfg.training.total_steps is None and cfg.training.max_steps is None:
             schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
@@ -591,22 +654,6 @@ def _build_online(
         ]
         target_repr = streaming.target_representation
         peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
-        high_watermark_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
-        in_flight_high_watermark = int(
-            high_watermark_override or cfg.runtime.in_flight_high_watermark
-        )
-        low_watermark_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
-        # Preserve the legacy one-watermark environment override: when only the
-        # old high value is supplied, resume at that same threshold.
-        in_flight_low_watermark = (
-            int(low_watermark_override)
-            if low_watermark_override is not None
-            else (
-                None
-                if high_watermark_override is not None
-                else cfg.runtime.in_flight_low_watermark
-            )
-        )
         _workers, drive = build_disagg_online_producer(
             algorithm=algorithm,
             modality=modality,
@@ -623,7 +670,7 @@ def _build_online(
             target_repr=target_repr,
             aux_hidden_state_layer_ids=layers,
             prompt_epochs=cfg.training.num_epochs,
-            prompt_seed=cfg.training.seed,
+            prompt_seed=_online_prompt_seed(cfg),
             lease=cfg.runtime.producer_lease,
             in_flight_high_watermark=in_flight_high_watermark,
             in_flight_low_watermark=in_flight_low_watermark,

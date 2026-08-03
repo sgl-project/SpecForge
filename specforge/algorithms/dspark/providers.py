@@ -33,9 +33,17 @@ from specforge.algorithms.contracts import (
     FeatureMode,
     OfflineStorageContract,
 )
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
+COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
+    {
+        DRAFT_ARCHITECTURE,
+        "KimiK3DSpark5MLADraftModel",
+        "KimiK3DSpark4KDA1MLADraftModel",
+    }
+)
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
@@ -112,7 +120,7 @@ def algorithm_spec() -> AlgorithmSpec:
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
-            compatible_architectures={DRAFT_ARCHITECTURE},
+            compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
             default_architecture=DRAFT_ARCHITECTURE,
         ),
         feature_contracts=(
@@ -155,6 +163,7 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
+                compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
                 expected_auto_map_model="dspark.DSparkDraftModel",
             ),
             build_draft=build_draft,
@@ -163,13 +172,14 @@ def algorithm_providers() -> AlgorithmProviders:
             minimum_loss_tokens=minimum_loss_tokens,
             needs_input_tools=needs_input_tools,
             default_dataloader_num_workers=8,
+            loss_mask_filter=has_consecutive_supervised_tokens,
         ),
         offline=(
             OfflineDataProvider(
                 modality="text",
                 normalizer_id=DSPARK_NORMALIZER_ID,
                 capture_layout=OfflineCaptureLayout(
-                    capture_method="dflash",
+                    capture_method="dspark",
                     aux_feature="hidden_states",
                     last_hidden_feature="target_last_hidden_states",
                     passthrough=(
@@ -185,7 +195,7 @@ def algorithm_providers() -> AlgorithmProviders:
         server_streaming=(
             ServerStreamingProvider(
                 modality="text",
-                capture_method="dflash",
+                capture_method="dspark",
                 target_representation="hidden_state",
                 layout=ServerCaptureLayout(
                     aux_feature="hidden_states",
