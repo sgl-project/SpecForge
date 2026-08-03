@@ -286,33 +286,57 @@ class TestTrainerCore(unittest.TestCase):
         self.assertEqual(result.metrics["ce_position_0"], 0.5)
         self.assertEqual(result.metrics["ce_position_1"], 0.5)
 
+    _RATIO_INPUTS = {
+        "acc": (torch.tensor(2.0), torch.tensor(4.0)),
+        "ce_position": (
+            torch.tensor([1.0, 3.0]),
+            torch.tensor([2.0, 6.0]),
+        ),
+    }
+
     def test_ratio_metrics_sum_numerators_and_denominators_before_dividing(self):
         remote = torch.tensor([8.0, 6.0, 3.0, 1.0, 2.0, 2.0])
+        reduced_groups = []
 
         def all_reduce(packed, *, group):
-            self.assertEqual(group, "dp")
+            reduced_groups.append(group)
             packed.add_(remote)
 
         with (
             mock.patch("torch.distributed.is_available", return_value=True),
             mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
             mock.patch("torch.distributed.all_reduce", side_effect=all_reduce),
         ):
             metrics = _reduce_ratio_metrics(
-                {
-                    "acc": (torch.tensor(2.0), torch.tensor(4.0)),
-                    "ce_position": (
-                        torch.tensor([1.0, 3.0]),
-                        torch.tensor([2.0, 6.0]),
-                    ),
-                },
+                self._RATIO_INPUTS,
                 device=torch.device("cpu"),
                 process_group="dp",
                 reduce=True,
             )
 
+        self.assertEqual(reduced_groups, ["dp"])
         self.assertEqual(metrics["acc"], 1.0)
         self.assertEqual(metrics["ce_position_0"], 1.0)
+        self.assertEqual(metrics["ce_position_1"], 0.5)
+
+    def test_ratio_metrics_skip_all_reduce_when_world_size_is_one(self):
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=1),
+            mock.patch("torch.distributed.all_reduce") as all_reduce_mock,
+        ):
+            metrics = _reduce_ratio_metrics(
+                self._RATIO_INPUTS,
+                device=torch.device("cpu"),
+                process_group="dp",
+                reduce=True,
+            )
+
+        all_reduce_mock.assert_not_called()
+        self.assertEqual(metrics["acc"], 0.5)
+        self.assertEqual(metrics["ce_position_0"], 0.5)
         self.assertEqual(metrics["ce_position_1"], 0.5)
 
     @staticmethod

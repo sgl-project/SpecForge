@@ -139,10 +139,16 @@ def _reduce_ratio_metrics(
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
-            if process_group is None:
-                dist.all_reduce(packed)
-            else:
-                dist.all_reduce(packed, group=process_group)
+            world = (
+                dist.get_world_size()
+                if process_group is None
+                else dist.get_world_size(group=process_group)
+            )
+            if world > 1:
+                if process_group is None:
+                    dist.all_reduce(packed)
+                else:
+                    dist.all_reduce(packed, group=process_group)
 
     output: Dict[str, float] = {}
     cursor = 0
