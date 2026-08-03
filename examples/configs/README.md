@@ -159,6 +159,7 @@ should make their training strategy and topology explicit.
 | `model.tokenizer_pad_token_id` | `null` | Explicit non-negative tokenizer pad ID. Use it for released tokenizers that omit padding metadata. |
 | `model.sglang_attention_backend` | `flashinfer` | SGLang attention implementation for an in-process or managed capture server. |
 | `model.sglang_mem_fraction_static` | `0.4` | SGLang static-memory fraction in `(0, 1]`; inherited by managed capture servers unless they override it. |
+| `model.sglang_disable_radix_cache` | `true` | Preserve the historical managed-capture behavior. Set `false` for hybrid targets such as Inkling that require the radix tree. Unique per-attempt cache namespaces still force complete capture prefills. |
 | `model.sglang_context_length` | `null` | Positive explicit context limit. Managed capture requires at least `data.max_length + 7`; omitting it derives that value. |
 | `model.sglang_enable_nccl_nvls` | `false` | Pass the matching SGLang NCCL NVLS optimization flag. |
 | `model.sglang_enable_symm_mem` | `false` | Pass the matching SGLang symmetric-memory flag. |
