@@ -140,10 +140,16 @@ def _reduce_ratio_metrics(
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
-            if process_group is None:
-                dist.all_reduce(packed)
-            else:
-                dist.all_reduce(packed, group=process_group)
+            world = (
+                dist.get_world_size()
+                if process_group is None
+                else dist.get_world_size(group=process_group)
+            )
+            if world > 1:
+                if process_group is None:
+                    dist.all_reduce(packed)
+                else:
+                    dist.all_reduce(packed, group=process_group)
 
     output: Dict[str, float] = {}
     cursor = 0
@@ -312,6 +318,7 @@ class TrainerCore:
         self.backend = backend
         self.accumulation_steps = max(1, accumulation_steps)
         self._micro = 0
+        self._ratio_totals: Dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @property
     def accumulation_remainder(self) -> int:
@@ -322,16 +329,79 @@ class TrainerCore:
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
         out: StepOutput = self.strategy.forward_loss(batch, ctx)
-        loss = out.loss / self.accumulation_steps
+        loss = out.loss
+        ratio_metrics = dict(out.ratio_metrics)
+        if out.loss_terms is not None:
+            numerator, denominator = out.loss_terms
+            if numerator.numel() != 1 or denominator.numel() != 1:
+                raise ValueError("loss_terms must contain scalar tensors")
+            loss = numerator.reshape(())
+            denominator = denominator.detach().reshape(())
+            ratio_metrics["loss"] = (
+                numerator.detach().reshape(()),
+                denominator,
+            )
+        self._accumulate_ratio_metrics(ratio_metrics)
+        loss = loss / self.accumulation_steps
         self._micro += 1
         # The boundary is known before backward so the backend can defer the FSDP
         # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
+        if stepped and out.loss_terms is not None:
+            self._normalize_gradients(self._ratio_totals["loss"][1])
         grad_norm = self.backend.step() if stepped else None
-        return self._result(out, grad_norm, stepped)
+        result_ratio_metrics = self._ratio_totals if stepped else ratio_metrics
+        result = self._result(
+            out,
+            grad_norm,
+            stepped,
+            ratio_metrics=result_ratio_metrics,
+        )
+        if stepped:
+            self._ratio_totals = {}
+        return result
 
-    def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
+    def _accumulate_ratio_metrics(self, values: Dict[str, Any]) -> None:
+        for name, (raw_numerator, raw_denominator) in values.items():
+            numerator = torch.as_tensor(raw_numerator).detach()
+            denominator = torch.as_tensor(raw_denominator).detach()
+            previous = self._ratio_totals.get(name)
+            if previous is not None:
+                numerator = previous[0] + numerator
+                denominator = previous[1] + denominator
+            self._ratio_totals[name] = (numerator, denominator)
+
+    def _normalize_gradients(self, local_denominator: torch.Tensor) -> None:
+        import torch.distributed as dist
+
+        denominator = local_denominator.clone()
+        parallel_config = getattr(self.backend, "parallel_config", None)
+        process_group = getattr(parallel_config, "fsdp_process_group", None)
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size(group=process_group)
+            if world_size > 1:
+                dist.all_reduce(
+                    denominator,
+                    op=dist.ReduceOp.SUM,
+                    group=process_group,
+                )
+        if denominator.item() <= 0:
+            raise ValueError("global loss denominator must be positive")
+        scale = (
+            denominator.new_tensor(world_size * self.accumulation_steps) / denominator
+        )
+        self.backend.scale_gradients(scale)
+
+    def _result(
+        self,
+        out: StepOutput,
+        grad_norm,
+        stepped: bool,
+        *,
+        ratio_metrics: Optional[Dict[str, Any]] = None,
+    ) -> StepResult:
         # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
         # positions and reduce counts before ratios; scalarizing its lists here
         # would both collapse the TTT structure and log one rank's local data.
@@ -354,7 +424,7 @@ class TrainerCore:
         metrics: Dict[str, Any] = dict(structured or {})
         metrics.update(
             _reduce_ratio_metrics(
-                out.ratio_metrics,
+                out.ratio_metrics if ratio_metrics is None else ratio_metrics,
                 device=metric_device,
                 process_group=process_group,
                 reduce=stepped,
@@ -375,7 +445,11 @@ class TrainerCore:
         # the generic trainer their algorithm-specific names. Move CPU schedule
         # scalars (for example Domino's lambda_base) onto the loss device before
         # the DP reduction so NCCL-backed runs do not all-reduce a CPU tensor.
-        reserved_metric_keys = _EAGLE3_STRUCTURED_METRIC_KEYS | {"accuracy", "loss"}
+        reserved_metric_keys = _EAGLE3_STRUCTURED_METRIC_KEYS | {
+            "accuracy",
+            "accuracy_denom",
+            "loss",
+        }
         for key, value in out.metrics.items():
             if key in reserved_metric_keys:
                 continue

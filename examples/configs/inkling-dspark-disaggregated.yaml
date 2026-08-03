@@ -2,9 +2,22 @@ model:
   target_model_path: thinkingmachines/Inkling
   draft_model_config: configs/inkling-dspark.json
   target_backend: sglang
+  trust_remote_code: true
   tokenizer_pad_token_id: 200006
   embedding_key: model.llm.embed.weight
   lm_head_key: model.llm.unembed.weight
+  # Inkling's hybrid cache path requires the unified radix tree. These values
+  # match the SGLang #31847 configuration validated by the two-node launcher.
+  sglang_attention_backend: fa4
+  sglang_mem_fraction_static: 0.85
+  sglang_disable_radix_cache: false
+  sglang_context_length: 4103
+  sglang_moe_runner_backend: flashinfer_trtllm_routed
+  sglang_page_size: 128
+  sglang_quantization: modelopt_fp4
+  sglang_mamba_radix_cache_strategy: extra_buffer
+  sglang_max_mamba_cache_size: 64
+  sglang_swa_full_tokens_ratio: 0.2
 data:
   train_data_path: ./cache/dataset/inkling_dspark_train.jsonl
   max_length: 4096
@@ -20,6 +33,7 @@ training:
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1.0
+  attention_backend: eager
   num_anchors: 512
   loss_decay_gamma: 4.0
   objective_chunk_blocks: 128

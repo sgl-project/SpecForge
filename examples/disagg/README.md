@@ -126,6 +126,27 @@ The relay has no authentication or TLS; bind it only to a trusted private
 interface. Set `--max-archives` to the same retention window as
 `training.max_checkpoints` so relay archives cannot grow without bound.
 
+The Inkling DSpark variant uses the same two-node lifecycle with the target
+settings validated against SGLang
+[#31847](https://github.com/sgl-project/sglang/pull/31847):
+
+```bash
+export DISAGG_STORE_ID=inkling-two-node-attempt-001
+export DISAGG_RUN_ROOT=/shared/specforge/$DISAGG_STORE_ID
+
+rcli exec --per-node <job> \
+  'bash examples/disagg/run_inkling_dspark_disagg_2node.sh'
+```
+
+Rank 0 uses four GPUs for TP4 ModelOpt-FP4 capture; rank 1 defaults to four
+FSDP trainer ranks. Override `TARGET_MODEL_PATH`, `SERVER_GPUS`,
+`TRAINER_GPUS`, or `TRAINER_NPROC` for another allocation. The launcher keeps
+the unified radix tree enabled and does not pass `--disable-radix-cache`.
+Until #31847 is available in a supported SGLang release, install that PR's
+checkout into both nodes' environment. The wrapper applies SpecForge's
+checked-in capture patch before starting the server; the patch is dry-run
+validated against both v0.5.14 and #31847 commit `b7252cc`.
+
 ## External and managed-local services
 
 By default, online capture requires an already-running Mooncake deployment and
@@ -173,12 +194,6 @@ topology; the second owns two TP=2 servers plus the DP2 trainer.
 That opt-in profile starts, health-checks, and cleans up the owned local
 services. It does not change the default external-service boundary or attempt
 to schedule services on remote hosts.
-
-The strict e2e gate at
-`scripts/gates/run_disaggregated_overfit_gate.sh` retains full local test-stack
-automation: it starts and health-checks Mooncake and SGLang, runs the unified
-producer/consumer entry, verifies training and serving, and cleans up owned
-processes. That test harness is not the production service supervisor.
 
 Online configs use Mooncake. Offline configs may use either a typed
 `shared_dir` store or Mooncake. `deployment.disaggregated.control_dir` is the

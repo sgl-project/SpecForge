@@ -27,7 +27,7 @@ import os
 import re
 import warnings
 from collections import Counter
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -36,6 +36,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from ..distributed import get_draft_sp_group, get_sp_ring_group
+from .loss_mask import has_consecutive_supervised_tokens
 from .parse import GeneralParser, GLMParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
@@ -180,6 +181,7 @@ def build_eagle3_dataset(
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
     minimum_valid_tokens: Optional[int] = None,
+    loss_mask_filter: Optional[Callable[[object], bool]] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -206,12 +208,16 @@ def build_eagle3_dataset(
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
                              Useful for thinking models where history may not contain thoughts.
         minimum_valid_tokens: If set, drops samples with fewer trainable tokens.
+        loss_mask_filter: Optional algorithm-owned predicate applied after
+                          tokenization and truncation.
 
     Returns:
         The processed HF dataset.
     """
     if minimum_valid_tokens is not None and minimum_valid_tokens < 0:
         raise ValueError("minimum_valid_tokens must be >= 0")
+    if loss_mask_filter is not None and not callable(loss_mask_filter):
+        raise TypeError("loss_mask_filter must be callable or None")
 
     # Validate chat_template requirement
     if chat_template is None:
@@ -257,7 +263,7 @@ def build_eagle3_dataset(
                 # Parse tools: handle JSON strings from safe_conversations_generator
                 tools = []
                 for tool_item in tools_raw:
-                    if isinstance(tool_item, (str, list)):
+                    if isinstance(tool_item, str):
                         try:
                             tools.append(json.loads(tool_item))
                         except json.JSONDecodeError:
@@ -342,6 +348,21 @@ def build_eagle3_dataset(
         )
         print(
             f"Filtered dataset by trainable tokens: {before_filter} -> {len(dataset)}"
+        )
+
+    if loss_mask_filter is not None:
+        before_filter = len(dataset)
+
+        def has_eligible_loss_mask(example):
+            return loss_mask_filter(example["loss_mask"])
+
+        dataset = dataset.filter(
+            has_eligible_loss_mask,
+            num_proc=num_proc,
+            desc="Filtering samples by algorithm loss-mask eligibility",
+        )
+        print(
+            f"Filtered dataset by loss-mask eligibility: {before_filter} -> {len(dataset)}"
         )
 
     dataset.set_format(type="torch")
@@ -684,6 +705,10 @@ def process_offline_dflash_sample(
             f"truncation: input_ids={input_ids.shape[1]}, "
             f"loss_mask={loss_mask.shape[1]}, "
             f"hidden_states={hidden_states.shape[1]}"
+        )
+    if not has_consecutive_supervised_tokens(loss_mask[0]):
+        raise ValueError(
+            "offline DFlash samples require two consecutive supervised tokens"
         )
     return {
         "input_ids": input_ids,

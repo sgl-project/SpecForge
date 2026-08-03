@@ -81,6 +81,9 @@ class ModelConfig(StrictConfigModel):
     #: SGLang target-engine tuning. Ignored by hf/custom backends.
     sglang_attention_backend: str = "flashinfer"
     sglang_mem_fraction_static: float = Field(default=0.4, gt=0.0, le=1.0)
+    #: Keep the historical managed-local behavior by default. Hybrid targets
+    #: such as Inkling require the radix tree and can opt back in explicitly.
+    sglang_disable_radix_cache: bool = True
     sglang_context_length: Optional[int] = Field(default=None, gt=0)
     sglang_enable_nccl_nvls: bool = False
     sglang_enable_symm_mem: bool = False

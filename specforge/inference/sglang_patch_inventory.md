@@ -29,11 +29,17 @@ providers map generic server artifacts (`aux`, `last_hidden`, passthrough
 inputs) to training feature names. No trainer or producer process imports
 SGLang model-runner internals or loads a target model.
 
-The same patch is dry-run validated against the v0.5.14 tag and the public
-`inkling-support` branch. Capture requests carry a unique `extra_key`, so every
+The same patch is dry-run validated against the v0.5.14 tag and SGLang #31847
+commit `b7252cc`. Capture requests carry a unique `extra_key`, so every
 training sample executes a full prefill even when radix cache support is
-present. Capture launch configs therefore leave radix cache enabled, including
-for hybrid targets that require the unified radix tree.
+present. Managed-local launch preserves the historical disabled-cache default;
+hybrid targets that require the unified radix tree set
+`model.sglang_disable_radix_cache: false`.
+
+For targets that declare `logits_mup_width_multiplier`, the SGLang model passes
+an LM-head-scaled hidden state into the logits processor. The capture patch
+restores the pre-head-scale post-norm representation because SpecForge folds
+the same multiplier into the frozen target head used during training.
 
 Apply the default patch with `scripts/apply_sglang_spec_capture_patch.sh`, or
 the K3 patch with

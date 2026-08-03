@@ -18,6 +18,7 @@ RUN_ID="${DISAGG_STORE_ID:-}"
 RUN_ROOT="${DISAGG_RUN_ROOT:-}"
 CONSUMER_STATE_DIR="${DISAGG_CONSUMER_STATE_DIR:-${LOCAL_SCRATCH:-/tmp}/specforge/$RUN_ID/consumer-state}"
 CONFIG="${CONFIG:-$ROOT_DIR/examples/configs/qwen3-8b-dflash-disaggregated.yaml}"
+RUN_LABEL="${RUN_LABEL:-qwen3-8b-dflash-2node}"
 
 SERVER_GPUS="${SERVER_GPUS:-0}"
 SERVER_TP="${SERVER_TP:-1}"
@@ -27,6 +28,15 @@ CAPTURE_LAYER_IDS="${CAPTURE_LAYER_IDS:-1 9 17 25 33}"
 TRAINER_GPUS="${TRAINER_GPUS:-0,1,2,3}"
 TRAINER_NPROC="${TRAINER_NPROC:-4}"
 TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-Qwen/Qwen3-8B}"
+# Whitespace-separated SGLang CLI tokens for model-specific server settings.
+# Each flag and value must be one shell token; embedded whitespace is
+# unsupported.
+SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-}"
+APPLY_SGLANG_CAPTURE_PATCH="${APPLY_SGLANG_CAPTURE_PATCH:-1}"
+SERVER_EXTRA_ARGV=()
+if [[ -n "$SERVER_EXTRA_ARGS" ]]; then
+    read -r -a SERVER_EXTRA_ARGV <<< "$SERVER_EXTRA_ARGS"
+fi
 
 MOONCAKE_RPC_PORT="${MOONCAKE_RPC_PORT:-35551}"
 MOONCAKE_HTTP_PORT="${MOONCAKE_HTTP_PORT:-35880}"
@@ -36,7 +46,7 @@ START_TIMEOUT_S="${START_TIMEOUT_S:-1800}"
 PEER_TIMEOUT_S="${PEER_TIMEOUT_S:-1800}"
 
 log() {
-    printf '[qwen3-8b-dflash-2node][rank=%s] %s\n' "${NODE_RANK:-?}" "$*"
+    printf '[%s][rank=%s] %s\n' "$RUN_LABEL" "${NODE_RANK:-?}" "$*"
 }
 
 fail() {
@@ -120,6 +130,9 @@ validate_identity() {
     [[ "$SERVER_TP" =~ ^[1-9][0-9]*$ ]] || fail "SERVER_TP must be positive"
     [[ "$TRAINER_NPROC" =~ ^[1-9][0-9]*$ ]] || \
         fail "TRAINER_NPROC must be positive"
+    [[ "$APPLY_SGLANG_CAPTURE_PATCH" == "0" || \
+        "$APPLY_SGLANG_CAPTURE_PATCH" == "1" ]] || \
+        fail "APPLY_SGLANG_CAPTURE_PATCH must be 0 or 1"
     [[ "$(count_devices "$SERVER_GPUS")" == "$SERVER_TP" ]] || \
         fail "SERVER_GPUS must contain exactly SERVER_TP=$SERVER_TP devices"
     [[ "$(count_devices "$TRAINER_GPUS")" == "$TRAINER_NPROC" ]] || \
@@ -161,17 +174,28 @@ run_inference_node() {
     local producer_result=1
 
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        local -a dry_run_server_command=(
+            python -m sglang.launch_server --host 0.0.0.0
+            --model-path "$TARGET_MODEL_PATH"
+            --trust-remote-code
+            --skip-tokenizer-init
+            --tp-size "$SERVER_TP"
+            --mem-fraction-static "$SERVER_MEM_FRACTION"
+            --chunked-prefill-size -1
+            --enable-spec-capture --spec-capture-method dflash
+            --spec-capture-aux-layer-ids $CAPTURE_LAYER_IDS
+            --port "$SERVER_PORT"
+        )
+        if [[ -n "$SERVER_EXTRA_ARGS" ]]; then
+            dry_run_server_command+=("${SERVER_EXTRA_ARGV[@]}")
+        fi
         print_command mooncake_master --enable_http_metadata_server=true \
             --http_metadata_server_host=0.0.0.0 \
             --rpc_port="$MOONCAKE_RPC_PORT" \
             --http_metadata_server_port="$MOONCAKE_HTTP_PORT" \
             --metrics_port="$MOONCAKE_METRICS_PORT"
         print_command env "CUDA_VISIBLE_DEVICES=$SERVER_GPUS" \
-            python -m sglang.launch_server --host 0.0.0.0 \
-            --model-path "$TARGET_MODEL_PATH" --tp-size "$SERVER_TP" \
-            --enable-spec-capture --spec-capture-method dflash \
-            --spec-capture-aux-layer-ids $CAPTURE_LAYER_IDS \
-            --port "$SERVER_PORT"
+            "${dry_run_server_command[@]}"
         print_command env CUDA_VISIBLE_DEVICES= specforge train -c "$CONFIG" \
             --role producer "${COMMON_OVERRIDES[@]}" "$@"
         result=0
@@ -195,7 +219,9 @@ run_inference_node() {
 
     command -v mooncake_master >/dev/null || fail "mooncake_master is not on PATH"
     command -v curl >/dev/null || fail "curl is not on PATH"
-    "$ROOT_DIR/scripts/apply_sglang_spec_capture_patch.sh"
+    if [[ "$APPLY_SGLANG_CAPTURE_PATCH" == "1" ]]; then
+        "$ROOT_DIR/scripts/apply_sglang_spec_capture_patch.sh"
+    fi
     export MOONCAKE_LOCAL_HOSTNAME="${INFERENCE_NODE_IP:-$HEAD_IP}"
     export MOONCAKE_GLOBAL_SEGMENT_SIZE="${MOONCAKE_GLOBAL_SEGMENT_SIZE:-$((32 << 30))}"
     export MOONCAKE_LOCAL_BUFFER_SIZE="${MOONCAKE_LOCAL_BUFFER_SIZE:-$((1 << 30))}"
@@ -227,19 +253,25 @@ run_inference_node() {
     done
 
     read -r -a capture_layers <<< "$CAPTURE_LAYER_IDS"
+    local -a server_command=(
+        python -m sglang.launch_server
+        --host 0.0.0.0
+        --model-path "$TARGET_MODEL_PATH"
+        --trust-remote-code
+        --skip-tokenizer-init
+        --tp-size "$SERVER_TP"
+        --mem-fraction-static "$SERVER_MEM_FRACTION"
+        --chunked-prefill-size -1
+        --enable-spec-capture
+        --spec-capture-method dflash
+        --spec-capture-aux-layer-ids "${capture_layers[@]}"
+        --port "$SERVER_PORT"
+    )
+    if [[ -n "$SERVER_EXTRA_ARGS" ]]; then
+        server_command+=("${SERVER_EXTRA_ARGV[@]}")
+    fi
     setsid env CUDA_VISIBLE_DEVICES="$SERVER_GPUS" \
-        python -m sglang.launch_server \
-        --host 0.0.0.0 \
-        --model-path "$TARGET_MODEL_PATH" \
-        --trust-remote-code \
-        --skip-tokenizer-init \
-        --tp-size "$SERVER_TP" \
-        --mem-fraction-static "$SERVER_MEM_FRACTION" \
-        --chunked-prefill-size -1 \
-        --enable-spec-capture \
-        --spec-capture-method dflash \
-        --spec-capture-aux-layer-ids "${capture_layers[@]}" \
-        --port "$SERVER_PORT" \
+        "${server_command[@]}" \
         > "$RUN_ROOT/sglang-server.log" 2>&1 &
     server_pid="$!"
 

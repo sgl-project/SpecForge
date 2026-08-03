@@ -6,6 +6,7 @@ import types
 import unittest
 from unittest.mock import patch
 
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
 from specforge.data.prompt_builder import prepare_prompt_tasks
 
 
@@ -89,6 +90,35 @@ class TestPreparePromptTasks(unittest.TestCase):
                 {"payload": {"input_ids": [1, 2, 3], "loss_mask": [0, 1, 1]}},
                 {"payload": {"input_ids": [7, 8], "loss_mask": [1, 1]}},
             ],
+        )
+
+    def test_algorithm_loss_mask_filter_applies_after_truncation(self):
+        records = [
+            {"input_ids": [1, 2, 3, 4, 5], "loss_mask": [1, 0, 0, 1, 1]},
+            {"input_ids": [4, 5, 6, 7], "loss_mask": [0, 0, 1, 1]},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "prompts.jsonl")
+            _write_jsonl(path, records)
+
+            prompts = prepare_prompt_tasks(
+                path,
+                tokenizer=None,
+                chat_template=None,
+                max_length=4,
+                is_preformatted=False,
+                train_only_last_turn=False,
+                cache_dir=None,
+                cache_key=None,
+                num_proc=1,
+                min_loss_tokens=2,
+                max_prompts=1,
+                loss_mask_filter=has_consecutive_supervised_tokens,
+            )
+
+        self.assertEqual(
+            prompts,
+            [{"payload": {"input_ids": [4, 5, 6, 7], "loss_mask": [0, 0, 1, 1]}}],
         )
 
     def test_raw_conversations_use_lazy_dataset_preprocessing(self):

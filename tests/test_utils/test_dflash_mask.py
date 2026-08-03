@@ -8,8 +8,15 @@ from specforge.algorithms.common.dflash_family_model import (
 )
 
 
-def _reference_dflash_mask(anchor_positions, block_keep_mask, S, block_size, device):
-    """Element-level reference mask mirroring the mask_mod inside create_dflash_block_mask.
+def _reference_dflash_mask(
+    anchor_positions,
+    block_keep_mask,
+    S,
+    block_size,
+    device,
+    sliding_window=None,
+):
+    """Element-level reference for full and sliding DFlash attention.
 
     This uses plain Python loops so correctness is obvious by inspection.
     """
@@ -27,11 +34,19 @@ def _reference_dflash_mask(anchor_positions, block_keep_mask, S, block_size, dev
                 continue
             for kv_idx in range(KV_LEN):
                 is_context = kv_idx < S
-                ctx_visible = is_context and (kv_idx < anchor_pos)
+                ctx_visible = is_context and kv_idx < anchor_pos
 
                 is_draft = kv_idx >= S
                 kv_block_id = (kv_idx - S) // block_size
                 draft_visible = is_draft and (q_block_id == kv_block_id)
+
+                if sliding_window is not None:
+                    q_offset = q_idx % block_size
+                    kv_offset = (kv_idx - S) % block_size
+                    ctx_visible = ctx_visible and (
+                        kv_idx >= anchor_pos + q_offset - (sliding_window - 1)
+                    )
+                    draft_visible = draft_visible and kv_offset <= q_offset
 
                 if ctx_visible or draft_visible:
                     mask[b, 0, q_idx, kv_idx] = True
@@ -44,7 +59,14 @@ class TestDFlashMask(unittest.TestCase):
         torch.manual_seed(42)
         self.device = torch.device("cuda")
 
-    def _compare_masks(self, anchor_positions, block_keep_mask, S, block_size):
+    def _compare_masks(
+        self,
+        anchor_positions,
+        block_keep_mask,
+        S,
+        block_size,
+        sliding_window=None,
+    ):
         """Compare create_dflash_sdpa_mask against element-level reference (ground truth)."""
         anchor_positions = anchor_positions.to(self.device)
         block_keep_mask = block_keep_mask.to(self.device)
@@ -55,6 +77,7 @@ class TestDFlashMask(unittest.TestCase):
             S=S,
             block_size=block_size,
             device=self.device,
+            sliding_window=sliding_window,
         )
 
         ref_mask = _reference_dflash_mask(
@@ -63,6 +86,7 @@ class TestDFlashMask(unittest.TestCase):
             S=S,
             block_size=block_size,
             device=self.device,
+            sliding_window=sliding_window,
         )
 
         self.assertEqual(
@@ -73,12 +97,17 @@ class TestDFlashMask(unittest.TestCase):
         self.assertTrue(
             torch.equal(sdpa_mask, ref_mask),
             f"Mask mismatch with S={S}, block_size={block_size}, "
-            f"anchors={anchor_positions.tolist()}, keep={block_keep_mask.tolist()}\n"
+            f"sliding_window={sliding_window}, anchors={anchor_positions.tolist()}, "
+            f"keep={block_keep_mask.tolist()}\n"
             f"Diff positions: {(sdpa_mask != ref_mask).nonzero(as_tuple=False).tolist()}",
         )
 
     def _compare_block_mask_consistency(
-        self, anchor_positions, block_keep_mask, S, block_size
+        self,
+        anchor_positions,
+        block_keep_mask,
+        S,
+        block_size,
     ):
         """Verify create_dflash_block_mask block-level mask is consistent with reference."""
         anchor_positions = anchor_positions.to(self.device)
@@ -118,12 +147,11 @@ class TestDFlashMask(unittest.TestCase):
                     k_end = min(k_start + BM_BLOCK, KV_LEN)
                     has_nonzero = ref_int[b, q_start:q_end, k_start:k_end].any().item()
                     block_val = dense_blocks[b, 0, qi, ki].item()
-                    if has_nonzero:
-                        self.assertEqual(
-                            block_val,
-                            1,
-                            f"Block ({qi},{ki}) for batch {b} should be 1 but got 0",
-                        )
+                    self.assertEqual(
+                        block_val,
+                        int(has_nonzero),
+                        f"Block ({qi},{ki}) for batch {b} has incorrect occupancy",
+                    )
 
     def test_basic_single_batch_single_block(self):
         """Single batch, single draft block."""
@@ -178,6 +206,41 @@ class TestDFlashMask(unittest.TestCase):
         anchor_positions = torch.tensor([[10, 30, 50]])
         block_keep_mask = torch.tensor([[True, True, True]])
         self._compare_masks(anchor_positions, block_keep_mask, S=64, block_size=1)
+
+    def test_sliding_window_moves_with_query_offset(self):
+        """The context window advances while the draft block stays causal."""
+        anchor_positions = torch.tensor([[6]])
+        block_keep_mask = torch.tensor([[True]])
+        mask = create_dflash_sdpa_mask(
+            anchor_positions=anchor_positions.to(self.device),
+            block_keep_mask=block_keep_mask.to(self.device),
+            S=12,
+            block_size=4,
+            device=self.device,
+            sliding_window=4,
+        )
+        expected_visible_keys = (
+            [3, 4, 5, 12],
+            [4, 5, 12, 13],
+            [5, 12, 13, 14],
+            [12, 13, 14, 15],
+        )
+        for query_offset, expected in enumerate(expected_visible_keys):
+            with self.subTest(query_offset=query_offset):
+                actual = mask[0, 0, query_offset].nonzero().flatten().tolist()
+                self.assertEqual(actual, expected)
+
+    def test_sliding_window_one_has_no_context_and_causal_draft(self):
+        """A one-token window removes context but keeps causal own-block keys."""
+        anchor_positions = torch.tensor([[4, 9]])
+        block_keep_mask = torch.tensor([[True, True]])
+        self._compare_masks(
+            anchor_positions,
+            block_keep_mask,
+            S=12,
+            block_size=3,
+            sliding_window=1,
+        )
 
     def test_mixed_validity_multi_batch(self):
         """Multi-batch with mixed block validity patterns."""
@@ -262,6 +325,25 @@ class TestDFlashMask(unittest.TestCase):
         self._compare_block_mask_consistency(
             anchor_positions, block_keep_mask, S=128, block_size=8
         )
+
+    def test_sliding_block_mask_matches_element_reference(self):
+        """Flex and dense masks implement the same sliding-layer rule."""
+        anchors = torch.tensor([[6, 12]], device=self.device)
+        keep = torch.tensor([[True, False]], device=self.device)
+        mask_args = {
+            "anchor_positions": anchors,
+            "block_keep_mask": keep,
+            "S": 16,
+            "block_size": 4,
+            "device": self.device,
+            "sliding_window": 5,
+        }
+        dense_mask = create_dflash_sdpa_mask(**mask_args)
+        block_mask = create_dflash_block_mask(**mask_args)
+        q_idx = torch.arange(8, device=self.device).unsqueeze(1)
+        kv_idx = torch.arange(24, device=self.device).unsqueeze(0)
+        flex_mask = block_mask.mask_mod(0, 0, q_idx, kv_idx)
+        self.assertTrue(torch.equal(flex_mask, dense_mask[0, 0]))
 
 
 if __name__ == "__main__":

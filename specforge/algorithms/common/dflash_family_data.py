@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import partial
 
 from specforge.algorithms.common.collation import pad_and_concatenate_features
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 NORMALIZER_ID = "dflash_family_offline_v1"
 DSPARK_NORMALIZER_ID = "dspark_offline_v1"
@@ -55,6 +56,10 @@ def normalize_offline_sample(raw, max_len: int):
             f"after truncation: input_ids={input_ids.shape[1]}, "
             f"loss_mask={loss_mask.shape[1]}, "
             f"hidden_states={hidden_states.shape[1]}"
+        )
+    if not has_consecutive_supervised_tokens(loss_mask[0]):
+        raise ValueError(
+            "offline DFlash-family samples require two consecutive supervised tokens"
         )
     return {
         "input_ids": input_ids,
