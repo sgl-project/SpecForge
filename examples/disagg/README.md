@@ -159,12 +159,6 @@ That opt-in profile starts, health-checks, and cleans up the owned local
 services. It does not change the default external-service boundary or attempt
 to schedule services on remote hosts.
 
-The strict e2e gate at
-`scripts/gates/run_disaggregated_overfit_gate.sh` retains full local test-stack
-automation: it starts and health-checks Mooncake and SGLang, runs the unified
-producer/consumer entry, verifies training and serving, and cleans up owned
-processes. That test harness is not the production service supervisor.
-
 Online configs use Mooncake. Offline configs may use either a typed
 `shared_dir` store or Mooncake. `deployment.disaggregated.control_dir` is the
 one attempt root from which the launcher derives the reference channel or

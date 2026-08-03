@@ -13,9 +13,7 @@ ONLINE = ROOT / "examples" / "disagg" / "run_online.sh"
 OFFLINE = ROOT / "examples" / "disagg" / "run_offline.sh"
 OFFLINE_TWO_NODE = ROOT / "examples" / "disagg" / "run_offline_2node.sh"
 TWO_NODE = ROOT / "examples" / "disagg" / "run_qwen3_8b_dflash_disagg_2node.sh"
-INKLING_TWO_NODE = (
-    ROOT / "examples" / "disagg" / "run_inkling_dspark_disagg_2node.sh"
-)
+INKLING_TWO_NODE = ROOT / "examples" / "disagg" / "run_inkling_dspark_disagg_2node.sh"
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):
