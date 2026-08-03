@@ -483,3 +483,29 @@ specforge export --to hf \
 
 Pass `--vocab-mapping /path/to/mapping.pt` when the checkpoint predates the
 mapping buffers or when you intentionally need to refresh them.
+
+## Troubleshooting
+
+### Late OOM or non-finite hidden states on online runs
+
+**Symptoms.** An online job starts cleanly, then fails well into training with a
+CUDA OOM that reports a large "reserved but unallocated" pool and only a few
+MiB free (for example, unable to serve a 388 MiB request with 58.3 GiB reserved
+and 34 MiB free). The same fragmentation can also surface first as non-finite
+target hidden states or as an anchor-sampling error that names the data rather
+than the allocator.
+
+**Cause.** Online training feeds the draft one micro-batch per step whose rows
+vary in length, so the caching allocator is asked for a differently sized block
+almost every step. Without expandable segments, reserved-but-unallocated memory
+accumulates until a modest allocation fails.
+
+**Fix.** Enable expandable segments before launch:
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+Set this before chasing data or numeric bugs that match the symptoms above. The
+Ascend equivalent (`PYTORCH_NPU_ALLOC_CONF`) is already set in the NPU recipes
+earlier in this page.

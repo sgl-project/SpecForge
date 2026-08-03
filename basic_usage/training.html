@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 21, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 03, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -484,6 +484,10 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#disaggregated-roles">Disaggregated roles</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checkpoints-and-resume">Checkpoints and resume</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#export-a-trained-draft">Export a trained draft</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#late-oom-or-non-finite-hidden-states-on-online-runs">Late OOM or non-finite hidden states on online runs</a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -1060,6 +1064,29 @@ serving validation step.</p>
 <p>Pass <code class="docutils literal notranslate"><span class="pre">--vocab-mapping</span> <span class="pre">/path/to/mapping.pt</span></code> when the checkpoint predates the
 mapping buffers or when you intentionally need to refresh them.</p>
 </section>
+<section id="troubleshooting">
+<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h2>
+<section id="late-oom-or-non-finite-hidden-states-on-online-runs">
+<h3>Late OOM or non-finite hidden states on online runs<a class="headerlink" href="#late-oom-or-non-finite-hidden-states-on-online-runs" title="Link to this heading">#</a></h3>
+<p><strong>Symptoms.</strong> An online job starts cleanly, then fails well into training with a
+CUDA OOM that reports a large “reserved but unallocated” pool and only a few
+MiB free (for example, unable to serve a 388 MiB request with 58.3 GiB reserved
+and 34 MiB free). The same fragmentation can also surface first as non-finite
+target hidden states or as an anchor-sampling error that names the data rather
+than the allocator.</p>
+<p><strong>Cause.</strong> Online training feeds the draft one micro-batch per step whose rows
+vary in length, so the caching allocator is asked for a differently sized block
+almost every step. Without expandable segments, reserved-but-unallocated memory
+accumulates until a modest allocation fails.</p>
+<p><strong>Fix.</strong> Enable expandable segments before launch:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">PYTORCH_CUDA_ALLOC_CONF</span><span class="o">=</span>expandable_segments:True
+</pre></div>
+</div>
+<p>Set this before chasing data or numeric bugs that match the symptoms above. The
+Ascend equivalent (<code class="docutils literal notranslate"><span class="pre">PYTORCH_NPU_ALLOC_CONF</span></code>) is already set in the NPU recipes
+earlier in this page.</p>
+</section>
+</section>
 </section>
 
 
@@ -1126,6 +1153,10 @@ mapping buffers or when you intentionally need to refresh them.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#disaggregated-roles">Disaggregated roles</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checkpoints-and-resume">Checkpoints and resume</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#export-a-trained-draft">Export a trained draft</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#late-oom-or-non-finite-hidden-states-on-online-runs">Late OOM or non-finite hidden states on online runs</a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -1159,7 +1190,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 21, 2026.
+  Last updated on Aug 03, 2026.
   <br/>
 </p>
   </div>
