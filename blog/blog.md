@@ -1,6 +1,6 @@
 # SpecForge v0.3.0: a Unified Disaggregated and Colocated Speculative Decoding Stack, and New Open SpecBundle Draft Models
 
-**The SpecForge Team · July 2026**
+**The SpecForge Team · August 2026**
 
 When we first released [SpecForge](https://www.lmsys.org/blog/2025-07-25-spec-forge/), a training job owned both the frozen target model and the draft model being optimized. This made EAGLE3 draft-model training practical and directly compatible with SGLang, but it also tied two very different workloads to the same process lifecycle and resource topology.
 
@@ -108,7 +108,7 @@ Every strategy reuses prompt scheduling, feature transport, distributed executio
 
 | Method | Strategy-specific idea | SpecForge support |
 | --- | --- | --- |
-| [EAGLE3](https://arxiv.org/abs/2503.01840) | Direct token prediction with training-time test and multi-layer target-feature fusion | Online-disaggregated, local offline, and disaggregated offline |
+| [EAGLE3](https://arxiv.org/abs/2503.01840) | Direct token prediction with training-time test and multi-layer target-feature fusion | Online-disaggregated, local offline, and disaggregated offline; optional [LK loss](https://arxiv.org/pdf/2602.23881) objective|
 | [P-EAGLE](https://arxiv.org/abs/2602.01469) | Parallel multi-token prediction through a shared hidden state | Online-disaggregated |
 | EAGLE3.1 | An EAGLE3 configuration variant with per-layer normalization and attention-drift settings | Online-disaggregated through the `eagle3` strategy |
 | [DFlash](https://arxiv.org/abs/2602.06036) | Block-diffusion drafting that predicts a token block in parallel | Online-disaggregated, local offline, and disaggregated offline; optional [D-PACE](https://arxiv.org/abs/2605.18810) objective |
@@ -256,7 +256,9 @@ The full per-workload numbers, including the other block sizes and the MTP and D
 
 #### DSpark
 
-*Results to be added.*
+![Kimi-K3 DSpark output throughput vs. baseline](./dspark-speedup.svg)
+
+*Figure 6. Kimi-K3 on 8 × B300: output throughput of DSpark against the autoregressive baseline across five workloads, with the speedup labelled above each bar. The gain is largest at concurrency 1 — up to 3.14× on GSM8K — and narrows to 1.37–2.36× at concurrency 16, where the target model is already better utilized. MT-Bench, the most open-ended of the five, benefits least at every concurrency level. Full numbers are on the [model card](https://huggingface.co/RadixArk/Kimi-K3-DSpark).*
 
 ## Verifying Training-Serving Consistency
 
@@ -284,12 +286,12 @@ We thank the SGLang and SpecForge communities, the authors of the supported spec
 
 **RadixArk Team**: Cheng Mao, Yi Sun, and Kan Wu
 
-**Domino**: Jianuo Huang
+**Domino Team**: Jianuo Huang
 
 **Ant Group AQ Team**: Yefei Chen, Yuan Wang
 
 **China Merchants Bank Team**: Peixiang Tan
 
-**Meta/Pytorch:**: Richard Zou
+**Meta/Pytorch**: Richard Zou
 
 **Modal Team**
