@@ -114,6 +114,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         self.assertEqual(
             {
                 "architecture",
+                "compatible_architectures",
                 "target_defaults",
                 "expected_auto_map_model",
                 "apply_overrides",

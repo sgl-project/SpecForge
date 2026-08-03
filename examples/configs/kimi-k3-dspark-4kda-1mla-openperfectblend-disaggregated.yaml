@@ -1,0 +1,93 @@
+model:
+  target_model_path: /workspace/models/Kimi-K3-cdd2e49a
+  draft_model_config: configs/kimi-k3-dspark-4kda-1mla.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.lm_head.weight
+  mask_token_id: 163824
+  torch_dtype: bfloat16
+  sglang_attention_backend: flashinfer
+  sglang_mem_fraction_static: 0.76
+  sglang_context_length: 4608
+  sglang_max_running_requests: 16
+  sglang_max_total_tokens: 73728
+  sglang_moe_runner_backend: marlin
+  # Latest K3 uses its faster fused CustomAllReduceV2 path only when the
+  # generic symmetric-memory allocator is disabled.
+  sglang_enable_symm_mem: false
+  sglang_mamba_radix_cache_strategy: extra_buffer
+  sglang_max_mamba_cache_size: 80
+
+data:
+  train_data_path: /workspace/k3_dspark/data/kimi-k3-openperfectblend-regen-439c2fdc/data.jsonl
+  max_length: 4096
+  chat_template: kimi-k3-thinking
+  cache_dir: /workspace/k3_dspark/cache
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 0
+
+training:
+  strategy: dspark
+  num_epochs: 10
+  # Source TP8x2 capture produced 16 samples per optimizer microbatch.  DP8
+  # consumes the same shape as 2 samples per rank; 8 * 2 * 32 = 512.
+  batch_size: 2
+  accumulation_steps: 32
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 250
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-dspark
+  wandb_name: kimi-k3-dspark-4kda-1mla-openperfectblend-disaggregated
+  wandb_offline: false
+  wandb_dir: /workspace/k3_dspark/runs/kimi-k3-4kda-1mla-openperfectblend/wandb
+
+runtime:
+  producer_lease: 16
+  # Per endpoint: publish batch N while TP8 prefills batch N+1.
+  producer_concurrency: 2
+  # Two optimizer windows remove the capture/train bubble.  The low watermark
+  # lets both batched capture workers resume after one 512-ref durable ack.
+  in_flight_high_watermark: 1088
+  in_flight_low_watermark: 640
+  resident_high_watermark_bytes: 377957122048
+  resident_low_watermark_bytes: 206158430208
+  feature_store_max_resident_bytes: 412316860416
+
+run_id: kimi-k3-dspark-4kda-1mla-openperfectblend-disaggregated
+output_dir: /workspace/k3_dspark/runs/kimi-k3-4kda-1mla-openperfectblend/output
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: /workspace/k3_dspark/runs/kimi-k3-4kda-1mla-openperfectblend/control
+    consumer_state_dir: /workspace/k3_dspark/runs/kimi-k3-4kda-1mla-openperfectblend/consumer-state
+    backend: mooncake
+    store_id: kimi-k3-dspark-4kda-1mla-openperfectblend-disaggregated
+    server_urls:
+      - http://capture-node-0:30000
+      - http://capture-node-1:30000
+    mooncake_metadata_server: http://10.65.0.2:35880/metadata
+    mooncake_master_server_addr: 10.65.0.2:35551
+    mooncake_protocol: tcp
+    client_buffer_size: 1073741824
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200

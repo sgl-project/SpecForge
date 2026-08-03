@@ -626,9 +626,16 @@ class ConfigSchemaTest(unittest.TestCase):
     def test_overrides_coerce_and_revalidate(self):
         cfg = Config.model_validate(MINIMAL)
         out = apply_overrides(
-            cfg, ["training.learning_rate=1e-3", "training.max_steps=7", "run_id=r2"]
+            cfg,
+            [
+                "training.learning_rate=1e-3",
+                "training.lr_scheduler=constant",
+                "training.max_steps=7",
+                "run_id=r2",
+            ],
         )
         self.assertEqual(out.training.learning_rate, 1e-3)
+        self.assertEqual(out.training.lr_scheduler, "constant")
         self.assertEqual(out.training.max_steps, 7)
         self.assertEqual(out.run_id, "r2")
         # original untouched

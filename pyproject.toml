@@ -44,6 +44,7 @@ dev = [
 ]
 fa = ["flash-attn", "ninja", "packaging"]
 liger = ["liger-kernel"]
+kda = ["fla-core==0.5.1"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}

@@ -30,7 +30,7 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
@@ -268,6 +268,7 @@ class _ConfiguredOptimizerFactory:
             lr=t.learning_rate,
             max_grad_norm=t.max_grad_norm,
             warmup_ratio=t.warmup_ratio,
+            lr_scheduler=t.lr_scheduler,
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
         )
@@ -306,6 +307,11 @@ def _configured_logger(cfg: Config):
     options["swanlab_name"] = options["swanlab_name"] or cfg.run_id
     options["mlflow_experiment_name"] = options["mlflow_experiment_name"] or "specforge"
     options["mlflow_run_name"] = options["mlflow_run_name"] or cfg.run_id
+    if cfg.tracking.report_to == "wandb":
+        # W&B is the canonical reproduction record for the disaggregated K3
+        # runs. Keep the complete resolved config next to the metric stream;
+        # tracker._public_config recursively redacts credentials before init.
+        options["specforge_config"] = cfg.model_dump(mode="json")
     return create_tracker_logger(
         SimpleNamespace(**options), cfg.output_dir, console_logger=_logger
     )
@@ -366,7 +372,7 @@ def _prepare_prompts(
     draft_config,
     path: Optional[str] = None,
     cache_key: Optional[str] = None,
-) -> List[dict]:
+) -> Sequence[dict]:
     """Prepare one prompt source with an optional path/cache namespace override.
 
     Training keeps the configured cache key. Evaluation supplies its own path

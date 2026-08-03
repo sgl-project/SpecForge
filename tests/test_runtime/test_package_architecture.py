@@ -713,6 +713,8 @@ class TestPackageArchitecture(unittest.TestCase):
             {
                 "glm-5.2-dspark.json",
                 "inkling-dspark.json",
+                "kimi-k3-dspark-fullattn-gqa16.json",
+                "kimi-k3-dspark-v1c.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
                 "qwen3.6-27b-dspark.json",

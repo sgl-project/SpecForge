@@ -50,6 +50,12 @@ two patched SGLang capture servers, and the trainer GPU allocation; the same
 Disaggregated recipes without `managed_local` keep Mooncake and SGLang external
 for scheduler- or service-managed deployments.
 
+The `kimi-k3-dspark-v1c-disaggregated.yaml` recipe is the external-service
+two-node migration of the 64K Kimi K3 V1C continual run. Its dedicated
+[runbook](../../docs/recipes/kimi-k3-dspark-v1c-disaggregated.md) pins the K3
+SGLang revision and patch target, preserves the old effective global batch and
+prompt order, and documents the TP8 capture plus four-rank trainer topology.
+
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
 intentionally record their GPU allocation and loopback services. External
@@ -219,6 +225,7 @@ Common fields:
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
+| `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
@@ -236,6 +243,7 @@ Common fields:
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.role` | `all` | Use `all` for local offline training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
+| `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
 
 Strategy-specific fields should be written only when tuning that objective:
 
@@ -271,9 +279,10 @@ For `deployment.mode: disaggregated`, also write:
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `deployment.disaggregated.control_dir` | required | Fresh attempt-scoped shared directory for refs/manifest and lifecycle markers. |
+| `deployment.disaggregated.control_dir` | required | Fresh attempt-scoped directory for refs/manifest and lifecycle markers. Shared by default; with `inbox_server_url`, only producer and consumer rank 0 must share it. |
 | `deployment.disaggregated.backend` | required | `mooncake` or `shared_dir`. Online disaggregated runs require Mooncake. |
 | `deployment.disaggregated.consumer_state_dir` | `null` | Node-local rank-0 SQLite/WAL root. Required for multi-node online consumers; their rank inboxes remain under shared `control_dir`. |
+| `deployment.disaggregated.inbox_server_url` | `null` | Optional private `http://host:port` rank-0 relay for tensor-free inbox refs when remote trainer ranks cannot share `control_dir`. Online multi-node only; no credentials, path, query, TLS, or built-in authentication. |
 | `deployment.disaggregated.store_root` | `null` | Shared feature directory; required when `backend: shared_dir`. |
 | `deployment.disaggregated.store_id` | `null` | Feature-store namespace; defaults to `run_id`. |
 | `deployment.disaggregated.server_urls` | `[]` | External patched SGLang capture endpoints. One rollout worker is created per entry. Do not set with `managed_local`. |
