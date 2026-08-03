@@ -570,9 +570,12 @@ flag to keep synchronized. The consumer world size is
 the online reference channel and lifecycle markers, or the offline manifest,
 beneath that root. Online consumers put the rank-0 SQLite/WAL under
 <code class="docutils literal notranslate"><span class="pre">consumer_state_dir</span></code>; that path should be node-local and is required for
-multi-node trainers. Rank inboxes stay under the shared <code class="docutils literal notranslate"><span class="pre">control_dir</span></code> when
-<code class="docutils literal notranslate"><span class="pre">deployment.trainer.nnodes</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, so remote ranks never need to access the
-SQLite filesystem. A fresh attempt requires fresh control and consumer-state
+multi-node trainers. By default rank inboxes stay under the shared
+<code class="docutils literal notranslate"><span class="pre">control_dir</span></code>. When a cluster cannot mount that path on every trainer node, set
+<code class="docutils literal notranslate"><span class="pre">inbox_server_url</span></code> to a private rank-0 HTTP origin: rank 0 keeps the inbox files
+locally and relays only tensor-free references and consumed counters to remote
+ranks. The producer and consumer rank 0 must still resolve <code class="docutils literal notranslate"><span class="pre">control_dir</span></code> to the
+same path. A fresh attempt requires fresh control and consumer-state
 directories. <code class="docutils literal notranslate"><span class="pre">store_id</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">run_id</span></code> and can be set explicitly when the
 Mooncake deployment requires another namespace.</p>
 <p>Long producer/consumer waits are unbounded unless <code class="docutils literal notranslate"><span class="pre">idle_timeout_s</span></code>,
@@ -720,7 +723,11 @@ on both nodes. <code class="docutils literal notranslate"><span class="pre">NODE
 <span class="w">    </span><span class="nt">master_addr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trainer-0.example</span>
 <span class="w">    </span><span class="nt">master_port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">29500</span>
 <span class="w">  </span><span class="nt">disaggregated</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">control_dir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/shared/control/attempt-001</span>
+<span class="w">    </span><span class="c1"># With inbox_server_url, only the producer and consumer rank 0 need this</span>
+<span class="w">    </span><span class="c1"># path; remote ranks receive their tensor-free reference stream over HTTP.</span>
+<span class="w">    </span><span class="nt">control_dir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/local/rank0/control/attempt-001</span>
+<span class="w">    </span><span class="nt">consumer_state_dir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/local/rank0/consumer-state/attempt-001</span>
+<span class="w">    </span><span class="nt">inbox_server_url</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http://trainer-0.example:35900</span>
 <span class="w">    </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mooncake</span>
 <span class="w">    </span><span class="nt">server_urls</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">http</span><span class="p p-Indicator">:</span><span class="nv">//capture-server</span><span class="p p-Indicator">:</span><span class="nv">30000</span><span class="p p-Indicator">]</span>
 </pre></div>
@@ -738,6 +745,12 @@ hosts or impersonate a cluster scheduler. An existing torchrun environment is
 detected and used as the worker environment rather than nesting another
 torchrun. A producer is rejected inside a multi-rank torchrun to prevent
 duplicate capture/ingestion roles.</p>
+<p><code class="docutils literal notranslate"><span class="pre">inbox_server_url</span></code> is optional; omit it when every trainer rank shares
+<code class="docutils literal notranslate"><span class="pre">control_dir</span></code>. When set, rank 0 binds the configured port on all interfaces and
+remote ranks pull only their private metadata stream. The endpoint has no
+built-in authentication or TLS, so expose it only on a trusted cluster network.
+The producer must run on the rank-0 host (or otherwise share rank 0’s
+<code class="docutils literal notranslate"><span class="pre">control_dir</span></code>); payload tensors never traverse this HTTP service.</p>
 <p>The separate-inference-node Qwen3-8B example keeps that scheduler boundary but
 restores full development-stack orchestration:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">DISAGG_STORE_ID</span><span class="o">=</span>qwen3-8b-two-node-attempt-001
@@ -788,8 +801,9 @@ node-local deployment values.</p>
 <p>The online producer sends prompts to the URLs in
 <code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.server_urls</span></code>. Start a patched SGLang server separately
 with the model, capture method, and auxiliary layer ids matching the draft
-config. DFlash, Domino, and DSpark use the DFlash capture contract; EAGLE3 and
-P-EAGLE use the EAGLE3 capture contract. Capture rejects chunked prefill and
+config. DFlash and Domino use the DFlash capture contract, DSpark uses its
+dedicated K3 capture contract, and EAGLE3 and P-EAGLE use the EAGLE3 capture
+contract. Capture rejects chunked prefill and
 gives every request attempt a unique radix-cache namespace so cached prefixes
 cannot truncate the captured sequence. Online capture is text-only: VLM
 training, including Qwen2.5-VL, is not supported. Online evaluation is also not

@@ -1,0 +1,783 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Kimi-K3 DSpark 5×MLA and 4×KDA+1×MLA &#8212; SpecForge</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'recipes/kimi-k3-dspark-mla-kda-disaggregated';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="icon" href="../_static/logo.ico"/>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Aug 03, 2026"/>
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/logo.png" class="logo__image only-light" alt="SpecForge - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SpecForge - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Get Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/about.html">⚡️ About SpecForge</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/data_preparation.html">📝 Data Preparation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/disaggregated_training.html">Disaggregated training</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../advanced_features/customization.html">Customize a training run</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/benchmark.html">Benchmarking inference serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/eagle3-disaggregated-parity.html">EAGLE3 offline disaggregated parity</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../benchmarks/domino-disaggregated-performance.html">Domino disaggregated performance findings</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/specbundle.html">🔥 SpecBundle</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/dashboard.html">📈 Performance Dashboard</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/recipes/kimi-k3-dspark-mla-kda-disaggregated.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/recipes/kimi-k3-dspark-mla-kda-disaggregated.md" target="_blank"
+   class="btn btn-sm btn-source-edit-button dropdown-item"
+   title="Suggest edit"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-pencil-alt"></i>
+  </span>
+<span class="btn__text-container">Suggest edit</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Frecipes/kimi-k3-dspark-mla-kda-disaggregated.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/recipes/kimi-k3-dspark-mla-kda-disaggregated.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Kimi-K3 DSpark 5×MLA and 4×KDA+1×MLA</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture-contract">Architecture contract</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pinned-data">Pinned data</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-training-settings">Reference training settings</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#smoke-then-full-training">Smoke then full training</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#capture-throughput-contract">Capture throughput contract</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="kimi-k3-dspark-5mla-and-4kda-1mla">
+<h1>Kimi-K3 DSpark 5×MLA and 4×KDA+1×MLA<a class="headerlink" href="#kimi-k3-dspark-5mla-and-4kda-1mla" title="Link to this heading">#</a></h1>
+<p>These experimental draft backbones train against Kimi-K3 target features with
+the disaggregated SpecForge data plane:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">KimiK3DSpark5MLADraftModel</span></code>: five K3-style MLA layers;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">KimiK3DSpark4KDA1MLADraftModel</span></code>: <code class="docutils literal notranslate"><span class="pre">KDA</span> <span class="pre">→</span> <span class="pre">KDA</span> <span class="pre">→</span> <span class="pre">MLA</span> <span class="pre">→</span> <span class="pre">KDA</span> <span class="pre">→</span> <span class="pre">KDA</span></code>.</p></li>
+</ul>
+<p>Both retain the normal DSpark target projector, Markov head, confidence head,
+loss, and seven-token proposal block. They use captured target layers
+<code class="docutils literal notranslate"><span class="pre">[11,</span> <span class="pre">23,</span> <span class="pre">47,</span> <span class="pre">71,</span> <span class="pre">83]</span></code> (zero based).</p>
+<section id="architecture-contract">
+<h2>Architecture contract<a class="headerlink" href="#architecture-contract" title="Link to this heading">#</a></h2>
+<p>MLA uses the K3 target dimensions: 96 heads, Q LoRA rank 1536, KV LoRA rank
+512, 128 non-RoPE QK channels, 64 RoPE channels, 128 value channels, and the
+K3 output gate.</p>
+<p>KDA uses 96 heads of width 128, a bias-free four-token causal depthwise
+convolution, a full-rank output gate, and the bounded forget gate with lower
+bound <code class="docutils literal notranslate"><span class="pre">-5</span></code>. GPU training uses <code class="docutils literal notranslate"><span class="pre">fla-core==0.5.1</span></code>.</p>
+<p>In the hybrid, the central MLA layer is the only layer that reads the captured
+target context. Each KDA layer operates on one proposal block at a time and
+resets its state between anchors. This preserves DFlash’s anchor isolation;
+linear recurrence cannot connect two independently sampled proposal blocks.</p>
+</section>
+<section id="pinned-data">
+<h2>Pinned data<a class="headerlink" href="#pinned-data" title="Link to this heading">#</a></h2>
+<p>The recipes use only this Kimi-K3 Open Perfect Blend regeneration:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Value</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>HF dataset</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">skx618/Kimi-K3-OpenPerfectBlend-Regen</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Revision</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">439c2fdc9fd2ae92e194bde468d26867b36dd660</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>File</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">data.jsonl</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Rows</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">698316</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>SHA-256</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">5418f09d1af8ec2e08e8385799f1eeb3c062c669b28407870f7737007bc3eeb9</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Store the Hugging Face token outside the repository:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>install<span class="w"> </span>-d<span class="w"> </span>-m<span class="w"> </span><span class="m">700</span><span class="w"> </span>/workspace/k3_dspark/secrets
+install<span class="w"> </span>-m<span class="w"> </span><span class="m">600</span><span class="w"> </span>/dev/stdin<span class="w"> </span>/workspace/k3_dspark/secrets/hf_token
+scripts/prepare_kimi_k3_openperfectblend.sh
+</pre></div>
+</div>
+<p>The downloader verifies both the row count and SHA-256. SpecForge dynamically
+renders the conversation schema and right-truncates to 4096 tokens.</p>
+</section>
+<section id="reference-training-settings">
+<h2>Reference training settings<a class="headerlink" href="#reference-training-settings" title="Link to this heading">#</a></h2>
+<p>The exact full-attention recipe preserves the K3 reference run’s training
+settings and trainer shape:</p>
+<ul class="simple">
+<li><p>4096 token examples, per-rank batch size 1, accumulation 32, DP16;</p></li>
+<li><p>four-batch feature prefetch to overlap Mooncake TCP transfer with trainer
+compute;</p></li>
+<li><p>10 epochs, learning rate <code class="docutils literal notranslate"><span class="pre">6e-4</span></code>, warmup ratio <code class="docutils literal notranslate"><span class="pre">0.04</span></code>;</p></li>
+<li><p>9,173 optimizer steps (<code class="docutils literal notranslate"><span class="pre">469,695</span> <span class="pre">*</span> <span class="pre">10</span> <span class="pre">//</span> <span class="pre">512</span></code>), explicitly pinned so all
+roles share one schedule horizon at startup;</p></li>
+<li><p>512 anchors, block size 7, Markov rank 256;</p></li>
+<li><p>CE/L1/confidence weights <code class="docutils literal notranslate"><span class="pre">0.1/0.9/1.0</span></code>;</p></li>
+<li><p>log every 10 steps and save every 250 steps;</p></li>
+<li><p>retain the latest three assembled checkpoints on each trainer node;</p></li>
+<li><p>online W&amp;B project <code class="docutils literal notranslate"><span class="pre">specforge-dspark</span></code>.</p></li>
+</ul>
+<p>The supplied exact topology is two TP8 K3 capture replicas and a separate
+two-node, 16-rank trainer. The source job’s <code class="docutils literal notranslate"><span class="pre">BATCH_SIZE=8</span></code> was per TP8 target
+replica, not per FSDP rank: its two replicas formed a 16-sample optimizer
+microbatch. One sample on each of 16 trainer GPUs with accumulation 32 restores
+the source global batch of 512 and its per-GPU draft compute. The experimental
+MLA/KDA recipes remain portable one-node DP8 configurations with two samples
+per rank and the same global batch. Two optimizer windows stay in Mooncake so
+target capture for the next update overlaps draft training; record any topology
+override in the W&amp;B run config.</p>
+</section>
+<section id="smoke-then-full-training">
+<h2>Smoke then full training<a class="headerlink" href="#smoke-then-full-training" title="Link to this heading">#</a></h2>
+<p>Start Mooncake as described in
+<a class="reference internal" href="kimi-k3-dspark-v1c-disaggregated.html"><span class="std std-doc">the K3 V1C runbook</span></a>, then apply the K3
+patch to revision <code class="docutils literal notranslate"><span class="pre">ee560a2b2df5dafe18fd835d2e546eff019ca5ba</span></code>. Launch
+<code class="docutils literal notranslate"><span class="pre">run_kimi_k3_dspark_capture_server.sh</span></code> on each of the two capture nodes. The
+capture layer ids are part of this recipe’s contract and intentionally differ
+from the V1C reproduction:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MODEL_PATH</span><span class="o">=</span>/workspace/models/Kimi-K3-cdd2e49a
+<span class="nb">export</span><span class="w"> </span><span class="nv">MOONCAKE_MASTER_IP</span><span class="o">=</span><span class="m">10</span>.65.0.2
+<span class="nb">export</span><span class="w"> </span><span class="nv">SGLANG_ROOT</span><span class="o">=</span>/workspace/sglang-kimi-k3-ee560a2-spec-capture
+<span class="nb">export</span><span class="w"> </span><span class="nv">CAPTURE_IP</span><span class="o">=</span><span class="m">10</span>.65.0.5<span class="w">  </span><span class="c1"># use the current node&#39;s routable address</span>
+examples/disagg/run_kimi_k3_dspark_capture_server.sh
+</pre></div>
+</div>
+<p>Use capture IP/ports that match the selected YAML.</p>
+<p>For the exact five-layer full-attention reference architecture, use capture
+layers <code class="docutils literal notranslate"><span class="pre">[7,</span> <span class="pre">23,</span> <span class="pre">51,</span> <span class="pre">67,</span> <span class="pre">83]</span></code> and the checked-in full-attention recipe. Run the
+producer beside trainer rank 0 so both can use the rank-0 local <code class="docutils literal notranslate"><span class="pre">control_dir</span></code>.
+The rank-0 inbox HTTP relay serves only tensor-free <code class="docutils literal notranslate"><span class="pre">SampleRef</span></code> metadata to the
+second trainer node; feature tensors still move directly through Mooncake.
+Override the placeholder host names with private, trusted-network addresses:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">AUX_LAYER_IDS</span><span class="o">=</span><span class="s2">&quot;7 23 51 67 83&quot;</span>
+specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--role<span class="w"> </span>producer<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>deployment.trainer.master_addr<span class="o">=</span><span class="m">10</span>.65.0.3<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>deployment.disaggregated.inbox_server_url<span class="o">=</span>http://10.65.0.3:35900
+
+<span class="c1"># Trainer node 0</span>
+<span class="nv">WANDB_MODE</span><span class="o">=</span>online<span class="w"> </span><span class="nv">MOONCAKE_LOCAL_HOSTNAME</span><span class="o">=</span><span class="m">10</span>.65.0.3<span class="w"> </span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--role<span class="w"> </span>consumer<span class="w"> </span>--node-rank<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>deployment.trainer.master_addr<span class="o">=</span><span class="m">10</span>.65.0.3<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>deployment.disaggregated.inbox_server_url<span class="o">=</span>http://10.65.0.3:35900
+
+<span class="c1"># Trainer node 1</span>
+<span class="nv">WANDB_MODE</span><span class="o">=</span>online<span class="w"> </span><span class="nv">MOONCAKE_LOCAL_HOSTNAME</span><span class="o">=</span><span class="m">10</span>.65.0.4<span class="w"> </span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--role<span class="w"> </span>consumer<span class="w"> </span>--node-rank<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>deployment.trainer.master_addr<span class="o">=</span><span class="m">10</span>.65.0.3<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>deployment.disaggregated.inbox_server_url<span class="o">=</span>http://10.65.0.3:35900
+</pre></div>
+</div>
+<p>When the two trainer nodes do not share <code class="docutils literal notranslate"><span class="pre">output_dir</span></code>, start
+<code class="docutils literal notranslate"><span class="pre">examples/disagg/sync_distributed_checkpoints.py</span></code> on both nodes with local rank
+ranges <code class="docutils literal notranslate"><span class="pre">0-7</span></code> and <code class="docutils literal notranslate"><span class="pre">8-15</span></code>, respectively. The
+<span class="xref myst">disaggregated examples guide</span>
+contains the complete commands and private-network boundary.</p>
+</section>
+<section id="capture-throughput-contract">
+<h2>Capture throughput contract<a class="headerlink" href="#capture-throughput-contract" title="Link to this heading">#</a></h2>
+<p>The source run used two independent TP8 target replicas. A normal TP8 prefill
+and a capture-enabled TP8 prefill should have comparable model-compute speed,
+but one replica still provides only half of the source job’s aggregate sample
+rate. The capture patch therefore:</p>
+<ul class="simple">
+<li><p>performs D2H only on the output TP rank and reuses contiguous per-request
+views instead of concatenating every single-chunk tensor;</p></li>
+<li><p>publishes the scheduler batch through Mooncake <code class="docutils literal notranslate"><span class="pre">batch_put_from</span></code> rather than
+one RPC per feature object;</p></li>
+<li><p>gives each target endpoint two producer request slots, overlapping one
+bounded background publish with the next TP8 prefill; and</p></li>
+<li><p>holds the HTTP completion response until every feature key is durable.</p></li>
+</ul>
+<p>The exact 4,096-token validation captured 128 unique samples (211,715 tokens,
+18,214,264,880 feature bytes) in 25.010 seconds after the first request began:
+5.118 samples/s per TP8 replica. Two replicas project to 10.236 samples/s, or
+71.97 optimizer steps/hour at global batch 512. The source W&amp;B run measured
+71.50 steps/hour. Steady target prefill remained approximately 10.9–11.2k
+tokens/s, so the remaining scale factor is replica count rather than an SGLang
+compute regression.</p>
+<p>A DP16 end-to-end smoke completed with finite losses and gradient norms across
+all 16 ranks. Both trainer nodes assembled and opened the portable checkpoint:
+one shared training-state file plus rank files 0–15. Before prefetch, its warm
+step took 56.44 seconds: 35–39 seconds of trainer compute plus up to 21 seconds
+waiting for Mooncake TCP feature materialization.</p>
+<p>With <code class="docutils literal notranslate"><span class="pre">data.dataloader_num_workers:</span> <span class="pre">4</span></code>, four subsequent warm steps took 49.61,
+47.70, 48.52, and 49.25 seconds. Their mean was 48.77 seconds, or 73.82
+steps/hour and 10.50 samples/s at global batch 512. This is 3.1% faster than
+the source W&amp;B run’s 50.35 seconds/step (71.50 steps/hour). The prefetch smoke
+is recorded in W&amp;B as run <code class="docutils literal notranslate"><span class="pre">npia5q21</span></code>. Keep prefetch enabled when Mooncake uses
+TCP; it overlaps feature transfer with the current optimizer step without
+changing capture outputs or the training objective.</p>
+<p>The resulting 9,173-step full run is recorded in W&amp;B as run <code class="docutils literal notranslate"><span class="pre">fth4aze4</span></code>. Steps
+20 through 70 reported finite losses and gradient norms. Step time fell from
+45.53 to approximately 40.3 seconds as feature prefetch warmed; steps 60 and
+70 sustained 89.28 and 88.85 steps/hour (about 12.7 samples/s), roughly 24%
+above the source run. These measurements are early-run validation; use the W&amp;B
+performance panels and assembled checkpoints to monitor the remaining run.</p>
+<p>Keep the W&amp;B API key in a protected file and export it only in the trainer
+shell; do not put it in YAML or a command transcript.</p>
+<p>Run a one-step smoke with the same architecture and objective before removing
+the overrides:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">WANDB_MODE</span><span class="o">=</span>online<span class="w"> </span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/kimi-k3-dspark-5mla-openperfectblend-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--role<span class="w"> </span>both<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>training.max_steps<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>training.batch_size<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>training.accumulation_steps<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>data.train_data_path<span class="o">=</span>/workspace/k3_dspark/data/kimi-k3-openperfectblend-smoke.jsonl
+</pre></div>
+</div>
+<p>After the smoke produces finite loss, gradients, a checkpoint, and online W&amp;B
+telemetry, launch the full run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">WANDB_MODE</span><span class="o">=</span>online<span class="w"> </span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/kimi-k3-dspark-5mla-openperfectblend-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--role<span class="w"> </span>both
+</pre></div>
+</div>
+<p>Use the corresponding
+<code class="docutils literal notranslate"><span class="pre">kimi-k3-dspark-4kda-1mla-openperfectblend-disaggregated.yaml</span></code> config for the
+hybrid, or the full-attention config above for the exact old architecture. The
+full jobs need separate output/control directories and should not share one
+trainer allocation concurrently.</p>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture-contract">Architecture contract</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pinned-data">Pinned data</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-training-settings">Reference training settings</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#smoke-then-full-training">Smoke then full training</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#capture-throughput-contract">Capture throughput contract</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By SpecForge Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SpecForge.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Aug 03, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
