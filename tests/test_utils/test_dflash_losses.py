@@ -773,6 +773,30 @@ class TestDFlashLosses(unittest.TestCase):
         self.assertEqual(anchors[0, 0].item(), 4)
         self.assertEqual(keep[0].tolist(), [True, False])
 
+    def test_dspark_sampler_pads_empty_usp_shard_to_shared_width(self):
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+        )
+        empty_local_mask = torch.zeros(1, 6)
+        anchors, keep = OnlineDSparkModel._sample_anchor_positions(
+            model,
+            seq_len=6,
+            loss_mask=empty_local_mask,
+            device=empty_local_mask.device,
+            minimum_anchor_width=2,
+        )
+        self.assertEqual(anchors.tolist(), [[0, 0]])
+        self.assertEqual(keep.tolist(), [[False, False]])
+        _, eval_mask, _ = model._build_dspark_labels_and_mask(
+            input_ids=torch.arange(6, dtype=torch.long).unsqueeze(0),
+            loss_mask=empty_local_mask,
+            anchor_positions=anchors,
+            block_keep_mask=keep,
+        )
+        self.assertFalse(eval_mask.any())
+
 
 if __name__ == "__main__":
     unittest.main()

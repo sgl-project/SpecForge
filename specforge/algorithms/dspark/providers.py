@@ -137,7 +137,7 @@ def algorithm_spec() -> AlgorithmSpec:
             ),
         ),
         capabilities=AlgorithmCapabilities(
-            attention_backends={"eager", "sdpa", "flex_attention"},
+            attention_backends={"eager", "sdpa", "flex_attention", "usp"},
         ),
     )
 

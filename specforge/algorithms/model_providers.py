@@ -61,6 +61,18 @@ def _device():
     return get_local_device()
 
 
+def _transformers_attention_implementation(attention_backend: str) -> str:
+    """Map SpecForge topology names to Transformers attention dispatchers."""
+
+    if attention_backend == "usp":
+        # USP controls how training ranks shard a sequence. Transformers still
+        # needs a concrete local attention implementation for draft creation.
+        return "sdpa"
+    if attention_backend == "fa":
+        return "flash_attention_2"
+    return attention_backend
+
+
 def _warm_start(
     cfg: Config,
     draft_model: Any,
@@ -161,7 +173,9 @@ def _finish_registered_draft(
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
 
-    draft_config._attn_implementation = cfg.training.attention_backend
+    draft_config._attn_implementation = _transformers_attention_implementation(
+        cfg.training.attention_backend
+    )
     draft_model = AutoDraftModel.from_config(
         draft_config,
         torch_dtype=_torch_dtype(cfg),
@@ -176,7 +190,9 @@ def build_dflash_draft(
 ):
     from specforge.modeling.auto import AutoDraftModel
 
-    draft_config._attn_implementation = cfg.training.attention_backend
+    draft_config._attn_implementation = _transformers_attention_implementation(
+        cfg.training.attention_backend
+    )
     draft_model = AutoDraftModel.from_config(
         draft_config,
         torch_dtype=_torch_dtype(cfg),

@@ -33,6 +33,74 @@ _VALID_LOSS_TYPES = {
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
 
 
+class _GatherSequenceShards(torch.autograd.Function):
+    """All-gather sequence shards while returning remote gradients to owners."""
+
+    @staticmethod
+    def forward(ctx, local_states: torch.Tensor, group, global_sequence_length: int):
+        import torch.distributed as dist
+
+        world_size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+        ctx.group = group
+        ctx.world_size = world_size
+        ctx.rank = rank
+        ctx.local_sequence_length = int(local_states.shape[1])
+        ctx.global_sequence_length = int(global_sequence_length)
+        gathered = [torch.empty_like(local_states) for _ in range(world_size)]
+        dist.all_gather(gathered, local_states.contiguous(), group=group)
+        return torch.cat(gathered, dim=1)[:, :global_sequence_length]
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        import torch.distributed as dist
+
+        full_length = ctx.world_size * ctx.local_sequence_length
+        complete_grad = grad_output.new_zeros(
+            grad_output.shape[0],
+            full_length,
+            grad_output.shape[2],
+        )
+        complete_grad[:, : ctx.global_sequence_length] = grad_output
+        # Each rank's ``grad_output`` contains every source shard. Reduce the
+        # complete gradient and scatter its rank-owned sequence piece; reducing
+        # a rank-local slice directly would incorrectly add different source
+        # positions (rank 0's shard plus rank 1's shard, and so on).
+        backend = str(dist.get_backend(ctx.group)).lower()
+        if backend == "gloo":
+            # Gloo does not provide reduce_scatter_tensor on every supported
+            # PyTorch build. This fallback is numerical-reference only.
+            dist.all_reduce(complete_grad, group=ctx.group)
+            local_grad = complete_grad.split(ctx.local_sequence_length, dim=1)[
+                ctx.rank
+            ].contiguous()
+        else:
+            local_grad = torch.empty_like(complete_grad[:, : ctx.local_sequence_length])
+            dist.reduce_scatter_tensor(
+                local_grad,
+                complete_grad.contiguous(),
+                op=dist.ReduceOp.SUM,
+                group=ctx.group,
+            )
+        return local_grad, None, None
+
+
+def gather_sequence_shards(
+    local_states: torch.Tensor,
+    *,
+    group,
+    global_sequence_length: int,
+) -> torch.Tensor:
+    """Gather equally padded sequence shards with an autograd-correct backward."""
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("DSpark USP requires initialized process groups")
+    if dist.get_world_size(group) <= 1:
+        return local_states[:, :global_sequence_length]
+    return _GatherSequenceShards.apply(local_states, group, global_sequence_length)
+
+
 def compute_accept_len(
     pred_ids_4d: torch.Tensor,
     target_ids_4d: torch.Tensor,
@@ -269,46 +337,122 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
-        )
+        sequence_start = 0
+        context_length = seq_len
+        target_hidden = hidden_states
+        target_hidden_is_projected = False
+        minimum_anchor_width = None
+        if self.attention_backend == "usp":
+            if attention_mask is None:
+                raise ValueError("DSpark USP requires a local attention_mask")
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    "DSpark USP attention_mask must match input_ids, got "
+                    f"{tuple(attention_mask.shape)} and {tuple(input_ids.shape)}"
+                )
+            if bsz != 1:
+                raise ValueError("DSpark USP requires batch_size=1")
+            import torch.distributed as dist
+
+            from specforge.distributed import get_draft_sp_group
+
+            group = get_draft_sp_group()
+            if group is None or not dist.is_initialized():
+                raise RuntimeError("DSpark USP requires initialized draft SP groups")
+            world_size = dist.get_world_size(group)
+            if world_size <= 1:
+                raise ValueError("DSpark USP requires a draft SP group larger than one")
+            local_valid_length = attention_mask.to(dtype=torch.long).sum().reshape(1)
+            valid_lengths = [
+                torch.zeros_like(local_valid_length) for _ in range(world_size)
+            ]
+            dist.all_gather(valid_lengths, local_valid_length, group=group)
+            lengths = [int(length.item()) for length in valid_lengths]
+            sequence_start = sum(lengths[: dist.get_rank(group)])
+            context_length = sum(lengths)
+            if context_length <= 0:
+                raise ValueError("DSpark USP sample has no valid context tokens")
+            # The stored feature is [capture_layers * hidden_size]. Projecting
+            # before HCCL exchange cuts the communicated width to hidden_size.
+            projected_target_hidden = self.draft_model.encode_target_hidden(
+                hidden_states
+            )
+            target_hidden = gather_sequence_shards(
+                projected_target_hidden,
+                group=group,
+                global_sequence_length=context_length,
+            )
+            target_hidden_is_projected = True
+
+            if self.loss_type == "dspark":
+                local_valid = (
+                    self._build_anchor_candidate_mask(seq_len, loss_mask)
+                    .sum(dim=1)
+                    .max()
+                    .to(dtype=torch.long)
+                )
+                dist.all_reduce(local_valid, op=dist.ReduceOp.MAX, group=group)
+                minimum_anchor_width = min(self.num_anchors, int(local_valid.item()))
+                if minimum_anchor_width <= 0:
+                    raise ValueError(
+                        "DSpark USP found no valid anchor with two consecutive loss tokens"
+                    )
+
+        if minimum_anchor_width is None:
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len, loss_mask, device
+            )
+        else:
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len,
+                loss_mask,
+                device,
+                minimum_anchor_width=minimum_anchor_width,
+            )
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
         )
 
         context_position_ids = (
-            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            torch.arange(context_length, device=device).unsqueeze(0).expand(bsz, -1)
         )
-        draft_position_ids = self._create_position_ids(anchor_positions)
+        attention_anchor_positions = anchor_positions + sequence_start
+        draft_position_ids = self._create_position_ids(attention_anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
         if self.attention_backend == "flex_attention":
             dflash_attn_mask = create_dflash_block_mask(
-                anchor_positions=anchor_positions,
+                anchor_positions=attention_anchor_positions,
                 block_keep_mask=block_keep_mask,
-                S=seq_len,
+                S=context_length,
                 block_size=self.block_size,
                 device=device,
             )
         else:
             dflash_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions=anchor_positions,
+                anchor_positions=attention_anchor_positions,
                 block_keep_mask=block_keep_mask,
-                S=seq_len,
+                S=context_length,
                 block_size=self.block_size,
                 device=device,
             )
 
+        draft_kwargs = {
+            "position_ids": full_position_ids,
+            "noise_embedding": noise_embedding,
+            "target_hidden": target_hidden,
+            "attention_mask": dflash_attn_mask,
+        }
+        if target_hidden_is_projected:
+            draft_kwargs["target_hidden_is_projected"] = True
         output_hidden = self.draft_model(
-            position_ids=full_position_ids,
-            noise_embedding=noise_embedding,
-            target_hidden=hidden_states,
-            attention_mask=dflash_attn_mask,
+            **draft_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
 
@@ -776,15 +920,26 @@ class OnlineDSparkModel(OnlineDFlashModel):
         return anchor_valid & first_target_valid
 
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        *,
+        minimum_anchor_width: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample only anchors with a valid first target, without dummy width."""
+        """Sample valid anchors, padding USP-local empty shards when required."""
 
         valid = self._build_anchor_candidate_mask(seq_len, loss_mask)
         if valid.shape[1] == 0:
             raise ValueError("DSpark needs sequences with at least two tokens")
         valid_counts = valid.sum(dim=1)
-        width = min(self.num_anchors, int(valid_counts.max().item()))
+        local_width = min(self.num_anchors, int(valid_counts.max().item()))
+        width = local_width if minimum_anchor_width is None else minimum_anchor_width
+        if width > self.num_anchors:
+            raise ValueError(
+                "DSpark minimum_anchor_width exceeds configured num_anchors: "
+                f"{width} > {self.num_anchors}"
+            )
         if width <= 0:
             raise ValueError(
                 "DSpark found no valid anchor with two consecutive loss tokens"
@@ -1128,6 +1283,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -1138,6 +1294,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            attention_mask=attention_mask,
         )
 
         (
