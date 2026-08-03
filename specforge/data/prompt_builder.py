@@ -94,7 +94,7 @@ def prepare_prompt_tasks(
         num_proc=num_proc,
         min_loss_tokens=min_loss_tokens,
         limit=limit,
-        loss_mask_filter=loss_mask_filter,
+        loss_mask_filter=None,
     )
 
 
@@ -143,7 +143,6 @@ def _prepare_raw_prompts(
         processed_dataset,
         max_length=max_length,
         min_loss_tokens=min_loss_tokens,
-        limit=limit,
         loss_mask_filter=loss_mask_filter,
     )
 
