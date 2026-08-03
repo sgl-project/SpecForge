@@ -672,6 +672,27 @@ fresh architecture:</p>
 <span class="w">  </span><span class="nt">draft_block_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span><span class="w">         </span><span class="c1"># DFlash only</span>
 </pre></div>
 </div>
+<p>For DFlash, configure the attention layout in the referenced draft JSON. Each
+entry corresponds to one draft layer; sliding layers share one positive window:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;layer_types&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="s2">&quot;sliding_attention&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="s2">&quot;sliding_attention&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="s2">&quot;sliding_attention&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="s2">&quot;sliding_attention&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="s2">&quot;full_attention&quot;</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;use_sliding_window&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;sliding_window&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Use <code class="docutils literal notranslate"><span class="pre">&quot;full_attention&quot;</span></code> for every entry, <code class="docutils literal notranslate"><span class="pre">&quot;use_sliding_window&quot;:</span> <span class="pre">false</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">&quot;sliding_window&quot;:</span> <span class="pre">null</span></code> for a full-only draft. The layout length must equal
+<code class="docutils literal notranslate"><span class="pre">num_hidden_layers</span></code>. A layer-count override may resize a uniform layout, but a
+mixed layout must be edited explicitly in the draft JSON.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">eager</span></code>, <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>, and <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> backends support both layouts.</p>
 <p>Domino and DSpark need their projector/head metadata, so they require an
 explicit draft config (or a pretrained warm-start source that contains
 <code class="docutils literal notranslate"><span class="pre">config.json</span></code>). The old Domino parser exposed an optional config flag, but its

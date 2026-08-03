@@ -154,6 +154,31 @@ model:
   draft_block_size: 8         # DFlash only
 ```
 
+For DFlash, configure the attention layout in the referenced draft JSON. Each
+entry corresponds to one draft layer; sliding layers share one positive window:
+
+```json
+{
+  "num_hidden_layers": 5,
+  "layer_types": [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention"
+  ],
+  "use_sliding_window": true,
+  "sliding_window": 2048
+}
+```
+
+Use `"full_attention"` for every entry, `"use_sliding_window": false`, and
+`"sliding_window": null` for a full-only draft. The layout length must equal
+`num_hidden_layers`. A layer-count override may resize a uniform layout, but a
+mixed layout must be edited explicitly in the draft JSON.
+
+The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
+
 Domino and DSpark need their projector/head metadata, so they require an
 explicit draft config (or a pretrained warm-start source that contains
 `config.json`). The old Domino parser exposed an optional config flag, but its
