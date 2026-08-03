@@ -280,17 +280,17 @@ Our next steps are to finish releasing the draft models for the remaining target
 
 We thank the SGLang and SpecForge communities, the authors of the supported speculative decoding methods, and all contributors who helped test the new runtime and algorithm integrations.
 
-**SpecForge Team**: Jiaping Wang, Shenggui Li, Xiaoming Dong, Chao Wang
+**SpecForge Team**: Jiaping Wang, Shenggui Li, Xiaoming Dong, Chao Wang, and Ji Li
 
 **RadixArk Team**: Cheng Mao, Yi Sun, and Kan Wu
 
 **Domino**: Jianuo Huang
 
-**Ant Group AQ Team**: Yefei Chen
+**Ant Group AQ Team**: Yefei Chen, Yuan Wang
 
 **China Merchants Bank Team**: Peixiang Tan
 
-**Meta/Pytorch:** Richard Zou
+**Meta/Pytorch:**: Richard Zou
 
-**Modal Team** 
+**Modal Team**
 
