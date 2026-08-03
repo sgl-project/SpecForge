@@ -136,6 +136,7 @@ LEGACY_EPOCH_OVERRIDES = {
     "qwen3.5-35b-a3b-dflash-online.yaml": 10,
     "qwen3.5-4b-dflash-online-npu.yaml": 10,
     "qwen3.5-4b-domino-online-npu.yaml": 10,
+    "qwen3.5-4b-vl-dflash-disaggregated.yaml": 10,
 }
 
 
@@ -146,7 +147,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 63)
+        self.assertEqual(len(paths), 64)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths
@@ -199,7 +200,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             with self.subTest(config=filename, contract="server-only online"):
                 self.assertEqual(config.deployment.mode, "disaggregated")
                 self.assertEqual(config.model.target_backend, "sglang")
-                self.assertEqual(config.model.input_modality, "text")
+                self.assertIn(config.model.input_modality, {"text", "multimodal"})
 
     def test_compact_teacher_reaches_the_eagle3_step_provider(self):
         cfg = Config.model_validate(

@@ -448,8 +448,12 @@ def populate_dflash_generated_config(
     payload: Dict[str, Any], target_config: Any, _cfg: Config
 ) -> None:
     from specforge.modeling.draft.dflash import build_target_layer_ids
+    from specforge.modeling.target.target_utils import target_text_config
 
-    target_layers = getattr(target_config, "num_hidden_layers", None)
+    # VLM targets (Qwen3-VL / Qwen3.5 / Qwen3.6) keep the language-model depth
+    # under ``text_config``; the top-level value may describe the vision stack.
+    text_config = target_text_config(target_config)
+    target_layers = getattr(text_config, "num_hidden_layers", None)
     if not isinstance(target_layers, int) or target_layers < 1:
         raise ValueError(
             "DFlash auto-generation requires target num_hidden_layers, got "

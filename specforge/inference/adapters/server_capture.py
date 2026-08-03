@@ -48,12 +48,16 @@ class ServerCaptureSchema:
     ``(feature_name, payload_key, trailing_shape)`` for client tensors stored
     verbatim (``trailing_shape`` is appended after ``(1, L)``).
     ``attention_mask_feature`` is synthesized all-ones (PromptTasks are unpadded).
+    ``position_ids_feature`` names the server-produced position-id artifact
+    (mRoPE positions for multimodal targets, stored ``(1, L, 3)`` int64);
+    None = not requested.
     """
 
     aux_feature: Optional[str]
     last_hidden_feature: Optional[str]
     passthrough: Tuple[Tuple[str, str, Tuple[int, ...]], ...]
     attention_mask_feature: Optional[str] = None
+    position_ids_feature: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -208,6 +212,8 @@ class SGLangServerCaptureAdapter:
             features["aux"] = self.schema.aux_feature
         if self.schema.last_hidden_feature is not None:
             features["last_hidden"] = self.schema.last_hidden_feature
+        if self.schema.position_ids_feature is not None:
+            features["position_ids"] = self.schema.position_ids_feature
         passthrough: List[Dict[str, Any]] = []
         for feature_name, payload_key, trailing in self.schema.passthrough:
             if payload_key == "input_ids":

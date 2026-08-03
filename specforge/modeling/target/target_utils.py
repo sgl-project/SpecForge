@@ -67,6 +67,45 @@ def target_text_config(config):
     return getattr(config, "text_config", config)
 
 
+#: Target ``model_type`` values whose checkpoints nest the language-model
+#: weights under ``model.language_model.*`` (Qwen VLM families).
+QWEN3_VL_MODEL_TYPES = {"qwen3_vl", "qwen3_vl_moe", "qwen3_5_moe", "qwen3_5"}
+
+
+def is_vlm_target_config(config) -> bool:
+    """Whether the target config is a vision-language model with a text stack."""
+    model_type = getattr(config, "model_type", None)
+    return model_type in QWEN3_VL_MODEL_TYPES or hasattr(config, "text_config")
+
+
+#: Default (non-VLM) embedding weight key.
+DEFAULT_EMBED_KEY = "model.embed_tokens.weight"
+#: Embedding weight key inside VLM checkpoints' language-model stack.
+VLM_EMBED_KEY = "model.language_model.embed_tokens.weight"
+
+
+def resolve_target_weight_keys(
+    config,
+    embed_key: Optional[str] = None,
+    lm_head_key: Optional[str] = None,
+) -> tuple[str, str]:
+    """Resolve default embedding / lm_head weight keys for a target config.
+
+    VLM checkpoints (Qwen3-VL, Qwen3.5, Qwen3.6) store the language-model
+    embedding at ``model.language_model.embed_tokens.weight`` instead of the
+    LLM default ``model.embed_tokens.weight``; the lm_head stays top-level.
+    An ``embed_key`` that is unset or left at the LLM default is rewritten
+    automatically for VLM targets; any other explicit key is honored as-is.
+    """
+    if embed_key is None or (
+        embed_key == DEFAULT_EMBED_KEY and is_vlm_target_config(config)
+    ):
+        embed_key = VLM_EMBED_KEY if is_vlm_target_config(config) else DEFAULT_EMBED_KEY
+    if lm_head_key is None:
+        lm_head_key = "lm_head.weight"
+    return embed_key, lm_head_key
+
+
 def target_vocab_size(config) -> int:
     text_config = target_text_config(config)
     return int(
@@ -113,10 +152,9 @@ class TargetEmbeddingsAndHead(nn.Module):
         )
         instance = cls(config)
 
-        if embed_key is None:
-            embed_key = "model.embed_tokens.weight"
-        if lm_head_key is None:
-            lm_head_key = "lm_head.weight"
+        embed_key, lm_head_key = resolve_target_weight_keys(
+            config, embed_key, lm_head_key
+        )
 
         # 2. Resolve Model Path
         local_model_path = model_path
