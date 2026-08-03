@@ -55,6 +55,19 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 }
                 self.assertEqual(contract_keys, provider_keys)
 
+    def test_dflash_family_requires_a_trainable_block_size(self):
+        for algorithm in ("dflash", "domino", "dspark"):
+            minimum_loss_tokens = self.registry.resolve(
+                algorithm
+            ).providers.model.minimum_loss_tokens
+            with self.subTest(algorithm=algorithm):
+                self.assertEqual(
+                    minimum_loss_tokens(None, SimpleNamespace(block_size=2)),
+                    2,
+                )
+                with self.assertRaisesRegex(ValueError, "block_size >= 2"):
+                    minimum_loss_tokens(None, SimpleNamespace(block_size=1))
+
     def test_algorithm_metadata_has_no_factories_or_topology_flags(self):
         field_names = {field.name for field in fields(AlgorithmSpec)}
         self.assertEqual(

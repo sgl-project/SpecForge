@@ -403,6 +403,7 @@ def _prepare_prompts(
         num_proc=cfg.data.build_dataset_num_proc,
         min_loss_tokens=min_loss_tokens,
         max_prompts=cfg.data.max_prompts,
+        loss_mask_filter=algorithm.providers.model.loss_mask_filter,
     )
 
 
