@@ -100,6 +100,10 @@ class ModelConfig(StrictConfigModel):
     sglang_quantization: Optional[str] = None
     sglang_fp4_gemm_runner_backend: Optional[str] = None
     sglang_mamba_radix_cache_strategy: Optional[str] = None
+    #: Disable the SGLang radix (prefix) cache. Required for hybrid
+    #: linear-attention/Mamba targets on ROCm, whose mamba radix-cache
+    #: ``extra_buffer`` strategy asserts CUDA/MUSA/NPU (FLA) at server init.
+    sglang_disable_radix_cache: bool = False
     sglang_max_mamba_cache_size: Optional[int] = Field(default=None, gt=0)
     sglang_swa_full_tokens_ratio: Optional[float] = Field(
         default=None,

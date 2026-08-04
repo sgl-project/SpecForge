@@ -351,102 +351,129 @@ freshness rules, multi-server capture, and resume, see the
 
 ## Reference results on MI355X
 
-The offline and online recipes above were run end-to-end on a single AMD
-Instinct **MI355X** (gfx950) inside the `lmsysorg/sglang:v0.5.14-rocm720-mi35x`
-container, training a **Qwen2.5-0.5B** EAGLE3 draft head on ShareGPT
-(`max_length=512`, `ttt_length=7`, `flex_attention`, `batch_size=1`,
-`learning_rate=1e-4`) for 1,500 steps. Offline consumes hidden states captured
-to disk by `prepare_hidden_states.py`; online consumes the same features
-streamed live from a patched SGLang capture server through Mooncake. Both paths
-converge to the same loss and acceptance rate — the online capture path
-reproduces offline quality on ROCm.
+The offline and online paths were run end-to-end on a single AMD Instinct
+**MI355X** (gfx950) inside the `lmsysorg/sglang:v0.5.14-rocm720-mi35x` container,
+training a **Qwen3.5-4B DFlash** draft on ShareGPT. Qwen3.5-4B is a hybrid
+linear-attention/Mamba target (`Qwen3_5ForConditionalGeneration`); its draft is a
+5-layer DFlash head (`hidden_size=2560`, `block_size=16`,
+`target_layer_ids=[1, 8, 15, 22, 29]`). Both runs used `max_length=2048`,
+`chat_template=qwen3.5`, `batch_size=2`, `accumulation_steps=4`,
+`learning_rate=6e-4`, `num_anchors=512`, `loss_decay_gamma=7`, a `flex_attention`
+trainer, and ~10 epochs (~680 optimizer steps).
+
+The SGLang side (offline capture and online capture server) runs the hybrid
+Mamba target under **AITER** on ROCm — export
+`SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1` and use
+`--attention-backend aiter`. A ROCm-specific requirement: the target needs
+**`--disable-radix-cache`** (offline: `--sglang-disable-radix-cache`; online:
+`sglang_disable_radix_cache: true`). SGLang's Mamba radix cache auto-selects the
+`extra_buffer` strategy, which asserts CUDA/MUSA/NPU (FLA) at server init and
+fails on ROCm; disabling the radix cache bypasses that path. Offline consumes
+hidden states captured to disk by `prepare_hidden_states.py`; online consumes the
+same features streamed live from the AITER capture server through Mooncake. Both
+paths converge together — the online capture path reproduces offline quality on
+ROCm.
 
 ### Training loss
 
-![EAGLE3 training loss on MI355X](imgs/mi355x_eagle3_loss.png)
+![Qwen3.5-4B DFlash training loss on MI355X](imgs/mi355x_qwen35_4b_dflash_loss.png)
 
-Draft-head loss falls from ~25–34 to ~15 over 1,500 steps. Faint lines are raw
-per-step values; bold lines are an exponential moving average. (Offline logs a
-handful of all-zero steps where a batch is fully truncated at `max_length`; those
-degenerate points are filtered from the curve.)
+Draft loss falls from ~9 to ~5.6 over ~680 steps. Faint lines are raw per-step
+values; bold lines are an exponential moving average.
 
-### Acceptance rate
+### Draft accuracy
 
-![EAGLE3 acceptance rate on MI355X](imgs/mi355x_eagle3_acceptance.png)
+![Qwen3.5-4B DFlash draft accuracy on MI355X](imgs/mi355x_qwen35_4b_dflash_acc.png)
 
-Mean draft-token acceptance rate — the quantity that translates into speculative
-decoding speedup at serving time — rises from ~0.01 to ~0.15 and the two paths
-track each other closely.
+Top-1 draft-token accuracy (`acc`) — the training-time proxy for serving-time
+acceptance — rises from ~0.03 to ~0.12–0.13 and the two paths track each other
+closely.
 
 ### Summary
 
 | Metric (final) | Offline | Online |
 | --- | --- | --- |
-| Draft loss (start → end) | 24.5 → 15.2 | 34.2 → 15.2 |
-| Top-1 draft accuracy (`acc_0`) | ~0.24 | ~0.25 |
-| Mean acceptance rate | ~0.16 | ~0.15 |
-| Training steps | 1,500 | 1,500 |
+| Draft loss (start → end) | 8.3 → 5.6 | 9.1 → 5.7 |
+| Top-1 draft accuracy (`acc`) | ~0.12 (peak ~0.22) | ~0.13 (peak ~0.17) |
+| Epochs / steps | 10 / 687 | 10 / 670 |
 
-**Throughput** (single MI355X GCD, `batch_size=1`, sequence length 512):
+**Throughput** (single MI355X, `batch_size=2`, `max_length=2048`):
 
-- **Offline** trainer: ~3–4 steps/s (pure GPU-local training; no capture server
-  in the loop).
-- **Online** trainer: ~1.7 steps/s end-to-end, bounded by a single capture
-  server producing ~1.9 prompts/s at ~10k tokens/s. The producer generated
-  1,719 prompts with **0 failures**; add more `capture_servers` to raise
-  producer throughput.
+- **Offline** capture: the AITER server generated hidden states for 572 prompts
+  (286 batches) in ~48 s (~8 batches/s). The GPU-local trainer then ran at
+  ~0.3 steps/s — sequences up to 2,048 tokens on a 4B target are much heavier
+  than a small draft at short context.
+- **Online** trainer: ~1.3 steps/s end-to-end (670 steps in ~520 s) with the
+  capture server on GPU 0 and the trainer on GPU 1. A single AITER capture server
+  produced 5,410 prompts across 10 epochs with **0 failures** (~10 prompts/s);
+  the single-command `managed_local` stack (Mooncake master + capture server +
+  trainer) came up and tore down cleanly (`default_kv_lease_ttl_ms=500`).
 
-These numbers are a functional reference for a 0.5B draft on one GCD, not a tuned
-performance benchmark — larger targets, longer sequences, and multi-GPU trainers
-scale differently.
+> **Data note (offline only):** `prepare_hidden_states.py` truncates each rendered
+> conversation at `max_length`. Long-prompt samples whose assistant reply is
+> pushed past the cutoff end up with an empty loss region, i.e. fewer than two
+> anchorable tokens, which trips DFlash's anchor sampler
+> (`ValueError: should preprocess the data.`). Drop those captured samples (any
+> with `< 2` loss-mask tokens before the last `block_size` positions) before
+> training. The online path never hits this — its producer regenerates full-length
+> responses, so every streamed sample has a non-empty loss region.
+
+These numbers are a functional reference for a 4B DFlash draft on ROCm, not a
+tuned performance benchmark — longer sequences and multi-GPU trainers scale
+differently.
+
+---
 
 ## Reference results on MI300X
 
-The same offline and online recipes were replicated on a single AMD Instinct
-**MI300X** (gfx942) inside the `lmsysorg/sglang:v0.5.14-rocm720-mi30x` container,
-with identical hyperparameters (**Qwen2.5-0.5B** EAGLE3 head on ShareGPT,
-`max_length=512`, `ttt_length=7`, `flex_attention`, `batch_size=1`,
-`learning_rate=1e-4`, 1,500 steps). The capture server used the `triton`
-attention backend (flashinfer is CUDA-only). This node was shared with another
-tenant, so the capture server and trainer each ran with a small
-`sglang_mem_fraction_static` (~0.12) on separate GPUs; on an idle MI300X you can
-raise these and expect higher throughput.
+The same **Qwen3.5-4B DFlash** recipe was reproduced end-to-end on a single AMD
+Instinct **MI300X** (gfx942) inside the `lmsysorg/sglang:v0.5.14-rocm720-mi30x`
+container, using identical hyperparameters (offline and online, `max_length=2048`,
+`chat_template=qwen3.5`, `batch_size=2`, `accumulation_steps=4`,
+`learning_rate=6e-4`, `num_anchors=512`, `loss_decay_gamma=7`, `flex_attention`
+trainer, ~10 epochs). The ROCm requirements are the same as on MI355X: run the
+hybrid Mamba target under **AITER**
+(`SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1`,
+`--attention-backend aiter`) and **`--disable-radix-cache`** to bypass the
+`extra_buffer` Mamba radix-cache FLA assertion.
 
 ### Training loss
 
-![EAGLE3 training loss on MI300X](imgs/mi300x_eagle3_loss.png)
+![Qwen3.5-4B DFlash training loss on MI300X](imgs/mi300x_qwen35_4b_dflash_loss.png)
 
-Draft-head loss falls from ~25–34 to ~15 over 1,500 steps, matching the MI355X
-run. Faint lines are raw per-step values; bold lines are an exponential moving
-average.
+Draft loss falls from ~8.4 to ~5.4 over ~680 steps; faint lines are raw per-step
+values, bold lines an exponential moving average.
 
-### Acceptance rate
+### Draft accuracy
 
-![EAGLE3 acceptance rate on MI300X](imgs/mi300x_eagle3_acceptance.png)
+![Qwen3.5-4B DFlash draft accuracy on MI300X](imgs/mi300x_qwen35_4b_dflash_acc.png)
 
-Mean draft-token acceptance rate rises from ~0.01 to ~0.15 and the offline and
-online paths track each other closely — the online capture path reproduces
-offline quality on gfx942 as well.
+Top-1 draft-token accuracy (`acc`) climbs from ~0.02 to ~0.14, and the offline and
+online paths converge to the same quality — matching the MI355X result.
 
 ### Summary
 
 | Metric (final) | Offline | Online |
 | --- | --- | --- |
-| Draft loss (start → end) | 24.5 → 15.0 | 34.0 → 15.5 |
-| Top-1 draft accuracy (`acc_0`) | ~0.26 | ~0.28 |
-| Mean acceptance rate | ~0.16 | ~0.15 |
-| Training steps | 1,500 | 1,500 |
+| Draft loss (start → end) | 8.3 → 5.4 | 8.5 → 5.5 |
+| Top-1 draft accuracy (`acc`) | ~0.14 (peak ~0.21) | ~0.14 (peak ~0.16) |
+| Epochs / steps | 10 / 687 | 10 / 666 |
 
-**Throughput** (single MI300X, `batch_size=1`, sequence length 512, GPUs shared
-with another tenant at ~0.12 mem fraction):
+**Throughput** (single MI300X, `batch_size=2`, `max_length=2048`):
 
-- **Offline** trainer: ~5–8 steps/s (pure GPU-local training; no capture server
-  in the loop).
-- **Online** trainer: ~7 steps/s end-to-end (1,500 steps in ~200 s). The managed
-  `triton` capture server sustained ~38k tokens/s prefill and the producer
-  generated 1,695 prompts with **0 failures**; the single-command
-  `managed_local` stack (Mooncake master + capture server + trainer) came up and
-  tore down cleanly (`default_kv_lease_ttl_ms=500`, no drain failure).
+- **Offline** capture: the AITER server captured hidden states for all 572
+  prompts; 21 truncated samples with an empty loss region were dropped (see the
+  data note below), leaving 551 for training.
+- **Online** trainer: 666 steps in ~858 s (~0.78 steps/s) with the capture server
+  on GPU 0 and the trainer on GPU 1. A single AITER capture server produced 5,330
+  prompts across 10 epochs with **0 failures** (~6 prompts/s) and streamed 15,990
+  feature objects through Mooncake; the single-command `managed_local` stack came
+  up and tore down cleanly (`default_kv_lease_ttl_ms=500`).
 
-As with the MI355X figures, these are a functional cross-architecture reference
-(gfx942 vs gfx950), not a tuned performance benchmark.
+> **Data note (offline only):** identical to the MI355X run — the offline capture
+> produced the same 21 empty-loss-region samples (mostly `max_length`-truncated
+> conversations), which must be dropped before training or DFlash's anchor sampler
+> raises `ValueError: should preprocess the data.`. The online path never hits this.
+
+Results on MI300X track MI355X closely, confirming the ROCm DFlash flow (AITER +
+`--disable-radix-cache`) is portable across gfx942 and gfx950.
