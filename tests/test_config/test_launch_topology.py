@@ -20,10 +20,7 @@ EXPECTED_NPROC_PER_NODE = {
     "gpt-oss-20b-eagle3-online.yaml": 8,
     "lfm2.5-1.2b-instruct-dflash-online.yaml": 8,
     "inkling-dspark-disaggregated.yaml": 1,
-    "kimi-k3-dspark-v1c-disaggregated.yaml": 4,
-    "kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml": 8,
-    "kimi-k3-dspark-5mla-openperfectblend-disaggregated.yaml": 8,
-    "kimi-k3-dspark-4kda-1mla-openperfectblend-disaggregated.yaml": 8,
+    "kimi-k3-dspark-disaggregated.yaml": 4,
     "ling-flash-2.0-eagle3-offline.yaml": 8,
     "ling-flash-2.0-eagle3-online.yaml": 8,
     "llama3.1-8b-eagle3-offline.yaml": 1,
@@ -316,7 +313,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 67)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 64)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
@@ -341,16 +338,6 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 )
                 self.assertEqual(deployment["mode"], expected_mode)
                 expected_trainer = {"nnodes": 1, "nproc_per_node": nproc_per_node}
-                if (
-                    filename
-                    == "kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml"
-                ):
-                    expected_trainer = {
-                        "nnodes": 2,
-                        "nproc_per_node": 8,
-                        "master_addr": "trainer-node-0",
-                        "master_port": 29500,
-                    }
                 self.assertEqual(
                     deployment["trainer"],
                     expected_trainer,
@@ -379,13 +366,7 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 config = Config.from_file(str(path))
                 topology = config.deployment.trainer
                 expected_nproc = EXPECTED_NPROC_PER_NODE[filename]
-                expected_nnodes = (
-                    2
-                    if filename
-                    == "kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml"
-                    else 1
-                )
-                self.assertEqual(topology.nnodes, expected_nnodes)
+                self.assertEqual(topology.nnodes, 1)
                 self.assertEqual(topology.nproc_per_node, expected_nproc)
                 config.validate_world_size(topology.nnodes * expected_nproc)
 
@@ -438,7 +419,7 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
         self.assertEqual(qwen4b.training.objective_chunk_blocks, 128)
 
         kimi = Config.from_file(
-            str(EXAMPLE_CONFIG_DIR / "kimi-k3-dspark-v1c-disaggregated.yaml")
+            str(EXAMPLE_CONFIG_DIR / "kimi-k3-dspark-disaggregated.yaml")
         )
         kimi_topology = kimi.deployment.trainer
         self.assertEqual(
@@ -456,55 +437,6 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
         )
         self.assertEqual(kimi.data.max_length, 65536)
         self.assertEqual(kimi.training.num_anchors, 512)
-
-        # The portable MLA/KDA recipes preserve the 16-sample optimizer
-        # microbatch on one DP8 trainer with two samples per rank.
-        for filename in (
-            "kimi-k3-dspark-5mla-openperfectblend-disaggregated.yaml",
-            "kimi-k3-dspark-4kda-1mla-openperfectblend-disaggregated.yaml",
-        ):
-            with self.subTest(config=filename):
-                config = Config.from_file(str(EXAMPLE_CONFIG_DIR / filename))
-                topology = config.deployment.trainer
-                world_size = topology.nnodes * topology.nproc_per_node
-                self.assertEqual(world_size, 8)
-                self.assertEqual(config.training.batch_size, 2)
-                self.assertEqual(config.training.accumulation_steps, 32)
-                self.assertEqual(world_size * config.training.batch_size, 16)
-                self.assertEqual(
-                    world_size
-                    * config.training.batch_size
-                    * config.training.accumulation_steps,
-                    512,
-                )
-
-        # The exact reference recipe restores the source job's 16 trainer
-        # ranks. Keeping one sample per GPU avoids doubling per-rank draft
-        # compute, while the HTTP inbox relay removes any shared-filesystem
-        # requirement for the second trainer node.
-        reference = Config.from_file(
-            str(
-                EXAMPLE_CONFIG_DIR
-                / "kimi-k3-dspark-fullattn-openperfectblend-disaggregated.yaml"
-            )
-        )
-        topology = reference.deployment.trainer
-        world_size = topology.nnodes * topology.nproc_per_node
-        self.assertEqual(world_size, 16)
-        self.assertEqual(reference.training.batch_size, 1)
-        self.assertEqual(reference.training.accumulation_steps, 32)
-        self.assertEqual(world_size * reference.training.batch_size, 16)
-        self.assertEqual(
-            world_size
-            * reference.training.batch_size
-            * reference.training.accumulation_steps,
-            512,
-        )
-        self.assertEqual(topology.master_addr, "trainer-node-0")
-        self.assertEqual(
-            reference.deployment.disaggregated.inbox_server_url,
-            "http://trainer-node-0:35900",
-        )
 
 
 if __name__ == "__main__":

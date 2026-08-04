@@ -213,7 +213,4 @@ URL userinfo are redacted.
 
 See the [disaggregated training guide](../../docs/basic_usage/disaggregated_training.md)
 for service prerequisites, recovery rules, and the online/offline data-plane
-contracts. Kimi-K3's two-replica production recipes use
-`run_kimi_k3_dspark_capture_server.sh` on each TP8 capture node; set the
-node-local model path and routable capture/Mooncake addresses through the
-script's required environment variables.
+contracts.

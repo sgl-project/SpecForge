@@ -1,6 +1,6 @@
-# Kimi K3 V1C DSpark disaggregated reproduction
+# Kimi K3 DSpark disaggregated reproduction
 
-This recipe migrates the prior four-node colocated Kimi K3 V1C continual run
+This recipe migrates the prior four-node colocated Kimi K3 continual run
 to one TP8 capture node and one four-rank trainer node. It preserves the draft
 architecture, weights-only warm start, regenerated agentic prompt order,
 effective global batch, constant learning rate, and DSpark loss weights.
@@ -27,11 +27,11 @@ and the Marlin grid.y fallback above 65,535 tokens.
 
 ## Artifacts
 
-The checked-in recipe uses the paths already provisioned on the K3 RunPod
-pool. Other deployments should override them without editing the recipe:
+The checked-in recipe uses paths already provisioned on the deployment. Other
+deployments should override them without editing the recipe:
 
 - target revision `cdd2e49a2c1cf8d4713b513955e415ed75405a72`;
-- the weights-only V1C `epoch_0_step_0` draft checkpoint;
+- the weights-only `epoch_0_step_0` draft checkpoint;
 - the 462-row regenerated dataset whose SHA-256 is
   `6d50e6bb9ee59095eed91bfba035081efef9fea43bece9ad5dd01c6648a8ef24`.
 
@@ -105,7 +105,7 @@ export WANDB_API_KEY="$(< /protected/path/wandb-api-key)"
 export WANDB_ENTITY=your-entity
 unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT NODE_RANK
 CUDA_VISIBLE_DEVICES=0,1,2,3 specforge train \
-  -c examples/configs/kimi-k3-dspark-v1c-disaggregated.yaml \
+  -c examples/configs/kimi-k3-dspark-disaggregated.yaml \
   --role both \
   "deployment.disaggregated.server_urls=[\"http://$CAPTURE_IP:30000\"]" \
   "deployment.disaggregated.mooncake_metadata_server=http://$CAPTURE_IP:35880/metadata" \
@@ -127,10 +127,10 @@ fixture and shrink the optimizer quantum:
 
 ```bash
 specforge train \
-  -c examples/configs/kimi-k3-dspark-v1c-disaggregated.yaml \
+  -c examples/configs/kimi-k3-dspark-disaggregated.yaml \
   --role both \
   data.train_data_path= \
-  data.prompts_path=/workspace/k3_dspark/k3_specforge/cache/kimi-k3-agentic-regen-9a6ea2c7-v1c-full139264/longest-smoke-pretokenized-4rows-65536.jsonl \
+  data.prompts_path=/workspace/k3_dspark/data/longest-smoke-pretokenized-4rows-65536.jsonl \
   training.num_epochs=1 \
   training.max_steps=1 \
   training.accumulation_steps=1 \

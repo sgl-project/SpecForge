@@ -50,9 +50,9 @@ two patched SGLang capture servers, and the trainer GPU allocation; the same
 Disaggregated recipes without `managed_local` keep Mooncake and SGLang external
 for scheduler- or service-managed deployments.
 
-The `kimi-k3-dspark-v1c-disaggregated.yaml` recipe is the external-service
-two-node migration of the 64K Kimi K3 V1C continual run. Its dedicated
-[runbook](../../docs/recipes/kimi-k3-dspark-v1c-disaggregated.md) pins the K3
+The `kimi-k3-dspark-disaggregated.yaml` recipe is the external-service
+two-node migration of the 64K Kimi K3 continual run. Its dedicated
+[runbook](../../docs/recipes/kimi-k3-dspark-disaggregated.md) pins the K3
 SGLang revision and patch target, preserves the old effective global batch and
 prompt order, and documents the TP8 capture plus four-rank trainer topology.
 
