@@ -33,8 +33,9 @@ def apply_legacy_rope_scaling(output_dir: str) -> bool:
     """Keep modern and legacy RoPE scaling fields compatible in an export.
 
     Transformers 5 writes ``rope_parameters`` while older serving stacks read
-    only ``rope_scaling``. When exactly one non-default representation is
-    present, write the other. On by default; set
+    only ``rope_scaling`` and the top-level ``rope_theta``. Mirror non-default
+    scaling representations and preserve the modern ``rope_theta`` for legacy
+    readers. On by default; set
     ``SPECFORGE_DISABLE_LEGACY_ROPE_SCALING=1`` to skip. Returns whether the
     config was rewritten.
     """
@@ -51,6 +52,13 @@ def apply_legacy_rope_scaling(output_dir: str) -> bool:
     def rope_kind(payload):
         return (payload or {}).get("rope_type") or (payload or {}).get("type")
 
+    changed = False
+    if rope_parameters and "rope_theta" in rope_parameters:
+        rope_theta = rope_parameters["rope_theta"]
+        if config.get("rope_theta") != rope_theta:
+            config["rope_theta"] = rope_theta
+            changed = True
+
     if (
         rope_parameters
         and not rope_scaling
@@ -59,8 +67,7 @@ def apply_legacy_rope_scaling(output_dir: str) -> bool:
         config["rope_scaling"] = {
             key: value for key, value in rope_parameters.items() if key != "rope_theta"
         }
-        if "rope_theta" in rope_parameters:
-            config["rope_theta"] = rope_parameters["rope_theta"]
+        changed = True
     elif (
         rope_scaling
         and not rope_parameters
@@ -70,7 +77,9 @@ def apply_legacy_rope_scaling(output_dir: str) -> bool:
         if "rope_theta" in config:
             mirrored.setdefault("rope_theta", config["rope_theta"])
         config["rope_parameters"] = mirrored
-    else:
+        changed = True
+
+    if not changed:
         return False
 
     temporary = f"{config_path}.{os.getpid()}.tmp"

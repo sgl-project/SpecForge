@@ -87,6 +87,26 @@ class TestRoPEConfigCompatibility(unittest.TestCase):
 
         self.assertEqual(after, before)
 
+    def test_default_rope_theta_is_mirrored_for_legacy_readers(self):
+        from specforge.export.checkpoint_io import apply_legacy_rope_scaling
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_config(
+                directory,
+                {
+                    "rope_parameters": {
+                        "rope_type": "default",
+                        "rope_theta": 1_000_000,
+                    }
+                },
+            )
+            self.assertTrue(apply_legacy_rope_scaling(directory))
+            with open(path, encoding="utf-8") as handle:
+                config = json.load(handle)
+
+        self.assertEqual(config["rope_theta"], 1_000_000)
+        self.assertNotIn("rope_scaling", config)
+
 
 class TestLegacyVocabMappingCompatibility(unittest.TestCase):
     def setUp(self):
