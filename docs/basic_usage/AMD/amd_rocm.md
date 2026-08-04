@@ -89,7 +89,7 @@ Use the `sdpa` or `flex_attention` attention backends on ROCm. The `fa`
 parallel (`sp_ulysses_size` / `sp_ring_size` > 1), depend on a CUDA flash-attn
 build; the single-GPU / data-parallel path never loads `yunchang`, and selecting
 those backends raises a clear error. The checked-in
-[`qwen3-8b-eagle3-offline.yaml`](../../examples/configs/qwen3-8b-eagle3-offline.yaml)
+[`qwen3-8b-eagle3-offline.yaml`](../../../examples/configs/qwen3-8b-eagle3-offline.yaml)
 recipe already uses `flex_attention`, so it runs on ROCm unchanged as a
 single-GPU offline EAGLE3 example.
 
@@ -107,7 +107,7 @@ python scripts/prepare_data.py --dataset sharegpt
 This produces `./cache/dataset/sharegpt_train.jsonl` in the stable
 `id` + `conversations` contract used by every checked-in recipe. For the full
 preset list, custom datasets, preformatted text, and target-model regeneration,
-see the [Data Preparation](../basic_usage/data_preparation.md) guide.
+see the [Data Preparation](../data_preparation.md) guide.
 
 ---
 
@@ -134,7 +134,7 @@ torchrun --standalone --nproc_per_node 8 \
 ```
 
 The output path matches `data.hidden_states_path` in the checked-in offline
-recipe. See [Data Preparation](../basic_usage/data_preparation.md#option-2-pre-formatted-text-format)
+recipe. See [Data Preparation](../data_preparation.md#option-2-pre-formatted-text-format)
 for preformatted inputs and other options.
 
 ### Step 2: Train
@@ -153,7 +153,7 @@ specforge train --config examples/configs/qwen3-8b-eagle3-offline.yaml \
   training.max_steps=20 output_dir=./outputs/eagle3-offline-smoke
 ```
 
-See the [Training](../basic_usage/training.md) guide for the full run schema,
+See the [Training](../training.md) guide for the full run schema,
 checkpoint/resume rules, and evaluation.
 
 ---
@@ -167,7 +167,7 @@ consumer trains the draft model. With `deployment.trainer.nnodes: 1` and no
 `--role`, a single `specforge train` command supervises both.
 
 This section uses the small
-[`qwen2.5-0.5b-eagle3-online.yaml`](../../examples/configs/qwen2.5-0.5b-eagle3-online.yaml)
+[`qwen2.5-0.5b-eagle3-online.yaml`](../../../examples/configs/qwen2.5-0.5b-eagle3-online.yaml)
 recipe as a single-node smoke test. Complete Step 4 of the installation first.
 
 ### Step 1: One-time run inputs
@@ -312,7 +312,7 @@ Instead of starting Mooncake and the capture server by hand, a
 `deployment.disaggregated.managed_local` block lets one `specforge train`
 command own those local processes and derive their endpoints. It defaults
 `default_kv_lease_ttl_ms` to 500, so the lease-TTL fix is applied automatically.
-See [Multi-server capture](../basic_usage/disaggregated_training.md#multi-server-capture)
+See [Multi-server capture](../disaggregated_training.md#multi-server-capture)
 for the managed-local profile.
 
 ---
@@ -345,4 +345,108 @@ capture server must use the same target model, revision, capture method, and
 auxiliary layer ids. Offline features can also be served through a disaggregated
 shared-directory or Mooncake store. For external-service prerequisites,
 freshness rules, multi-server capture, and resume, see the
-[Disaggregated training](../basic_usage/disaggregated_training.md) guide.
+[Disaggregated training](../disaggregated_training.md) guide.
+
+---
+
+## Reference results on MI355X
+
+The offline and online recipes above were run end-to-end on a single AMD
+Instinct **MI355X** (gfx950) inside the `lmsysorg/sglang:v0.5.14-rocm720-mi35x`
+container, training a **Qwen2.5-0.5B** EAGLE3 draft head on ShareGPT
+(`max_length=512`, `ttt_length=7`, `flex_attention`, `batch_size=1`,
+`learning_rate=1e-4`) for 1,500 steps. Offline consumes hidden states captured
+to disk by `prepare_hidden_states.py`; online consumes the same features
+streamed live from a patched SGLang capture server through Mooncake. Both paths
+converge to the same loss and acceptance rate — the online capture path
+reproduces offline quality on ROCm.
+
+### Training loss
+
+![EAGLE3 training loss on MI355X](imgs/mi355x_eagle3_loss.png)
+
+Draft-head loss falls from ~25–34 to ~15 over 1,500 steps. Faint lines are raw
+per-step values; bold lines are an exponential moving average. (Offline logs a
+handful of all-zero steps where a batch is fully truncated at `max_length`; those
+degenerate points are filtered from the curve.)
+
+### Acceptance rate
+
+![EAGLE3 acceptance rate on MI355X](imgs/mi355x_eagle3_acceptance.png)
+
+Mean draft-token acceptance rate — the quantity that translates into speculative
+decoding speedup at serving time — rises from ~0.01 to ~0.15 and the two paths
+track each other closely.
+
+### Summary
+
+| Metric (final) | Offline | Online |
+| --- | --- | --- |
+| Draft loss (start → end) | 24.5 → 15.2 | 34.2 → 15.2 |
+| Top-1 draft accuracy (`acc_0`) | ~0.24 | ~0.25 |
+| Mean acceptance rate | ~0.16 | ~0.15 |
+| Training steps | 1,500 | 1,500 |
+
+**Throughput** (single MI355X GCD, `batch_size=1`, sequence length 512):
+
+- **Offline** trainer: ~3–4 steps/s (pure GPU-local training; no capture server
+  in the loop).
+- **Online** trainer: ~1.7 steps/s end-to-end, bounded by a single capture
+  server producing ~1.9 prompts/s at ~10k tokens/s. The producer generated
+  1,719 prompts with **0 failures**; add more `capture_servers` to raise
+  producer throughput.
+
+These numbers are a functional reference for a 0.5B draft on one GCD, not a tuned
+performance benchmark — larger targets, longer sequences, and multi-GPU trainers
+scale differently.
+
+## Reference results on MI300X
+
+The same offline and online recipes were replicated on a single AMD Instinct
+**MI300X** (gfx942) inside the `lmsysorg/sglang:v0.5.14-rocm720-mi30x` container,
+with identical hyperparameters (**Qwen2.5-0.5B** EAGLE3 head on ShareGPT,
+`max_length=512`, `ttt_length=7`, `flex_attention`, `batch_size=1`,
+`learning_rate=1e-4`, 1,500 steps). The capture server used the `triton`
+attention backend (flashinfer is CUDA-only). This node was shared with another
+tenant, so the capture server and trainer each ran with a small
+`sglang_mem_fraction_static` (~0.12) on separate GPUs; on an idle MI300X you can
+raise these and expect higher throughput.
+
+### Training loss
+
+![EAGLE3 training loss on MI300X](imgs/mi300x_eagle3_loss.png)
+
+Draft-head loss falls from ~25–34 to ~15 over 1,500 steps, matching the MI355X
+run. Faint lines are raw per-step values; bold lines are an exponential moving
+average.
+
+### Acceptance rate
+
+![EAGLE3 acceptance rate on MI300X](imgs/mi300x_eagle3_acceptance.png)
+
+Mean draft-token acceptance rate rises from ~0.01 to ~0.15 and the offline and
+online paths track each other closely — the online capture path reproduces
+offline quality on gfx942 as well.
+
+### Summary
+
+| Metric (final) | Offline | Online |
+| --- | --- | --- |
+| Draft loss (start → end) | 24.5 → 15.0 | 34.0 → 15.5 |
+| Top-1 draft accuracy (`acc_0`) | ~0.26 | ~0.28 |
+| Mean acceptance rate | ~0.16 | ~0.15 |
+| Training steps | 1,500 | 1,500 |
+
+**Throughput** (single MI300X, `batch_size=1`, sequence length 512, GPUs shared
+with another tenant at ~0.12 mem fraction):
+
+- **Offline** trainer: ~5–8 steps/s (pure GPU-local training; no capture server
+  in the loop).
+- **Online** trainer: ~7 steps/s end-to-end (1,500 steps in ~200 s). The managed
+  `triton` capture server sustained ~38k tokens/s prefill and the producer
+  generated 1,695 prompts with **0 failures**; the single-command
+  `managed_local` stack (Mooncake master + capture server + trainer) came up and
+  tore down cleanly (`default_kv_lease_ttl_ms=500`, no drain failure).
+
+As with the MI355X figures, these are a functional cross-architecture reference
+(gfx942 vs gfx950), not a tuned performance benchmark.
