@@ -195,11 +195,14 @@ def parse_args():
     sglang_group.add_argument("--sglang-ep-size", type=int, default=1)
     sglang_group.add_argument(
         "--sglang-disable-radix-cache",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Disable the SGLang radix (prefix) cache. Required for hybrid "
-            "linear-attention/Mamba targets on ROCm, whose mamba radix-cache "
-            "extra_buffer strategy asserts CUDA/MUSA/NPU (FLA) at server init."
+            "Disable the SGLang radix (prefix) cache (default: enabled). "
+            "Required for hybrid linear-attention/Mamba targets on ROCm, whose "
+            "mamba radix-cache extra_buffer strategy asserts CUDA/MUSA/NPU "
+            "(FLA) at server init. Pass --no-sglang-disable-radix-cache to keep "
+            "the radix cache for targets that require it."
         ),
     )
     return parser.parse_args()
@@ -318,7 +321,7 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
         "enable_dp_attention": args.sglang_enable_dp_attention,
         "enable_dp_lm_head": args.sglang_enable_dp_lm_head,
         "ep_size": args.sglang_ep_size,
-        "disable_radix_cache": args.sglang_disable_radix_cache,
+        "disable_radix_cache": getattr(args, "sglang_disable_radix_cache", True),
         "max_running_requests": args.batch_size,
         "max_total_tokens": args.batch_size * args.max_length,
     }

@@ -136,6 +136,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             sglang_enable_dp_attention=False,
             sglang_enable_dp_lm_head=False,
             sglang_ep_size=1,
+            sglang_disable_radix_cache=False,
             batch_size=4,
             max_length=128,
         )
@@ -172,6 +173,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             sglang_enable_dp_attention=False,
             sglang_enable_dp_lm_head=False,
             sglang_ep_size=1,
+            sglang_disable_radix_cache=False,
             batch_size=4,
             max_length=128,
         )
