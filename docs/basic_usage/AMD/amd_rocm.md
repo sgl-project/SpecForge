@@ -84,14 +84,19 @@ module used by online capture.
 
 ### Step 5: Attention backends on ROCm
 
-Use the `sdpa` or `flex_attention` attention backends on ROCm. The `fa`
-(flash-attn) and `usp` backends, and `yunchang`-based Ulysses/Ring sequence
-parallel (`sp_ulysses_size` / `sp_ring_size` > 1), depend on a CUDA flash-attn
-build; the single-GPU / data-parallel path never loads `yunchang`, and selecting
-those backends raises a clear error. The checked-in
-[`qwen3-8b-eagle3-offline.yaml`](../../../examples/configs/qwen3-8b-eagle3-offline.yaml)
+Use the `sdpa` or `flex_attention` attention backends for the **trainer** on
+ROCm. The `fa` (flash-attn) and `usp` backends, and `yunchang`-based
+Ulysses/Ring sequence parallel (`sp_ulysses_size` / `sp_ring_size` > 1), depend
+on a CUDA flash-attn build; the single-GPU / data-parallel path never loads
+`yunchang`, and selecting those backends raises a clear error. The checked-in
+[`amd/qwen3.5-4b-dflash-offline.yaml`](../../../examples/configs/amd/qwen3.5-4b-dflash-offline.yaml)
 recipe already uses `flex_attention`, so it runs on ROCm unchanged as a
-single-GPU offline EAGLE3 example.
+single-GPU offline DFlash example.
+
+The **capture side** (the SGLang target that materializes hidden states, both
+offline and online) has an extra ROCm requirement for Qwen3.5-4B, a hybrid
+linear-attention/Mamba target: run it under **AITER** and disable the radix
+cache. Section 3 covers this in detail.
 
 ---
 
@@ -115,42 +120,63 @@ see the [Data Preparation](../data_preparation.md) guide.
 
 Offline training reads target features from disk, so the trainer only has to fit
 the draft model. It uses more storage but keeps target inference out of the
-training loop, and needs no capture patch or Mooncake.
+training loop, and needs no capture patch or Mooncake. This section trains a
+**Qwen3.5-4B DFlash** draft (`configs/qwen3.5-4b-dflash.json`).
 
 ### Step 1: Capture hidden states
 
-Feature preparation is a data-processing step, not a second training entry point:
+Feature preparation is a data-processing step, not a second training entry point.
+Qwen3.5-4B is a hybrid linear-attention/Mamba target, so run the capture under
+**AITER** and pass `--sglang-disable-radix-cache`. Without it, SGLang's Mamba
+radix cache auto-selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU
+(FLA) at server init and fails on ROCm:
 
 ```bash
-torchrun --standalone --nproc_per_node 8 \
+SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1 \
+torchrun --standalone --nproc_per_node 1 \
   scripts/prepare_hidden_states.py \
-  --target-model-path Qwen/Qwen3-8B \
+  --target-model-path Qwen/Qwen3.5-4B \
+  --strategy dflash \
+  --draft-model-config configs/qwen3.5-4b-dflash.json \
+  --trust-remote-code \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
-  --output-path ./cache/hidden_states/qwen3-8b-sharegpt \
-  --chat-template qwen \
-  --max-length 4096 \
+  --output-path ./cache/hidden_states/qwen3.5-4b-dflash-sharegpt \
+  --chat-template qwen3.5 \
+  --max-length 2048 \
   --tp-size 1 \
-  --batch-size 32
+  --batch-size 8 \
+  --sglang-attention-backend aiter \
+  --sglang-disable-radix-cache \
+  --sglang-mem-fraction-static 0.8 \
+  --sglang-context-length 2560
 ```
 
 The output path matches `data.hidden_states_path` in the checked-in offline
 recipe. See [Data Preparation](../data_preparation.md#option-2-pre-formatted-text-format)
 for preformatted inputs and other options.
 
+> **Data note:** `prepare_hidden_states.py` truncates each rendered conversation
+> at `max_length`. A long prompt can push the assistant reply past the cutoff,
+> leaving an empty loss region (fewer than two anchorable tokens), which trips
+> DFlash's anchor sampler (`ValueError: should preprocess the data.`). Drop the
+> captured samples with `< 2` loss-mask tokens before the last `block_size`
+> positions before training. The online path (Section 4) never hits this — its
+> producer regenerates full-length responses.
+
 ### Step 2: Train
 
-The checked-in offline recipe already uses `flex_attention`, so it runs on ROCm
-unchanged:
+The checked-in offline recipe already uses `flex_attention` for the trainer, so
+it runs on ROCm unchanged:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-offline.yaml
+specforge train --config examples/configs/amd/qwen3.5-4b-dflash-offline.yaml
 ```
 
 Override any field inline without copying the YAML, e.g. a quick smoke run:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-offline.yaml \
-  training.max_steps=20 output_dir=./outputs/eagle3-offline-smoke
+specforge train --config examples/configs/amd/qwen3.5-4b-dflash-offline.yaml \
+  training.max_steps=20 output_dir=./outputs/dflash-offline-smoke
 ```
 
 See the [Training](../training.md) guide for the full run schema,
@@ -166,72 +192,21 @@ streams them through Mooncake to the trainer. Every online run is
 consumer trains the draft model. With `deployment.trainer.nnodes: 1` and no
 `--role`, a single `specforge train` command supervises both.
 
-This section uses the small
-[`qwen2.5-0.5b-eagle3-online.yaml`](../../../examples/configs/qwen2.5-0.5b-eagle3-online.yaml)
+This section uses the
+[`amd/qwen3.5-4b-dflash-online.yaml`](../../../examples/configs/amd/qwen3.5-4b-dflash-online.yaml)
 recipe as a single-node smoke test. Complete Step 4 of the installation first.
 
 ### Step 1: One-time run inputs
 
-EAGLE3 disaggregated runs require an explicit **shared vocabulary mapping** (the
-producer and consumer cannot each derive one). The recipe expects it at
-`cache/vocab_mapping/qwen2.5-0.5b-eagle3.pt`:
+DFlash needs **no shared vocabulary mapping** (that is an EAGLE3-only
+requirement, where a reduced draft vocabulary must be derived once and shared by
+producer and consumer). DFlash keeps the full vocabulary and derives its target
+signal from the draft's `target_layer_ids`, so there is nothing to precompute.
 
-```bash
-python - <<'PY'
-from datasets import Dataset
-from transformers import AutoTokenizer
-from specforge.data.preprocessing import build_eagle3_dataset, generate_vocab_mapping_file
-import json
-
-rows = [json.loads(l) for l in open("cache/dataset/sharegpt_train.jsonl")]
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", trust_remote_code=True)
-eds = build_eagle3_dataset(Dataset.from_list(rows), tok,
-    chat_template="qwen", max_length=512, num_proc=8)
-path = generate_vocab_mapping_file(eds, target_vocab_size=151936,
-    draft_vocab_size=16000, cache_dir="cache/vocab_mapping",
-    cache_key="qwen2.5-0.5b-eagle3")
-print("vocab mapping:", path)
-PY
-```
-
-The consumer's target head loader reads the LM-head weight from a `*.index.json`
-weight map. Qwen2.5-0.5B ships a single `model.safetensors` with **tied
-embeddings** (no standalone `lm_head.weight`), so build a small local target
-directory that adds an index and points at the tied weight:
-
-```bash
-python - <<'PY'
-import os, json, glob
-from safetensors import safe_open
-
-snap = glob.glob(os.path.expanduser(
-    "~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/*"))[0]
-dst = "outputs/online-test/target_model"
-os.makedirs(dst, exist_ok=True)
-for f in os.listdir(snap):
-    if f.endswith(".index.json"):
-        continue
-    lnk = os.path.join(dst, f)
-    if os.path.lexists(lnk):
-        os.remove(lnk)
-    os.symlink(os.path.realpath(os.path.join(snap, f)), lnk)
-
-wm, total = {}, 0
-with safe_open(os.path.join(dst, "model.safetensors"), framework="pt") as fh:
-    for k in fh.keys():
-        wm[k] = "model.safetensors"
-        n = 1
-        for s in fh.get_slice(k).get_shape():
-            n *= s
-        total += n * 2
-json.dump({"metadata": {"total_size": total}, "weight_map": wm},
-    open(os.path.join(dst, "model.safetensors.index.json"), "w"), indent=2)
-print("target model:", os.path.abspath(dst))
-PY
-```
-
-Larger sharded models (for example Qwen3-8B) already ship an index and a
-standalone LM head, so they need neither of these workarounds.
+Qwen3.5-4B is also a large sharded checkpoint that already ships a
+`*.index.json` weight map and a resolvable head, so it needs no local target
+directory or index workaround. Just make sure `cache/dataset/sharegpt_train.jsonl`
+exists (Section 2).
 
 ### Step 2: Start Mooncake and the capture server
 
@@ -247,11 +222,15 @@ mooncake_master --enable_http_metadata_server=true \
 ```
 
 Start the patched capture server on GPU 0. **The `--spec-capture-aux-layer-ids`
-must match the layers the producer derives** for EAGLE3:
-`[1, num_layers//2 - 1, num_layers - 4]`. Qwen2.5-0.5B has 24 layers, so the ids
-are `1 11 20`. A mismatch produces zero features with no error.
+must match the draft's `target_layer_ids`** — for DFlash these are read straight
+from `configs/qwen3.5-4b-dflash.json`: `1 8 15 22 29` (this is not the EAGLE3
+`[1, num_layers//2 - 1, num_layers - 4]` formula). A mismatch produces zero
+features with no error. Because Qwen3.5-4B is a hybrid Mamba target, the server
+must run under **AITER** with `--attention-backend aiter` and
+`--disable-radix-cache` (see Section 3 for why):
 
 ```bash
+SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1 \
 HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=0 \
 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1 \
 MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
@@ -259,18 +238,19 @@ MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
 MOONCAKE_PROTOCOL=tcp \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=$((32<<30)) \
 python -m sglang.launch_server \
-  --model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --model-path Qwen/Qwen3.5-4B \
   --trust-remote-code --skip-tokenizer-init \
-  --tp-size 1 --context-length 2048 --mem-fraction-static 0.85 \
+  --tp-size 1 --context-length 4096 --mem-fraction-static 0.8 \
+  --attention-backend aiter \
   --chunked-prefill-size -1 --disable-radix-cache \
-  --enable-spec-capture --spec-capture-method eagle3 \
-  --spec-capture-aux-layer-ids 1 11 20 \
+  --enable-spec-capture --spec-capture-method dflash \
+  --spec-capture-aux-layer-ids 1 8 15 22 29 \
   --host 127.0.0.1 --port 30000 &
 ```
 
 Wait for `curl --fail http://127.0.0.1:30000/health` to return 200 (the first
-health check can take a few minutes while attention kernels compile).
-`--context-length` must exceed `data.max_length` (512) or `/generate` returns
+health check can take a few minutes while AITER kernels compile).
+`--context-length` must exceed `data.max_length` (2048) or `/generate` returns
 `400 input longer than context length`.
 
 ### Step 3: Launch training
@@ -284,22 +264,21 @@ MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
 MOONCAKE_PROTOCOL=tcp \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=$((32<<30)) \
-specforge train -c examples/configs/qwen2.5-0.5b-eagle3-online.yaml \
-  model.target_model_path=outputs/online-test/target_model \
-  model.lm_head_key=model.embed_tokens.weight \
+specforge train -c examples/configs/amd/qwen3.5-4b-dflash-online.yaml \
   training.max_steps=20 training.num_epochs=1 \
   training.save_interval=20 training.log_interval=5
 ```
 
-Before rerunning, clear stale control state:
-`rm -rf outputs/qwen2.5-0.5b-eagle3-online`.
+The trainer needs no AITER env — it runs `flex_attention` on ROCm; only the
+capture server (Step 2) drives the Mamba target. Before rerunning, clear stale
+control state: `rm -rf outputs/qwen3.5-4b-dflash-online`.
 
 ### Success criteria
 
 - Producer log: `drive_producer returning produced=<N> prompts_failed=0`.
-- Consumer log: `step N: {...loss..., acceptance_rate...}` lines, and **no**
+- Consumer log: `step N: {...loss..., acc...}` lines, and **no**
   `could not drain` error or traceback at teardown.
-- Checkpoint: `outputs/qwen2.5-0.5b-eagle3-online/qwen2.5-0.5b-eagle3-online-step20/`
+- Checkpoint: `outputs/qwen3.5-4b-dflash-online/qwen3.5-4b-dflash-online-step20/`
   contains `training_state.pt` and `training_state_rank0.pt`.
 
 > If `produced=0`, the capture aux-layer ids do not match the producer contract
@@ -325,10 +304,10 @@ process pools or nodes, use the **same config** with an explicit `--role`:
 
 ```bash
 # Inference / capture pool
-specforge train -c examples/configs/qwen2.5-0.5b-eagle3-online.yaml --role producer
+specforge train -c examples/configs/amd/qwen3.5-4b-dflash-online.yaml --role producer
 
 # Trainer pool
-specforge train -c examples/configs/qwen2.5-0.5b-eagle3-online.yaml --role consumer
+specforge train -c examples/configs/amd/qwen3.5-4b-dflash-online.yaml --role consumer
 ```
 
 For multiple consumer nodes, record `deployment.trainer.nnodes`,
@@ -342,7 +321,9 @@ specforge train -c run.yaml --role consumer --node-rank 1   # trainer-1
 
 A fresh attempt requires fresh control and consumer-state directories, and every
 capture server must use the same target model, revision, capture method, and
-auxiliary layer ids. Offline features can also be served through a disaggregated
+auxiliary layer ids — for this recipe `--spec-capture-method dflash` with aux ids
+`1 8 15 22 29`, and on ROCm each must run under AITER with `--disable-radix-cache`
+(Section 4, Step 2). Offline features can also be served through a disaggregated
 shared-directory or Mooncake store. For external-service prerequisites,
 freshness rules, multi-server capture, and resume, see the
 [Disaggregated training](../disaggregated_training.md) guide.
