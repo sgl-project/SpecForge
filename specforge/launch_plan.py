@@ -416,6 +416,11 @@ def _managed_local_services(
                 f"--rpc_port={mooncake.rpc_port}",
                 f"--http_metadata_server_port={mooncake.metadata_port}",
                 f"--metrics_port={mooncake.metrics_port}",
+                *(
+                    (f"--default_kv_lease_ttl={mooncake.default_kv_lease_ttl_ms}",)
+                    if mooncake.default_kv_lease_ttl_ms is not None
+                    else ()
+                ),
             ),
             {"CUDA_VISIBLE_DEVICES": ""},
         ),
