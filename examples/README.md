@@ -31,8 +31,7 @@ NPU, offline, and managed/external-service variants, is in
 | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | Domino |
 | `examples/configs/qwen3-8b-peagle-disaggregated.yaml` | Disaggregated SGLang server capture | P-EAGLE |
 | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` | Disaggregated server capture | DSpark |
-| `examples/configs/kimi-k3-dspark-5mla-openperfectblend-disaggregated.yaml` | Two Kimi-K3 TP8 capture replicas + eight-rank pipelined trainer | DSpark 5×MLA |
-| `examples/configs/kimi-k3-dspark-4kda-1mla-openperfectblend-disaggregated.yaml` | Two Kimi-K3 TP8 capture replicas + eight-rank pipelined trainer | DSpark 4×KDA+1×MLA |
+| `examples/configs/kimi-k3-dspark-disaggregated.yaml` | External-service TP8 capture + four-rank trainer | DSpark |
 | `examples/configs/qwen3-4b-dspark-offline.yaml` | Precomputed features | DSpark |
 | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
 | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` | Managed local one capture server + DP2 | DFlash |
