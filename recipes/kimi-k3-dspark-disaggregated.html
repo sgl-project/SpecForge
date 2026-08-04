@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Kimi K3 V1C DSpark disaggregated reproduction &#8212; SpecForge</title>
+    <title>Kimi K3 DSpark disaggregated reproduction &#8212; SpecForge</title>
   
   
   
@@ -46,7 +46,7 @@
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'recipes/kimi-k3-dspark-v1c-disaggregated';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'recipes/kimi-k3-dspark-disaggregated';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 03, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 04, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -310,7 +310,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/recipes/kimi-k3-dspark-v1c-disaggregated.md?plain=1" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/recipes/kimi-k3-dspark-disaggregated.md?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -327,7 +327,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/recipes/kimi-k3-dspark-v1c-disaggregated.md" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/recipes/kimi-k3-dspark-disaggregated.md" target="_blank"
    class="btn btn-sm btn-source-edit-button dropdown-item"
    title="Suggest edit"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -344,7 +344,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Frecipes/kimi-k3-dspark-v1c-disaggregated.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Frecipes/kimi-k3-dspark-disaggregated.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -374,7 +374,7 @@
       
       
       
-      <li><a href="../_sources/recipes/kimi-k3-dspark-v1c-disaggregated.md" target="_blank"
+      <li><a href="../_sources/recipes/kimi-k3-dspark-disaggregated.md" target="_blank"
    class="btn btn-sm btn-download-source-button dropdown-item"
    title="Download source file"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -457,7 +457,7 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>Kimi K3 V1C DSpark disaggregated reproduction</h1>
+    <h1>Kimi K3 DSpark disaggregated reproduction</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
@@ -482,9 +482,9 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="kimi-k3-v1c-dspark-disaggregated-reproduction">
-<h1>Kimi K3 V1C DSpark disaggregated reproduction<a class="headerlink" href="#kimi-k3-v1c-dspark-disaggregated-reproduction" title="Link to this heading">#</a></h1>
-<p>This recipe migrates the prior four-node colocated Kimi K3 V1C continual run
+  <section class="tex2jax_ignore mathjax_ignore" id="kimi-k3-dspark-disaggregated-reproduction">
+<h1>Kimi K3 DSpark disaggregated reproduction<a class="headerlink" href="#kimi-k3-dspark-disaggregated-reproduction" title="Link to this heading">#</a></h1>
+<p>This recipe migrates the prior four-node colocated Kimi K3 continual run
 to one TP8 capture node and one four-rank trainer node. It preserves the draft
 architecture, weights-only warm start, regenerated agentic prompt order,
 effective global batch, constant learning rate, and DSpark loss weights.</p>
@@ -511,11 +511,11 @@ and the Marlin grid.y fallback above 65,535 tokens.</p>
 </section>
 <section id="artifacts">
 <h2>Artifacts<a class="headerlink" href="#artifacts" title="Link to this heading">#</a></h2>
-<p>The checked-in recipe uses the paths already provisioned on the K3 RunPod
-pool. Other deployments should override them without editing the recipe:</p>
+<p>The checked-in recipe uses paths already provisioned on the deployment. Other
+deployments should override them without editing the recipe:</p>
 <ul class="simple">
 <li><p>target revision <code class="docutils literal notranslate"><span class="pre">cdd2e49a2c1cf8d4713b513955e415ed75405a72</span></code>;</p></li>
-<li><p>the weights-only V1C <code class="docutils literal notranslate"><span class="pre">epoch_0_step_0</span></code> draft checkpoint;</p></li>
+<li><p>the weights-only <code class="docutils literal notranslate"><span class="pre">epoch_0_step_0</span></code> draft checkpoint;</p></li>
 <li><p>the 462-row regenerated dataset whose SHA-256 is
 <code class="docutils literal notranslate"><span class="pre">6d50e6bb9ee59095eed91bfba035081efef9fea43bece9ad5dd01c6648a8ef24</span></code>.</p></li>
 </ul>
@@ -584,7 +584,7 @@ four-rank FSDP consumer on the same trainer host.</p>
 <span class="nb">export</span><span class="w"> </span><span class="nv">WANDB_ENTITY</span><span class="o">=</span>your-entity
 <span class="nb">unset</span><span class="w"> </span>RANK<span class="w"> </span>LOCAL_RANK<span class="w"> </span>WORLD_SIZE<span class="w"> </span>MASTER_ADDR<span class="w"> </span>MASTER_PORT<span class="w"> </span>NODE_RANK
 <span class="nv">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span>,1,2,3<span class="w"> </span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-c<span class="w"> </span>examples/configs/kimi-k3-dspark-v1c-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-c<span class="w"> </span>examples/configs/kimi-k3-dspark-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--role<span class="w"> </span>both<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="s2">&quot;deployment.disaggregated.server_urls=[\&quot;http://</span><span class="nv">$CAPTURE_IP</span><span class="s2">:30000\&quot;]&quot;</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="s2">&quot;deployment.disaggregated.mooncake_metadata_server=http://</span><span class="nv">$CAPTURE_IP</span><span class="s2">:35880/metadata&quot;</span><span class="w"> </span><span class="se">\</span>
@@ -603,10 +603,10 @@ instead of guessing which world the four trainer ranks should join.</p>
 <p>For a one-update smoke run, additionally override the pre-tokenized four-row
 fixture and shrink the optimizer quantum:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-c<span class="w"> </span>examples/configs/kimi-k3-dspark-v1c-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-c<span class="w"> </span>examples/configs/kimi-k3-dspark-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--role<span class="w"> </span>both<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>data.train_data_path<span class="o">=</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>data.prompts_path<span class="o">=</span>/workspace/k3_dspark/k3_specforge/cache/kimi-k3-agentic-regen-9a6ea2c7-v1c-full139264/longest-smoke-pretokenized-4rows-65536.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>data.prompts_path<span class="o">=</span>/workspace/k3_dspark/data/longest-smoke-pretokenized-4rows-65536.jsonl<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.num_epochs<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.max_steps<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.accumulation_steps<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
@@ -691,7 +691,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 03, 2026.
+  Last updated on Aug 04, 2026.
   <br/>
 </p>
   </div>
