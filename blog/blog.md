@@ -181,6 +181,8 @@ Start training and inference on a single node using a single command:
 specforge train --config examples/configs/qwen3.6-27b-dspark-disaggregated.yaml
 ```
 
+### Training Example: Kimi-K3
+The training recipes are listed in [docs/recipes/kimi-k3-dspark-disaggregated.md](https://github.com/sgl-project/SpecForge/blob/main/docs/recipes/kimi-k3-dspark-disaggregated.md).
 
 ## Draft-Model Serving Performance
 
