@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "specforge"
 dynamic = ["version"]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 description = "SpecForge: Speculative Decoding Training Framework"
 authors = [{name = "SGLang Team"}]
 urls = {Homepage = "https://github.com/sgl-project/SpecForge"}
