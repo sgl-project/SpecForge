@@ -9,6 +9,7 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
    :caption: Get Started
 
    get_started/installation.md
+   get_started/amd_rocm.md
    get_started/about.md
 
 .. toctree::
