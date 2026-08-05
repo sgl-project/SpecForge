@@ -13,10 +13,50 @@ round trips require GPU and can be run on the H200 box via rcli.
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
 CUDA = torch.cuda.is_available()
+
+
+class TestCommittedCheckpointResolution(unittest.TestCase):
+    def test_committed_checkpoint_is_resolved_from_all_supported_forms(self):
+        from specforge.export.checkpoint_io import resolve_training_state
+        from specforge.training.checkpoint import STATE_FILE, CheckpointManager
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            checkpoint_dir = CheckpointManager(output_dir, "run").save(
+                {"global_step": 5, "draft_state_dict": {}}, 5
+            )
+            for source in (
+                checkpoint_dir,
+                os.path.join(checkpoint_dir, STATE_FILE),
+                f"file://{checkpoint_dir}",
+                output_dir,
+            ):
+                self.assertEqual(resolve_training_state(source)["global_step"], 5)
+
+    def test_markerless_checkpoint_is_not_exportable(self):
+        from specforge.export.checkpoint_io import resolve_training_state
+        from specforge.training.checkpoint import STATE_FILE
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            checkpoint_dir = Path(output_dir, "run-step5")
+            checkpoint_dir.mkdir()
+            state_file = checkpoint_dir / STATE_FILE
+            torch.save({"global_step": 5, "draft_state_dict": {}}, state_file)
+
+            for source in (
+                str(checkpoint_dir),
+                str(state_file),
+                f"file://{checkpoint_dir}",
+            ):
+                with self.subTest(source=source):
+                    with self.assertRaisesRegex(ValueError, "missing _SUCCESS"):
+                        resolve_training_state(source)
+            with self.assertRaisesRegex(FileNotFoundError, "no complete checkpoint"):
+                resolve_training_state(output_dir)
 
 
 class TestLegacyVocabMappingCompatibility(unittest.TestCase):
