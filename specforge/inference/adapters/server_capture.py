@@ -323,7 +323,7 @@ class SGLangServerCaptureAdapter:
         # targets. Retries need a new key because the prior attempt may have
         # populated its namespace before the response was lost.
         body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
-        body["sampling_params"] = {"temperature": 0.0, "max_new_tokens": 1}
+        body["sampling_params"] = {"temperature": 0.0, "max_new_tokens": 0}
         capture_payloads = [self._spec_capture_payload(t) for t in tasks]
         body["spec_capture"] = capture_payloads
         for payload in capture_payloads:
