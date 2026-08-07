@@ -101,7 +101,7 @@ class NPUDistributedTest(unittest.TestCase):
                 sf_dist,
                 "_load_yunchang_globals",
                 return_value=(process_group, set_seq_parallel_pg),
-            ),
+            ) as load_yunchang,
         ):
             sf_dist.init_distributed(
                 timeout=7, tp_size=2, sp_ulysses_size=1, sp_ring_size=1
@@ -116,7 +116,10 @@ class NPUDistributedTest(unittest.TestCase):
             [call.kwargs["device_type"] for call in from_group.call_args_list],
             ["npu", "npu"],
         )
-        set_seq_parallel_pg.assert_called_once_with(1, 1, 3, 8)
+        # SP sizes of 1 must not touch yunchang: its import probes CUDA and
+        # crashes NPU-only torch builds, and SP=1 groups are never used.
+        load_yunchang.assert_not_called()
+        set_seq_parallel_pg.assert_not_called()
 
 
 class DistributedTeardownTest(unittest.TestCase):
