@@ -1,0 +1,48 @@
+# Single-GPU offline DFlash recipe for AMD GPUs (ROCm).
+#
+# ROCm-safe baseline: flex_attention on a single GPU, consuming precomputed
+# hidden states (no colocated target in the trainer process). DFlash's draft
+# attention runs through transformers' sdpa / flex_attention backends, so it is
+# fully ROCm-native and needs no CUDA flash-attn build.
+#
+# PyTorch reports ROCm devices through its `torch.cuda` API, so no device-specific
+# flags are needed. Generate the offline hidden states with a ROCm-compatible
+# SGLang capture first (see scripts/prepare_hidden_states.py and
+# docs/get_started/installation.md), then point data.hidden_states_path at them.
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-dflash.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/qwen3-8b-sharegpt-dflash
+  max_length: 3072
+  chat_template: qwen
+  cache_dir: ./cache
+
+training:
+  strategy: dflash
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 1
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+run_id: qwen3-8b-dflash-offline-rocm
+output_dir: ./outputs/qwen3-8b-dflash-offline-rocm
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
