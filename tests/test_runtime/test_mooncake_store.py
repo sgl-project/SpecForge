@@ -336,11 +336,24 @@ class TestMooncakeFeatureStore(unittest.TestCase):
             optimizer_durable=True,
         )
 
+        # The current optimizer window is only tombstoned.  Its short remote
+        # read lease gets one full window to expire, so ack itself never sleeps.
+        self.assertTrue(_phys_resident(fake, sid="durable"))
+        self.assertTrue(_phys_resident(fake, sid="prefetched"))
+        self.assertEqual(fs.health()["release_pending"], 2)
+
+        controller.ack_train_refs(
+            "trainer",
+            [],
+            global_step=2,
+            optimizer_durable=True,
+        )
+
         self.assertFalse(_phys_resident(fake, sid="durable"))
         self.assertTrue(_phys_resident(fake, sid="prefetched"))
         self.assertEqual(fs.health()["release_pending"], 1)
         marker = controller.store.durable_marker()
-        self.assertEqual(marker["global_step"], 1)
+        self.assertEqual(marker["global_step"], 2)
         self.assertEqual(marker["acked"], {"durable"})
 
     def test_lifecycle_drain_does_not_renew_read_lease_between_retries(self):

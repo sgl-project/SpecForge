@@ -232,6 +232,38 @@ def drain_feature_store_sample_removals(
     )
 
 
+def retry_feature_store_sample_removals(
+    store: FeatureStore,
+    sample_ids: List[str],
+) -> Dict[str, Any]:
+    """Make one non-blocking removal attempt for selected durable samples.
+
+    Remote stores may need a later optimizer boundary to outlive a short read
+    lease.  Unlike the lifecycle drain, this steady-state hook never sleeps and
+    reports the ids that remain pending so the control plane can batch a later
+    retry.  Synchronously-freeing stores need no extra work after ``abort``.
+    """
+    ids = list(dict.fromkeys(sample_ids))
+    if not ids:
+        return {
+            "removed": 0,
+            "removed_bytes": 0,
+            "release_pending": 0,
+            "remaining_ids": [],
+            "attempts": 0,
+        }
+    retry = getattr(store, "retry_sample_removals", None)
+    if not callable(retry):
+        return {
+            "removed": 0,
+            "removed_bytes": 0,
+            "release_pending": 0,
+            "remaining_ids": [],
+            "attempts": 0,
+        }
+    return retry(ids)
+
+
 def load_feature_file(path: str) -> Dict[str, torch.Tensor]:
     """Load one prepared SpecForge offline feature file."""
     if path.endswith(".gz"):
@@ -631,6 +663,7 @@ __all__ = [
     "LocalFeatureStore",
     "drain_feature_store_removals",
     "drain_feature_store_sample_removals",
+    "retry_feature_store_sample_removals",
     "load_feature_file",
     "spec_from_tensor",
 ]
