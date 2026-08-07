@@ -334,11 +334,20 @@ class OnlineDFlashModel(nn.Module):
                 ),
             }
 
+        draft_kwargs = {}
+        if self.attention_backend == "flex_attention":
+            # DFlash's dynamic short-query batches are training/prefill shaped,
+            # not autoregressive decoding.  AUTO may route q_len < 128 to the
+            # more restrictive flex-decoding kernel, whose config set can be
+            # empty for DFlash's sparse BlockMask.  Keep the general Triton
+            # Flex Attention kernel for every DFlash-family batch.
+            draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **draft_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
 
