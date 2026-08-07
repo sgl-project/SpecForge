@@ -394,10 +394,23 @@ class MooncakeFeatureStore(FeatureStore):
                 f"mooncake get_into short read for {key}: got {rc} of {nb} bytes"
             )
 
-    def _store_remove(self, key: str) -> bool:
-        """Best-effort physical free. Returns True on confirmed removal."""
+    def _store_remove(self, key: str, *, force: bool = False) -> bool:
+        """Best-effort physical free. Returns True on confirmed removal.
+
+        Recent Mooncake bindings expose ``remove(key, force=True)`` so a
+        lifecycle authority can reclaim an object after all application-level
+        leases have closed without waiting for Mooncake's (potentially
+        minutes-long) KV lease TTL.  Older bindings only accept ``key``; keep
+        those usable and let their normal bounded retry behavior apply.
+        """
         try:
-            rc = self._store.remove(key)
+            if force:
+                try:
+                    rc = self._store.remove(key, force=True)
+                except TypeError:
+                    rc = self._store.remove(key)
+            else:
+                rc = self._store.remove(key)
         except Exception:  # pragma: no cover - transient RPC failure
             return False
         return rc is None or int(rc) == 0
@@ -645,6 +658,7 @@ class MooncakeFeatureStore(FeatureStore):
         sample_id: str,
         *,
         confirm_absent_on_failure: bool = True,
+        force: bool = False,
     ) -> bool:
         """Remove all tensor objects. False on a retryable RPC failure.
 
@@ -661,7 +675,7 @@ class MooncakeFeatureStore(FeatureStore):
         ok = True
         for name in self._sample_names.get(sample_id, []):
             key = self._tkey(sample_id, gen, name)
-            if self._store_remove(key):
+            if self._store_remove(key, force=force):
                 continue
             if confirm_absent_on_failure and not self._store_exists(key):
                 continue  # already gone (freed remotely) counts as freed
@@ -716,6 +730,26 @@ class MooncakeFeatureStore(FeatureStore):
             else:
                 self._release_pending.setdefault(sample_id, 0)
 
+    def drain_sample_removals(
+        self,
+        sample_ids: List[str],
+        *,
+        max_attempts: int = 8,
+        retry_interval_s: float = 0.25,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> Dict[str, int]:
+        """Force-remove only the named optimizer-durable samples.
+
+        Other pending samples may belong to prefetched, not-yet-durable
+        batches and must remain available for crash replay.
+        """
+        return self._drain_removals(
+            sample_ids=sample_ids,
+            max_attempts=max_attempts,
+            retry_interval_s=retry_interval_s,
+            sleep=sleep,
+        )
+
     def drain_pending_removals(
         self,
         *,
@@ -732,17 +766,37 @@ class MooncakeFeatureStore(FeatureStore):
         ``sleep`` is injectable so protocol tests can advance a fake lease clock
         without wall-clock delays.
         """
+        return self._drain_removals(
+            sample_ids=None,
+            max_attempts=max_attempts,
+            retry_interval_s=retry_interval_s,
+            sleep=sleep,
+        )
+
+    def _drain_removals(
+        self,
+        *,
+        sample_ids: Optional[List[str]],
+        max_attempts: int,
+        retry_interval_s: float,
+        sleep: Callable[[float], None],
+    ) -> Dict[str, int]:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if retry_interval_s < 0:
             raise ValueError("retry_interval_s must be >= 0")
+        target_ids = None if sample_ids is None else set(sample_ids)
         removed = removed_bytes = 0
         last_errors: Dict[str, str] = {}
         attempts_run = 0
         for attempt in range(max_attempts):
             attempts_run = attempt + 1
             with self._lock:
-                pending = list(self._release_pending)
+                pending = [
+                    sample_id
+                    for sample_id in self._release_pending
+                    if target_ids is None or sample_id in target_ids
+                ]
                 if not pending:
                     return {
                         "removed": removed,
@@ -755,6 +809,12 @@ class MooncakeFeatureStore(FeatureStore):
                     try:
                         physically_removed = self._try_physical_free(
                             sample_id,
+                            # The application lease has already been released
+                            # before a sample enters _release_pending.  Use the
+                            # lifecycle-authority path in current Mooncake so
+                            # its default multi-minute KV lease does not turn a
+                            # clean trainer shutdown into a false failure.
+                            force=True,
                             # Intermediate retries must not renew Mooncake's
                             # read lease. The final probe only classifies an
                             # already-absent key and has no following retry to
@@ -776,7 +836,11 @@ class MooncakeFeatureStore(FeatureStore):
                             self.max_release_attempts,
                             self._release_pending.get(sample_id, 0) + 1,
                         )
-                remaining = list(self._release_pending)
+                remaining = [
+                    sample_id
+                    for sample_id in self._release_pending
+                    if target_ids is None or sample_id in target_ids
+                ]
             if not remaining:
                 return {
                     "removed": removed,
@@ -788,7 +852,11 @@ class MooncakeFeatureStore(FeatureStore):
                 sleep(retry_interval_s)
 
         with self._lock:
-            remaining = list(self._release_pending)
+            remaining = [
+                sample_id
+                for sample_id in self._release_pending
+                if target_ids is None or sample_id in target_ids
+            ]
         preview = remaining[:16]
         detail = f"; last errors={last_errors}" if last_errors else ""
         raise RuntimeError(

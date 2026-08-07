@@ -97,10 +97,12 @@ class OfflineSGLangCaptureBackend:
         setter_name = {
             "eagle3": "set_eagle3_layers_to_capture",
             "dflash": "set_dflash_layers_to_capture",
+            "dspark": "set_dspark_layers_to_capture",
         }.get(capture_method)
         if setter_name is None:
             raise ValueError(
-                "offline SGLang capture method must be 'eagle3' or 'dflash', "
+                "offline SGLang capture method must be 'eagle3', 'dflash', or "
+                "'dspark', "
                 f"got {capture_method!r}"
             )
         setter = getattr(self.model_runner.model, setter_name, None)

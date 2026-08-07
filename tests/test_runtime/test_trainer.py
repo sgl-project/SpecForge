@@ -61,6 +61,23 @@ class RecordingStrategy(FakeStrategy):
         return super().forward_loss(batch, ctx)
 
 
+class WeightedStrategy(FakeStrategy):
+    def forward_loss(self, batch, ctx=None):
+        self.validate_batch(batch)
+        coefficient = batch.tensors["x"].reshape(())
+        denominator = batch.tensors["denominator"].reshape(())
+        correct = batch.tensors["correct"].reshape(())
+        numerator = self.model.w.reshape(()) * coefficient
+        return StepOutput(
+            loss=numerator / denominator,
+            metrics={"accuracy": correct / denominator},
+            ratio_metrics={
+                "acc": (correct, denominator),
+            },
+            loss_terms=(numerator, denominator),
+        )
+
+
 class FakeBackend(TrainingBackend):
     name = "fake"
 
@@ -77,6 +94,11 @@ class FakeBackend(TrainingBackend):
         self.backwards += 1
         self.boundaries.append(is_boundary)
         loss.backward()
+
+    def scale_gradients(self, factor):
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(factor)
 
     def step(self):
         self.steps += 1
@@ -100,6 +122,19 @@ class RetryableCloseQueue(SampleRefQueue):
 def _batch():
     return TrainBatch(
         sample_ids=["s"], strategy="fake", tensors={"x": torch.ones(2)}, metadata={}
+    )
+
+
+def _weighted_batch(coefficient, denominator, correct):
+    return TrainBatch(
+        sample_ids=["s"],
+        strategy="fake",
+        tensors={
+            "x": torch.tensor(float(coefficient)),
+            "denominator": torch.tensor(float(denominator)),
+            "correct": torch.tensor(float(correct)),
+        },
+        metadata={},
     )
 
 
@@ -148,6 +183,60 @@ class TestTrainerCore(unittest.TestCase):
         rep = core.train_step(_batch())
         self.assertNotIn("mode", rep.metrics)
 
+    def test_global_loss_normalization_matches_combined_batch(self):
+        split_strategy = WeightedStrategy()
+        split_core = TrainerCore(
+            split_strategy,
+            FakeBackend(split_strategy.model),
+            accumulation_steps=2,
+        )
+        split_core.train_step(_weighted_batch(2, 1, 1))
+        split_result = split_core.train_step(_weighted_batch(30, 3, 1))
+
+        combined_strategy = WeightedStrategy()
+        combined_core = TrainerCore(
+            combined_strategy,
+            FakeBackend(combined_strategy.model),
+        )
+        combined_result = combined_core.train_step(_weighted_batch(32, 4, 2))
+
+        torch.testing.assert_close(
+            split_strategy.model.w.grad,
+            combined_strategy.model.w.grad,
+        )
+        self.assertEqual(split_strategy.model.w.grad.item(), 8.0)
+        self.assertEqual(split_result.loss, combined_result.loss)
+        self.assertEqual(split_result.metrics["acc"], 0.5)
+        self.assertEqual(combined_result.metrics["acc"], 0.5)
+
+    def test_global_loss_normalization_compensates_rank_averaging(self):
+        strategy = FakeStrategy()
+        backend = FakeBackend(strategy.model)
+        backend.parallel_config = mock.Mock(fsdp_process_group="dp")
+        core = TrainerCore(strategy, backend)
+        strategy.model.w.grad = torch.tensor([9.0])
+
+        def add_remote_denominator(denominator, *, op, group):
+            self.assertEqual(op, torch.distributed.ReduceOp.SUM)
+            self.assertEqual(group, "dp")
+            denominator.add_(7.0)
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch(
+                "torch.distributed.all_reduce",
+                side_effect=add_remote_denominator,
+            ),
+        ):
+            core._normalize_gradients(torch.tensor(3.0))
+
+        torch.testing.assert_close(
+            strategy.model.w.grad,
+            torch.tensor([1.8]),
+        )
+
     def test_strategy_scalar_metrics_are_preserved(self):
         strat = FakeStrategy()
         core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
@@ -157,6 +246,7 @@ class TestTrainerCore(unittest.TestCase):
                 metrics={
                     "loss": torch.tensor(99.0),
                     "accuracy": torch.tensor(0.5),
+                    "accuracy_denom": torch.tensor(4.0),
                     "ce_loss": torch.tensor(1.25),
                     "lambda_base": 0.75,
                     "non_scalar_debug": torch.tensor([1.0, 2.0]),
@@ -170,6 +260,7 @@ class TestTrainerCore(unittest.TestCase):
         self.assertEqual(result.metrics["acc"], 0.5)
         self.assertEqual(result.metrics["ce_loss"], 1.25)
         self.assertEqual(result.metrics["lambda_base"], 0.75)
+        self.assertNotIn("accuracy_denom", result.metrics)
         self.assertNotIn("non_scalar_debug", result.metrics)
 
     def test_ratio_metrics_override_mean_of_means_accuracy(self):
@@ -195,33 +286,57 @@ class TestTrainerCore(unittest.TestCase):
         self.assertEqual(result.metrics["ce_position_0"], 0.5)
         self.assertEqual(result.metrics["ce_position_1"], 0.5)
 
+    _RATIO_INPUTS = {
+        "acc": (torch.tensor(2.0), torch.tensor(4.0)),
+        "ce_position": (
+            torch.tensor([1.0, 3.0]),
+            torch.tensor([2.0, 6.0]),
+        ),
+    }
+
     def test_ratio_metrics_sum_numerators_and_denominators_before_dividing(self):
         remote = torch.tensor([8.0, 6.0, 3.0, 1.0, 2.0, 2.0])
+        reduced_groups = []
 
         def all_reduce(packed, *, group):
-            self.assertEqual(group, "dp")
+            reduced_groups.append(group)
             packed.add_(remote)
 
         with (
             mock.patch("torch.distributed.is_available", return_value=True),
             mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
             mock.patch("torch.distributed.all_reduce", side_effect=all_reduce),
         ):
             metrics = _reduce_ratio_metrics(
-                {
-                    "acc": (torch.tensor(2.0), torch.tensor(4.0)),
-                    "ce_position": (
-                        torch.tensor([1.0, 3.0]),
-                        torch.tensor([2.0, 6.0]),
-                    ),
-                },
+                self._RATIO_INPUTS,
                 device=torch.device("cpu"),
                 process_group="dp",
                 reduce=True,
             )
 
+        self.assertEqual(reduced_groups, ["dp"])
         self.assertEqual(metrics["acc"], 1.0)
         self.assertEqual(metrics["ce_position_0"], 1.0)
+        self.assertEqual(metrics["ce_position_1"], 0.5)
+
+    def test_ratio_metrics_skip_all_reduce_when_world_size_is_one(self):
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=1),
+            mock.patch("torch.distributed.all_reduce") as all_reduce_mock,
+        ):
+            metrics = _reduce_ratio_metrics(
+                self._RATIO_INPUTS,
+                device=torch.device("cpu"),
+                process_group="dp",
+                reduce=True,
+            )
+
+        all_reduce_mock.assert_not_called()
+        self.assertEqual(metrics["acc"], 0.5)
+        self.assertEqual(metrics["ce_position_0"], 0.5)
         self.assertEqual(metrics["ce_position_1"], 0.5)
 
     @staticmethod
@@ -327,6 +442,39 @@ class TestTrainerCore(unittest.TestCase):
 
 
 class TestTrainerController(unittest.TestCase):
+    def test_training_log_reports_pipeline_throughput_breakdown(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        logged = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=2,
+                num_epochs=1,
+                log_interval=2,
+                logger=lambda metrics, step: logged.append((dict(metrics), step)),
+            )
+            self.assertEqual(ctrl.fit([_batch(), _batch()]), 2)
+
+        self.assertEqual(len(logged), 1)
+        metrics, step = logged[0]
+        self.assertEqual(step, 2)
+        for name in (
+            "perf/optimizer_steps_per_hour",
+            "perf/optimizer_step_time_s",
+            "perf/data_wait_time_s",
+            "perf/train_compute_time_s",
+            "perf/durable_ack_time_s",
+            "perf/global_samples_per_second",
+        ):
+            self.assertIn(name, metrics)
+            self.assertGreaterEqual(metrics[name], 0.0)
+        self.assertGreater(metrics["perf/optimizer_steps_per_hour"], 0.0)
+        self.assertGreater(metrics["perf/global_samples_per_second"], 0.0)
+
     def test_progress_bar_tracks_optimizer_steps_on_rank_zero(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)

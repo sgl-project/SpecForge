@@ -49,15 +49,28 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
                 draft_provider = algorithm.providers.model.draft_config
                 self.assertTrue(draft_config.is_file(), draft_config)
                 payload = json.loads(draft_config.read_text())
-                self.assertEqual(
-                    payload.get("architectures"),
-                    [draft_provider.architecture],
+                architectures = payload.get("architectures")
+                self.assertIsInstance(architectures, list)
+                self.assertEqual(len(architectures), 1)
+                architecture = architectures[0]
+                self.assertIn(
+                    architecture,
+                    draft_provider.compatible_architectures,
                 )
                 expected_auto_model = draft_provider.expected_auto_map_model
-                if expected_auto_model is not None:
+                actual_auto_model = payload.get("auto_map", {}).get("AutoModel")
+                if (
+                    expected_auto_model is not None
+                    and architecture == draft_provider.architecture
+                ):
                     self.assertEqual(
-                        payload.get("auto_map", {}).get("AutoModel"),
+                        actual_auto_model,
                         expected_auto_model,
+                    )
+                elif actual_auto_model is not None:
+                    self.assertEqual(
+                        actual_auto_model.rsplit(".", 1)[-1],
+                        architecture,
                     )
 
     def test_only_future_vlm_draft_configs_lack_a_unified_recipe(self):

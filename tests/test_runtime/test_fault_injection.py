@@ -120,7 +120,7 @@ class TestOfflineManifestFaults(unittest.TestCase):
                 os.path.join(d, "bad.ckpt"),
             )
             with self.assertRaises(TypeError):
-                OfflineManifestReader(d, run_id="off").read()
+                OfflineManifestReader(d, run_id="off", validate_files=True).read()
 
     def test_mixed_schema_version_batch_rejected(self):
         store = LocalFeatureStore("st")

@@ -3,7 +3,7 @@ import logging
 import torch
 import torch.distributed as dist
 
-from specforge.lr_scheduler import CosineAnnealingWarmupLR
+from specforge.lr_scheduler import ConstantWarmupLR, CosineAnnealingWarmupLR
 from specforge.utils import print_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 class BF16Optimizer:
     """AdamW over fp32 master copies of the bf16 trainable params, with grad
-    clipping and cosine warmup scheduling."""
+    clipping and configurable warmup scheduling."""
 
     def __init__(
         self,
@@ -21,6 +21,7 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        lr_scheduler="cosine",
         offload_master=False,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
@@ -44,7 +45,17 @@ class BF16Optimizer:
         self.last_grad_norm = None
         self._grad_norm_process_group = None
         self._reduce_grad_norm_across_ranks = True
-        self.scheduler = CosineAnnealingWarmupLR(
+        scheduler_types = {
+            "constant": ConstantWarmupLR,
+            "cosine": CosineAnnealingWarmupLR,
+        }
+        if lr_scheduler not in scheduler_types:
+            raise ValueError(
+                f"unsupported lr_scheduler={lr_scheduler!r}; "
+                f"expected one of {sorted(scheduler_types)}"
+            )
+        self.lr_scheduler_type = lr_scheduler
+        self.scheduler = scheduler_types[lr_scheduler](
             self.optimizer,
             total_steps=total_steps,
             warmup_steps=int(warmup_ratio * total_steps),
@@ -160,6 +171,13 @@ class BF16Optimizer:
         """Restore optimizer/scheduler state and, when present, the rank-local
         fp32 master params; without them the masters are re-cloned from the
         bf16 weights and the resume is not numerically faithful."""
+        saved_scheduler_type = state_dict.get("lr_scheduler_type", "cosine")
+        if saved_scheduler_type != self.lr_scheduler_type:
+            raise ValueError(
+                "checkpoint optimizer used lr_scheduler="
+                f"{saved_scheduler_type!r} but this run has "
+                f"lr_scheduler={self.lr_scheduler_type!r}"
+            )
         saved_max_grad_norm = state_dict.get("max_grad_norm")
         if saved_max_grad_norm is not None and float(saved_max_grad_norm) != float(
             self.max_grad_norm
@@ -204,6 +222,7 @@ class BF16Optimizer:
         return {
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
+            "lr_scheduler_type": self.lr_scheduler_type,
             "max_grad_norm": self.max_grad_norm,
             # rank-local fp32 masters; without them a resume re-quantizes from bf16
             "fp32_params": [t.detach().cpu() for t in self.fp32_params],

@@ -200,6 +200,40 @@ def drain_feature_store_removals(
     return {"removed": 0, "removed_bytes": 0, "release_pending": 0}
 
 
+def drain_feature_store_sample_removals(
+    store: FeatureStore,
+    sample_ids: List[str],
+    *,
+    max_attempts: int = 8,
+    retry_interval_s: float = 0.25,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Dict[str, int]:
+    """Physically reclaim only optimizer-durable samples from a remote store.
+
+    A streaming loader can have removal-pending objects from prefetched batches
+    that have not reached an optimizer boundary yet.  Draining the store-wide
+    pending set at an acknowledgement boundary would delete their crash-replay
+    source too early.  Backends that need lease-authority removal therefore
+    expose a selective hook; synchronously-freeing stores need no extra work.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if retry_interval_s < 0:
+        raise ValueError("retry_interval_s must be >= 0")
+    ids = list(dict.fromkeys(sample_ids))
+    if not ids:
+        return {"removed": 0, "removed_bytes": 0, "release_pending": 0}
+    drain = getattr(store, "drain_sample_removals", None)
+    if not callable(drain):
+        return {"removed": 0, "removed_bytes": 0, "release_pending": 0}
+    return drain(
+        ids,
+        max_attempts=max_attempts,
+        retry_interval_s=retry_interval_s,
+        sleep=sleep,
+    )
+
+
 def load_feature_file(path: str) -> Dict[str, torch.Tensor]:
     """Load one prepared SpecForge offline feature file."""
     if path.endswith(".gz"):
@@ -598,6 +632,7 @@ __all__ = [
     "FeatureStore",
     "LocalFeatureStore",
     "drain_feature_store_removals",
+    "drain_feature_store_sample_removals",
     "load_feature_file",
     "spec_from_tensor",
 ]

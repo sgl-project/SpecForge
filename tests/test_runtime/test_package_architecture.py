@@ -136,11 +136,11 @@ OPERATIONAL_EXAMPLE_REPLACEMENTS = {
         "examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml",
     ),
     "examples/disagg/run_domino_dflash_serving_gate.sh": (
-        "scripts/gates/run_dflash_serving_gate.sh",
+        "scripts/gates/README.md",
+        "scripts/gates/normalize_dflash_export.py",
+        "scripts/gates/run_dflash_chat_serving_gate.py",
     ),
-    "examples/disagg/run_domino_disagg_overfit_gate.sh": (
-        "scripts/gates/run_disaggregated_overfit_gate.sh",
-    ),
+    "examples/disagg/run_domino_disagg_overfit_gate.sh": ("scripts/gates/README.md",),
 }
 
 REMOVED_PACKAGE_DIRECTORIES = (
@@ -713,8 +713,10 @@ class TestPackageArchitecture(unittest.TestCase):
             {
                 "glm-5.2-dspark.json",
                 "inkling-dspark.json",
+                "kimi-k3-dspark.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
+                "qwen3.6-27b-dspark.json",
             },
         )
         for name, payload in dspark_configs.items():
@@ -750,6 +752,7 @@ class TestPackageArchitecture(unittest.TestCase):
             Path("examples/disagg/run_offline.sh"),
             Path("examples/disagg/run_offline_2node.sh"),
             Path("examples/disagg/run_qwen3_8b_dflash_disagg_2node.sh"),
+            Path("examples/disagg/run_inkling_dspark_disagg_2node.sh"),
         }
         bypasses = []
         train_command = re.compile(r"\btrain\s+(?:--config|-c)\b")

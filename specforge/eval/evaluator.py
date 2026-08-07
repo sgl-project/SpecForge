@@ -39,10 +39,10 @@ class Evaluator:
     ) -> Dict[str, Any]:
         """Run the pass; returns ``{}`` if zero batches were processed globally.
 
-        Scalar accuracy is weighted by ``metrics['accuracy_denom']`` when present,
-        else by the loss-token count — only approximately batch-size invariant
-        when the accuracy counts a different token set than the loss. In a mixed
-        pass, scalar batches feed avg_loss only; their accuracy is not merged.
+        Additive loss and accuracy terms are used directly when the strategy
+        provides them. Scalar fallbacks use ``metrics['accuracy_denom']`` when
+        present, else the loss-token count. In a mixed pass, scalar batches feed
+        avg_loss only; their accuracy is not merged.
         """
         # pp rows: [correct, denom, acceptance_rate*w, ploss*w] per TTT
         # position, float64 so counts stay exact past 2**24.
@@ -63,8 +63,13 @@ class Evaluator:
                 if sums is None:
                     sums = torch.zeros(7, dtype=torch.float64, device=loss.device)
                 tokens = self._token_count(batch, m, device=sums.device)
-                sums[0] += loss.to(sums.device) * tokens
-                sums[1] += tokens
+                if out.loss_terms is None:
+                    sums[0] += loss.to(sums.device) * tokens
+                    sums[1] += tokens
+                else:
+                    loss_numerator, loss_denominator = out.loss_terms
+                    sums[0] += self._sum64(loss_numerator, sums.device)
+                    sums[1] += self._sum64(loss_denominator, sums.device)
                 sums[4] += 1.0
 
                 if "acc_corrects" in m and "acc_denoms" in m:
@@ -86,6 +91,10 @@ class Evaluator:
                     if "plosses" in m:
                         pp[3] += self._stack(m["plosses"]) * w
                         sums[6] += tokens
+                elif "acc" in out.ratio_metrics:
+                    accuracy_numerator, accuracy_denominator = out.ratio_metrics["acc"]
+                    sums[2] += self._sum64(accuracy_numerator, sums.device)
+                    sums[3] += self._sum64(accuracy_denominator, sums.device)
                 elif "accuracy" in m:
                     acc = m["accuracy"]
                     acc = (
@@ -96,11 +105,7 @@ class Evaluator:
                         )
                     )
                     denom = m.get("accuracy_denom")
-                    w = (
-                        torch.as_tensor(denom).detach().double().sum().to(sums.device)
-                        if denom is not None
-                        else tokens
-                    )
+                    w = self._sum64(denom, sums.device) if denom is not None else tokens
                     sums[2] += acc * w
                     sums[3] += w
 
@@ -161,6 +166,10 @@ class Evaluator:
     @staticmethod
     def _stack(values: Iterable[Any]) -> torch.Tensor:
         return torch.stack([torch.as_tensor(v).detach().double() for v in values])
+
+    @staticmethod
+    def _sum64(value: Any, device: torch.device) -> torch.Tensor:
+        return torch.as_tensor(value).detach().double().sum().to(device)
 
     @staticmethod
     def _comm_device() -> torch.device:

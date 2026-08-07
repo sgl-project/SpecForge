@@ -64,10 +64,15 @@ OnlineDFlashModel = _dflash_module.OnlineDFlashModel
 OnlineDSparkModel = _dflash_module.OnlineDSparkModel
 
 
+def _anchor_sampler_subject(num_anchors: int = 8):
+    return types.SimpleNamespace(num_anchors=num_anchors)
+
+
 class _FixedDraft(nn.Module):
     def __init__(self, hidden_size: int):
         super().__init__()
         self.hidden_size = hidden_size
+        self.sliding_window = None
 
     def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
         bsz, draft_len = noise_embedding.shape[:2]
@@ -317,7 +322,7 @@ def _naive_dflash_loss(neg_log_q, binary_mask, gamma):
         positions = torch.arange(block_size, dtype=neg_log_q.dtype).view(1, 1, -1)
         decay = torch.exp(-(positions - 1).clamp(min=0) / gamma)
         weight = weight * decay
-    return (neg_log_q * weight).sum() / (weight.sum() + 1e-6)
+    return (neg_log_q * weight).sum() / weight.sum()
 
 
 class TestDFlashLosses(unittest.TestCase):
@@ -362,6 +367,49 @@ class TestDFlashLosses(unittest.TestCase):
         want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=gamma)
         torch.testing.assert_close(got, want, rtol=0, atol=1e-8)
 
+    def test_dflash_exposes_additive_loss_and_accuracy_terms(self):
+        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
+        model = _make_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=head,
+        )
+
+        loss, accuracy, metrics = model(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+        )
+
+        loss_num, loss_den = metrics["loss_terms"]
+        self.assertTrue(loss_num.requires_grad)
+        torch.testing.assert_close(loss, loss_num / loss_den)
+        accuracy_num, accuracy_den = metrics["ratio_metrics"]["acc"]
+        torch.testing.assert_close(accuracy, accuracy_num / accuracy_den)
+
+    def test_dflash_partial_tail_has_one_finite_target(self):
+        vocab_size = 7
+        logits = torch.randn(1, 1, 5, vocab_size, dtype=torch.double)
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        loss_mask = torch.ones_like(input_ids, dtype=torch.double)
+        model = _make_model(
+            logits,
+            anchors=torch.tensor([[2]]),
+            keep_mask=torch.tensor([[True]]),
+        )
+
+        loss, _accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=torch.zeros(1, 4, 4, dtype=torch.double),
+            loss_mask=loss_mask,
+        )
+
+        expected = F.cross_entropy(logits[0, 0, 1].unsqueeze(0), input_ids[:, 3])
+        torch.testing.assert_close(loss, expected)
+        torch.testing.assert_close(metrics["loss_terms"][1], loss.new_tensor(1.0))
+
     def test_dpace_full_matches_naive_reference(self):
         alpha = 0.5
         got = self._forward_loss(loss_type="dpace", dpace_alpha=alpha)
@@ -405,12 +453,28 @@ class TestDFlashLosses(unittest.TestCase):
 
     def test_dpace_loss_reduces_by_batch_size(self):
         alpha = 0.5
-        got = self._forward_loss(loss_type="dpace", dpace_alpha=alpha)
+        model = _make_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            loss_type="dpace",
+            dpace_alpha=alpha,
+        )
+        got, _accuracy, metrics = model(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+        )
         weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
         weighted_sum = (self.neg_log_q * weight * self.binary_mask).sum()
         token_count_loss = weighted_sum / ((weight * self.binary_mask).sum() + 1e-6)
         batch_loss = weighted_sum / float(self.input_ids.shape[0])
         torch.testing.assert_close(got, batch_loss, rtol=0, atol=1e-10)
+        torch.testing.assert_close(metrics["loss_terms"][0], weighted_sum)
+        torch.testing.assert_close(
+            metrics["loss_terms"][1],
+            got.new_tensor(float(self.input_ids.shape[0])),
+        )
         self.assertFalse(torch.allclose(got, token_count_loss))
 
     def test_alpha_changes_dpace_loss(self):
@@ -772,6 +836,59 @@ class TestDFlashLosses(unittest.TestCase):
         )
         self.assertEqual(anchors[0, 0].item(), 4)
         self.assertEqual(keep[0].tolist(), [True, False])
+
+    def test_shared_sampler_uses_adjacent_targets_and_partial_tails(self):
+        sampler = OnlineDFlashModel._sample_anchor_positions
+        model = _anchor_sampler_subject()
+        loss_mask = torch.tensor([[1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0]])
+
+        anchors, keep = sampler(
+            model,
+            seq_len=loss_mask.shape[1],
+            loss_mask=loss_mask,
+            device=loss_mask.device,
+        )
+
+        self.assertEqual(anchors[keep].tolist(), [0, 5])
+
+    def test_shared_sampler_is_batch_padding_invariant(self):
+        sampler = OnlineDFlashModel._sample_anchor_positions
+        model = _anchor_sampler_subject()
+        short_mask = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
+        short_anchors, short_keep = sampler(
+            model,
+            seq_len=4,
+            loss_mask=short_mask,
+            device=short_mask.device,
+        )
+        padded_batch = torch.tensor(
+            [
+                [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+                [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            ]
+        )
+        batch_anchors, batch_keep = sampler(
+            model,
+            seq_len=7,
+            loss_mask=padded_batch,
+            device=padded_batch.device,
+        )
+
+        self.assertEqual(short_anchors[short_keep].tolist(), [2])
+        self.assertEqual(batch_anchors[0][batch_keep[0]].tolist(), [2])
+        self.assertFalse(batch_keep[2].any())
+
+    def test_shared_sampler_rejects_a_batch_without_adjacent_targets(self):
+        model = _anchor_sampler_subject()
+        loss_mask = torch.tensor([[1.0, 0.0, 1.0]])
+        with self.assertRaisesRegex(ValueError, "two consecutive"):
+            OnlineDFlashModel._sample_anchor_positions(
+                model,
+                seq_len=loss_mask.shape[1],
+                loss_mask=loss_mask,
+                device=loss_mask.device,
+            )
 
 
 if __name__ == "__main__":

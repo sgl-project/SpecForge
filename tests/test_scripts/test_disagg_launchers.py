@@ -13,6 +13,10 @@ ONLINE = ROOT / "examples" / "disagg" / "run_online.sh"
 OFFLINE = ROOT / "examples" / "disagg" / "run_offline.sh"
 OFFLINE_TWO_NODE = ROOT / "examples" / "disagg" / "run_offline_2node.sh"
 TWO_NODE = ROOT / "examples" / "disagg" / "run_qwen3_8b_dflash_disagg_2node.sh"
+INKLING_TWO_NODE = ROOT / "examples" / "disagg" / "run_inkling_dspark_disagg_2node.sh"
+KIMI_K3_CAPTURE_PATCH = (
+    ROOT / "patches" / "sglang" / "kimi-k3-f8493a4" / "spec-capture.patch"
+)
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):
@@ -123,6 +127,23 @@ class DisaggregatedWrapperTest(unittest.TestCase):
             self.assertIn("--role", result.stdout)
             self.assertIn("producer and consumer", result.stdout)
 
+    def test_kimi_k3_capture_patch_only_copies_features_on_the_writer_rank(self):
+        source = KIMI_K3_CAPTURE_PATCH.read_text(encoding="utf-8")
+        self.assertIn("self.output_streamer.ps.attn_tp_rank != 0", source)
+        self.assertNotIn(".cpu().clone()", source)
+        self.assertIn('getattr(logits_output, "_spec_capture_aux_cpu", None)', source)
+        self.assertIn("logits_output.hidden_states.cpu()", source)
+        self.assertIn('"aux" in features', source)
+        self.assertIn('"last_hidden" in features', source)
+        self.assertIn("_should_copy_hidden_states_to_cpu", source)
+        self.assertIn("self.ps.attn_tp_rank == 0", source)
+        self.assertIn("self.logits_output.last_hidden_states = _async_d2h(", source)
+        self.assertIn("len(chunks) == 1", source)
+        self.assertIn("ThreadPoolExecutor(", source)
+        self.assertIn('getattr(store, "batch_put_from", None)', source)
+        self.assertIn("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", source)
+        self.assertIn("req.finished() and req.spec_capture_result is None", source)
+
     def test_two_node_wrapper_keeps_training_on_the_unified_cli(self):
         self.assertTrue(os.access(TWO_NODE, os.X_OK))
         syntax = subprocess.run(
@@ -178,6 +199,54 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertNotIn("run_disagg_dflash.py", "".join(outputs.values()))
         self.assertNotIn("torchrun", "".join(outputs.values()))
         self.assertFalse(shared_root.exists())
+
+    def test_inkling_two_node_wrapper_pins_the_validated_server_contract(self):
+        self.assertTrue(os.access(INKLING_TWO_NODE, os.X_OK))
+        syntax = subprocess.run(
+            ["bash", "-n", str(INKLING_TWO_NODE)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        env = self._env()
+        env.update(
+            {
+                "NODE_RANK": "0",
+                "NUM_NODES": "2",
+                "HEAD_IP": "10.0.0.1",
+                "DISAGG_STORE_ID": "inkling-two-node-test",
+                "DISAGG_RUN_ROOT": str(self.root / "inkling-shared-attempt"),
+                "DRY_RUN": "1",
+            }
+        )
+        result = subprocess.run(
+            [str(INKLING_TWO_NODE), "training.max_steps=1"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = result.stdout
+        for expected in (
+            "thinkingmachines/Inkling",
+            "--tp-size 4",
+            "--spec-capture-aux-layer-ids 5 17 35 47 59",
+            "--attention-backend fa4",
+            "--quantization modelopt_fp4",
+            "--mamba-radix-cache-strategy extra_buffer",
+            "training.accumulation_steps=128",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, output)
+        self.assertNotIn("--disable-radix-cache", output)
+
+        source = INKLING_TWO_NODE.read_text(encoding="utf-8")
+        self.assertIn("SGLANG_ENABLE_UNIFIED_RADIX_TREE", source)
+        self.assertIn("SGLANG_OPT_USE_INKLING_CUSTOM_AR", source)
 
     def test_offline_two_node_wrapper_dispatches_roles_to_the_unified_cli(self):
         self.assertTrue(os.access(OFFLINE_TWO_NODE, os.X_OK))

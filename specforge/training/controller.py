@@ -20,6 +20,7 @@ import itertools
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -139,10 +140,16 @@ def _reduce_ratio_metrics(
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
-            if process_group is None:
-                dist.all_reduce(packed)
-            else:
-                dist.all_reduce(packed, group=process_group)
+            world = (
+                dist.get_world_size()
+                if process_group is None
+                else dist.get_world_size(group=process_group)
+            )
+            if world > 1:
+                if process_group is None:
+                    dist.all_reduce(packed)
+                else:
+                    dist.all_reduce(packed, group=process_group)
 
     output: Dict[str, float] = {}
     cursor = 0
@@ -311,6 +318,7 @@ class TrainerCore:
         self.backend = backend
         self.accumulation_steps = max(1, accumulation_steps)
         self._micro = 0
+        self._ratio_totals: Dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @property
     def accumulation_remainder(self) -> int:
@@ -321,16 +329,79 @@ class TrainerCore:
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
         out: StepOutput = self.strategy.forward_loss(batch, ctx)
-        loss = out.loss / self.accumulation_steps
+        loss = out.loss
+        ratio_metrics = dict(out.ratio_metrics)
+        if out.loss_terms is not None:
+            numerator, denominator = out.loss_terms
+            if numerator.numel() != 1 or denominator.numel() != 1:
+                raise ValueError("loss_terms must contain scalar tensors")
+            loss = numerator.reshape(())
+            denominator = denominator.detach().reshape(())
+            ratio_metrics["loss"] = (
+                numerator.detach().reshape(()),
+                denominator,
+            )
+        self._accumulate_ratio_metrics(ratio_metrics)
+        loss = loss / self.accumulation_steps
         self._micro += 1
         # The boundary is known before backward so the backend can defer the FSDP
         # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
+        if stepped and out.loss_terms is not None:
+            self._normalize_gradients(self._ratio_totals["loss"][1])
         grad_norm = self.backend.step() if stepped else None
-        return self._result(out, grad_norm, stepped)
+        result_ratio_metrics = self._ratio_totals if stepped else ratio_metrics
+        result = self._result(
+            out,
+            grad_norm,
+            stepped,
+            ratio_metrics=result_ratio_metrics,
+        )
+        if stepped:
+            self._ratio_totals = {}
+        return result
 
-    def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
+    def _accumulate_ratio_metrics(self, values: Dict[str, Any]) -> None:
+        for name, (raw_numerator, raw_denominator) in values.items():
+            numerator = torch.as_tensor(raw_numerator).detach()
+            denominator = torch.as_tensor(raw_denominator).detach()
+            previous = self._ratio_totals.get(name)
+            if previous is not None:
+                numerator = previous[0] + numerator
+                denominator = previous[1] + denominator
+            self._ratio_totals[name] = (numerator, denominator)
+
+    def _normalize_gradients(self, local_denominator: torch.Tensor) -> None:
+        import torch.distributed as dist
+
+        denominator = local_denominator.clone()
+        parallel_config = getattr(self.backend, "parallel_config", None)
+        process_group = getattr(parallel_config, "fsdp_process_group", None)
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size(group=process_group)
+            if world_size > 1:
+                dist.all_reduce(
+                    denominator,
+                    op=dist.ReduceOp.SUM,
+                    group=process_group,
+                )
+        if denominator.item() <= 0:
+            raise ValueError("global loss denominator must be positive")
+        scale = (
+            denominator.new_tensor(world_size * self.accumulation_steps) / denominator
+        )
+        self.backend.scale_gradients(scale)
+
+    def _result(
+        self,
+        out: StepOutput,
+        grad_norm,
+        stepped: bool,
+        *,
+        ratio_metrics: Optional[Dict[str, Any]] = None,
+    ) -> StepResult:
         # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
         # positions and reduce counts before ratios; scalarizing its lists here
         # would both collapse the TTT structure and log one rank's local data.
@@ -353,7 +424,7 @@ class TrainerCore:
         metrics: Dict[str, Any] = dict(structured or {})
         metrics.update(
             _reduce_ratio_metrics(
-                out.ratio_metrics,
+                out.ratio_metrics if ratio_metrics is None else ratio_metrics,
                 device=metric_device,
                 process_group=process_group,
                 reduce=stepped,
@@ -374,7 +445,11 @@ class TrainerCore:
         # the generic trainer their algorithm-specific names. Move CPU schedule
         # scalars (for example Domino's lambda_base) onto the loss device before
         # the DP reduction so NCCL-backed runs do not all-reduce a CPU tensor.
-        reserved_metric_keys = _EAGLE3_STRUCTURED_METRIC_KEYS | {"accuracy", "loss"}
+        reserved_metric_keys = _EAGLE3_STRUCTURED_METRIC_KEYS | {
+            "accuracy",
+            "accuracy_denom",
+            "loss",
+        }
         for key, value in out.metrics.items():
             if key in reserved_metric_keys:
                 continue
@@ -540,6 +615,12 @@ class TrainerController:
             self.eval_interval > 0 and self.eval_data_factory is not None
         )
         pending_ack: List[str] = []
+        perf_window_started = time.perf_counter()
+        perf_window_steps = 0
+        perf_window_samples = 0
+        perf_data_wait_s = 0.0
+        perf_train_compute_s = 0.0
+        perf_durable_ack_s = 0.0
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
@@ -563,32 +644,40 @@ class TrainerController:
                     stream = it
             _it = iter(stream)
             while True:
+                data_wait_started = time.perf_counter()
                 try:
                     batch = next(_it)
                 except StopIteration:
                     break
+                perf_data_wait_s += time.perf_counter() - data_wait_started
+                perf_window_samples += len(batch.sample_ids)
                 self._epoch_batch += 1
                 self._epoch_samples += len(batch.sample_ids)
                 self.micro_step += 1
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
                 self._step_profiler.before_micro_step(self.global_step)
+                train_compute_started = time.perf_counter()
                 result = self.core.train_step(
                     batch,
                     ctx=StepContext(
                         global_step=self.global_step, total_steps=self.total_steps
                     ),
                 )
+                perf_train_compute_s += time.perf_counter() - train_compute_started
                 self.last_metrics = result.metrics
                 # grad accumulated but optimizer has not stepped yet; everything
                 # keyed on optimizer steps fires only at the boundary.
                 if not result.optimizer_stepped:
                     continue
                 self.global_step += 1
+                perf_window_steps += 1
                 self._step_profiler.after_optimizer_step(self.global_step)
                 if self.ack_fn is not None:
                     # durable ack transaction at the optimizer-step boundary
+                    durable_ack_started = time.perf_counter()
                     self.ack_fn(pending_ack, self.global_step)
+                    perf_durable_ack_s += time.perf_counter() - durable_ack_started
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     log_metrics = dict(result.metrics)
@@ -596,7 +685,46 @@ class TrainerController:
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
+                    perf_elapsed_s = max(
+                        time.perf_counter() - perf_window_started,
+                        1e-12,
+                    )
+                    parallel = getattr(self.core.backend, "parallel_config", None)
+                    world_size = int(getattr(parallel, "world_size", 1))
+                    tp_size = int(getattr(parallel, "tp_size", 1))
+                    sp_size = int(getattr(parallel, "sp_size", 1))
+                    data_parallel_size = max(1, world_size // (tp_size * sp_size))
+                    log_metrics.update(
+                        {
+                            "perf/optimizer_steps_per_hour": (
+                                perf_window_steps * 3600.0 / perf_elapsed_s
+                            ),
+                            "perf/optimizer_step_time_s": (
+                                perf_elapsed_s / max(1, perf_window_steps)
+                            ),
+                            "perf/data_wait_time_s": (
+                                perf_data_wait_s / max(1, perf_window_steps)
+                            ),
+                            "perf/train_compute_time_s": (
+                                perf_train_compute_s / max(1, perf_window_steps)
+                            ),
+                            "perf/durable_ack_time_s": (
+                                perf_durable_ack_s / max(1, perf_window_steps)
+                            ),
+                            "perf/global_samples_per_second": (
+                                perf_window_samples
+                                * data_parallel_size
+                                / perf_elapsed_s
+                            ),
+                        }
+                    )
                     self.logger(log_metrics, self.global_step)
+                    perf_window_started = time.perf_counter()
+                    perf_window_steps = 0
+                    perf_window_samples = 0
+                    perf_data_wait_s = 0.0
+                    perf_train_compute_s = 0.0
+                    perf_durable_ack_s = 0.0
                 eval_metrics: Optional[Dict[str, Any]] = None
                 if eval_enabled and self.global_step % self.eval_interval == 0:
                     eval_metrics = self.evaluate_configured()
