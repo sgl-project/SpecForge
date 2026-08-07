@@ -258,9 +258,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if plan.kind == "worker":
             for key, value in plan.worker_env.items():
                 if value is None:
-                    # Same contract as CommandSpec.env: None unsets the
-                    # variable (Ascend rejects an empty
-                    # ASCEND_RT_VISIBLE_DEVICES).
+                    # CommandSpec.env contract: None unsets the variable.
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value

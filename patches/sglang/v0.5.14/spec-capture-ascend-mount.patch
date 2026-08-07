@@ -13,11 +13,8 @@ index 4955e11..902f0b1 100644
 +                os.environ.get("MOONCAKE_LOCAL_BUFFER_SIZE", 1 << 30)
 +            )
 +            protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp")
-+            # Ascend Mooncake builds reject the wildcard location
-+            # ("location:* is not supported") that setup() uses when
-+            # registering the local buffer and mounting the global segment.
-+            # On such hosts skip both in setup() and mount the segment
-+            # explicitly with location="cpu".
++            # Ascend Mooncake rejects the wildcard location ("location:* is
++            # not supported"); skip it in setup() and mount with location="cpu".
 +            ascend_host = bool(os.environ.get("ASCEND_RT_VISIBLE_DEVICES"))
 +            segment_to_mount = global_segment_size if ascend_host else 0
 +            if ascend_host:

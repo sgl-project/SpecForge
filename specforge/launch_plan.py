@@ -93,9 +93,8 @@ def _redacted_env(values: Mapping[str, Optional[str]]) -> dict[str, Optional[str
 class CommandSpec:
     label: str
     argv: tuple[str, ...]
-    #: Child environment overrides. A None value removes the variable from
-    #: the inherited environment (e.g. Ascend rejects an empty
-    #: ASCEND_RT_VISIBLE_DEVICES, so hiding devices must unset the variable).
+    #: Child environment overrides; a None value unsets the inherited
+    #: variable (Ascend rejects an empty ASCEND_RT_VISIBLE_DEVICES).
     env: Mapping[str, Optional[str]] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
@@ -367,12 +366,10 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
 
 
 def _device_visibility_env_var() -> str:
-    """Name of the visible-devices env var for the active accelerator.
+    """Visible-devices env var for the active accelerator.
 
-    CUDA hosts use ``CUDA_VISIBLE_DEVICES``; Ascend NPU hosts use
-    ``ASCEND_RT_VISIBLE_DEVICES``. Kept torch-free so launch planning works
-    in supervisor processes without torch: ``torch_npu`` is detected by
-    module availability (no import) after explicit env markers.
+    Kept torch-free for supervisor processes: ``torch_npu`` is detected by
+    module availability, after explicit env markers.
     """
     forced = os.environ.get("SPECFORGE_DEVICE")
     if forced == "npu":
@@ -393,9 +390,8 @@ def _device_visibility_env_var() -> str:
 def _hidden_devices_env_value(visibility_env: str) -> Optional[str]:
     """Env value that hides accelerators from a managed child process.
 
-    CUDA hides devices with an empty list; the Ascend driver rejects an
-    empty ``ASCEND_RT_VISIBLE_DEVICES``, so the variable must be unset
-    (``None``, removed by ``_spawn_command``) instead.
+    The Ascend driver rejects an empty ``ASCEND_RT_VISIBLE_DEVICES``, so
+    there the variable must be unset (``None``) instead of emptied.
     """
     return "" if visibility_env == "CUDA_VISIBLE_DEVICES" else None
 
@@ -441,8 +437,6 @@ def _managed_local_services(
     control_dir = Path(deployment.control_dir)
     log_dir = control_dir / "logs"
     shared_env = _managed_local_environment(cfg)
-    #: Device ordinals from the typed config are injected through the
-    #: accelerator-appropriate visibility env var (CUDA vs Ascend NPU).
     visibility_env = _device_visibility_env_var()
     capture_context_length = cfg.model.sglang_context_length or (
         cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
@@ -1043,12 +1037,11 @@ def _spawn_command(
     stderr=None,
 ) -> subprocess.Popen:
     child_env = os.environ.copy()
-    child_env.update(
-        {key: value for key, value in command.env.items() if value is not None}
-    )
     for key, value in command.env.items():
         if value is None:
             child_env.pop(key, None)
+        else:
+            child_env[key] = value
     kwargs = {"env": child_env, "start_new_session": True}
     if stdout is not None:
         kwargs["stdout"] = stdout

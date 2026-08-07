@@ -145,12 +145,9 @@ def init_distributed(
     # initialization; doing the same for NCCL also removes ambiguous rank/device
     # inference on heterogeneous hosts.
     local_rank = _bind_local_device(device_type)
-    # Yunchang probes the active CUDA device while importing, which fails
-    # outright on NPU-only torch builds. It is only needed for sequence
-    # parallelism (USP), so load it lazily only when SP sizes exceed 1. With
-    # SP sizes of 1 its groups are unused: the SP getters stay None, and
-    # get_rank/get_world_size(None) resolve to the default group exactly like
-    # yunchang's SP=1 groups do.
+    # Yunchang probes the active CUDA device at import, which crashes
+    # NPU-only torch builds. Only USP needs it, so load it lazily when SP
+    # sizes exceed 1; with SP=1 the SP getters stay None.
     if sp_ulysses_size * sp_ring_size > 1:
         process_group, set_seq_parallel_pg = _load_yunchang_globals()
     else:

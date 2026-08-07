@@ -91,21 +91,17 @@ class _InjectedReplicateConfig:
         self.with_soft_pin = with_soft_pin
 
 
-# Ascend selects visible NPUs through these env vars, mirroring
-# ``CUDA_VISIBLE_DEVICES``. Their presence marks a host as Ascend even before
-# ``torch_npu`` has been imported (e.g. in a capture producer that never runs
-# ``init_distributed``).
+# Ascend's CUDA_VISIBLE_DEVICES equivalent; its presence marks an Ascend
+# host even before torch_npu is imported.
 _ASCEND_VISIBLE_DEVICE_ENVS = ("ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES")
 
 
 def _ascend_runtime_available() -> bool:
-    """Report whether a usable Ascend NPU runtime is present.
+    """Whether a usable Ascend NPU runtime is present.
 
-    ``torch.npu`` only exists once ``torch_npu`` is imported, which the canonical
-    trainer does lazily inside ``init_distributed``. A disaggregated capture
-    producer skips that path, so activate ``torch_npu`` here (only on a host that
-    actually selects Ascend devices) to detect the runtime without forcing the
-    import on CUDA/CPU hosts.
+    ``torch.npu`` exists only after ``torch_npu`` is imported; do that here,
+    but only on hosts already selecting Ascend devices via env var, so the
+    import never fires on CUDA/CPU hosts.
     """
     if getattr(torch, "npu", None) is None:
         if not any(os.environ.get(name) for name in _ASCEND_VISIBLE_DEVICE_ENVS):
@@ -124,19 +120,10 @@ def _ascend_runtime_available() -> bool:
 def _bind_transport_device() -> None:
     """Bind this process's local NPU before Mooncake installs its transport.
 
-    On Ascend, ``MooncakeDistributedStore.setup()`` installs the
-    ``AscendDirectTransport``, which calls ``aclrtGetDevice`` and fails with
-    ``ACL_ERROR_RT_CONTEXT_NULL`` (107002) when no device context exists for the
-    calling process. The store is constructed at run-assembly time; a trainer
-    (consumer) has already bound its NPU in ``init_distributed``, but a capture
-    *producer* deliberately never initializes an accelerator, so the transport
-    would have no device to allocate its local segment against.
-
-    Bind only for NPU: CUDA's transport defaults to device 0 without an explicit
-    ``set_device`` and the producer intentionally avoids initializing CUDA.
-    ``_bind_local_device`` reads ``LOCAL_RANK``/``RANK`` (set by ``torchrun``), so
-    every rank pins the transport to its own NPU, and it is idempotent with the
-    trainer's earlier binding.
+    Ascend's transport calls ``aclrtGetDevice`` in ``setup()`` and fails with
+    ``ACL_ERROR_RT_CONTEXT_NULL`` when no device context exists — the case in
+    a capture producer, which never runs ``init_distributed``. No-op on CUDA,
+    where the transport defaults to device 0.
     """
     from specforge.utils import get_device_type
 
@@ -163,17 +150,12 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
             "official wheel (`mooncake-transfer-engine` for CUDA < 13, or "
             "`mooncake-transfer-engine-cuda13` for CUDA >= 13)."
         ) from e
-    # Ascend's transport is installed inside setup() and needs a bound device
-    # context; bind the local accelerator first so the transfer engine can
-    # allocate its local segment (see _bind_transport_device).
+    # Ascend's transport needs a bound device context (see _bind_transport_device).
     _bind_transport_device()
     setup_kwargs = dict(setup_kwargs)
     if _ascend_runtime_available():
-        # AscendDirectTransport rejects the store client's wildcard-location
-        # registration of the CPU staging buffer ("location:* is not
-        # supported" -> INVALID_PARAMS). SpecForge roles are pure zero-copy
-        # clients (put_from/get_into), so force the staging buffer to 0; the
-        # store client skips registration entirely when local_buffer_size == 0.
+        # Ascend rejects the wildcard-location staging-buffer registration
+        # ("location:* is not supported"); zero-copy clients can drop it.
         setup_kwargs["local_buffer_size"] = 0
     store = MooncakeDistributedStore()
     rc = store.setup(**setup_kwargs)
@@ -280,9 +262,8 @@ class MooncakeFeatureStore(FeatureStore):
         _require_store_api(store)
         self._store = store
         put_config.replica_num = replica_num
-        # Older/Ascend Mooncake builds expose no with_hard_pin on
-        # ReplicateConfig; objects then follow the store's default pin
-        # behavior until remove(). Set it only when the field exists.
+        # Older/Ascend Mooncake builds lack with_hard_pin; objects then
+        # follow the store's default pin behavior.
         if hasattr(put_config, "with_hard_pin"):
             put_config.with_hard_pin = hard_pin
         elif hard_pin:

@@ -172,9 +172,8 @@ def drain_feature_store_removals(
     concrete class. The default is bounded to forty attempts and 19.5 seconds of
     inter-attempt waiting; Mooncake's implementation avoids existence probes
     between attempts so those waits let an existing read lease expire rather
-    than renewing it. The window must exceed Mooncake's read-lease TTL: the
-    final optimizer step's refs are read moments before this drain runs, and a
-    shorter window fails removals whose leases are still live (remove -706).
+    than renewing it. The window must exceed Mooncake's read-lease TTL, or
+    removals with live leases fail at shutdown (remove -706).
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")

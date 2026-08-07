@@ -307,10 +307,8 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
 class ManagedLocalCaptureServerConfig(StrictConfigModel):
     """One patched SGLang capture server owned by the local supervisor.
 
-    ``cuda_visible_devices`` holds device ordinals (not CUDA-specific): the
-    launcher injects them through the accelerator-appropriate visibility env
-    var — ``CUDA_VISIBLE_DEVICES`` on CUDA hosts,
-    ``ASCEND_RT_VISIBLE_DEVICES`` on Ascend NPU hosts.
+    ``cuda_visible_devices`` holds plain device ordinals; the launcher maps
+    them to the accelerator's visibility env var.
     """
 
     port: int = Field(gt=0, le=65535)
@@ -339,10 +337,8 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
 class ManagedLocalStackConfig(StrictConfigModel):
     """Opt-in ownership of a complete single-node online capture stack.
 
-    ``trainer_cuda_visible_devices`` holds device ordinals (not
-    CUDA-specific): the launcher injects them through the
-    accelerator-appropriate visibility env var — ``CUDA_VISIBLE_DEVICES``
-    on CUDA hosts, ``ASCEND_RT_VISIBLE_DEVICES`` on Ascend NPU hosts.
+    ``trainer_cuda_visible_devices`` holds plain device ordinals; the
+    launcher maps them to the accelerator's visibility env var.
     """
 
     trainer_cuda_visible_devices: List[str] = Field(min_length=1)

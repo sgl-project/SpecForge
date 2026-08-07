@@ -1,7 +1,6 @@
-# Single-node managed full stack for Ascend NPU: one `specforge train` command
-# owns Mooncake, one patched SGLang capture server (device 0), and a 7-rank
-# trainer (devices 1-7). Device ordinals are injected via
-# ASCEND_RT_VISIBLE_DEVICES on Ascend hosts.
+# Single-node managed full stack for Ascend NPU, launched with one
+# `specforge train` command. Device ordinals are injected via
+# ASCEND_RT_VISIBLE_DEVICES.
 model:
   target_model_path: "Qwen/Qwen3.5-4B"
   draft_model_config: "configs/qwen3.5-4b-dflash.json"
