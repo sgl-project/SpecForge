@@ -871,6 +871,8 @@ def build_disagg_online_producer(
     )
 
     def producer_timing(message: str) -> None:
+        if os.environ.get("SPECFORGE_PRODUCER_TIMING", "1") == "0":
+            return
         print(
             f"[producer-timing] {time.strftime('%Y-%m-%d %H:%M:%S')} {message}",
             flush=True,
