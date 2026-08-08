@@ -175,6 +175,21 @@ class DPAckController(DataFlowController):
                     )
                 except BaseException as exc:
                     failures.append(f"{sample_id}: {type(exc).__name__}: {exc}")
+            try:
+                # Mooncake read leases can defer abort()'s physical removal for
+                # minutes.  Once this exact optimizer window is durable, force
+                # only its rank-local ids; a store-wide drain could delete
+                # prefetched refs that still need crash replay.
+                from specforge.runtime.data_plane.feature_store import (
+                    drain_feature_store_sample_removals,
+                )
+
+                drain_feature_store_sample_removals(self.feature_store, local_ids)
+            except BaseException as exc:
+                failures.append(
+                    "optimizer-boundary selective drain: "
+                    f"{type(exc).__name__}: {exc}"
+                )
             if failures:
                 cleanup_error = ", ".join(failures)
         cleanup_error = self._sync_cleanup_error(cleanup_error)

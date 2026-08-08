@@ -21,6 +21,21 @@ class TemplateRegistryTest(unittest.TestCase):
             template.assistant_header,
         )
 
+    def test_kimi_k3_template_matches_target_xtml_contract(self):
+        template = TEMPLATE_REGISTRY.get("kimi-k3-thinking")
+        self.assertEqual(
+            template.assistant_header,
+            '<|open|>message role="assistant"<|sep|><|open|>think<|sep|>',
+        )
+        self.assertEqual(
+            template.user_header,
+            '<|open|>message role="user"<|sep|>',
+        )
+        self.assertEqual(template.end_of_turn_token, "<|end_of_msg|>")
+        self.assertEqual(template.parser_type, "thinking")
+        self.assertFalse(template.enable_thinking)
+        self.assertEqual(template.ignore_token, ["<|end_of_msg|>"])
+
 
 if __name__ == "__main__":
     unittest.main()

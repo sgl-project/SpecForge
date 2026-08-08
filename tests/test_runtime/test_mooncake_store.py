@@ -15,6 +15,7 @@ import unittest
 import torch
 
 from specforge.runtime.control_plane.controller import DataFlowController
+from specforge.runtime.control_plane.dp_ack import DPAckController
 from specforge.runtime.control_plane.metadata_store import InMemoryMetadataStore
 from specforge.runtime.data_plane.disaggregated import AuthPolicy
 from specforge.runtime.data_plane.feature_store import (
@@ -266,6 +267,81 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(fs.health()["release_pending"], 0)
         self.assertEqual(fs.health()["force_freed_total"], 1)
         self.assertFalse(_phys_resident(fake))
+
+    def test_lifecycle_drain_forces_removal_after_application_lease_closes(self):
+        class ForceAwareFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.force_values = []
+
+            def remove(self, key, force=False):
+                self.remove_calls += 1
+                self.force_values.append(force)
+                if not force:
+                    return -706
+                self._d.pop(key, None)
+                return 0
+
+        fake = ForceAwareFake()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, handle = fs.get(ref)
+
+        fs.release(handle)
+        self.assertEqual(fs.health()["release_pending"], 1)
+        self.assertTrue(_phys_resident(fake))
+
+        report = drain_feature_store_removals(fs)
+
+        self.assertEqual(report["attempts"], 1)
+        self.assertEqual(fs.health()["release_pending"], 0)
+        self.assertFalse(_phys_resident(fake))
+        num_features = len(ref.feature_keys)
+        self.assertEqual(fake.force_values[:num_features], [False] * num_features)
+        self.assertEqual(fake.force_values[num_features:], [True] * num_features)
+
+    def test_optimizer_ack_forces_only_durable_samples(self):
+        class ForceAwareFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.force_values = []
+
+            def remove(self, key, force=False):
+                self.remove_calls += 1
+                self.force_values.append((key, force))
+                if not force:
+                    return -706
+                self._d.pop(key, None)
+                return 0
+
+        fake = ForceAwareFake()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        durable = fs.put(_tensors(), sample_id="durable", metadata=_meta())
+        prefetched = fs.put(_tensors(), sample_id="prefetched", metadata=_meta())
+        for ref in (durable, prefetched):
+            _, handle = fs.get(ref)
+            fs.release(handle)
+        self.assertEqual(fs.health()["release_pending"], 2)
+
+        controller = DPAckController(
+            "run0",
+            feature_store=fs,
+            metadata_store=InMemoryMetadataStore(),
+        )
+        controller.commit_samples("distributor", [durable, prefetched])
+        controller.ack_train_refs(
+            "trainer",
+            [durable.sample_id],
+            global_step=1,
+            optimizer_durable=True,
+        )
+
+        self.assertFalse(_phys_resident(fake, sid="durable"))
+        self.assertTrue(_phys_resident(fake, sid="prefetched"))
+        self.assertEqual(fs.health()["release_pending"], 1)
+        marker = controller.store.durable_marker()
+        self.assertEqual(marker["global_step"], 1)
+        self.assertEqual(marker["acked"], {"durable"})
 
     def test_lifecycle_drain_does_not_renew_read_lease_between_retries(self):
         clock = _FakeClock()

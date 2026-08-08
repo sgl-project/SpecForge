@@ -1,0 +1,94 @@
+model:
+  target_model_path: /workspace/models/Kimi-K3-cdd2e49a
+  draft_model_config: configs/kimi-k3-dspark.json
+  # Weights-only initialization: optimizer, scheduler, counters, and RNG start
+  # fresh for the regenerated agentic data.
+  draft_checkpoint_path: /workspace/k3_dspark/checkpoints/kimi-k3-dspark/epoch_0_step_0
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.lm_head.weight
+  mask_token_id: 163824
+  torch_dtype: bfloat16
+  sglang_attention_backend: trtllm_mla
+  sglang_mem_fraction_static: 0.76
+  sglang_context_length: 66048
+  sglang_max_running_requests: 1
+  sglang_max_total_tokens: 66048
+  sglang_moe_runner_backend: marlin
+  sglang_mamba_radix_cache_strategy: extra_buffer
+  sglang_max_mamba_cache_size: 5
+
+data:
+  train_data_path: /workspace/k3_dspark/data/kimi-k3-agentic-regen.jsonl
+  max_length: 65536
+  chat_template: kimi-k3-thinking
+  cache_dir: /workspace/k3_dspark/cache
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 0
+
+training:
+  strategy: dspark
+  num_epochs: 10
+  # Four consumer ranks x one sequence x 32 microbatches preserves the old
+  # effective global batch of 128 sequences.
+  batch_size: 1
+  accumulation_steps: 32
+  learning_rate: 0.000050959167111070076
+  lr_scheduler: constant
+  warmup_ratio: 0
+  max_grad_norm: 1
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 8
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-dspark
+  wandb_name: kimi-k3-dspark-specforge-disaggregated
+  wandb_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/wandb
+
+runtime:
+  producer_lease: 1
+  producer_concurrency: 1
+  # One 64K K3 sample is roughly 5.25 GiB of BF16 DSpark features. A complete
+  # optimizer quantum is 128 samples, so the server segment must exceed 672 GiB.
+  in_flight_high_watermark: 128
+  # Consumers dispatch complete optimizer windows. Keep the resume threshold
+  # at least one global quantum to avoid a producer/consumer backpressure
+  # deadlock while a window is still incomplete.
+  in_flight_low_watermark: 128
+  resident_high_watermark_bytes: 858993459200
+  resident_low_watermark_bytes: 697932185600
+  feature_store_max_resident_bytes: 966367641600
+
+run_id: kimi-k3-dspark-specforge-disaggregated
+output_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/output
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/control
+    consumer_state_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/consumer-state
+    backend: mooncake
+    store_id: kimi-k3-dspark-specforge-disaggregated
+    server_urls:
+      - http://capture-node:30000
+    mooncake_metadata_server: http://capture-node:35880/metadata
+    mooncake_master_server_addr: capture-node:35551
+    mooncake_protocol: tcp
+    client_buffer_size: 1073741824
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200

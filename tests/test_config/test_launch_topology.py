@@ -20,6 +20,7 @@ EXPECTED_NPROC_PER_NODE = {
     "gpt-oss-20b-eagle3-online.yaml": 8,
     "lfm2.5-1.2b-instruct-dflash-online.yaml": 8,
     "inkling-dspark-disaggregated.yaml": 1,
+    "kimi-k3-dspark-disaggregated.yaml": 4,
     "ling-flash-2.0-eagle3-offline.yaml": 8,
     "ling-flash-2.0-eagle3-online.yaml": 8,
     "llama3.1-8b-eagle3-offline.yaml": 1,
@@ -312,7 +313,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 63)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 64)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
@@ -336,9 +337,10 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                     else "local_colocated"
                 )
                 self.assertEqual(deployment["mode"], expected_mode)
+                expected_trainer = {"nnodes": 1, "nproc_per_node": nproc_per_node}
                 self.assertEqual(
                     deployment["trainer"],
-                    {"nnodes": 1, "nproc_per_node": nproc_per_node},
+                    expected_trainer,
                 )
 
                 expected_keys = {"mode", "trainer"}
@@ -415,6 +417,26 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
         )
         self.assertEqual(qwen4b.training.loss_decay_gamma, 4.0)
         self.assertEqual(qwen4b.training.objective_chunk_blocks, 128)
+
+        kimi = Config.from_file(
+            str(EXAMPLE_CONFIG_DIR / "kimi-k3-dspark-disaggregated.yaml")
+        )
+        kimi_topology = kimi.deployment.trainer
+        self.assertEqual(
+            kimi_topology.nnodes
+            * kimi_topology.nproc_per_node
+            * kimi.training.batch_size
+            * kimi.training.accumulation_steps,
+            128,
+        )
+        self.assertEqual(kimi.training.lr_scheduler, "constant")
+        self.assertEqual(kimi.training.prompt_seed, 1)
+        self.assertAlmostEqual(
+            kimi.training.learning_rate,
+            0.000050959167111070076,
+        )
+        self.assertEqual(kimi.data.max_length, 65536)
+        self.assertEqual(kimi.training.num_anchors, 512)
 
 
 if __name__ == "__main__":

@@ -1,18 +1,76 @@
+diff --git a/python/sglang/srt/layers/attn_residual.py b/python/sglang/srt/layers/attn_residual.py
+index 266d2f2cd..2a75af790 100644
+--- a/python/sglang/srt/layers/attn_residual.py
++++ b/python/sglang/srt/layers/attn_residual.py
+@@ -115,10 +115,28 @@ def _score_kernel(
+     BLOCK_H: tl.constexpr,
+ ):
+     """One CTA per (token, row): scan H, output one scalar score."""
+-    pid_t = tl.program_id(0)
++    # bank stride is 8 * 7168; 64K token offsets exceed signed int32.
++    pid_t = tl.program_id(0).to(tl.int64)
+     j = tl.program_id(1)
+     if j > NVB:
+         return
++
++    # The raw K3 residual stream can remain finite near the bf16 limit. A
++    # direct fp32 sum(v * v) then overflows even though RMSNorm(v) is well
++    # defined, making this DSpark-only capture path emit NaN scores. Scale
++    # each row before the norm/projection reduction to keep intermediates
++    # representable without changing the normalized score.
++    max_abs = 0.0
++    for h0 in tl.static_range(0, H, BLOCK_H):
++        offs_h = h0 + tl.arange(0, BLOCK_H)
++        if j < NVB:
++            v = tl.load(bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h).to(
++                tl.float32
++            )
++        else:
++            v = tl.load(prefix_ptr + pid_t * stride_pm + offs_h).to(tl.float32)
++        max_abs = tl.maximum(max_abs, tl.max(tl.abs(v), axis=0))
++    scale = tl.maximum(max_abs, 1.0)
+     sumsq = 0.0
+     dotv = 0.0
+     for h0 in tl.static_range(0, H, BLOCK_H):
+@@ -130,9 +148,10 @@ def _score_kernel(
+         else:
+             v = tl.load(prefix_ptr + pid_t * stride_pm + offs_h).to(tl.float32)
+         cw = tl.load(cw_ptr + offs_h)
+-        sumsq += tl.sum(v * v)
+-        dotv += tl.sum(v * cw)
+-    rrms = 1.0 / tl.sqrt(sumsq / H + eps)
++        v_scaled = v / scale
++        sumsq += tl.sum(v_scaled * v_scaled)
++        dotv += tl.sum(v_scaled * cw)
++    rrms = 1.0 / tl.sqrt(sumsq / H + eps / scale / scale)
+     tl.store(scores_ptr + pid_t * stride_sm + j, dotv * rrms)
+
+
+@@ -159,7 +178,8 @@ def _combine_kernel(
+     Softmax is redundantly computed by each H-chunk CTA (≤16 elements, trivial).
+     This gives full H-parallelism: 7 CTAs for H=7168/1024.
+     """
+-    pid_t = tl.program_id(0)
++    # Keep bank/scores/output pointer arithmetic in the same 64-bit domain.
++    pid_t = tl.program_id(0).to(tl.int64)
+     pid_h = tl.program_id(1)
+     h0 = pid_h * BLOCK_H
+
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index a99d252..bde8a84 100644
+index 480ed81a5..f84d489a1 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
-@@ -94,6 +94,9 @@ class LogitsProcessorOutput:
+@@ -163,6 +163,9 @@ class LogitsProcessorOutput:
      # Used by speculative decoding (EAGLE)
      # The last hidden layers
      hidden_states: Optional[torch.Tensor] = None
 +    # Spec-training capture: under FULL+aux, `hidden_states` is the aux
 +    # concatenation, so the post-norm last hidden is exposed here separately.
 +    last_hidden_states: Optional[torch.Tensor] = None
- 
+
      ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
      # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
-@@ -361,6 +364,30 @@ class LogitsProcessor(nn.Module):
+@@ -447,6 +450,16 @@ class LogitsProcessor(nn.Module):
              sample_indices,
              logits_metadata,
          )
@@ -26,24 +84,10 @@ index a99d252..bde8a84 100644
 +            )
 +            else None
 +        )
-+        # muP targets pass LM-head-scaled hidden states into LogitsProcessor,
-+        # while SpecForge folds the same multiplier into its frozen target
-+        # head. Restore the pre-head-scale representation before capture so
-+        # the multiplier is applied exactly once when training recomputes logits.
-+        logits_mup_width_multiplier = getattr(
-+            self.config, "logits_mup_width_multiplier", None
-+        )
-+        if (
-+            last_hidden_states_to_store is not None
-+            and logits_mup_width_multiplier
-+        ):
-+            last_hidden_states_to_store = (
-+                last_hidden_states_to_store * float(logits_mup_width_multiplier)
-+            )
          del hidden_states
- 
+
          if not logits_metadata.extend_return_logprob:
-@@ -374,6 +401,7 @@ class LogitsProcessor(nn.Module):
+@@ -460,6 +473,7 @@ class LogitsProcessor(nn.Module):
              return LogitsProcessorOutput(
                  next_token_logits=sampled_logits,
                  hidden_states=hidden_states_to_store,
@@ -51,34 +95,48 @@ index a99d252..bde8a84 100644
                  # FIXME: These fields are not logits-related but are passed through here as a
                  # workaround since ForwardBatch is local to forward_batch_generation().
                  # They should be moved to GenerationBatchResult to keep this class clean.
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
+index 1bf6aa7d2..e7a303074 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
+@@ -402,6 +402,9 @@ def fused_marlin_moe(
+             and intermediate_cache3.is_contiguous()
+             and output.is_contiguous()
+             and intermediate_cache3.shape[-1] % 8 == 0
++            # The JIT helper maps M to CUDA grid.y, whose architectural limit
++            # is 65,535. Long-context prefills use the generic reduction.
++            and intermediate_cache3.shape[0] <= 65_535
+         ):
+             from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
+
 diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
-index b05334d..2853c82 100644
+index 19a7f4938..b3c5220f3 100644
 --- a/python/sglang/srt/managers/detokenizer_manager.py
 +++ b/python/sglang/srt/managers/detokenizer_manager.py
-@@ -441,6 +441,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
-             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
-             output_token_entropy_val=recv_obj.output_token_entropy_val,
+@@ -475,6 +475,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+             output_token_sampling_mask=recv_obj.output_token_sampling_mask,
+             output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
              output_hidden_states=recv_obj.output_hidden_states,
 +            spec_capture=recv_obj.spec_capture,
              routed_experts=routed_experts,
              indexer_topk=indexer_topk,
              customized_info=recv_obj.customized_info,
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 951f354..cd6ebf2 100644
+index 06282f331..4675de4ef 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -188,6 +188,10 @@ class GenerateReqInput(BaseReq):
-     log_metrics: bool = True
-     # Whether to return hidden states
-     return_hidden_states: Union[List[bool], bool] = False
+@@ -309,6 +309,10 @@ class GenerateReqInput:
+     # For Unlimited-OCR
+     images_config: Optional[dict] = None
+
 +    # Spec-training capture sink instructions (see spec_capture_sink.py).
 +    # Batch-level: List[Optional[dict]]; per-request after __getitem__.
 +    spec_capture: Optional[Union[List[Optional[Dict]], Dict]] = None
 +
-     # Whether to return captured routed experts
-     return_routed_experts: bool = False
-     return_indexer_topk: bool = False
-@@ -743,6 +747,11 @@ class GenerateReqInput(BaseReq):
+     # Pre-computed delimiter indices for multi-item scoring.
+     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+@@ -804,6 +808,11 @@ class GenerateReqInput:
                  if self.multi_item_delimiter_indices is not None
                  else None
              ),
@@ -90,49 +148,49 @@ index 951f354..cd6ebf2 100644
          )
          cache[i] = sub
          return sub
-@@ -839,6 +848,9 @@ class TokenizedGenerateReqInput(BaseReq):
+@@ -902,6 +911,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
      # Internal IPC only.
      encoder_urls: Optional[List[str]] = None
- 
+
 +    # Spec-training capture sink instructions (see GenerateReqInput.spec_capture)
 +    spec_capture: Optional[Dict] = None
 +
      # Pre-computed delimiter indices for multi-item scoring
      multi_item_delimiter_indices: Optional[List[int]] = None
- 
-@@ -1176,6 +1188,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+
+@@ -1328,6 +1340,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
      # Number of times each request was retracted.
-     retraction_counts: List[int]
- 
+     retraction_counts: Optional[List[int]] = None
+
 +    # Spec-training capture: one result dict per request (see spec_capture_sink).
 +    spec_capture: Optional[List[Any]] = None
 +
      # The trainer step id. Used to know which step's weights are used for sampling.
-     token_steps: List[List[int]] = None
- 
-@@ -1244,6 +1259,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+     token_steps: Optional[List[List[int]]] = None
+
+@@ -1419,6 +1434,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
      # Number of times each request was retracted.
-     retraction_counts: List[int]
- 
+     retraction_counts: Optional[List[int]] = None
+
 +    # Spec-training capture: one result dict per request (see spec_capture_sink).
 +    spec_capture: Optional[List[Any]] = None
 +
      # The trainer step id. Used to know which step's weights are used for sampling.
-     token_steps: List[List[int]] = None
- 
+     token_steps: Optional[List[List[int]]] = None
+
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index f1dc81d..acefaac 100755
+index 0ef94dd95..d3cada1fa 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -707,6 +707,7 @@ class Req(ReqDllmMixin):
+@@ -768,6 +768,7 @@ class Req(ReqDllmMixin):
              Union[APIServerReqTimeStats, DPControllerReqTimeStats]
          ] = None,
          return_pooled_hidden_states: bool = False,
 +        spec_capture: Optional[Dict[str, Any]] = None,
          multi_item_delimiter_indices: Optional[List[int]] = None,
+         session_id: Optional[str] = None,
      ):
-         # Input and output info
-@@ -771,7 +772,13 @@ class Req(ReqDllmMixin):
+@@ -832,7 +833,13 @@ class Req(ReqDllmMixin):
              }
          self.sampling_params = sampling_params
          self.custom_logit_processor = custom_logit_processor
@@ -144,17 +202,17 @@ index f1dc81d..acefaac 100755
 +        self.spec_capture_aux: List[torch.Tensor] = []
 +        self.spec_capture_last_hidden: List[torch.Tensor] = []
 +        self.spec_capture_result = None  # per-request sink result -> output field
- 
+
          # extra key for classifying the request (e.g. cache_salt)
          if lora_id is not None:
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index abba374..241da3f 100644
+index 6589c6a78..d31be1b92 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -576,6 +576,19 @@ class Scheduler(
- 
+@@ -637,6 +637,19 @@ class Scheduler(
+
          self.init_batch_result_processor()
- 
+
 +        if server_args.enable_spec_capture:
 +            # Capture needs single-pass prefill; chunking would drop all but the
 +            # final chunk's hidden rows.
@@ -169,20 +227,20 @@ index abba374..241da3f 100644
 +            spec_capture_sink.maybe_init_sink(server_args)
 +
          self.is_initializing = False
- 
+
      def init_zbal_on_npu(self):
-@@ -2054,6 +2067,7 @@ class Scheduler(
+@@ -2283,6 +2296,7 @@ class Scheduler(
                  dllm_config=self.dllm_config,
                  time_stats=recv_req.time_stats,
                  multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
 +                spec_capture=recv_req.spec_capture,
              )
              req.tokenizer = self.tokenizer
- 
-@@ -3097,6 +3111,13 @@ class Scheduler(
+
+@@ -3385,6 +3399,13 @@ class Scheduler(
          # GenerationBatchResult.extra_keep_alive_refs after forward returns.
          self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
- 
+
 +    def _should_copy_hidden_states_to_cpu(self, batch: ScheduleBatch) -> bool:
 +        """Avoid redundant multi-GiB capture D2H on non-writer TP ranks."""
 +        return batch.return_hidden_states and (
@@ -193,7 +251,29 @@ index abba374..241da3f 100644
      @contextmanager
      def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
          """Make SB transactional across one forward (overlap and non-overlap).
-@@ -3258,7 +3279,9 @@ class Scheduler(
+@@ -3531,7 +3552,9 @@ class Scheduler(
+                                 # overlaps.
+                                 batch_result.copy_to_cpu(
+                                     return_logprob=batch.return_logprob,
+-                                    return_hidden_states=batch.return_hidden_states,
++                                    return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                                        batch
++                                    ),
+                                 )
+                             else:
+                                 # Result D2H on copy_stream overlaps the next forward
+@@ -3541,7 +3564,9 @@ class Scheduler(
+                                 with self.copy_stream_ctx:
+                                     batch_result.copy_to_cpu(
+                                         return_logprob=batch.return_logprob,
+-                                        return_hidden_states=batch.return_hidden_states,
++                                        return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                                            batch
++                                        ),
+                                     )
+                         else:
+                             batch_result.future_indices = future_indices
+@@ -3580,7 +3605,9 @@ class Scheduler(
                  batch_result.copy_done = self.device_module.Event()
                  batch_result.copy_to_cpu(
                      return_logprob=batch.return_logprob,
@@ -204,7 +284,18 @@ index abba374..241da3f 100644
                  )
              else:
                  kwargs = (
-@@ -3369,6 +3392,10 @@ class Scheduler(
+@@ -3699,7 +3726,9 @@ class Scheduler(
+             self._relay_forward_payload(batch_result.future_indices, batch_result)
+             batch_result.copy_to_cpu(
+                 return_logprob=cur_batch.return_logprob,
+-                return_hidden_states=cur_batch.return_hidden_states,
++                return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                    cur_batch
++                ),
+             )
+
+         # Release the closure and large GPU tensors that are no longer needed.
+@@ -3718,6 +3747,10 @@ class Scheduler(
          batch: ScheduleBatch,
          result: Union[GenerationBatchResult, EmbeddingBatchResult],
      ):
@@ -213,14 +304,14 @@ index abba374..241da3f 100644
 +        # the output socket's single-thread ownership under mixed traffic.
 +        self.batch_result_processor.drain_spec_captures()
          self.publish_load_snapshot(force=batch.forward_mode.is_extend())
- 
+
          if batch.forward_mode.is_decode():
-@@ -3448,6 +3475,15 @@ class Scheduler(
- 
+@@ -3826,6 +3859,15 @@ class Scheduler(
+
      def on_idle(self):
          """Idle housekeeping: guard, check, metrics, reset, sleep."""
 +        # A capture response is intentionally delayed until its background
-+        # sink transfer completes; finish it on this thread so ownership of
++        # Mooncake batch write completes.  Poll it on the scheduler thread so
 +        # the ZeroMQ output socket remains single-threaded.  Do not enter the
 +        # idle sleeper while a future is outstanding or the producer waiting
 +        # for that response could deadlock.
@@ -230,22 +321,22 @@ index abba374..241da3f 100644
 +            return
          if not self.is_fully_idle():
              return
- 
-@@ -3496,6 +3532,7 @@ class Scheduler(
+
+@@ -3879,6 +3921,7 @@ class Scheduler(
+             and not self.dllm_manager.any_staging_reqs()
              and (self.last_batch is None or self.last_batch.is_empty())
-             and (self.cur_batch is None or self.cur_batch.is_empty())
              and (not self.enable_overlap or len(self.result_queue) == 0)
 +            and not self.batch_result_processor.has_pending_spec_captures()
              and self._pp_microbatches_drained()
          )
- 
+
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index a9d5f0c..f134354 100644
+index f75eab004..5af4c1d6b 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -1,7 +1,9 @@
  from __future__ import annotations
- 
+
  import logging
 -from dataclasses import dataclass
 +import os
@@ -254,7 +345,7 @@ index a9d5f0c..f134354 100644
  from typing import (
      TYPE_CHECKING,
      Callable,
-@@ -78,6 +80,12 @@ class SchedulerBatchResultProcessor:
+@@ -87,6 +89,12 @@ class SchedulerBatchResultProcessor:
      logprob_result_processor: SchedulerLogprobResultProcessor
      output_streamer: SchedulerOutputStreamer
      abort_request: Callable
@@ -264,20 +355,20 @@ index a9d5f0c..f134354 100644
 +        repr=False,
 +        compare=False,
 +    )
- 
+
      def process_batch_result_prebuilt(self, batch: ScheduleBatch):
          assert self.disaggregation_mode == DisaggregationMode.DECODE
-@@ -181,6 +189,7 @@ class SchedulerBatchResultProcessor:
+@@ -190,6 +198,7 @@ class SchedulerBatchResultProcessor:
          result: Union[GenerationBatchResult, EmbeddingBatchResult],
      ):
          skip_stream_req = None
-+        pending_spec_captures: List = []
- 
++        pending_spec_captures = []
+
          if self.is_generation:
              if result.copy_done is not None:
-@@ -257,6 +266,20 @@ class SchedulerBatchResultProcessor:
-                         )
- 
+@@ -269,6 +278,20 @@ class SchedulerBatchResultProcessor:
+                         self.add_sampling_mask_return_values(i, req, logits_output)
+
                      if (
 +                        req.spec_capture is not None
 +                        and logits_output.hidden_states is not None
@@ -296,10 +387,10 @@ index a9d5f0c..f134354 100644
                          req.return_hidden_states
                          and logits_output.hidden_states is not None
                      ):
-@@ -329,9 +352,25 @@ class SchedulerBatchResultProcessor:
+@@ -343,9 +366,25 @@ class SchedulerBatchResultProcessor:
                      req.inflight_middle_chunks -= 1
                      req.time_stats.set_last_chunked_prefill_finish_time()
- 
+
 -        self.output_streamer.stream_output(
 -            batch.reqs, batch.return_logprob, skip_stream_req
 -        )
@@ -322,13 +413,13 @@ index a9d5f0c..f134354 100644
 +            self.output_streamer.stream_output(
 +                batch.reqs, batch.return_logprob, skip_stream_req
 +            )
- 
+
          can_run_cuda_graph = result.can_run_cuda_graph
          self.metrics_reporter.report_prefill_stats(
-@@ -462,6 +501,183 @@ class SchedulerBatchResultProcessor:
+@@ -476,6 +515,181 @@ class SchedulerBatchResultProcessor:
                      f"Placeholder zeros would be appended to output_ids."
                  )
- 
+
 +    def _append_spec_capture_states(
 +        self,
 +        *,
@@ -345,8 +436,8 @@ index a9d5f0c..f134354 100644
 +        start = hidden_state_offset
 +        end = start + len(req.origin_input_ids)
 +        # Only attention-TP rank 0 owns the Mooncake sink.  Copying these very
-+        # large tensors to host on every TP rank creates identical D2H
-+        # transfers whose results are immediately discarded on TP > 1.
++        # large tensors to host on every TP rank creates eight identical D2H
++        # transfers and seven immediately-discarded CPU copies on TP8.
 +        if self.output_streamer.ps.attn_tp_rank != 0:
 +            return end
 +        # Materialize each scheduler result on host once, rather than issuing
@@ -375,12 +466,10 @@ index a9d5f0c..f134354 100644
 +        return end
 +
 +    def _sink_spec_capture(self, req: Req):
-+        """Stage a finished capture request for the background Mooncake sink.
++        """Write a finished capture request's tensors to the Mooncake sink.
 +
-+        Runs on the attention-TP rank that streams output; returns the pending
-+        tuple queued by ``_queue_spec_captures`` (or ``None`` off the writer
-+        rank).  The per-request result (or an ``{"error": ...}`` marker) is set
-+        on ``req.spec_capture_result`` when the batch transfer completes, and
++        Runs on the attention-TP rank that streams output; the per-request result
++        (or an ``{"error": ...}`` marker) is set on ``req.spec_capture_result``,
 +        returned to the client via the dedicated ``spec_capture`` output field
 +        (a per-request channel, unlike per-token ``customized_info``).
 +        """
@@ -391,11 +480,11 @@ index a9d5f0c..f134354 100644
 +            return None
 +        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
 +        cat_start = time.perf_counter()
-+        # With chunked prefill disabled (the recommended capture-server
-+        # configuration), each request owns exactly one contiguous view into
-+        # the batch-level D2H buffer.  torch.cat([view]) needlessly copied the
-+        # whole capture a second time on CPU.  Keep that view zero-copy;
-+        # concatenate only the genuinely chunked case.
++        # With chunked prefill disabled (the K3 training configuration), each
++        # request owns exactly one contiguous view into the batch-level pinned
++        # D2H buffer.  torch.cat([view]) needlessly copied the whole capture a
++        # second time on CPU -- about 18 GiB per 128 reference samples.  Keep
++        # that view zero-copy; concatenate only the genuinely chunked case.
 +        aux = self._coalesce_spec_capture_chunks(req.spec_capture_aux)
 +        last_hidden = self._coalesce_spec_capture_chunks(
 +            req.spec_capture_last_hidden
@@ -424,9 +513,9 @@ index a9d5f0c..f134354 100644
 +                time.perf_counter(),
 +            )
 +        )
-+        # Bound retained D2H buffers.  Reaching this point means the target
-+        # prefill for batch N+1 already overlapped host transfer N; wait only
-+        # if N is still finishing before admitting N+2.
++        # Bound retained D2H buffers.  With producer concurrency=2, reaching
++        # this point means target prefill N+1 already overlapped host transfer
++        # N; wait only if N is still finishing before admitting N+2.
 +        max_pending = int(
 +            os.environ.get("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", "2")
 +        )
@@ -510,10 +599,10 @@ index a9d5f0c..f134354 100644
          self,
          *,
 diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-index f95c59f..6c51abc 100644
+index 9f5b2329a..cce5b4afe 100644
 --- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
 +++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-@@ -145,6 +145,14 @@ class SchedulerOutputStreamer:
+@@ -162,6 +162,14 @@ class SchedulerOutputStreamer:
          for req in reqs:
              if req is skip_req:
                  continue
@@ -528,15 +617,15 @@ index f95c59f..6c51abc 100644
              if req.finished() and req.finished_output:
                  # With the overlap schedule, a request will try to output twice and hit this line twice
                  # because of the one additional delayed token. This "continue" prevented the dummy output.
-@@ -273,6 +281,7 @@ class _GenerationStreamAccumulator:
-     spec_correct_drafts_histogram: list = field(default_factory=list)
+@@ -302,6 +310,7 @@ class _GenerationStreamAccumulator:
+     spec_cap_lens_histogram: list = field(default_factory=list)
      retraction_counts: list = field(default_factory=list)
      output_hidden_states: Optional[list] = None
 +    spec_capture: list = field(default_factory=list)
      routed_experts: Optional[list] = None
      indexer_topk: Optional[list] = None
      customized_info: dict = field(default_factory=dict)
-@@ -482,6 +491,8 @@ class _GenerationStreamAccumulator:
+@@ -571,6 +580,8 @@ class _GenerationStreamAccumulator:
                  self.output_hidden_states.append(hs)
              else:
                  self.output_hidden_states.append(None)
@@ -545,19 +634,19 @@ index f95c59f..6c51abc 100644
          if self.return_routed_experts:
              self.routed_experts.append(
                  req.routed_experts if req.return_routed_experts else None
-@@ -540,6 +551,7 @@ class _GenerationStreamAccumulator:
-             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
-             output_token_entropy_val=None,
+@@ -663,6 +674,7 @@ class _GenerationStreamAccumulator:
+             output_token_sampling_mask=self.output_token_sampling_mask,
+             output_token_sampling_logprobs=self.output_token_sampling_logprobs,
              output_hidden_states=self.output_hidden_states,
 +            spec_capture=self.spec_capture or None,
              routed_experts=self.routed_experts,
              indexer_topk=self.indexer_topk,
-             customized_info=self.customized_info,
+             customized_info=(
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index bf93261..f0e821e 100644
+index 41cc4c246..5d429a91f 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1172,6 +1172,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1337,6 +1337,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                  mm_data_mooncake=obj.mm_data_mooncake,
                  encoder_urls=obj.encoder_urls,
@@ -565,7 +654,7 @@ index bf93261..f0e821e 100644
              )
          elif isinstance(obj, EmbeddingReqInput):
              # Resolve unresolved embed overrides now that input_ids are available
-@@ -1922,6 +1923,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -2124,6 +2125,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  hidden_states = recv_obj.output_hidden_states[i]
                  if hidden_states is not None:
                      meta_info["hidden_states"] = hidden_states
@@ -577,80 +666,73 @@ index bf93261..f0e821e 100644
                  val = recv_obj.routed_experts[i]
                  if val is not None:
 diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
-index e9ede57..1d624fd 100644
+index fe883c264..2b7206a13 100644
 --- a/python/sglang/srt/managers/utils.py
 +++ b/python/sglang/srt/managers/utils.py
-@@ -77,6 +77,16 @@ class GenerationBatchResult:
-         Only the tensors which are needed for processing results are copied,
-         e.g., next_token_ids, logits outputs
-         """
-+        if (
-+            return_hidden_states
-+            and self.logits_output.last_hidden_states is not None
-+        ):
-+            # Spec-capture's post-norm last hidden rides the same async D2H
-+            # as the aux hidden states (the field exists only when the
-+            # spec-capture patch is applied).
-+            self.logits_output.last_hidden_states = (
-+                self.logits_output.last_hidden_states.to("cpu", non_blocking=True)
-+            )
-         if return_logprob:
-             if self.logits_output.next_token_logprobs is not None:
-                 self.logits_output.next_token_logprobs = (
+@@ -148,6 +148,10 @@ class GenerationBatchResult:
+             self.logits_output.hidden_states = _async_d2h(
+                 self.logits_output.hidden_states
+             )
++            if self.logits_output.last_hidden_states is not None:
++                self.logits_output.last_hidden_states = _async_d2h(
++                    self.logits_output.last_hidden_states
++                )
+         self.next_token_ids = _async_d2h(self.next_token_ids)
+
+         if self.accept_lens is not None:
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 1cff5c9..5309965 100644
+index 661bd5ad1..e1fce6365 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -515,6 +515,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
-                 draft_num_layers=int(draft_num_layers),
+@@ -489,6 +489,26 @@ class ModelRunner:
+                 is_draft_worker=self.is_draft_worker,
              )
- 
-+        if server_args.enable_spec_capture and not self.is_draft_worker:
-+            # Aux capture without a draft worker, routed to the strategy's own
-+            # capture method (they wire different submodules — e.g. VL models
-+            # only populate layers_to_capture via the dflash path).
-+            capture_method = getattr(server_args, "spec_capture_method", "eagle3")
+         )
++        if self.server_args.enable_spec_capture and not self.is_draft_worker:
++            # Spec-training capture runs without a speculative draft worker, so
++            # populate the same aux-state configuration that online decoding
++            # would normally derive from the draft model.
++            capture_method = self.server_args.spec_capture_method
 +            if capture_method in ("dflash", "dspark"):
-+                # DSpark rides the DFlash aux plumbing: this patch's supported
-+                # targets expose dflash capture hooks (targets with a native
-+                # dspark hook are served by the kimi-k3 patch variant).
-+                self.dflash_use_aux_hidden_state = True
-+                self.dflash_target_layer_ids = server_args.spec_capture_aux_layer_ids
-+                if hasattr(self, "spec_aux_config"):
-+                    self.spec_aux_config.dflash_use_aux_hidden_state = True
-+                    self.spec_aux_config.dflash_target_layer_ids = (
-+                        server_args.spec_capture_aux_layer_ids
-+                    )
-+                self.dflash_family_use_aux_hidden_state = True
-+                self.dflash_family_target_layer_ids = (
-+                    server_args.spec_capture_aux_layer_ids
++                self.spec_aux_config.dflash_use_aux_hidden_state = True
++                self.spec_aux_config.dflash_target_layer_ids = (
++                    self.server_args.spec_capture_aux_layer_ids
 +                )
 +            elif capture_method == "eagle3":
-+                self.eagle_use_aux_hidden_state = True
-+                self.eagle_aux_hidden_state_layer_ids = (
-+                    server_args.spec_capture_aux_layer_ids
++                self.spec_aux_config.eagle_use_aux_hidden_state = True
++                self.spec_aux_config.eagle_aux_hidden_state_layer_ids = (
++                    self.server_args.spec_capture_aux_layer_ids
 +                )
-+                if hasattr(self, "spec_aux_config"):
-+                    self.spec_aux_config.eagle_use_aux_hidden_state = True
-+                    self.spec_aux_config.eagle_aux_hidden_state_layer_ids = (
-+                        server_args.spec_capture_aux_layer_ids
-+                    )
 +            else:
 +                raise ValueError(
 +                    "--spec-capture-method must be one of: eagle3, dflash, dspark; "
 +                    f"got {capture_method!r}"
 +                )
-+
-         # Apply the rank zero filter to logger
-         if server_args.show_time_cost:
-             enable_show_time_cost()
+
+     def init_weight_exporter(self):
+         self.weight_exporter = WeightExporter(
+@@ -866,7 +886,13 @@ class ModelRunner:
+             eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
+             dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
+             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
+-            is_dspark=self.spec_algorithm.is_dspark(),
++            is_dspark=(
++                self.spec_algorithm.is_dspark()
++                or (
++                    self.server_args.enable_spec_capture
++                    and self.server_args.spec_capture_method == "dspark"
++                )
++            ),
+         )
+         backends = build_attention_backends(model_runner=self)
+         self.attn_backend = backends.attn_backend
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index c7162c1..cfbce7a 100644
+index e9f84cb17..dd64be9f1 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
-@@ -2127,6 +2127,26 @@ class ServerArgs:
-         bool,
-         "Enable returning hidden states with responses.",
+@@ -3349,6 +3349,26 @@ class ServerArgs:
+     enable_return_hidden_states: A[
+         bool, "Enable returning hidden states with responses.", NS("exec.features")
      ] = False
 +    enable_spec_capture: A[
 +        bool,
@@ -668,19 +750,19 @@ index c7162c1..cfbce7a 100644
 +    spec_capture_method: A[
 +        str,
 +        "Capture method for --enable-spec-capture: 'eagle3', 'dflash', or "
-+        "'dspark'. Must match the draft strategy being trained; they wire "
-+        "capture onto different submodules (VL targets only populate the "
-+        "dflash path; dspark rides the dflash aux plumbing).",
++        "'dspark'. Must "
++        "match the draft strategy being trained; they wire capture onto "
++        "different target-model submodules.",
 +    ] = "eagle3"
      enable_return_routed_experts: A[
          bool,
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000..95eb8ae
+index 000000000..8ab06e25d
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,389 @@
+@@ -0,0 +1,388 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -847,10 +929,9 @@ index 0000000..95eb8ae
 +    ) -> List[Dict[str, Any]]:
 +        """Publish a scheduler batch with one native Mooncake batch RPC.
 +
-+        A capture prefill batch normally finishes many samples together.
-+        Calling ``put_from`` once per feature object paid dozens of metadata
-+        and transport round trips per batch on the writer rank and serialized
-+        the response behind them.
++        A K3 prefill normally finishes 16 samples together.  Calling
++        ``put_from`` four times per sample paid 64 metadata/transport round
++        trips on the writer rank and serialized the response behind them.
 +        ``batch_put_from`` preserves the existing per-feature keys and raw
 +        tensor layout while amortizing that fixed cost across the whole
 +        scheduler batch.  The response is still emitted only after every

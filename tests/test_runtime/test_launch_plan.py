@@ -391,8 +391,12 @@ class LaunchPlanTest(unittest.TestCase):
             Config.model_validate(raw)
 
     def test_multi_node_keeps_wal_local_and_inboxes_shared(self):
+        raw = _config(mode="disaggregated", nproc=2, nnodes=2).model_dump()
+        raw["deployment"]["disaggregated"][
+            "inbox_server_url"
+        ] = "http://trainer-0:35900"
         plan = build_launch_plan(
-            _config(mode="disaggregated", nproc=2, nnodes=2),
+            Config.model_validate(raw),
             config_path="run.yaml",
             requested_role="consumer",
             node_rank=0,
@@ -404,6 +408,30 @@ class LaunchPlanTest(unittest.TestCase):
         command = plan.commands[0]
         self.assertEqual("/local/attempt-1/consumer.sqlite", command.env["DISAGG_DB"])
         self.assertEqual("/shared/attempt-1/inboxes", command.env["DISAGG_INBOX_DIR"])
+        self.assertEqual(
+            "http://trainer-0:35900", command.env["DISAGG_INBOX_SERVER_URL"]
+        )
+
+    def test_inbox_server_url_is_typed_and_online_multinode_only(self):
+        cfg = _config(mode="disaggregated", nproc=2, nnodes=2)
+        invalid = {
+            "https": "https://trainer-0:35900",
+            "missing port": "http://trainer-0",
+            "path": "http://trainer-0:35900/inboxes",
+        }
+        for name, value in invalid.items():
+            with self.subTest(case=name):
+                raw = cfg.model_dump()
+                raw["deployment"]["disaggregated"]["inbox_server_url"] = value
+                with self.assertRaisesRegex(ValidationError, "http://host:port"):
+                    Config.model_validate(raw)
+
+        raw = _config(mode="disaggregated", nproc=2, nnodes=1).model_dump()
+        raw["deployment"]["disaggregated"][
+            "inbox_server_url"
+        ] = "http://trainer-0:35900"
+        with self.assertRaisesRegex(ValidationError, "multi-node trainer"):
+            Config.model_validate(raw)
 
     def test_disaggregated_roles_are_independently_selectable(self):
         producer = build_launch_plan(
