@@ -26,7 +26,11 @@ import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
-from specforge.export.checkpoint_io import materialize_draft, resolve_training_state
+from specforge.export.checkpoint_io import (
+    apply_legacy_rope_scaling,
+    materialize_draft,
+    resolve_training_state,
+)
 
 
 def _load_embedding_tensor(source: str, key: str) -> torch.Tensor:
@@ -110,6 +114,7 @@ def export_to_hf(
         )
     full_state.update(state["draft_state_dict"])  # trained keys win
     model.save_pretrained(output_dir, state_dict=full_state)
+    apply_legacy_rope_scaling(output_dir)
     return output_dir
 
 
