@@ -217,9 +217,11 @@ class FeatureDataLoader:
             raise TypeError(f"collate_fn returned non-tensors for {non_tensors}")
         if self.pin_memory:
             batch_tensors = {
-                name: value.pin_memory()
-                if value.device.type == "cpu" and not value.is_pinned()
-                else value
+                name: (
+                    value.pin_memory()
+                    if value.device.type == "cpu" and not value.is_pinned()
+                    else value
+                )
                 for name, value in batch_tensors.items()
             }
         return TrainBatch(

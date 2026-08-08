@@ -754,14 +754,10 @@ class TestDPAckController(unittest.TestCase):
             metadata_store=SQLiteMetadataStore(os.path.join(self.dir, "lag.db")),
         )
         controller.commit_samples("w0", [_ref("s0")])
-        controller.ack_train_refs(
-            "t0", ["s0"], global_step=1, optimizer_durable=True
-        )
+        controller.ack_train_refs("t0", ["s0"], global_step=1, optimizer_durable=True)
         self.assertEqual(retries, [])
 
-        controller.ack_train_refs(
-            "t0", [], global_step=2, optimizer_durable=True
-        )
+        controller.ack_train_refs("t0", [], global_step=2, optimizer_durable=True)
         self.assertEqual(retries, [["s0"]])
         controller.store.close()
 
@@ -783,9 +779,7 @@ class TestDPAckController(unittest.TestCase):
             metadata_store=SQLiteMetadataStore(os.path.join(self.dir, "drain.db")),
         )
         controller.commit_samples("w0", [_ref("s0")])
-        controller.ack_train_refs(
-            "t0", ["s0"], global_step=1, optimizer_durable=True
-        )
+        controller.ack_train_refs("t0", ["s0"], global_step=1, optimizer_durable=True)
         for step in range(2, 5):
             controller.ack_train_refs(
                 "t0", [], global_step=step, optimizer_durable=True
@@ -793,9 +787,7 @@ class TestDPAckController(unittest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError, "optimizer-boundary selective drain.*remove stayed pinned"
         ):
-            controller.ack_train_refs(
-                "t0", [], global_step=5, optimizer_durable=True
-            )
+            controller.ack_train_refs("t0", [], global_step=5, optimizer_durable=True)
         marker = controller.store.durable_marker()
         self.assertEqual(marker["global_step"], 5)
         self.assertTrue(marker["optimizer_durable"])

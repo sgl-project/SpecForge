@@ -82,6 +82,48 @@ def terminate_process_trees(*processes: subprocess.Popen, grace_s: float = 30) -
     )
 
 
+def process_is_running(pid: int) -> bool:
+    """Return whether *pid* is live, treating Linux zombies as terminated."""
+    stat_path = f"/proc/{pid}/stat"
+    if os.path.isdir("/proc"):
+        try:
+            with open(stat_path, encoding="utf-8") as stream:
+                stat = stream.read()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            pass
+        else:
+            # The command name is parenthesized and may contain spaces or ')',
+            # so split only after its final closing parenthesis. The next field
+            # is the process state. Zombies still answer kill(pid, 0), even
+            # though no code can run and no signal can make them exit again.
+            command_end = stat.rfind(")")
+            fields = stat[command_end + 1 :].split()
+            if fields and fields[0] in {"Z", "X", "x"}:
+                return False
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_for_processes_to_stop(
+    pids: tuple[int, ...], *, timeout_s: float
+) -> tuple[int, ...]:
+    """Wait for PIDs to stop running and return any live survivors."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        survivors = tuple(pid for pid in pids if process_is_running(pid))
+        if not survivors or time.monotonic() >= deadline:
+            return survivors
+        time.sleep(0.02)
+
+
 def wait_for_server(
     base_url: str,
     timeout: int | None = None,

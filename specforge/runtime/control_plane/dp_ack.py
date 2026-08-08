@@ -218,17 +218,14 @@ class DPAckController(DataFlowController):
             overdue_ids = [
                 sample_id
                 for sample_id, first_boundary in self._cleanup_pending.items()
-                if boundary - first_boundary
-                >= self._CLEANUP_ESCALATION_BOUNDARIES
+                if boundary - first_boundary >= self._CLEANUP_ESCALATION_BOUNDARIES
             ]
             if overdue_ids:
                 try:
                     # Sustained failure is exceptional.  Use the existing
                     # bounded strong drain only for the old durable ids, never
                     # for this boundary's fresh or merely-prefetched samples.
-                    drain_feature_store_sample_removals(
-                        self.feature_store, overdue_ids
-                    )
+                    drain_feature_store_sample_removals(self.feature_store, overdue_ids)
                     for sample_id in overdue_ids:
                         self._cleanup_pending.pop(sample_id, None)
                 except BaseException as exc:

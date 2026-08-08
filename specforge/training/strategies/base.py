@@ -406,9 +406,7 @@ class PEagleTrainStrategy(DraftTrainStrategy):
 
         loss, model_metrics = self.peagle_model(
             input_ids=input_ids,
-            attention_mask=tensors["attention_mask"].to(
-                device, non_blocking=True
-            ),
+            attention_mask=tensors["attention_mask"].to(device, non_blocking=True),
             loss_mask=loss_mask,
             target=target,
             hidden_states=tensors["hidden_state"].to(device, non_blocking=True),

@@ -112,10 +112,7 @@ def _materialize_metrics(values: Dict[str, Any]) -> Dict[str, float]:
         packed = torch.stack([tensor.to(device) for tensor in tensors])
         materialized = packed.cpu().tolist()
         host_values.update(
-            {
-                name: float(value)
-                for name, value in zip(tensor_names, materialized)
-            }
+            {name: float(value) for name, value in zip(tensor_names, materialized)}
         )
     return host_values
 
@@ -139,9 +136,11 @@ def _dp_mean_scalars(
     import torch.distributed as dist
 
     normalized = {
-        name: value.detach().float().reshape(())
-        if isinstance(value, torch.Tensor)
-        else float(value)
+        name: (
+            value.detach().float().reshape(())
+            if isinstance(value, torch.Tensor)
+            else float(value)
+        )
         for name, value in values.items()
     }
     if not normalized or not (dist.is_available() and dist.is_initialized()):
@@ -156,9 +155,11 @@ def _dp_mean_scalars(
     names = list(normalized)
     packed = torch.stack(
         [
-            value.to(device)
-            if isinstance(value, torch.Tensor)
-            else torch.tensor(value, dtype=torch.float32, device=device)
+            (
+                value.to(device)
+                if isinstance(value, torch.Tensor)
+                else torch.tensor(value, dtype=torch.float32, device=device)
+            )
             for value in normalized.values()
         ]
     )
@@ -231,9 +232,7 @@ def _reduce_ratio_metrics(
         if width == 1:
             output[name] = ratios.reshape(())
         else:
-            output.update(
-                {f"{name}_{index}": ratios[index] for index in range(width)}
-            )
+            output.update({f"{name}_{index}": ratios[index] for index in range(width)})
     return output
 
 
