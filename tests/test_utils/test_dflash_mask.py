@@ -1,8 +1,14 @@
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
+from torch import nn
 
 from specforge.algorithms.common.dflash_family_model import (
+    OnlineDFlashModel,
+    OnlineDominoModel,
+    OnlineDSparkModel,
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
@@ -28,6 +34,7 @@ def _reference_dflash_mask(
     for b in range(B):
         for q_idx in range(Q_LEN):
             q_block_id = q_idx // block_size
+            q_offset = q_idx % block_size
             anchor_pos = anchor_positions[b, q_block_id].item()
             is_valid = block_keep_mask[b, q_block_id].item()
             if not is_valid:
@@ -51,6 +58,21 @@ def _reference_dflash_mask(
                 if ctx_visible or draft_visible:
                     mask[b, 0, q_idx, kv_idx] = True
     return mask
+
+
+class _RecordingDraftModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+        )
+        self.sliding_window = 8
+        self.attention_mask = None
+
+    def forward(self, noise_embedding, attention_mask, **kwargs):
+        self.attention_mask = attention_mask
+        return noise_embedding
 
 
 class TestDFlashMask(unittest.TestCase):
@@ -108,6 +130,7 @@ class TestDFlashMask(unittest.TestCase):
         block_keep_mask,
         S,
         block_size,
+        sliding_window=None,
     ):
         """Verify create_dflash_block_mask block-level mask is consistent with reference."""
         anchor_positions = anchor_positions.to(self.device)
@@ -119,6 +142,7 @@ class TestDFlashMask(unittest.TestCase):
             S=S,
             block_size=block_size,
             device=self.device,
+            sliding_window=sliding_window,
         )
 
         ref_mask = _reference_dflash_mask(
@@ -127,6 +151,7 @@ class TestDFlashMask(unittest.TestCase):
             S=S,
             block_size=block_size,
             device=self.device,
+            sliding_window=sliding_window,
         )
 
         dense_blocks = block_mask.to_dense()  # (B, H, Q_blocks, KV_blocks)
@@ -241,6 +266,62 @@ class TestDFlashMask(unittest.TestCase):
             block_size=3,
             sliding_window=1,
         )
+
+    def test_sliding_window_block_mask_consistency(self):
+        anchor_positions = torch.tensor([[12, 24]])
+        block_keep_mask = torch.tensor([[True, True]])
+        self._compare_block_mask_consistency(
+            anchor_positions,
+            block_keep_mask,
+            S=32,
+            block_size=4,
+            sliding_window=8,
+        )
+
+    def test_invalid_sliding_window(self):
+        anchor_positions = torch.tensor([[12]], device=self.device)
+        block_keep_mask = torch.tensor([[True]], device=self.device)
+        for factory in (create_dflash_sdpa_mask, create_dflash_block_mask):
+            with self.subTest(factory=factory.__name__):
+                with self.assertRaisesRegex(ValueError, "sliding_window must be > 0"):
+                    factory(
+                        anchor_positions=anchor_positions,
+                        block_keep_mask=block_keep_mask,
+                        S=16,
+                        block_size=4,
+                        device=self.device,
+                        sliding_window=0,
+                    )
+
+    def test_all_dflash_families_build_mixed_layer_masks(self):
+        anchors = torch.tensor([[12]], device=self.device)
+        keep = torch.tensor([[True]], device=self.device)
+        for model_class in (OnlineDFlashModel, OnlineDominoModel, OnlineDSparkModel):
+            with self.subTest(model_class=model_class.__name__):
+                draft_model = _RecordingDraftModel().to(self.device)
+                model = model_class(
+                    draft_model=draft_model,
+                    target_lm_head=nn.Identity(),
+                    target_embed_tokens=nn.Embedding(32, 8).to(self.device),
+                    mask_token_id=31,
+                    block_size=4,
+                    attention_backend="sdpa",
+                )
+                with mock.patch.object(
+                    model,
+                    "_sample_anchor_positions",
+                    return_value=(anchors, keep),
+                ):
+                    model._forward_draft_blocks(
+                        input_ids=torch.arange(16, device=self.device).unsqueeze(0),
+                        hidden_states=torch.randn(1, 16, 8, device=self.device),
+                        loss_mask=torch.ones(1, 16, device=self.device),
+                    )
+
+                masks = draft_model.attention_mask
+                self.assertEqual(set(masks), {"full_attention", "sliding_attention"})
+                self.assertTrue(masks["full_attention"][0, 0, 0, 0].item())
+                self.assertFalse(masks["sliding_attention"][0, 0, 0, 0].item())
 
     def test_mixed_validity_multi_batch(self):
         """Multi-batch with mixed block validity patterns."""
