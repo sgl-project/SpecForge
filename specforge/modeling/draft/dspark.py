@@ -286,19 +286,19 @@ class DSparkDraftModel(DFlashDraftModel):
     expected_projector_type = "dspark"
 
     def __init__(self, config) -> None:
-        dflash_config = dict(getattr(config, "dflash_config", None) or {})
         num_heads = int(config.num_attention_heads)
         num_kv_heads = int(config.num_key_value_heads)
-        if num_heads % num_kv_heads:
+        dflash_config = dict(getattr(config, "dflash_config", None) or {})
+        attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
+        if attention_mode not in {"gqa", "mha", "mla"}:
+            raise ValueError(
+                "DSpark dflash_config.attention_mode must be 'gqa', 'mha', "
+                f"or 'mla', got {attention_mode!r}"
+            )
+        if attention_mode != "mla" and num_heads % num_kv_heads:
             raise ValueError(
                 "DSpark requires num_key_value_heads to divide "
                 f"num_attention_heads, got {num_kv_heads} and {num_heads}"
-            )
-        attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
-        if attention_mode not in {"gqa", "mha"}:
-            raise ValueError(
-                "DSpark dflash_config.attention_mode must be 'gqa' or 'mha', "
-                f"got {attention_mode!r}"
             )
         if attention_mode == "gqa" and num_kv_heads >= num_heads:
             raise ValueError(

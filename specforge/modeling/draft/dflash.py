@@ -1,3 +1,4 @@
+import copy
 from typing import Callable, Optional
 
 import torch
@@ -25,6 +26,7 @@ from .registry import register_draft
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
 _VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
+_VALID_DFLASH_ATTENTION_MODES = {"gqa", "mha", "mla"}
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -68,6 +70,57 @@ def resolve_dflash_attention_layout(
             "and a positive config.sliding_window"
         )
     return layer_types, sliding_window
+
+
+def resolve_dflash_attention_mode(config: Qwen3Config) -> str:
+    """Return the configured draft attention architecture.
+
+    GQA and MHA share the existing Qwen attention implementation. MLA swaps
+    only the attention projections while retaining the DFlash-family decoder,
+    target-context injection, masks, and objective.
+    """
+
+    dflash_config = dict(getattr(config, "dflash_config", None) or {})
+    attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
+    if attention_mode not in _VALID_DFLASH_ATTENTION_MODES:
+        raise ValueError(
+            "DFlash dflash_config.attention_mode must be one of "
+            f"{sorted(_VALID_DFLASH_ATTENTION_MODES)}, got {attention_mode!r}"
+        )
+    return attention_mode
+
+
+def validate_dflash_mla_config(config: Qwen3Config) -> None:
+    """Validate the standard MLA dimensions carried by a draft config."""
+
+    required = (
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+    )
+    missing = [name for name in required if getattr(config, name, None) is None]
+    if missing:
+        raise ValueError(f"MLA draft config is missing required fields: {missing}")
+
+    q_lora_rank = getattr(config, "q_lora_rank", None)
+    if q_lora_rank is not None and int(q_lora_rank) <= 0:
+        raise ValueError(f"q_lora_rank must be positive or null, got {q_lora_rank}")
+
+    positive = ("kv_lora_rank", "qk_rope_head_dim", "v_head_dim")
+    for name in positive:
+        value = int(getattr(config, name))
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, got {value}")
+
+    qk_nope_head_dim = int(config.qk_nope_head_dim)
+    if qk_nope_head_dim < 0:
+        raise ValueError(
+            f"qk_nope_head_dim must be non-negative, got {qk_nope_head_dim}"
+        )
+    qk_rope_head_dim = int(config.qk_rope_head_dim)
+    if qk_rope_head_dim % 2:
+        raise ValueError(f"qk_rope_head_dim must be even, got {qk_rope_head_dim}")
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -230,6 +283,275 @@ class Qwen3DFlashAttention(nn.Module):
         return attn_output, attn_weights
 
 
+def _rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
+    """Rotate consecutive pairs, as used by DeepSeek-style MLA RoPE."""
+
+    paired = x.float().reshape(*x.shape[:-1], -1, 2)
+    first, second = paired.unbind(dim=-1)
+    return torch.stack((-second, first), dim=-1).flatten(-2).to(x.dtype)
+
+
+def _apply_mla_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    interleaved: bool,
+) -> torch.Tensor:
+    if interleaved:
+        half = cos.shape[-1] // 2
+        cos = cos[..., :half].repeat_interleave(2, dim=-1)
+        sin = sin[..., :half].repeat_interleave(2, dim=-1)
+        rotated = _rotate_half_interleaved(x)
+    else:
+        rotated = rotate_half(x)
+    return x * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)
+
+
+class Qwen3DFlashMLAAttention(nn.Module):
+    """Config-selected Multi-head Latent Attention for DFlash-family drafts.
+
+    The module uses the standard MLA parameterization: an optional low-rank Q
+    path, a shared compressed KV latent, partial RoPE, and expanded per-head
+    K/V projections for training. Expanding K/V makes the implementation work
+    with the same eager, SDPA, and FlexAttention interfaces and masks as the
+    existing GQA/MHA path while preserving MLA's parameterization.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        kernels: DFlashKernels,
+    ):
+        super().__init__()
+        validate_dflash_mla_config(config)
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = int(config.hidden_size)
+        self.num_heads = int(config.num_attention_heads)
+        self.num_key_value_groups = 1
+        self.q_lora_rank = (
+            None
+            if getattr(config, "q_lora_rank", None) is None
+            else int(config.q_lora_rank)
+        )
+        self.kv_lora_rank = int(config.kv_lora_rank)
+        self.qk_nope_head_dim = int(config.qk_nope_head_dim)
+        self.qk_rope_head_dim = int(config.qk_rope_head_dim)
+        self.v_head_dim = int(config.v_head_dim)
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.head_dim = self.qk_head_dim
+        self.scaling = self.qk_head_dim**-0.5
+        self.attention_dropout = float(config.attention_dropout)
+        self.is_causal = False
+
+        dflash_config = dict(getattr(config, "dflash_config", None) or {})
+        self.rope_interleaved = bool(
+            dflash_config.get(
+                "mla_rope_interleaved",
+                getattr(config, "rope_interleave", True),
+            )
+        )
+        self.use_output_gate = bool(
+            dflash_config.get(
+                "mla_use_output_gate",
+                getattr(config, "mla_use_output_gate", False),
+            )
+        )
+
+        bias = bool(config.attention_bias)
+        if self.q_lora_rank is None:
+            self.q_proj = nn.Linear(
+                self.hidden_size,
+                self.num_heads * self.qk_head_dim,
+                bias=bias,
+            )
+        else:
+            self.q_a_proj = nn.Linear(
+                self.hidden_size,
+                self.q_lora_rank,
+                bias=bias,
+            )
+            self.q_a_layernorm = kernels.make_rms_norm(
+                self.q_lora_rank,
+                config.rms_norm_eps,
+            )
+            self.q_b_proj = nn.Linear(
+                self.q_lora_rank,
+                self.num_heads * self.qk_head_dim,
+                bias=bias,
+            )
+
+        self.kv_a_proj_with_mqa = nn.Linear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=bias,
+        )
+        self.kv_a_layernorm = kernels.make_rms_norm(
+            self.kv_lora_rank,
+            config.rms_norm_eps,
+        )
+        self.kv_b_proj = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=bias,
+        )
+        if self.use_output_gate:
+            self.g_proj = nn.Linear(
+                self.hidden_size,
+                self.num_heads * self.v_head_dim,
+                bias=False,
+            )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=bias,
+        )
+
+        rope_config = copy.deepcopy(config)
+        rope_config.head_dim = self.qk_rope_head_dim
+        self.rotary_emb = Qwen3RotaryEmbedding(rope_config)
+        self.sliding_window = (
+            config.sliding_window
+            if config.layer_types[layer_idx] == SLIDING_ATTENTION
+            else None
+        )
+
+    def _project_q(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.q_lora_rank is None:
+            return self.q_proj(hidden_states)
+        return self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+
+    def _project_kv(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len = hidden_states.shape[:2]
+        kv_combined = self.kv_a_proj_with_mqa(hidden_states)
+        kv_compressed, k_rope = kv_combined.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        kv = self.kv_b_proj(self.kv_a_layernorm(kv_compressed)).view(
+            batch_size,
+            seq_len,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        k_nope, value = kv.split(
+            [self.qk_nope_head_dim, self.v_head_dim],
+            dim=-1,
+        )
+        return k_nope, k_rope, value
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        target_hidden: torch.Tensor,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]],
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        del position_embeddings
+        if position_ids is None:
+            raise ValueError("MLA attention requires position_ids")
+
+        batch_size, query_len = hidden_states.shape[:2]
+        context_len = target_hidden.shape[1]
+        key_len = context_len + query_len
+        if position_ids.shape[-1] != key_len:
+            raise ValueError(
+                "MLA position_ids must cover target context and draft queries; "
+                f"expected {key_len}, got {position_ids.shape[-1]}"
+            )
+
+        query = self._project_q(hidden_states).view(
+            batch_size,
+            query_len,
+            self.num_heads,
+            self.qk_head_dim,
+        )
+        q_nope, q_rope = query.split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim],
+            dim=-1,
+        )
+
+        context_k_nope, context_k_rope, context_value = self._project_kv(target_hidden)
+        noise_k_nope, noise_k_rope, noise_value = self._project_kv(hidden_states)
+        k_nope = torch.cat((context_k_nope, noise_k_nope), dim=1)
+        k_rope = torch.cat((context_k_rope, noise_k_rope), dim=1)
+        value = torch.cat((context_value, noise_value), dim=1)
+
+        cos, sin = self.rotary_emb(k_rope, position_ids)
+        q_rope = _apply_mla_rope(
+            q_rope.transpose(1, 2),
+            cos[:, -query_len:],
+            sin[:, -query_len:],
+            interleaved=self.rope_interleaved,
+        )
+        k_rope = _apply_mla_rope(
+            k_rope.unsqueeze(1),
+            cos,
+            sin,
+            interleaved=self.rope_interleaved,
+        ).expand(-1, self.num_heads, -1, -1)
+        query = torch.cat((q_nope.transpose(1, 2), q_rope), dim=-1)
+        key = torch.cat((k_nope.transpose(1, 2), k_rope), dim=-1)
+        value = value.transpose(1, 2)
+
+        if past_key_values is not None:
+            cache_kwargs = {"cache_position": cache_position}
+            key, value = past_key_values.update(
+                key,
+                value,
+                self.layer_idx,
+                cache_kwargs,
+            )
+
+        valid_queries = None
+        attn_fn: Callable = eager_attention_forward
+        if self.config._attn_implementation == "eager":
+            attention_mask, valid_queries = _prepare_dflash_eager_mask(
+                attention_mask,
+                query.dtype,
+            )
+        else:
+            attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attn_output, attn_weights = attn_fn(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
+        if valid_queries is not None and attn_weights is not None:
+            attn_weights = attn_weights.masked_fill(~valid_queries, 0)
+
+        if self.use_output_gate:
+            gate = torch.sigmoid(self.g_proj(hidden_states)).view(
+                batch_size,
+                query_len,
+                self.num_heads,
+                self.v_head_dim,
+            )
+            attn_output = attn_output * gate
+        attn_output = self.o_proj(attn_output.reshape(batch_size, query_len, -1))
+        if valid_queries is not None:
+            attn_output = attn_output.masked_fill(
+                ~valid_queries.any(dim=1),
+                0,
+            )
+        return attn_output, attn_weights
+
+
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     def __init__(
         self,
@@ -239,7 +561,12 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3DFlashAttention(
+        attention_cls = (
+            Qwen3DFlashMLAAttention
+            if resolve_dflash_attention_mode(config) == "mla"
+            else Qwen3DFlashAttention
+        )
+        self.self_attn = attention_cls(
             config=config,
             layer_idx=layer_idx,
             kernels=kernels,
@@ -368,6 +695,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
+        self.attention_mode = resolve_dflash_attention_mode(config)
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         self.layers = nn.ModuleList(
             [
@@ -463,7 +791,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = (
+            None
+            if self.attention_mode == "mla"
+            else self.rotary_emb(hidden_states, position_ids)
+        )
         for layer_type, layer in zip(self.layer_types, self.layers):
             layer_attention_mask = (
                 attention_mask[layer_type]

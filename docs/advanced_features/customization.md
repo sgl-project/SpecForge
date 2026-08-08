@@ -85,6 +85,45 @@ EAGLE3 offline sequence parallelism is selected with
 tracking are also config features rather than custom launchers; see the
 [training guide](../basic_usage/training.md) for their validated combinations.
 
+## MLA draft attention
+
+DFlash-family draft models can select Multi-head Latent Attention (MLA) in the
+draft JSON without introducing a model-specific architecture. Keep the existing
+`DFlashDraftModel`, `DominoDraftModel`, or `DSparkDraftModel` architecture and
+set `dflash_config.attention_mode` to `"mla"`:
+
+```json
+{
+  "architectures": ["DSparkDraftModel"],
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "q_lora_rank": 1536,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 128,
+  "dflash_config": {
+    "projector_type": "dspark",
+    "attention_mode": "mla",
+    "mla_rope_interleaved": true,
+    "mla_use_output_gate": false
+  }
+}
+```
+
+`q_lora_rank` may be `null` to use a direct query projection. The KV rank and
+all head dimensions must be positive except `qk_nope_head_dim`, which may be
+zero; the rotary dimension must be even. Interleaved partial RoPE is the
+default MLA convention and can be disabled with
+`dflash_config.mla_rope_interleaved: false`. The output gate is optional and
+disabled by default.
+
+MLA changes only the draft attention parameterization. The DFlash-family
+target-context injection, per-layer full/sliding masks, objectives, capture
+contract, and `eager`, `sdpa`, or `flex_attention` training backend selection
+remain unchanged. Omitting `attention_mode` preserves the existing GQA path;
+explicit `"mha"` continues to select equal query/KV head counts for DSpark.
+
 ## Draft architectures
 
 Draft classes register through `@register_draft`. The key defaults to the
