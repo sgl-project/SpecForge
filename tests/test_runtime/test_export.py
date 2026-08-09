@@ -10,6 +10,7 @@ The legacy checkpoint compatibility checks run on CPU. The end-to-end exporter
 round trips require GPU and can be run on the H200 box via rcli.
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -17,6 +18,94 @@ import unittest
 import torch
 
 CUDA = torch.cuda.is_available()
+
+
+class TestRoPEConfigCompatibility(unittest.TestCase):
+    def _write_config(self, directory, payload):
+        path = os.path.join(directory, "config.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return path
+
+    def test_modern_rope_parameters_are_mirrored_for_legacy_readers(self):
+        from specforge.export.checkpoint_io import apply_legacy_rope_scaling
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_config(
+                directory,
+                {
+                    "rope_parameters": {
+                        "rope_type": "yarn",
+                        "factor": 128.0,
+                        "rope_theta": 8_000_000,
+                    }
+                },
+            )
+            self.assertTrue(apply_legacy_rope_scaling(directory))
+            with open(path, encoding="utf-8") as handle:
+                config = json.load(handle)
+
+        self.assertEqual(
+            config["rope_scaling"],
+            {"rope_type": "yarn", "factor": 128.0},
+        )
+        self.assertEqual(config["rope_theta"], 8_000_000)
+
+    def test_legacy_rope_scaling_is_mirrored_for_modern_readers(self):
+        from specforge.export.checkpoint_io import apply_legacy_rope_scaling
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_config(
+                directory,
+                {
+                    "rope_theta": 8_000_000,
+                    "rope_scaling": {"type": "yarn", "factor": 128.0},
+                },
+            )
+            self.assertTrue(apply_legacy_rope_scaling(directory))
+            with open(path, encoding="utf-8") as handle:
+                config = json.load(handle)
+
+        self.assertEqual(
+            config["rope_parameters"],
+            {"type": "yarn", "factor": 128.0, "rope_theta": 8_000_000},
+        )
+
+    def test_default_rope_config_is_not_rewritten(self):
+        from specforge.export.checkpoint_io import apply_legacy_rope_scaling
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_config(
+                directory,
+                {"rope_parameters": {"rope_type": "default"}},
+            )
+            with open(path, "rb") as handle:
+                before = handle.read()
+            self.assertFalse(apply_legacy_rope_scaling(directory))
+            with open(path, "rb") as handle:
+                after = handle.read()
+
+        self.assertEqual(after, before)
+
+    def test_default_rope_theta_is_mirrored_for_legacy_readers(self):
+        from specforge.export.checkpoint_io import apply_legacy_rope_scaling
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_config(
+                directory,
+                {
+                    "rope_parameters": {
+                        "rope_type": "default",
+                        "rope_theta": 1_000_000,
+                    }
+                },
+            )
+            self.assertTrue(apply_legacy_rope_scaling(directory))
+            with open(path, encoding="utf-8") as handle:
+                config = json.load(handle)
+
+        self.assertEqual(config["rope_theta"], 1_000_000)
+        self.assertNotIn("rope_scaling", config)
 
 
 class TestLegacyVocabMappingCompatibility(unittest.TestCase):
