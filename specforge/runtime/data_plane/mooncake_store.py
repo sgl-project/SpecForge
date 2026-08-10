@@ -68,7 +68,14 @@ import torch
 
 from specforge.runtime.contracts import SCHEMA_VERSION, FeatureHandle, SampleRef
 from specforge.runtime.data_plane.disaggregated import AuthPolicy
-from specforge.runtime.data_plane.feature_store import FeatureStore, spec_from_tensor
+from specforge.runtime.data_plane.feature_store import (
+    DEFAULT_PENDING_DRAIN_MAX_ATTEMPTS,
+    DEFAULT_PENDING_DRAIN_RETRY_INTERVAL_S,
+    DEFAULT_SAMPLE_DRAIN_MAX_ATTEMPTS,
+    DEFAULT_SAMPLE_DRAIN_RETRY_INTERVAL_S,
+    FeatureStore,
+    spec_from_tensor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -720,8 +727,8 @@ class MooncakeFeatureStore(FeatureStore):
         self,
         sample_ids: List[str],
         *,
-        max_attempts: int = 8,
-        retry_interval_s: float = 0.25,
+        max_attempts: int = DEFAULT_SAMPLE_DRAIN_MAX_ATTEMPTS,
+        retry_interval_s: float = DEFAULT_SAMPLE_DRAIN_RETRY_INTERVAL_S,
         sleep: Callable[[float], None] = time.sleep,
     ) -> Dict[str, int]:
         """Force-remove only the named optimizer-durable samples.
@@ -739,8 +746,8 @@ class MooncakeFeatureStore(FeatureStore):
     def drain_pending_removals(
         self,
         *,
-        max_attempts: int = 40,
-        retry_interval_s: float = 0.5,
+        max_attempts: int = DEFAULT_PENDING_DRAIN_MAX_ATTEMPTS,
+        retry_interval_s: float = DEFAULT_PENDING_DRAIN_RETRY_INTERVAL_S,
         sleep: Callable[[float], None] = time.sleep,
     ) -> Dict[str, int]:
         """Retry deferred removes at lifecycle shutdown or fail loudly.
