@@ -305,7 +305,11 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
 
 
 class ManagedLocalCaptureServerConfig(StrictConfigModel):
-    """One patched SGLang capture server owned by the local supervisor."""
+    """One patched SGLang capture server owned by the local supervisor.
+
+    ``cuda_visible_devices`` holds plain device ordinals; the launcher maps
+    them to the accelerator's visibility env var.
+    """
 
     port: int = Field(gt=0, le=65535)
     cuda_visible_devices: List[str] = Field(min_length=1)
@@ -331,7 +335,11 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
 
 
 class ManagedLocalStackConfig(StrictConfigModel):
-    """Opt-in ownership of a complete single-node online capture stack."""
+    """Opt-in ownership of a complete single-node online capture stack.
+
+    ``trainer_cuda_visible_devices`` holds plain device ordinals; the
+    launcher maps them to the accelerator's visibility env var.
+    """
 
     trainer_cuda_visible_devices: List[str] = Field(min_length=1)
     mooncake: ManagedLocalMooncakeConfig = Field(
