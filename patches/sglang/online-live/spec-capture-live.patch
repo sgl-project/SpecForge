@@ -1,0 +1,394 @@
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2147,6 +2147,19 @@
+         "match the draft strategy being trained; they wire capture onto "
+         "different submodules (VL targets only populate the dflash path).",
+     ] = "eagle3"
++    spec_capture_intake_url: A[
++        Optional[str],
++        "Online-live capture: SpecForge intake origin (http://host:port). The "
++        "sink fetches its capture config from this endpoint, captures ordinary "
++        "serving requests (prefill + generated tokens), writes tensors into "
++        "Mooncake, and pushes tensor-free records back. Requires "
++        "--enable-spec-capture.",
++    ] = None
++    spec_capture_sample_rate: A[
++        float,
++        "Fraction of live serving requests to capture (deterministic per "
++        "request id). Only used with --spec-capture-intake-url.",
++    ] = 1.0
+     enable_return_routed_experts: A[
+         bool,
+         "Enable returning routed experts of each layer with responses.",
+--- a/python/sglang/srt/spec_capture_sink.py
++++ b/python/sglang/srt/spec_capture_sink.py
+@@ -26,14 +26,30 @@
+ 
+ Mooncake connection uses the standard ``MOONCAKE_*`` env vars (see
+ ``MooncakeFeatureStore``).
++
++Online-live mode (``--spec-capture-intake-url``): ordinary serving requests
++are captured without any client ``spec_capture`` field. The sink GETs its
++capture config (store id, feature names, passthrough synthesis rules, token
++cap) from the SpecForge intake, mints a deterministic spec per sampled
++request, and — on a background writer thread, never the scheduler loop —
++writes prefill+decode rows to Mooncake and POSTs the tensor-free record back.
++Every failure (queue full, Mooncake down/full, intake down or non-2xx) drops
++just that capture, removes any keys already written, and never touches the
++user's response.
+ """
+ 
+ from __future__ import annotations
+ 
++import hashlib
++import json
+ import logging
+ import os
++import queue
+ import threading
++import time
+ from typing import Any, Dict, List, Optional
++from urllib.error import HTTPError
++from urllib.request import Request, urlopen
+ 
+ import torch
+ 
+@@ -66,7 +82,13 @@
+ class SpecCaptureSink:
+     """Writes captured per-request tensors into Mooncake in SpecForge layout."""
+ 
+-    def __init__(self, aux_layer_ids: Optional[List[int]] = None) -> None:
++    def __init__(
++        self,
++        aux_layer_ids: Optional[List[int]] = None,
++        *,
++        intake_url: Optional[str] = None,
++        sample_rate: float = 1.0,
++    ) -> None:
+         self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids else None
+         self._store = None
+         self._put_config = None
+@@ -74,6 +96,26 @@
+         # Retried HTTP requests reuse deterministic keys.  Striped locks keep
+         # replacement atomic per key without retaining one lock per sample.
+         self._write_locks = [threading.Lock() for _ in range(256)]
++        self.intake_url = intake_url.rstrip("/") if intake_url else None
++        self.sample_rate = float(sample_rate)
++        self._live_config: Optional[Dict[str, Any]] = None
++        self._live_config_next_fetch = 0.0
++        self._live_stats = {
++            "captured": 0,
++            "dropped_queue_full": 0,
++            "dropped_put": 0,
++            "dropped_post": 0,
++            "dropped_bad_rows": 0,
++        }
++        self._live_stats_last_log = 0.0
++        self._live_queue: Optional[queue.Queue] = None
++        if self.intake_url:
++            self._live_queue = queue.Queue(
++                maxsize=int(os.environ.get("SPEC_CAPTURE_LIVE_QUEUE", 64))
++            )
++            threading.Thread(
++                target=self._live_writer, name="spec-capture-live", daemon=True
++            ).start()
+ 
+     # -- connection ---------------------------------------------------------
+     def _connect(self):
+@@ -235,6 +277,146 @@
+             "features": result_feats,
+         }
+ 
++    # -- online-live mode -----------------------------------------------------
++    def _fetch_live_config(self) -> Optional[Dict[str, Any]]:
++        """Lazy capture-config handshake; re-attempted at most every 5s."""
++        if self._live_config is not None:
++            return self._live_config
++        now = time.monotonic()
++        if now < self._live_config_next_fetch:
++            return None
++        self._live_config_next_fetch = now + 5.0
++        try:
++            with urlopen(
++                f"{self.intake_url}/v1/spec-capture/config", timeout=5.0
++            ) as response:
++                self._live_config = json.load(response)
++            logger.info("spec-capture live config: %s", self._live_config)
++        except Exception as e:
++            logger.warning("spec-capture live config fetch failed: %s", e)
++        return self._live_config
++
++    def maybe_live_spec(self, rid: str) -> Optional[Dict[str, Any]]:
++        """Server-minted capture spec for one serving request (None = skip).
++
++        Both the sampling decision and the sample id derive deterministically
++        from ``rid`` so every TP rank makes the same capture decision.
++        """
++        if self.intake_url is None:
++            return None
++        config = self._fetch_live_config()
++        if config is None:
++            return None
++        if self.sample_rate < 1.0:
++            digest = hashlib.sha1(str(rid).encode("utf-8")).digest()
++            if int.from_bytes(digest[:8], "big") / 2**64 >= self.sample_rate:
++                return None
++        return {
++            "store_id": config["store_id"],
++            "sample_id": f"live-{rid}",
++            "gen": int(config.get("gen", 1)),
++            "replace": False,
++            "features": dict(config.get("features") or {}),
++            "live": True,
++        }
++
++    def put_sample_live(
++        self,
++        spec: Dict[str, Any],
++        *,
++        aux: Optional[torch.Tensor],
++        last_hidden: Optional[torch.Tensor],
++        tokens: List[int],
++    ) -> None:
++        """Fire-and-forget: hand one finished capture to the writer thread."""
++        try:
++            self._live_queue.put_nowait((spec, aux, last_hidden, list(tokens)))
++        except queue.Full:
++            self._live_stats["dropped_queue_full"] += 1
++            self._log_live_stats()
++
++    def _live_writer(self) -> None:
++        while True:
++            item = self._live_queue.get()
++            try:
++                self._write_live_sample(*item)
++            except Exception as e:
++                logger.warning("spec-capture live write failed: %s", e)
++            finally:
++                self._live_queue.task_done()
++
++    def _write_live_sample(self, spec, aux, last_hidden, tokens) -> None:
++        config = self._live_config or {}
++        min_tokens = int(config.get("min_num_tokens") or 2)
++        max_tokens = int(config.get("max_num_tokens") or 0)
++        rows = aux.shape[0] if aux is not None else -1
++        if (
++            rows != len(tokens)
++            or len(tokens) < min_tokens  # warmup/probe one-token requests
++            or (max_tokens and len(tokens) > max_tokens)
++        ):
++            self._live_stats["dropped_bad_rows"] += 1
++            self._log_live_stats()
++            return
++        passthrough = []
++        for item in config.get("passthrough") or []:
++            data = tokens if item["source"] == "tokens" else [1] * len(tokens)
++            passthrough.append(
++                {
++                    "name": item["name"],
++                    "data": data,
++                    "shape": [1, len(tokens)],
++                    "dtype": "int64",
++                }
++            )
++        spec = dict(spec, passthrough=passthrough)
++        try:
++            result = self.put_sample(spec, aux=aux, last_hidden=last_hidden)
++        except Exception as e:
++            # Pool full or Mooncake down: partial keys were already removed.
++            logger.warning("spec-capture live put failed for %s: %s", spec["sample_id"], e)
++            self._live_stats["dropped_put"] += 1
++            self._log_live_stats()
++            return
++        result["num_tokens"] = len(tokens)
++        if self._post_live_record(result):
++            self._live_stats["captured"] += 1
++        else:
++            # A record SpecForge never accepted must not stay hard-pinned.
++            for name in result["features"]:
++                self._remove_quiet(
++                    self._tkey(
++                        spec["store_id"], spec["sample_id"], int(spec["gen"]), name
++                    )
++                )
++            self._live_stats["dropped_post"] += 1
++        self._log_live_stats()
++
++    def _post_live_record(self, result: Dict[str, Any]) -> bool:
++        body = json.dumps(result).encode("utf-8")
++        for _attempt in range(2):  # the intake dedups sample_id; retry is safe
++            request = Request(
++                f"{self.intake_url}/v1/spec-capture/records",
++                data=body,
++                headers={"Content-Type": "application/json"},
++                method="POST",
++            )
++            try:
++                with urlopen(request, timeout=10.0) as response:
++                    return 200 <= response.status < 300
++            except HTTPError:
++                return False  # shed/rejected: no point retrying
++            except Exception:
++                continue
++        return False
++
++    def _log_live_stats(self) -> None:
++        now = time.monotonic()
++        if now - self._live_stats_last_log < 60.0:
++            return
++        self._live_stats_last_log = now
++        logger.info("spec-capture live stats: %s", self._live_stats)
++
+ 
+ _SINK: Optional[SpecCaptureSink] = None
+ 
+@@ -248,9 +430,17 @@
+     global _SINK
+     if getattr(server_args, "enable_spec_capture", False) and _SINK is None:
+         _SINK = SpecCaptureSink(
+-            aux_layer_ids=getattr(server_args, "spec_capture_aux_layer_ids", None)
++            aux_layer_ids=getattr(server_args, "spec_capture_aux_layer_ids", None),
++            intake_url=getattr(server_args, "spec_capture_intake_url", None),
++            sample_rate=getattr(server_args, "spec_capture_sample_rate", 1.0),
+         )
+ 
+ 
+ def get_sink() -> Optional[SpecCaptureSink]:
+     return _SINK
++
++
++def maybe_live_spec(rid: str) -> Optional[Dict[str, Any]]:
++    """Scheduler one-liner: a live capture spec for ``rid``, or None."""
++    sink = _SINK
++    return sink.maybe_live_spec(rid) if sink is not None else None
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -153,6 +153,7 @@
+     decide_needs_cpu_seq_lens,
+     resolve_forward_inputs,
+ )
++from sglang.srt import spec_capture_sink
+ from sglang.srt.managers.prefill_delayer import (
+     PrefillDelayer,
+     PrefillDelayerSinglePassExecutor,
+@@ -585,6 +586,14 @@
+                     "(single-pass prefill) so captured hidden states cover the "
+                     "whole sequence"
+                 )
++            if (
++                server_args.spec_capture_intake_url
++                and server_args.speculative_algorithm is not None
++            ):
++                raise ValueError(
++                    "--spec-capture-intake-url (online-live capture) does not "
++                    "support serving with speculative decoding yet"
++                )
+             from sglang.srt import spec_capture_sink
+ 
+             spec_capture_sink.maybe_init_sink(server_args)
+@@ -2067,7 +2076,10 @@
+                 dllm_config=self.dllm_config,
+                 time_stats=recv_req.time_stats,
+                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+-                spec_capture=recv_req.spec_capture,
++                # An explicit client spec (driven capture) wins; otherwise the
++                # sink may mint one for this live serving request.
++                spec_capture=recv_req.spec_capture
++                or spec_capture_sink.maybe_live_spec(recv_req.rid),
+             )
+             req.tokenizer = self.tokenizer
+ 
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1489,6 +1489,16 @@
+         if self.input_embeds is not None:
+             self.output_ids = array("q")
+ 
++        if self.spec_capture is not None and self.spec_capture.get("live"):
++            # The re-prefill would double-append captured rows; drop this
++            # request's live capture instead. return_hidden_states was forced
++            # on by the live spec, so reset it or the re-prefill would stream
++            # hidden states into the user's response.
++            self.spec_capture = None
++            self.spec_capture_aux = []
++            self.spec_capture_last_hidden = []
++            self.return_hidden_states = False
++
+     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+         token_indices = req_to_token_pool.req_to_token[
+             self.req_pool_idx, : self.seqlen - 1
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -498,6 +498,23 @@
+             )
+         return end
+ 
++    def _append_spec_capture_decode_states(
++        self,
++        *,
++        req: Req,
++        logits_output: LogitsProcessorOutput,
++        start: int,
++        count: int,
++    ) -> None:
++        """Accumulate captured decode rows (aligned with the fed tokens)."""
++        req.spec_capture_aux.append(
++            logits_output.hidden_states[start : start + count].cpu().clone()
++        )
++        if logits_output.last_hidden_states is not None:
++            req.spec_capture_last_hidden.append(
++                logits_output.last_hidden_states[start : start + count].cpu().clone()
++            )
++
+     def _sink_spec_capture(self, req: Req) -> None:
+         """Write a finished capture request's tensors to the Mooncake sink.
+ 
+@@ -505,6 +522,9 @@
+         (or an ``{"error": ...}`` marker) is set on ``req.spec_capture_result``,
+         returned to the client via the dedicated ``spec_capture`` output field
+         (a per-request channel, unlike per-token ``customized_info``).
++
++        Live capture instead hands off to the sink's background writer: the
++        record goes to the SpecForge intake, nothing enters the user response.
+         """
+         from sglang.srt import spec_capture_sink
+ 
+@@ -517,6 +537,16 @@
+             if req.spec_capture_last_hidden
+             else None
+         )
++        if req.spec_capture.get("live"):
++            # Rows cover origin_input_ids plus every fed decode token; the
++            # final sampled token has no hidden row and is dropped.
++            tokens = list(req.origin_input_ids) + list(req.output_ids)[:-1]
++            sink.put_sample_live(
++                req.spec_capture, aux=aux, last_hidden=last_hidden, tokens=tokens
++            )
++            req.spec_capture_aux = []
++            req.spec_capture_last_hidden = []
++            return
+         try:
+             req.spec_capture_result = sink.put_sample(
+                 req.spec_capture, aux=aux, last_hidden=last_hidden
+@@ -781,7 +811,20 @@
+                     logits_output=logits_output,
+                 )
+ 
+-            if req.return_hidden_states and logits_output.hidden_states is not None:
++            if req.spec_capture is not None and logits_output.hidden_states is not None:
++                # Spec-training capture: one row per fed token (the previously
++                # sampled one), covering prompt + generated tokens by finish.
++                if not is_spec:
++                    start, count = i, 1
++                else:
++                    start = i * result.speculative_num_draft_tokens
++                    count = len(next_token_id)
++                self._append_spec_capture_decode_states(
++                    req=req, logits_output=logits_output, start=start, count=count
++                )
++                if req.finished():
++                    self._sink_spec_capture(req)
++            elif req.return_hidden_states and logits_output.hidden_states is not None:
+                 if not is_spec:
+                     req.hidden_states.append(
+                         logits_output.hidden_states[i].cpu().clone().tolist()

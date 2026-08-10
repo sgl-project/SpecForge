@@ -47,6 +47,13 @@ The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 full-stack examples. Their typed `managed_local` blocks own Mooncake, one or
 two patched SGLang capture servers, and the trainer GPU allocation; the same
 `specforge train -c ...` command starts and cleans up each complete stack.
+The `qwen3-4b-dspark-live.yaml` recipe is the online-live example: external
+serving traffic drives capture (`deployment.disaggregated.live`). With
+`live.mooncake` set, one `specforge train` command supervises Mooncake +
+producer + consumer; `scripts/online_live/launch_capture_server.py` launches
+the live-patched SGLang server with flags derived from the same config, and
+`scripts/online_live/live_traffic_mimic.py` stands in for real users.
+
 Disaggregated recipes without `managed_local` keep Mooncake and SGLang external
 for scheduler- or service-managed deployments.
 
@@ -298,6 +305,11 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.producer_hold_s` | `null` | Optional positive offline producer retention timeout. Unset is unbounded; expiration fails the attempt. |
 | `deployment.disaggregated.shutdown_grace_s` | `30.0` | SIGTERM-to-SIGKILL window for a plain supervisor teardown; must cover worker cleanup (Mooncake drains, checkpoint flush, failure sentinels). `managed_local` stacks use `managed_local.shutdown_grace_s`. |
 | `deployment.disaggregated.managed_local` | `null` | Optional owned single-node Mooncake + capture-server stack described below. |
+| `deployment.disaggregated.live` | `null` | Online-live mode: external serving-traffic capture servers push records to a producer-hosted intake endpoint. Mutually exclusive with `managed_local` and `server_urls`; requires `training.max_steps` (or `total_steps`) and no data source. |
+| `deployment.disaggregated.live.host` | `0.0.0.0` | Intake bind host on the producer. |
+| `deployment.disaggregated.live.port` | required | Intake bind port; capture servers point `--spec-capture-intake-url` at it. |
+| `deployment.disaggregated.live.mooncake` | `null` | Optional supervisor-owned loopback Mooncake master (same shape as `managed_local.mooncake`): one `specforge train` command launches Mooncake + producer + consumer. Set together with `trainer_cuda_visible_devices`. |
+| `deployment.disaggregated.live.trainer_cuda_visible_devices` | `null` | Consumer CUDA devices for the supervised live launch; count must equal `deployment.trainer.nproc_per_node`. |
 
 The four path fields have different ownership:
 

@@ -400,31 +400,39 @@ def _sglang_argv(
     return argv
 
 
-def _managed_local_services(
-    cfg: Config,
-    *,
-    algorithm: "AlgorithmRegistration",
-) -> tuple[ServiceSpec, ...]:
-    from specforge.training.capture_contract import resolve_server_capture_contract
-
+def _live_managed_environment(cfg: Config) -> dict[str, str]:
     deployment = cfg.deployment.disaggregated
-    assert deployment is not None and deployment.managed_local is not None
-    managed = deployment.managed_local
-    mooncake = managed.mooncake
-    control_dir = Path(deployment.control_dir)
-    log_dir = control_dir / "logs"
-    shared_env = _managed_local_environment(cfg)
-    capture_context_length = cfg.model.sglang_context_length or (
-        cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
-    )
+    assert deployment is not None and deployment.live is not None
+    mooncake = deployment.live.mooncake
+    assert mooncake is not None
+    values = {
+        "MOONCAKE_METADATA_SERVER": (
+            f"http://127.0.0.1:{mooncake.metadata_port}/metadata"
+        ),
+        "MOONCAKE_MASTER_SERVER_ADDR": f"127.0.0.1:{mooncake.rpc_port}",
+        "MOONCAKE_LOCAL_HOSTNAME": mooncake.local_hostname,
+        "MOONCAKE_PROTOCOL": mooncake.protocol,
+        "MC_TRANSFER_TIMEOUT": os.environ.get("MC_TRANSFER_TIMEOUT", "300"),
+        "MC_TCP_BIND_ADDRESS": os.environ.get(
+            "MC_TCP_BIND_ADDRESS", mooncake.local_hostname
+        ),
+    }
+    if mooncake.rdma_devices:
+        values["MOONCAKE_RDMA_DEVICES"] = mooncake.rdma_devices
+    return values
 
+
+def _mooncake_master_service(
+    control_dir: Path, mooncake, metadata_server_url: str
+) -> ServiceSpec:
     # Prefer the interpreter's own mooncake_master: a system-wide binary of a
     # different version speaks an incompatible RPC schema, and every client
     # mount then fails with "invalid rpc arg" / RPC_FAIL.
     _venv_master = Path(sys.executable).parent / "mooncake_master"
-    mooncake_master_bin = str(_venv_master) if _venv_master.exists() else "mooncake_master"
-
-    mooncake_service = ServiceSpec(
+    mooncake_master_bin = (
+        str(_venv_master) if _venv_master.exists() else "mooncake_master"
+    )
+    return ServiceSpec(
         command=CommandSpec(
             "mooncake",
             (
@@ -445,13 +453,36 @@ def _managed_local_services(
         ),
         readiness=ReadinessSpec(
             "mooncake",
-            shared_env["MOONCAKE_METADATA_SERVER"] + "?key=specforge-health-check",
+            metadata_server_url + "?key=specforge-health-check",
             mooncake.startup_timeout_s,
             tcp_host="127.0.0.1",
             tcp_port=mooncake.rpc_port,
         ),
-        log_path=str(log_dir / "mooncake.log"),
+        log_path=str(control_dir / "logs" / "mooncake.log"),
         phase=0,
+    )
+
+
+def _managed_local_services(
+    cfg: Config,
+    *,
+    algorithm: "AlgorithmRegistration",
+) -> tuple[ServiceSpec, ...]:
+    from specforge.training.capture_contract import resolve_server_capture_contract
+
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.managed_local is not None
+    managed = deployment.managed_local
+    mooncake = managed.mooncake
+    control_dir = Path(deployment.control_dir)
+    log_dir = control_dir / "logs"
+    shared_env = _managed_local_environment(cfg)
+    capture_context_length = cfg.model.sglang_context_length or (
+        cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
+    )
+
+    mooncake_service = _mooncake_master_service(
+        control_dir, mooncake, shared_env["MOONCAKE_METADATA_SERVER"]
     )
 
     contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
@@ -648,6 +679,9 @@ def _validate_capture_urls(
     deployment = cfg.deployment.disaggregated
     if deployment is not None and deployment.managed_local is not None:
         return
+    if deployment is not None and deployment.live is not None:
+        # Live capture servers are external and push to the producer's intake.
+        return
     if deployment is not None and deployment.server_urls:
         return
     if base_env.get("DISAGG_SERVER_URLS") or base_env.get("DISAGG_SERVER_URL"):
@@ -689,32 +723,39 @@ def build_launch_plan(
         raise ValueError(
             "managed_local launch planning requires a resolved algorithm registration"
         )
+    live = deployment.live if deployment is not None else None
+    live_managed = live is not None and live.mooncake is not None
+    managed_stack = "managed_local" if managed_local is not None else (
+        "live.mooncake" if live_managed else None
+    )
     managed_child = base_env.get(_MANAGED_CHILD_ENV) == "1"
-    if managed_local is not None:
+    if managed_stack is not None:
         if managed_child:
             if requested_role not in ("producer", "consumer"):
                 raise ValueError(
-                    "managed_local child workers require an explicit producer "
+                    f"{managed_stack} child workers require an explicit producer "
                     "or consumer role"
                 )
             if not Path(deployment.control_dir, "logs").is_dir():
                 raise ValueError(
-                    "managed_local child worker requires an active supervisor "
+                    f"{managed_stack} child worker requires an active supervisor "
                     f"control_dir: {deployment.control_dir}"
                 )
         else:
             if distributed:
-                raise ValueError("managed_local cannot run inside an existing torchrun")
+                raise ValueError(
+                    f"{managed_stack} cannot run inside an existing torchrun"
+                )
             if requested_role not in ("auto", "both"):
                 raise ValueError(
-                    "managed_local supports only --role auto or --role both"
+                    f"{managed_stack} supports only --role auto or --role both"
                 )
             if node_rank is not None:
-                raise ValueError("managed_local does not accept --node-rank")
+                raise ValueError(f"{managed_stack} does not accept --node-rank")
             if os.path.exists(deployment.control_dir):
                 raise ValueError(
-                    "managed_local requires a fresh control_dir, but it already "
-                    f"exists: {deployment.control_dir}"
+                    f"{managed_stack} requires a fresh control_dir, but it "
+                    f"already exists: {deployment.control_dir}"
                 )
     role = _resolve_role(cfg, requested_role, distributed=distributed)
     topology = cfg.deployment.trainer
@@ -735,19 +776,25 @@ def build_launch_plan(
         managed_environment: dict[str, str] = {}
         if managed_local is not None:
             managed_environment = _managed_local_environment(cfg)
+        elif live_managed:
+            managed_environment = _live_managed_environment(cfg)
+        if managed_environment:
             role_base_env = {**base_env, **managed_environment}
         if role in ("producer", "both"):
             producer_env = _disaggregated_env(cfg, role_base_env, role="producer")
         if role in ("consumer", "both"):
             consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
-        if managed_local is not None:
+        if managed_stack is not None:
+            trainer_devices = (
+                managed_local.trainer_cuda_visible_devices
+                if managed_local is not None
+                else live.trainer_cuda_visible_devices
+            )
             producer_env.update(managed_environment)
             producer_env["CUDA_VISIBLE_DEVICES"] = ""
             producer_env[_MANAGED_CHILD_ENV] = "1"
             consumer_env.update(managed_environment)
-            consumer_env["CUDA_VISIBLE_DEVICES"] = ",".join(
-                managed_local.trainer_cuda_visible_devices
-            )
+            consumer_env["CUDA_VISIBLE_DEVICES"] = ",".join(trainer_devices)
             consumer_env[_MANAGED_CHILD_ENV] = "1"
 
     _validate_capture_urls(cfg, role=role, base_env=base_env)
@@ -844,6 +891,28 @@ def build_launch_plan(
             ),
             shutdown_grace_s=managed_local.shutdown_grace_s,
         )
+    if live_managed:
+        mooncake = live.mooncake
+        return LaunchPlan(
+            "managed_supervisor",
+            "both",
+            commands=(producer, consumer),
+            services=(
+                _mooncake_master_service(
+                    Path(deployment.control_dir),
+                    mooncake,
+                    f"http://127.0.0.1:{mooncake.metadata_port}/metadata",
+                ),
+            ),
+            managed_root=deployment.control_dir,
+            managed_ports=(
+                mooncake.rpc_port,
+                mooncake.metadata_port,
+                mooncake.metrics_port,
+                live.port,
+            ),
+            shutdown_grace_s=deployment.shutdown_grace_s,
+        )
     return LaunchPlan(
         "supervisor",
         "both",
@@ -930,17 +999,21 @@ def _managed_preflight(plan: LaunchPlan) -> None:
         mooncake_available = False
     if not mooncake_available:
         raise RuntimeError("managed_local requires the mooncake Python package")
-    try:
-        patched_sglang = (
-            importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
-        )
-    except ModuleNotFoundError:
-        patched_sglang = False
-    if not patched_sglang:
-        raise RuntimeError(
-            "managed_local requires patched SGLang spec capture; run "
-            "scripts/apply_sglang_spec_capture_patch.sh"
-        )
+    owns_capture_servers = any(
+        service.command.label.startswith("capture-server") for service in plan.services
+    )
+    if owns_capture_servers:
+        try:
+            patched_sglang = (
+                importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
+            )
+        except ModuleNotFoundError:
+            patched_sglang = False
+        if not patched_sglang:
+            raise RuntimeError(
+                "managed_local requires patched SGLang spec capture; run "
+                "scripts/apply_sglang_spec_capture_patch.sh"
+            )
 
     for port in plan.managed_ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:

@@ -63,6 +63,17 @@ def _managed_local_payload(*, ep_size: int) -> dict:
     return payload
 
 
+def _live_payload() -> dict:
+    payload = _online_payload("dspark")
+    payload["data"] = {"max_length": 2048}
+    payload["deployment"]["disaggregated"] = {
+        "control_dir": "/control",
+        "backend": "mooncake",
+        "live": {"port": 8600},
+    }
+    return payload
+
+
 def _write(payload: dict, suffix: str) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
     with os.fdopen(fd, "w") as f:
@@ -192,6 +203,94 @@ class ConfigSchemaTest(unittest.TestCase):
         raw_payload["data"] = {"train_data_path": "/conversations.jsonl"}
         raw = Config.model_validate(raw_payload)
         self.assertEqual(raw.mode, "online")
+
+    def test_live_capture_trains_from_serving_traffic_without_a_dataset(self):
+        config = Config.model_validate(_live_payload())
+        self.assertEqual(config.mode, "online")
+        self.assertEqual(config.deployment.disaggregated.live.host, "0.0.0.0")
+        self.assertEqual(config.deployment.disaggregated.live.port, 8600)
+
+    def test_live_capture_rejects_a_data_source(self):
+        payload = _live_payload()
+        payload["data"]["train_data_path"] = "/conversations.jsonl"
+        with self.assertRaisesRegex(ValidationError, "do not set a"):
+            Config.model_validate(payload)
+
+    def test_live_capture_requires_a_bounded_schedule(self):
+        payload = _live_payload()
+        payload["training"].pop("max_steps")
+        with self.assertRaisesRegex(ValidationError, "unbounded stream"):
+            Config.model_validate(payload)
+        payload["training"]["total_steps"] = 100
+        config = Config.model_validate(payload)
+        self.assertEqual(config.training.total_steps, 100)
+
+    def test_live_capture_rejects_driven_capture_topologies(self):
+        payload = _live_payload()
+        payload["deployment"]["disaggregated"]["server_urls"] = [
+            "http://127.0.0.1:30000"
+        ]
+        with self.assertRaisesRegex(ValidationError, "server_urls"):
+            Config.model_validate(payload)
+
+        payload = _live_payload()
+        payload["deployment"]["disaggregated"]["managed_local"] = {
+            "trainer_cuda_visible_devices": ["1"],
+            "capture_servers": [{"port": 30000, "cuda_visible_devices": ["0"]}],
+        }
+        with self.assertRaisesRegex(ValidationError, "managed_local"):
+            Config.model_validate(payload)
+
+        payload = _live_payload()
+        payload["deployment"]["disaggregated"]["producer_segment_size"] = 1024
+        with self.assertRaisesRegex(ValidationError, "producer_segment_size"):
+            Config.model_validate(payload)
+
+        payload = _live_payload()
+        payload["deployment"]["disaggregated"]["backend"] = "shared_dir"
+        payload["deployment"]["disaggregated"]["store_root"] = "/features"
+        with self.assertRaisesRegex(ValidationError, "backend=mooncake"):
+            Config.model_validate(payload)
+
+    def test_live_supervised_launch_pairs_mooncake_with_trainer_devices(self):
+        payload = _live_payload()
+        payload["deployment"]["trainer"] = {"nnodes": 1, "nproc_per_node": 2}
+        payload["deployment"]["disaggregated"]["live"].update(
+            {
+                "mooncake": {"global_segment_size_bytes": 4096},
+                "trainer_cuda_visible_devices": ["1", "2"],
+            }
+        )
+        config = Config.model_validate(payload)
+        self.assertEqual(
+            config.deployment.disaggregated.live.mooncake.rpc_port, 35551
+        )
+
+        missing_devices = _live_payload()
+        missing_devices["deployment"]["disaggregated"]["live"]["mooncake"] = {}
+        with self.assertRaisesRegex(ValidationError, "together"):
+            Config.model_validate(missing_devices)
+
+        wrong_count = _live_payload()
+        wrong_count["deployment"]["disaggregated"]["live"].update(
+            {"mooncake": {}, "trainer_cuda_visible_devices": ["1", "2"]}
+        )
+        with self.assertRaisesRegex(ValidationError, "nproc_per_node"):
+            Config.model_validate(wrong_count)
+
+        explicit_endpoint = _live_payload()
+        explicit_endpoint["deployment"]["trainer"] = {
+            "nnodes": 1,
+            "nproc_per_node": 2,
+        }
+        explicit_endpoint["deployment"]["disaggregated"].update(
+            {"mooncake_metadata_server": "http://metadata:8080/metadata"}
+        )
+        explicit_endpoint["deployment"]["disaggregated"]["live"].update(
+            {"mooncake": {}, "trainer_cuda_visible_devices": ["1", "2"]}
+        )
+        with self.assertRaisesRegex(ValidationError, "derives Mooncake endpoints"):
+            Config.model_validate(explicit_endpoint)
 
     def test_offline_eval_source_and_interval_form_one_pair(self):
         offline = Config.model_validate(

@@ -40,7 +40,8 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3-32b-eagle3-online.yaml": 4,
     "qwen3-4b-dflash-online.yaml": 8,
     "qwen3-4b-dspark-offline.yaml": 1,
-    "qwen3-4b-dspark-disaggregated.yaml": 1,
+    "qwen3-4b-dspark-disaggregated.yaml": 7,
+    "qwen3-4b-dspark-live.yaml": 7,
     "qwen3-4b-eagle3-online.yaml": 1,
     "qwen3-8b-dspark-offline.yaml": 1,
     "qwen3-8b-dflash-disaggregated.yaml": 4,
@@ -73,7 +74,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.6-27b-dflash-multiserver-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-online.yaml": 8,
     "qwen3.6-27b-domino-online.yaml": 8,
-    "qwen3.6-27b-dspark-disaggregated.yaml": 1,
+    "qwen3.6-27b-dspark-disaggregated.yaml": 6,
     "qwq-32b-eagle3-online.yaml": 4,
 }
 
@@ -104,8 +105,36 @@ EXPECTED_DISAGGREGATED = {
     "qwen3-4b-dspark-disaggregated.yaml": {
         "control_dir": "outputs/qwen3-4b-dspark-disaggregated/control",
         "backend": "mooncake",
-        "server_urls": ["http://127.0.0.1:30000"],
-        **LOCAL_MOONCAKE_ENDPOINTS,
+        "managed_local": {
+            "trainer_cuda_visible_devices": ["1", "2", "3", "4", "5", "6", "7"],
+            "mooncake": {
+                "protocol": "tcp",
+                "global_segment_size_bytes": 34359738368,
+                "local_buffer_size_bytes": 1073741824,
+            },
+            "capture_servers": [
+                {
+                    "port": 30000,
+                    "cuda_visible_devices": ["0"],
+                    "tp_size": 1,
+                    "mem_fraction_static": 0.7,
+                }
+            ],
+        },
+    },
+    "qwen3-4b-dspark-live.yaml": {
+        "control_dir": "outputs/qwen3-4b-dspark-live/control",
+        "backend": "mooncake",
+        "live": {
+            "host": "0.0.0.0",
+            "port": 8600,
+            "mooncake": {
+                "protocol": "tcp",
+                "global_segment_size_bytes": 34359738368,
+                "local_buffer_size_bytes": 1073741824,
+            },
+            "trainer_cuda_visible_devices": ["1", "2", "3", "4", "5", "6", "7"],
+        },
     },
     "qwen3-8b-dflash-disaggregated.yaml": {
         "control_dir": "outputs/qwen3-8b-dflash-disaggregated/control",
@@ -283,7 +312,7 @@ EXPECTED_DISAGGREGATED = {
         "control_dir": "outputs/qwen3.6-27b-dspark-disaggregated/control",
         "backend": "mooncake",
         "managed_local": {
-            "trainer_cuda_visible_devices": ["1"],
+            "trainer_cuda_visible_devices": ["2", "3", "4", "5", "6", "7"],
             "mooncake": {
                 "protocol": "tcp",
                 "global_segment_size_bytes": 68719476736,
@@ -295,7 +324,13 @@ EXPECTED_DISAGGREGATED = {
                     "cuda_visible_devices": ["0"],
                     "tp_size": 1,
                     "mem_fraction_static": 0.7,
-                }
+                },
+                {
+                    "port": 30001,
+                    "cuda_visible_devices": ["1"],
+                    "tp_size": 1,
+                    "mem_fraction_static": 0.7,
+                },
             ],
         },
     },
@@ -313,7 +348,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 64)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 65)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():

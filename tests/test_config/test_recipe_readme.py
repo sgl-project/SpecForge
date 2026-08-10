@@ -8,6 +8,7 @@ from specforge.config import (
     DataConfig,
     DeploymentConfig,
     DisaggregatedDeploymentConfig,
+    LiveIntakeDeploymentConfig,
     ManagedLocalCaptureServerConfig,
     ManagedLocalMooncakeConfig,
     ManagedLocalStackConfig,
@@ -46,6 +47,7 @@ class TestRecipeReadmeSync(unittest.TestCase):
                 "deployment.disaggregated.managed_local.capture_servers[]",
                 ManagedLocalCaptureServerConfig,
             ),
+            ("deployment.disaggregated.live", LiveIntakeDeploymentConfig),
         )
 
         missing = []

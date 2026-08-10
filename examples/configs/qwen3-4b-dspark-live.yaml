@@ -1,0 +1,72 @@
+# Online-live DSpark training from real serving traffic.
+#
+# Unlike the driven qwen3-4b-dspark-disaggregated recipe, the serving engine
+# and its traffic stay external: users (or the mimic script) send ordinary
+# /generate requests, the live-patched server captures prefill + generated
+# tokens, and SpecForge trains on them. live.mooncake makes the launcher a
+# supervisor that owns Mooncake master + producer + consumer, so the whole
+# workflow is three commands (one terminal each):
+#
+#   1. specforge train --config examples/configs/qwen3-4b-dspark-live.yaml
+#   2. python scripts/online_live/launch_capture_server.py \
+#        --config examples/configs/qwen3-4b-dspark-live.yaml --cuda 0
+#   3. python scripts/online_live/live_traffic_mimic.py \
+#        --server-url http://127.0.0.1:30000 \
+#        --config examples/configs/qwen3-4b-dspark-live.yaml
+model:
+  target_model_path: Qwen/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-dspark.json
+  target_backend: sglang
+data:
+  # No training data source: samples come from serving traffic. max_length is
+  # the intake token cap (prompt + generated tokens); longer captures are shed.
+  max_length: 3072
+  chat_template: qwen
+  cache_dir: cache
+training:
+  strategy: dspark
+  max_steps: 10000
+  batch_size: 1
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  save_interval: 1000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+tracking:
+  # WANDB_API_KEY is supplied via the process environment, never YAML.
+  report_to: wandb
+  wandb_project: specforge
+  wandb_name: qwen3-4b-dspark-live
+run_id: qwen3-4b-dspark-live
+output_dir: outputs/qwen3-4b-dspark-live
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 7
+  disaggregated:
+    control_dir: outputs/qwen3-4b-dspark-live/control
+    backend: mooncake
+    live:
+      host: 0.0.0.0
+      port: 8600
+      # Supervisor-owned loopback Mooncake master; the pool size is the live
+      # capture buffer (write-until-full, trainer acks free space).
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 1073741824
+      trainer_cuda_visible_devices:
+        - "1"
+        - "2"
+        - "3"
+        - "4"
+        - "5"
+        - "6"
+        - "7"

@@ -658,15 +658,18 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual([service.phase for service in plan.services], [0, 1, 1])
         self.assertEqual(plan.managed_ports, (35551, 35880, 35903, 30000, 30001))
         mooncake = plan.services[0]
+        venv_master = Path(sys.executable).parent / "mooncake_master"
+        expected_master = str(venv_master) if venv_master.exists() else "mooncake_master"
         self.assertEqual(
             mooncake.command.argv,
             (
-                "mooncake_master",
+                expected_master,
                 "--enable_http_metadata_server=true",
                 "--http_metadata_server_host=127.0.0.1",
                 "--rpc_port=35551",
                 "--http_metadata_server_port=35880",
                 "--metrics_port=35903",
+                "--default_kv_lease_ttl=60000",
             ),
         )
         self.assertEqual(mooncake.readiness.kind, "mooncake")
@@ -886,6 +889,62 @@ class LaunchPlanTest(unittest.TestCase):
                 requested_role="producer",
                 env=MOONCAKE_ENV,
             )
+        consumer = build_launch_plan(
+            cfg,
+            config_path="run.yaml",
+            requested_role="consumer",
+            env=MOONCAKE_ENV,
+        )
+        self.assertEqual(consumer.role, "consumer")
+
+    def test_live_managed_plan_owns_only_the_mooncake_master(self):
+        raw = _config(mode="disaggregated", nproc=2).model_dump()
+        raw["data"] = {}
+        raw["deployment"]["disaggregated"]["server_urls"] = []
+        raw["deployment"]["disaggregated"]["control_dir"] = os.path.join(
+            tempfile.mkdtemp(prefix="live_managed_"), "attempt-1"
+        )
+        raw["deployment"]["disaggregated"]["live"] = {
+            "port": 8600,
+            "mooncake": {"global_segment_size_bytes": 4096},
+            "trainer_cuda_visible_devices": ["1", "2"],
+        }
+        cfg = Config.model_validate(raw)
+        plan = build_launch_plan(cfg, config_path="run.yaml", env={})
+        self.assertEqual(plan.kind, "managed_supervisor")
+        self.assertEqual(
+            [service.command.label for service in plan.services], ["mooncake"]
+        )
+        self.assertEqual(plan.managed_ports, (35551, 35880, 35903, 8600))
+        producer, consumer = plan.commands
+        self.assertEqual(producer.env["CUDA_VISIBLE_DEVICES"], "")
+        self.assertEqual(consumer.env["CUDA_VISIBLE_DEVICES"], "1,2")
+        for command in plan.commands:
+            self.assertEqual(
+                command.env["MOONCAKE_MASTER_SERVER_ADDR"], "127.0.0.1:35551"
+            )
+            self.assertEqual(command.env["SPECFORGE_MANAGED_LOCAL_CHILD"], "1")
+        with self.assertRaisesRegex(ValueError, "explicit producer or consumer"):
+            build_launch_plan(
+                cfg,
+                config_path="run.yaml",
+                env={"SPECFORGE_MANAGED_LOCAL_CHILD": "1"},
+            )
+
+    def test_live_producer_needs_no_capture_server_urls(self):
+        raw = _config(mode="disaggregated").model_dump()
+        raw["data"] = {}
+        raw["deployment"]["disaggregated"]["server_urls"] = []
+        raw["deployment"]["disaggregated"]["live"] = {"port": 8600}
+        cfg = Config.model_validate(raw)
+        producer = build_launch_plan(
+            cfg,
+            config_path="run.yaml",
+            requested_role="producer",
+            env=MOONCAKE_ENV,
+        )
+        self.assertEqual(producer.role, "producer")
+        self.assertEqual(producer.worker_env["DISAGG_CLIENT_SEGMENT_SIZE"], "0")
         consumer = build_launch_plan(
             cfg,
             config_path="run.yaml",

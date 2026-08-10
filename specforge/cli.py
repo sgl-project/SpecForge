@@ -161,6 +161,11 @@ def _config_for_role(cfg: Config, role: str) -> Config:
         # child consumes the already-derived environment and must not attempt to
         # validate or own that stack again.
         disaggregated["managed_local"] = None
+    if disaggregated is not None and disaggregated.get("live") is not None:
+        # Same ownership rule for the supervised live stack; children keep the
+        # intake host/port but not the supervisor-owned Mooncake topology.
+        disaggregated["live"]["mooncake"] = None
+        disaggregated["live"]["trainer_cuda_visible_devices"] = None
     if role == "producer":
         raw["profiling"]["enabled"] = False
     return Config.model_validate(raw)

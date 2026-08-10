@@ -148,11 +148,25 @@ def build_application_run(
     )
 
 
+def resolve_capture_contract(cfg: Config, registry: AlgorithmRegistry | None = None):
+    """Resolve the server capture contract (method, aux layers, dims).
+
+    Composition-root accessor for external launchers (e.g. the online-live
+    capture-server script), which must not import ``specforge.training``.
+    """
+    from specforge.training.capture_contract import resolve_server_capture_contract
+
+    return resolve_server_capture_contract(
+        cfg, algorithm=resolve_run(cfg, registry).algorithm
+    )
+
+
 __all__ = [
     "ResolvedOfflineCapture",
     "ResolvedRun",
     "bind_run",
     "build_application_run",
+    "resolve_capture_contract",
     "resolve_offline_capture",
     "resolve_run",
 ]

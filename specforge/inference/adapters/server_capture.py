@@ -65,6 +65,103 @@ class ServerCaptureFailure:
     retryable: bool = True
 
 
+def build_server_capture_ref(
+    result: Dict[str, Any],
+    *,
+    schema: ServerCaptureSchema,
+    capture: CaptureConfig,
+    run_id: str,
+    strategy: str,
+    source_task_id: str,
+    target_model_version: str,
+    num_tokens: int,
+    transport: str,
+    origin: str,
+    tokenizer_version: str = "unknown",
+):
+    """Build a SampleRef from a server capture result dict (no validation)."""
+    from specforge.runtime.contracts import SampleRef
+
+    sample_id = str(result["sample_id"])
+    gen = int(result["gen"])
+    feats: Dict[str, Dict[str, Any]] = result["features"]
+    specs: Dict[str, FeatureSpec] = {}
+    nbytes = 0
+    for name, meta in feats.items():
+        shape = tuple(int(d) for d in meta["shape"])
+        dtype = str(meta["dtype"])
+        extra: Dict[str, Any] = {}
+        if name == schema.last_hidden_feature:
+            extra["target_repr"] = capture.target_repr
+            if capture.vocab_map_version:
+                extra["target_meta"] = {"vocab_map_version": capture.vocab_map_version}
+        specs[name] = FeatureSpec(name=name, shape=shape, dtype=dtype, **extra)
+        nbytes += _spec_nbytes(shape, dtype)
+    return SampleRef(
+        sample_id=sample_id,
+        run_id=run_id,
+        source_task_id=source_task_id,
+        feature_store_uri=f"mooncake://{result['store_id']}/{sample_id}",
+        feature_keys={n: f"{sample_id}/{n}" for n in specs},
+        feature_specs=specs,
+        strategy=strategy,
+        schema_version=SCHEMA_VERSION,
+        target_model_version=target_model_version,
+        tokenizer_version=tokenizer_version,
+        num_tokens=num_tokens,
+        estimated_bytes=nbytes,
+        metadata={
+            "run_id": run_id,
+            "source_task_id": source_task_id,
+            "strategy": strategy,
+            "target_repr": capture.target_repr,
+            "vocab_map_version": capture.vocab_map_version,
+            "transport": transport,
+            "server": origin,  # which server captured it (provenance)
+            "generation": gen,  # the zero-copy get() locator
+        },
+    )
+
+
+def validate_server_capture_ref(
+    ref,
+    result: Dict[str, Any],
+    *,
+    schema: ServerCaptureSchema,
+    capture: CaptureConfig,
+    expected_len: int,
+) -> None:
+    """Verify a server-built ref against the capture contract; raise loudly."""
+    short = {
+        name: spec.shape
+        for name, spec in ref.feature_specs.items()
+        if len(spec.shape) >= 2 and spec.shape[1] != expected_len
+    }
+    if short:
+        raise CaptureMismatchError(
+            f"[{ref.sample_id}] captured seq len != expected {expected_len} "
+            f"for {short}"
+        )
+    recorded_aux_layer_ids = result.get("aux_layer_ids")
+    if capture.aux_hidden_state_layer_ids and recorded_aux_layer_ids is None:
+        raise CaptureMismatchError(
+            f"[{ref.sample_id}] capture omitted aux-layer ids; cannot verify "
+            f"requested layers {capture.aux_hidden_state_layer_ids}"
+        )
+    verify_capture_specs(
+        ref.feature_specs,
+        capture,
+        sample_id=ref.sample_id,
+        recorded_aux_layer_ids=(
+            tuple(recorded_aux_layer_ids)
+            if recorded_aux_layer_ids is not None
+            else None
+        ),
+        aux_feature_name=schema.aux_feature or "hidden_state",
+        target_feature_name=schema.last_hidden_feature or "target",
+    )
+
+
 def _default_post(url: str, json_body: Dict[str, Any], timeout: float):
     import requests
 
@@ -259,51 +356,21 @@ class SGLangServerCaptureAdapter:
     def _ref_from_result(
         self, task: PromptTask, result: Dict[str, Any], capture: CaptureConfig
     ):
-        from specforge.runtime.contracts import SampleRef
-
-        sample_id = str(result["sample_id"])
-        gen = int(result["gen"])
-        feats: Dict[str, Dict[str, Any]] = result["features"]
-        specs: Dict[str, FeatureSpec] = {}
-        nbytes = 0
-        for name, meta in feats.items():
-            shape = tuple(int(d) for d in meta["shape"])
-            dtype = str(meta["dtype"])
-            extra: Dict[str, Any] = {}
-            if name == self.schema.last_hidden_feature:
-                extra["target_repr"] = capture.target_repr
-                if capture.vocab_map_version:
-                    extra["target_meta"] = {
-                        "vocab_map_version": capture.vocab_map_version
-                    }
-            specs[name] = FeatureSpec(name=name, shape=shape, dtype=dtype, **extra)
-            nbytes += _spec_nbytes(shape, dtype)
         num_tokens = int(task.metadata.get("num_tokens", 0)) or len(
             task.payload["input_ids"]
         )
-        return SampleRef(
-            sample_id=sample_id,
+        return build_server_capture_ref(
+            result,
+            schema=self.schema,
+            capture=capture,
             run_id=self.run_id,
-            source_task_id=task.task_id,
-            feature_store_uri=f"mooncake://{result['store_id']}/{sample_id}",
-            feature_keys={n: f"{sample_id}/{n}" for n in specs},
-            feature_specs=specs,
             strategy=self.strategy,
-            schema_version=SCHEMA_VERSION,
+            source_task_id=task.task_id,
             target_model_version=self.target_model_version,
-            tokenizer_version=str(task.metadata.get("tokenizer_version", "unknown")),
             num_tokens=num_tokens,
-            estimated_bytes=nbytes,
-            metadata={
-                "run_id": self.run_id,
-                "source_task_id": task.task_id,
-                "strategy": self.strategy,
-                "target_repr": capture.target_repr,
-                "vocab_map_version": capture.vocab_map_version,
-                "transport": "sglang_server_capture",
-                "server": self.base_url,  # which server captured it (provenance)
-                "generation": gen,  # the zero-copy get() locator
-            },
+            transport="sglang_server_capture",
+            origin=self.base_url,
+            tokenizer_version=str(task.metadata.get("tokenizer_version", "unknown")),
         )
 
     # -- the RefSource entry point ----------------------------------------------
@@ -422,52 +489,16 @@ class SGLangServerCaptureAdapter:
                     f"{expected_identity}"
                 )
             ref = self._ref_from_result(task, result, capture)
-            # A capture shorter than the prompt is corrupt: it means cache
-            # isolation or another full-prefill invariant failed despite the
-            # request's fresh namespace.
-            expected_len = len(task.payload["input_ids"])
-            short = {
-                name: spec.shape
-                for name, spec in ref.feature_specs.items()
-                if len(spec.shape) >= 2 and spec.shape[1] != expected_len
-            }
-            if short:
-                self.store.adopt(ref)
-                self.store.abort(ref.sample_id, reason="seq-len-mismatch")
-                out.append(
-                    ServerCaptureFailure(
-                        task_id=task.task_id,
-                        reason=(
-                            f"server_capture: captured seq len != prompt len "
-                            f"{expected_len} for {short}; the capture request "
-                            "did not execute a complete prefill"
-                        ),
-                        retryable=False,
-                    )
-                )
-                continue
             try:
-                recorded_aux_layer_ids = result.get("aux_layer_ids")
-                if (
-                    capture.aux_hidden_state_layer_ids
-                    and recorded_aux_layer_ids is None
-                ):
-                    raise CaptureMismatchError(
-                        f"[{ref.sample_id}] capture omitted aux-layer ids; "
-                        "cannot verify requested layers "
-                        f"{capture.aux_hidden_state_layer_ids}"
-                    )
-                verify_capture_specs(
-                    ref.feature_specs,
-                    capture,
-                    sample_id=ref.sample_id,
-                    recorded_aux_layer_ids=(
-                        tuple(recorded_aux_layer_ids)
-                        if recorded_aux_layer_ids is not None
-                        else None
-                    ),
-                    aux_feature_name=self.schema.aux_feature or "hidden_state",
-                    target_feature_name=self.schema.last_hidden_feature or "target",
+                # A capture shorter than the prompt is corrupt: it means cache
+                # isolation or another full-prefill invariant failed despite
+                # the request's fresh namespace.
+                validate_server_capture_ref(
+                    ref,
+                    result,
+                    schema=self.schema,
+                    capture=capture,
+                    expected_len=len(task.payload["input_ids"]),
                 )
             except CaptureMismatchError as exc:
                 # Loud boundary failure; free the server-written keys so a
@@ -525,4 +556,6 @@ __all__ = [
     "ServerCaptureSchema",
     "ServerCaptureFailure",
     "SGLangServerCaptureAdapter",
+    "build_server_capture_ref",
+    "validate_server_capture_ref",
 ]

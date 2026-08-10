@@ -789,6 +789,59 @@ def build_disagg_offline_runtime(
 # ---------------------------------------------------------------------------
 
 
+def _await_consumer_quantum(
+    channel,
+    *,
+    in_flight_high_watermark: int,
+    resolved_low_watermark: int,
+    peer_wait_timeout_s: Optional[float],
+    sleep,
+    poll_s: float,
+) -> int:
+    """Block until the consumer publishes its optimizer window; validate it."""
+    import time
+
+    start = time.monotonic()
+    while True:
+        quantum = channel.consumer_quantum()
+        if quantum is not None:
+            break
+        consumer_failure = channel.consumer_failure()
+        if consumer_failure is not None:
+            raise RuntimeError(
+                "consumer failed before publishing its optimizer window: "
+                f"{consumer_failure}"
+            )
+        if (
+            peer_wait_timeout_s is not None
+            and time.monotonic() - start > peer_wait_timeout_s
+        ):
+            raise TimeoutError(
+                "producer timed out waiting for the consumer optimizer "
+                f"window after {peer_wait_timeout_s:.0f}s"
+            )
+        sleep(poll_s)
+    if in_flight_high_watermark < quantum:
+        raise ValueError(
+            "producer in-flight high watermark "
+            f"{in_flight_high_watermark} is smaller than the consumer's "
+            f"global optimizer-step quantum {quantum}; set "
+            "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
+        )
+    if resolved_low_watermark < quantum:
+        # The consumer dispatches only whole optimizer windows, so a paused
+        # producer must be resumable while the consumer still needs up to one
+        # full window: a low watermark below the quantum could leave both
+        # sides waiting on each other.
+        raise ValueError(
+            "producer in-flight low watermark "
+            f"{resolved_low_watermark} is smaller than the consumer's "
+            f"global optimizer-step quantum {quantum}; set "
+            "DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
+        )
+    return quantum
+
+
 def build_disagg_online_producer(
     *,
     algorithm: AlgorithmRegistration,
@@ -997,46 +1050,17 @@ def build_disagg_online_producer(
             f"{flow_control.limits.resolved_low_watermark_refs} "
             f"progress_interval={progress_interval}"
         )
-        quantum_wait_start = time.monotonic()
         try:
-            while True:
-                consumer_quantum = channel.consumer_quantum()
-                if consumer_quantum is not None:
-                    break
-                consumer_failure = channel.consumer_failure()
-                if consumer_failure is not None:
-                    raise RuntimeError(
-                        "consumer failed before publishing its optimizer window: "
-                        f"{consumer_failure}"
-                    )
-                if (
-                    peer_wait_timeout_s is not None
-                    and time.monotonic() - quantum_wait_start > peer_wait_timeout_s
-                ):
-                    raise TimeoutError(
-                        "producer timed out waiting for the consumer optimizer "
-                        f"window after {peer_wait_timeout_s:.0f}s"
-                    )
-                sleep(backpressure_poll_s)
-            if in_flight_high_watermark < consumer_quantum:
-                raise ValueError(
-                    "producer in-flight high watermark "
-                    f"{in_flight_high_watermark} is smaller than the consumer's "
-                    f"global optimizer-step quantum {consumer_quantum}; set "
-                    "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
-                )
-            resolved_low_watermark = flow_control.limits.resolved_low_watermark_refs
-            if resolved_low_watermark < consumer_quantum:
-                # The consumer dispatches only whole optimizer windows, so a
-                # paused producer must be resumable while the consumer still
-                # needs up to one full window: a low watermark below the
-                # quantum could leave both sides waiting on each other.
-                raise ValueError(
-                    "producer in-flight low watermark "
-                    f"{resolved_low_watermark} is smaller than the consumer's "
-                    f"global optimizer-step quantum {consumer_quantum}; set "
-                    "DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
-                )
+            consumer_quantum = _await_consumer_quantum(
+                channel,
+                in_flight_high_watermark=in_flight_high_watermark,
+                resolved_low_watermark=(
+                    flow_control.limits.resolved_low_watermark_refs
+                ),
+                peer_wait_timeout_s=peer_wait_timeout_s,
+                sleep=sleep,
+                poll_s=backpressure_poll_s,
+            )
             producer_timing(
                 f"consumer optimizer window ready quantum={consumer_quantum}"
             )
@@ -1442,6 +1466,226 @@ def build_disagg_online_producer(
 
     drive_producer.flow_control = flow_control
     return workers, drive_producer
+
+
+def build_disagg_live_producer(
+    *,
+    feature_store: FeatureStore,
+    channel,
+    ref_source,
+    intake_host: str,
+    intake_port: int,
+    in_flight_high_watermark: int = 256,
+    in_flight_low_watermark: Optional[int] = None,
+    resident_high_watermark_bytes: Optional[int] = None,
+    resident_low_watermark_bytes: Optional[int] = None,
+    feature_store_max_resident_bytes: Optional[int] = None,
+    gc_interval_s: float = 30.0,
+    backpressure_poll_s: float = 0.2,
+    peer_wait_timeout_s: Optional[float] = None,
+    progress_interval_s: float = 30.0,
+    sleep=None,
+):
+    """Producer side of an ONLINE-LIVE run (intake pump, no rollout pool).
+
+    External serving engines capture hidden states from real user traffic,
+    write tensors straight into Mooncake, and push tensor-free capture records
+    to the hosted :class:`CaptureIntakeServer`.  Each fresh record is
+    validated by ``ref_source``, adopted into ``feature_store``, and published
+    on ``channel``; the consumer side is identical to the driven online mode.
+
+    Flow control is shed-based because user traffic cannot be paused: above
+    the in-flight/resident watermarks (or the hard byte cap) a record answers
+    429 and the serving sink drops that capture.  The Mooncake pool itself is
+    the final bound — when it fills the server's write fails and the capture
+    is dropped before a record is ever pushed.
+
+    Returns ``(intake_server, drive_producer)``.  ``drive_producer`` blocks
+    until ``should_stop`` (normally the consumer's stop sentinel) and closes
+    the channel; a failure publishes the failure sentinel instead.
+    """
+    import threading
+    import time
+    from collections import deque
+
+    from specforge.runtime.control_plane.flow_control import (
+        FlowControlLimits,
+        ProducerFlowControl,
+    )
+    from specforge.runtime.data_plane.intake_server import CaptureIntakeServer
+
+    sleep = sleep or time.sleep
+    flow_control = ProducerFlowControl(
+        FlowControlLimits(
+            high_watermark_refs=in_flight_high_watermark,
+            low_watermark_refs=in_flight_low_watermark,
+            high_watermark_bytes=resident_high_watermark_bytes,
+            low_watermark_bytes=resident_low_watermark_bytes,
+        )
+    )
+    if (
+        feature_store_max_resident_bytes is not None
+        and feature_store_max_resident_bytes < 1
+    ):
+        raise ValueError("feature_store_max_resident_bytes must be >= 1")
+    if (
+        feature_store_max_resident_bytes is not None
+        and resident_high_watermark_bytes is not None
+        and feature_store_max_resident_bytes < resident_high_watermark_bytes
+    ):
+        raise ValueError(
+            "feature_store_max_resident_bytes must be >= resident_high_watermark_bytes"
+        )
+
+    publish_lock = threading.Lock()
+    published_sizes = deque()
+    state = {
+        "produced": 0,
+        "shed": 0,
+        "rejected": 0,
+        "quantum": None,
+        "accounted_consumed": 0,
+        "resident_bytes": 0,
+        "stopped": False,
+        "fatal": None,
+    }
+
+    def reconcile_consumed_locked() -> int:
+        # Mooncake health is process-local and cannot observe deletes made by
+        # a remote consumer; track resident bytes from estimated_bytes and the
+        # channel's durable consumed counter.
+        consumed = channel.consumed_remote()
+        delta = consumed - state["accounted_consumed"]
+        if delta < 0 or delta > len(published_sizes):
+            raise RuntimeError(
+                "producer byte accounting does not match the channel: "
+                f"consumed advanced by {delta} with "
+                f"{len(published_sizes)} published refs tracked"
+            )
+        for _ in range(delta):
+            state["resident_bytes"] -= published_sizes.popleft()
+        state["accounted_consumed"] = consumed
+        return state["resident_bytes"]
+
+    def on_record(record):
+        with publish_lock:
+            if state["fatal"] is not None:
+                return "rejected", "producer failed"
+            if state["stopped"] or state["quantum"] is None:
+                return "rejected", "producer is not accepting records"
+            in_flight = channel.in_flight_remote()
+            current_bytes = reconcile_consumed_locked()
+            # Never shed below one optimizer window or the consumer starves.
+            if in_flight >= state["quantum"] and flow_control.should_pause(
+                in_flight_refs=in_flight, resident_bytes=current_bytes
+            ):
+                state["shed"] += 1
+                return "shed", f"in_flight={in_flight} bytes={current_bytes}"
+            try:
+                ref = ref_source.ref_from_record(record)
+            except Exception as exc:
+                state["rejected"] += 1
+                return "rejected", f"{type(exc).__name__}: {exc}"
+            ref_size = max(0, int(ref.estimated_bytes or 0))
+            projected_bytes = current_bytes + ref_size
+            if (
+                feature_store_max_resident_bytes is not None
+                and projected_bytes > feature_store_max_resident_bytes
+            ):
+                state["shed"] += 1
+                return "shed", (
+                    f"resident byte hard cap {feature_store_max_resident_bytes}"
+                )
+            feature_store.adopt(ref)
+            try:
+                _publish_refs_with_cleanup(
+                    channel=channel, feature_store=feature_store, refs=[ref]
+                )
+            except BaseException as exc:
+                state["fatal"] = exc
+                raise
+            published_sizes.append(ref_size)
+            state["resident_bytes"] = projected_bytes
+            state["produced"] += 1
+            return "accepted", ref.sample_id
+
+    intake_server = CaptureIntakeServer(
+        intake_host,
+        intake_port,
+        config_payload=ref_source.config_payload(),
+        on_record=on_record,
+    )
+
+    def drive_producer(should_stop=None) -> int:
+        try:
+            quantum = _await_consumer_quantum(
+                channel,
+                in_flight_high_watermark=in_flight_high_watermark,
+                resolved_low_watermark=(
+                    flow_control.limits.resolved_low_watermark_refs
+                ),
+                peer_wait_timeout_s=peer_wait_timeout_s,
+                sleep=sleep,
+                poll_s=backpressure_poll_s,
+            )
+        except BaseException as exc:
+            try:
+                channel.fail(f"{type(exc).__name__}: {exc}")
+            except Exception:
+                logger.exception("failed to publish producer setup failure")
+            raise
+        with publish_lock:
+            state["accounted_consumed"] = channel.consumed_remote()
+            state["quantum"] = quantum
+        intake_server.start()
+        logger.info(
+            "live capture intake listening on %s:%d (quantum=%d)",
+            intake_host,
+            intake_server.port,
+            quantum,
+        )
+        last_gc = last_log = time.monotonic()
+        try:
+            while True:
+                if state["fatal"] is not None:
+                    raise state["fatal"]
+                if should_stop is not None and should_stop():
+                    break
+                now = time.monotonic()
+                if gc_interval_s and now - last_gc >= gc_interval_s:
+                    feature_store.gc()
+                    last_gc = now
+                if progress_interval_s and now - last_log >= progress_interval_s:
+                    logger.info(
+                        "live producer produced=%d shed=%d rejected=%d "
+                        "in_flight=%d resident_bytes=%d intake=%s",
+                        state["produced"],
+                        state["shed"],
+                        state["rejected"],
+                        channel.in_flight_remote(),
+                        state["resident_bytes"],
+                        intake_server.stats(),
+                    )
+                    last_log = now
+                sleep(backpressure_poll_s)
+        except BaseException as exc:
+            with publish_lock:
+                state["stopped"] = True
+            intake_server.stop()
+            try:
+                channel.fail(f"{type(exc).__name__}: {exc}")
+            except Exception:
+                logger.exception("failed to publish producer failure sentinel")
+            raise
+        with publish_lock:
+            state["stopped"] = True
+        intake_server.stop()
+        channel.close()  # successful EOF; a failure uses channel.fail()
+        return state["produced"]
+
+    drive_producer.flow_control = flow_control
+    drive_producer.stats = lambda: dict(state)
+    return intake_server, drive_producer
 
 
 def build_disagg_online_consumer(

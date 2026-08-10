@@ -545,6 +545,61 @@ def _build_offline(
     )
 
 
+def _finalize_online_producer(
+    store,
+    channel_path: str,
+    *,
+    discard_external: bool,
+    primary_exc: Optional[BaseException],
+    produced: int,
+) -> int:
+    """Terminal producer cleanup shared by the driven and live online modes."""
+    from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
+    from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+
+    cleanup_errors = []
+    try:
+        reader = StreamingRefChannel(channel_path)
+        while True:
+            refs = reader.poll(max_n=1024)
+            if not refs:
+                break
+            for ref in refs:
+                try:
+                    store.abort(ref.sample_id, reason="online-attempt-finished")
+                except Exception as exc:
+                    cleanup_errors.append(
+                        f"{ref.sample_id}: {type(exc).__name__}: {exc}"
+                    )
+    except Exception as exc:
+        cleanup_errors.append(f"published-ref scan: {type(exc).__name__}: {exc}")
+    if discard_external:
+        try:
+            store.discard_external_attempts(reason="online-attempt-unadopted-capture")
+        except Exception as exc:
+            cleanup_errors.append(
+                f"unadopted-capture cleanup: {type(exc).__name__}: {exc}"
+            )
+    try:
+        drain_feature_store_removals(store)
+    except Exception as exc:
+        cleanup_errors.append(f"pending-remove drain: {type(exc).__name__}: {exc}")
+    if primary_exc is not None and cleanup_errors:
+        raise RuntimeError(
+            f"producer failed ({type(primary_exc).__name__}: "
+            f"{primary_exc}) and Mooncake cleanup also failed: "
+            f"{cleanup_errors}"
+        ) from primary_exc
+    if primary_exc is not None:
+        raise primary_exc
+    if cleanup_errors:
+        raise RuntimeError(
+            "producer could not clean all published Mooncake features: "
+            f"{cleanup_errors}"
+        )
+    return produced
+
+
 def _producer_capture_metadata(cfg: Config, algorithm: AlgorithmRegistration):
     from specforge.training.capture_contract import resolve_server_capture_contract
 
@@ -555,6 +610,121 @@ def _producer_capture_metadata(cfg: Config, algorithm: AlgorithmRegistration):
         contract.target_vocab_size,
         contract.draft_vocab_size,
     )
+
+
+def _build_live_producer(
+    cfg: Config,
+    *,
+    algorithm: AlgorithmRegistration,
+    streaming,
+    store,
+    channel,
+    channel_path: str,
+    live,
+):
+    """Producer role of the online-live mode: intake pump over pushed records."""
+    from specforge.inference.adapters.live_intake import LiveIntakeRefSource
+    from specforge.inference.adapters.server_capture import ServerCaptureSchema
+    from specforge.inference.capture import CaptureConfig
+    from specforge.launch import build_disagg_live_producer
+    from specforge.training.assembly import TrainingRun
+    from specforge.training.capture_contract import resolve_server_capture_contract
+
+    in_flight_high_watermark, in_flight_low_watermark = _online_flow_window(cfg)
+    contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
+    feature_contract = algorithm.spec.feature_contract(
+        "streaming", cfg.model.input_modality
+    )
+    target_repr = streaming.target_representation
+    allowed = feature_contract.allowed_target_representations
+    if allowed and target_repr not in allowed:
+        raise ValueError(
+            f"target representation {target_repr!r} is not supported by "
+            f"algorithm {algorithm.name!r}; expected one of {sorted(allowed)}"
+        )
+    layout = streaming.layout
+    ref_source = LiveIntakeRefSource(
+        store,
+        run_id=cfg.run_id,
+        algorithm=algorithm.name,
+        schema=ServerCaptureSchema(
+            aux_feature=layout.aux_feature,
+            last_hidden_feature=layout.last_hidden_feature,
+            passthrough=layout.passthrough,
+            attention_mask_feature=layout.attention_mask_feature,
+        ),
+        capture=CaptureConfig.from_strategy(
+            required_features=feature_contract.required_tensors,
+            aux_hidden_state_layer_ids=contract.aux_layer_ids,
+            target_repr=target_repr,
+            target_hidden_size=contract.target_hidden_size,
+            target_vocab_size=contract.target_vocab_size,
+            draft_vocab_size=contract.draft_vocab_size,
+        ),
+        max_num_tokens=cfg.data.max_length,
+        target_model_version=cfg.model.target_model_path,
+    )
+    _intake, drive = build_disagg_live_producer(
+        feature_store=store,
+        channel=channel,
+        ref_source=ref_source,
+        intake_host=live.host,
+        intake_port=live.port,
+        in_flight_high_watermark=in_flight_high_watermark,
+        in_flight_low_watermark=in_flight_low_watermark,
+        resident_high_watermark_bytes=(
+            int(os.environ["DISAGG_RESIDENT_HIGH_WATERMARK_BYTES"])
+            if os.environ.get("DISAGG_RESIDENT_HIGH_WATERMARK_BYTES")
+            else cfg.runtime.resident_high_watermark_bytes
+        ),
+        resident_low_watermark_bytes=(
+            int(os.environ["DISAGG_RESIDENT_LOW_WATERMARK_BYTES"])
+            if os.environ.get("DISAGG_RESIDENT_LOW_WATERMARK_BYTES")
+            else cfg.runtime.resident_low_watermark_bytes
+        ),
+        feature_store_max_resident_bytes=(
+            cfg.runtime.feature_store_max_resident_bytes
+        ),
+        peer_wait_timeout_s=_optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT"),
+    )
+    aux_layer_args = " ".join(str(layer) for layer in contract.aux_layer_ids)
+    print(
+        "[live-producer] launch capture servers with: --enable-spec-capture "
+        f"--spec-capture-method {contract.method} "
+        f"--spec-capture-aux-layer-ids {aux_layer_args} "
+        f"--spec-capture-intake-url http://<producer-host>:{live.port} "
+        "--chunked-prefill-size -1",
+        flush=True,
+    )
+
+    def produce() -> int:
+        produced = 0
+        primary_exc = None
+        try:
+            produced = drive(should_stop=channel.consumer_stopped)
+            consumer_failure = channel.consumer_failure()
+            if consumer_failure is not None:
+                raise RuntimeError(f"consumer failed: {consumer_failure}")
+        except BaseException as exc:
+            primary_exc = exc
+            try:
+                channel.fail(f"{type(exc).__name__}: {exc}")
+            except Exception as signal_exc:
+                print(
+                    f"failed to publish producer failure: {signal_exc}",
+                    flush=True,
+                )
+        # Live capture pre-registers nothing, so there are no external
+        # provisional attempts to discard.
+        return _finalize_online_producer(
+            store,
+            channel_path,
+            discard_external=False,
+            primary_exc=primary_exc,
+            produced=produced,
+        )
+
+    return TrainingRun(execute=produce)
 
 
 def _build_online(
@@ -582,10 +752,25 @@ def _build_online(
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
     store = _mooncake_store(cfg, retain_on_release=cfg.training.role == "consumer")
-    from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
     channel = StreamingRefChannel(channel_path)
+
+    live = (
+        cfg.deployment.disaggregated.live
+        if cfg.deployment.disaggregated is not None
+        else None
+    )
+    if cfg.training.role == "producer" and live is not None:
+        return _build_live_producer(
+            cfg,
+            algorithm=algorithm,
+            streaming=streaming,
+            store=store,
+            channel=channel,
+            channel_path=channel_path,
+            live=live,
+        )
 
     if cfg.training.role == "producer":
         from specforge.inference.adapters.server_capture import (
@@ -719,52 +904,13 @@ def _build_online(
                         f"failed to publish producer failure: {signal_exc}",
                         flush=True,
                     )
-            cleanup_errors = []
-            try:
-                reader = StreamingRefChannel(channel_path)
-                while True:
-                    refs = reader.poll(max_n=1024)
-                    if not refs:
-                        break
-                    for ref in refs:
-                        try:
-                            store.abort(ref.sample_id, reason="online-attempt-finished")
-                        except Exception as exc:
-                            cleanup_errors.append(
-                                f"{ref.sample_id}: {type(exc).__name__}: {exc}"
-                            )
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"published-ref scan: {type(exc).__name__}: {exc}"
-                )
-            try:
-                store.discard_external_attempts(
-                    reason="online-attempt-unadopted-capture"
-                )
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"unadopted-capture cleanup: {type(exc).__name__}: {exc}"
-                )
-            try:
-                drain_feature_store_removals(store)
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"pending-remove drain: {type(exc).__name__}: {exc}"
-                )
-            if primary_exc is not None and cleanup_errors:
-                raise RuntimeError(
-                    f"producer failed ({type(primary_exc).__name__}: "
-                    f"{primary_exc}) and Mooncake cleanup also failed: "
-                    f"{cleanup_errors}"
-                ) from primary_exc
-            if primary_exc is not None:
-                raise primary_exc
-            if cleanup_errors:
-                raise RuntimeError(
-                    "producer could not clean all published Mooncake features: "
-                    f"{cleanup_errors}"
-                )
-            return produced
+            return _finalize_online_producer(
+                store,
+                channel_path,
+                discard_external=True,
+                primary_exc=primary_exc,
+                produced=produced,
+            )
 
         return TrainingRun(execute=produce)
 

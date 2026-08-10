@@ -150,19 +150,30 @@ class DataConfig(StrictConfigModel):
     max_prompts: Optional[int] = Field(default=None, ge=0)
 
     @model_validator(mode="after")
-    def _exactly_one_source(self):
+    def _at_most_one_source(self):
         sources = [
             bool(self.train_data_path),
             bool(self.prompts_path),
             bool(self.hidden_states_path),
         ]
-        if sum(sources) != 1:
+        if sum(sources) > 1:
             raise ValueError(
-                "set exactly one of data.train_data_path (raw online data), "
+                "set at most one of data.train_data_path (raw online data), "
                 "data.prompts_path (pre-tokenized online data), or "
                 "data.hidden_states_path (offline features)"
             )
         return self
+
+    @property
+    def source_count(self) -> int:
+        return sum(
+            bool(value)
+            for value in (
+                self.train_data_path,
+                self.prompts_path,
+                self.hidden_states_path,
+            )
+        )
 
 
 class TrackingConfig(StrictConfigModel):
@@ -381,6 +392,47 @@ class ManagedLocalStackConfig(StrictConfigModel):
         return self
 
 
+class LiveIntakeDeploymentConfig(StrictConfigModel):
+    """Intake endpoint where external live capture servers push records.
+
+    Setting ``mooncake`` opts into the one-command launch: the supervisor owns
+    a loopback Mooncake master and spawns producer + consumer, leaving only
+    the serving engine and traffic external.
+    """
+
+    host: str = "0.0.0.0"
+    port: int = Field(gt=0, le=65535)
+    mooncake: Optional[ManagedLocalMooncakeConfig] = None
+    trainer_cuda_visible_devices: Optional[List[str]] = None
+
+    @model_validator(mode="after")
+    def _validate_live(self):
+        if not self.host or self.host.strip() != self.host:
+            raise ValueError(
+                "deployment.disaggregated.live.host must be non-empty and must "
+                "not contain surrounding whitespace"
+            )
+        if (self.mooncake is None) != (self.trainer_cuda_visible_devices is None):
+            raise ValueError(
+                "live.mooncake and live.trainer_cuda_visible_devices opt into "
+                "the supervised launch together"
+            )
+        if self.trainer_cuda_visible_devices is not None:
+            _validate_cuda_devices(
+                self.trainer_cuda_visible_devices,
+                field_name="live.trainer_cuda_visible_devices",
+            )
+        if self.mooncake is not None:
+            ports = {
+                self.mooncake.rpc_port,
+                self.mooncake.metadata_port,
+                self.mooncake.metrics_port,
+            }
+            if self.port in ports:
+                raise ValueError("live.port must not collide with Mooncake ports")
+        return self
+
+
 class DisaggregatedDeploymentConfig(StrictConfigModel):
     """Shared, non-secret topology for producer/consumer launch planning."""
 
@@ -418,6 +470,9 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: managed_local supervisors use managed_local.shutdown_grace_s instead.
     shutdown_grace_s: float = Field(default=30.0, gt=0)
     managed_local: Optional[ManagedLocalStackConfig] = None
+    #: Online-live mode: hidden states are captured from production serving
+    #: traffic and pushed to this producer-hosted intake endpoint.
+    live: Optional[LiveIntakeDeploymentConfig] = None
 
     @model_validator(mode="after")
     def _validate_store(self):
@@ -480,6 +535,38 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
                     "managed_local online capture is server-owned; do not set "
                     "producer_segment_size"
                 )
+        if self.live is not None:
+            if self.backend != "mooncake":
+                raise ValueError("live capture requires backend=mooncake")
+            if self.managed_local is not None:
+                raise ValueError(
+                    "live capture uses external serving; do not set managed_local"
+                )
+            if self.server_urls:
+                raise ValueError(
+                    "live capture servers push to the intake; do not set "
+                    "deployment.disaggregated.server_urls"
+                )
+            if self.producer_segment_size is not None:
+                raise ValueError(
+                    "live capture is server-owned; do not set producer_segment_size"
+                )
+            if self.live.mooncake is not None:
+                explicit = [
+                    name
+                    for name in (
+                        "mooncake_metadata_server",
+                        "mooncake_master_server_addr",
+                        "mooncake_local_hostname",
+                        "mooncake_protocol",
+                        "mooncake_rdma_devices",
+                    )
+                    if getattr(self, name)
+                ]
+                if explicit:
+                    raise ValueError(
+                        f"live.mooncake derives Mooncake endpoints; do not set {explicit}"
+                    )
         return self
 
 
@@ -702,6 +789,52 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+        live = (
+            self.deployment.disaggregated.live
+            if self.deployment.disaggregated is not None
+            else None
+        )
+
+        if live is not None:
+            if self.data.source_count != 0:
+                raise ValueError(
+                    "live capture trains from serving traffic; do not set a "
+                    "data source"
+                )
+            if self.training.max_steps is None and self.training.total_steps is None:
+                raise ValueError(
+                    "live capture is an unbounded stream; set training.max_steps "
+                    "or training.total_steps"
+                )
+            if live.mooncake is not None:
+                if self.deployment.trainer.nnodes != 1:
+                    raise ValueError(
+                        "live.mooncake requires deployment.trainer.nnodes=1"
+                    )
+                if self.training.role != "auto":
+                    raise ValueError(
+                        "live.mooncake requires the persisted training role to "
+                        "be auto"
+                    )
+                if self.training.resume_from is not None:
+                    raise ValueError(
+                        "live.mooncake requires a fresh control_dir and does "
+                        "not support resume"
+                    )
+                if (
+                    len(live.trainer_cuda_visible_devices)
+                    != self.deployment.trainer.nproc_per_node
+                ):
+                    raise ValueError(
+                        "live.trainer_cuda_visible_devices count must equal "
+                        "deployment.trainer.nproc_per_node"
+                    )
+        elif self.data.source_count != 1:
+            raise ValueError(
+                "set exactly one of data.train_data_path (raw online data), "
+                "data.prompts_path (pre-tokenized online data), or "
+                "data.hidden_states_path (offline features)"
+            )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

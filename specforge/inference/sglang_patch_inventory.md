@@ -51,6 +51,39 @@ Marlin reduction fallback when the token dimension exceeds CUDA grid.y's
 65,535 limit. The server-capture unit and GPU gates must pass before updating
 either supported source revision.
 
+## Online-live: capture from production serving traffic
+
+[`patches/sglang/online-live/spec-capture-live.patch`](../../patches/sglang/online-live/spec-capture-live.patch)
+is a separate layer on top of the v0.5.14 base patch (apply with
+`scripts/apply_sglang_spec_capture_patch.sh --live`, or let
+`scripts/online_live/launch_capture_server.py` apply it and launch the server
+in one command). It captures ordinary
+user requests — no client `spec_capture` field — and pushes the resulting
+records to a SpecForge producer, closing the serve→train loop:
+
+- Two new flags: `--spec-capture-intake-url http://<producer>:<port>` and
+  `--spec-capture-sample-rate` (deterministic per request id, so all TP ranks
+  make the same capture decision).
+- At startup the sink GETs `/v1/spec-capture/config` from the intake
+  ([`runtime/data_plane/intake_server.py`](../runtime/data_plane/intake_server.py)):
+  store id, feature names, passthrough synthesis rules (`input_ids` from the
+  request tokens, `loss_mask`/`attention_mask` all-ones), and the token cap.
+- Capture covers prefill **and** generated tokens: one row per fed token, so a
+  finished request yields `prompt + output[:-1]` rows aligned with the
+  `input_ids` passthrough.
+- Tensors still go straight into Mooncake via the base sink; the tensor-free
+  record then POSTs to `/v1/spec-capture/records` from a bounded background
+  writer queue (never the scheduler loop). Any failure — queue full, Mooncake
+  down or pool full, intake down, 429 shed, 422 reject — drops just that
+  capture, removes any keys already written, and never touches the user's
+  response. Flow control is therefore shed-based; the Mooncake pool size is
+  the final buffer bound and trainer acks free it.
+
+v1 limitations: `--chunked-prefill-size -1` is still required; the live
+capture server cannot itself serve with speculative decoding; a retracted
+request drops its capture; a sink crash between the Mooncake write and the
+key removal leaks hard-pinned orphans until the store is restarted.
+
 ## Offline: dedicated local capture
 
 [`../offline_capture`](../offline_capture) is used exclusively by
