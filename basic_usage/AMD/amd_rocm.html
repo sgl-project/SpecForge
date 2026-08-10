@@ -1,0 +1,1122 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>🚀 AMD ROCm Tutorial &#8212; SpecForge</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'basic_usage/AMD/amd_rocm';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="icon" href="../../_static/logo.ico"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Customize a training run" href="../../advanced_features/customization.html" />
+    <link rel="prev" title="Disaggregated training" href="../disaggregated_training.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Aug 10, 2026"/>
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/logo.png" class="logo__image only-light" alt="SpecForge - Home"/>
+    <img src="../../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SpecForge - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../get_started/installation.html">🚀 Get Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../get_started/about.html">⚡️ About SpecForge</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../data_preparation.html">📝 Data Preparation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../training.html">Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../disaggregated_training.html">Disaggregated training</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">🚀 AMD ROCm Tutorial</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../advanced_features/customization.html">Customize a training run</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../benchmarks/benchmark.html">Benchmarking inference serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../benchmarks/eagle3-disaggregated-parity.html">EAGLE3 offline disaggregated parity</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../benchmarks/domino-disaggregated-performance.html">Domino disaggregated performance findings</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../community_resources/specbundle.html">🔥 SpecBundle</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community_resources/dashboard.html">📈 Performance Dashboard</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/basic_usage/AMD/amd_rocm.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/basic_usage/AMD/amd_rocm.md" target="_blank"
+   class="btn btn-sm btn-source-edit-button dropdown-item"
+   title="Suggest edit"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-pencil-alt"></i>
+  </span>
+<span class="btn__text-container">Suggest edit</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Fbasic_usage/AMD/amd_rocm.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../../_sources/basic_usage/AMD/amd_rocm.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>🚀 AMD ROCm Tutorial</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">1. Installation</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-pull-the-image-for-your-accelerator">Step 1: Pull the image for your accelerator</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-start-the-container">Step 2: Start the container</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-clone-and-install-specforge">Step 3: Clone and install SpecForge</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-4-apply-the-capture-patch-online-runs-only">Step 4: Apply the capture patch (online runs only)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-attention-backends-on-rocm">Step 5: Attention backends on ROCm</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#data-preparation">2. Data preparation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#offline-training">3. Offline training</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-capture-hidden-states">Step 1: Capture hidden states</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-train">Step 2: Train</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-training">4. Online training</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-one-time-run-inputs">Step 1: One-time run inputs</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-start-mooncake-and-the-capture-server">Step 2: Start Mooncake and the capture server</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-launch-training">Step 3: Launch training</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#success-criteria">Success criteria</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#managed-local-shortcut">Managed-local shortcut</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#disaggregated-training">5. Disaggregated training</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-results-on-mi355x">Reference results on MI355X</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#training-loss">Training loss</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-accuracy">Draft accuracy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-results-on-mi300x">Reference results on MI300X</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Training loss</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Draft accuracy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Summary</a></li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="amd-rocm-tutorial">
+<h1>🚀 AMD ROCm Tutorial<a class="headerlink" href="#amd-rocm-tutorial" title="Link to this heading">#</a></h1>
+<p>This is an end-to-end tutorial for running SpecForge on AMD Instinct GPUs
+(ROCm). It walks through the complete flow: <strong>installation → data preparation →
+offline training → online training → disaggregated training</strong>.</p>
+<p>All commands assume a ROCm host with the AMD driver stack and Docker already
+installed. Validated on MI300X (gfx942) and MI355X (gfx950).</p>
+<hr class="docutils" />
+<section id="installation">
+<h2>1. Installation<a class="headerlink" href="#installation" title="Link to this heading">#</a></h2>
+<p>On ROCm, install SpecForge into an environment that already provides a ROCm
+PyTorch and a ROCm SGLang, and install the package <strong>without dependencies</strong> so
+pip does not pull CUDA wheels over the working ROCm stack.</p>
+<p>The recommended base is an official SGLang ROCm release container. These ship a
+ROCm PyTorch and an editable ROCm SGLang build, so SpecForge only needs to be
+cloned and installed on top.</p>
+<section id="step-1-pull-the-image-for-your-accelerator">
+<h3>Step 1: Pull the image for your accelerator<a class="headerlink" href="#step-1-pull-the-image-for-your-accelerator" title="Link to this heading">#</a></h3>
+<p>The accelerator is baked into the tag, so use the image that matches your
+hardware:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># AMD Instinct MI300X (gfx942)</span>
+docker<span class="w"> </span>pull<span class="w"> </span>lmsysorg/sglang:v0.5.14-rocm720-mi30x
+
+<span class="c1"># AMD Instinct MI355X (gfx950)</span>
+docker<span class="w"> </span>pull<span class="w"> </span>lmsysorg/sglang:v0.5.14-rocm700-mi35x
+</pre></div>
+</div>
+</section>
+<section id="step-2-start-the-container">
+<h3>Step 2: Start the container<a class="headerlink" href="#step-2-start-the-container" title="Link to this heading">#</a></h3>
+<p>Expose the ROCm device nodes (swap in the tag for your accelerator). Use <code class="docutils literal notranslate"><span class="pre">--name</span></code>
+and omit <code class="docutils literal notranslate"><span class="pre">--rm</span></code> so the checkout survives across sessions:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </span>--name<span class="w"> </span>specforge<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--device<span class="o">=</span>/dev/kfd<span class="w"> </span>--device<span class="o">=</span>/dev/dri<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--group-add<span class="w"> </span>video<span class="w"> </span>--cap-add<span class="w"> </span>SYS_PTRACE<span class="w"> </span>--security-opt<span class="w"> </span><span class="nv">seccomp</span><span class="o">=</span>unconfined<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--ipc<span class="o">=</span>host<span class="w"> </span>--shm-size<span class="o">=</span>16g<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>lmsysorg/sglang:v0.5.14-rocm720-mi30x<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>bash
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--device=/dev/kfd</span> <span class="pre">--device=/dev/dri</span> <span class="pre">--group-add</span> <span class="pre">video</span></code> are required for ROCm
+GPU access; <code class="docutils literal notranslate"><span class="pre">--ipc=host</span> <span class="pre">--shm-size=16g</span></code> gives Mooncake and PyTorch enough shared
+memory. Re-enter the running container later with <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">exec</span> <span class="pre">-it</span> <span class="pre">specforge</span> <span class="pre">bash</span></code>.</p>
+</section>
+<section id="step-3-clone-and-install-specforge">
+<h3>Step 3: Clone and install SpecForge<a class="headerlink" href="#step-3-clone-and-install-specforge" title="Link to this heading">#</a></h3>
+<p>Inside the container, clone SpecForge into <code class="docutils literal notranslate"><span class="pre">/workspace/SpecForge</span></code> and register it
+in editable mode without touching the image’s torch/sglang:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/sgl-project/SpecForge.git<span class="w"> </span>/workspace/SpecForge
+<span class="nb">cd</span><span class="w"> </span>/workspace/SpecForge
+python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.<span class="w"> </span>--no-deps
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--no-deps</span></code> is mandatory: a full resolve pulls the CUDA SGLang stack and
+clobbers the image’s ROCm torch/sglang. If a later step reports a missing
+lightweight dependency (for example <code class="docutils literal notranslate"><span class="pre">accelerate</span></code>), install just that package,
+also with <code class="docutils literal notranslate"><span class="pre">--no-deps</span></code>.</p>
+</section>
+<section id="step-4-apply-the-capture-patch-online-runs-only">
+<h3>Step 4: Apply the capture patch (online runs only)<a class="headerlink" href="#step-4-apply-the-capture-patch-online-runs-only" title="Link to this heading">#</a></h3>
+<p>These images pin SGLang to exactly <code class="docutils literal notranslate"><span class="pre">0.5.14</span></code> (editable at <code class="docutils literal notranslate"><span class="pre">/sgl-workspace/sglang</span></code>),
+so the online capture patch applies with a plain <code class="docutils literal notranslate"><span class="pre">git</span> <span class="pre">apply</span></code>. Skip this step for
+offline training, which reads features from disk and needs no capture service:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/sgl-workspace/sglang
+git<span class="w"> </span>apply<span class="w"> </span>/workspace/SpecForge/patches/sglang/v0.5.14/spec-capture.patch
+<span class="nb">cd</span><span class="w"> </span>/workspace/SpecForge
+</pre></div>
+</div>
+<p>The patch adds the <code class="docutils literal notranslate"><span class="pre">--enable-spec-capture</span></code>, <code class="docutils literal notranslate"><span class="pre">--spec-capture-method</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">--spec-capture-aux-layer-ids</span></code> server flags plus the <code class="docutils literal notranslate"><span class="pre">sglang.srt.spec_capture_sink</span></code>
+module used by online capture.</p>
+</section>
+<section id="step-5-attention-backends-on-rocm">
+<h3>Step 5: Attention backends on ROCm<a class="headerlink" href="#step-5-attention-backends-on-rocm" title="Link to this heading">#</a></h3>
+<p>Use the <code class="docutils literal notranslate"><span class="pre">sdpa</span></code> or <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> attention backends for the <strong>trainer</strong> on
+ROCm. The <code class="docutils literal notranslate"><span class="pre">fa</span></code> (flash-attn) and <code class="docutils literal notranslate"><span class="pre">usp</span></code> backends, and <code class="docutils literal notranslate"><span class="pre">yunchang</span></code>-based
+Ulysses/Ring sequence parallel (<code class="docutils literal notranslate"><span class="pre">sp_ulysses_size</span></code> / <code class="docutils literal notranslate"><span class="pre">sp_ring_size</span></code> &gt; 1), depend
+on a CUDA flash-attn build; the single-GPU / data-parallel path never loads
+<code class="docutils literal notranslate"><span class="pre">yunchang</span></code>, and selecting those backends raises a clear error. The checked-in
+<a class="reference download internal" download="" href="../../_downloads/084542cf68a0205e947b19cddf4f3a84/qwen3.5-4b-dflash-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">amd/qwen3.5-4b-dflash-offline.yaml</span></code></span></a>
+recipe already uses <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>, so it runs on ROCm unchanged as a
+single-GPU offline DFlash example.</p>
+<p>The <strong>capture side</strong> (the SGLang target that materializes hidden states, both
+offline and online) has an extra ROCm requirement for Qwen3.5-4B, a hybrid
+linear-attention/Mamba target: run it under <strong>AITER</strong> and disable the radix
+cache. Section 3 covers this in detail.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="data-preparation">
+<h2>2. Data preparation<a class="headerlink" href="#data-preparation" title="Link to this heading">#</a></h2>
+<p>Data preparation is platform independent — the same scripts run on ROCm. Write a
+ShareGPT training set into <code class="docutils literal notranslate"><span class="pre">cache/dataset</span></code> from the repository root:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--dataset<span class="w"> </span>sharegpt
+</pre></div>
+</div>
+<p>This produces <code class="docutils literal notranslate"><span class="pre">./cache/dataset/sharegpt_train.jsonl</span></code> in the stable
+<code class="docutils literal notranslate"><span class="pre">id</span></code> + <code class="docutils literal notranslate"><span class="pre">conversations</span></code> contract used by every checked-in recipe. For the full
+preset list, custom datasets, preformatted text, and target-model regeneration,
+see the <a class="reference internal" href="../data_preparation.html"><span class="std std-doc">Data Preparation</span></a> guide.</p>
+</section>
+<hr class="docutils" />
+<section id="offline-training">
+<h2>3. Offline training<a class="headerlink" href="#offline-training" title="Link to this heading">#</a></h2>
+<p>Offline training reads target features from disk, so the trainer only has to fit
+the draft model. It uses more storage but keeps target inference out of the
+training loop, and needs no capture patch or Mooncake. This section trains a
+<strong>Qwen3.5-4B DFlash</strong> draft (<code class="docutils literal notranslate"><span class="pre">configs/qwen3.5-4b-dflash.json</span></code>).</p>
+<section id="step-1-capture-hidden-states">
+<h3>Step 1: Capture hidden states<a class="headerlink" href="#step-1-capture-hidden-states" title="Link to this heading">#</a></h3>
+<p>Feature preparation is a data-processing step, not a second training entry point.
+Qwen3.5-4B is a hybrid linear-attention/Mamba target, so run the capture under
+<strong>AITER</strong> and pass <code class="docutils literal notranslate"><span class="pre">--sglang-disable-radix-cache</span></code>. Without it, SGLang’s Mamba
+radix cache selects the <code class="docutils literal notranslate"><span class="pre">extra_buffer</span></code> strategy, which asserts CUDA/MUSA/NPU
+(FLA) at server init and fails on ROCm:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">SGLANG_USE_AITER</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">SGLANG_USE_AITER_UNIFIED_ATTN</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">AITER_FLYDSL_FORCE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>scripts/prepare_hidden_states.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--target-model-path<span class="w"> </span>Qwen/Qwen3.5-4B<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--strategy<span class="w"> </span>dflash<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--draft-model-config<span class="w"> </span>configs/qwen3.5-4b-dflash.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--data-path<span class="w"> </span>./cache/dataset/sharegpt_train.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-path<span class="w"> </span>./cache/hidden_states/qwen3.5-4b-dflash-sharegpt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--chat-template<span class="w"> </span>qwen3.5<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--max-length<span class="w"> </span><span class="m">2048</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tp-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--batch-size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sglang-attention-backend<span class="w"> </span>aiter<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sglang-disable-radix-cache<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sglang-mem-fraction-static<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sglang-context-length<span class="w"> </span><span class="m">2560</span>
+</pre></div>
+</div>
+<p>The output path matches <code class="docutils literal notranslate"><span class="pre">data.hidden_states_path</span></code> in the checked-in offline
+recipe. See <a class="reference internal" href="../data_preparation.html#option-2-pre-formatted-text-format"><span class="std std-ref">Data Preparation</span></a>
+for preformatted inputs and other options.</p>
+<blockquote>
+<div><p><strong>Data note:</strong> <code class="docutils literal notranslate"><span class="pre">prepare_hidden_states.py</span></code> truncates each rendered conversation
+at <code class="docutils literal notranslate"><span class="pre">max_length</span></code>. A long prompt can push the assistant reply past the cutoff,
+leaving an empty loss region (fewer than two anchorable tokens), which trips
+DFlash’s anchor sampler (<code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">should</span> <span class="pre">preprocess</span> <span class="pre">the</span> <span class="pre">data.</span></code>). Drop the
+captured samples with <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">2</span></code> loss-mask tokens before the last <code class="docutils literal notranslate"><span class="pre">block_size</span></code>
+positions before training. The online path (Section 4) never hits this — its
+producer regenerates full-length responses.</p>
+</div></blockquote>
+</section>
+<section id="step-2-train">
+<h3>Step 2: Train<a class="headerlink" href="#step-2-train" title="Link to this heading">#</a></h3>
+<p>The checked-in offline recipe already uses <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> for the trainer, so
+it runs on ROCm unchanged:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/amd/qwen3.5-4b-dflash-offline.yaml
+</pre></div>
+</div>
+<p>Override any field inline without copying the YAML, e.g. a quick smoke run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/amd/qwen3.5-4b-dflash-offline.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>training.max_steps<span class="o">=</span><span class="m">20</span><span class="w"> </span><span class="nv">output_dir</span><span class="o">=</span>./outputs/dflash-offline-smoke
+</pre></div>
+</div>
+<p>See the <a class="reference internal" href="../training.html"><span class="std std-doc">Training</span></a> guide for the full run schema,
+checkpoint/resume rules, and evaluation.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="online-training">
+<h2>4. Online training<a class="headerlink" href="#online-training" title="Link to this heading">#</a></h2>
+<p>Online training captures target features live from a patched SGLang server and
+streams them through Mooncake to the trainer. Every online run is
+<strong>disaggregated</strong>: a producer drives prompts through the capture server and a
+consumer trains the draft model. With <code class="docutils literal notranslate"><span class="pre">deployment.trainer.nnodes:</span> <span class="pre">1</span></code> and no
+<code class="docutils literal notranslate"><span class="pre">--role</span></code>, a single <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span></code> command supervises both.</p>
+<p>This section uses the
+<a class="reference download internal" download="" href="../../_downloads/60502cf9dc37f6b6f151e38f16c4b0b8/qwen3.5-4b-dflash-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">amd/qwen3.5-4b-dflash-online.yaml</span></code></span></a>
+recipe as a single-node smoke test. Complete Step 4 of the installation first.</p>
+<section id="step-1-one-time-run-inputs">
+<h3>Step 1: One-time run inputs<a class="headerlink" href="#step-1-one-time-run-inputs" title="Link to this heading">#</a></h3>
+<p>DFlash needs <strong>no shared vocabulary mapping</strong> (that is an EAGLE3-only
+requirement, where a reduced draft vocabulary must be derived once and shared by
+producer and consumer). DFlash keeps the full vocabulary and derives its target
+signal from the draft’s <code class="docutils literal notranslate"><span class="pre">target_layer_ids</span></code>, so there is nothing to precompute.</p>
+<p>Qwen3.5-4B is also a large sharded checkpoint that already ships a
+<code class="docutils literal notranslate"><span class="pre">*.index.json</span></code> weight map and a resolvable head, so it needs no local target
+directory or index workaround. Just make sure <code class="docutils literal notranslate"><span class="pre">cache/dataset/sharegpt_train.jsonl</span></code>
+exists (Section 2).</p>
+</section>
+<section id="step-2-start-mooncake-and-the-capture-server">
+<h3>Step 2: Start Mooncake and the capture server<a class="headerlink" href="#step-2-start-mooncake-and-the-capture-server" title="Link to this heading">#</a></h3>
+<p>Start the Mooncake master. <strong>Set <code class="docutils literal notranslate"><span class="pre">--default_kv_lease_ttl=500</span></code></strong>: the consumer’s
+teardown drain now allows about 19.5s for leases to settle, while the shorter
+managed TTL keeps a normal shutdown from waiting several seconds for an expired
+read lease.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mooncake_master<span class="w"> </span>--enable_http_metadata_server<span class="o">=</span><span class="nb">true</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--rpc_port<span class="o">=</span><span class="m">35551</span><span class="w"> </span>--http_metadata_server_port<span class="o">=</span><span class="m">35880</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--metrics_port<span class="o">=</span><span class="m">35903</span><span class="w"> </span>--enable_metric_reporting<span class="o">=</span><span class="nb">false</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--default_kv_lease_ttl<span class="o">=</span><span class="m">500</span><span class="w"> </span><span class="p">&amp;</span>
+</pre></div>
+</div>
+<p>Start the patched capture server on GPU 0. <strong>The <code class="docutils literal notranslate"><span class="pre">--spec-capture-aux-layer-ids</span></code>
+must match the draft’s <code class="docutils literal notranslate"><span class="pre">target_layer_ids</span></code></strong> — for DFlash these are read straight
+from <code class="docutils literal notranslate"><span class="pre">configs/qwen3.5-4b-dflash.json</span></code>: <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">8</span> <span class="pre">15</span> <span class="pre">22</span> <span class="pre">29</span></code> (this is not the EAGLE3
+<code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">num_layers//2</span> <span class="pre">-</span> <span class="pre">1,</span> <span class="pre">num_layers</span> <span class="pre">-</span> <span class="pre">4]</span></code> formula). A mismatch produces zero
+features with no error. Because Qwen3.5-4B is a hybrid Mamba target, the server
+must run under <strong>AITER</strong> with <code class="docutils literal notranslate"><span class="pre">--attention-backend</span> <span class="pre">aiter</span></code> and
+<code class="docutils literal notranslate"><span class="pre">--disable-radix-cache</span></code> (see Section 3 for why):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">SGLANG_USE_AITER</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">SGLANG_USE_AITER_UNIFIED_ATTN</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">AITER_FLYDSL_FORCE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="nv">HIP_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span><span class="w"> </span><span class="nv">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_LOCAL_HOSTNAME</span><span class="o">=</span><span class="m">127</span>.0.0.1<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_METADATA_SERVER</span><span class="o">=</span>http://127.0.0.1:35880/metadata<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_MASTER_SERVER_ADDR</span><span class="o">=</span><span class="m">127</span>.0.0.1:35551<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_PROTOCOL</span><span class="o">=</span>tcp<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_GLOBAL_SEGMENT_SIZE</span><span class="o">=</span><span class="k">$((</span><span class="m">32</span><span class="o">&lt;&lt;</span><span class="m">30</span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+python<span class="w"> </span>-m<span class="w"> </span>sglang.launch_server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3.5-4B<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--skip-tokenizer-init<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tp-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--context-length<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--attention-backend<span class="w"> </span>aiter<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--chunked-prefill-size<span class="w"> </span>-1<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--disable-radix-cache<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--enable-spec-capture<span class="w"> </span>--spec-capture-method<span class="w"> </span>dflash<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--spec-capture-aux-layer-ids<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="m">15</span><span class="w"> </span><span class="m">22</span><span class="w"> </span><span class="m">29</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--host<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>--port<span class="w"> </span><span class="m">30000</span><span class="w"> </span><span class="p">&amp;</span>
+</pre></div>
+</div>
+<p>Wait for <code class="docutils literal notranslate"><span class="pre">curl</span> <span class="pre">--fail</span> <span class="pre">http://127.0.0.1:30000/health</span></code> to return 200 (the first
+health check can take a few minutes while AITER kernels compile).
+<code class="docutils literal notranslate"><span class="pre">--context-length</span></code> must exceed <code class="docutils literal notranslate"><span class="pre">data.max_length</span></code> (2048) or <code class="docutils literal notranslate"><span class="pre">/generate</span></code> returns
+<code class="docutils literal notranslate"><span class="pre">400</span> <span class="pre">input</span> <span class="pre">longer</span> <span class="pre">than</span> <span class="pre">context</span> <span class="pre">length</span></code>.</p>
+</section>
+<section id="step-3-launch-training">
+<h3>Step 3: Launch training<a class="headerlink" href="#step-3-launch-training" title="Link to this heading">#</a></h3>
+<p>One command supervises producer and consumer on GPU 1:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">HIP_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_LOCAL_HOSTNAME</span><span class="o">=</span><span class="m">127</span>.0.0.1<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_METADATA_SERVER</span><span class="o">=</span>http://127.0.0.1:35880/metadata<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_MASTER_SERVER_ADDR</span><span class="o">=</span><span class="m">127</span>.0.0.1:35551<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_PROTOCOL</span><span class="o">=</span>tcp<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_GLOBAL_SEGMENT_SIZE</span><span class="o">=</span><span class="k">$((</span><span class="m">32</span><span class="o">&lt;&lt;</span><span class="m">30</span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/amd/qwen3.5-4b-dflash-online.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>training.max_steps<span class="o">=</span><span class="m">20</span><span class="w"> </span>training.num_epochs<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>training.save_interval<span class="o">=</span><span class="m">20</span><span class="w"> </span>training.log_interval<span class="o">=</span><span class="m">5</span>
+</pre></div>
+</div>
+<p>The trainer needs no AITER env — it runs <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> on ROCm; only the
+capture server (Step 2) drives the Mamba target. Before rerunning, clear stale
+control state: <code class="docutils literal notranslate"><span class="pre">rm</span> <span class="pre">-rf</span> <span class="pre">outputs/qwen3.5-4b-dflash-online</span></code>.</p>
+</section>
+<section id="success-criteria">
+<h3>Success criteria<a class="headerlink" href="#success-criteria" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Producer log: <code class="docutils literal notranslate"><span class="pre">drive_producer</span> <span class="pre">returning</span> <span class="pre">produced=&lt;N&gt;</span> <span class="pre">prompts_failed=0</span></code>.</p></li>
+<li><p>Consumer log: <code class="docutils literal notranslate"><span class="pre">step</span> <span class="pre">N:</span> <span class="pre">{...loss...,</span> <span class="pre">acc...}</span></code> lines, and <strong>no</strong>
+<code class="docutils literal notranslate"><span class="pre">could</span> <span class="pre">not</span> <span class="pre">drain</span></code> error or traceback at teardown.</p></li>
+<li><p>Checkpoint: <code class="docutils literal notranslate"><span class="pre">outputs/qwen3.5-4b-dflash-online/qwen3.5-4b-dflash-online-step20/</span></code>
+contains <code class="docutils literal notranslate"><span class="pre">training_state.pt</span></code> and <code class="docutils literal notranslate"><span class="pre">training_state_rank0.pt</span></code>.</p></li>
+</ul>
+<blockquote>
+<div><p>If <code class="docutils literal notranslate"><span class="pre">produced=0</span></code>, the capture aux-layer ids do not match the producer contract
+(see Step 2). If training succeeds but teardown reports <code class="docutils literal notranslate"><span class="pre">could</span> <span class="pre">not</span> <span class="pre">drain</span></code>, the
+Mooncake lease TTL is above the drain window (see Step 2).</p>
+</div></blockquote>
+</section>
+<section id="managed-local-shortcut">
+<h3>Managed-local shortcut<a class="headerlink" href="#managed-local-shortcut" title="Link to this heading">#</a></h3>
+<p>Instead of starting Mooncake and the capture server by hand, a
+<code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.managed_local</span></code> block lets one <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span></code>
+command own those local processes and derive their endpoints. It defaults
+<code class="docutils literal notranslate"><span class="pre">default_kv_lease_ttl_ms</span></code> to 500, so the lease-TTL fix is applied automatically.
+See <a class="reference internal" href="../disaggregated_training.html#multi-server-capture"><span class="std std-ref">Multi-server capture</span></a>
+for the managed-local profile.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="disaggregated-training">
+<h2>5. Disaggregated training<a class="headerlink" href="#disaggregated-training" title="Link to this heading">#</a></h2>
+<p>Online training is already a disaggregated producer/consumer topology; Section 4
+runs both roles under one single-node supervisor. To split the roles across
+process pools or nodes, use the <strong>same config</strong> with an explicit <code class="docutils literal notranslate"><span class="pre">--role</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Inference / capture pool</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/amd/qwen3.5-4b-dflash-online.yaml<span class="w"> </span>--role<span class="w"> </span>producer
+
+<span class="c1"># Trainer pool</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/amd/qwen3.5-4b-dflash-online.yaml<span class="w"> </span>--role<span class="w"> </span>consumer
+</pre></div>
+</div>
+<p>For multiple consumer nodes, record <code class="docutils literal notranslate"><span class="pre">deployment.trainer.nnodes</span></code>,
+<code class="docutils literal notranslate"><span class="pre">nproc_per_node</span></code>, <code class="docutils literal notranslate"><span class="pre">master_addr</span></code>, and <code class="docutils literal notranslate"><span class="pre">master_port</span></code> once in the config, then pass
+only the node-local identity on each trainer host:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>consumer<span class="w"> </span>--node-rank<span class="w"> </span><span class="m">0</span><span class="w">   </span><span class="c1"># trainer-0</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>consumer<span class="w"> </span>--node-rank<span class="w"> </span><span class="m">1</span><span class="w">   </span><span class="c1"># trainer-1</span>
+</pre></div>
+</div>
+<p>A fresh attempt requires fresh control and consumer-state directories, and every
+capture server must use the same target model, revision, capture method, and
+auxiliary layer ids — for this recipe <code class="docutils literal notranslate"><span class="pre">--spec-capture-method</span> <span class="pre">dflash</span></code> with aux ids
+<code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">8</span> <span class="pre">15</span> <span class="pre">22</span> <span class="pre">29</span></code>, and on ROCm each must run under AITER with <code class="docutils literal notranslate"><span class="pre">--disable-radix-cache</span></code>
+(Section 4, Step 2). Offline features can also be served through a disaggregated
+shared-directory or Mooncake store. For external-service prerequisites,
+freshness rules, multi-server capture, and resume, see the
+<a class="reference internal" href="../disaggregated_training.html"><span class="std std-doc">Disaggregated training</span></a> guide.</p>
+</section>
+<hr class="docutils" />
+<section id="reference-results-on-mi355x">
+<h2>Reference results on MI355X<a class="headerlink" href="#reference-results-on-mi355x" title="Link to this heading">#</a></h2>
+<p>The offline and online paths were run end-to-end on a single AMD Instinct
+<strong>MI355X</strong> (gfx950) inside the <code class="docutils literal notranslate"><span class="pre">lmsysorg/sglang:v0.5.14-rocm720-mi35x</span></code> container,
+training a <strong>Qwen3.5-4B DFlash</strong> draft on ShareGPT. Qwen3.5-4B is a hybrid
+linear-attention/Mamba target (<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code>); its draft is a
+5-layer DFlash head (<code class="docutils literal notranslate"><span class="pre">hidden_size=2560</span></code>, <code class="docutils literal notranslate"><span class="pre">block_size=16</span></code>,
+<code class="docutils literal notranslate"><span class="pre">target_layer_ids=[1,</span> <span class="pre">8,</span> <span class="pre">15,</span> <span class="pre">22,</span> <span class="pre">29]</span></code>). Both runs used <code class="docutils literal notranslate"><span class="pre">max_length=2048</span></code>,
+<code class="docutils literal notranslate"><span class="pre">chat_template=qwen3.5</span></code>, <code class="docutils literal notranslate"><span class="pre">batch_size=2</span></code>, <code class="docutils literal notranslate"><span class="pre">accumulation_steps=4</span></code>,
+<code class="docutils literal notranslate"><span class="pre">learning_rate=6e-4</span></code>, <code class="docutils literal notranslate"><span class="pre">num_anchors=512</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_decay_gamma=7</span></code>, a <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>
+trainer, and ~10 epochs (~680 optimizer steps).</p>
+<p>The SGLang side (offline capture and online capture server) runs the hybrid
+Mamba target under <strong>AITER</strong> on ROCm — export
+<code class="docutils literal notranslate"><span class="pre">SGLANG_USE_AITER=1</span> <span class="pre">SGLANG_USE_AITER_UNIFIED_ATTN=1</span> <span class="pre">AITER_FLYDSL_FORCE=1</span></code> and use
+<code class="docutils literal notranslate"><span class="pre">--attention-backend</span> <span class="pre">aiter</span></code>. A ROCm-specific requirement: the target needs
+the radix cache disabled (offline capture: <code class="docutils literal notranslate"><span class="pre">--sglang-disable-radix-cache</span></code>;
+external online server: <code class="docutils literal notranslate"><span class="pre">--disable-radix-cache</span></code>; managed-local config:
+<code class="docutils literal notranslate"><span class="pre">model.sglang_disable_radix_cache:</span> <span class="pre">true</span></code>). SGLang’s Mamba radix cache
+auto-selects the <code class="docutils literal notranslate"><span class="pre">extra_buffer</span></code> strategy, which asserts CUDA/MUSA/NPU (FLA) at
+server init and fails on ROCm; disabling the radix cache bypasses that path.
+Offline consumes hidden states captured to disk by
+<code class="docutils literal notranslate"><span class="pre">prepare_hidden_states.py</span></code>; online consumes the same features streamed live
+from the AITER capture server through Mooncake. Both paths converge together —
+the online capture path reproduces offline quality on ROCm.</p>
+<section id="training-loss">
+<h3>Training loss<a class="headerlink" href="#training-loss" title="Link to this heading">#</a></h3>
+<p><img alt="Qwen3.5-4B DFlash training loss on MI355X" src="../../_images/mi355x_qwen35_4b_dflash_loss.png" /></p>
+<p>Draft loss falls from ~9 to ~5.6 over ~680 steps. Faint lines are raw per-step
+values; bold lines are an exponential moving average.</p>
+</section>
+<section id="draft-accuracy">
+<h3>Draft accuracy<a class="headerlink" href="#draft-accuracy" title="Link to this heading">#</a></h3>
+<p><img alt="Qwen3.5-4B DFlash draft accuracy on MI355X" src="../../_images/mi355x_qwen35_4b_dflash_acc.png" /></p>
+<p>Top-1 draft-token accuracy (<code class="docutils literal notranslate"><span class="pre">acc</span></code>) — the training-time proxy for serving-time
+acceptance — rises from ~0.03 to ~0.12–0.13 and the two paths track each other
+closely.</p>
+</section>
+<section id="summary">
+<h3>Summary<a class="headerlink" href="#summary" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric (final)</p></th>
+<th class="head"><p>Offline</p></th>
+<th class="head"><p>Online</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Draft loss (start → end)</p></td>
+<td><p>8.3 → 5.6</p></td>
+<td><p>9.1 → 5.7</p></td>
+</tr>
+<tr class="row-odd"><td><p>Top-1 draft accuracy (<code class="docutils literal notranslate"><span class="pre">acc</span></code>)</p></td>
+<td><p>~0.12 (peak ~0.22)</p></td>
+<td><p>~0.13 (peak ~0.17)</p></td>
+</tr>
+<tr class="row-even"><td><p>Epochs / steps</p></td>
+<td><p>10 / 687</p></td>
+<td><p>10 / 670</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Throughput</strong> (single MI355X, <code class="docutils literal notranslate"><span class="pre">batch_size=2</span></code>, <code class="docutils literal notranslate"><span class="pre">max_length=2048</span></code>):</p>
+<ul class="simple">
+<li><p><strong>Offline</strong> capture: the AITER server generated hidden states for 572 prompts
+(286 batches) in ~48 s (~8 batches/s). The GPU-local trainer then ran at
+~0.3 steps/s — sequences up to 2,048 tokens on a 4B target are much heavier
+than a small draft at short context.</p></li>
+<li><p><strong>Online</strong> trainer: ~1.3 steps/s end-to-end (670 steps in ~520 s) with the
+capture server on GPU 0 and the trainer on GPU 1. A single AITER capture server
+produced 5,410 prompts across 10 epochs with <strong>0 failures</strong> (~10 prompts/s);
+the single-command <code class="docutils literal notranslate"><span class="pre">managed_local</span></code> stack (Mooncake master + capture server +
+trainer) came up and tore down cleanly (<code class="docutils literal notranslate"><span class="pre">default_kv_lease_ttl_ms=500</span></code>).</p></li>
+</ul>
+<blockquote>
+<div><p><strong>Data note (offline only):</strong> <code class="docutils literal notranslate"><span class="pre">prepare_hidden_states.py</span></code> truncates each rendered
+conversation at <code class="docutils literal notranslate"><span class="pre">max_length</span></code>. Long-prompt samples whose assistant reply is
+pushed past the cutoff end up with an empty loss region, i.e. fewer than two
+anchorable tokens, which trips DFlash’s anchor sampler
+(<code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">should</span> <span class="pre">preprocess</span> <span class="pre">the</span> <span class="pre">data.</span></code>). Drop those captured samples (any
+with <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">2</span></code> loss-mask tokens before the last <code class="docutils literal notranslate"><span class="pre">block_size</span></code> positions) before
+training. The online path never hits this — its producer regenerates full-length
+responses, so every streamed sample has a non-empty loss region.</p>
+</div></blockquote>
+<p>These numbers are a functional reference for a 4B DFlash draft on ROCm, not a
+tuned performance benchmark — longer sequences and multi-GPU trainers scale
+differently.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="reference-results-on-mi300x">
+<h2>Reference results on MI300X<a class="headerlink" href="#reference-results-on-mi300x" title="Link to this heading">#</a></h2>
+<p>The same <strong>Qwen3.5-4B DFlash</strong> recipe was reproduced end-to-end on a single AMD
+Instinct <strong>MI300X</strong> (gfx942) inside the <code class="docutils literal notranslate"><span class="pre">lmsysorg/sglang:v0.5.14-rocm720-mi30x</span></code>
+container, using identical hyperparameters (offline and online, <code class="docutils literal notranslate"><span class="pre">max_length=2048</span></code>,
+<code class="docutils literal notranslate"><span class="pre">chat_template=qwen3.5</span></code>, <code class="docutils literal notranslate"><span class="pre">batch_size=2</span></code>, <code class="docutils literal notranslate"><span class="pre">accumulation_steps=4</span></code>,
+<code class="docutils literal notranslate"><span class="pre">learning_rate=6e-4</span></code>, <code class="docutils literal notranslate"><span class="pre">num_anchors=512</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_decay_gamma=7</span></code>, <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>
+trainer, ~10 epochs). The ROCm requirements are the same as on MI355X: run the
+hybrid Mamba target under <strong>AITER</strong>
+(<code class="docutils literal notranslate"><span class="pre">SGLANG_USE_AITER=1</span> <span class="pre">SGLANG_USE_AITER_UNIFIED_ATTN=1</span> <span class="pre">AITER_FLYDSL_FORCE=1</span></code>,
+<code class="docutils literal notranslate"><span class="pre">--attention-backend</span> <span class="pre">aiter</span></code>) and <strong><code class="docutils literal notranslate"><span class="pre">--disable-radix-cache</span></code></strong> to bypass the
+<code class="docutils literal notranslate"><span class="pre">extra_buffer</span></code> Mamba radix-cache FLA assertion.</p>
+<section id="id1">
+<h3>Training loss<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
+<p><img alt="Qwen3.5-4B DFlash training loss on MI300X" src="../../_images/mi300x_qwen35_4b_dflash_loss.png" /></p>
+<p>Draft loss falls from ~8.4 to ~5.4 over ~680 steps; faint lines are raw per-step
+values, bold lines an exponential moving average.</p>
+</section>
+<section id="id2">
+<h3>Draft accuracy<a class="headerlink" href="#id2" title="Link to this heading">#</a></h3>
+<p><img alt="Qwen3.5-4B DFlash draft accuracy on MI300X" src="../../_images/mi300x_qwen35_4b_dflash_acc.png" /></p>
+<p>Top-1 draft-token accuracy (<code class="docutils literal notranslate"><span class="pre">acc</span></code>) climbs from ~0.02 to ~0.14, and the offline and
+online paths converge to the same quality — matching the MI355X result.</p>
+</section>
+<section id="id3">
+<h3>Summary<a class="headerlink" href="#id3" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric (final)</p></th>
+<th class="head"><p>Offline</p></th>
+<th class="head"><p>Online</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Draft loss (start → end)</p></td>
+<td><p>8.3 → 5.4</p></td>
+<td><p>8.5 → 5.5</p></td>
+</tr>
+<tr class="row-odd"><td><p>Top-1 draft accuracy (<code class="docutils literal notranslate"><span class="pre">acc</span></code>)</p></td>
+<td><p>~0.14 (peak ~0.21)</p></td>
+<td><p>~0.14 (peak ~0.16)</p></td>
+</tr>
+<tr class="row-even"><td><p>Epochs / steps</p></td>
+<td><p>10 / 687</p></td>
+<td><p>10 / 666</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Throughput</strong> (single MI300X, <code class="docutils literal notranslate"><span class="pre">batch_size=2</span></code>, <code class="docutils literal notranslate"><span class="pre">max_length=2048</span></code>):</p>
+<ul class="simple">
+<li><p><strong>Offline</strong> capture: the AITER server captured hidden states for all 572
+prompts; 21 truncated samples with an empty loss region were dropped (see the
+data note below), leaving 551 for training.</p></li>
+<li><p><strong>Online</strong> trainer: 666 steps in ~858 s (~0.78 steps/s) with the capture server
+on GPU 0 and the trainer on GPU 1. A single AITER capture server produced 5,330
+prompts across 10 epochs with <strong>0 failures</strong> (~6 prompts/s) and streamed 15,990
+feature objects through Mooncake; the single-command <code class="docutils literal notranslate"><span class="pre">managed_local</span></code> stack came
+up and tore down cleanly (<code class="docutils literal notranslate"><span class="pre">default_kv_lease_ttl_ms=500</span></code>).</p></li>
+</ul>
+<blockquote>
+<div><p><strong>Data note (offline only):</strong> identical to the MI355X run — the offline capture
+produced the same 21 empty-loss-region samples (mostly <code class="docutils literal notranslate"><span class="pre">max_length</span></code>-truncated
+conversations), which must be dropped before training or DFlash’s anchor sampler
+raises <code class="docutils literal notranslate"><span class="pre">ValueError:</span> <span class="pre">should</span> <span class="pre">preprocess</span> <span class="pre">the</span> <span class="pre">data.</span></code>. The online path never hits this.</p>
+</div></blockquote>
+<p>Results on MI300X track MI355X closely, confirming the ROCm DFlash flow (AITER +
+<code class="docutils literal notranslate"><span class="pre">--disable-radix-cache</span></code>) is portable across gfx942 and gfx950.</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../disaggregated_training.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Disaggregated training</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../../advanced_features/customization.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Customize a training run</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">1. Installation</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-pull-the-image-for-your-accelerator">Step 1: Pull the image for your accelerator</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-start-the-container">Step 2: Start the container</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-clone-and-install-specforge">Step 3: Clone and install SpecForge</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-4-apply-the-capture-patch-online-runs-only">Step 4: Apply the capture patch (online runs only)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-5-attention-backends-on-rocm">Step 5: Attention backends on ROCm</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#data-preparation">2. Data preparation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#offline-training">3. Offline training</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-capture-hidden-states">Step 1: Capture hidden states</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-train">Step 2: Train</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-training">4. Online training</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-one-time-run-inputs">Step 1: One-time run inputs</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-start-mooncake-and-the-capture-server">Step 2: Start Mooncake and the capture server</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-launch-training">Step 3: Launch training</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#success-criteria">Success criteria</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#managed-local-shortcut">Managed-local shortcut</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#disaggregated-training">5. Disaggregated training</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-results-on-mi355x">Reference results on MI355X</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#training-loss">Training loss</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-accuracy">Draft accuracy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-results-on-mi300x">Reference results on MI300X</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Training loss</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Draft accuracy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Summary</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By SpecForge Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SpecForge.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Aug 10, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

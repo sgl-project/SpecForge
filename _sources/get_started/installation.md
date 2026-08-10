@@ -35,19 +35,21 @@ the same `specforge train` entry.
 
 ### AMD ROCm
 
-For the pinned ROCm environment, install the checked-in requirements before the
-package:
+On ROCm, install SpecForge into an environment that already provides a ROCm
+PyTorch and a ROCm SGLang (an official SGLang ROCm release container is the
+recommended base), and install the package **without dependencies** so pip does
+not pull CUDA wheels over the working ROCm stack:
 
 ```bash
-python -m pip install -r requirements-rocm.txt
-python -m pip install -e .
+# Inside the ROCm SGLang container
+git clone https://github.com/sgl-project/SpecForge.git /workspace/SpecForge
+cd /workspace/SpecForge
+python -m pip install -e . --no-deps
 ```
 
-The file pins a ROCm 7.2 PyTorch stack. Use a wheel index and driver combination
-compatible with the host if your ROCm version differs. Online runs require a
-ROCm-compatible SGLang capture service; offline feature consumers can start
-without target inference. PyTorch exposes ROCm accelerators through its
-`torch.cuda` API and uses NCCL for distributed runs.
+For the complete container setup and an end-to-end walkthrough covering
+installation, data preparation, and offline / online / disaggregated training on
+AMD Instinct GPUs, follow the [AMD ROCm Tutorial](../basic_usage/AMD/amd_rocm.md).
 
 ### Ascend NPU
 

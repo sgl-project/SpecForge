@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 04, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 10, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -214,6 +214,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/data_preparation.html">📝 Data Preparation</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/training.html">Training</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/disaggregated_training.html">Disaggregated training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../basic_usage/AMD/amd_rocm.html">🚀 AMD ROCm Tutorial</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
 <ul class="nav bd-sidenav">
@@ -522,17 +523,19 @@ the same <code class="docutils literal notranslate"><span class="pre">specforge<
 </section>
 <section id="amd-rocm">
 <h3>AMD ROCm<a class="headerlink" href="#amd-rocm" title="Link to this heading">#</a></h3>
-<p>For the pinned ROCm environment, install the checked-in requirements before the
-package:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>requirements-rocm.txt
-python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
+<p>On ROCm, install SpecForge into an environment that already provides a ROCm
+PyTorch and a ROCm SGLang (an official SGLang ROCm release container is the
+recommended base), and install the package <strong>without dependencies</strong> so pip does
+not pull CUDA wheels over the working ROCm stack:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Inside the ROCm SGLang container</span>
+git<span class="w"> </span>clone<span class="w"> </span>https://github.com/sgl-project/SpecForge.git<span class="w"> </span>/workspace/SpecForge
+<span class="nb">cd</span><span class="w"> </span>/workspace/SpecForge
+python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.<span class="w"> </span>--no-deps
 </pre></div>
 </div>
-<p>The file pins a ROCm 7.2 PyTorch stack. Use a wheel index and driver combination
-compatible with the host if your ROCm version differs. Online runs require a
-ROCm-compatible SGLang capture service; offline feature consumers can start
-without target inference. PyTorch exposes ROCm accelerators through its
-<code class="docutils literal notranslate"><span class="pre">torch.cuda</span></code> API and uses NCCL for distributed runs.</p>
+<p>For the complete container setup and an end-to-end walkthrough covering
+installation, data preparation, and offline / online / disaggregated training on
+AMD Instinct GPUs, follow the <a class="reference internal" href="../basic_usage/AMD/amd_rocm.html"><span class="std std-doc">AMD ROCm Tutorial</span></a>.</p>
 </section>
 <section id="ascend-npu">
 <h3>Ascend NPU<a class="headerlink" href="#ascend-npu" title="Link to this heading">#</a></h3>
@@ -636,7 +639,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 04, 2026.
+  Last updated on Aug 10, 2026.
   <br/>
 </p>
   </div>
