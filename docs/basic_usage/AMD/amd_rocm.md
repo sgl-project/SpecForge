@@ -128,7 +128,7 @@ training loop, and needs no capture patch or Mooncake. This section trains a
 Feature preparation is a data-processing step, not a second training entry point.
 Qwen3.5-4B is a hybrid linear-attention/Mamba target, so run the capture under
 **AITER** and pass `--sglang-disable-radix-cache`. Without it, SGLang's Mamba
-radix cache auto-selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU
+radix cache selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU
 (FLA) at server init and fails on ROCm:
 
 ```bash
@@ -211,8 +211,9 @@ exists (Section 2).
 ### Step 2: Start Mooncake and the capture server
 
 Start the Mooncake master. **Set `--default_kv_lease_ttl=500`**: the consumer's
-teardown drain retries for only ~1.75s, so Mooncake's stock 5000ms lease leaves
-keys pinned past the drain window and fails an otherwise successful shutdown.
+teardown drain now allows about 19.5s for leases to settle, while the shorter
+managed TTL keeps a normal shutdown from waiting several seconds for an expired
+read lease.
 
 ```bash
 mooncake_master --enable_http_metadata_server=true \
@@ -239,10 +240,14 @@ MOONCAKE_PROTOCOL=tcp \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=$((32<<30)) \
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3.5-4B \
-  --trust-remote-code --skip-tokenizer-init \
-  --tp-size 1 --context-length 4096 --mem-fraction-static 0.8 \
+  --trust-remote-code \
+  --skip-tokenizer-init \
+  --tp-size 1 \
+  --context-length 4096 \
+  --mem-fraction-static 0.8 \
   --attention-backend aiter \
-  --chunked-prefill-size -1 --disable-radix-cache \
+  --chunked-prefill-size -1 \
+  --disable-radix-cache \
   --enable-spec-capture --spec-capture-method dflash \
   --spec-capture-aux-layer-ids 1 8 15 22 29 \
   --host 127.0.0.1 --port 30000 &
@@ -346,14 +351,15 @@ The SGLang side (offline capture and online capture server) runs the hybrid
 Mamba target under **AITER** on ROCm — export
 `SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1` and use
 `--attention-backend aiter`. A ROCm-specific requirement: the target needs
-**`--disable-radix-cache`** (offline: `--sglang-disable-radix-cache`; online:
-`sglang_disable_radix_cache: true`). SGLang's Mamba radix cache auto-selects the
-`extra_buffer` strategy, which asserts CUDA/MUSA/NPU (FLA) at server init and
-fails on ROCm; disabling the radix cache bypasses that path. Offline consumes
-hidden states captured to disk by `prepare_hidden_states.py`; online consumes the
-same features streamed live from the AITER capture server through Mooncake. Both
-paths converge together — the online capture path reproduces offline quality on
-ROCm.
+the radix cache disabled (offline capture: `--sglang-disable-radix-cache`;
+external online server: `--disable-radix-cache`; managed-local config:
+`model.sglang_disable_radix_cache: true`). SGLang's Mamba radix cache
+auto-selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU (FLA) at
+server init and fails on ROCm; disabling the radix cache bypasses that path.
+Offline consumes hidden states captured to disk by
+`prepare_hidden_states.py`; online consumes the same features streamed live
+from the AITER capture server through Mooncake. Both paths converge together —
+the online capture path reproduces offline quality on ROCm.
 
 ### Training loss
 
