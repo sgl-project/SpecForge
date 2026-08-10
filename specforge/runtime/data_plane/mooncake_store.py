@@ -33,14 +33,18 @@ Contract carried from the reference backend:
 Lifetime: Mooncake's default eviction is approximate-LRU for a KV *cache*, which
 would silently drop a committed-but-unacked feature when the trainer lags hours
 (turning ``get()`` into a ``KeyError`` and violating the controller's
-no-data-loss guarantee). We therefore **hard-pin** every object on ``put`` and
-free it only by explicit ``remove()`` on consume/abort — SpecForge is the sole
-lifetime authority, not Mooncake's LRU. Because ``remove()`` is a real (fallible)
-RPC, ``release()`` parks a failed free in ``_release_pending`` and ``gc()``
-retries up to ``max_release_attempts`` during steady state. Lifecycle shutdown
-calls :meth:`drain_pending_removals`, a separate bounded retry that raises if
-physical removal never succeeds; failed hard-pinned objects are never silently
-dropped from bookkeeping.
+no-data-loss guarantee). When Mooncake exposes ``with_hard_pin``, SpecForge
+therefore **hard-pins** every object on ``put`` and frees it only by explicit
+``remove()`` on consume/abort — SpecForge is the sole lifetime authority, not
+Mooncake's LRU. Older and Ascend Mooncake clients may not expose that field; the
+store logs a warning and inherits their default pin behavior, so deployments
+that require the strict no-eviction guarantee must use a hard-pin-capable
+client. Because ``remove()`` is a real (fallible) RPC, ``release()`` parks a
+failed free in ``_release_pending`` and ``gc()`` retries up to
+``max_release_attempts`` during steady state. Lifecycle shutdown calls
+:meth:`drain_pending_removals`, a separate bounded retry that raises if physical
+removal never succeeds; failed removals are never silently dropped from
+bookkeeping.
 
 Concurrency: ``release``/``abort``/``gc`` hold ``self._lock`` across the
 ``remove()`` RPC. The lock is what makes consume-once free race-free against a
@@ -214,7 +218,7 @@ def _nbytes(t: torch.Tensor) -> int:
 class MooncakeFeatureStore(FeatureStore):
     """A disaggregated :class:`FeatureStore` backed by the Mooncake store.
 
-    **Zero-copy transport.** One hard-pinned Mooncake object per
+    **Zero-copy transport.** One Mooncake object per
     *tensor*, keyed ``{store_id}/{sample_id}/g{gen}/{name}``. ``put()`` writes each
     tensor straight from its storage with ``put_from(ptr)``; ``get()`` reads each
     straight into a tensor allocated from the ref's ``FeatureSpec`` with
@@ -291,7 +295,7 @@ class MooncakeFeatureStore(FeatureStore):
         # Server capture registers deterministic keys before issuing HTTP. If
         # the response is lost, no SampleRef exists to adopt/abort them. Keep a
         # shared (multi-adapter) provisional index so terminal producer cleanup
-        # can reclaim those hard-pinned objects; a successful adopt clears it.
+        # can reclaim those provisional objects; a successful adopt clears it.
         self._external_provisional: Dict[Tuple[str, int], List[str]] = {}
         self._active_leases: Dict[str, FeatureHandle] = {}
         # Samples whose remote remove() failed. gc() performs bounded
@@ -322,7 +326,7 @@ class MooncakeFeatureStore(FeatureStore):
         return int(self._store.is_exist(key)) == 1
 
     def _store_put_tensor(self, key: str, t: torch.Tensor) -> None:
-        """Zero-copy publish: DMA straight from the tensor's storage, hard-pinned.
+        """Zero-copy publish, requesting a hard pin when the client supports it.
 
         ``t`` must be contiguous + CPU (caller stages it). The bytes are the raw
         tensor buffer; shape/dtype travel on the ref's FeatureSpec, so get()
@@ -423,7 +427,8 @@ class MooncakeFeatureStore(FeatureStore):
             gen = self._gen_counter
             prior_gen = self._generation.get(sample_id)
             prior_names = self._sample_names.get(sample_id, [])
-        # One hard-pinned object per tensor, DMA'd straight from its storage.
+        # One object per tensor, DMA'd straight from its storage. The shared put
+        # config requests hard pinning when the Mooncake client supports it.
         # staged keeps the source tensors alive across the synchronous puts.
         for name, t in staged.items():
             self._store_put_tensor(self._tkey(sample_id, gen, name), t)
@@ -438,7 +443,7 @@ class MooncakeFeatureStore(FeatureStore):
             if leaked:
                 logger.warning(
                     "MooncakeFeatureStore re-put of %s gen %s: removing prior "
-                    "generation %s tensors %s failed; hard-pinned objects may be "
+                    "generation %s tensors %s failed; remote objects may be "
                     "orphaned (and the stale ref stays readable until reclaimed)",
                     sample_id,
                     prior_gen,
@@ -871,7 +876,7 @@ class MooncakeFeatureStore(FeatureStore):
                     # Keep the physical key metadata and surface the pending
                     # sample. Lifecycle drain owns the final bounded retry and
                     # loud failure; silently dropping this bookkeeping would
-                    # make a hard-pinned remote leak invisible.
+                    # make a remote object leak invisible.
                     continue
                 attempts = self._release_pending[sid] + 1
                 if self._try_physical_free(sid, confirm_absent_on_failure=False):

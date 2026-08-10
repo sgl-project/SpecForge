@@ -70,7 +70,7 @@ SpecBundle is a collection of production-grade speculative decoding models that 
 
 ## 🎉 News
 - [2026-08] 🎉 Released SpecBundle (phase 2) and SpecForge v0.3.0. Check out our blog at [LMSYS.org](https://www.lmsys.org/blog/2026-08-04-specforge-v0-3)
-- [2026-07] 🚀 Day0 supported two flagship dspark draft model, [Inklink](https://huggingface.co/RadixArk/Inkling-DSpark-Preview) and [Kimi-K3](https://huggingface.co/RadixArk/Kimi-K3-DSpark).
+- [2026-07] 🚀 Day0 supported two flagship dspark draft model, [Inkling](https://huggingface.co/RadixArk/Inkling-DSpark-Preview) and [Kimi-K3](https://huggingface.co/RadixArk/Kimi-K3-DSpark).
 - [2026-07] 🔥 Supported full disaggregation of training and inference in online training.
 - [2026-07] 🔥 Added DSpark online training for DFlash draft models.
 - [2026-06] 🔥 Added D-PACE as an optional loss for DFlash training.
