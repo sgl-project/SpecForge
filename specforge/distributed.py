@@ -145,10 +145,15 @@ def init_distributed(
     # initialization; doing the same for NCCL also removes ambiguous rank/device
     # inference on heterogeneous hosts.
     local_rank = _bind_local_device(device_type)
-    # Yunchang probes the active CUDA device while importing. Keep it behind
-    # the trainer-only, device-bound initialization boundary so config loading
-    # and prompt preprocessing remain safe in CPU-only producer processes.
-    process_group, set_seq_parallel_pg = _load_yunchang_globals()
+    # Yunchang probes the active CUDA device at import, which crashes
+    # NPU-only torch builds. Only USP needs it, so load it lazily when SP
+    # sizes exceed 1. For SP=1, the getters are populated from the singleton
+    # DeviceMesh group below; publishing None would make torch.distributed
+    # operations silently use the default WORLD group instead.
+    if sp_ulysses_size * sp_ring_size > 1:
+        process_group, set_seq_parallel_pg = _load_yunchang_globals()
+    else:
+        process_group, set_seq_parallel_pg = None, None
 
     dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout))
     print_with_rank(f"bind to {device_type} device {local_rank}")
@@ -173,14 +178,23 @@ def init_distributed(
         (draft_dp_size, sp_ulysses_size * sp_ring_size),
         mesh_dim_names=("draft_dp", "sp"),
     )
-    set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
+    if set_seq_parallel_pg is not None:
+        set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
 
     print_with_rank(f"device mesh: {device_mesh}")
     tp_group = device_mesh.get_group("tp")
     dp_group = device_mesh.get_group("dp")
+    draft_dp_group = draft_device_mesh.get_group("draft_dp")
+    draft_sp_group = draft_device_mesh.get_group("sp")
 
-    sp_ulysses_group = process_group.ULYSSES_PG
-    sp_ring_group = process_group.RING_PG
+    if process_group is not None:
+        sp_ulysses_group = process_group.ULYSSES_PG
+        sp_ring_group = process_group.RING_PG
+    else:
+        # Both SP dimensions are 1 here. Reuse the per-rank singleton SP group
+        # so callers always receive a real group whose world size is 1.
+        sp_ulysses_group = draft_sp_group
+        sp_ring_group = draft_sp_group
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
 
@@ -191,8 +205,8 @@ def init_distributed(
     _SP_ULYSSES_GROUP = sp_ulysses_group
     _SP_RING_GROUP = sp_ring_group
     _DP_GROUP = dp_group
-    _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
-    _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
+    _DRAFT_DP_GROUP = draft_dp_group
+    _DRAFT_SP_GROUP = draft_sp_group
     _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
 
