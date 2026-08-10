@@ -716,6 +716,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "kimi-k3-dspark.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
+                "qwen3.5-4b-dspark.json",
                 "qwen3.6-27b-dspark.json",
             },
         )

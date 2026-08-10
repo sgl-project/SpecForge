@@ -38,6 +38,7 @@ NPU, offline, and managed/external-service variants, is in
 | `examples/configs/qwen3.5-4b-dflash-online-npu.yaml` | Disaggregated NPU SGLang capture | DFlash |
 | `examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml` | Managed local NPU full stack | DFlash |
 | `examples/configs/qwen3.5-4b-domino-online-npu.yaml` | Disaggregated NPU SGLang capture | Domino |
+| `examples/configs/qwen3.5-4b-dspark-disaggregated-npu.yaml` | Managed local NPU full stack | DSpark |
 
 Online configs point `data.train_data_path` at raw conversation data. Offline
 configs expect strategy-specific feature checkpoints in
