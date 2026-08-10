@@ -41,6 +41,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Sequence
 
@@ -114,7 +115,8 @@ class StreamingRefChannel:
         self._published = 0
         # consumer-side
         self._read_offset = 0
-        self._buf = ""
+        self._partial_line = ""
+        self._complete_lines = deque[str]()
         self._consumed = 0
         # ``mark_consumed`` is called from both the trainer thread (batch acks)
         # and the prefetch worker (failure settlement), so the increment and
@@ -327,15 +329,16 @@ class StreamingRefChannel:
         except FileNotFoundError:
             chunk = ""
         if chunk:
-            self._buf += chunk
-        # parse the buffer even when no new bytes arrived -- a previous max_n call
-        # may have left complete lines buffered.
+            lines = (self._partial_line + chunk).split("\n")
+            self._partial_line = lines.pop()
+            self._complete_lines.extend(lines)
+        # Parse queued lines even when no new bytes arrived -- a previous max_n
+        # call may have left complete lines buffered.
         out: List[SampleRef] = []
-        while "\n" in self._buf:
+        while self._complete_lines:
             if max_n is not None and len(out) >= max_n:
                 break
-            line, self._buf = self._buf.split("\n", 1)
-            line = line.strip()
+            line = self._complete_lines.popleft().strip()
             if line:
                 out.append(ref_from_dict(json.loads(line)))
         return out

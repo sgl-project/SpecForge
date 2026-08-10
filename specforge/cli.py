@@ -256,7 +256,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(plan.render())
             return 0
         if plan.kind == "worker":
-            os.environ.update(plan.worker_env)
+            for key, value in plan.worker_env.items():
+                if value is None:
+                    # CommandSpec.env contract: None unsets the variable.
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
             role_config = _config_for_role(resolved.config, plan.role)
             try:
                 with _worker_signal_unwind():

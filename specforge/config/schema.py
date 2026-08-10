@@ -291,10 +291,10 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
     #: Master key-lease TTL (ms) forwarded to ``mooncake_master
-    #: --default_kv_lease_ttl``. The consumer's teardown drain retries for only
-    #: ~1.75s, so Mooncake's stock 5000ms lease leaves keys pinned past the
-    #: drain window and fails shutdown. Default to a value below that window so
-    #: managed_local tears down cleanly; set null to inherit Mooncake's default.
+    #: --default_kv_lease_ttl``. The consumer's teardown drain allows about
+    #: 19.5s for leases to settle. Keep the managed-local default at 500ms so
+    #: normal shutdown does not spend several seconds waiting for an expired
+    #: read lease; set null to inherit Mooncake's server default.
     default_kv_lease_ttl_ms: Optional[int] = Field(default=500, gt=0)
 
     @model_validator(mode="after")
@@ -314,7 +314,11 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
 
 
 class ManagedLocalCaptureServerConfig(StrictConfigModel):
-    """One patched SGLang capture server owned by the local supervisor."""
+    """One patched SGLang capture server owned by the local supervisor.
+
+    ``cuda_visible_devices`` holds plain device ordinals; the launcher maps
+    them to the accelerator's visibility env var.
+    """
 
     port: int = Field(gt=0, le=65535)
     cuda_visible_devices: List[str] = Field(min_length=1)
@@ -340,7 +344,11 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
 
 
 class ManagedLocalStackConfig(StrictConfigModel):
-    """Opt-in ownership of a complete single-node online capture stack."""
+    """Opt-in ownership of a complete single-node online capture stack.
+
+    ``trainer_cuda_visible_devices`` holds plain device ordinals; the
+    launcher maps them to the accelerator's visibility env var.
+    """
 
     trainer_cuda_visible_devices: List[str] = Field(min_length=1)
     mooncake: ManagedLocalMooncakeConfig = Field(
