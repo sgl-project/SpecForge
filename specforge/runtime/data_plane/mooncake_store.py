@@ -262,14 +262,23 @@ class MooncakeFeatureStore(FeatureStore):
         _require_store_api(store)
         self._store = store
         put_config.replica_num = replica_num
-        # Older/Ascend Mooncake builds lack with_hard_pin; objects then
-        # follow the store's default pin behavior.
+        # Prefer true hard pinning when the installed Mooncake supports it.
+        # Older ROCm builds expose only `with_soft_pin`; that is a best-effort
+        # fallback rather than the same no-eviction guarantee. Some older
+        # Ascend builds expose neither field and must use the store default.
         if hasattr(put_config, "with_hard_pin"):
             put_config.with_hard_pin = hard_pin
+        elif hasattr(put_config, "with_soft_pin"):
+            put_config.with_soft_pin = hard_pin
+            if hard_pin:
+                logger.warning(
+                    "Mooncake ReplicateConfig has no with_hard_pin field; "
+                    "falling back to with_soft_pin"
+                )
         elif hard_pin:
             logger.warning(
-                "Mooncake ReplicateConfig has no with_hard_pin field; "
-                "objects use the store's default pin behavior"
+                "Mooncake ReplicateConfig exposes neither with_hard_pin nor "
+                "with_soft_pin; objects use the store's default pin behavior"
             )
         self._put_config = put_config
         self.max_resident_bytes = max_resident_bytes

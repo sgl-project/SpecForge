@@ -539,7 +539,7 @@ class Trainer:
                 self._on_fit_failure(exc)
             raise
         finally:
-            primary_exception = sys.exception()
+            primary_exception = sys.exc_info()[1]
             cleanup_errors: list[tuple[str, BaseException]] = []
 
             def capture_cleanup(label: str, action) -> None:
