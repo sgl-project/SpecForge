@@ -244,6 +244,11 @@ class MooncakeFeatureStore(FeatureStore):
         # frees within a run (empty in retain_on_release/offline mode); a durable
         # shared index would own this in the online multi-node follow-up.
         self._freed: set = set()
+        # Receive buffers whose get_into failed transiently: the transfer
+        # engine may still hold in-flight slices targeting them, so they stay
+        # registered and alive for the life of the process (see
+        # _store_get_tensor).
+        self._quarantined_buffers: List[torch.Tensor] = []
         self._lock = threading.RLock()
         self._counter = 0
         self._gen_counter = 0
@@ -285,31 +290,85 @@ class MooncakeFeatureStore(FeatureStore):
         if rc is not None and int(rc) < 0:
             raise RuntimeError(f"mooncake put_from failed (status {rc}) for {key}")
 
+    # Transport-level statuses that do not indicate a missing object:
+    # REPLICA_IS_NOT_READY (-703), LEASE_EXPIRED (-707, "lease expired before
+    # data transfer completed"), TRANSFER_FAIL (-800), CHECKSUM_MISMATCH
+    # (-801), RPC_FAIL (-900), RPC_TIMEOUT (-901). A single stalled TCP
+    # transfer must not kill a multi-day run, so these are retried on a fresh
+    # attempt (a retry acquires a fresh lease). OBJECT_NOT_FOUND (-704) stays
+    # fatal.
+    _TRANSIENT_GET_STATUSES = frozenset({-703, -707, -800, -801, -900, -901})
+    _GET_ATTEMPTS = 3
+
+    def _attempt_get_into(self, key: str, buf: torch.Tensor, nb: int) -> Optional[int]:
+        """One registered get_into attempt. Returns rc, or None on a binding error.
+
+        If the transfer fails transiently (e.g. a stalled TCP batch hits the
+        store's fixed 60s deadline -> TRANSFER_FAIL), the engine may still hold
+        in-flight slices targeting ``buf``, so it must NOT be unregistered:
+        doing so corrupted glibc's heap in practice (``munmap_chunk(): invalid
+        pointer``). Such buffers stay registered and pinned for the life of
+        the process instead (bounded leak: one receive buffer per rare
+        transport failure).
+        """
+        registered = False
+        try:
+            self._store.register_buffer(buf.data_ptr(), nb)
+            registered = True
+        except Exception:  # pragma: no cover - some builds auto-register
+            pass
+        rc: Optional[int] = None
+        try:
+            rc = int(self._store.get_into(key, buf.data_ptr(), nb))
+        except Exception:  # pragma: no cover - binding-level failure
+            rc = None
+        if registered:
+            if rc is None or (rc < 0 and rc in self._TRANSIENT_GET_STATUSES):
+                self._quarantined_buffers.append(buf)
+            else:
+                try:
+                    self._store.unregister_buffer(buf.data_ptr())
+                except Exception:  # pragma: no cover
+                    pass
+        return rc
+
     def _store_get_tensor(self, key: str, out: torch.Tensor) -> None:
         """Zero-copy fetch into a pre-allocated tensor. Raises KeyError if absent.
 
-        The receive buffer is registered with the transfer engine for the get_into
-        (required by the raw-buffer path), then unregistered.
+        Transient transport failures are retried into a FRESH receive buffer
+        each time — a buffer whose transfer timed out may still receive late
+        slices and is quarantined by _attempt_get_into, never reused. A late
+        slice replaying into ``out`` after a successful retry is harmless:
+        tensor keys are per-generation and never rewritten, so it can only
+        write identical bytes.
         """
         nb = _nbytes(out)
-        try:
-            self._store.register_buffer(out.data_ptr(), nb)
-        except Exception:  # pragma: no cover - some builds auto-register
-            pass
-        try:
-            rc = self._store.get_into(key, out.data_ptr(), nb)
-        finally:
-            try:
-                self._store.unregister_buffer(out.data_ptr())
-            except Exception:  # pragma: no cover
-                pass
-        if rc is None or int(rc) < 0:
+        rc = self._attempt_get_into(key, out, nb)
+        for attempt in range(1, self._GET_ATTEMPTS):
+            if rc is not None and rc >= 0:
+                break
+            if rc is not None and rc not in self._TRANSIENT_GET_STATUSES:
+                raise KeyError(f"mooncake get_into failed (status {rc}) for {key}")
+            logger.warning(
+                "mooncake get_into transient failure (status %s) for %s; "
+                "retrying into a fresh buffer (attempt %d/%d)",
+                rc,
+                key,
+                attempt,
+                self._GET_ATTEMPTS - 1,
+            )
+            time.sleep(2.0 * attempt)
+            tmp = torch.empty_like(out)
+            rc = self._attempt_get_into(key, tmp, nb)
+            if rc is not None and rc == nb:
+                out.copy_(tmp)
+        if rc is None or rc < 0:
             raise KeyError(f"mooncake get_into failed (status {rc}) for {key}")
         # get_into returns the number of bytes read; a full read returns exactly
         # nb. A short read (0 <= rc < nb) would leave the tail of this freshly
         # allocated buffer as uninitialized garbage. Reject it rather than hand
         # the trainer silently-corrupt data (B5: never serve wrong bytes).
-        if int(rc) != nb:
+        if rc != nb:
             raise KeyError(
                 f"mooncake get_into short read for {key}: got {rc} of {nb} bytes"
             )
@@ -570,6 +629,16 @@ class MooncakeFeatureStore(FeatureStore):
                 )
             out[n] = _alloc_from_spec(spec)  # fresh -> clone-on-fetch for free (B5)
             self._store_get_tensor(key, out[n])
+        from specforge.runtime.workflow_log import wlog
+
+        wlog(
+            "trainer",
+            "mooncake get_into: fetched one sample's tensors from the store "
+            "(zero-copy into pre-allocated CPU buffers)",
+            sample_id=sid,
+            gen=gen,
+            **out,
+        )
         return out, gen
 
     # -- lifetime ----------------------------------------------------------

@@ -1300,6 +1300,21 @@ def build_disagg_online_producer(
 
         def ingest_prompt_batch(epoch: int, batch_index: int, epoch_prompts) -> None:
             phase = time.perf_counter()
+            if epoch_prompts:
+                from specforge.runtime.workflow_log import wlog
+
+                first = epoch_prompts[0]
+                wlog(
+                    "producer",
+                    "pull data: tokenized prompts from the dataset cache enter "
+                    "the flow controller (leased to rollout workers next)",
+                    n_prompts=len(epoch_prompts),
+                    epoch=epoch + 1,
+                    first_prompt_keys=list(first)[:8],
+                    first_prompt_len=len(first.get("input_ids", ()))
+                    if isinstance(first, dict)
+                    else "?",
+                )
             producer_timing(
                 "controller.ingest_prompts start "
                 f"epoch={epoch + 1}/{prompt_epochs} batch={batch_index + 1} "

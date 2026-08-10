@@ -657,6 +657,20 @@ class TrainerController:
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
                 self._step_profiler.before_micro_step(self.global_step)
+                if self.micro_step <= 3:
+                    from specforge.runtime.workflow_log import wlog
+
+                    wlog(
+                        "trainer",
+                        "train_step input (one micro-batch of fetched features "
+                        "entering forward/backward; shown for micro-steps 1-3)",
+                        micro_step=self.micro_step,
+                        **{
+                            k: v
+                            for k, v in vars(batch).items()
+                            if not k.startswith("_")
+                        },
+                    )
                 train_compute_started = time.perf_counter()
                 result = self.core.train_step(
                     batch,
@@ -665,6 +679,16 @@ class TrainerController:
                     ),
                 )
                 perf_train_compute_s += time.perf_counter() - train_compute_started
+                if self.micro_step <= 3:
+                    from specforge.runtime.workflow_log import wlog
+
+                    wlog(
+                        "trainer",
+                        "train_step output",
+                        micro_step=self.micro_step,
+                        optimizer_stepped=result.optimizer_stepped,
+                        metrics=result.metrics,
+                    )
                 self.last_metrics = result.metrics
                 # grad accumulated but optimizer has not stepped yet; everything
                 # keyed on optimizer steps fires only at the boundary.

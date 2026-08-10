@@ -336,10 +336,32 @@ class SGLangServerCaptureAdapter:
                 generation=int(payload["gen"]),
                 feature_names=feature_names,
             )
+        from specforge.runtime.workflow_log import wlog
+
+        wlog(
+            "producer",
+            "POST /generate (prompts -> SGLang; capture spec asks the server "
+            "to write hidden states into Mooncake)",
+            url=f"{self.base_url}/generate",
+            n_prompts=len(tasks),
+            sample_ids=[self._sample_id(t) for t in tasks[:2]] + ["..."],
+            requested_features=list(capture_payloads[0]["features"].values())
+            if capture_payloads
+            else [],
+        )
         rows = self.post_fn(
             f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
         )
         rows = _flatten_list_wrappers(rows)
+        wlog(
+            "producer",
+            "SGLang /generate response (tensors are NOT here; only Mooncake "
+            "keys + shapes come back in meta_info.spec_capture)",
+            n_rows=len(rows),
+            first_spec_capture=(rows[0].get("meta_info") or {}).get("spec_capture")
+            if rows and isinstance(rows[0], dict)
+            else None,
+        )
         if len(rows) != len(tasks):
             raise RuntimeError(
                 f"spec-capture server returned {len(rows)} rows for "

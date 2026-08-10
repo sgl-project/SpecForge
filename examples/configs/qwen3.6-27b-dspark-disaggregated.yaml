@@ -15,9 +15,15 @@ data:
 training:
   strategy: dspark
   num_epochs: 10
-  # Portable one-rank equivalent of the source recipe's global batch 512.
+  # Global batch ~512 as in the source recipe: 6 trainer ranks x batch 1 x
+  # accumulation 85 = 510. Measured balance: one capture server sustains
+  # ~7 samples/s while 7 trainer ranks consumed ~23 samples/s of compute,
+  # so a GPU moved from the trainer to a second capture server.
   batch_size: 1
-  accumulation_steps: 512
+  accumulation_steps: 85
+  # One optimizer step is ~minutes here; log every step so WandB shows
+  # progress immediately (default 50 would mean hours to the first point).
+  log_interval: 1
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1.0
@@ -27,6 +33,17 @@ training:
   save_interval: 125
   dist_timeout: 30
   seed: 42
+runtime:
+  # The consumer dispatches one full optimizer window at a time
+  # (nnodes * nproc_per_node * batch_size * accumulation_steps = 510),
+  # so both watermarks must be at least that quantum.
+  in_flight_high_watermark: 576
+  in_flight_low_watermark: 512
+tracking:
+  # WANDB_API_KEY is supplied via the process environment, never YAML.
+  report_to: wandb
+  wandb_project: specforge
+  wandb_name: qwen3.6-27b-dspark-disaggregated
 run_id: qwen3.6-27b-dspark-disaggregated
 output_dir: outputs/qwen3.6-27b-dspark-disaggregated
 
@@ -34,14 +51,24 @@ deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 1
+    nproc_per_node: 6
   disaggregated:
     control_dir: outputs/qwen3.6-27b-dspark-disaggregated/control
     backend: mooncake
     managed_local:
       trainer_cuda_visible_devices:
-        - "1"
+        - "2"
+        - "3"
+        - "4"
+        - "5"
+        - "6"
+        - "7"
       mooncake:
+        # RDMA was tried here (mlx5_4/mlx5_5) but this KVM guest's IB fabric
+        # rejects same-host loopback: every slice dies with "transport retry
+        # counter exceeded", even intra-HCA. Loopback TCP (pinned via
+        # MC_TCP_BIND_ADDRESS in launch_plan) is the working transport for
+        # single-node runs; use RDMA only for true multi-node deployments.
         protocol: tcp
         global_segment_size_bytes: 68719476736
         local_buffer_size_bytes: 1073741824
@@ -49,5 +76,10 @@ deployment:
         - port: 30000
           cuda_visible_devices:
             - "0"
+          tp_size: 1
+          mem_fraction_static: 0.7
+        - port: 30001
+          cuda_visible_devices:
+            - "1"
           tp_size: 1
           mem_fraction_static: 0.7

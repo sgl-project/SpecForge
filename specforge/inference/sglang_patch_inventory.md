@@ -12,7 +12,7 @@ Online training uses one of these source-specific patches:
 
 | Target | Patch | Capture methods |
 |---|---|---|
-| SGLang v0.5.14 / `inkling-support` | [`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch) | EAGLE3, DFlash |
+| SGLang v0.5.14 / `inkling-support` | [`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch) | EAGLE3, DFlash, DSpark (DSpark reuses the DFlash aux wiring; stock models expose only `set_dflash_layers_to_capture`) |
 | Kimi K3 SGLang `9acd9cb` (`f8493a4` compatible) | [`patches/sglang/kimi-k3-f8493a4/spec-capture.patch`](../../patches/sglang/kimi-k3-f8493a4/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 
 The patch adds `--enable-spec-capture` and a server-side sink that:

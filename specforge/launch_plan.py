@@ -355,6 +355,18 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
         "MOONCAKE_LOCAL_HOSTNAME": mooncake.local_hostname,
         "MOONCAKE_PROTOCOL": mooncake.protocol,
         "DISAGG_SERVER_URLS": ",".join(server_urls),
+        # Mooncake's default 60s transfer deadline is too tight for large
+        # hidden-state tensors when the transfer engine stalls under load
+        # (observed TRANSFER_FAIL on loopback TCP); match the recipe docs.
+        "MC_TRANSFER_TIMEOUT": os.environ.get("MC_TRANSFER_TIMEOUT", "300"),
+        # Without an explicit bind, the transfer engine advertises data
+        # endpoints on an auto-discovered external interface even for this
+        # single-node topology, routing tensor traffic through the host NIC
+        # stack (observed stalls/EFAULT under cilium). Pin TCP data to the
+        # same loopback endpoint as the master.
+        "MC_TCP_BIND_ADDRESS": os.environ.get(
+            "MC_TCP_BIND_ADDRESS", mooncake.local_hostname
+        ),
     }
     if mooncake.rdma_devices:
         values["MOONCAKE_RDMA_DEVICES"] = mooncake.rdma_devices
@@ -406,16 +418,28 @@ def _managed_local_services(
         cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
     )
 
+    # Prefer the interpreter's own mooncake_master: a system-wide binary of a
+    # different version speaks an incompatible RPC schema, and every client
+    # mount then fails with "invalid rpc arg" / RPC_FAIL.
+    _venv_master = Path(sys.executable).parent / "mooncake_master"
+    mooncake_master_bin = str(_venv_master) if _venv_master.exists() else "mooncake_master"
+
     mooncake_service = ServiceSpec(
         command=CommandSpec(
             "mooncake",
             (
-                "mooncake_master",
+                mooncake_master_bin,
                 "--enable_http_metadata_server=true",
                 "--http_metadata_server_host=127.0.0.1",
                 f"--rpc_port={mooncake.rpc_port}",
                 f"--http_metadata_server_port={mooncake.metadata_port}",
                 f"--metrics_port={mooncake.metrics_port}",
+                # The default 10s KV lease can expire mid-transfer when large
+                # hidden-state tensors move slowly (observed LEASE_EXPIRED on
+                # loopback TCP). Do not raise this too far: a live read lease
+                # blocks the store's non-forced remove-on-consume, so a long
+                # TTL parks freed samples and can exhaust the global segment.
+                "--default_kv_lease_ttl=60000",
             ),
             {"CUDA_VISIBLE_DEVICES": ""},
         ),
@@ -991,6 +1015,14 @@ def _spawn_command(
     stdout=None,
     stderr=None,
 ) -> subprocess.Popen:
+    from specforge.runtime.workflow_log import wlog
+
+    wlog(
+        "launcher",
+        f"spawn {command.label!r}",
+        argv=" ".join(str(a) for a in command.argv),
+        gpus=command.env.get("CUDA_VISIBLE_DEVICES", "<inherited>"),
+    )
     child_env = os.environ.copy()
     child_env.update(command.env)
     kwargs = {"env": child_env, "start_new_session": True}

@@ -184,6 +184,13 @@ class Qwen3DFlashAttention(nn.Module):
             )
         else:
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        if self.config._attn_implementation == "flex_attention":
+            # Draft blocks issue short (<128-token) GQA queries, which routes
+            # inductor to its flex-decoding kernel. That path computes
+            # BLOCK_M = next_pow2(q_len_hint * gqa_groups) and rejects every
+            # config once BLOCK_M exceeds the 128 sparse block size, raising
+            # NoValidChoicesError. Force the main flex kernel instead.
+            kwargs.setdefault("kernel_options", {"FORCE_USE_FLEX_ATTENTION": True})
         attn_output, attn_weights = attn_fn(
             self,
             q,

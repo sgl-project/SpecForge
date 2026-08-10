@@ -302,7 +302,7 @@ index 1cff5c983..a5935fa3c 100644
 +            # Aux capture without a draft worker, routed to the strategy's own
 +            # capture method (they wire different submodules — e.g. VL models
 +            # only populate layers_to_capture via the dflash path).
-+            if getattr(server_args, "spec_capture_method", "eagle3") == "dflash":
++            if getattr(server_args, "spec_capture_method", "eagle3") in ("dflash", "dspark"):
 +                self.dflash_use_aux_hidden_state = True
 +                self.dflash_target_layer_ids = server_args.spec_capture_aux_layer_ids
 +                if hasattr(self, "spec_aux_config"):
@@ -332,7 +332,7 @@ diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
 index c7162c16d..d515b3c69 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
-@@ -2127,6 +2127,25 @@ class ServerArgs:
+@@ -2127,6 +2127,26 @@ class ServerArgs:
          bool,
          "Enable returning hidden states with responses.",
      ] = False
@@ -351,7 +351,8 @@ index c7162c16d..d515b3c69 100644
 +    ] = None
 +    spec_capture_method: A[
 +        str,
-+        "Capture method for --enable-spec-capture: 'eagle3' or 'dflash'. Must "
++        "Capture method for --enable-spec-capture: 'eagle3', 'dflash', or "
++        "'dspark' (dspark reuses the dflash aux wiring on stock SGLang). Must "
 +        "match the draft strategy being trained; they wire capture onto "
 +        "different submodules (VL targets only populate the dflash path).",
 +    ] = "eagle3"
