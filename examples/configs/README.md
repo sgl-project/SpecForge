@@ -73,7 +73,7 @@ errors; YAML files and dotted CLI overrides go through the same validation.
 New checked-in recipes should explicitly set `training.strategy`,
 `deployment.mode`, `deployment.trainer.nnodes`,
 `deployment.trainer.nproc_per_node`, `run_id`, and `output_dir`, even when the
-schema has the same default. A minimal server-only online recipe looks like:
+schema has the same default. A minimal external-server online recipe looks like:
 
 ```yaml
 model:
@@ -118,6 +118,8 @@ assume the command runs from the repository root.
 
 | Workflow | Canonical starting point |
 | --- | --- |
+| DSpark colocated online | `qwen3-8b-dspark-colocated.yaml` |
+| K3-class colocated HSDP | `kimi-k3-dspark-colocated.yaml` |
 | EAGLE3 colocated offline | `qwen3-8b-eagle3-offline.yaml` |
 | DFlash colocated offline | `qwen3-8b-dflash-offline.yaml` |
 | Domino colocated offline | `qwen3-8b-domino-offline.yaml` |
@@ -151,7 +153,7 @@ should make their training strategy and topology explicit.
 | `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
 | `model.target_backend` | `sglang` | `sglang` is the only accepted value; retired `hf`/`custom` names fail at config load. Offline feature consumers do not instantiate a target inference backend. |
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
-| `model.shard_target_output` | `false` | Retained for config migration; leave it false on the server-only online path. |
+| `model.shard_target_output` | `false` | Retained for config migration; leave it false on every SGLang online path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
 | `model.use_liger_kernel` | `false` | Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash training. Requires the `specforge[liger]` extra. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
@@ -164,9 +166,9 @@ should make their training strategy and topology explicit.
 | `model.mask_token_id` | `null` | DFlash-family/P-EAGLE mask token override. Otherwise it resolves from the draft config and then the tokenizer. |
 | `model.tokenizer_pad_token_id` | `null` | Explicit non-negative tokenizer pad ID. Use it for released tokenizers that omit padding metadata. |
 | `model.sglang_attention_backend` | `flashinfer` | SGLang attention implementation for an in-process or managed capture server. |
-| `model.sglang_mem_fraction_static` | `0.4` | SGLang static-memory fraction in `(0, 1]`; inherited by managed capture servers unless they override it. |
+| `model.sglang_mem_fraction_static` | `0.4` | SGLang weights plus static KV/cache budget in `(0, 1]`; it is not an exclusive GPU partition. Inherited by managed capture servers unless they override it. |
 | `model.sglang_disable_radix_cache` | `true` | Preserve the historical managed-capture behavior. Set `false` for hybrid targets such as Inkling that require the radix tree. Unique per-attempt cache namespaces still force complete capture prefills. |
-| `model.sglang_context_length` | `null` | Positive explicit context limit. Managed capture requires at least `data.max_length + 7`; omitting it derives that value. |
+| `model.sglang_context_length` | `null` | Positive explicit context limit. Managed and colocated capture require at least `data.max_length + 7`; omitting it derives that value. |
 | `model.sglang_enable_nccl_nvls` | `false` | Pass the matching SGLang NCCL NVLS optimization flag. |
 | `model.sglang_enable_symm_mem` | `false` | Pass the matching SGLang symmetric-memory flag. |
 | `model.sglang_enable_torch_compile` | `false` | Enable the SGLang torch-compile path. |
@@ -202,7 +204,7 @@ Exactly one of the first three fields must be non-empty:
 | `data.is_preformatted` | `false` | Treat each record's text as already formatted by `chat_template`. |
 | `data.train_only_last_turn` | `false` | Restrict the loss mask to the final assistant turn. |
 | `data.build_dataset_num_proc` | `8` | Positive CPU process count for dataset preprocessing. |
-| `data.dataloader_num_workers` | `null` | Ordered feature-loader workers. `null` preserves strategy defaults: EAGLE/P-EAGLE 4, DFlash-family 8; use 0 for synchronous loading. |
+| `data.dataloader_num_workers` | `null` | Ordered feature-loader workers. `null` preserves strategy defaults: EAGLE/P-EAGLE 4, DFlash-family 8. Colocated target capture remains synchronous regardless, to keep CUDA work on the trainer thread. |
 | `data.cache_dir` | `./cache` | Prepared dataset and derived vocabulary-mapping cache. |
 | `data.cache_key` | `null` | Optional explicit namespace when multiple preparations share the same source. |
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
@@ -223,14 +225,14 @@ Common fields:
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
-| `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
+| `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer mode: `SHARD_GRAD_OP`, `FULL_SHARD`, `HYBRID_SHARD`, or `NO_SHARD`. `HYBRID_SHARD` uses the colocated target-TP group for node-local sharding and the target-DP group for replication. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
-| `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
+| `training.tp_size` | `1` | Colocated target TP/island width. Online disaggregated and offline consumers keep it at 1. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
 | `training.sp_ring_size` | `1` | Ring sequence-parallel factor for offline EAGLE3 USP. |
 | `training.dist_timeout` | `10` | Positive distributed-operation timeout in minutes. |
@@ -241,7 +243,7 @@ Common fields:
 | `training.resume_from` | `null` | Full-run checkpoint/run root: draft, optimizer/scheduler, counters, data position, and RNG. Mutually exclusive with `model.draft_checkpoint_path`. |
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
-| `training.role` | `all` | Use `all` for local offline training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
+| `training.role` | `all` | Use `all` for local offline or colocated-online training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
 
@@ -264,6 +266,7 @@ New recipes must not write the loader-only migration fields
 | --- | --- | --- |
 | `deployment.mode` | `local_colocated` | Set `local_colocated` or `disaggregated` explicitly in every new recipe. |
 | `deployment.trainer` | default object | Trainer process topology described by the fields below. |
+| `deployment.colocated` | `null` | Optional colocated policy; defaults to capture synchronization and zero-copy local features. |
 | `deployment.disaggregated` | `null` | Required object only when `deployment.mode: disaggregated`. |
 | `deployment.trainer.nnodes` | `1` | Number of trainer nodes. |
 | `deployment.trainer.nproc_per_node` | `1` | Trainer processes per node; the single CLI self-launches local ranks. |
@@ -271,9 +274,15 @@ New recipes must not write the loader-only migration fields
 | `deployment.trainer.master_addr` | `null` | Rendezvous address; required when `nnodes > 1`. |
 | `deployment.trainer.master_port` | `29500` | Rendezvous port. |
 
-The trainer world size is `nnodes * nproc_per_node`. `training.tp_size` must
-remain 1, and the world size must be divisible by
-`training.sp_ulysses_size * training.sp_ring_size`.
+`deployment.colocated.synchronize_after_capture` defaults to `true`; it places
+a stable accelerator boundary between SGLang and the next FSDP collective.
+`deployment.colocated.zero_copy_features` also defaults to `true`; set it false
+to retain the loader's defensive clone while debugging tensor lifetime issues.
+
+The trainer world size is `nnodes * nproc_per_node` and must be divisible by
+`training.tp_size` and `training.sp_ulysses_size * training.sp_ring_size`.
+Disaggregated and offline consumers keep `training.tp_size: 1`; colocated
+online recipes use it as the target-island width.
 
 For `deployment.mode: disaggregated`, also write:
 

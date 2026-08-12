@@ -207,6 +207,12 @@ class RolloutWorker:
                     self.capture,
                     sample_id=sample_id,
                     recorded_aux_layer_ids=recorded,
+                    aux_feature_name=self.capture.extra.get(
+                        "aux_feature_name", "hidden_state"
+                    ),
+                    target_feature_name=self.capture.extra.get(
+                        "target_feature_name", "target"
+                    ),
                 )
             except CaptureMismatchError as exc:
                 # Loud failure: do not persist a corrupt sample, but keep this

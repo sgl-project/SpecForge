@@ -111,6 +111,11 @@ def _validate_world_size(cfg: Config, world_size: int) -> None:
 
 
 def _train(resolved) -> int:
+    from specforge.torch_environment import configure_flex_attention_inductor
+
+    # Install the safe dynamic-shape fallback before Accelerate imports the
+    # PyTorch compiler stack. Explicit operator settings remain authoritative.
+    configure_flex_attention_inductor(resolved.config.training.attention_backend)
     from accelerate.utils import set_seed
 
     cfg = resolved.config
@@ -135,15 +140,22 @@ def _train(resolved) -> int:
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
     )
+    failed = True
     try:
         import torch.distributed as dist
 
         _validate_world_size(cfg, dist.get_world_size())
         from specforge.application import build_application_run
 
-        return build_application_run(resolved).run()
+        result = build_application_run(resolved).run()
+        failed = False
+        return result
     finally:
-        destroy_distributed()
+        # A rank-local data/capture error can leave peers inside a CUDA or FSDP
+        # collective. Collective NCCL destruction then hides the real exception
+        # and prevents torchrun from terminating the peers. Abort communicators
+        # on the exceptional path so the originating traceback reaches elastic.
+        destroy_distributed(abort=failed)
 
 
 def _config_for_role(cfg: Config, role: str) -> Config:
@@ -176,7 +188,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         choices=("auto", "all", "producer", "consumer", "both"),
         default="auto",
         help=(
-            "launch selection (default: offline local all or online/disaggregated "
+            "launch selection (default: local all or online/disaggregated "
             "producer+consumer)"
         ),
     )

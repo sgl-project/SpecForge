@@ -16,8 +16,8 @@
 
 The application resolves one immutable algorithm registration and passes it
 through every builder.  This module never resolves an algorithm name and never
-constructs an in-process online target engine; online capture comes exclusively
-from an external SGLang server through the disaggregated runtime.
+constructs algorithm-specific target policy. Online capture uses either a local
+SGLang runner or an external SGLang server through the disaggregated runtime.
 
 Heavy model/data dependencies stay lazy so importing :mod:`specforge.training`
 does not load Transformers, datasets, or a target backend.
@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
-from specforge.config import Config
+from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config
 from specforge.training.provenance import (
     model_resume_provenance as _model_resume_provenance,
 )
@@ -178,6 +178,11 @@ def _load_input_tools(
 
 def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> ModelBundle:
     """Build the method-specific composite model and frozen target pieces."""
+    from specforge.torch_environment import configure_flex_attention_inductor
+
+    # Programmatic callers do not pass through the CLI's early environment
+    # setup, so install the same safe default before importing model modules.
+    configure_flex_attention_inductor(cfg.training.attention_backend)
     import torch
 
     from specforge.modeling.target.target_utils import (
@@ -293,6 +298,14 @@ def _logger(metrics, step):
 
 def _configured_logger(cfg: Config):
     """Create an external tracker only for a trainer-bearing run."""
+    if cfg.training.role != "producer":
+        import torch.distributed as dist
+
+        # A distributed run has one logical metric stream.  Letting every rank
+        # create W&B/MLflow runs or write the same TensorBoard directory both
+        # duplicates metrics and makes large jobs increasingly fragile.
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return None
     if cfg.tracking.report_to == "none" or cfg.training.role == "producer":
         return _logger
 
@@ -413,6 +426,91 @@ def _prepare_prompts(
     )
 
 
+def _training_prompt_cache_ready_file(cfg: Config, tokenizer) -> Optional[str]:
+    """Return the completion sentinel for the training prompt map cache."""
+    if not cfg.data.cache_dir:
+        return None
+    cache_key = cfg.data.cache_key or _prompt_cache_key(cfg, tokenizer=tokenizer)
+    return os.path.join(cfg.data.cache_dir, f"{cache_key}.ready")
+
+
+def _prepare_colocated_prompts(
+    cfg: Config,
+    tokenizer,
+    *,
+    algorithm: AlgorithmRegistration,
+    draft_config,
+) -> Sequence[dict]:
+    """Populate a reusable prompt cache once before colocated ranks read it.
+
+    Raw prompt tokenization can spawn many worker processes.  Starting that
+    work independently on every training rank causes a startup storm on large
+    HSDP jobs and lets several ranks race to write the same Arrow cache.  Rank
+    zero populates shared storage first; for node-local cache paths, local rank
+    zero on each remaining node fills that node's copy.  Every other rank then
+    takes the normal cache-hit path and receives its own memory-mapped dataset.
+    """
+
+    ready_file = _training_prompt_cache_ready_file(cfg, tokenizer)
+
+    def prepare(*, mark_ready: bool = False) -> Sequence[dict]:
+        prompts = _prepare_prompts(
+            cfg,
+            tokenizer,
+            algorithm=algorithm,
+            draft_config=draft_config,
+        )
+        if mark_ready and ready_file is not None:
+            os.makedirs(cfg.data.cache_dir, exist_ok=True)
+            temporary = f"{ready_file}.{os.getpid()}.tmp"
+            with open(temporary, "w", encoding="utf-8") as stream:
+                stream.write("ready\n")
+            os.replace(temporary, ready_file)
+        return prompts
+
+    import torch.distributed as dist
+
+    if (
+        ready_file is None
+        or not dist.is_available()
+        or not dist.is_initialized()
+        or dist.get_world_size() == 1
+    ):
+        return prepare()
+
+    def prepare_collectively(should_prepare: bool) -> Optional[Sequence[dict]]:
+        prompts = None
+        error = None
+        if should_prepare:
+            try:
+                prompts = prepare(mark_ready=True)
+            except BaseException as exc:
+                error = f"rank {dist.get_rank()}: {type(exc).__name__}: {exc}"
+        errors = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, error)
+        failures = [item for item in errors if item is not None]
+        if failures:
+            raise RuntimeError(
+                "colocated prompt-cache preparation failed: " + "; ".join(failures)
+            )
+        return prompts
+
+    prompts = prepare_collectively(dist.get_rank() == 0)
+
+    # On a shared filesystem rank zero's cache is now visible everywhere.  On
+    # node-local storage, exactly one process per missing node performs the
+    # same deterministic build.
+    node_prompts = prepare_collectively(
+        prompts is None
+        and int(os.environ.get("LOCAL_RANK", "0")) == 0
+        and not os.path.isfile(ready_file)
+    )
+    if prompts is None:
+        prompts = node_prompts
+
+    return prompts if prompts is not None else prepare()
+
+
 def _install_dataset_vocab_mapping(
     cfg: Config,
     bundle: ModelBundle,
@@ -507,6 +605,60 @@ def _ensure_offline_vocab_mapping(
     )
 
 
+def _ensure_online_vocab_mapping(
+    cfg: Config,
+    bundle: ModelBundle,
+    algorithm: AlgorithmRegistration,
+    prompts: Sequence[dict],
+) -> None:
+    """Derive a colocated streaming vocabulary map from prepared prompts."""
+    if FeatureMode.STREAMING not in algorithm.providers.vocab_mapping_modes:
+        return
+    if (
+        cfg.model.vocab_mapping_path
+        or bundle.draft_vocab_size == bundle.target_vocab_size
+    ):
+        return
+    counts: Counter = Counter()
+    for task in prompts:
+        payload = task["payload"]
+        for token_id, keep in zip(payload["input_ids"], payload["loss_mask"]):
+            if keep:
+                counts[int(token_id)] += 1
+    _install_dataset_vocab_mapping(
+        cfg,
+        bundle,
+        counts=counts,
+        dataset_identity=cfg.data.cache_key or _prompt_cache_key(cfg),
+    )
+
+
+def _colocated_sglang_kwargs(cfg: Config) -> Dict[str, Any]:
+    """Map the typed ``sglang_*`` namespace to local ``ServerArgs`` fields."""
+    context_length = cfg.model.sglang_context_length or (
+        cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
+    )
+    target_batch_size = cfg.training.batch_size * cfg.training.tp_size
+    overrides = {
+        "sglang_context_length": context_length,
+        "sglang_max_running_requests": (
+            cfg.model.sglang_max_running_requests or target_batch_size
+        ),
+        "sglang_max_total_tokens": (
+            cfg.model.sglang_max_total_tokens or target_batch_size * context_length
+        ),
+        "sglang_dp_size": 1,
+    }
+    kwargs = {}
+    for name in type(cfg.model).model_fields:
+        if not name.startswith("sglang_"):
+            continue
+        value = overrides.get(name, getattr(cfg.model, name))
+        if value is not None:
+            kwargs[name.removeprefix("sglang_")] = value
+    return kwargs
+
+
 def _dataloader_num_workers(cfg: Config, algorithm: AlgorithmRegistration) -> int:
     dataloader_num_workers = cfg.data.dataloader_num_workers
     if dataloader_num_workers is None:
@@ -573,8 +725,8 @@ def build_training_run(
     """Assemble one validated run from an already-resolved algorithm.
 
     Offline training may run in one process or with a disaggregated feature
-    source.  Online training is always disaggregated and captures through
-    external SGLang servers; colocated online execution is intentionally absent.
+    source. Online training selects either bounded in-process SGLang capture or
+    the external-server disaggregated transport from ``deployment.mode``.
     """
 
     if algorithm.name != cfg.training.strategy:
@@ -588,12 +740,6 @@ def build_training_run(
         import torch.distributed as dist
 
         cfg.validate_world_size(dist.get_world_size() if dist.is_initialized() else 1)
-
-    if cfg.mode == "online" and cfg.deployment.mode != "disaggregated":
-        raise ValueError(
-            "online training is server-only and requires "
-            "deployment.mode='disaggregated'"
-        )
 
     if cfg.deployment.mode == "disaggregated":
         from specforge.training.disaggregated import build_disaggregated_run
@@ -619,32 +765,166 @@ def build_training_run(
             _close_configured_logger(run_logger)
             raise
 
-    if cfg.mode != "offline":
-        raise ValueError("colocated execution supports offline training only")
-
     bundle = build_model_bundle(cfg, algorithm=algorithm)
-    from specforge.launch import build_offline_runtime
+    if cfg.mode == "offline":
+        from specforge.launch import build_offline_runtime
 
-    _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
+        _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
+        run_logger = _configured_logger(cfg)
+        try:
+            trainer = build_offline_runtime(
+                hidden_states_path=cfg.data.hidden_states_path,
+                eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
+                draft_model=bundle.model,
+                target_head=bundle.target_head,
+                ttt_length=t.ttt_length,
+                max_len=cfg.data.max_length,
+                num_epochs=t.num_epochs,
+                use_usp_preprocess=(t.attention_backend == "usp"),
+                seed=t.seed,
+                resume_from=t.resume_from,
+                **_common_launch_kwargs(
+                    cfg,
+                    bundle,
+                    algorithm,
+                    logger=run_logger,
+                ),
+            )
+        except BaseException:
+            _close_configured_logger(run_logger)
+            raise
+        return TrainingRun(trainer=trainer)
+
+    from specforge.launch import (
+        _plan_online_prompt_stream,
+        _preposition_online_prompts,
+        _target_dp_layout,
+        build_colocated_online_runtime,
+    )
+
+    prompts = _prepare_colocated_prompts(
+        cfg,
+        bundle.input_tools,
+        algorithm=algorithm,
+        draft_config=bundle.draft_config,
+    )
+    if not prompts:
+        raise ValueError("online data preparation produced no trainable prompts")
+    _ensure_online_vocab_mapping(cfg, bundle, algorithm, prompts)
+    source_prompt_count = len(prompts)
+    prompt_seed = t.seed if t.prompt_seed is None else t.prompt_seed
+    prompts = _plan_online_prompt_stream(
+        prompts,
+        num_epochs=t.num_epochs,
+        seed=prompt_seed,
+        tp_size=t.tp_size,
+        batch_size=t.batch_size,
+        shuffle=True,
+    )
+    if not prompts:
+        raise ValueError(
+            "online prompt planning produced no complete target batch after "
+            "target-DP sharding; provide at least tp_size * batch_size prompts "
+            "per target-DP replica"
+        )
+    dataset_size = len(prompts) // t.tp_size
+
+    resume_state = None
+    remaining_prompts = prompts
+    if t.resume_from is not None:
+        from specforge.training.checkpoint import CheckpointManager
+
+        resume_state = CheckpointManager.read_resume_state(t.resume_from)
+        checkpoint_epoch = int(resume_state.get("epoch", 0))
+        can_preposition = all(
+            resume_state.get(key) in (None, current)
+            for key, current in (
+                ("dataset_size", dataset_size),
+                ("batch_size", t.batch_size),
+                ("tp_size", t.tp_size),
+            )
+        )
+        if checkpoint_epoch == 0 and can_preposition:
+            remaining_prompts = _preposition_online_prompts(
+                prompts,
+                local_samples=int(resume_state.get("epoch_samples", 0)),
+                tp_size=t.tp_size,
+            )
+        else:
+            remaining_prompts = []
+
+    from specforge.training.schedule import resolve_total_steps
+
+    total_steps = resolve_total_steps(
+        total_steps=t.total_steps,
+        max_steps=t.max_steps,
+        num_samples=dataset_size,
+        batch_size=t.batch_size,
+        accumulation_steps=t.accumulation_steps,
+        num_epochs=1,
+    )
+    target_dp_rank, target_dp_size = _target_dp_layout()
+    checkpoint_extra = {
+        "online_prompt_plan_version": 2,
+        "prompt_source_size": source_prompt_count,
+        "prompt_seed": prompt_seed,
+        "prompt_epochs": t.num_epochs,
+        "target_dp_rank": target_dp_rank,
+        "target_dp_size": target_dp_size,
+        "colocated_capture": "sglang_hidden_state_v1",
+    }
+    policy = cfg.deployment.colocated
+    synchronize_after_capture = (
+        True if policy is None else policy.synchronize_after_capture
+    )
+    zero_copy_features = True if policy is None else policy.zero_copy_features
+
     run_logger = _configured_logger(cfg)
     try:
-        trainer = build_offline_runtime(
-            hidden_states_path=cfg.data.hidden_states_path,
-            eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
+        import torch
+
+        from specforge.inference.adapters import LocalSGLangCaptureAdapter
+        from specforge.offline_capture import load_offline_capture
+
+        target_capture = load_offline_capture(
+            cfg.model.target_model_path,
+            torch_dtype=getattr(torch, cfg.model.torch_dtype),
+            trust_remote_code=cfg.model.trust_remote_code,
+            **_colocated_sglang_kwargs(cfg),
+        )
+        streaming = algorithm.providers.server_streaming_for(cfg.model.input_modality)
+        target_capture.set_capture_layers(
+            bundle.capture_layers,
+            capture_method=streaming.capture_method,
+        )
+        feature_source = LocalSGLangCaptureAdapter(
+            target_capture,
+            provider=streaming,
+            synchronize_after_capture=synchronize_after_capture,
+        )
+        common = _common_launch_kwargs(
+            cfg,
+            bundle,
+            algorithm,
+            logger=run_logger,
+        )
+        common["total_steps"] = total_steps
+        trainer = build_colocated_online_runtime(
+            prompts=remaining_prompts,
+            feature_source=feature_source,
             draft_model=bundle.model,
             target_head=bundle.target_head,
-            ttt_length=t.ttt_length,
-            max_len=cfg.data.max_length,
-            num_epochs=t.num_epochs,
-            use_usp_preprocess=(t.attention_backend == "usp"),
-            seed=t.seed,
+            target_hidden_size=bundle.target_hidden_size,
+            target_vocab_size=bundle.target_vocab_size,
+            draft_vocab_size=bundle.draft_vocab_size,
+            target_repr=streaming.target_representation,
+            aux_hidden_state_layer_ids=bundle.capture_layers,
             resume_from=t.resume_from,
-            **_common_launch_kwargs(
-                cfg,
-                bundle,
-                algorithm,
-                logger=run_logger,
-            ),
+            resume_state=resume_state,
+            dataset_size=dataset_size,
+            checkpoint_extra=checkpoint_extra,
+            zero_copy_features=zero_copy_features,
+            **common,
         )
     except BaseException:
         _close_configured_logger(run_logger)

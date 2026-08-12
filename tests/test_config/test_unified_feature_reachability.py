@@ -146,7 +146,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 65)
+        self.assertEqual(len(paths), 67)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths
@@ -196,8 +196,10 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         for filename, config in configs.items():
             if config.mode != "online":
                 continue
-            with self.subTest(config=filename, contract="server-only online"):
-                self.assertEqual(config.deployment.mode, "disaggregated")
+            with self.subTest(config=filename, contract="SGLang online"):
+                self.assertIn(
+                    config.deployment.mode, {"disaggregated", "local_colocated"}
+                )
                 self.assertEqual(config.model.target_backend, "sglang")
                 self.assertEqual(config.model.input_modality, "text")
 
@@ -344,6 +346,15 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         )
         self.assertEqual(output_dir, "/tmp/output")
         self.assertIs(create.call_args.kwargs["console_logger"], _logger)
+
+    def test_only_global_rank_zero_creates_a_training_logger(self):
+        cfg = Config.model_validate(OFFLINE_EAGLE3)
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_rank", return_value=3),
+        ):
+            self.assertIsNone(_configured_logger(cfg))
 
     def test_tracking_backend_is_strictly_typed(self):
         with self.assertRaises(ValidationError):

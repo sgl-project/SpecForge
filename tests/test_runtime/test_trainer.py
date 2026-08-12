@@ -16,7 +16,7 @@ from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
-from specforge.training.backend import TrainingBackend
+from specforge.training.backend import ParallelConfig, TrainingBackend
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import (
     Checkpoint,
@@ -442,6 +442,31 @@ class TestTrainerCore(unittest.TestCase):
 
 
 class TestTrainerController(unittest.TestCase):
+    def test_target_tp_peers_count_as_distinct_draft_training_samples(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        backend.parallel_config = ParallelConfig(world_size=4, tp_size=2)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        logged = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=1,
+                num_epochs=1,
+                log_interval=1,
+                logger=lambda metrics, step: logged.append((dict(metrics), step)),
+            )
+            with mock.patch(
+                "specforge.training.controller.time.perf_counter",
+                side_effect=(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0),
+            ):
+                self.assertEqual(ctrl.fit([_batch()]), 1)
+
+        metrics, _ = logged[0]
+        self.assertEqual(metrics["perf/global_samples_per_second"], 4.0)
+
     def test_training_log_reports_pipeline_throughput_breakdown(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
@@ -456,6 +481,7 @@ class TestTrainerController(unittest.TestCase):
                 num_epochs=1,
                 log_interval=2,
                 logger=lambda metrics, step: logged.append((dict(metrics), step)),
+                runtime_metrics_provider=lambda: {"colocated_capture_time_s": 0.25},
             )
             self.assertEqual(ctrl.fit([_batch(), _batch()]), 2)
 
@@ -469,6 +495,7 @@ class TestTrainerController(unittest.TestCase):
             "perf/train_compute_time_s",
             "perf/durable_ack_time_s",
             "perf/global_samples_per_second",
+            "perf/colocated_capture_time_s",
         ):
             self.assertIn(name, metrics)
             self.assertGreaterEqual(metrics[name], 0.0)

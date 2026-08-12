@@ -9,9 +9,21 @@ import torch
 
 from specforge.offline_capture.sglang_backend import patch as sglang_patch
 from specforge.offline_capture.sglang_backend import utils as sglang_utils
+from specforge.offline_capture.sglang_backend.capture import (
+    OfflineSGLangCaptureBackend,
+)
 
 
 class SGLang0514CompatibilityTest(unittest.TestCase):
+    def test_dspark_uses_dense_dflash_capture_hook_as_compatibility_fallback(self):
+        model = mock.Mock(spec=["set_dflash_layers_to_capture"])
+        backend = object.__new__(OfflineSGLangCaptureBackend)
+        backend.model_runner = types.SimpleNamespace(model=model)
+
+        backend.set_capture_layers([1, 9, 17], capture_method="dspark")
+
+        model.set_dflash_layers_to_capture.assert_called_once_with([1, 9, 17])
+
     def test_tp_and_pdmux_calls_omit_removed_keywords(self):
         tree = ast.parse(
             textwrap.dedent(inspect.getsource(sglang_patch.initialize_model_parallel))

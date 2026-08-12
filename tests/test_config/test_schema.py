@@ -105,6 +105,28 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Config.model_validate(payload)
 
+    def test_hybrid_shard_requires_multiple_colocated_target_islands(self):
+        payload = _online_payload("dspark")
+        payload["deployment"] = {
+            "mode": "local_colocated",
+            "trainer": {
+                "nnodes": 2,
+                "nproc_per_node": 8,
+                "master_addr": "trainer-0",
+            },
+        }
+        payload["training"].update({"tp_size": 8, "fsdp_sharding": "HYBRID_SHARD"})
+
+        config = Config.model_validate(payload)
+
+        self.assertEqual(config.training.fsdp_sharding, "HYBRID_SHARD")
+        config.validate_world_size(16)
+
+        payload["deployment"]["trainer"]["nnodes"] = 1
+        payload["deployment"]["trainer"].pop("master_addr")
+        with self.assertRaisesRegex(ValidationError, "two colocated target islands"):
+            Config.model_validate(payload)
+
     def test_removed_vlm_pixel_knobs_are_rejected(self):
         for field in ("min_pixels", "max_pixels"):
             payload = copy.deepcopy(MINIMAL)
@@ -140,9 +162,7 @@ class ConfigSchemaTest(unittest.TestCase):
         payload["model"]["shard_target_output"] = True
         cfg = Config.model_validate(payload)
         self.assertTrue(cfg.model.shard_target_output)
-        with self.assertRaisesRegex(
-            ValueError, "unavailable with external server capture"
-        ):
+        with self.assertRaisesRegex(ValueError, "unavailable with SGLang capture"):
             resolve_run(cfg)
 
     def test_sglang_expert_parallelism_must_fit_target_tensor_parallelism(self):

@@ -48,13 +48,12 @@ class ModelConfig(StrictConfigModel):
     draft_num_hidden_layers: Optional[int] = Field(default=None, gt=0)
     #: Optional DFlash block-size override (auto-generated default: 16).
     draft_block_size: Optional[int] = Field(default=None, gt=0)
-    #: Online capture always runs on an external SGLang server; the in-process
-    #: HF/custom target backends were removed with the server-only cutover, so
-    #: configs naming them fail at load instead of being silently ignored.
+    #: Online capture uses SGLang, either in-process for local_colocated or via
+    #: an external server for disaggregated execution. Retired HF/custom names
+    #: fail at load instead of being silently ignored.
     target_backend: Literal["sglang"] = "sglang"
-    #: Retained for offline/config migration only. The server-only online path
-    #: transports complete feature records and does not shard target outputs in
-    #: the trainer.
+    #: Retained for offline/config migration only. SGLang capture emits complete
+    #: per-sample hidden-state records; TP ownership is handled by batch slicing.
     shard_target_output: bool = False
     #: Input family consumed by the capture provider. Built-in algorithms support
     #: text only; unsupported modalities fail during application resolution.
@@ -500,11 +499,25 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
         return self
 
 
+class ColocatedDeploymentConfig(StrictConfigModel):
+    """Runtime policy for in-process SGLang capture plus draft training.
+
+    The target engine and FSDP draft share each accelerator.  Capture is
+    intentionally pull-through (one local training batch resident at a time),
+    so these switches control only the two safety/performance boundaries that
+    are useful to expose to operators.
+    """
+
+    synchronize_after_capture: bool = True
+    zero_copy_features: bool = True
+
+
 class DeploymentConfig(StrictConfigModel):
     """User-facing launch topology for ``specforge train``."""
 
     mode: Literal["local_colocated", "disaggregated"] = "local_colocated"
     trainer: TrainerDeploymentConfig = Field(default_factory=TrainerDeploymentConfig)
+    colocated: Optional[ColocatedDeploymentConfig] = None
     disaggregated: Optional[DisaggregatedDeploymentConfig] = None
 
     @model_validator(mode="after")
@@ -518,6 +531,10 @@ class DeploymentConfig(StrictConfigModel):
             raise ValueError(
                 "deployment.disaggregated requires deployment.mode=disaggregated"
             )
+        if self.mode == "disaggregated" and self.colocated is not None:
+            raise ValueError(
+                "deployment.colocated requires deployment.mode=local_colocated"
+            )
         return self
 
 
@@ -528,7 +545,9 @@ class TrainingConfig(StrictConfigModel):
     total_steps: Optional[int] = Field(default=None, gt=0)
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
-    fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    fsdp_sharding: Literal[
+        "SHARD_GRAD_OP", "FULL_SHARD", "HYBRID_SHARD", "NO_SHARD"
+    ] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
@@ -540,8 +559,10 @@ class TrainingConfig(StrictConfigModel):
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
     )
-    #: Trainer tensor parallelism. The unified runtime currently requires one;
-    #: target-model TP belongs to external or managed capture servers.
+    #: Colocated target tensor parallelism.  Each contiguous TP group owns one
+    #: target replica; the draft still participates in FSDP across the trainer
+    #: world (or HSDP with the TP group as its node-local shard group).
+    #: Disaggregated/offline consumers keep this at one.
     tp_size: int = Field(default=1, gt=0)
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
@@ -584,9 +605,9 @@ class TrainingConfig(StrictConfigModel):
     compact_teacher_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
-    #: ``all`` is an offline colocated run. Online runs launch producer and
-    #: consumer as separate ``specforge train`` processes with the same config
-    #: and different roles.
+    #: ``all`` is a local offline or colocated-online run. Disaggregated online
+    #: runs launch producer and consumer as separate ``specforge train``
+    #: processes with the same config and different roles.
     role: Literal["auto", "all", "producer", "consumer"] = "all"
     seed: int = 42
     #: Deterministic online prompt ordering. ``None`` preserves the historical
@@ -720,20 +741,20 @@ class Config(StrictConfigModel):
         deployment = self.deployment.mode
         role = self.training.role
 
-        if mode == "online" and deployment != "disaggregated":
-            raise ValueError(
-                "online training requires deployment.mode=disaggregated; "
-                "colocated online training is no longer supported"
-            )
         if mode == "online" and self.model.target_backend != "sglang":
             raise ValueError(
-                "online training uses an external SGLang capture server and "
+                "online training uses SGLang target capture and "
                 "requires model.target_backend=sglang"
             )
         if role != "all" and deployment != "disaggregated":
             raise ValueError(
                 "training.role=auto/producer/consumer requires "
                 "deployment.mode=disaggregated"
+            )
+        if mode != "online" and self.deployment.colocated is not None:
+            raise ValueError(
+                "deployment.colocated is valid only for online local_colocated "
+                "training"
             )
         if deployment == "disaggregated" and role == "all":
             raise ValueError(
@@ -757,7 +778,7 @@ class Config(StrictConfigModel):
         if self.data.eval_data_path:
             raise ValueError(
                 "data.eval_data_path is unsupported; online evaluation is not "
-                "supported by the server-only capture path"
+                "supported by the SGLang capture paths"
             )
         has_eval_source = bool(self.data.eval_hidden_states_path)
         has_eval_interval = self.training.eval_interval > 0
@@ -891,6 +912,74 @@ class Config(StrictConfigModel):
                     "divide every managed capture-server tp_size; incompatible "
                     f"tp sizes: {incompatible_tp_sizes}"
                 )
+        if mode == "online" and deployment == "local_colocated":
+            minimum_context_length = (
+                self.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
+            )
+            if (
+                self.model.sglang_context_length is not None
+                and self.model.sglang_context_length < minimum_context_length
+            ):
+                raise ValueError(
+                    "colocated model.sglang_context_length must be at least "
+                    "data.max_length + "
+                    f"{SGLANG_CAPTURE_CONTEXT_HEADROOM} for SGLang capture "
+                    f"request headroom ({minimum_context_length})"
+                )
+            if self.model.shard_target_output:
+                raise ValueError(
+                    "model.shard_target_output is unavailable with colocated "
+                    "SGLang capture"
+                )
+            if self.training.sp_ulysses_size != 1 or self.training.sp_ring_size != 1:
+                raise ValueError(
+                    "colocated online training does not yet compose target TP "
+                    "with draft sequence parallelism; keep training.sp sizes at 1"
+                )
+            if self.model.sglang_dp_size not in (None, 1):
+                raise ValueError(
+                    "colocated target replicas are derived from training.tp_size; "
+                    "keep model.sglang_dp_size unset or 1"
+                )
+            target_batch_size = self.training.tp_size * self.training.batch_size
+            if (
+                self.model.sglang_max_running_requests is not None
+                and self.model.sglang_max_running_requests < target_batch_size
+            ):
+                raise ValueError(
+                    "colocated model.sglang_max_running_requests must be at least "
+                    "training.tp_size * training.batch_size "
+                    f"({target_batch_size})"
+                )
+            minimum_total_tokens = target_batch_size * self.data.max_length
+            if (
+                self.model.sglang_max_total_tokens is not None
+                and self.model.sglang_max_total_tokens < minimum_total_tokens
+            ):
+                raise ValueError(
+                    "colocated model.sglang_max_total_tokens must be at least "
+                    "training.tp_size * training.batch_size * data.max_length "
+                    f"({minimum_total_tokens})"
+                )
+            unsupported_dp_options = [
+                name
+                for name in (
+                    "sglang_enable_dp_attention",
+                    "sglang_enable_dp_lm_head",
+                )
+                if getattr(self.model, name)
+            ]
+            if unsupported_dp_options:
+                raise ValueError(
+                    "colocated target replicas are owned by SpecForge and do not "
+                    f"support SGLang DP options: {unsupported_dp_options}"
+                )
+            ep_size = self.model.sglang_ep_size
+            if ep_size > self.training.tp_size or self.training.tp_size % ep_size:
+                raise ValueError(
+                    "model.sglang_ep_size must be no larger than and evenly "
+                    "divide training.tp_size for colocated capture"
+                )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
         if self.training.attention_backend == "usp":
@@ -916,6 +1005,20 @@ class Config(StrictConfigModel):
                 "data parallelism; configure target TP on the external server and "
                 "keep training.tp_size/sp sizes at 1"
             )
+        if self.training.fsdp_sharding == "HYBRID_SHARD":
+            trainer_world = (
+                self.deployment.trainer.nnodes * self.deployment.trainer.nproc_per_node
+            )
+            if deployment != "local_colocated" or mode != "online":
+                raise ValueError(
+                    "training.fsdp_sharding=HYBRID_SHARD currently requires "
+                    "online deployment.mode=local_colocated"
+                )
+            if self.training.tp_size <= 1 or trainer_world <= self.training.tp_size:
+                raise ValueError(
+                    "HYBRID_SHARD requires training.tp_size > 1 and at least "
+                    "two colocated target islands"
+                )
         return self
 
     @property
@@ -937,6 +1040,13 @@ class Config(StrictConfigModel):
                 f"world_size={world_size} must be divisible by draft sequence "
                 f"parallel size {sp_size} "
                 "(sp_ulysses_size * sp_ring_size)"
+            )
+        if self.training.fsdp_sharding == "HYBRID_SHARD" and (
+            tp_size <= 1 or world_size <= tp_size
+        ):
+            raise ValueError(
+                "HYBRID_SHARD requires a target-TP shard group larger than one "
+                "and at least two target-DP replicas"
             )
 
     @classmethod
