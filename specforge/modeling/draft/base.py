@@ -33,9 +33,10 @@ from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
+from specforge.modeling.draft.vocab_mixin import DraftVocabMappingMixin
 
 
-class Eagle3DraftModel(PreTrainedModel, ABC):
+class Eagle3DraftModel(DraftVocabMappingMixin, PreTrainedModel, ABC):
     """
     This is the base class for the Eagle3 draft model implementation. The child class needs to implement
     the abstract methods to support training with TTT.
@@ -190,17 +191,5 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
             local_cache_path = snapshot_download(repo_id=model_path)
             self.load_embedding(local_cache_path, embedding_key)
 
-    def load_vocab_mapping(self, file_path: str) -> None:
-        """
-        Load the vocab buffers of the draft model.
-
-        Args:
-            file_path (str): The path to the vocab mapping file.
-        """
-        assert hasattr(self, "t2d") and hasattr(
-            self, "d2t"
-        ), "t2d and d2t buffersare not found in the draft model, please check your draft model implementation"
-        vocab_mapping = torch.load(file_path)
-        self.t2d.copy_(vocab_mapping["t2d"])
-        self.d2t.copy_(vocab_mapping["d2t"])
-        self.vocab_mapping_loaded = True
+    # ``load_vocab_mapping`` / ``install_vocab_mapping`` come from
+    # DraftVocabMappingMixin, shared with the DFlash family.

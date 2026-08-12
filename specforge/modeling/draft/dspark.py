@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -33,17 +33,30 @@ class AcceptRatePredictor(nn.Module):
 
 
 class VanillaMarkovHead(nn.Module):
-    """Low-rank previous-token logit bias used by DSpark."""
+    """Low-rank previous-token logit bias used by DSpark.
 
-    def __init__(self, *, vocab_size: int, markov_rank: int):
+    The two factors do not share a vocabulary. ``markov_w1`` is indexed by the
+    preceding *real* token, which can be any target id, so it stays at the full
+    target vocabulary. ``markov_w2`` emits a bias added onto the draft logits,
+    so it follows the (possibly pruned) draft vocabulary.
+    """
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        draft_vocab_size: Optional[int] = None,
+    ):
         super().__init__()
         self.vocab_size = int(vocab_size)
+        self.draft_vocab_size = int(draft_vocab_size or vocab_size)
         self.markov_rank = int(markov_rank)
         self.markov_head_type = "vanilla"
         if self.markov_rank <= 0:
             raise ValueError(f"markov_rank must be > 0, got {self.markov_rank}")
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.markov_w2 = nn.Linear(self.markov_rank, self.draft_vocab_size, bias=False)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -86,7 +99,15 @@ class VanillaMarkovHead(nn.Module):
         first_prev_token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         temperature: float = 0.0,
+        to_target_ids: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Autoregressively sample one block; returns ids in the TARGET vocabulary.
+
+        ``to_target_ids`` maps a sampled draft id back to its target id. It must
+        be applied before the id is fed back as ``prev_token_ids``: ``markov_w1``
+        is indexed by target ids, and a pruned draft id is a silently valid --
+        but wrong -- index into it.
+        """
         batch_size, proposal_len = base_logits.shape[:2]
         if proposal_len == 0:
             empty_tokens = torch.empty(
@@ -112,14 +133,27 @@ class VanillaMarkovHead(nn.Module):
                 step_logits.unsqueeze(1),
                 temperature=temperature,
             ).squeeze(1)
+            if to_target_ids is not None:
+                next_token_ids = to_target_ids(next_token_ids)
             sampled_tokens.append(next_token_ids)
             prev_token_ids = next_token_ids
         return torch.stack(sampled_tokens, dim=1), torch.cat(corrected_logits, dim=1)
 
 
 class GatedMarkovHead(VanillaMarkovHead):
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int):
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        draft_vocab_size: Optional[int] = None,
+    ):
+        super().__init__(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            draft_vocab_size=draft_vocab_size,
+        )
         self.markov_head_type = "gated"
         self.gate_proj = nn.Linear(hidden_size + markov_rank, markov_rank)
 
@@ -147,8 +181,19 @@ class GatedMarkovHead(VanillaMarkovHead):
 class RNNMarkovHead(VanillaMarkovHead):
     """Recurrent DSpark Markov head unrolled inside one draft block."""
 
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int):
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        draft_vocab_size: Optional[int] = None,
+    ):
+        super().__init__(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            draft_vocab_size=draft_vocab_size,
+        )
         self.markov_head_type = "rnn"
         self.state_size = markov_rank
         self.joint_proj = nn.Linear(2 * markov_rank + hidden_size, 3 * markov_rank)
@@ -215,6 +260,7 @@ class RNNMarkovHead(VanillaMarkovHead):
         first_prev_token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         temperature: float = 0.0,
+        to_target_ids: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states is None:
             raise ValueError("rnn Markov head requires hidden_states")
@@ -246,6 +292,8 @@ class RNNMarkovHead(VanillaMarkovHead):
                 step_logits.unsqueeze(1),
                 temperature=temperature,
             ).squeeze(1)
+            if to_target_ids is not None:
+                next_token_ids = to_target_ids(next_token_ids)
             sampled_tokens.append(next_token_ids)
             prev_token_ids = next_token_ids
         return torch.stack(sampled_tokens, dim=1), torch.cat(corrected_logits, dim=1)
@@ -258,21 +306,27 @@ def build_markov_head(config, dspark_config: dict) -> Optional[nn.Module]:
     if markov_rank == 0:
         return None
 
+    # W1 is indexed by the previous real token (target vocabulary); W2 emits the
+    # draft-side bias, so it follows draft_vocab_size when the vocab is pruned.
+    draft_vocab_size = getattr(config, "draft_vocab_size", None) or config.vocab_size
     markov_head_type = str(dspark_config.get("markov_head_type", "vanilla")).lower()
     if markov_head_type == "vanilla":
         return VanillaMarkovHead(
             vocab_size=config.vocab_size,
+            draft_vocab_size=draft_vocab_size,
             markov_rank=markov_rank,
         )
     if markov_head_type == "gated":
         return GatedMarkovHead(
             vocab_size=config.vocab_size,
+            draft_vocab_size=draft_vocab_size,
             markov_rank=markov_rank,
             hidden_size=config.hidden_size,
         )
     if markov_head_type == "rnn":
         return RNNMarkovHead(
             vocab_size=config.vocab_size,
+            draft_vocab_size=draft_vocab_size,
             markov_rank=markov_rank,
             hidden_size=config.hidden_size,
         )
@@ -332,13 +386,16 @@ class DSparkDraftModel(DFlashDraftModel):
         """Generate a block with the same Markov correction used in training."""
 
         proposal_hidden = draft_hidden[:, -self.block_size + 1 :, :]
-        base_logits = target.lm_head(proposal_hidden)
+        base_logits = self.draft_logits_from_target_head(target, proposal_hidden)
         if self.markov_head is None:
-            return _sample(base_logits)
+            return self.draft_ids_to_target_ids(_sample(base_logits))
         sampled_tokens, _ = self.markov_head.sample_block_tokens(
             base_logits,
             first_prev_token_ids=block_output_ids[:, 0],
             hidden_states=proposal_hidden,
+            to_target_ids=(
+                self.draft_ids_to_target_ids if self.use_draft_vocab else None
+            ),
         )
         return sampled_tokens
 

@@ -50,7 +50,7 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
-    return {
+    contract = {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -66,6 +66,18 @@ def resume_contract(_config, draft_model, training_model):
             training_model.dspark_confidence_head_alpha
         ),
     }
+    # Only recorded when the run actually prunes. The trainer treats a contract
+    # key that a checkpoint does not carry as fatal, so adding this
+    # unconditionally would make every DSpark checkpoint written before this
+    # feature unresumable -- for a field that, unpruned, could only ever hold
+    # vocab_size. It catches a changed K before any weight loads, and nothing
+    # more: two mappings of the same size select different tokens without
+    # disagreeing here. Which tokens is checked where the buffers actually meet,
+    # in _reject_conflicting_vocab_mapping, since the contract is bound before
+    # the offline mapping is installed and cannot see it.
+    if getattr(draft_model, "use_draft_vocab", False):
+        contract["dspark_draft_vocab_size"] = int(draft_model.draft_vocab_size)
+    return contract
 
 
 def build_draft(config, draft_config):
@@ -140,6 +152,10 @@ def algorithm_spec() -> AlgorithmSpec:
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
+            supports_vocab_mapping=True,
+            # DFlash-family drafts register t2d/d2t only when they prune, so an
+            # unpruned run has nowhere to put a mapping. See _validate_vocab_mapping.
+            keeps_vocab_buffers_when_unpruned=False,
         ),
     )
 
@@ -202,6 +218,7 @@ def algorithm_providers() -> AlgorithmProviders:
                 build_collator=build_dspark_collator,
             ),
         ),
+        vocab_mapping_modes=frozenset({FeatureMode.OFFLINE, FeatureMode.STREAMING}),
     )
 
 

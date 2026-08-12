@@ -453,9 +453,7 @@ def _install_dataset_vocab_mapping(
     # Every rank derives the same mapping and installs it directly, so training
     # does not depend on a shared cache filesystem. Rank 0 alone persists the
     # reusable cache file, avoiding concurrent torch.save writes.
-    bundle.draft_model.d2t.copy_(d2t)
-    bundle.draft_model.t2d.copy_(t2d)
-    bundle.draft_model.vocab_mapping_loaded = True
+    bundle.draft_model.install_vocab_mapping(t2d, d2t)
     distributed = (
         torch.distributed.is_available() and torch.distributed.is_initialized()
     )

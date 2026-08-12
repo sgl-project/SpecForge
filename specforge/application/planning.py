@@ -169,15 +169,87 @@ def _validate_training_topology(
         raise ValueError("USP attention currently requires offline features")
 
 
+def _prunes_vocabulary(
+    cfg: Config,
+    algorithm: AlgorithmRegistration,
+) -> Optional[bool]:
+    """Whether this run's draft actually predicts over a pruned vocabulary.
+
+    Declaring ``supports_vocab_mapping`` says the algorithm *can* prune; only
+    ``draft_vocab_size < vocab_size`` in the resolved draft config says this run
+    *does*. Mapping requirements must key off the latter, or turning the
+    capability on would start rejecting full-vocabulary configs that never
+    needed a mapping.
+
+    Returns ``None`` when the draft config cannot be read. Resolving it is not
+    this check's job -- config validation must keep working without the draft
+    config on disk -- so each caller decides what an unknown answer means for
+    the rule it enforces, rather than this guessing an answer for all of them.
+    """
+    if not algorithm.spec.capabilities.supports_vocab_mapping:
+        return False
+
+    from specforge.training.model_loading import draft_config_dict
+
+    try:
+        draft_cfg = draft_config_dict(
+            cfg, provider=algorithm.providers.model.draft_config
+        )
+    except Exception:
+        return None
+    vocab_size = draft_cfg.get("vocab_size")
+    draft_vocab_size = draft_cfg.get("draft_vocab_size") or vocab_size
+    if vocab_size is None or draft_vocab_size is None:
+        return False
+    return int(draft_vocab_size) != int(vocab_size)
+
+
 def _validate_vocab_mapping(
     cfg: Config,
     algorithm: AlgorithmRegistration,
     mode: FeatureMode,
 ) -> None:
+    supports_mapping = algorithm.spec.capabilities.supports_vocab_mapping
+    if cfg.model.vocab_mapping_path and not supports_mapping:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} does not support vocabulary mapping, "
+            "so model.vocab_mapping_path would be silently ignored; remove it"
+        )
+    # Supporting mapping is not the same as being able to consume one. A draft
+    # that only registers t2d/d2t when it prunes cannot load a mapping at full
+    # vocabulary, and without this the path is accepted here and then fails much
+    # later with a "t2d/d2t buffers are not present" error that points at the
+    # model instead of at the config. Drafts that always carry the buffers just
+    # install an identity map, which is redundant but works, so they are left
+    # alone rather than having a shipped config invalidated retroactively.
+    # An unknown answer is not evidence of a full vocabulary, so this rejects
+    # only a config proven to be unpruned; the unreadable draft config then
+    # surfaces at the model-loading boundary with its own error.
+    if (
+        cfg.model.vocab_mapping_path
+        and supports_mapping
+        and not algorithm.spec.capabilities.keeps_vocab_buffers_when_unpruned
+        and _prunes_vocabulary(cfg, algorithm) is False
+    ):
+        raise ValueError(
+            f"algorithm {algorithm.name!r} run has draft_vocab_size == "
+            "vocab_size, so its draft carries no t2d/d2t buffers for "
+            "model.vocab_mapping_path to load into; set a smaller "
+            "draft_vocab_size in the draft config or remove the path"
+        )
+    # An unknown answer falls back to what the algorithm needs by default: a
+    # draft that always carries t2d/d2t always needs the two sides to agree on
+    # one mapping, so an unreadable config must not drop a requirement that held
+    # before pruning was configurable. A draft that carries them only when it
+    # prunes has nothing to share until the config says it prunes.
+    prunes = _prunes_vocabulary(cfg, algorithm)
+    if prunes is None:
+        prunes = algorithm.spec.capabilities.keeps_vocab_buffers_when_unpruned
     if (
         cfg.deployment.mode == "disaggregated"
         and mode in algorithm.providers.vocab_mapping_modes
         and not cfg.model.vocab_mapping_path
+        and prunes
     ):
         raise ValueError(
             f"algorithm {algorithm.name!r} disaggregated runs require "

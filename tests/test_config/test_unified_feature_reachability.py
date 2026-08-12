@@ -146,7 +146,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 65)
+        self.assertEqual(len(paths), 66)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths
@@ -223,10 +223,17 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
 
     def test_loader_and_profiler_options_reach_the_canonical_trainer(self):
         eagle = resolve_run(Config.model_validate(OFFLINE_EAGLE3))
+        # DFlash declares no vocab-mapping capability, so it must not carry the
+        # EAGLE3 fixture's mapping path.
         dflash = resolve_run(
             Config.model_validate(
                 {
                     **OFFLINE_EAGLE3,
+                    "model": {
+                        key: value
+                        for key, value in OFFLINE_EAGLE3["model"].items()
+                        if key != "vocab_mapping_path"
+                    },
                     "training": {"strategy": "dflash"},
                 }
             )
