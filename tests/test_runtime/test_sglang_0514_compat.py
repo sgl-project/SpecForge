@@ -9,9 +9,7 @@ import torch
 
 from specforge.offline_capture.sglang_backend import patch as sglang_patch
 from specforge.offline_capture.sglang_backend import utils as sglang_utils
-from specforge.offline_capture.sglang_backend.capture import (
-    OfflineSGLangCaptureBackend,
-)
+from specforge.offline_capture.sglang_backend.capture import OfflineSGLangCaptureBackend
 
 
 class SGLang0514CompatibilityTest(unittest.TestCase):

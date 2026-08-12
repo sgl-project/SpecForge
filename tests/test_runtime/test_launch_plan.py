@@ -28,9 +28,7 @@ from specforge.launch_plan import (
     _http_ready,
 )
 from specforge.launch_plan import build_launch_plan as _build_launch_plan
-from specforge.launch_plan import (
-    run_commands,
-)
+from specforge.launch_plan import run_commands
 from specforge.training.capture_contract import ServerCaptureContract
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
