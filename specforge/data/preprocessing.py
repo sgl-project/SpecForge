@@ -757,12 +757,15 @@ def process_token_dict_to_mappings(
         top_N_ratio = top_N_frequency_sum / total_frequency
 
     print(f"top {draft_vocab_size} token frequency ratio: {top_N_ratio:.2%}")
-    used_tokens = [key for key, freq in top_N]
-    used_tokens.sort()
-
-    d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
-    t2d = [i in used_tokens for i in range(target_vocab_size)]
-    d2t = torch.tensor(d2t)
-    t2d = torch.tensor(t2d)
+    used_tokens = torch.tensor(
+        sorted(key for key, _frequency in top_N), dtype=torch.int64
+    )
+    # ``t2d`` used to be built as ``[i in used_tokens for i in range(V)]`` over a
+    # list, i.e. a linear scan per target id -- tens of seconds at V=248320 and
+    # K=64000, in a phase that prints nothing. Scattering into a zeroed mask is
+    # the same result in milliseconds.
+    d2t = used_tokens - torch.arange(used_tokens.numel(), dtype=torch.int64)
+    t2d = torch.zeros(target_vocab_size, dtype=torch.bool)
+    t2d[used_tokens] = True
 
     return d2t, t2d

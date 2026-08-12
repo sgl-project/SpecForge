@@ -479,8 +479,8 @@ def _ensure_offline_vocab_mapping(
     ):
         return
 
+    from specforge.data.vocab_mapping import count_effective_feature_tokens
     from specforge.runtime.data_plane.offline_reader import list_feature_files
-    from specforge.training.vocab_mapping import count_effective_feature_tokens
 
     identity_parts = []
     for path in list_feature_files(cfg.data.hidden_states_path):
