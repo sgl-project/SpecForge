@@ -7,8 +7,8 @@ specforge train -c run.yaml
 ```
 
 The producer captures or ingests features and the consumer runs the canonical
-trainer. Online training always uses this producer/consumer topology; there is
-no colocated target-inference path and no separate Python training entry.
+trainer. This page covers the producer/consumer topology; online colocated
+training is documented separately, and both use the same Python training entry.
 
 The checked-in recipes are:
 

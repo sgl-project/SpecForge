@@ -18,9 +18,9 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 We have seen many open-source projects for speculative decoding, but most of them are not well-maintained or not directly compatible with SGLang. We prepared this project because we wish that the open-source community can enjoy a speculative decoding framework that is
 - regularly maintained by the SpecForge team: the code is runnable out-of-the-box
 - directly compatible with SGLang: there is no additional efforts for porting to SGLang
-- provides local offline and server-only online-disaggregated training through
-  one runtime, including the supported data, tensor, and sequence parallel
-  topologies
+- provides local offline, online-colocated, and online-disaggregated training
+  through one runtime, including supported data, tensor, sequence, and hybrid
+  sharded parallel topologies
 
 
 Check out [**our documentation**](https://docs.sglang.ai/SpecForge/) to get started.

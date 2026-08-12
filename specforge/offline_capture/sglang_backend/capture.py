@@ -94,23 +94,33 @@ class OfflineSGLangCaptureBackend:
     ) -> None:
         """Set auxiliary layers through the strategy's SGLang capture API."""
 
-        setter_name = {
-            "eagle3": "set_eagle3_layers_to_capture",
-            "dflash": "set_dflash_layers_to_capture",
-            "dspark": "set_dspark_layers_to_capture",
+        setter_names = {
+            "eagle3": ("set_eagle3_layers_to_capture",),
+            "dflash": ("set_dflash_layers_to_capture",),
+            # K3/DeepSeek-v4 targets have a native DSpark hook.  Dense and
+            # earlier SGLang targets expose the same auxiliary-hidden-state
+            # layout through the DFlash (or, on older builds, EAGLE3) hook.
+            "dspark": (
+                "set_dspark_layers_to_capture",
+                "set_dflash_layers_to_capture",
+                "set_eagle3_layers_to_capture",
+            ),
         }.get(capture_method)
-        if setter_name is None:
+        if setter_names is None:
             raise ValueError(
                 "offline SGLang capture method must be 'eagle3', 'dflash', or "
                 "'dspark', "
                 f"got {capture_method!r}"
             )
-        setter = getattr(self.model_runner.model, setter_name, None)
-        if not callable(setter):
-            raise RuntimeError(
-                f"target model does not expose SGLang capture hook {setter_name!r}"
-            )
-        setter(layer_ids)
+        for setter_name in setter_names:
+            setter = getattr(self.model_runner.model, setter_name, None)
+            if callable(setter):
+                setter(layer_ids)
+                return
+        raise RuntimeError(
+            "target model does not expose a compatible SGLang capture hook; "
+            f"tried {setter_names!r}"
+        )
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch) -> None:
         if require_mlp_sync(self.model_runner.server_args):
@@ -164,6 +174,43 @@ class OfflineSGLangCaptureBackend:
         self.model_runner.token_to_kv_pool_allocator.clear()
 
     @torch.no_grad()
+    def capture_rows(self, input_ids: list[list[int]]):
+        """Capture variable-length request rows in one packed prefill."""
+        if not input_ids:
+            return (), ()
+        if any(not row for row in input_ids):
+            raise ValueError("SGLang capture rows must contain at least one token")
+        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
+        reqs: list[Req] = []
+        for idx, input_row in enumerate(input_ids):
+            req = Req(
+                rid=str(idx),
+                origin_input_text="",
+                origin_input_ids=list(input_row),
+                sampling_params=sampling_params,
+            )
+            req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
+            req.fill_len = len(req.full_untruncated_fill_ids)
+            req.extend_input_len = req.fill_len - len(req.prefix_indices)
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+            reqs.append(req)
+
+        input_lens = [len(req.origin_input_ids) for req in reqs]
+        try:
+            output = self._forward_extend(reqs)
+            aux_hidden_states = getattr(output, "aux_hidden_states", None)
+            last_hidden_states = getattr(output, "last_hidden_states", None)
+            if aux_hidden_states is None or last_hidden_states is None:
+                raise RuntimeError(
+                    "SGLang did not return the hidden states required for capture"
+                )
+            aux_rows = torch.split(aux_hidden_states, input_lens, dim=0)
+            last_rows = torch.split(last_hidden_states, input_lens, dim=0)
+        finally:
+            self._clear_pools()
+        return aux_rows, last_rows
+
+    @torch.no_grad()
     def capture_eagle3(
         self,
         *,
@@ -173,43 +220,25 @@ class OfflineSGLangCaptureBackend:
     ):
         """Capture per-request auxiliary and final hidden states without logits."""
 
-        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
-        reqs: list[Req] = []
         data = []
+        active_input_ids = []
         input_rows = torch.split(input_ids, 1, dim=0)
         attention_rows = torch.split(attention_mask, 1, dim=0)
         loss_rows = torch.split(loss_mask, 1, dim=0)
 
-        for idx, (input_row, attention_row, loss_row) in enumerate(
-            zip(input_rows, attention_rows, loss_rows)
+        for input_row, attention_row, loss_row in zip(
+            input_rows, attention_rows, loss_rows
         ):
-            req = Req(
-                rid=str(idx),
-                origin_input_text="",
-                origin_input_ids=input_row.view(-1).tolist(),
-                sampling_params=sampling_params,
-            )
-            req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.fill_len = len(req.full_untruncated_fill_ids)
-            req.extend_input_len = req.fill_len - len(req.prefix_indices)
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-            reqs.append(req)
+            length = int(attention_row.to(dtype=torch.long).sum().item())
+            if length < 1:
+                raise ValueError("offline SGLang capture received an empty row")
+            input_row = input_row[:, :length]
+            attention_row = attention_row[:, :length]
+            loss_row = loss_row[:, :length]
+            active_input_ids.append(input_row.view(-1).tolist())
             data.append((input_row, attention_row, loss_row))
 
-        input_lens = [len(req.origin_input_ids) for req in reqs]
-        try:
-            output = self._forward_extend(reqs)
-            aux_hidden_states = getattr(output, "aux_hidden_states", None)
-            last_hidden_states = getattr(output, "last_hidden_states", None)
-            if aux_hidden_states is None or last_hidden_states is None:
-                raise RuntimeError(
-                    "SGLang did not return the hidden states required for "
-                    "offline feature preparation"
-                )
-            aux_rows = torch.split(aux_hidden_states, input_lens, dim=0)
-            last_rows = torch.split(last_hidden_states, input_lens, dim=0)
-        finally:
-            self._clear_pools()
+        aux_rows, last_rows = self.capture_rows(active_input_ids)
 
         return data, aux_rows, last_rows
 

@@ -377,7 +377,14 @@ class TrainerCore:
 
         denominator = local_denominator.clone()
         parallel_config = getattr(self.backend, "parallel_config", None)
-        process_group = getattr(parallel_config, "fsdp_process_group", None)
+        # Prefer the explicit reduction group added for HSDP. Reading the
+        # instance dictionary keeps older duck-typed backend shims (including
+        # tests built with an unconstrained Mock) on the FSDP-group fallback.
+        process_group = getattr(parallel_config, "__dict__", {}).get(
+            "reduction_process_group"
+        )
+        if process_group is None:
+            process_group = getattr(parallel_config, "fsdp_process_group", None)
         world_size = 1
         if dist.is_available() and dist.is_initialized():
             world_size = dist.get_world_size(group=process_group)
@@ -411,7 +418,9 @@ class TrainerCore:
             else torch.device("cpu")
         )
         parallel_config = getattr(self.backend, "parallel_config", None)
-        process_group = getattr(parallel_config, "fsdp_process_group", None)
+        process_group = getattr(parallel_config, "reduction_process_group", None)
+        if process_group is None:
+            process_group = getattr(parallel_config, "fsdp_process_group", None)
         structured = _reduce_eagle3_metrics(
             out.metrics,
             device=metric_device,
@@ -514,6 +523,7 @@ class TrainerController:
         checkpoint_manager: Optional[Any] = None,
         checkpoint_extra: Optional[Dict[str, Any]] = None,
         profiling_options=None,
+        runtime_metrics_provider: Optional[Callable[[], Dict[str, Any]]] = None,
     ) -> None:
         if (start_batch == 0) != (start_samples == 0):
             raise ValueError(
@@ -540,6 +550,7 @@ class TrainerController:
         self.total_steps = total_steps if total_steps is not None else max_steps
         self.num_epochs = num_epochs
         self.logger = logger
+        self.runtime_metrics_provider = runtime_metrics_provider
         # ack_fn(sample_ids, global_step) records the durable ack transaction at
         # the optimizer-step boundary; None = the loader acks (simple runs).
         self.ack_fn = ack_fn
@@ -664,6 +675,10 @@ class TrainerController:
                         global_step=self.global_step, total_steps=self.total_steps
                     ),
                 )
+                # The colocated loader performs target capture inside next().
+                # Release the prior feature tensors before requesting another
+                # microbatch so long-context features cannot overlap in memory.
+                del batch
                 perf_train_compute_s += time.perf_counter() - train_compute_started
                 self.last_metrics = result.metrics
                 # grad accumulated but optimizer has not stepped yet; everything
@@ -691,9 +706,12 @@ class TrainerController:
                     )
                     parallel = getattr(self.core.backend, "parallel_config", None)
                     world_size = int(getattr(parallel, "world_size", 1))
-                    tp_size = int(getattr(parallel, "tp_size", 1))
                     sp_size = int(getattr(parallel, "sp_size", 1))
-                    data_parallel_size = max(1, world_size // (tp_size * sp_size))
+                    # Target-TP peers capture one packed target batch, then each
+                    # train a distinct local sample.  They are therefore sample-
+                    # parallel for draft training; only draft sequence parallelism
+                    # duplicates a logical sample across ranks.
+                    sample_parallel_size = max(1, world_size // sp_size)
                     log_metrics.update(
                         {
                             "perf/optimizer_steps_per_hour": (
@@ -713,11 +731,37 @@ class TrainerController:
                             ),
                             "perf/global_samples_per_second": (
                                 perf_window_samples
-                                * data_parallel_size
+                                * sample_parallel_size
                                 / perf_elapsed_s
                             ),
                         }
                     )
+                    if self.runtime_metrics_provider is not None:
+                        runtime_metrics = self.runtime_metrics_provider()
+                        log_metrics.update(
+                            {
+                                f"perf/{name}": float(value)
+                                for name, value in runtime_metrics.items()
+                            }
+                        )
+                    try:
+                        model_device = next(module.parameters()).device
+                        device_module = getattr(torch, model_device.type, None)
+                        if device_module is not None and model_device.type != "cpu":
+                            log_metrics.update(
+                                {
+                                    "perf/accelerator_peak_allocated_gib": (
+                                        device_module.max_memory_allocated(model_device)
+                                        / float(1 << 30)
+                                    ),
+                                    "perf/accelerator_peak_reserved_gib": (
+                                        device_module.max_memory_reserved(model_device)
+                                        / float(1 << 30)
+                                    ),
+                                }
+                            )
+                    except (AttributeError, RuntimeError, StopIteration):
+                        pass
                     self.logger(log_metrics, self.global_step)
                     perf_window_started = time.perf_counter()
                     perf_window_steps = 0

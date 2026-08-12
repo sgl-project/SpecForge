@@ -21,6 +21,7 @@ EXPECTED_NPROC_PER_NODE = {
     "lfm2.5-1.2b-instruct-dflash-online.yaml": 8,
     "inkling-dspark-disaggregated.yaml": 1,
     "kimi-k3-dspark-disaggregated.yaml": 4,
+    "kimi-k3-dspark-colocated.yaml": 8,
     "ling-flash-2.0-eagle3-offline.yaml": 8,
     "ling-flash-2.0-eagle3-online.yaml": 8,
     "llama3.1-8b-eagle3-offline.yaml": 1,
@@ -54,6 +55,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3-8b-domino-online.yaml": 8,
     "qwen3-8b-dpace-online.yaml": 8,
     "qwen3-8b-dspark-disaggregated.yaml": 1,
+    "qwen3-8b-dspark-colocated.yaml": 8,
     "qwen3-8b-eagle3-offline-disaggregated.yaml": 1,
     "qwen3-8b-eagle3-offline.yaml": 1,
     "qwen3-8b-eagle3-disaggregated.yaml": 1,
@@ -76,6 +78,18 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.6-27b-domino-online.yaml": 8,
     "qwen3.6-27b-dspark-disaggregated.yaml": 1,
     "qwq-32b-eagle3-online.yaml": 4,
+}
+
+EXPECTED_LOCAL_ONLINE = {
+    "kimi-k3-dspark-colocated.yaml",
+    "qwen3-8b-dspark-colocated.yaml",
+}
+
+EXPECTED_MULTI_NODE = {
+    "kimi-k3-dspark-colocated.yaml": {
+        "nnodes": 4,
+        "master_addr": "trainer-0",
+    }
 }
 
 LOCAL_MOONCAKE_ENDPOINTS = {
@@ -347,7 +361,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 65)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 67)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
@@ -367,11 +381,22 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 online = bool(data.get("train_data_path") or data.get("prompts_path"))
                 expected_mode = (
                     "disaggregated"
-                    if online or filename in EXPECTED_DISAGGREGATED
+                    if (
+                        online
+                        and filename not in EXPECTED_LOCAL_ONLINE
+                        or filename in EXPECTED_DISAGGREGATED
+                    )
                     else "local_colocated"
                 )
                 self.assertEqual(deployment["mode"], expected_mode)
-                expected_trainer = {"nnodes": 1, "nproc_per_node": nproc_per_node}
+                expected_trainer = {
+                    "nnodes": EXPECTED_MULTI_NODE.get(filename, {}).get("nnodes", 1),
+                    "nproc_per_node": nproc_per_node,
+                }
+                if filename in EXPECTED_MULTI_NODE:
+                    expected_trainer["master_addr"] = EXPECTED_MULTI_NODE[filename][
+                        "master_addr"
+                    ]
                 self.assertEqual(
                     deployment["trainer"],
                     expected_trainer,
@@ -380,12 +405,14 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 expected_keys = {"mode", "trainer"}
                 if expected_mode == "disaggregated":
                     expected_keys.add("disaggregated")
+                elif filename in EXPECTED_LOCAL_ONLINE:
+                    expected_keys.add("colocated")
                 if filename in EXPECTED_DISAGGREGATED:
                     self.assertEqual(
                         deployment["disaggregated"],
                         EXPECTED_DISAGGREGATED[filename],
                     )
-                elif online:
+                elif online and expected_mode == "disaggregated":
                     services = deployment["disaggregated"]
                     self.assertEqual(services["backend"], "mooncake")
                     self.assertTrue(services.get("server_urls"))
@@ -400,15 +427,26 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 config = Config.from_file(str(path))
                 topology = config.deployment.trainer
                 expected_nproc = EXPECTED_NPROC_PER_NODE[filename]
-                self.assertEqual(topology.nnodes, 1)
+                expected_nodes = EXPECTED_MULTI_NODE.get(filename, {}).get("nnodes", 1)
+                self.assertEqual(topology.nnodes, expected_nodes)
                 self.assertEqual(topology.nproc_per_node, expected_nproc)
-                config.validate_world_size(topology.nnodes * expected_nproc)
+                config.validate_world_size(expected_nodes * expected_nproc)
 
-    def test_every_recipe_keeps_trainer_tp_at_one(self):
+    def test_every_recipe_uses_the_supported_trainer_tp_contract(self):
         recipes = _recipes()
         for filename, path in recipes.items():
             with self.subTest(config=filename):
                 config = Config.from_file(str(path))
+                if (
+                    config.mode == "online"
+                    and config.deployment.mode == "local_colocated"
+                ):
+                    self.assertEqual(
+                        config.deployment.trainer.nproc_per_node
+                        % config.training.tp_size,
+                        0,
+                    )
+                    continue
                 self.assertEqual(config.training.tp_size, 1)
                 if config.deployment.mode != "disaggregated":
                     continue

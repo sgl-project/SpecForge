@@ -210,7 +210,7 @@ def init_distributed(
     _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
 
-def destroy_distributed():
+def destroy_distributed(*, abort: bool = False):
     global _DEVICE_MESH, _TP_DEVICE_MESH, _TP_GROUP
     global _DP_DEVICE_MESH, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     global _SP_ULYSSES_GROUP, _SP_RING_GROUP
@@ -218,8 +218,11 @@ def destroy_distributed():
     # underlying group (e.g. DP and draft-DP when there is no sequence
     # parallelism), and degenerate single-rank SP groups (created when
     # sp_ulysses_size == 1 or sp_ring_size == 1) are not registered in torch's
-    # process-group map and would raise on destroy. Destroy each distinct, valid
-    # sub-group at most once, then tear down the default group.
+    # process-group map and would raise on destroy. Clean up each distinct,
+    # valid group at most once. On rank-local failure, ProcessGroup.abort() is
+    # intentionally non-collective and lets elastic surface the real exception
+    # instead of hanging inside NCCL communicator destruction.
+    default_group = dist.group.WORLD if dist.is_initialized() else None
     seen = set()
     for group in (
         _TP_GROUP,
@@ -228,22 +231,20 @@ def destroy_distributed():
         _SP_RING_GROUP,
         _DRAFT_DP_GROUP,
         _DRAFT_SP_GROUP,
+        default_group,
     ):
         if group is None or id(group) in seen:
             continue
         seen.add(id(group))
         try:
-            dist.destroy_process_group(group)
+            abort_group = getattr(group, "abort", None)
+            if abort and callable(abort_group):
+                abort_group()
+            else:
+                dist.destroy_process_group(group)
         except Exception:
             # Group not registered (e.g. degenerate single-rank SP group) or
             # already destroyed.
-            pass
-    # The all-ranks DP group may alias the default group, in which case
-    # destroying it above already tore the default group down.
-    if dist.is_initialized():
-        try:
-            dist.destroy_process_group()
-        except Exception:
             pass
 
     # Process-group and DeviceMesh objects are invalid after teardown. Keeping

@@ -71,6 +71,7 @@ def _assemble_trainer(
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     dataloader_num_workers: int = 0,
+    clone_on_fetch: bool = True,
     profiling_options=None,
     fit_context=None,
     on_fit_success: Optional[Callable[[int], None]] = None,
@@ -145,6 +146,7 @@ def _assemble_trainer(
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         dataloader_num_workers=dataloader_num_workers,
+        clone_on_fetch=clone_on_fetch,
         profiling_options=profiling_options,
         fit_context=fit_context,
         on_fit_success=on_fit_success,
@@ -237,6 +239,124 @@ def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle
         repeats = math.ceil(padding_size / len(indices))
         indices.extend((indices * repeats)[:padding_size])
     return indices[dp_rank:total_size:dp_size]
+
+
+def _target_dp_layout(*, dp_rank=None, dp_size=None):
+    """Resolve the target-replica rank shared by all peers in one TP island."""
+    if (dp_rank is None) != (dp_size is None):
+        raise ValueError("dp_rank and dp_size must be provided together")
+    if dp_rank is not None:
+        if dp_size < 1 or not 0 <= dp_rank < dp_size:
+            raise ValueError(f"invalid target-DP layout rank={dp_rank}, size={dp_size}")
+        return int(dp_rank), int(dp_size)
+
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return 0, 1
+    from specforge.distributed import get_dp_group
+
+    group = get_dp_group()
+    return dist.get_rank(group), dist.get_world_size(group)
+
+
+def _shard_online_prompts(
+    prompts,
+    *,
+    seed=0,
+    epoch=0,
+    tp_size=1,
+    batch_size=1,
+    shuffle=True,
+    dp_rank=None,
+    dp_size=None,
+):
+    """Plan one target-DP shard and truncate it to complete TP-wide batches."""
+    prompts = list(prompts)
+    if tp_size < 1 or batch_size < 1:
+        raise ValueError("tp_size and batch_size must be positive")
+    rank, replicas = _target_dp_layout(dp_rank=dp_rank, dp_size=dp_size)
+    selected = _distributed_sampler_indices(
+        len(prompts),
+        dp_rank=rank,
+        dp_size=replicas,
+        seed=seed,
+        epoch=epoch,
+        shuffle=shuffle,
+    )
+    target_batch_size = tp_size * batch_size
+    selected = selected[: len(selected) // target_batch_size * target_batch_size]
+    sharded = []
+    for slot, source_index in enumerate(selected):
+        item = dict(prompts[source_index])
+        metadata = dict(item.get("metadata") or {})
+        if "task_id" in item:
+            metadata.setdefault("base_task_id", str(item["task_id"]))
+        metadata.update(
+            {
+                "source_prompt_index": source_index,
+                "prompt_epoch": epoch,
+                "target_dp_rank": rank,
+                "target_dp_slot": slot,
+            }
+        )
+        item["metadata"] = metadata
+        item["task_id"] = (
+            f"target-dp{rank:04d}-epoch{epoch:08d}-"
+            f"slot{slot:012d}-prompt{source_index:012d}"
+        )
+        sharded.append(item)
+    return sharded
+
+
+def _plan_online_prompt_stream(
+    prompts,
+    *,
+    num_epochs,
+    seed,
+    tp_size,
+    batch_size,
+    shuffle=True,
+    dp_rank=None,
+    dp_size=None,
+):
+    """Flatten deterministic, independently truncated epochs for one island."""
+    if num_epochs < 1:
+        raise ValueError("num_epochs must be positive")
+    prompts = list(prompts)
+    rank, replicas = _target_dp_layout(dp_rank=dp_rank, dp_size=dp_size)
+    planned = []
+    for epoch in range(num_epochs):
+        planned.extend(
+            _shard_online_prompts(
+                prompts,
+                seed=seed,
+                epoch=epoch,
+                tp_size=tp_size,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                dp_rank=rank,
+                dp_size=replicas,
+            )
+        )
+    return planned
+
+
+def _preposition_online_prompts(prompts, *, local_samples, tp_size):
+    """Drop a checkpointed rank-local prefix from the TP-wide prompt stream."""
+    if local_samples < 0:
+        raise ValueError("checkpoint epoch_samples cannot be negative")
+    if tp_size < 1:
+        raise ValueError("tp_size must be positive")
+    prompts = list(prompts)
+    target_samples = local_samples * tp_size
+    if target_samples > len(prompts):
+        raise ValueError(
+            "checkpoint resume position skips past the online prompt stream: "
+            f"{local_samples} rank-local samples require {target_samples} target "
+            f"prompts, but the planned stream has {len(prompts)}"
+        )
+    return prompts[target_samples:]
 
 
 def _make_offline_eval_data_factory(
@@ -507,6 +627,14 @@ def _assemble_server_rollout_workers(
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,
         vocab_map_version=vocab_map_version,
+        extra={
+            "aux_feature_name": algorithm.providers.server_streaming_for(
+                modality
+            ).layout.aux_feature,
+            "target_feature_name": algorithm.providers.server_streaming_for(
+                modality
+            ).layout.last_hidden_feature,
+        },
     )
     return [
         RolloutWorker(
@@ -520,6 +648,56 @@ def _assemble_server_rollout_workers(
         )
         for index, source in enumerate(sources)
     ]
+
+
+def _assemble_local_rollout_worker(
+    *,
+    algorithm: AlgorithmRegistration,
+    modality: str,
+    controller: DataFlowController,
+    store: FeatureStore,
+    feature_source,
+    batch_partition,
+    run_id: str,
+    target_hidden_size: int,
+    target_vocab_size: Optional[int],
+    draft_vocab_size: Optional[int],
+    target_repr: Optional[str],
+    aux_hidden_state_layer_ids,
+    vocab_map_version: Optional[str],
+):
+    """Build the one synchronous worker owned by a colocated trainer rank."""
+    from specforge.inference.capture import CaptureConfig
+    from specforge.inference.rollout_worker import RolloutWorker
+
+    provider = algorithm.providers.server_streaming_for(modality)
+    contract = algorithm.spec.feature_contract("streaming", modality)
+    capture_config = CaptureConfig.from_strategy(
+        required_features=contract.required_tensors,
+        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids or ()),
+        target_repr=target_repr,
+        target_hidden_size=target_hidden_size,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        vocab_map_version=vocab_map_version,
+        extra={
+            "aux_feature_name": provider.layout.aux_feature,
+            "target_feature_name": provider.layout.last_hidden_feature,
+        },
+    )
+    return RolloutWorker(
+        controller,
+        store,
+        feature_source,
+        capture_config,
+        run_id=run_id,
+        worker_id="colocated-rollout",
+        strategy=algorithm.name,
+        batch_partition=batch_partition,
+        feature_source_returns_local_batch=bool(
+            getattr(feature_source, "returns_local_batch", False)
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -784,8 +962,141 @@ def build_disagg_offline_runtime(
 
 
 # ---------------------------------------------------------------------------
-# Online disaggregated producer/consumer.  Capture is always delegated to an
-# externally managed SGLang server source.
+# Online colocated runtime.
+# ---------------------------------------------------------------------------
+
+
+def build_colocated_online_runtime(
+    *,
+    algorithm: AlgorithmRegistration,
+    modality: str = "text",
+    prompts,
+    feature_source,
+    draft_model,
+    target_head,
+    optimizer_factory,
+    run_id: str,
+    output_dir: str,
+    target_hidden_size: int,
+    target_vocab_size: Optional[int] = None,
+    draft_vocab_size: Optional[int] = None,
+    target_repr: Optional[str] = None,
+    aux_hidden_state_layer_ids=None,
+    vocab_map_version: Optional[str] = None,
+    batch_size: int = 1,
+    accumulation_steps: int = 1,
+    max_steps: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    save_interval: int = 0,
+    eval_interval: int = 0,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    logger=None,
+    log_interval: int = 50,
+    resume_from: Optional[str] = None,
+    resume_state: Optional[dict] = None,
+    dataset_size: Optional[int] = None,
+    checkpoint_extra: Optional[dict] = None,
+    max_checkpoints: int = 0,
+    strategy_kwargs: Optional[Mapping[str, Any]] = None,
+    dataloader_num_workers: int = 0,
+    profiling_options=None,
+    zero_copy_features: bool = True,
+):
+    """Assemble bounded in-process target capture and FSDP draft training.
+
+    Every target-TP peer captures the same TP-wide prompt batch.  Each peer
+    persists and trains only its contiguous local slice, while target-DP groups
+    receive deterministic disjoint prompt plans from the composition root.
+    """
+    if sp_ulysses_size != 1 or sp_ring_size != 1:
+        raise NotImplementedError(
+            "colocated target TP does not yet compose with draft sequence parallelism"
+        )
+    from specforge.inference.batch_partition import TargetBatchPartition
+    from specforge.runtime.data_plane import LocalRolloutStream
+
+    batch_partition = TargetBatchPartition.from_distributed(tp_size)
+    configure_partition = getattr(feature_source, "set_batch_partition", None)
+    if callable(configure_partition):
+        configure_partition(batch_partition)
+    provider = algorithm.providers.server_streaming_for(modality)
+    controller = DataFlowController(
+        run_id,
+        metadata_store=NoOpMetadataStore(),
+    )
+    controller.ingest_prompts(prompts)
+    store = LocalFeatureStore(run_id)
+    worker = _assemble_local_rollout_worker(
+        algorithm=algorithm,
+        modality=modality,
+        controller=controller,
+        store=store,
+        feature_source=feature_source,
+        batch_partition=batch_partition,
+        run_id=run_id,
+        target_hidden_size=target_hidden_size,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        target_repr=target_repr,
+        aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
+        vocab_map_version=vocab_map_version,
+    )
+    rollout_stream = LocalRolloutStream(
+        controller=controller,
+        workers=[worker],
+        feature_store=store,
+        max_resident_samples=batch_size,
+        capture_batch_multiplier=batch_partition.size,
+    )
+    trainer = _assemble_trainer(
+        algorithm=algorithm,
+        controller=controller,
+        store=store,
+        ref_source={"queue": rollout_stream, "prepositioned": resume_from is not None},
+        model=draft_model,
+        target_head=(
+            target_head if algorithm.providers.step.uses_external_target_head else None
+        ),
+        optimizer_factory=optimizer_factory,
+        run_id=run_id,
+        output_dir=output_dir,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        num_epochs=1,
+        max_steps=max_steps,
+        total_steps=total_steps,
+        save_interval=save_interval,
+        eval_interval=eval_interval,
+        logger=logger,
+        log_interval=log_interval,
+        collate_fn=provider.build_collator(),
+        strategy_kwargs=strategy_kwargs,
+        per_sample_transform=None,
+        durable_ack=False,
+        resume_from=resume_from,
+        resume_state=resume_state,
+        dataset_size=dataset_size,
+        checkpoint_extra=checkpoint_extra,
+        max_checkpoints=max_checkpoints,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+        dataloader_num_workers=dataloader_num_workers,
+        clone_on_fetch=not zero_copy_features,
+        profiling_options=profiling_options,
+        fit_context=rollout_stream,
+    )
+    trainer.rollout_workers = [worker]
+    trainer.rollout_stream = rollout_stream
+    trainer.colocated_feature_source = feature_source
+    return trainer
+
+
+# ---------------------------------------------------------------------------
+# Online disaggregated producer/consumer.  Capture is delegated to an external
+# SGLang server source.
 # ---------------------------------------------------------------------------
 
 

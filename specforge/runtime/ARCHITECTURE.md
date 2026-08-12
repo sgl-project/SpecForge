@@ -2,10 +2,11 @@
 
 SpecForge has one public training entry point, `specforge train`. A typed run
 configuration selects an algorithm and a topology; it does not select a second
-trainer. The launch layer exposes exactly four topology builders:
+trainer. The launch layer exposes five topology builders:
 
 - `build_offline_runtime`
 - `build_disagg_offline_runtime`
+- `build_colocated_online_runtime`
 - `build_disagg_online_producer`
 - `build_disagg_online_consumer`
 
@@ -18,8 +19,9 @@ the reference source and feature-store backend change.
 | Mode | Producer side | Consumer reference source | Feature store | Iteration contract |
 | --- | --- | --- | --- | --- |
 | Colocated offline | Precomputed feature files | Fixed `SampleRef` list | `LocalFeatureStore` reads `file://` refs | Re-iterable; epochs and checkpoint resume are supported |
+| Colocated online | In-process SGLang capture on trainer demand | Bounded `LocalRolloutStream` | Rank-private `LocalFeatureStore` | Consume once; deterministic prompt planning supports epochs and resume |
 | Disaggregated offline | `CONFIG=path/to/offline-disagg.yaml run_offline.sh --role producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
-| Online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
+| Disaggregated online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
 
 `training.num_epochs` on an online run controls how many prompt passes the
 producer creates. Each pass receives new task and sample ids. The consumer
@@ -33,8 +35,8 @@ stream as a second trainer epoch.
 - The data plane carries feature tensors behind `FeatureStore` URIs.
 - `FeatureDataLoader` is the only bridge from refs plus a store to a
   tensor-carrying `TrainBatch`.
-- The inference plane sends model inputs to an external spec-capture server,
-  adopts its Mooncake-backed refs, and commits only metadata.
+- The inference plane either captures locally into a private feature store or
+  sends model inputs to an external server and adopts its Mooncake-backed refs.
 - The training plane resolves an algorithm step provider; the core training loop
   does not branch on online, offline, colocated, or disaggregated deployment.
 

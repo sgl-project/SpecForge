@@ -696,16 +696,16 @@ def build_launch_plan(
     torchrun_prefix: Optional[Sequence[str]] = None,
 ) -> LaunchPlan:
     """Resolve one validated config into a side-effect-free process plan."""
-    if cfg.mode == "online":
-        if cfg.deployment.mode != "disaggregated":
-            raise ValueError(
-                "online launch planning requires disaggregated producer/consumer "
-                "mode; colocated online training is no longer supported"
-            )
-        if cfg.model.target_backend != "sglang":
-            raise ValueError(
-                "online launch planning requires an external SGLang capture server"
-            )
+    if cfg.mode == "online" and cfg.model.target_backend != "sglang":
+        capture_location = (
+            "an in-process"
+            if cfg.deployment.mode == "local_colocated"
+            else "an external"
+        )
+        raise ValueError(
+            f"online launch planning requires {capture_location} SGLang "
+            "capture backend"
+        )
     base_env = os.environ if env is None else env
     distributed = _distributed_state(base_env)
     deployment = cfg.deployment.disaggregated

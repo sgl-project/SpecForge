@@ -71,6 +71,28 @@ class TestClipGradNormSingleProcess(unittest.TestCase):
         backend.set_optimizer(replicated)
         self.assertFalse(replicated.config["enabled"])
 
+    def test_backend_uses_the_hsdp_shard_group_for_grad_norm(self):
+        class RecordingOptimizer:
+            def configure_grad_norm_reduction(self, **kwargs):
+                self.config = kwargs
+
+        fsdp_groups = (object(), object())
+        shard_group = object()
+        backend = FSDPTrainingBackend(
+            ParallelConfig(
+                sharding_strategy="HYBRID_SHARD",
+                fsdp_process_group=fsdp_groups,
+                grad_norm_process_group=shard_group,
+            )
+        )
+        backend._wrapped = True
+        optimizer = RecordingOptimizer()
+
+        backend.set_optimizer(optimizer)
+
+        self.assertIs(optimizer.config["process_group"], shard_group)
+        self.assertTrue(optimizer.config["enabled"])
+
     def test_cpu_offload_matches_resident_optimizer_update(self):
         resident_model, resident = _make_optimizer(seed=7, offload_master=False)
         offload_model, offload = _make_optimizer(seed=7, offload_master=True)

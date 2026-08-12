@@ -16,6 +16,7 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
@@ -888,6 +889,7 @@ class LlamaFlexAttention(LlamaAttention):
             value=value_cache.contiguous(),
             block_mask=block_mask,
             enable_gqa=True,
+            kernel_options={"BACKEND": flex_attention_backend()},
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)

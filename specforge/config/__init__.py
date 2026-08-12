@@ -3,6 +3,7 @@
 
 from specforge.config.schema import (
     SGLANG_CAPTURE_CONTEXT_HEADROOM,
+    ColocatedDeploymentConfig,
     Config,
     DataConfig,
     DeploymentConfig,
@@ -23,6 +24,7 @@ from specforge.config.schema import (
 
 __all__ = [
     "Config",
+    "ColocatedDeploymentConfig",
     "ModelConfig",
     "DataConfig",
     "DeploymentConfig",

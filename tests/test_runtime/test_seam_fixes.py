@@ -91,6 +91,53 @@ class TestParallelConfigHandles(unittest.TestCase):
         self.assertEqual(pc.tp_size, 2)
         self.assertEqual(pc.sp_size, 2)
 
+    def test_hybrid_shard_separates_fsdp_metrics_and_grad_norm_groups(self):
+        tp_group = object()
+        dp_group = object()
+
+        def group_size(group=None):
+            if group is tp_group:
+                return 8
+            if group is dp_group:
+                return 2
+            return 16
+
+        with (
+            mock.patch(
+                "specforge.training.backend.dist.is_initialized", return_value=True
+            ),
+            mock.patch(
+                "specforge.training.backend.dist.get_world_size",
+                side_effect=group_size,
+            ),
+            mock.patch("specforge.distributed.get_tp_group", return_value=tp_group),
+            mock.patch("specforge.distributed.get_dp_group", return_value=dp_group),
+            mock.patch(
+                "specforge.distributed.get_draft_dp_group", return_value=object()
+            ),
+            mock.patch(
+                "specforge.distributed.get_draft_sp_group", return_value=object()
+            ),
+            mock.patch(
+                "specforge.distributed.get_sp_ulysses_group", return_value=object()
+            ),
+            mock.patch(
+                "specforge.distributed.get_sp_ring_group", return_value=object()
+            ),
+            mock.patch("specforge.distributed.get_device_mesh", return_value=object()),
+            mock.patch(
+                "specforge.distributed.get_tp_device_mesh", return_value=object()
+            ),
+        ):
+            pc = ParallelConfig.from_distributed(
+                tp_size=8,
+                sharding_strategy="HYBRID_SHARD",
+            )
+
+        self.assertEqual(pc.fsdp_process_group, (tp_group, dp_group))
+        self.assertIs(pc.reduction_process_group, torch.distributed.group.WORLD)
+        self.assertIs(pc.grad_norm_process_group, tp_group)
+
     def test_frozen_target_tables_are_ignored_by_fsdp(self):
         class Composite(nn.Module):
             def __init__(self):

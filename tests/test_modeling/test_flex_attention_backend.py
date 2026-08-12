@@ -12,10 +12,31 @@ from specforge.algorithms.common.dflash_family_model import (
 )
 from specforge.modeling.draft.dflash import DFlashDraftModel, Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
-from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+from specforge.modeling.draft.flex_attention_backend import (
+    _default_backend,
+    flex_attention_backend,
+)
 
 
 class FlexAttentionBackendTest(unittest.TestCase):
+    def test_hopper_and_cpu_default_to_stable_triton_backend(self):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch(
+                "specforge.modeling.draft.flex_attention_backend._DEFAULT_BACKEND",
+                "TRITON",
+            ),
+        ):
+            self.assertEqual(flex_attention_backend(), "TRITON")
+
+    def test_supported_blackwell_defaults_to_flash_backend(self):
+        with (
+            mock.patch("torch.__version__", "2.11.0"),
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            self.assertEqual(_default_backend(), "FLASH")
+
     @unittest.skipUnless(torch.cuda.is_available(), "FlexAttention requires CUDA")
     def test_sliding_block_mask_matches_sdpa(self):
         torch.manual_seed(0)

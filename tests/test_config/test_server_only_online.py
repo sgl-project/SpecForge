@@ -43,9 +43,23 @@ def _online_payload(
 
 
 class ServerOnlyOnlineConfigTest(unittest.TestCase):
-    def test_colocated_online_is_rejected_at_the_config_boundary(self):
-        with self.assertRaisesRegex(ValidationError, "colocated online training"):
-            Config.model_validate(_online_payload(topology="local_colocated"))
+    def test_colocated_online_uses_the_in_process_sglang_contract(self):
+        config = Config.model_validate(_online_payload(topology="local_colocated"))
+
+        self.assertEqual(config.mode, "online")
+        self.assertEqual(config.deployment.mode, "local_colocated")
+        self.assertEqual(config.training.role, "all")
+        self.assertIsNone(config.deployment.disaggregated)
+
+    def test_every_builtin_streaming_algorithm_resolves_colocated(self):
+        for strategy in ("eagle3", "peagle", "dflash", "domino", "dspark"):
+            with self.subTest(strategy=strategy):
+                payload = _online_payload(topology="local_colocated")
+                payload["training"]["strategy"] = strategy
+                config = Config.model_validate(payload)
+                resolved = resolve_run(config)
+                self.assertEqual(resolved.config.deployment.mode, "local_colocated")
+                self.assertEqual(resolved.algorithm.name, strategy)
 
     def test_online_requires_the_sglang_server_backend(self):
         # The retired in-process backends are no longer schema values at all,
@@ -90,7 +104,7 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
             ):
                 Config.model_validate(_offline_payload(backend))
 
-    def test_every_online_recipe_uses_the_server_data_plane(self):
+    def test_every_online_recipe_uses_a_supported_sglang_data_plane(self):
         online_recipes = []
         for path in sorted(EXAMPLE_CONFIG_DIR.glob("*.yaml")):
             payload = yaml.safe_load(path.read_text())
@@ -98,12 +112,14 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
             if not (data.get("train_data_path") or data.get("prompts_path")):
                 continue
             online_recipes.append(path.name)
-            self.assertEqual(payload["deployment"]["mode"], "disaggregated")
             self.assertEqual(payload["model"]["target_backend"], "sglang")
             self.assertFalse(payload["model"].get("shard_target_output", False))
-            self.assertEqual(
-                payload["deployment"]["disaggregated"]["backend"], "mooncake"
-            )
+            topology = payload["deployment"]["mode"]
+            self.assertIn(topology, {"local_colocated", "disaggregated"})
+            if topology == "disaggregated":
+                self.assertEqual(
+                    payload["deployment"]["disaggregated"]["backend"], "mooncake"
+                )
         self.assertTrue(online_recipes)
         self.assertFalse(
             (EXAMPLE_CONFIG_DIR / "qwen2.5-vl-7b-eagle3-online.yaml").exists()
