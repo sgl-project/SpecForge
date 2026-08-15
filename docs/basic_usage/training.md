@@ -179,6 +179,41 @@ mixed layout must be edited explicitly in the draft JSON.
 
 The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
 
+The context layout and projection layout are independent. Use
+`dflash_config.attention_mode` as a uniform `"gqa"`, `"mha"`, or `"mla"`
+shorthand, or use `dflash_config.attention_modes` to select one mode per draft
+layer. The per-layer list must match `num_hidden_layers`; do not set the scalar
+and list forms together.
+
+```json
+{
+  "num_hidden_layers": 4,
+  "layer_types": [
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+    "full_attention"
+  ],
+  "use_sliding_window": true,
+  "sliding_window": 2048,
+  "dflash_config": {
+    "attention_modes": ["gqa", "mla", "gqa", "mla"]
+  }
+}
+```
+
+The two lists are paired by layer index:
+
+| Context layout | Projection mode | Result |
+|---|---|---|
+| `sliding_attention` | `gqa` | SWA-GQA |
+| `sliding_attention` | `mla` | SWA-MLA |
+| `full_attention` | `gqa` or `mha` | full-context standard attention |
+| `full_attention` | `mla` | full-context MLA |
+
+Any configuration containing an MLA layer must also provide the standard MLA
+dimension fields described in [MLA draft attention](../advanced_features/customization.md#mla-draft-attention).
+
 Domino and DSpark need their projector/head metadata, so they require an
 explicit draft config (or a pretrained warm-start source that contains
 `config.json`). The old Domino parser exposed an optional config flag, but its

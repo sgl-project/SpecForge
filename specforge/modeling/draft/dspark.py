@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from .dflash import DFlashDraftModel
+from .dflash import DFlashDraftModel, resolve_dflash_attention_modes
 from .registry import register_draft
 
 
@@ -289,29 +289,28 @@ class DSparkDraftModel(DFlashDraftModel):
         num_heads = int(config.num_attention_heads)
         num_kv_heads = int(config.num_key_value_heads)
         dflash_config = dict(getattr(config, "dflash_config", None) or {})
-        attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
-        if attention_mode not in {"gqa", "mha", "mla"}:
-            raise ValueError(
-                "DSpark dflash_config.attention_mode must be 'gqa', 'mha', "
-                f"or 'mla', got {attention_mode!r}"
-            )
-        if attention_mode != "mla" and num_heads % num_kv_heads:
+        attention_modes = resolve_dflash_attention_modes(config)
+        standard_modes = set(attention_modes) - {"mla"}
+        if standard_modes and num_heads % num_kv_heads:
             raise ValueError(
                 "DSpark requires num_key_value_heads to divide "
                 f"num_attention_heads, got {num_kv_heads} and {num_heads}"
             )
-        if attention_mode == "gqa" and num_kv_heads >= num_heads:
+        if "gqa" in standard_modes and num_kv_heads >= num_heads:
             raise ValueError(
                 "DSpark defaults to GQA and requires num_key_value_heads < "
                 "num_attention_heads; set dflash_config.attention_mode='mha' "
                 "to opt into equal query/KV head counts"
             )
-        if attention_mode == "mha" and num_kv_heads != num_heads:
+        if "mha" in standard_modes and num_kv_heads != num_heads:
             raise ValueError(
                 "DSpark MHA opt-in requires num_key_value_heads == "
                 f"num_attention_heads, got {num_kv_heads} and {num_heads}"
             )
-        dflash_config["attention_mode"] = attention_mode
+        if "attention_modes" in dflash_config:
+            dflash_config["attention_modes"] = list(attention_modes)
+        else:
+            dflash_config["attention_mode"] = attention_modes[0]
         projector_type = dflash_config.get("projector_type")
         if projector_type is None:
             dflash_config["projector_type"] = self.expected_projector_type

@@ -123,6 +123,11 @@ target-context injection, per-layer full/sliding masks, objectives, capture
 contract, and `eager`, `sdpa`, or `flex_attention` training backend selection
 remain unchanged. Omitting `attention_mode` preserves the existing GQA path;
 explicit `"mha"` continues to select equal query/KV head counts for DSpark.
+For a mixed projection stack, replace the scalar with an `attention_modes`
+list containing one `"gqa"`, `"mha"`, or `"mla"` entry per draft layer. This
+list composes with `layer_types`, so both SWA-GQA and SWA-MLA layers can appear
+in the same architecture; see the [training guide](../basic_usage/training.md)
+for the paired config contract.
 
 ## Draft architectures
 

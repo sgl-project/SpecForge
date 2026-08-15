@@ -72,22 +72,54 @@ def resolve_dflash_attention_layout(
     return layer_types, sliding_window
 
 
-def resolve_dflash_attention_mode(config: Qwen3Config) -> str:
-    """Return the configured draft attention architecture.
+def resolve_dflash_attention_modes(config: Qwen3Config) -> tuple[str, ...]:
+    """Return the validated per-layer draft attention architectures.
 
-    GQA and MHA share the existing Qwen attention implementation. MLA swaps
-    only the attention projections while retaining the DFlash-family decoder,
-    target-context injection, masks, and objective.
+    ``attention_mode`` remains the uniform shorthand. ``attention_modes`` is
+    the per-layer form and is intentionally orthogonal to ``layer_types``:
+    each layer independently chooses its projection layout (GQA/MHA/MLA) and
+    its context layout (full/sliding).
     """
 
     dflash_config = dict(getattr(config, "dflash_config", None) or {})
-    attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
-    if attention_mode not in _VALID_DFLASH_ATTENTION_MODES:
+    if "attention_mode" in dflash_config and "attention_modes" in dflash_config:
         raise ValueError(
-            "DFlash dflash_config.attention_mode must be one of "
-            f"{sorted(_VALID_DFLASH_ATTENTION_MODES)}, got {attention_mode!r}"
+            "DFlash dflash_config must set only one of attention_mode or "
+            "attention_modes"
         )
-    return attention_mode
+
+    configured_modes = dflash_config.get("attention_modes")
+    if configured_modes is None:
+        mode = str(dflash_config.get("attention_mode", "gqa")).lower()
+        attention_modes = (mode,) * int(config.num_hidden_layers)
+    else:
+        if not isinstance(configured_modes, (list, tuple)):
+            raise ValueError(
+                "DFlash dflash_config.attention_modes must be a per-layer list"
+            )
+        attention_modes = tuple(str(mode).lower() for mode in configured_modes)
+        if len(attention_modes) != int(config.num_hidden_layers):
+            raise ValueError(
+                "DFlash dflash_config.attention_modes must contain exactly "
+                f"num_hidden_layers={config.num_hidden_layers} entries, got "
+                f"{len(attention_modes)}"
+            )
+
+    invalid = set(attention_modes) - _VALID_DFLASH_ATTENTION_MODES
+    if invalid:
+        raise ValueError(
+            "DFlash dflash_config.attention_mode/attention_modes values must be "
+            "selected from "
+            f"{sorted(_VALID_DFLASH_ATTENTION_MODES)}, got {sorted(invalid)}"
+        )
+    return attention_modes
+
+
+def resolve_dflash_attention_mode(config: Qwen3Config) -> str:
+    """Return the uniform mode, or ``mixed`` for a per-layer configuration."""
+
+    attention_modes = resolve_dflash_attention_modes(config)
+    return attention_modes[0] if len(set(attention_modes)) == 1 else "mixed"
 
 
 def validate_dflash_mla_config(config: Qwen3Config) -> None:
@@ -561,10 +593,9 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
+        attention_mode = resolve_dflash_attention_modes(config)[layer_idx]
         attention_cls = (
-            Qwen3DFlashMLAAttention
-            if resolve_dflash_attention_mode(config) == "mla"
-            else Qwen3DFlashAttention
+            Qwen3DFlashMLAAttention if attention_mode == "mla" else Qwen3DFlashAttention
         )
         self.self_attn = attention_cls(
             config=config,
@@ -695,7 +726,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
-        self.attention_mode = resolve_dflash_attention_mode(config)
+        self.attention_modes = resolve_dflash_attention_modes(config)
+        self.attention_mode = (
+            self.attention_modes[0] if len(set(self.attention_modes)) == 1 else "mixed"
+        )
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         self.layers = nn.ModuleList(
             [
@@ -793,7 +827,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = (
             None
-            if self.attention_mode == "mla"
+            if all(mode == "mla" for mode in self.attention_modes)
             else self.rotary_emb(hidden_states, position_ids)
         )
         for layer_type, layer in zip(self.layer_types, self.layers):
