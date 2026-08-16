@@ -21,6 +21,7 @@ _DISTRIBUTED_BACKENDS = {
     "cpu": "gloo",
     "cuda": "nccl",
     "npu": "hccl",
+    "xpu": "xccl",
 }
 
 
