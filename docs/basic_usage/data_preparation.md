@@ -341,13 +341,15 @@ See the [Training](training.md) guide for the complete run schema and supported
 combinations.
 
 
-## 🔤 Build a draft vocabulary mapping
+## 🔤 Build an EAGLE-family draft vocabulary mapping
 
-A draft that predicts over a subset of the target vocabulary needs a `t2d`/`d2t`
-mapping. `prepare_hidden_states.py` writes one as a side effect of capture, so
-trying a second `draft_vocab_size` — or building a mapping for a corpus whose
-features were captured before one was needed — otherwise means repeating the
-capture. `scripts/build_vocab_mapping.py` derives it directly, without a GPU.
+EAGLE3 and P-EAGLE drafts that predict over a subset of the target vocabulary
+need a `t2d`/`d2t` mapping. DFlash, DSpark, and Domino currently train over the
+full target vocabulary and do not consume this mapping. `prepare_hidden_states.py`
+writes one as a side effect of EAGLE-family capture, so trying a second
+`draft_vocab_size` — or building a mapping for a corpus whose features were
+captured before one was needed — otherwise means repeating the capture.
+`scripts/build_vocab_mapping.py` derives it directly, without a GPU.
 
 From the source JSONL, re-tokenizing with the same stack the capture used. Pass
 the same tokenizer, chat template, `--max-length`, and `--minimum-valid-tokens`,
@@ -356,6 +358,7 @@ or the counts describe a different corpus than training sees:
 ```bash
 python scripts/build_vocab_mapping.py \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
+    --target-model-path Qwen/Qwen3-8B \
     --tokenizer-path Qwen/Qwen3-8B \
     --chat-template qwen \
     --max-length 2048 \
@@ -370,19 +373,22 @@ chat template:
 ```bash
 python scripts/build_vocab_mapping.py \
     --hidden-states-path ./cache/hidden_states/sharegpt_train_Qwen3-8B \
+    --target-model-path Qwen/Qwen3-8B \
     --max-length 2048 \
     --draft-model-config configs/qwen3-8b-eagle3.json \
     --output-path ./cache/vocab_mapping/qwen3-8b-32k.pt
 ```
 
-The draft config supplies `vocab_size` — the map's length, which must match the
-model's `t2d` buffer — and the default `draft_vocab_size`. Both modes cache the
-per-corpus token counts, reusing them only while the corpus fingerprint is
-unchanged, so surveying sizes costs one pass:
+The target model config supplies `vocab_size`, the full vocabulary indexed by
+the mapping, while the EAGLE-family draft config supplies the default
+`draft_vocab_size`. Both modes cache the per-corpus token counts, reusing them
+only while the corpus fingerprint is unchanged, so surveying sizes costs one
+pass:
 
 ```bash
 python scripts/build_vocab_mapping.py \
     --hidden-states-path ./cache/hidden_states/sharegpt_train_Qwen3-8B \
+    --target-model-path Qwen/Qwen3-8B \
     --draft-model-config configs/qwen3-8b-eagle3.json \
     --draft-vocab-size 16000,32000,64000
 ```
@@ -390,9 +396,9 @@ python scripts/build_vocab_mapping.py \
 A comma-separated list only reports the coverage each size would reach and
 writes nothing; omitting `--output-path` reports coverage for a single size.
 
-Point `model.vocab_mapping_path` at the written file. A disaggregated run
-requires this, because producer and consumer cannot derive one shared mapping
-independently.
+Point `model.vocab_mapping_path` at the written file. A disaggregated
+EAGLE-family run requires this, because producer and consumer cannot derive one
+shared mapping independently.
 
 `--hidden-states-path` is exact but reads every feature file serially, which is
 impractical for a large gzipped corpus; prefer `--data-path` there.

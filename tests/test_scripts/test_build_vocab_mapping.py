@@ -49,10 +49,18 @@ def _write_features(directory: Path, *, compress: bool, seed: int = 0) -> None:
 
 
 def _write_draft_config(path: Path, draft_vocab_size=None) -> None:
-    payload = {"vocab_size": VOCAB_SIZE}
+    payload = {}
     if draft_vocab_size is not None:
         payload["draft_vocab_size"] = draft_vocab_size
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_target_config(directory: Path, vocab_size=VOCAB_SIZE) -> None:
+    directory.mkdir(exist_ok=True)
+    (directory / "config.json").write_text(
+        json.dumps({"model_type": "llama", "vocab_size": vocab_size}),
+        encoding="utf-8",
+    )
 
 
 class BuildVocabMappingTest(unittest.TestCase):
@@ -62,6 +70,8 @@ class BuildVocabMappingTest(unittest.TestCase):
         self.features = self.root / "features"
         self.features.mkdir()
         self.config = self.root / "draft.json"
+        self.target = self.root / "target"
+        _write_target_config(self.target)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -74,6 +84,8 @@ class BuildVocabMappingTest(unittest.TestCase):
             [
                 "--hidden-states-path",
                 str(self.features),
+                "--target-model-path",
+                str(self.target),
                 "--draft-model-config",
                 str(self.config),
                 *extra,
@@ -114,6 +126,16 @@ class BuildVocabMappingTest(unittest.TestCase):
         mapping = torch.load(out, map_location="cpu")
         self.assertEqual(tuple(mapping["t2d"].shape), (VOCAB_SIZE,))
         self.assertEqual(tuple(mapping["d2t"].shape), (DRAFT_VOCAB_SIZE,))
+
+    def test_full_vocab_size_comes_from_the_target_config(self):
+        target_vocab_size = VOCAB_SIZE + 32
+        _write_target_config(self.target, target_vocab_size)
+        out = self.root / "mapping.pt"
+
+        self.assertEqual(0, self._run("--output-path", str(out)))
+
+        mapping = torch.load(out, map_location="cpu")
+        self.assertEqual(tuple(mapping["t2d"].shape), (target_vocab_size,))
 
     def test_counts_are_cached_and_reused(self):
         """Counting is the expensive half; changing K must not repeat it."""
@@ -169,6 +191,8 @@ class BuildVocabMappingTest(unittest.TestCase):
                 [
                     "--data-path",
                     str(jsonl),
+                    "--target-model-path",
+                    str(self.target),
                     "--draft-model-config",
                     str(self.config),
                 ]
@@ -183,6 +207,8 @@ class BuildVocabMappingTest(unittest.TestCase):
                     str(self.features),
                     "--data-path",
                     str(self.root / "train.jsonl"),
+                    "--target-model-path",
+                    str(self.target),
                     "--draft-model-config",
                     str(self.config),
                 ]
@@ -191,7 +217,14 @@ class BuildVocabMappingTest(unittest.TestCase):
     def test_a_source_is_required(self):
         _write_draft_config(self.config, DRAFT_VOCAB_SIZE)
         with self.assertRaises(SystemExit):
-            main(["--draft-model-config", str(self.config)])
+            main(
+                [
+                    "--target-model-path",
+                    str(self.target),
+                    "--draft-model-config",
+                    str(self.config),
+                ]
+            )
 
     def test_dataset_counts_are_cached_under_the_dataset_cache_dir(self):
         """The JSONL route caches too, so surveying K stays a one-time cost."""
@@ -289,7 +322,7 @@ class BuildVocabMappingTest(unittest.TestCase):
         from scripts.build_vocab_mapping import tally_loss_tokens
 
         dataset = Dataset.from_dict({"input_ids": [[VOCAB_SIZE]], "loss_mask": [[1]]})
-        with self.assertRaisesRegex(ValueError, "outside the draft config"):
+        with self.assertRaisesRegex(ValueError, "outside the target model"):
             tally_loss_tokens(dataset, vocab_size=VOCAB_SIZE)
 
     def test_coverage_ratio_matches_the_definition(self):

@@ -1,4 +1,4 @@
-"""Build a draft vocabulary mapping from prepared offline features.
+"""Build an EAGLE-family draft vocabulary mapping from a training corpus.
 
 Training can derive this map on its own, but only for a colocated offline run,
 and only by reading every feature file first -- which for gzipped features means
@@ -11,10 +11,9 @@ the dataset, while choosing the top-K is cheap and is the half you actually want
 to iterate on. Changing K therefore never requires regenerating hidden states,
 and never requires a second pass over them.
 
-The map is emitted at the *draft config's* ``vocab_size``, which is the length
-the model's ``t2d`` buffer is registered with. Sizing it from the target config
-instead would produce a file that silently fails to load whenever the target
-declares ``padded_vocab_size``.
+The map is emitted at the target model config's ``vocab_size``, matching the
+target-token IDs and logits the mapping indexes. The draft config supplies only
+the selected ``draft_vocab_size``.
 
 Two sources, same numbers. ``--hidden-states-path`` reads the prepared
 features, which is exact but serial -- for a large gzipped dataset it is not
@@ -27,17 +26,19 @@ Survey several sizes before committing to one (writes nothing):
 
     python scripts/build_vocab_mapping.py \
         --data-path ./cache/dataset/train.jsonl \
+        --target-model-path Qwen/Qwen3-8B \
         --tokenizer-path Qwen/Qwen3-8B --chat-template qwen --max-length 4096 \
-        --draft-model-config configs/qwen3.6-27b-dspark.json \
+        --draft-model-config configs/qwen3-8b-eagle3.json \
         --draft-vocab-size 16000,32000,48000,64000
 
 Then write the chosen one, reusing the cached counts:
 
     python scripts/build_vocab_mapping.py \
         --data-path ./cache/dataset/train.jsonl \
+        --target-model-path Qwen/Qwen3-8B \
         --tokenizer-path Qwen/Qwen3-8B --chat-template qwen --max-length 4096 \
-        --draft-model-config configs/qwen3.6-27b-dspark-draftvocab64k.json \
-        --output-path ./cache/vocab_mapping/qwen3.6-27b-k64000.pt
+        --draft-model-config configs/qwen3-8b-eagle3.json \
+        --output-path ./cache/vocab_mapping/qwen3-8b-k32000.pt
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ import torch
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Derive t2d/d2t from prepared offline features, without "
+            "Derive an EAGLE-family t2d/d2t mapping, without "
             "regenerating them and without a second pass per vocabulary size."
         )
     )
@@ -80,6 +81,16 @@ def build_parser() -> argparse.ArgumentParser:
             "and --minimum-valid-tokens the capture ran with, or the counts "
             "will describe a different corpus than training sees."
         ),
+    )
+    parser.add_argument(
+        "--target-model-path",
+        required=True,
+        help="Target model/config path supplying the full target vocab_size.",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow custom code while loading the target model config.",
     )
     parser.add_argument(
         "--tokenizer-path",
@@ -132,10 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--draft-model-config",
         type=Path,
         required=True,
-        help=(
-            "Draft config JSON. Supplies vocab_size (the map's length, matching "
-            "the model's t2d buffer) and the default draft_vocab_size."
-        ),
+        help="EAGLE-family draft config JSON supplying the default draft_vocab_size.",
     )
     parser.add_argument(
         "--draft-vocab-size",
@@ -284,7 +292,7 @@ def tally_loss_tokens(dataset, *, vocab_size: int, batch_size: int = 512) -> Cou
         flat = torch.cat(selected).long()
         if int(flat.min()) < 0 or int(flat.max()) >= vocab_size:
             raise ValueError(
-                f"token id {int(flat.max())} is outside the draft config's "
+                f"token id {int(flat.max())} is outside the target model's "
                 f"vocab_size {vocab_size}"
             )
         totals += torch.bincount(flat, minlength=vocab_size)
@@ -367,9 +375,17 @@ def write_mapping(
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
+    from transformers import AutoConfig
+
+    target_config = AutoConfig.from_pretrained(
+        args.target_model_path,
+        trust_remote_code=args.trust_remote_code,
+    )
+    target_text_config = getattr(target_config, "text_config", target_config)
+    vocab_size = int(target_text_config.vocab_size)
+
     with open(args.draft_model_config, encoding="utf-8") as handle:
         draft_config = json.load(handle)
-    vocab_size = int(draft_config["vocab_size"])
 
     if args.draft_vocab_size is not None:
         sizes = [int(item) for item in str(args.draft_vocab_size).split(",") if item]
