@@ -49,28 +49,80 @@ class Checkpoint:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
 class StepResult:
     """Result of one TrainerCore step; ``optimizer_stepped`` is the authoritative
-    grad-accumulation boundary signal."""
+    grad-accumulation boundary signal.
 
-    optimizer_stepped: bool
-    loss: float
-    grad_norm: Optional[float]
-    metrics: Dict[str, Any] = field(default_factory=dict)
+    Metric tensors stay on the training device until a consumer actually asks
+    for host values.  This keeps ``train_step`` asynchronous on non-logging
+    steps while preserving the existing float-valued public properties.
+    """
+
+    def __init__(
+        self,
+        *,
+        optimizer_stepped: bool,
+        metric_values: Dict[str, Any],
+        has_grad_norm: bool,
+    ) -> None:
+        self.optimizer_stepped = optimizer_stepped
+        self._metric_values = metric_values
+        self._has_grad_norm = has_grad_norm
+        self._materialized_metrics: Optional[Dict[str, float]] = None
+
+    def materialize_metrics(self) -> Dict[str, float]:
+        """Copy all device metrics to the host in one synchronization."""
+        if self._materialized_metrics is None:
+            self._materialized_metrics = _materialize_metrics(self._metric_values)
+        return self._materialized_metrics
+
+    @property
+    def metrics(self) -> Dict[str, float]:
+        return self.materialize_metrics()
+
+    @property
+    def loss(self) -> float:
+        return self.materialize_metrics()["loss"]
+
+    @property
+    def grad_norm(self) -> Optional[float]:
+        if not self._has_grad_norm:
+            return None
+        return self.materialize_metrics()["grad_norm"]
 
 
-def _scalar(x: Any) -> float:
-    if isinstance(x, torch.Tensor):
-        return float(x.detach().float().mean().item())
-    if isinstance(x, (list, tuple)) and x:
-        return float(torch.stack([t.detach().float() for t in x]).mean().item())
-    return float(x)
+def _materialize_metrics(values: Dict[str, Any]) -> Dict[str, float]:
+    """Materialize scalar metrics with at most one device-to-host transfer."""
+    host_values: Dict[str, float] = {}
+    tensor_names = []
+    tensors = []
+    for name, value in values.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(
+                    f"metric {name!r} must be scalar before materialization"
+                )
+            tensor_names.append(name)
+            tensors.append(value.detach().float().reshape(()))
+        else:
+            host_values[name] = float(value)
+
+    if tensors:
+        device = tensors[0].device
+        packed = torch.stack([tensor.to(device) for tensor in tensors])
+        materialized = packed.cpu().tolist()
+        host_values.update(
+            {name: float(value) for name, value in zip(tensor_names, materialized)}
+        )
+    return host_values
 
 
 def _dp_mean_scalars(
-    values: Dict[str, torch.Tensor], *, process_group: Any = None
-) -> Dict[str, torch.Tensor]:
+    values: Dict[str, Any],
+    *,
+    device: torch.device,
+    process_group: Any = None,
+) -> Dict[str, Any]:
     """Average scalar metrics across DP ranks with one collective.
 
     Uses the established DFlash metric convention (DP mean):
@@ -83,17 +135,34 @@ def _dp_mean_scalars(
     """
     import torch.distributed as dist
 
-    if not values or not (dist.is_available() and dist.is_initialized()):
-        return values
+    normalized = {
+        name: (
+            value.detach().float().reshape(())
+            if isinstance(value, torch.Tensor)
+            else float(value)
+        )
+        for name, value in values.items()
+    }
+    if not normalized or not (dist.is_available() and dist.is_initialized()):
+        return normalized
     world = (
         dist.get_world_size()
         if process_group is None
         else dist.get_world_size(group=process_group)
     )
     if world <= 1:
-        return values
-    names = list(values)
-    packed = torch.stack([values[name].detach().float().reshape(()) for name in names])
+        return normalized
+    names = list(normalized)
+    packed = torch.stack(
+        [
+            (
+                value.to(device)
+                if isinstance(value, torch.Tensor)
+                else torch.tensor(value, dtype=torch.float32, device=device)
+            )
+            for value in normalized.values()
+        ]
+    )
     if process_group is None:
         dist.all_reduce(packed)
     else:
@@ -108,7 +177,7 @@ def _reduce_ratio_metrics(
     device: torch.device,
     process_group: Any,
     reduce: bool,
-) -> Dict[str, float]:
+) -> Dict[str, torch.Tensor]:
     """Form telemetry ratios only after summing their numerators and counts."""
 
     if not values:
@@ -151,7 +220,7 @@ def _reduce_ratio_metrics(
                 else:
                     dist.all_reduce(packed, group=process_group)
 
-    output: Dict[str, float] = {}
+    output: Dict[str, torch.Tensor] = {}
     cursor = 0
     for name, numerator, _denominator in normalized:
         width = numerator.numel()
@@ -161,11 +230,9 @@ def _reduce_ratio_metrics(
         cursor += width
         ratios = summed_numerator / summed_denominator.clamp_min(1e-12)
         if width == 1:
-            output[name] = float(ratios.item())
+            output[name] = ratios.reshape(())
         else:
-            output.update(
-                {f"{name}_{index}": float(value) for index, value in enumerate(ratios)}
-            )
+            output.update({f"{name}_{index}": ratios[index] for index in range(width)})
     return output
 
 
@@ -203,7 +270,8 @@ def _reduce_eagle3_metrics(
     device: torch.device,
     process_group: Any,
     ploss_decay: float,
-) -> Optional[Dict[str, float]]:
+    reduce: bool,
+) -> Optional[Dict[str, torch.Tensor]]:
     """Reduce EAGLE3's per-position training telemetry as numerators/counts.
 
     Accuracy and p-loss are ratios, so averaging rank-local ratios biases the
@@ -275,32 +343,31 @@ def _reduce_eagle3_metrics(
 
     import torch.distributed as dist
 
-    if dist.is_available() and dist.is_initialized():
+    if reduce and dist.is_available() and dist.is_initialized():
         world = dist.get_world_size(process_group)
         if world > 1:
             dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=process_group)
 
     reduced_acc = packed[0] / packed[1].clamp_min(1e-6)
     reduced_ploss = packed[2] / packed[3].clamp_min(1e-6)
-    result: Dict[str, float] = {}
-    for index, value in enumerate(reduced_acc.tolist()):
-        result[f"acc_{index}"] = float(value)
-    for index, value in enumerate(reduced_ploss.tolist()):
-        result[f"ploss_{index}"] = float(value)
+    result: Dict[str, torch.Tensor] = {}
+    for index in range(length):
+        result[f"acc_{index}"] = reduced_acc[index]
+        result[f"ploss_{index}"] = reduced_ploss[index]
 
-    result["acc"] = float(packed[0].sum().div(packed[1].sum().clamp_min(1e-6)).item())
+    result["acc"] = packed[0].sum().div(packed[1].sum().clamp_min(1e-6))
     weights = torch.tensor(
         [ploss_decay**index for index in range(length)],
         dtype=reduced_ploss.dtype,
         device=reduced_ploss.device,
     )
-    result["loss"] = float((reduced_ploss * weights).sum().item())
+    result["loss"] = (reduced_ploss * weights).sum()
 
     if acceptance_rates is not None:
         reduced_acceptance = packed[4] / packed[5].clamp_min(1e-6)
-        for index, value in enumerate(reduced_acceptance.tolist()):
-            result[f"acceptance_rate_{index}"] = float(value)
-        result["acceptance_rate"] = float(reduced_acceptance.mean().item())
+        for index in range(length):
+            result[f"acceptance_rate_{index}"] = reduced_acceptance[index]
+        result["acceptance_rate"] = reduced_acceptance.mean()
     return result
 
 
@@ -417,6 +484,7 @@ class TrainerCore:
             device=metric_device,
             process_group=process_group,
             ploss_decay=float(getattr(self.strategy, "ploss_decay", 1.0)),
+            reduce=stepped,
         )
         # Structured EAGLE3 metrics are already globally reduced.  Remaining
         # scalar diagnostics are DP-averaged in a single collective at optimizer
@@ -430,21 +498,19 @@ class TrainerCore:
                 reduce=stepped,
             )
         )
-        scalar_metrics: Dict[str, torch.Tensor] = {}
+        scalar_metrics: Dict[str, Any] = {}
         if "loss" not in metrics:
-            scalar_metrics["loss"] = out.loss
+            scalar_metrics["loss"] = out.loss.detach()
         if "accuracy" in out.metrics and "acc" not in metrics:
             accuracy = out.metrics["accuracy"]
             if isinstance(accuracy, torch.Tensor):
-                scalar_metrics["acc"] = (
-                    accuracy.detach().float().mean().to(out.loss.device)
-                )
+                scalar_metrics["acc"] = accuracy.detach().float().mean()
             elif isinstance(accuracy, (int, float)) and not isinstance(accuracy, bool):
-                scalar_metrics["acc"] = out.loss.detach().new_tensor(float(accuracy))
+                scalar_metrics["acc"] = float(accuracy)
         # Strategies may expose additional scalar diagnostics without teaching
-        # the generic trainer their algorithm-specific names. Move CPU schedule
-        # scalars (for example Domino's lambda_base) onto the loss device before
-        # the DP reduction so NCCL-backed runs do not all-reduce a CPU tensor.
+        # the generic trainer their algorithm-specific names. Keep host schedule
+        # scalars (for example Domino's lambda_base) on the host unless a real
+        # multi-rank DP reduction requires moving them to the loss device.
         reserved_metric_keys = _EAGLE3_STRUCTURED_METRIC_KEYS | {
             "accuracy",
             "accuracy_denom",
@@ -456,26 +522,29 @@ class TrainerCore:
             if isinstance(value, torch.Tensor):
                 if value.numel() != 1:
                     continue
-                scalar = value.detach().reshape(()).to(out.loss.device)
+                scalar = value.detach().reshape(())
             elif isinstance(value, (int, float)) and not isinstance(value, bool):
-                scalar = out.loss.detach().new_tensor(float(value))
+                scalar = float(value)
             else:
                 continue
             scalar_metrics[key] = scalar
         if stepped:
             scalar_metrics = _dp_mean_scalars(
                 scalar_metrics,
+                device=metric_device,
                 process_group=process_group,
             )
-        metrics.update({key: _scalar(value) for key, value in scalar_metrics.items()})
-        gn = _scalar(grad_norm) if grad_norm is not None else None
-        if gn is not None:
-            metrics["grad_norm"] = gn
+        metrics.update(scalar_metrics)
+        if grad_norm is not None:
+            if isinstance(grad_norm, torch.Tensor):
+                grad_norm_metric = grad_norm.detach().float().mean()
+            else:
+                grad_norm_metric = float(grad_norm)
+            metrics["grad_norm"] = grad_norm_metric
         return StepResult(
             optimizer_stepped=stepped,
-            loss=metrics["loss"],
-            grad_norm=gn,
-            metrics=metrics,
+            metric_values=metrics,
+            has_grad_norm=grad_norm is not None,
         )
 
 
@@ -559,7 +628,8 @@ class TrainerController:
         # with its trained prefix already removed. Suppress the generic iterable
         # seek exactly once; consuming ``start_batch`` again would skip fresh data.
         self._data_prepositioned = bool(data_prepositioned)
-        self.last_metrics: Dict[str, Any] = {}
+        self._last_result: Optional[StepResult] = None
+        self._last_eval_metrics: Dict[str, Any] = {}
         self.last_checkpoint_step: Optional[int] = None
         from specforge.training.profiling import ProfilingOptions, StepProfiler
 
@@ -568,6 +638,16 @@ class TrainerController:
             options,
             output_dir=output_dir,
         )
+
+    @property
+    def last_metrics(self) -> Dict[str, Any]:
+        metrics = (
+            dict(self._last_result.materialize_metrics())
+            if self._last_result is not None
+            else {}
+        )
+        metrics.update(self._last_eval_metrics)
+        return metrics
 
     def _make_progress_bar(self):
         """Build a rank-0 optimizer-step bar for interactive terminals only."""
@@ -665,12 +745,13 @@ class TrainerController:
                     ),
                 )
                 perf_train_compute_s += time.perf_counter() - train_compute_started
-                self.last_metrics = result.metrics
                 # grad accumulated but optimizer has not stepped yet; everything
                 # keyed on optimizer steps fires only at the boundary.
                 if not result.optimizer_stepped:
                     continue
                 self.global_step += 1
+                self._last_result = result
+                self._last_eval_metrics = {}
                 perf_window_steps += 1
                 self._step_profiler.after_optimizer_step(self.global_step)
                 if self.ack_fn is not None:
@@ -680,7 +761,7 @@ class TrainerController:
                     perf_durable_ack_s += time.perf_counter() - durable_ack_started
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
-                    log_metrics = dict(result.metrics)
+                    log_metrics = dict(result.materialize_metrics())
                     optimizer = getattr(self.core.backend, "optimizer", None)
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
@@ -732,7 +813,7 @@ class TrainerController:
                     if eval_metrics:
                         if self.logger:
                             self.logger(eval_metrics, self.global_step)
-                        self.last_metrics = {**self.last_metrics, **eval_metrics}
+                        self._last_eval_metrics = dict(eval_metrics)
                 # ``is_better`` is collective (rank0 verdict broadcast inside
                 # the manager); its guard is rank-identical because eval metrics
                 # are DP-reduced. Empty eval metrics skip best tracking.

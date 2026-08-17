@@ -171,7 +171,7 @@ def _fixed_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
 
 
 def _fixed_anchor_sampler(anchors, keep_mask):
-    def _sample(self, seq_len, loss_mask, device):
+    def _sample(self, seq_len, loss_mask, device, max_valid_anchors=None):
         return anchors.to(device), keep_mask.to(device)
 
     return _sample

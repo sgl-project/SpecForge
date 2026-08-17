@@ -22,6 +22,7 @@ from specforge.training.controller import (
     Checkpoint,
     TrainerController,
     TrainerCore,
+    _materialize_metrics,
     _reduce_ratio_metrics,
 )
 from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
@@ -242,7 +243,7 @@ class TestTrainerCore(unittest.TestCase):
         core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
         result = core._result(
             StepOutput(
-                loss=torch.tensor(2.0),
+                loss=torch.tensor(2.0, requires_grad=True),
                 metrics={
                     "loss": torch.tensor(99.0),
                     "accuracy": torch.tensor(0.5),
@@ -260,8 +261,27 @@ class TestTrainerCore(unittest.TestCase):
         self.assertEqual(result.metrics["acc"], 0.5)
         self.assertEqual(result.metrics["ce_loss"], 1.25)
         self.assertEqual(result.metrics["lambda_base"], 0.75)
+        self.assertIsInstance(result._metric_values["lambda_base"], float)
+        self.assertFalse(result._metric_values["loss"].requires_grad)
         self.assertNotIn("accuracy_denom", result.metrics)
         self.assertNotIn("non_scalar_debug", result.metrics)
+
+    def test_metrics_are_materialized_lazily_and_cached(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+
+        with mock.patch(
+            "specforge.training.controller._materialize_metrics",
+            wraps=_materialize_metrics,
+        ) as materialize:
+            result = core.train_step(_batch())
+            materialize.assert_not_called()
+
+            self.assertEqual(result.loss, 2.0)
+            materialize.assert_called_once()
+            self.assertEqual(result.metrics["acc"], 0.5)
+            self.assertEqual(result.grad_norm, 1.0)
+            materialize.assert_called_once()
 
     def test_ratio_metrics_override_mean_of_means_accuracy(self):
         strat = FakeStrategy()
@@ -420,7 +440,7 @@ class TestTrainerCore(unittest.TestCase):
                 "torch.distributed.all_reduce", side_effect=all_reduce
             ) as reduce,
         ):
-            result = core._result(self._eagle_output(), grad_norm=None, stepped=False)
+            result = core._result(self._eagle_output(), grad_norm=None, stepped=True)
 
         reduce.assert_called_once()
         self.assertAlmostEqual(result.metrics["acc_0"], 9 / 12, places=6)
@@ -447,7 +467,13 @@ class TestTrainerController(unittest.TestCase):
         backend = FakeBackend(strat.model)
         core = TrainerCore(strat, backend, accumulation_steps=1)
         logged = []
-        with tempfile.TemporaryDirectory() as d:
+        with (
+            tempfile.TemporaryDirectory() as d,
+            mock.patch(
+                "specforge.training.controller._materialize_metrics",
+                wraps=_materialize_metrics,
+            ) as materialize,
+        ):
             ctrl = TrainerController(
                 core,
                 run_id="r",
@@ -458,6 +484,8 @@ class TestTrainerController(unittest.TestCase):
                 logger=lambda metrics, step: logged.append((dict(metrics), step)),
             )
             self.assertEqual(ctrl.fit([_batch(), _batch()]), 2)
+
+        materialize.assert_called_once()
 
         self.assertEqual(len(logged), 1)
         metrics, step = logged[0]

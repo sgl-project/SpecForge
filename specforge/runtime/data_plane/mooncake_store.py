@@ -740,6 +740,52 @@ class MooncakeFeatureStore(FeatureStore):
             sleep=sleep,
         )
 
+    def retry_sample_removals(self, sample_ids: List[str]) -> Dict[str, Any]:
+        """Try selected removals once, without probing or sleeping.
+
+        The optimizer path calls this only for samples made durable at an
+        earlier boundary.  A failed remove remains in ``_release_pending`` for
+        the next batched attempt; avoiding ``is_exist`` here is important
+        because that probe renews Mooncake's read lease.
+        """
+        target_ids = set(sample_ids)
+        removed = removed_bytes = 0
+        with self._lock:
+            pending = [
+                sample_id
+                for sample_id in self._release_pending
+                if sample_id in target_ids
+            ]
+            for sample_id in pending:
+                physically_removed = self._try_physical_free(
+                    sample_id,
+                    force=True,
+                    confirm_absent_on_failure=False,
+                )
+                if physically_removed:
+                    sample_bytes = self._free_bookkeeping_locked(sample_id)
+                    removed += 1
+                    removed_bytes += sample_bytes
+                    self._stats["force_freed"] += 1
+                    self._stats["force_freed_bytes"] += sample_bytes
+                else:
+                    self._release_pending[sample_id] = min(
+                        self.max_release_attempts,
+                        self._release_pending.get(sample_id, 0) + 1,
+                    )
+            remaining = [
+                sample_id
+                for sample_id in self._release_pending
+                if sample_id in target_ids
+            ]
+        return {
+            "removed": removed,
+            "removed_bytes": removed_bytes,
+            "release_pending": len(remaining),
+            "remaining_ids": remaining,
+            "attempts": 1 if pending else 0,
+        }
+
     def drain_pending_removals(
         self,
         *,

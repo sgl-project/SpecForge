@@ -73,8 +73,9 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-multiserver-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-online.yaml": 8,
-    "qwen3.6-27b-domino-online.yaml": 8,
+    "qwen3.6-27b-domino-online.yaml": 1,
     "qwen3.6-27b-dspark-disaggregated.yaml": 1,
+    "qwen3.6-27b-dspark-online.yaml": 1,
     "qwq-32b-eagle3-online.yaml": 4,
 }
 
@@ -332,6 +333,14 @@ EXPECTED_DISAGGREGATED = {
                 }
             ],
         },
+    },
+    "qwen3.6-27b-dspark-online.yaml": {
+        "control_dir": "outputs/qwen3.6-27b-dspark-online/control",
+        "consumer_state_dir": "outputs/qwen3.6-27b-dspark-online/consumer-state",
+        "backend": "mooncake",
+        "server_urls": ["http://127.0.0.1:30000"],
+        **LOCAL_MOONCAKE_ENDPOINTS,
+        "mooncake_local_hostname": "127.0.0.1",
     },
 }
 
