@@ -62,13 +62,13 @@ class TestEquivTrimLossPositions(unittest.TestCase):
 
         @torch.no_grad()
         def step_losses(trim: bool):
-            model.trim_loss_positions = trim
             plosses, *_ = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 loss_mask=loss_mask,
                 target=target,
                 hidden_states=hidden_states,
+                trim_loss_positions=trim,
             )
             return [float(p.item()) for p in plosses]
 

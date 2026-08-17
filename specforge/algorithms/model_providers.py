@@ -268,7 +268,6 @@ def build_eagle3_model(
         lk_loss_type=cfg.training.lk_loss_type,
         kl_scale=cfg.training.kl_scale,
         kl_decay=cfg.training.kl_decay,
-        trim_loss_positions=cfg.training.trim_loss_positions,
     ).to(device=_device(), dtype=_torch_dtype(cfg))
     needs_target_head = cfg.mode == "offline" or (
         cfg.deployment.mode == "disaggregated" and cfg.training.role == "consumer"
@@ -437,6 +436,7 @@ def build_dspark_model(
 
 def eagle3_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
     return {
+        "trim_loss_positions": cfg.training.trim_loss_positions,
         "compact_teacher": cfg.training.compact_teacher,
         "compact_teacher_chunk_size": cfg.training.compact_teacher_chunk_size,
     }

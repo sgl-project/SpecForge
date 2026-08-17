@@ -165,6 +165,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
     def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
         training = SimpleNamespace(
             attention_backend="flex_attention",
+            trim_loss_positions=True,
             compact_teacher=True,
             compact_teacher_chunk_size=1024,
             lambda_base_start=0.75,
@@ -215,6 +216,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "eagle3_lk_loss_type",
                 "eagle3_kl_scale",
                 "eagle3_kl_decay",
+                "eagle3_trim_loss_positions",
                 "eagle3_compact_teacher",
             },
             "peagle": {
@@ -261,6 +263,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         config = SimpleNamespace(
             training=SimpleNamespace(
                 attention_backend="flex_attention",
+                trim_loss_positions=False,
                 compact_teacher=False,
                 compact_teacher_chunk_size=None,
             )
@@ -296,6 +299,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             (
                 ("compact_teacher", False),
                 ("compact_teacher_chunk_size", None),
+                ("trim_loss_positions", False),
             ),
         )
         self.assertEqual(
