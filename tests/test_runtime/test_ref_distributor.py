@@ -732,10 +732,42 @@ class TestDPAckController(unittest.TestCase):
         self.assertEqual(reason, "optimizer-boundary-durable-ack")
         controller.store.close()
 
-    def test_selective_drain_failure_is_reported_after_durable_commit(self):
+    def test_selective_cleanup_waits_one_boundary_without_strong_drain(self):
+        retries = []
+
         class FeatureStore:
             def abort(self, sample_id, *, reason):
                 pass
+
+            def retry_sample_removals(self, sample_ids):
+                retries.append(list(sample_ids))
+                return {"remaining_ids": []}
+
+            def drain_sample_removals(self, sample_ids, **kwargs):
+                raise AssertionError("normal cleanup must not enter the sleeping drain")
+
+        store = FeatureStore()
+        controller = DPAckController(
+            "run0",
+            is_authority=True,
+            feature_store=store,
+            metadata_store=SQLiteMetadataStore(os.path.join(self.dir, "lag.db")),
+        )
+        controller.commit_samples("w0", [_ref("s0")])
+        controller.ack_train_refs("t0", ["s0"], global_step=1, optimizer_durable=True)
+        self.assertEqual(retries, [])
+
+        controller.ack_train_refs("t0", [], global_step=2, optimizer_durable=True)
+        self.assertEqual(retries, [["s0"]])
+        controller.store.close()
+
+    def test_selective_drain_failure_is_reported_after_bounded_deferral(self):
+        class FeatureStore:
+            def abort(self, sample_id, *, reason):
+                pass
+
+            def retry_sample_removals(self, sample_ids):
+                return {"remaining_ids": list(sample_ids)}
 
             def drain_sample_removals(self, sample_ids, **kwargs):
                 raise OSError(f"remove stayed pinned for {sample_ids}")
@@ -747,14 +779,17 @@ class TestDPAckController(unittest.TestCase):
             metadata_store=SQLiteMetadataStore(os.path.join(self.dir, "drain.db")),
         )
         controller.commit_samples("w0", [_ref("s0")])
+        controller.ack_train_refs("t0", ["s0"], global_step=1, optimizer_durable=True)
+        for step in range(2, 5):
+            controller.ack_train_refs(
+                "t0", [], global_step=step, optimizer_durable=True
+            )
         with self.assertRaisesRegex(
             RuntimeError, "optimizer-boundary selective drain.*remove stayed pinned"
         ):
-            controller.ack_train_refs(
-                "t0", ["s0"], global_step=1, optimizer_durable=True
-            )
+            controller.ack_train_refs("t0", [], global_step=5, optimizer_durable=True)
         marker = controller.store.durable_marker()
-        self.assertEqual(marker["global_step"], 1)
+        self.assertEqual(marker["global_step"], 5)
         self.assertTrue(marker["optimizer_durable"])
         controller.store.close()
 

@@ -12,6 +12,7 @@ import ctypes
 import importlib.util
 import unittest
 from inspect import signature
+from unittest import mock
 
 import torch
 
@@ -168,6 +169,49 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         fs.put(_tensors(), sample_id="s0", metadata=_meta())
         self.assertTrue(getattr(fake.last_config, "with_hard_pin", False))
         self.assertTrue(fs.health()["hard_pin"])
+
+    def test_constructor_falls_back_to_soft_pin(self):
+        import specforge.runtime.data_plane.mooncake_store as mooncake_store
+
+        class _SoftPinOnlyConfig:
+            def __init__(self):
+                self.replica_num = 1
+                self.with_soft_pin = False
+
+        fake = _FakeMooncakeStore()
+        with (
+            mock.patch.object(
+                mooncake_store,
+                "_connect_store",
+                return_value=(fake, _SoftPinOnlyConfig),
+            ),
+            self.assertLogs(mooncake_store.logger, level="WARNING") as logs,
+        ):
+            fs = MooncakeFeatureStore(store_id="run0", setup_kwargs={})
+
+        self.assertTrue(fs._put_config.with_soft_pin)
+        self.assertIn("falling back to with_soft_pin", "\n".join(logs.output))
+
+    def test_constructor_tolerates_config_without_pin_fields(self):
+        import specforge.runtime.data_plane.mooncake_store as mooncake_store
+
+        class _ConfigWithoutPinFields:
+            def __init__(self):
+                self.replica_num = 1
+
+        fake = _FakeMooncakeStore()
+        with (
+            mock.patch.object(
+                mooncake_store,
+                "_connect_store",
+                return_value=(fake, _ConfigWithoutPinFields),
+            ),
+            self.assertLogs(mooncake_store.logger, level="WARNING") as logs,
+        ):
+            fs = MooncakeFeatureStore(store_id="run0", setup_kwargs={})
+
+        self.assertEqual(fs._put_config.replica_num, 1)
+        self.assertIn("neither with_hard_pin nor with_soft_pin", "\n".join(logs.output))
 
     def test_get_after_release_raises(self):
         fs = _store()
@@ -371,11 +415,24 @@ class TestMooncakeFeatureStore(unittest.TestCase):
             optimizer_durable=True,
         )
 
+        # The current optimizer window is only tombstoned.  Its short remote
+        # read lease gets one full window to expire, so ack itself never sleeps.
+        self.assertTrue(_phys_resident(fake, sid="durable"))
+        self.assertTrue(_phys_resident(fake, sid="prefetched"))
+        self.assertEqual(fs.health()["release_pending"], 2)
+
+        controller.ack_train_refs(
+            "trainer",
+            [],
+            global_step=2,
+            optimizer_durable=True,
+        )
+
         self.assertFalse(_phys_resident(fake, sid="durable"))
         self.assertTrue(_phys_resident(fake, sid="prefetched"))
         self.assertEqual(fs.health()["release_pending"], 1)
         marker = controller.store.durable_marker()
-        self.assertEqual(marker["global_step"], 1)
+        self.assertEqual(marker["global_step"], 2)
         self.assertEqual(marker["acked"], {"durable"})
 
     def test_lifecycle_drain_does_not_renew_read_lease_between_retries(self):

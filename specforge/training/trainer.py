@@ -22,6 +22,8 @@ import sys
 from contextlib import nullcontext
 from typing import Callable, Mapping, Optional
 
+import torch
+
 from specforge.algorithms.common.providers import (
     MODEL_PROVENANCE_CONTRACT_KEY,
     OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
@@ -152,6 +154,9 @@ class Trainer:
             strategy=algorithm_name,
             ack=not defer_queue_ack,
             num_workers=dataloader_num_workers,
+            # Pin in the existing loader workers so Domino's non-blocking H2D
+            # copies do not add pinning work to the training thread.
+            pin_memory=dataloader_num_workers > 0 and torch.cuda.is_available(),
         )
         if refs_for_epoch is not None:
             expected_refs = len(ref_source["refs"])
@@ -539,7 +544,7 @@ class Trainer:
                 self._on_fit_failure(exc)
             raise
         finally:
-            primary_exception = sys.exception()
+            primary_exception = sys.exc_info()[1]
             cleanup_errors: list[tuple[str, BaseException]] = []
 
             def capture_cleanup(label: str, action) -> None:

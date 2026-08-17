@@ -273,14 +273,23 @@ class MooncakeFeatureStore(FeatureStore):
         _require_store_api(store)
         self._store = store
         put_config.replica_num = replica_num
-        # Older/Ascend Mooncake builds lack with_hard_pin; objects then
-        # follow the store's default pin behavior.
+        # Prefer true hard pinning when the installed Mooncake supports it.
+        # Older ROCm builds expose only `with_soft_pin`; that is a best-effort
+        # fallback rather than the same no-eviction guarantee. Some older
+        # Ascend builds expose neither field and must use the store default.
         if hasattr(put_config, "with_hard_pin"):
             put_config.with_hard_pin = hard_pin
+        elif hasattr(put_config, "with_soft_pin"):
+            put_config.with_soft_pin = hard_pin
+            if hard_pin:
+                logger.warning(
+                    "Mooncake ReplicateConfig has no with_hard_pin field; "
+                    "falling back to with_soft_pin"
+                )
         elif hard_pin:
             logger.warning(
-                "Mooncake ReplicateConfig has no with_hard_pin field; "
-                "objects use the store's default pin behavior"
+                "Mooncake ReplicateConfig exposes neither with_hard_pin nor "
+                "with_soft_pin; objects use the store's default pin behavior"
             )
         self._put_config = put_config
         self.max_resident_bytes = max_resident_bytes
@@ -742,6 +751,52 @@ class MooncakeFeatureStore(FeatureStore):
             retry_interval_s=retry_interval_s,
             sleep=sleep,
         )
+
+    def retry_sample_removals(self, sample_ids: List[str]) -> Dict[str, Any]:
+        """Try selected removals once, without probing or sleeping.
+
+        The optimizer path calls this only for samples made durable at an
+        earlier boundary.  A failed remove remains in ``_release_pending`` for
+        the next batched attempt; avoiding ``is_exist`` here is important
+        because that probe renews Mooncake's read lease.
+        """
+        target_ids = set(sample_ids)
+        removed = removed_bytes = 0
+        with self._lock:
+            pending = [
+                sample_id
+                for sample_id in self._release_pending
+                if sample_id in target_ids
+            ]
+            for sample_id in pending:
+                physically_removed = self._try_physical_free(
+                    sample_id,
+                    force=True,
+                    confirm_absent_on_failure=False,
+                )
+                if physically_removed:
+                    sample_bytes = self._free_bookkeeping_locked(sample_id)
+                    removed += 1
+                    removed_bytes += sample_bytes
+                    self._stats["force_freed"] += 1
+                    self._stats["force_freed_bytes"] += sample_bytes
+                else:
+                    self._release_pending[sample_id] = min(
+                        self.max_release_attempts,
+                        self._release_pending.get(sample_id, 0) + 1,
+                    )
+            remaining = [
+                sample_id
+                for sample_id in self._release_pending
+                if sample_id in target_ids
+            ]
+        return {
+            "removed": removed,
+            "removed_bytes": removed_bytes,
+            "release_pending": len(remaining),
+            "remaining_ids": remaining,
+            "attempts": 1 if pending else 0,
+        }
 
     def drain_pending_removals(
         self,

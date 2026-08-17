@@ -83,6 +83,9 @@ class ModelConfig(StrictConfigModel):
     sglang_mem_fraction_static: float = Field(default=0.4, gt=0.0, le=1.0)
     #: Keep the historical managed-local behavior by default. Hybrid targets
     #: such as Inkling require the radix tree and can opt back in explicitly.
+    #: Disabling it is also required for hybrid linear-attention/Mamba targets
+    #: on ROCm, whose mamba radix-cache ``extra_buffer`` strategy asserts
+    #: CUDA/MUSA/NPU (FLA) at server init.
     sglang_disable_radix_cache: bool = True
     sglang_context_length: Optional[int] = Field(default=None, gt=0)
     sglang_enable_nccl_nvls: bool = False
@@ -287,6 +290,12 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
+    #: Master key-lease TTL (ms) forwarded to ``mooncake_master
+    #: --default_kv_lease_ttl``. The consumer's teardown drain allows about
+    #: 19.5s for leases to settle. Keep the managed-local default at 500ms so
+    #: normal shutdown does not spend several seconds waiting for an expired
+    #: read lease; set null to inherit Mooncake's server default.
+    default_kv_lease_ttl_ms: Optional[int] = Field(default=500, gt=0)
 
     @model_validator(mode="after")
     def _validate_endpoint(self):
