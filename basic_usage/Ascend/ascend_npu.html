@@ -1,0 +1,865 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Ascend NPU Tutorial &#8212; SpecForge</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=03e43079" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'basic_usage/Ascend/ascend_npu';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="icon" href="../../_static/logo.ico"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Customize a training run" href="../../advanced_features/customization.html" />
+    <link rel="prev" title="🚀 AMD ROCm Tutorial" href="../AMD/amd_rocm.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Aug 17, 2026"/>
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/logo.png" class="logo__image only-light" alt="SpecForge - Home"/>
+    <img src="../../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SpecForge - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../get_started/installation.html">🚀 Get Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../get_started/about.html">⚡️ About SpecForge</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../data_preparation.html">📝 Data Preparation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../training.html">Training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../disaggregated_training.html">Disaggregated training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../AMD/amd_rocm.html">🚀 AMD ROCm Tutorial</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Ascend NPU Tutorial</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../advanced_features/customization.html">Customize a training run</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../benchmarks/benchmark.html">Benchmarking inference serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../benchmarks/eagle3-disaggregated-parity.html">EAGLE3 offline disaggregated parity</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../benchmarks/domino-disaggregated-performance.html">Domino disaggregated performance findings</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../community_resources/specbundle.html">🔥 SpecBundle</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community_resources/dashboard.html">📈 Performance Dashboard</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/basic_usage/Ascend/ascend_npu.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/basic_usage/Ascend/ascend_npu.md" target="_blank"
+   class="btn btn-sm btn-source-edit-button dropdown-item"
+   title="Suggest edit"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-pencil-alt"></i>
+  </span>
+<span class="btn__text-container">Suggest edit</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Fbasic_usage/Ascend/ascend_npu.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../../_sources/basic_usage/Ascend/ascend_npu.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Ascend NPU Tutorial</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">1. Installation</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#apply-the-sglang-capture-patches-online-runs-only">Apply the SGLang capture patches (online runs only)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#device-visibility-on-ascend">Device visibility on Ascend</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-backends-on-ascend">Attention backends on Ascend</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#data-preparation">2. Data preparation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-training-external-capture-server">3. Online training (external capture server)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-start-mooncake-and-the-capture-server">Step 1: Start Mooncake and the capture server</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-launch-training">Step 2: Launch training</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#success-criteria">Success criteria</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#managed-local-full-stack-one-command">4. Managed-local full stack (one command)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#scaling-capture-throughput">Scaling capture throughput</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cleanup-between-runs">Cleanup between runs</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-node-disaggregation">5. Multi-node disaggregation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#npu-notes-and-troubleshooting">6. NPU notes and troubleshooting</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-results-on-16x-a3-64gb">Reference results on 16x A3 (64GB)</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="ascend-npu-tutorial">
+<h1>Ascend NPU Tutorial<a class="headerlink" href="#ascend-npu-tutorial" title="Link to this heading">#</a></h1>
+<p>This is an end-to-end tutorial for running SpecForge on Ascend NPU hosts. It
+walks through <strong>installation → data preparation → online training → the
+managed-local full stack → multi-node disaggregation</strong>, using Qwen3.5-4B DFlash
+as the running example. Validated on a 16-card A3 (64GB) host.</p>
+<hr class="docutils" />
+<section id="installation">
+<h2>1. Installation<a class="headerlink" href="#installation" title="Link to this heading">#</a></h2>
+<p>You need an Ascend host with the driver, CANN, and a <code class="docutils literal notranslate"><span class="pre">torch_npu</span></code>-enabled
+PyTorch already installed, plus SGLang <code class="docutils literal notranslate"><span class="pre">0.5.14</span></code> with NPU support. Then install
+SpecForge without touching that stack:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/sgl-project/SpecForge.git
+<span class="nb">cd</span><span class="w"> </span>SpecForge
+python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.<span class="w"> </span>--no-deps
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--no-deps</span></code> keeps pip from pulling CUDA wheels over the working NPU
+torch/sglang. If a later step reports a missing lightweight dependency, install
+just that package, also with <code class="docutils literal notranslate"><span class="pre">--no-deps</span></code>.</p>
+<section id="apply-the-sglang-capture-patches-online-runs-only">
+<h3>Apply the SGLang capture patches (online runs only)<a class="headerlink" href="#apply-the-sglang-capture-patches-online-runs-only" title="Link to this heading">#</a></h3>
+<p>Online capture needs two patches on top of the installed SGLang, applied <strong>in
+this order</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Base capture patch: --enable-spec-capture server flags + the capture sink</span>
+bash<span class="w"> </span>scripts/apply_sglang_spec_capture_patch.sh
+
+<span class="c1"># Ascend companion patch: skip the wildcard segment mount that Ascend</span>
+<span class="c1"># Mooncake rejects, and mount the feature segment with location=&quot;cpu&quot;</span>
+<span class="nv">SGLANG_DIR</span><span class="o">=</span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))&quot;</span><span class="k">)</span>
+<span class="nb">cd</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$SGLANG_DIR</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>apply<span class="w"> </span>/path/to/SpecForge/patches/sglang/v0.5.14/spec-capture-ascend-mount.patch
+</pre></div>
+</div>
+<p>Skip both for offline training, which reads features from disk. The companion
+patch is a no-op on non-Ascend hosts (it keys off <code class="docutils literal notranslate"><span class="pre">ASCEND_RT_VISIBLE_DEVICES</span></code>),
+so a shared installation stays CUDA-safe.</p>
+</section>
+<section id="device-visibility-on-ascend">
+<h3>Device visibility on Ascend<a class="headerlink" href="#device-visibility-on-ascend" title="Link to this heading">#</a></h3>
+<p>Ascend selects devices through <code class="docutils literal notranslate"><span class="pre">ASCEND_RT_VISIBLE_DEVICES</span></code>, and the driver
+rejects an <em>empty</em> value — hiding devices from a process means <strong>unsetting</strong>
+the variable, not setting it to <code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code>. SpecForge handles this internally: device
+ordinals from the config are injected through <code class="docutils literal notranslate"><span class="pre">CUDA_VISIBLE_DEVICES</span></code> on CUDA
+hosts and <code class="docutils literal notranslate"><span class="pre">ASCEND_RT_VISIBLE_DEVICES</span></code> on Ascend hosts, and a “hide all devices”
+role unsets the variable. You only need to export the visible set once for the
+supervisor:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">ASCEND_RT_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span>,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+</pre></div>
+</div>
+<p>Two more environment settings are recommended for long online runs:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">HCCL_CONNECT_TIMEOUT</span><span class="o">=</span><span class="m">7200</span><span class="w"> </span><span class="nv">HCCL_EXEC_TIMEOUT</span><span class="o">=</span><span class="m">7200</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTORCH_NPU_ALLOC_CONF</span><span class="o">=</span>expandable_segments:True
+</pre></div>
+</div>
+</section>
+<section id="attention-backends-on-ascend">
+<h3>Attention backends on Ascend<a class="headerlink" href="#attention-backends-on-ascend" title="Link to this heading">#</a></h3>
+<p>Use <code class="docutils literal notranslate"><span class="pre">sdpa</span></code> for the <strong>trainer</strong>. Sequence parallelism (<code class="docutils literal notranslate"><span class="pre">sp_ulysses_size</span></code> /
+<code class="docutils literal notranslate"><span class="pre">sp_ring_size</span></code> &gt; 1, the <code class="docutils literal notranslate"><span class="pre">usp</span></code> backend) requires <code class="docutils literal notranslate"><span class="pre">yunchang</span></code>, whose import probes
+the CUDA device and crashes NPU-only torch builds, so USP is CUDA-only for now.
+SpecForge imports <code class="docutils literal notranslate"><span class="pre">yunchang</span></code> lazily only when SP sizes exceed 1, so the default
+SP=1 path never touches it.</p>
+<p>For the <strong>capture server</strong>, the recipes set <code class="docutils literal notranslate"><span class="pre">model.sglang_attention_backend:</span> <span class="pre">ascend</span></code>. If a config leaves it at the flashinfer default, the launcher falls
+back to <code class="docutils literal notranslate"><span class="pre">ascend</span></code> automatically on Ascend hosts (flashinfer does not exist
+there).</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="data-preparation">
+<h2>2. Data preparation<a class="headerlink" href="#data-preparation" title="Link to this heading">#</a></h2>
+<p>Data preparation is platform independent. From the repository root:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/prepare_data.py<span class="w"> </span>--dataset<span class="w"> </span>sharegpt
+</pre></div>
+</div>
+<p>This writes <code class="docutils literal notranslate"><span class="pre">./cache/dataset/sharegpt_train.jsonl</span></code>. For custom datasets and
+target-model regeneration, see the <a class="reference internal" href="../data_preparation.html"><span class="std std-doc">Data Preparation</span></a>
+guide.</p>
+</section>
+<hr class="docutils" />
+<section id="online-training-external-capture-server">
+<h2>3. Online training (external capture server)<a class="headerlink" href="#online-training-external-capture-server" title="Link to this heading">#</a></h2>
+<p>Online training is always <strong>disaggregated</strong>: a producer drives prompts through
+a patched SGLang capture server, features stream through Mooncake, and a
+consumer trains the draft. The checked-in
+<a class="reference download internal" download="" href="../../_downloads/80fb60b7b4b579275dcfe77789f8b58b/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a>
+recipe targets an externally started capture server.</p>
+<section id="step-1-start-mooncake-and-the-capture-server">
+<h3>Step 1: Start Mooncake and the capture server<a class="headerlink" href="#step-1-start-mooncake-and-the-capture-server" title="Link to this heading">#</a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mooncake_master<span class="w"> </span>--enable_http_metadata_server<span class="o">=</span><span class="nb">true</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--rpc_port<span class="o">=</span><span class="m">35551</span><span class="w"> </span>--http_metadata_server_port<span class="o">=</span><span class="m">35880</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--metrics_port<span class="o">=</span><span class="m">35903</span><span class="w"> </span>--enable_metric_reporting<span class="o">=</span><span class="nb">false</span><span class="w"> </span><span class="p">&amp;</span>
+</pre></div>
+</div>
+<p>Start the patched capture server on NPU 0. The <code class="docutils literal notranslate"><span class="pre">--spec-capture-aux-layer-ids</span></code>
+must match the draft’s <code class="docutils literal notranslate"><span class="pre">target_layer_ids</span></code> — for DFlash these come from
+<code class="docutils literal notranslate"><span class="pre">configs/qwen3.5-4b-dflash.json</span></code>: <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">8</span> <span class="pre">15</span> <span class="pre">22</span> <span class="pre">29</span></code>. A mismatch produces zero
+features with no error:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ASCEND_RT_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_LOCAL_HOSTNAME</span><span class="o">=</span><span class="m">127</span>.0.0.1<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_METADATA_SERVER</span><span class="o">=</span>http://127.0.0.1:35880/metadata<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_MASTER_SERVER_ADDR</span><span class="o">=</span><span class="m">127</span>.0.0.1:35551<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_PROTOCOL</span><span class="o">=</span>tcp<span class="w"> </span><span class="se">\</span>
+<span class="nv">MOONCAKE_GLOBAL_SEGMENT_SIZE</span><span class="o">=</span><span class="k">$((</span><span class="m">32</span><span class="o">&lt;&lt;</span><span class="m">30</span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+python<span class="w"> </span>-m<span class="w"> </span>sglang.launch_server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3.5-4B<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--skip-tokenizer-init<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tp-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--attention-backend<span class="w"> </span>ascend<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--enable-spec-capture<span class="w"> </span>--spec-capture-method<span class="w"> </span>dflash<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--spec-capture-aux-layer-ids<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="m">15</span><span class="w"> </span><span class="m">22</span><span class="w"> </span><span class="m">29</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--host<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>--port<span class="w"> </span><span class="m">30000</span><span class="w"> </span><span class="p">&amp;</span>
+</pre></div>
+</div>
+<p>Wait for <code class="docutils literal notranslate"><span class="pre">curl</span> <span class="pre">--fail</span> <span class="pre">http://127.0.0.1:30000/health</span></code> to return 200.</p>
+</section>
+<section id="step-2-launch-training">
+<h3>Step 2: Launch training<a class="headerlink" href="#step-2-launch-training" title="Link to this heading">#</a></h3>
+<p>On the remaining NPUs:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ASCEND_RT_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">1</span>,2,3,4,5,6,7,8<span class="w"> </span><span class="se">\</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3.5-4b-dflash-online-npu.yaml
+</pre></div>
+</div>
+<p>Before rerunning, clear stale control state:
+<code class="docutils literal notranslate"><span class="pre">rm</span> <span class="pre">-rf</span> <span class="pre">outputs/qwen3.5-4b-dflash-npu-online</span></code>.</p>
+</section>
+<section id="success-criteria">
+<h3>Success criteria<a class="headerlink" href="#success-criteria" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Producer log ends with <code class="docutils literal notranslate"><span class="pre">prompts_failed=0</span></code>.</p></li>
+<li><p>Consumer prints <code class="docutils literal notranslate"><span class="pre">step</span> <span class="pre">N:</span> <span class="pre">{...loss...,</span> <span class="pre">acc...}</span></code> lines and no
+<code class="docutils literal notranslate"><span class="pre">could</span> <span class="pre">not</span> <span class="pre">drain</span></code> error at teardown.</p></li>
+<li><p>If the capture producer dies with <code class="docutils literal notranslate"><span class="pre">ACL_ERROR_RT_CONTEXT_NULL</span></code> (107002), the
+installed SpecForge predates the NPU transport bind — upgrade past #722.</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="managed-local-full-stack-one-command">
+<h2>4. Managed-local full stack (one command)<a class="headerlink" href="#managed-local-full-stack-one-command" title="Link to this heading">#</a></h2>
+<p>Instead of starting Mooncake and capture servers by hand, the
+<a class="reference download internal" download="" href="../../_downloads/fe448ec9ace6d871ffd07467f1a1befd/qwen3.5-4b-dflash-disaggregated-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-disaggregated-npu.yaml</span></code></span></a>
+recipe lets a single <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span></code> command own the whole single-node
+stack — Mooncake, capture server(s), and the trainer — and derives their
+endpoints and device assignments:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">ASCEND_RT_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span>,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+<span class="nb">export</span><span class="w"> </span><span class="nv">HCCL_CONNECT_TIMEOUT</span><span class="o">=</span><span class="m">7200</span><span class="w"> </span><span class="nv">HCCL_EXEC_TIMEOUT</span><span class="o">=</span><span class="m">7200</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTORCH_NPU_ALLOC_CONF</span><span class="o">=</span>expandable_segments:True
+
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml
+</pre></div>
+</div>
+<p>The checked-in layout parks the capture server on device 0 and runs a 14-rank
+trainer on devices 2-15 (8-card hosts: trainer on devices 1-7 with
+<code class="docutils literal notranslate"><span class="pre">deployment.trainer.nproc_per_node=7</span></code>).</p>
+<section id="scaling-capture-throughput">
+<h3>Scaling capture throughput<a class="headerlink" href="#scaling-capture-throughput" title="Link to this heading">#</a></h3>
+<p>One capture server is enough for correctness but bounds the pipeline: the
+trainer’s data wait then dominates step time. To give capture more cards,
+override the layout inline — e.g. a 6:10 split with six TP=1 capture servers:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;deployment.trainer.nproc_per_node=10&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;deployment.disaggregated.managed_local.trainer_cuda_visible_devices=[&quot;6&quot;,&quot;7&quot;,&quot;8&quot;,&quot;9&quot;,&quot;10&quot;,&quot;11&quot;,&quot;12&quot;,&quot;13&quot;,&quot;14&quot;,&quot;15&quot;]&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;deployment.disaggregated.managed_local.capture_servers=[{port: 40000, cuda_visible_devices: [&quot;0&quot;], tp_size: 1}, {port: 40001, cuda_visible_devices: [&quot;1&quot;], tp_size: 1}, {port: 40002, cuda_visible_devices: [&quot;2&quot;], tp_size: 1}, {port: 40003, cuda_visible_devices: [&quot;3&quot;], tp_size: 1}, {port: 40004, cuda_visible_devices: [&quot;4&quot;], tp_size: 1}, {port: 40005, cuda_visible_devices: [&quot;5&quot;], tp_size: 1}]&#39;</span>
+</pre></div>
+</div>
+<p>In the validated 16-card run this cut step time from ~20s to ~4.5s.</p>
+</section>
+<section id="cleanup-between-runs">
+<h3>Cleanup between runs<a class="headerlink" href="#cleanup-between-runs" title="Link to this heading">#</a></h3>
+<p>Managed children exit with the supervisor, but after an interrupted run check
+for strays before relaunching:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pkill<span class="w"> </span>-9<span class="w"> </span>-f<span class="w"> </span>specforge<span class="p">;</span><span class="w"> </span>pkill<span class="w"> </span>-9<span class="w"> </span>-f<span class="w"> </span>mooncake_master<span class="p">;</span><span class="w"> </span>pkill<span class="w"> </span>-9<span class="w"> </span>-f<span class="w"> </span>torch.distributed.run
+rm<span class="w"> </span>-rf<span class="w"> </span>outputs/qwen3.5-4b-dflash-npu-managed
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="multi-node-disaggregation">
+<h2>5. Multi-node disaggregation<a class="headerlink" href="#multi-node-disaggregation" title="Link to this heading">#</a></h2>
+<p>The same configs split across nodes with an explicit <code class="docutils literal notranslate"><span class="pre">--role</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>producer<span class="w">   </span><span class="c1"># inference / capture pool</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>consumer<span class="w"> </span>--node-rank<span class="w"> </span><span class="m">0</span><span class="w">   </span><span class="c1"># trainer-0</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>consumer<span class="w"> </span>--node-rank<span class="w"> </span><span class="m">1</span><span class="w">   </span><span class="c1"># trainer-1</span>
+</pre></div>
+</div>
+<p>Every capture server must use the same target model, capture method, and aux
+layer ids. For external-service prerequisites, freshness rules, and resume, see
+the <a class="reference internal" href="../disaggregated_training.html"><span class="std std-doc">Disaggregated training</span></a> guide.</p>
+</section>
+<hr class="docutils" />
+<section id="npu-notes-and-troubleshooting">
+<h2>6. NPU notes and troubleshooting<a class="headerlink" href="#npu-notes-and-troubleshooting" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Empty <code class="docutils literal notranslate"><span class="pre">ASCEND_RT_VISIBLE_DEVICES</span></code> is invalid</strong> — the Ascend driver rejects
+it. SpecForge unsets the variable instead of emptying it; do not export
+<code class="docutils literal notranslate"><span class="pre">ASCEND_RT_VISIBLE_DEVICES=</span></code> by hand.</p></li>
+<li><p><strong>USP is CUDA-only for now</strong> — <code class="docutils literal notranslate"><span class="pre">yunchang</span></code> probes CUDA at import. Keep
+<code class="docutils literal notranslate"><span class="pre">sp_ulysses_size</span></code> / <code class="docutils literal notranslate"><span class="pre">sp_ring_size</span></code> at 1 and use the <code class="docutils literal notranslate"><span class="pre">sdpa</span></code> trainer backend.</p></li>
+<li><p><strong>Ascend Mooncake rejects wildcard buffer registration</strong> — the trainer side
+forces <code class="docutils literal notranslate"><span class="pre">local_buffer_size=0</span></code> automatically (SpecForge roles are pure
+zero-copy clients), and the capture side needs the companion patch from
+Section 1.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">ACL_ERROR_RT_CONTEXT_NULL</span></code> in the capture producer</strong> — the Mooncake
+transfer engine needs a bound device context; SpecForge binds the local NPU
+before <code class="docutils literal notranslate"><span class="pre">setup()</span></code>. Seeing this error means the installation predates #722.</p></li>
+<li><p><strong>Teardown drain</strong> — the lifecycle drain window (~20s) covers Mooncake’s
+read-lease TTL, and managed-local masters start with
+<code class="docutils literal notranslate"><span class="pre">default_kv_lease_ttl_ms=500</span></code>. A <code class="docutils literal notranslate"><span class="pre">could</span> <span class="pre">not</span> <span class="pre">drain</span> <span class="pre">pending</span> <span class="pre">removals</span></code> error
+after an otherwise successful run means one of these is missing — upgrade
+SpecForge.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="reference-results-on-16x-a3-64gb">
+<h2>Reference results on 16x A3 (64GB)<a class="headerlink" href="#reference-results-on-16x-a3-64gb" title="Link to this heading">#</a></h2>
+<p>End-to-end online run on the managed-local stack, training a <strong>Qwen3.5-4B
+DFlash</strong> draft (<code class="docutils literal notranslate"><span class="pre">configs/qwen3.5-4b-dflash.json</span></code>) with 6 TP=1 capture servers
+(devices 0-5) and 10 trainer ranks (devices 6-15): ~9.5k prompts x 10 epochs,
+global batch 80/step, ~1.18k optimizer steps, ~1.5h total.</p>
+<ul class="simple">
+<li><p>Loss falls from ~6.0 to ~2.0 over the run with cosine LR (6e-4 -&gt; 0); no
+NaN, no stall.</p></li>
+<li><p>~4.5s/optimizer step with six capture servers (~20s/step with one).</p></li>
+<li><p>Memory: ~29GB per trainer rank, ~31-33GB per capture server; no OOM with
+<code class="docutils literal notranslate"><span class="pre">num_anchors:</span> <span class="pre">512</span></code> (lower it on smaller cards).</p></li>
+<li><p>Clean terminal drain on shutdown.</p></li>
+</ul>
+<p><img alt="Qwen3.5-4B DFlash online training on 16x A3" src="https://github.com/user-attachments/assets/1b94b455-cb61-4374-a548-9a219a37ed64" /></p>
+<p>These numbers are a functional reference for the NPU managed-local stack, not
+a tuned performance benchmark.</p>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../AMD/amd_rocm.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">🚀 AMD ROCm Tutorial</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../../advanced_features/customization.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Customize a training run</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">1. Installation</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#apply-the-sglang-capture-patches-online-runs-only">Apply the SGLang capture patches (online runs only)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#device-visibility-on-ascend">Device visibility on Ascend</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-backends-on-ascend">Attention backends on Ascend</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#data-preparation">2. Data preparation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-training-external-capture-server">3. Online training (external capture server)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-start-mooncake-and-the-capture-server">Step 1: Start Mooncake and the capture server</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-launch-training">Step 2: Launch training</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#success-criteria">Success criteria</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#managed-local-full-stack-one-command">4. Managed-local full stack (one command)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#scaling-capture-throughput">Scaling capture throughput</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cleanup-between-runs">Cleanup between runs</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-node-disaggregation">5. Multi-node disaggregation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#npu-notes-and-troubleshooting">6. NPU notes and troubleshooting</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-results-on-16x-a3-64gb">Reference results on 16x A3 (64GB)</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By SpecForge Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SpecForge.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Aug 17, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
