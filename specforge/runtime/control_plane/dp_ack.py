@@ -25,6 +25,7 @@ the gather.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Callable, List, Optional
 
 from specforge.runtime.control_plane.controller import DataFlowController
@@ -65,6 +66,8 @@ def _broadcast_authority_error(error: Optional[str]) -> Optional[str]:
     except ModuleNotFoundError:
         return error
     if not (dist.is_available() and dist.is_initialized()):
+        return error
+    if dist.get_world_size() == 1:
         return error
     payload = [error]
     dist.broadcast_object_list(payload, src=0)
@@ -115,6 +118,9 @@ class DPAckController(DataFlowController):
     optimizer-boundary counts onto the source counter.
     """
 
+    _CLEANUP_LAG_BOUNDARIES = 1
+    _CLEANUP_ESCALATION_BOUNDARIES = 4
+
     def __init__(
         self,
         run_id: str,
@@ -136,6 +142,8 @@ class DPAckController(DataFlowController):
         self._sync_error = sync_error
         self._sync_cleanup_error = sync_cleanup_error
         self.feature_store = feature_store
+        self._cleanup_boundary = 0
+        self._cleanup_pending: OrderedDict[str, int] = OrderedDict()
 
     def ack_train_refs(
         self,
@@ -167,6 +175,8 @@ class DPAckController(DataFlowController):
 
         cleanup_error = None
         if optimizer_durable and self.feature_store is not None:
+            self._cleanup_boundary += 1
+            boundary = self._cleanup_boundary
             failures = []
             for sample_id in local_ids:
                 try:
@@ -175,6 +185,54 @@ class DPAckController(DataFlowController):
                     )
                 except BaseException as exc:
                     failures.append(f"{sample_id}: {type(exc).__name__}: {exc}")
+                self._cleanup_pending.setdefault(sample_id, boundary)
+
+            eligible_ids = [
+                sample_id
+                for sample_id, first_boundary in self._cleanup_pending.items()
+                if boundary - first_boundary >= self._CLEANUP_LAG_BOUNDARIES
+            ]
+            try:
+                from specforge.runtime.data_plane.feature_store import (
+                    drain_feature_store_sample_removals,
+                    retry_feature_store_sample_removals,
+                )
+
+                # Give short Mooncake read leases one optimizer window to
+                # expire, then make one selective, no-sleep batched attempt.
+                # A store-wide retry could delete prefetched refs that still
+                # need crash replay.
+                report = retry_feature_store_sample_removals(
+                    self.feature_store, eligible_ids
+                )
+                remaining_ids = set(report.get("remaining_ids", ()))
+                for sample_id in eligible_ids:
+                    if sample_id not in remaining_ids:
+                        self._cleanup_pending.pop(sample_id, None)
+            except BaseException as exc:
+                failures.append(
+                    "optimizer-boundary selective retry: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            overdue_ids = [
+                sample_id
+                for sample_id, first_boundary in self._cleanup_pending.items()
+                if boundary - first_boundary >= self._CLEANUP_ESCALATION_BOUNDARIES
+            ]
+            if overdue_ids:
+                try:
+                    # Sustained failure is exceptional.  Use the existing
+                    # bounded strong drain only for the old durable ids, never
+                    # for this boundary's fresh or merely-prefetched samples.
+                    drain_feature_store_sample_removals(self.feature_store, overdue_ids)
+                    for sample_id in overdue_ids:
+                        self._cleanup_pending.pop(sample_id, None)
+                except BaseException as exc:
+                    failures.append(
+                        "optimizer-boundary selective drain: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             if failures:
                 cleanup_error = ", ".join(failures)
         cleanup_error = self._sync_cleanup_error(cleanup_error)

@@ -322,7 +322,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
             request["multi_modal_data"],
         )
         self.assertEqual(
-            {"temperature": 0.0, "max_new_tokens": 1},
+            {"temperature": 0.0, "max_new_tokens": 0},
             request["sampling_params"],
         )
         self.assertEqual(2, len(request["spec_capture"]))

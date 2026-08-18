@@ -159,8 +159,8 @@ class FeatureStore(abc.ABC):
 def drain_feature_store_removals(
     store: FeatureStore,
     *,
-    max_attempts: int = 8,
-    retry_interval_s: float = 0.25,
+    max_attempts: int = 40,
+    retry_interval_s: float = 0.5,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Dict[str, int]:
     """Bound lifecycle shutdown until deferred physical removes settle.
@@ -169,10 +169,11 @@ def drain_feature_store_removals(
     may expose ``drain_pending_removals`` to retry fallible RPCs.  Keeping this
     small adapter at the FeatureStore boundary lets online producer/consumer
     finalization enforce the same loud contract without depending on Mooncake's
-    concrete class. The default is bounded to eight attempts and 1.75 seconds of
+    concrete class. The default is bounded to forty attempts and 19.5 seconds of
     inter-attempt waiting; Mooncake's implementation avoids existence probes
     between attempts so those waits let an existing read lease expire rather
-    than renewing it.
+    than renewing it. The window must exceed Mooncake's read-lease TTL, or
+    removals with live leases fail at shutdown (remove -706).
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
@@ -196,6 +197,72 @@ def drain_feature_store_removals(
             "no drain_pending_removals lifecycle hook"
         )
     return {"removed": 0, "removed_bytes": 0, "release_pending": 0}
+
+
+def drain_feature_store_sample_removals(
+    store: FeatureStore,
+    sample_ids: List[str],
+    *,
+    max_attempts: int = 8,
+    retry_interval_s: float = 0.25,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Dict[str, int]:
+    """Physically reclaim only optimizer-durable samples from a remote store.
+
+    A streaming loader can have removal-pending objects from prefetched batches
+    that have not reached an optimizer boundary yet.  Draining the store-wide
+    pending set at an acknowledgement boundary would delete their crash-replay
+    source too early.  Backends that need lease-authority removal therefore
+    expose a selective hook; synchronously-freeing stores need no extra work.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if retry_interval_s < 0:
+        raise ValueError("retry_interval_s must be >= 0")
+    ids = list(dict.fromkeys(sample_ids))
+    if not ids:
+        return {"removed": 0, "removed_bytes": 0, "release_pending": 0}
+    drain = getattr(store, "drain_sample_removals", None)
+    if not callable(drain):
+        return {"removed": 0, "removed_bytes": 0, "release_pending": 0}
+    return drain(
+        ids,
+        max_attempts=max_attempts,
+        retry_interval_s=retry_interval_s,
+        sleep=sleep,
+    )
+
+
+def retry_feature_store_sample_removals(
+    store: FeatureStore,
+    sample_ids: List[str],
+) -> Dict[str, Any]:
+    """Make one non-blocking removal attempt for selected durable samples.
+
+    Remote stores may need a later optimizer boundary to outlive a short read
+    lease.  Unlike the lifecycle drain, this steady-state hook never sleeps and
+    reports the ids that remain pending so the control plane can batch a later
+    retry.  Synchronously-freeing stores need no extra work after ``abort``.
+    """
+    ids = list(dict.fromkeys(sample_ids))
+    if not ids:
+        return {
+            "removed": 0,
+            "removed_bytes": 0,
+            "release_pending": 0,
+            "remaining_ids": [],
+            "attempts": 0,
+        }
+    retry = getattr(store, "retry_sample_removals", None)
+    if not callable(retry):
+        return {
+            "removed": 0,
+            "removed_bytes": 0,
+            "release_pending": 0,
+            "remaining_ids": [],
+            "attempts": 0,
+        }
+    return retry(ids)
 
 
 def load_feature_file(path: str) -> Dict[str, torch.Tensor]:
@@ -596,6 +663,8 @@ __all__ = [
     "FeatureStore",
     "LocalFeatureStore",
     "drain_feature_store_removals",
+    "drain_feature_store_sample_removals",
+    "retry_feature_store_sample_removals",
     "load_feature_file",
     "spec_from_tensor",
 ]

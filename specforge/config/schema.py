@@ -20,6 +20,7 @@ import copy
 import json
 import os
 from typing import List, Literal, Optional
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -80,6 +81,12 @@ class ModelConfig(StrictConfigModel):
     #: SGLang target-engine tuning. Ignored by hf/custom backends.
     sglang_attention_backend: str = "flashinfer"
     sglang_mem_fraction_static: float = Field(default=0.4, gt=0.0, le=1.0)
+    #: Keep the historical managed-local behavior by default. Hybrid targets
+    #: such as Inkling require the radix tree and can opt back in explicitly.
+    #: Disabling it is also required for hybrid linear-attention/Mamba targets
+    #: on ROCm, whose mamba radix-cache ``extra_buffer`` strategy asserts
+    #: CUDA/MUSA/NPU (FLA) at server init.
+    sglang_disable_radix_cache: bool = True
     sglang_context_length: Optional[int] = Field(default=None, gt=0)
     sglang_enable_nccl_nvls: bool = False
     sglang_enable_symm_mem: bool = False
@@ -283,6 +290,12 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
+    #: Master key-lease TTL (ms) forwarded to ``mooncake_master
+    #: --default_kv_lease_ttl``. The consumer's teardown drain allows about
+    #: 19.5s for leases to settle. Keep the managed-local default at 500ms so
+    #: normal shutdown does not spend several seconds waiting for an expired
+    #: read lease; set null to inherit Mooncake's server default.
+    default_kv_lease_ttl_ms: Optional[int] = Field(default=500, gt=0)
 
     @model_validator(mode="after")
     def _validate_endpoint(self):
@@ -301,7 +314,11 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
 
 
 class ManagedLocalCaptureServerConfig(StrictConfigModel):
-    """One patched SGLang capture server owned by the local supervisor."""
+    """One patched SGLang capture server owned by the local supervisor.
+
+    ``cuda_visible_devices`` holds plain device ordinals; the launcher maps
+    them to the accelerator's visibility env var.
+    """
 
     port: int = Field(gt=0, le=65535)
     cuda_visible_devices: List[str] = Field(min_length=1)
@@ -327,7 +344,11 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
 
 
 class ManagedLocalStackConfig(StrictConfigModel):
-    """Opt-in ownership of a complete single-node online capture stack."""
+    """Opt-in ownership of a complete single-node online capture stack.
+
+    ``trainer_cuda_visible_devices`` holds plain device ordinals; the
+    launcher maps them to the accelerator's visibility env var.
+    """
 
     trainer_cuda_visible_devices: List[str] = Field(min_length=1)
     mooncake: ManagedLocalMooncakeConfig = Field(
@@ -383,9 +404,13 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: Attempt-scoped shared directory. The launcher derives refs, manifest,
     #: and lifecycle markers beneath it.
     control_dir: str
-    #: Optional node-local root for online consumer SQLite/WAL and rank inboxes.
-    #: When omitted, the historical control_dir-derived paths remain in use.
+    #: Optional node-local root for the online consumer SQLite/WAL. When
+    #: omitted, the historical control_dir-derived path remains in use.
     consumer_state_dir: Optional[str] = None
+    #: Optional rank-0 HTTP relay for per-rank online inboxes.  This removes the
+    #: shared-filesystem requirement between trainer nodes while keeping the
+    #: authority-owned source channel and SQLite/WAL on trainer node 0.
+    inbox_server_url: Optional[str] = None
     backend: Literal["shared_dir", "mooncake"]
     store_root: Optional[str] = None
     store_id: Optional[str] = None
@@ -423,6 +448,24 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
                 "deployment.disaggregated.consumer_state_dir must be non-empty "
                 "and must not contain surrounding whitespace"
             )
+        if self.inbox_server_url is not None:
+            parsed = urlparse(self.inbox_server_url)
+            if (
+                parsed.scheme != "http"
+                or not parsed.hostname
+                or parsed.port is None
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in ("", "/")
+                or parsed.params
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "deployment.disaggregated.inbox_server_url must be an "
+                    "http://host:port origin without credentials, path, query, "
+                    "or fragment"
+                )
         if self.backend == "shared_dir" and not self.store_root:
             raise ValueError(
                 "deployment.disaggregated.store_root is required for shared_dir"
@@ -447,8 +490,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
             explicit = [name for name, value in configured_endpoints.items() if value]
             if explicit:
                 raise ValueError(
-                    "managed_local derives Mooncake endpoints; do not set "
-                    f"{explicit}"
+                    f"managed_local derives Mooncake endpoints; do not set {explicit}"
                 )
             if self.producer_segment_size is not None:
                 raise ValueError(
@@ -488,6 +530,7 @@ class TrainingConfig(StrictConfigModel):
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
+    lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
@@ -507,6 +550,12 @@ class TrainingConfig(StrictConfigModel):
     lk_loss_type: Optional[Literal["lambda", "alpha"]] = None
     kl_scale: float = 1.0
     kl_decay: float = 1.0
+    #: Compute the teacher target_p, draft logits and loss only at supervised
+    #: (loss-masked) positions instead of over the full sequence. Mathematically
+    #: equivalent (the mean denominator is rescaled) and saves memory/compute on
+    #: prompt-heavy data. Falls back to the full-length path for batch > 1 or when
+    #: an lk_loss objective is used.
+    trim_loss_positions: bool = False
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None
@@ -546,6 +595,9 @@ class TrainingConfig(StrictConfigModel):
     #: and different roles.
     role: Literal["auto", "all", "producer", "consumer"] = "all"
     seed: int = 42
+    #: Deterministic online prompt ordering. ``None`` preserves the historical
+    #: behavior of using the run RNG seed for both model and prompt sampling.
+    prompt_seed: Optional[int] = None
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
@@ -722,8 +774,7 @@ class Config(StrictConfigModel):
             )
         if self.data.eval_hidden_states_path and mode != "offline":
             raise ValueError(
-                "data.eval_hidden_states_path requires an offline training data "
-                "source"
+                "data.eval_hidden_states_path requires an offline training data source"
             )
         if (
             not self.training.compact_teacher
@@ -753,11 +804,27 @@ class Config(StrictConfigModel):
             if self.deployment.disaggregated is not None
             else None
         )
+        inbox_server_url = (
+            self.deployment.disaggregated.inbox_server_url
+            if self.deployment.disaggregated is not None
+            else None
+        )
         if consumer_state_dir is not None:
             if mode != "online" or deployment != "disaggregated":
                 raise ValueError(
                     "deployment.disaggregated.consumer_state_dir is valid only "
                     "for online disaggregated training"
+                )
+        if inbox_server_url is not None:
+            if mode != "online" or deployment != "disaggregated":
+                raise ValueError(
+                    "deployment.disaggregated.inbox_server_url is valid only "
+                    "for online disaggregated training"
+                )
+            if self.deployment.trainer.nnodes < 2:
+                raise ValueError(
+                    "deployment.disaggregated.inbox_server_url requires a "
+                    "multi-node trainer"
                 )
         if (
             mode == "online"

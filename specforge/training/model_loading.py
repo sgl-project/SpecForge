@@ -288,11 +288,12 @@ def resolve_draft_config(
         draft_config = _generate_draft_config(cfg, provider)
 
     expected = provider.architecture
+    compatible = provider.compatible_architectures or frozenset({expected})
     architectures = list(getattr(draft_config, "architectures", None) or [])
-    if architectures != [expected]:
+    if len(architectures) != 1 or architectures[0] not in compatible:
         raise ValueError(
             f"training.strategy={cfg.training.strategy!r} requires draft "
-            f"architecture {expected}, got {architectures!r}"
+            f"architecture in {sorted(compatible)!r}, got {architectures!r}"
         )
     _apply_draft_overrides(cfg, draft_config, provider)
     return draft_config

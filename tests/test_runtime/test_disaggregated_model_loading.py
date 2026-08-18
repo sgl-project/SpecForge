@@ -135,6 +135,37 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
         self.assertEqual(contract.method, "dflash")
         self.assertEqual(contract.aux_layer_ids, (3, 7))
 
+    def test_dspark_uses_its_dedicated_server_capture_method(self):
+        resolved = resolve_run(
+            _config(strategy="dspark", draft_model_config="dspark-draft")
+        )
+        draft_payload = {
+            "architectures": ["DSparkDraftModel"],
+            "vocab_size": 128,
+            "num_target_layers": 2,
+            "dflash_config": {
+                "projector_type": "dspark",
+                "target_layer_ids": [3, 7],
+            },
+        }
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=SimpleNamespace(hidden_size=64, vocab_size=128),
+            ),
+            mock.patch(
+                "specforge.training.model_loading.draft_config_dict",
+                return_value=draft_payload,
+            ),
+        ):
+            contract = resolve_server_capture_contract(
+                resolved.config,
+                algorithm=resolved.algorithm,
+            )
+
+        self.assertEqual(contract.method, "dspark")
+        self.assertEqual(contract.aux_layer_ids, (3, 7))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

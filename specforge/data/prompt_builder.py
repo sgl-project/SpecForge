@@ -12,7 +12,7 @@ import json
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from numbers import Integral
-from typing import Any
+from typing import Any, Callable
 
 PromptTaskDict = dict[str, Any]
 
@@ -30,14 +30,17 @@ def prepare_prompt_tasks(
     num_proc: int | None,
     min_loss_tokens: int = 1,
     max_prompts: int | None = None,
-) -> list[PromptTaskDict]:
+    loss_mask_filter: Callable[[Sequence[int]], bool] | None = None,
+) -> Sequence[PromptTaskDict]:
     """Prepare runtime prompt dictionaries from a JSONL file.
 
     Each returned item has the control-plane shape
     ``{"payload": {"input_ids": [...], "loss_mask": [...]}}`` and contains no
     tensors. Files whose first record contains ``input_ids`` and ``loss_mask``
     are treated as pre-tokenized. Other files are treated as raw conversation
-    data and processed through :func:`build_eagle3_dataset`.
+    data and processed through :func:`build_eagle3_dataset`, then exposed as a
+    lazy random-access sequence so large Arrow datasets are not expanded into
+    Python token lists before rollout starts.
 
     ``max_prompts`` caps accepted prompts; ``None`` and ``0`` mean no cap.
     """
@@ -48,6 +51,7 @@ def prepare_prompt_tasks(
         max_prompts=max_prompts,
         cache_dir=cache_dir,
         cache_key=cache_key,
+        loss_mask_filter=loss_mask_filter,
     )
     path_string = os.fspath(path)
     first_record = next(_iter_records(path_string), None)
@@ -75,6 +79,7 @@ def prepare_prompt_tasks(
             max_length=max_length,
             min_loss_tokens=min_loss_tokens,
             limit=limit,
+            loss_mask_filter=loss_mask_filter,
         )
 
     return _prepare_raw_prompts(
@@ -89,6 +94,7 @@ def prepare_prompt_tasks(
         num_proc=num_proc,
         min_loss_tokens=min_loss_tokens,
         limit=limit,
+        loss_mask_filter=None,
     )
 
 
@@ -105,7 +111,8 @@ def _prepare_raw_prompts(
     num_proc: int | None,
     min_loss_tokens: int,
     limit: int | None,
-) -> list[PromptTaskDict]:
+    loss_mask_filter: Callable[[Sequence[int]], bool] | None,
+) -> Sequence[PromptTaskDict]:
     try:
         from datasets import load_dataset
     except ImportError as exc:  # pragma: no cover - package dependency in production
@@ -116,7 +123,7 @@ def _prepare_raw_prompts(
     from .preprocessing import build_eagle3_dataset
 
     dataset = load_dataset("json", data_files=path, split="train")
-    if limit is not None and limit < len(dataset):
+    if loss_mask_filter is None and limit is not None and limit < len(dataset):
         dataset = dataset.select(range(limit))
 
     processed_dataset = build_eagle3_dataset(
@@ -130,17 +137,55 @@ def _prepare_raw_prompts(
         is_preformatted=is_preformatted,
         train_only_last_turn=train_only_last_turn,
         minimum_valid_tokens=min_loss_tokens,
+        loss_mask_filter=loss_mask_filter,
     )
-    rows = (
-        (record, f"processed dataset row {index}")
-        for index, record in enumerate(processed_dataset)
-    )
-    return _materialize_prompt_tasks(
-        rows,
+    return _ProcessedPromptSequence(
+        processed_dataset,
         max_length=max_length,
         min_loss_tokens=min_loss_tokens,
-        limit=limit,
+        loss_mask_filter=loss_mask_filter,
     )
+
+
+class _ProcessedPromptSequence(Sequence[PromptTaskDict]):
+    """Normalize memory-mapped processed rows only when the producer ingests them."""
+
+    def __init__(
+        self,
+        dataset,
+        *,
+        max_length: int,
+        min_loss_tokens: int,
+        loss_mask_filter: Callable[[Sequence[int]], bool] | None,
+    ) -> None:
+        self._dataset = dataset
+        self._max_length = max_length
+        self._min_loss_tokens = min_loss_tokens
+        self._loss_mask_filter = loss_mask_filter
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __iter__(self) -> Iterator[PromptTaskDict]:
+        for index in range(len(self)):
+            yield self[index]
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        record = self._dataset[index]
+        prompt = _prompt_from_record(
+            record,
+            source=f"processed dataset row {index}",
+            max_length=self._max_length,
+            min_loss_tokens=self._min_loss_tokens,
+        )
+        if prompt is None:
+            raise ValueError(
+                f"processed dataset row {index} violates the preprocessing "
+                f"minimum of {self._min_loss_tokens} trainable tokens"
+            )
+        return prompt
 
 
 def _materialize_prompt_tasks(
@@ -149,42 +194,62 @@ def _materialize_prompt_tasks(
     max_length: int,
     min_loss_tokens: int,
     limit: int | None,
+    loss_mask_filter: Callable[[Sequence[int]], bool] | None,
 ) -> list[PromptTaskDict]:
     prompts: list[PromptTaskDict] = []
     for record, source in rows:
-        if "input_ids" not in record or "loss_mask" not in record:
-            raise ValueError(f"{source} must contain both input_ids and loss_mask")
-
-        input_ids = _normalize_integer_sequence(
-            record["input_ids"], field="input_ids", source=source, binary=False
+        prompt = _prompt_from_record(
+            record,
+            source=source,
+            max_length=max_length,
+            min_loss_tokens=min_loss_tokens,
         )
-        loss_mask = _normalize_integer_sequence(
-            record["loss_mask"], field="loss_mask", source=source, binary=True
-        )
-        if len(input_ids) != len(loss_mask):
-            raise ValueError(
-                f"{source} has mismatched input_ids/loss_mask lengths: "
-                f"{len(input_ids)} != {len(loss_mask)}"
-            )
-        if not input_ids:
-            raise ValueError(f"{source} contains an empty token sequence")
-
-        input_ids = input_ids[:max_length]
-        loss_mask = loss_mask[:max_length]
-        if sum(loss_mask) < min_loss_tokens:
+        if prompt is None:
             continue
-
-        prompts.append(
-            {
-                "payload": {
-                    "input_ids": input_ids,
-                    "loss_mask": loss_mask,
-                }
-            }
-        )
+        if loss_mask_filter is not None and not loss_mask_filter(
+            prompt["payload"]["loss_mask"]
+        ):
+            continue
+        prompts.append(prompt)
         if limit is not None and len(prompts) >= limit:
             break
     return prompts
+
+
+def _prompt_from_record(
+    record: Mapping[str, Any],
+    *,
+    source: str,
+    max_length: int,
+    min_loss_tokens: int,
+) -> PromptTaskDict | None:
+    if "input_ids" not in record or "loss_mask" not in record:
+        raise ValueError(f"{source} must contain both input_ids and loss_mask")
+
+    input_ids = _normalize_integer_sequence(
+        record["input_ids"], field="input_ids", source=source, binary=False
+    )
+    loss_mask = _normalize_integer_sequence(
+        record["loss_mask"], field="loss_mask", source=source, binary=True
+    )
+    if len(input_ids) != len(loss_mask):
+        raise ValueError(
+            f"{source} has mismatched input_ids/loss_mask lengths: "
+            f"{len(input_ids)} != {len(loss_mask)}"
+        )
+    if not input_ids:
+        raise ValueError(f"{source} contains an empty token sequence")
+
+    input_ids = input_ids[:max_length]
+    loss_mask = loss_mask[:max_length]
+    if sum(loss_mask) < min_loss_tokens:
+        return None
+    return {
+        "payload": {
+            "input_ids": input_ids,
+            "loss_mask": loss_mask,
+        }
+    }
 
 
 def _normalize_integer_sequence(
@@ -275,6 +340,7 @@ def _validate_options(
     max_prompts: int | None,
     cache_dir: str | None,
     cache_key: str | None,
+    loss_mask_filter: Callable[[Sequence[int]], bool] | None,
 ) -> None:
     if (
         not isinstance(max_length, int)
@@ -300,6 +366,8 @@ def _validate_options(
         )
     if (cache_dir is None) != (cache_key is None):
         raise ValueError("cache_dir and cache_key must be provided together")
+    if loss_mask_filter is not None and not callable(loss_mask_filter):
+        raise TypeError("loss_mask_filter must be callable or None")
 
 
 __all__ = ["PromptTaskDict", "prepare_prompt_tasks"]

@@ -54,6 +54,19 @@ def _scalar_out(loss, acc, tokens, denom=None):
     return StepOutput(loss=torch.tensor(float(loss)), metrics=metrics)
 
 
+def _additive_scalar_out(loss_num, loss_den, accuracy_num, accuracy_den):
+    loss_num = torch.tensor(float(loss_num))
+    loss_den = torch.tensor(float(loss_den))
+    accuracy_num = torch.tensor(float(accuracy_num))
+    accuracy_den = torch.tensor(float(accuracy_den))
+    return StepOutput(
+        loss=loss_num / loss_den,
+        metrics={"accuracy": accuracy_num / accuracy_den},
+        ratio_metrics={"acc": (accuracy_num, accuracy_den)},
+        loss_terms=(loss_num, loss_den),
+    )
+
+
 class TestEvaluatorAggregation(unittest.TestCase):
     def _run(self, outputs):
         from specforge.eval import Evaluator
@@ -170,6 +183,19 @@ class TestEvaluatorAggregation(unittest.TestCase):
             self.assertAlmostEqual(m["eval/simulated_acc_len"], 4 / 6, places=6)
             # loss-token weighting would skew to (0.75*10 + 0.5*50)/60 ~ 0.542
             self.assertNotAlmostEqual(m["eval/avg_acc"], 32.5 / 60, places=2)
+
+    def test_additive_scalar_terms_are_partition_invariant(self):
+        split = self._run(
+            [
+                _additive_scalar_out(2, 1, 1, 1),
+                _additive_scalar_out(30, 3, 1, 3),
+            ]
+        )
+        combined = self._run([_additive_scalar_out(32, 4, 2, 4)])
+
+        self.assertEqual(split, combined)
+        self.assertEqual(split["eval/avg_loss"], 8.0)
+        self.assertEqual(split["eval/avg_acc"], 0.5)
 
     def test_reports_per_position_acceptance(self):
         m = self._run([_step_output(1.0, corrects=[3, 2], denoms=[4, 4])])

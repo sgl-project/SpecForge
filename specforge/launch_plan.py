@@ -78,12 +78,12 @@ def _redacted(value: str) -> str:
     return f"{name}={raw}" if name is not None else raw
 
 
-def _redacted_env(values: Mapping[str, str]) -> dict[str, str]:
+def _redacted_env(values: Mapping[str, Optional[str]]) -> dict[str, Optional[str]]:
     return {
         name: (
             "<redacted>"
             if any(fragment in name.lower() for fragment in _SECRET_NAMES)
-            else _redacted(value)
+            else (_redacted(value) if value is not None else None)
         )
         for name, value in sorted(values.items())
     }
@@ -93,7 +93,9 @@ def _redacted_env(values: Mapping[str, str]) -> dict[str, str]:
 class CommandSpec:
     label: str
     argv: tuple[str, ...]
-    env: Mapping[str, str] = field(default_factory=dict)
+    #: Child environment overrides; a None value unsets the inherited
+    #: variable (Ascend rejects an empty ASCEND_RT_VISIBLE_DEVICES).
+    env: Mapping[str, Optional[str]] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -142,7 +144,9 @@ class LaunchPlan:
     kind: PlanKind
     role: Literal["all", "producer", "consumer", "both"]
     commands: tuple[CommandSpec, ...] = ()
-    worker_env: Mapping[str, str] = field(default_factory=dict)
+    #: In-process environment overrides for kind="worker". Shares the
+    #: CommandSpec.env contract: a None value unsets the variable.
+    worker_env: Mapping[str, Optional[str]] = field(default_factory=dict)
     services: tuple[ServiceSpec, ...] = ()
     managed_root: Optional[str] = None
     managed_ports: tuple[int, ...] = ()
@@ -203,7 +207,7 @@ def _resolve_role(
         raise ValueError("--role producer/consumer/both requires disaggregated mode")
     if requested == "both" and cfg.training.resume_from:
         raise ValueError(
-            "--role both cannot resume a disaggregated producer; use " "--role consumer"
+            "--role both cannot resume a disaggregated producer; use --role consumer"
         )
     if distributed and requested == "both":
         raise ValueError(
@@ -222,7 +226,7 @@ def _resolved_node_rank(
         node_rank = int(env["NODE_RANK"])
     if node_rank is not None and not 0 <= node_rank < cfg.deployment.trainer.nnodes:
         raise ValueError(
-            f"node_rank={node_rank} must be in [0, " f"{cfg.deployment.trainer.nnodes})"
+            f"node_rank={node_rank} must be in [0, {cfg.deployment.trainer.nnodes})"
         )
     return node_rank
 
@@ -265,6 +269,8 @@ def _disaggregated_env(
         "DISAGG_BACKEND": deployment.backend,
         "DISAGG_STORE_ID": deployment.store_id or cfg.run_id,
     }
+    if deployment.inbox_server_url:
+        values["DISAGG_INBOX_SERVER_URL"] = deployment.inbox_server_url
     if cfg.mode == "online":
         if deployment.backend != "mooncake":
             raise ValueError("online disaggregated training requires Mooncake")
@@ -275,9 +281,9 @@ def _disaggregated_env(
             {
                 "DISAGG_REF_CHANNEL": str(control_dir / "refs.jsonl"),
                 "DISAGG_DB": str(consumer_state_dir / "consumer.sqlite"),
-                # SQLite/WAL stays on rank 0's local filesystem.  Inboxes are
-                # ordinary append-only channels and must remain visible to
-                # ranks on every trainer node.
+                # SQLite/WAL stays on rank 0's local filesystem. Inboxes are
+                # shared normally or served by rank 0 when the HTTP relay is
+                # configured.
                 "DISAGG_INBOX_DIR": str(
                     (
                         control_dir
@@ -359,6 +365,37 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
     return values
 
 
+def _device_visibility_env_var() -> str:
+    """Visible-devices env var for the active accelerator.
+
+    Kept torch-free for supervisor processes: ``torch_npu`` is detected by
+    module availability, after explicit env markers.
+    """
+    forced = os.environ.get("SPECFORGE_DEVICE")
+    if forced == "npu":
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    if forced == "cuda":
+        return "CUDA_VISIBLE_DEVICES"
+    if os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
+        "ASCEND_VISIBLE_DEVICES"
+    ):
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return "CUDA_VISIBLE_DEVICES"
+    if importlib.util.find_spec("torch_npu") is not None:
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    return "CUDA_VISIBLE_DEVICES"
+
+
+def _hidden_devices_env_value(device_visibility_env: str) -> Optional[str]:
+    """Env value that hides accelerators from a managed child process.
+
+    The Ascend driver rejects an empty ``ASCEND_RT_VISIBLE_DEVICES``, so
+    there the variable must be unset (``None``) instead of emptied.
+    """
+    return "" if device_visibility_env == "CUDA_VISIBLE_DEVICES" else None
+
+
 def _sglang_argv(
     model: ModelConfig,
     *,
@@ -400,6 +437,7 @@ def _managed_local_services(
     control_dir = Path(deployment.control_dir)
     log_dir = control_dir / "logs"
     shared_env = _managed_local_environment(cfg)
+    device_visibility_env = _device_visibility_env_var()
     capture_context_length = cfg.model.sglang_context_length or (
         cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
     )
@@ -414,8 +452,13 @@ def _managed_local_services(
                 f"--rpc_port={mooncake.rpc_port}",
                 f"--http_metadata_server_port={mooncake.metadata_port}",
                 f"--metrics_port={mooncake.metrics_port}",
+                *(
+                    (f"--default_kv_lease_ttl={mooncake.default_kv_lease_ttl_ms}",)
+                    if mooncake.default_kv_lease_ttl_ms is not None
+                    else ()
+                ),
             ),
-            {"CUDA_VISIBLE_DEVICES": ""},
+            {device_visibility_env: _hidden_devices_env_value(device_visibility_env)},
         ),
         readiness=ReadinessSpec(
             "mooncake",
@@ -451,7 +494,6 @@ def _managed_local_services(
                 str(server.tp_size),
                 "--chunked-prefill-size",
                 "-1",
-                "--disable-radix-cache",
                 "--enable-spec-capture",
                 "--spec-capture-method",
                 contract.method,
@@ -463,6 +505,16 @@ def _managed_local_services(
                 str(server.port),
             ]
         )
+        attention_backend = (
+            server.attention_backend or cfg.model.sglang_attention_backend
+        )
+        if (
+            server.attention_backend is None
+            and attention_backend == "flashinfer"
+            and device_visibility_env == "ASCEND_RT_VISIBLE_DEVICES"
+        ):
+            # flashinfer does not exist on Ascend; default to the NPU backend.
+            attention_backend = "ascend"
         argv.extend(
             _sglang_argv(
                 cfg.model,
@@ -473,15 +525,13 @@ def _managed_local_services(
                         if server.mem_fraction_static is not None
                         else cfg.model.sglang_mem_fraction_static
                     ),
-                    "sglang_attention_backend": (
-                        server.attention_backend or cfg.model.sglang_attention_backend
-                    ),
+                    "sglang_attention_backend": attention_backend,
                 },
             )
         )
         service_env = {
             **shared_env,
-            "CUDA_VISIBLE_DEVICES": ",".join(server.cuda_visible_devices),
+            device_visibility_env: ",".join(server.cuda_visible_devices),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
@@ -593,8 +643,7 @@ def _validate_consumer_database(
     if cfg.training.resume_from:
         if state_owner and not os.path.exists(database):
             raise ValueError(
-                "consumer resume requires the retained metadata database: "
-                f"{database}"
+                f"consumer resume requires the retained metadata database: {database}"
             )
         return
     stale = [
@@ -717,11 +766,14 @@ def build_launch_plan(
         if role in ("consumer", "both"):
             consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
         if managed_local is not None:
+            device_visibility_env = _device_visibility_env_var()
             producer_env.update(managed_environment)
-            producer_env["CUDA_VISIBLE_DEVICES"] = ""
+            producer_env[device_visibility_env] = _hidden_devices_env_value(
+                device_visibility_env
+            )
             producer_env[_MANAGED_CHILD_ENV] = "1"
             consumer_env.update(managed_environment)
-            consumer_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            consumer_env[device_visibility_env] = ",".join(
                 managed_local.trainer_cuda_visible_devices
             )
             consumer_env[_MANAGED_CHILD_ENV] = "1"
@@ -992,7 +1044,11 @@ def _spawn_command(
     stderr=None,
 ) -> subprocess.Popen:
     child_env = os.environ.copy()
-    child_env.update(command.env)
+    for key, value in command.env.items():
+        if value is None:
+            child_env.pop(key, None)
+        else:
+            child_env[key] = value
     kwargs = {"env": child_env, "start_new_session": True}
     if stdout is not None:
         kwargs["stdout"] = stdout

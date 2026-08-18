@@ -6,18 +6,24 @@ import types
 import unittest
 from unittest.mock import patch
 
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
 from specforge.data.prompt_builder import prepare_prompt_tasks
 
 
 class _FakeDataset:
     def __init__(self, rows):
         self.rows = list(rows)
+        self.getitem_calls = 0
 
     def __iter__(self):
         return iter(self.rows)
 
     def __len__(self):
         return len(self.rows)
+
+    def __getitem__(self, index):
+        self.getitem_calls += 1
+        return self.rows[index]
 
     def select(self, indices):
         return _FakeDataset(self.rows[index] for index in indices)
@@ -86,6 +92,35 @@ class TestPreparePromptTasks(unittest.TestCase):
             ],
         )
 
+    def test_algorithm_loss_mask_filter_applies_after_truncation(self):
+        records = [
+            {"input_ids": [1, 2, 3, 4, 5], "loss_mask": [1, 0, 0, 1, 1]},
+            {"input_ids": [4, 5, 6, 7], "loss_mask": [0, 0, 1, 1]},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "prompts.jsonl")
+            _write_jsonl(path, records)
+
+            prompts = prepare_prompt_tasks(
+                path,
+                tokenizer=None,
+                chat_template=None,
+                max_length=4,
+                is_preformatted=False,
+                train_only_last_turn=False,
+                cache_dir=None,
+                cache_key=None,
+                num_proc=1,
+                min_loss_tokens=2,
+                max_prompts=1,
+                loss_mask_filter=has_consecutive_supervised_tokens,
+            )
+
+        self.assertEqual(
+            prompts,
+            [{"payload": {"input_ids": [4, 5, 6, 7], "loss_mask": [0, 0, 1, 1]}}],
+        )
+
     def test_raw_conversations_use_lazy_dataset_preprocessing(self):
         raw_rows = [
             {"conversations": [{"role": "user", "content": "one"}]},
@@ -141,8 +176,11 @@ class TestPreparePromptTasks(unittest.TestCase):
                     max_prompts=1,
                 )
 
+        self.assertEqual(processed_dataset.getitem_calls, 0)
+        materialized_prompts = list(prompts)
+        self.assertEqual(processed_dataset.getitem_calls, 1)
         self.assertEqual(
-            prompts,
+            materialized_prompts,
             [
                 {
                     "payload": {

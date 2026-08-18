@@ -20,6 +20,7 @@ EXPECTED_NPROC_PER_NODE = {
     "gpt-oss-20b-eagle3-online.yaml": 8,
     "lfm2.5-1.2b-instruct-dflash-online.yaml": 8,
     "inkling-dspark-disaggregated.yaml": 1,
+    "kimi-k3-dspark-disaggregated.yaml": 4,
     "ling-flash-2.0-eagle3-offline.yaml": 8,
     "ling-flash-2.0-eagle3-online.yaml": 8,
     "llama3.1-8b-eagle3-offline.yaml": 1,
@@ -66,13 +67,15 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.5-35b-a3b-eagle3-offline.yaml": 4,
     "qwen3.5-35b-a3b-eagle3-online.yaml": 2,
     "qwen3.5-4b-dflash-online-npu.yaml": 8,
+    "qwen3.5-4b-dflash-disaggregated-npu.yaml": 14,
     "qwen3.5-4b-domino-online-npu.yaml": 8,
     "qwen3.6-27b-dflash-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-multiserver-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-online.yaml": 8,
-    "qwen3.6-27b-domino-online.yaml": 8,
+    "qwen3.6-27b-domino-online.yaml": 1,
     "qwen3.6-27b-dspark-disaggregated.yaml": 1,
+    "qwen3.6-27b-dspark-online.yaml": 1,
     "qwq-32b-eagle3-online.yaml": 4,
 }
 
@@ -226,6 +229,39 @@ EXPECTED_DISAGGREGATED = {
         "server_urls": ["http://127.0.0.1:30000"],
         **LOCAL_MOONCAKE_ENDPOINTS,
     },
+    "qwen3.5-4b-dflash-disaggregated-npu.yaml": {
+        "control_dir": "outputs/qwen3.5-4b-dflash-npu-managed/control",
+        "consumer_state_dir": "outputs/qwen3.5-4b-dflash-npu-managed/consumer-state",
+        "backend": "mooncake",
+        "managed_local": {
+            "trainer_cuda_visible_devices": [
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+                "9",
+                "10",
+                "11",
+                "12",
+                "13",
+                "14",
+                "15",
+            ],
+            "mooncake": {
+                "global_segment_size_bytes": 17179869184,
+            },
+            "capture_servers": [
+                {
+                    "port": 30000,
+                    "cuda_visible_devices": ["0"],
+                    "tp_size": 1,
+                }
+            ],
+        },
+    },
     "qwen3.6-27b-dflash-disaggregated.yaml": {
         "control_dir": "outputs/qwen3.6-27b-dflash-disaggregated/control",
         "backend": "mooncake",
@@ -298,6 +334,14 @@ EXPECTED_DISAGGREGATED = {
             ],
         },
     },
+    "qwen3.6-27b-dspark-online.yaml": {
+        "control_dir": "outputs/qwen3.6-27b-dspark-online/control",
+        "consumer_state_dir": "outputs/qwen3.6-27b-dspark-online/consumer-state",
+        "backend": "mooncake",
+        "server_urls": ["http://127.0.0.1:30000"],
+        **LOCAL_MOONCAKE_ENDPOINTS,
+        "mooncake_local_hostname": "127.0.0.1",
+    },
 }
 
 
@@ -312,7 +356,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 63)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 66)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
@@ -336,9 +380,10 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                     else "local_colocated"
                 )
                 self.assertEqual(deployment["mode"], expected_mode)
+                expected_trainer = {"nnodes": 1, "nproc_per_node": nproc_per_node}
                 self.assertEqual(
                     deployment["trainer"],
-                    {"nnodes": 1, "nproc_per_node": nproc_per_node},
+                    expected_trainer,
                 )
 
                 expected_keys = {"mode", "trainer"}
@@ -415,6 +460,26 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
         )
         self.assertEqual(qwen4b.training.loss_decay_gamma, 4.0)
         self.assertEqual(qwen4b.training.objective_chunk_blocks, 128)
+
+        kimi = Config.from_file(
+            str(EXAMPLE_CONFIG_DIR / "kimi-k3-dspark-disaggregated.yaml")
+        )
+        kimi_topology = kimi.deployment.trainer
+        self.assertEqual(
+            kimi_topology.nnodes
+            * kimi_topology.nproc_per_node
+            * kimi.training.batch_size
+            * kimi.training.accumulation_steps,
+            128,
+        )
+        self.assertEqual(kimi.training.lr_scheduler, "constant")
+        self.assertEqual(kimi.training.prompt_seed, 1)
+        self.assertAlmostEqual(
+            kimi.training.learning_rate,
+            0.000050959167111070076,
+        )
+        self.assertEqual(kimi.data.max_length, 65536)
+        self.assertEqual(kimi.training.num_anchors, 512)
 
 
 if __name__ == "__main__":

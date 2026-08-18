@@ -34,7 +34,7 @@ def _load_preprocessing_stack():
     distributed_module.get_sp_ring_group = lambda: None
     sys.modules[f"{package_name}.distributed"] = distributed_module
 
-    for module_name in ("template", "parse", "preprocessing"):
+    for module_name in ("template", "parse", "loss_mask", "preprocessing"):
         full_name = f"{data_package_name}.{module_name}"
         module_path = repo_root / "specforge" / "data" / f"{module_name}.py"
         spec = importlib.util.spec_from_file_location(full_name, module_path)

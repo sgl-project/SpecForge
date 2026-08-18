@@ -338,6 +338,53 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertGreaterEqual(snapshot["pause_transitions"], 1)
         self.assertGreaterEqual(snapshot["resume_transitions"], 1)
 
+    def test_byte_watermark_cannot_block_the_first_optimizer_window(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(3),
+            store,
+            channel,
+            consumer_quantum=3,
+            lease=1,
+            resident_high_watermark_bytes=1,
+            resident_low_watermark_bytes=0,
+        )
+
+        outcome = {}
+
+        def run_producer():
+            try:
+                outcome["produced"] = drive()
+            except BaseException as exc:  # expose a thread failure to the test
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run_producer, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 2
+        while channel.published < 3 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        published_before_ack = channel.published
+
+        # Keep cleanup bounded if this invariant regresses and the producer
+        # pauses before publishing a complete window.
+        reader = StreamingRefChannel(channel.path)
+        cleanup_deadline = time.monotonic() + 2
+        while thread.is_alive() and time.monotonic() < cleanup_deadline:
+            refs = reader.poll()
+            if refs:
+                reader.mark_consumed(len(refs))
+            time.sleep(0.001)
+        thread.join(2)
+
+        self.assertEqual(published_before_ack, 3)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome.get("produced"), 3)
+
     def test_hard_byte_cap_aborts_unpublished_capture_and_fails_channel(self):
         backend = _FakeMooncakeStore()
         stub = _StubCaptureServer(backend)
@@ -548,6 +595,35 @@ class TestMultiServerProducer(unittest.TestCase):
             },
         )
         self.assertTrue(channel.is_closed())
+
+    def test_prompt_ingest_chunks_preserve_epoch_ids_and_release_payloads(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        N, E = 5, 2
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(N),
+            store,
+            channel,
+            lease=2,
+            prompt_epochs=E,
+            prompt_ingest_batch_size=2,
+        )
+
+        produced = drive()
+
+        self.assertEqual(produced, N * E)
+        self.assertEqual(workers[0].controller.status()["prompts"], 0)
+        self.assertEqual(
+            set(_published_sample_ids(channel.path)),
+            {
+                f"run0:epoch{epoch:04d}-prompt{idx:012d}"
+                for epoch in range(E)
+                for idx in range(N)
+            },
+        )
 
     def test_prompt_epoch_order_is_seeded_and_reconstruction_stable(self):
         prompts = _prompts(12)

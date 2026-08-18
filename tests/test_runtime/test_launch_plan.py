@@ -30,6 +30,7 @@ from specforge.launch_plan import (
 from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
 from specforge.training.capture_contract import ServerCaptureContract
+from tests.utils import wait_for_processes_to_stop
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
@@ -391,8 +392,12 @@ class LaunchPlanTest(unittest.TestCase):
             Config.model_validate(raw)
 
     def test_multi_node_keeps_wal_local_and_inboxes_shared(self):
+        raw = _config(mode="disaggregated", nproc=2, nnodes=2).model_dump()
+        raw["deployment"]["disaggregated"][
+            "inbox_server_url"
+        ] = "http://trainer-0:35900"
         plan = build_launch_plan(
-            _config(mode="disaggregated", nproc=2, nnodes=2),
+            Config.model_validate(raw),
             config_path="run.yaml",
             requested_role="consumer",
             node_rank=0,
@@ -404,6 +409,30 @@ class LaunchPlanTest(unittest.TestCase):
         command = plan.commands[0]
         self.assertEqual("/local/attempt-1/consumer.sqlite", command.env["DISAGG_DB"])
         self.assertEqual("/shared/attempt-1/inboxes", command.env["DISAGG_INBOX_DIR"])
+        self.assertEqual(
+            "http://trainer-0:35900", command.env["DISAGG_INBOX_SERVER_URL"]
+        )
+
+    def test_inbox_server_url_is_typed_and_online_multinode_only(self):
+        cfg = _config(mode="disaggregated", nproc=2, nnodes=2)
+        invalid = {
+            "https": "https://trainer-0:35900",
+            "missing port": "http://trainer-0",
+            "path": "http://trainer-0:35900/inboxes",
+        }
+        for name, value in invalid.items():
+            with self.subTest(case=name):
+                raw = cfg.model_dump()
+                raw["deployment"]["disaggregated"]["inbox_server_url"] = value
+                with self.assertRaisesRegex(ValidationError, "http://host:port"):
+                    Config.model_validate(raw)
+
+        raw = _config(mode="disaggregated", nproc=2, nnodes=1).model_dump()
+        raw["deployment"]["disaggregated"][
+            "inbox_server_url"
+        ] = "http://trainer-0:35900"
+        with self.assertRaisesRegex(ValidationError, "multi-node trainer"):
+            Config.model_validate(raw)
 
     def test_disaggregated_roles_are_independently_selectable(self):
         producer = build_launch_plan(
@@ -539,7 +568,7 @@ class LaunchPlanTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, message):
                     Config.model_validate(raw)
 
-    def test_managed_local_accepts_minimum_context_and_disables_radix_cache(self):
+    def test_managed_local_accepts_minimum_context_and_configures_radix_cache(self):
         with tempfile.TemporaryDirectory() as root:
             cfg = _managed_config(os.path.join(root, "attempt"))
             raw = cfg.model_dump()
@@ -555,6 +584,19 @@ class LaunchPlanTest(unittest.TestCase):
         argv = plan.services[1].command.argv
         self.assertEqual(argv[argv.index("--context-length") + 1], "135")
         self.assertIn("--disable-radix-cache", argv)
+
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"))
+            raw = cfg.model_dump()
+            raw["model"]["sglang_disable_radix_cache"] = False
+            validated = Config.model_validate(raw)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                plan = build_launch_plan(validated, config_path="run.yaml", env={})
+
+        self.assertNotIn("--disable-radix-cache", plan.services[1].command.argv)
 
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [
@@ -626,6 +668,7 @@ class LaunchPlanTest(unittest.TestCase):
                 "--rpc_port=35551",
                 "--http_metadata_server_port=35880",
                 "--metrics_port=35903",
+                "--default_kv_lease_ttl=500",
             ),
         )
         self.assertEqual(mooncake.readiness.kind, "mooncake")
@@ -1453,6 +1496,7 @@ plan = LaunchPlan(
             (sys.executable, "-c", {child_code!r}, {marker!r}),
         ),
     ),
+    shutdown_grace_s=1.0,
 )
 raise SystemExit(run_commands(plan))
 """
@@ -1464,6 +1508,7 @@ raise SystemExit(run_commands(plan))
                 text=True,
             )
             child_pid = None
+            grandchild_pid = None
             try:
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
@@ -1471,12 +1516,15 @@ raise SystemExit(run_commands(plan))
                         with open(marker, encoding="utf-8") as stream:
                             raw = stream.read().strip()
                         if len(raw.split()) == 2:
-                            child_pid = int(raw.split()[0])
+                            child_pid, grandchild_pid = map(int, raw.split())
                             break
                     if runner.poll() is not None:
                         break
                     time.sleep(0.02)
                 self.assertIsNotNone(child_pid, "managed child never became ready")
+                self.assertIsNotNone(
+                    grandchild_pid, "managed grandchild never became ready"
+                )
                 self.assertEqual(os.getpgid(child_pid), child_pid)
 
                 os.kill(runner.pid, signal.SIGTERM)
@@ -1487,15 +1535,13 @@ raise SystemExit(run_commands(plan))
                     f"stdout={stdout!r} stderr={stderr!r}",
                 )
 
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    try:
-                        os.killpg(child_pid, 0)
-                    except ProcessLookupError:
-                        break
-                    time.sleep(0.02)
-                else:
-                    self.fail(f"managed process group {child_pid} survived SIGTERM")
+                survivors = wait_for_processes_to_stop(
+                    (child_pid, grandchild_pid), timeout_s=5
+                )
+                self.assertFalse(
+                    survivors,
+                    f"managed processes survived SIGTERM: {survivors}",
+                )
             finally:
                 if runner.poll() is None:
                     runner.kill()
