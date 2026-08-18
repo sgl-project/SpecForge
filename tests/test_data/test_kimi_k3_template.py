@@ -1,8 +1,6 @@
 """Kimi-K3 template registration and draft-config contract."""
 
-import json
 import unittest
-from pathlib import Path
 
 from specforge.data.template import TEMPLATE_REGISTRY
 
