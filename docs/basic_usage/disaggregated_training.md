@@ -14,18 +14,18 @@ The checked-in recipes are:
 
 | Workflow | Config |
 | --- | --- |
-| Online EAGLE3 | `examples/configs/qwen3-8b-eagle3-disaggregated.yaml` |
-| Online P-EAGLE | `examples/configs/qwen3-8b-peagle-disaggregated.yaml` |
-| Online DFlash | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` |
-| Online one-server + DP7 Qwen3-8B DFlash | `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` |
-| Online Domino | `examples/configs/qwen3-8b-domino-disaggregated.yaml` |
-| Online two-server Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` |
-| Online DSpark | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` |
-| Online Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-disaggregated.yaml` |
-| Online one-server + DP2 Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` |
-| Online two-server Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` |
-| Offline EAGLE3 | `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` |
-| Offline Qwen2.5-7B EAGLE3 | `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` |
+| Online EAGLE3 | `examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml` |
+| Online P-EAGLE | `examples/configs/online/disaggregated/external/qwen3-8b-peagle-disaggregated.yaml` |
+| Online DFlash | `examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml` |
+| Online one-server + DP7 Qwen3-8B DFlash | `examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` |
+| Online Domino | `examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml` |
+| Online two-server Qwen3-8B Domino | `examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml` |
+| Online DSpark | `examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml` |
+| Online Qwen3.6 DFlash | `examples/configs/online/disaggregated/external/qwen3.6-27b-dflash-disaggregated.yaml` |
+| Online one-server + DP2 Qwen3.6 DFlash | `examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` |
+| Online two-server Qwen3.6 DFlash | `examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` |
+| Offline EAGLE3 | `examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml` |
+| Offline Qwen2.5-7B EAGLE3 | `examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml` |
 
 ## One config owns the launch topology
 
@@ -84,7 +84,7 @@ With `deployment.trainer.nnodes: 1`, omitting `--role` starts a supervisor for
 both SpecForge roles:
 
 ```bash
-specforge train -c examples/configs/qwen3-8b-dflash-disaggregated.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml
 ```
 
 The checked-in online recipes use the local demo endpoints shown above, so the
@@ -102,7 +102,7 @@ canceling it.
 Inspect the resolved plan without starting processes:
 
 ```bash
-specforge train -c examples/configs/qwen3-8b-dflash-disaggregated.yaml --plan
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml --plan
 ```
 
 Plan output redacts secret-shaped overrides and credentials embedded in URLs.
@@ -144,7 +144,7 @@ four producer workers against one server while keeping the checked-in YAML as
 the source of every other setting:
 
 ```bash
-specforge train -c examples/configs/qwen3-8b-domino-disaggregated.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml \
   'deployment.disaggregated.server_urls=["http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000"]'
 ```
 
@@ -164,10 +164,10 @@ TP=1 capture server on GPU 0 and a DP=7 trainer on GPUs 1–7:
 
 ```bash
 specforge train -c \
-  examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
 
 specforge train -c \
-  examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml
 ```
 
 The checked-in multi-server Qwen3-8B Domino recipe records two TP=1 capture
@@ -177,7 +177,7 @@ the unified training entry:
 
 ```bash
 specforge train -c \
-  examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml
 ```
 
 The Qwen3.6 DFlash one-server recipe owns a TP=1 server on GPU 0 and a DP=2
@@ -186,10 +186,10 @@ GPUs 0–3 and a DP=2 trainer on GPUs 4–5:
 
 ```bash
 specforge train -c \
-  examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
 
 specforge train -c \
-  examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
 ```
 
 The launcher starts Mooncake first, waits for its metadata and RPC endpoints,
@@ -220,7 +220,7 @@ the launcher-provided rank to those same two commands:
 
 ```bash
 rcli exec --per-node <job> \
-  'CONFIG=examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
+  'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
 ```
 
 `RCLI_NODE_RANK=0` selects the producer and rank 1 selects the consumer. The

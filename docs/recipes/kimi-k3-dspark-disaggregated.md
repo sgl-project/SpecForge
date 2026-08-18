@@ -105,7 +105,7 @@ export WANDB_API_KEY="$(< /protected/path/wandb-api-key)"
 export WANDB_ENTITY=your-entity
 unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT NODE_RANK
 CUDA_VISIBLE_DEVICES=0,1,2,3 specforge train \
-  -c examples/configs/kimi-k3-dspark-disaggregated.yaml \
+  -c examples/configs/online/disaggregated/external/kimi-k3-dspark-disaggregated.yaml \
   --role both \
   "deployment.disaggregated.server_urls=[\"http://$CAPTURE_IP:30000\"]" \
   "deployment.disaggregated.mooncake_metadata_server=http://$CAPTURE_IP:35880/metadata" \
@@ -127,7 +127,7 @@ fixture and shrink the optimizer quantum:
 
 ```bash
 specforge train \
-  -c examples/configs/kimi-k3-dspark-disaggregated.yaml \
+  -c examples/configs/online/disaggregated/external/kimi-k3-dspark-disaggregated.yaml \
   --role both \
   data.train_data_path= \
   data.prompts_path=/workspace/k3_dspark/data/longest-smoke-pretokenized-4rows-65536.jsonl \

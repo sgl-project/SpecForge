@@ -5,7 +5,7 @@ its model and data paths, and launch it directly; multi-process topology is
 already recorded in the YAML:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
 The representative configs are below. The complete recipe catalog, including
@@ -14,30 +14,30 @@ NPU, offline, and managed/external-service variants, is in
 
 | Config | Mode | Strategy |
 | --- | --- | --- |
-| `examples/configs/qwen3-8b-eagle3-disaggregated.yaml` | Disaggregated SGLang server capture | EAGLE3 |
-| `examples/configs/qwen3-8b-eagle3-offline.yaml` | Precomputed features | EAGLE3 |
-| `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
-| `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
-| `examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml` | Disaggregated SGLang server capture with normalized EAGLE3 inputs | EAGLE3.1 |
-| `examples/configs/qwen3-8b-dflash-online.yaml` | Disaggregated SGLang server capture | DFlash |
-| `examples/configs/qwen3-8b-dflash-offline.yaml` | Precomputed features | DFlash |
-| `examples/configs/qwen3-8b-dpace-online.yaml` | Online D-PACE objective | DFlash |
-| `examples/configs/qwen3-8b-dflash-disaggregated.yaml` | Disaggregated server capture | DFlash |
-| `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | DFlash |
-| `examples/configs/qwen3-8b-domino-online.yaml` | Disaggregated SGLang server capture | Domino |
-| `examples/configs/qwen3-8b-domino-offline.yaml` | Precomputed features | Domino |
-| `examples/configs/qwen3-8b-domino-disaggregated.yaml` | Disaggregated server capture | Domino |
-| `examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | Domino |
-| `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | Domino |
-| `examples/configs/qwen3-8b-peagle-disaggregated.yaml` | Disaggregated SGLang server capture | P-EAGLE |
-| `examples/configs/qwen3-4b-dspark-disaggregated.yaml` | Disaggregated server capture | DSpark |
-| `examples/configs/kimi-k3-dspark-disaggregated.yaml` | External-service TP8 capture + four-rank trainer | DSpark |
-| `examples/configs/qwen3-4b-dspark-offline.yaml` | Precomputed features | DSpark |
-| `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
-| `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` | Managed local one capture server + DP2 | DFlash |
-| `examples/configs/qwen3.5-4b-dflash-online-npu.yaml` | Disaggregated NPU SGLang capture | DFlash |
-| `examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml` | Managed local NPU full stack | DFlash |
-| `examples/configs/qwen3.5-4b-domino-online-npu.yaml` | Disaggregated NPU SGLang capture | Domino |
+| `examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml` | Disaggregated SGLang server capture | EAGLE3 |
+| `examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml` | Precomputed features | EAGLE3 |
+| `examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
+| `examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
+| `examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1-online.yaml` | Disaggregated SGLang server capture with normalized EAGLE3 inputs | EAGLE3.1 |
+| `examples/configs/online/disaggregated/external/qwen3-8b-dflash-online.yaml` | Disaggregated SGLang server capture | DFlash |
+| `examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml` | Precomputed features | DFlash |
+| `examples/configs/online/disaggregated/external/qwen3-8b-dpace-online.yaml` | Online D-PACE objective | DFlash |
+| `examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml` | Disaggregated server capture | DFlash |
+| `examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | DFlash |
+| `examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml` | Disaggregated SGLang server capture | Domino |
+| `examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml` | Precomputed features | Domino |
+| `examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml` | Disaggregated server capture | Domino |
+| `examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | Domino |
+| `examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | Domino |
+| `examples/configs/online/disaggregated/external/qwen3-8b-peagle-disaggregated.yaml` | Disaggregated SGLang server capture | P-EAGLE |
+| `examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml` | Disaggregated server capture | DSpark |
+| `examples/configs/online/disaggregated/external/kimi-k3-dspark-disaggregated.yaml` | External-service TP8 capture + four-rank trainer | DSpark |
+| `examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml` | Precomputed features | DSpark |
+| `examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
+| `examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` | Managed local one capture server + DP2 | DFlash |
+| `examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml` | Disaggregated NPU SGLang capture | DFlash |
+| `examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-disaggregated-npu.yaml` | Managed local NPU full stack | DFlash |
+| `examples/configs/online/disaggregated/external/qwen3.5-4b-domino-online-npu.yaml` | Disaggregated NPU SGLang capture | Domino |
 
 Online configs point `data.train_data_path` at raw conversation data. Offline
 configs expect strategy-specific feature checkpoints in

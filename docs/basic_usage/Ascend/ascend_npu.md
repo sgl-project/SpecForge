@@ -97,7 +97,7 @@ guide.
 Online training is always **disaggregated**: a producer drives prompts through
 a patched SGLang capture server, features stream through Mooncake, and a
 consumer trains the draft. The checked-in
-[`qwen3.5-4b-dflash-online-npu.yaml`](../../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml)
+[`qwen3.5-4b-dflash-online-npu.yaml`](../../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml)
 recipe targets an externally started capture server.
 
 ### Step 1: Start Mooncake and the capture server
@@ -140,7 +140,7 @@ On the remaining NPUs:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=1,2,3,4,5,6,7,8 \
-specforge train -c examples/configs/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
 ```
 
 Before rerunning, clear stale control state:
@@ -159,7 +159,7 @@ Before rerunning, clear stale control state:
 ## 4. Managed-local full stack (one command)
 
 Instead of starting Mooncake and capture servers by hand, the
-[`qwen3.5-4b-dflash-disaggregated-npu.yaml`](../../../examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml)
+[`qwen3.5-4b-dflash-disaggregated-npu.yaml`](../../../examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-disaggregated-npu.yaml)
 recipe lets a single `specforge train` command own the whole single-node
 stack — Mooncake, capture server(s), and the trainer — and derives their
 endpoints and device assignments:
@@ -169,7 +169,7 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export HCCL_CONNECT_TIMEOUT=7200 HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-specforge train -c examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml
+specforge train -c examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-disaggregated-npu.yaml
 ```
 
 The checked-in layout parks the capture server on device 0 and runs a 14-rank
@@ -183,7 +183,7 @@ trainer's data wait then dominates step time. To give capture more cards,
 override the layout inline — e.g. a 6:10 split with six TP=1 capture servers:
 
 ```bash
-specforge train -c examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml \
+specforge train -c examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-disaggregated-npu.yaml \
   'deployment.trainer.nproc_per_node=10' \
   'deployment.disaggregated.managed_local.trainer_cuda_visible_devices=["6","7","8","9","10","11","12","13","14","15"]' \
   'deployment.disaggregated.managed_local.capture_servers=[{port: 40000, cuda_visible_devices: ["0"], tp_size: 1}, {port: 40001, cuda_visible_devices: ["1"], tp_size: 1}, {port: 40002, cuda_visible_devices: ["2"], tp_size: 1}, {port: 40003, cuda_visible_devices: ["3"], tp_size: 1}, {port: 40004, cuda_visible_devices: ["4"], tp_size: 1}, {port: 40005, cuda_visible_devices: ["5"], tp_size: 1}]'

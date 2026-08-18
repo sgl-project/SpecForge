@@ -55,9 +55,9 @@ AMD Instinct GPUs, follow the [AMD ROCm Tutorial](../basic_usage/AMD/amd_rocm.md
 
 Install the vendor-matched PyTorch and `torch_npu` packages first, then install
 SpecForge. The checked-in
-[`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml)
+[`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml)
 and
-[`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml)
+[`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-domino-online-npu.yaml)
 recipes use external SGLang server capture with SDPA consumers. Install a
 compatible SGLang/Mooncake service first. The unified launcher detects the NPU
 device, self-launches the process count recorded in YAML, and selects HCCL; see

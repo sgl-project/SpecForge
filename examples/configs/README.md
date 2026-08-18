@@ -1,10 +1,39 @@
 # Unified training recipe catalog
 
 Every draft model JSON under `configs/` has at least one typed YAML recipe in
-this directory. Run any recipe through the one public training entry:
+this catalog. Recipes are organized first by feature-production mode, then by
+trainer topology:
+
+```text
+examples/configs/
+├── offline/
+│   ├── colocated/
+│   └── disaggregated/
+└── online/
+    ├── colocated/
+    └── disaggregated/
+        ├── external/
+        └── managed-local/
+```
+
+- `offline/colocated` trains directly from precomputed feature files.
+- `offline/disaggregated` ingests precomputed features into a shared store and
+  trains through separate producer and consumer roles.
+- `online/colocated` is reserved for a future same-topology capture path; it is
+  intentionally empty because the current runtime does not support it.
+- `online/disaggregated/external` connects to user- or scheduler-managed
+  Mooncake and SGLang services.
+- `online/disaggregated/managed-local` lets SpecForge start and stop the local
+  Mooncake and SGLang services declared by `managed_local`.
+
+The directory is the source of truth for mode, topology, and service ownership.
+Some filenames retain historical `-online`, `-offline`, or `-disaggregated`
+labels so existing recipe identities and run names remain recognizable.
+
+Run any recipe through the one public training entry:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
 `model.draft_model_config` may name a local JSON file, a local model directory,
@@ -18,25 +47,19 @@ Every recipe records its audited process count under `deployment.trainer`.
 Multi-process configs self-launch through torch distributed:
 
 ```bash
-specforge train -c examples/configs/qwen3-30b-a3b-eagle3-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3-online.yaml
 ```
 
 The Qwen3-30B-A3B EAGLE3.1 variant uses the same unified entry point:
 
 ```bash
-specforge train -c examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1-online.yaml
 ```
 
 Its draft config enables per-layer RMS normalization before the three captured
 target hidden states are concatenated and projected. It remains registered as
 the `eagle3` strategy; EAGLE3.1 is a draft-model configuration variant, not a
 second runtime or launch path.
-
-The filename is the index: `*-online.yaml` performs SGLang server capture while
-training, `*-offline.yaml` consumes precomputed features, and
-`*-disaggregated.yaml` highlights a producer/consumer topology. Every online
-recipe is disaggregated even when its historical filename only says `online`.
-VLM training is not supported, so the catalog contains text-only recipes.
 
 The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
@@ -481,7 +504,7 @@ export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-specforge train -c examples/configs/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
 ```
 
 The unified launcher provides rank/world/rendezvous variables and the runtime

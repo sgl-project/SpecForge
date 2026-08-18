@@ -4,7 +4,7 @@ SpecForge has one public training entry point for every strategy and runtime
 topology:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
 The YAML file is the run contract. It selects the draft strategy, target model,
@@ -55,14 +55,14 @@ accumulation greater than one did not have the same boundary semantics.
 Use the command directly for every checked-in topology:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
 `deployment.trainer.nproc_per_node` records the audited local process count.
 When it is greater than one, the CLI starts torch distributed itself:
 
 ```bash
-specforge train -c examples/configs/qwen3-30b-a3b-eagle3-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3-online.yaml
 ```
 
 Online target inference never runs in the trainer. A patched SGLang server owns
@@ -79,7 +79,7 @@ validated `section.field=value` syntax:
 
 ```bash
 specforge train \
-  --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml \
+  --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml \
   training.learning_rate=5e-5 \
   training.max_steps=100 \
   output_dir=./outputs/eagle3-smoke
@@ -220,20 +220,20 @@ The checked-in examples are the canonical starting points:
 
 | Strategy and mode | Config |
 | --- | --- |
-| EAGLE3 online | [`qwen3-8b-eagle3-disaggregated.yaml`](../../examples/configs/qwen3-8b-eagle3-disaggregated.yaml) |
-| EAGLE3 offline | [`qwen3-8b-eagle3-offline.yaml`](../../examples/configs/qwen3-8b-eagle3-offline.yaml) |
-| DFlash online | [`qwen3-8b-dflash-online.yaml`](../../examples/configs/qwen3-8b-dflash-online.yaml) |
-| DFlash offline | [`qwen3-8b-dflash-offline.yaml`](../../examples/configs/qwen3-8b-dflash-offline.yaml) |
-| Domino online | [`qwen3-8b-domino-online.yaml`](../../examples/configs/qwen3-8b-domino-online.yaml) |
-| Domino offline | [`qwen3-8b-domino-offline.yaml`](../../examples/configs/qwen3-8b-domino-offline.yaml) |
-| P-EAGLE online | [`qwen3-8b-peagle-disaggregated.yaml`](../../examples/configs/qwen3-8b-peagle-disaggregated.yaml) |
-| DFlash disaggregated | [`qwen3-8b-dflash-disaggregated.yaml`](../../examples/configs/qwen3-8b-dflash-disaggregated.yaml) |
-| Domino disaggregated | [`qwen3-8b-domino-disaggregated.yaml`](../../examples/configs/qwen3-8b-domino-disaggregated.yaml) |
-| DSpark disaggregated | [`qwen3-4b-dspark-disaggregated.yaml`](../../examples/configs/qwen3-4b-dspark-disaggregated.yaml) |
-| DSpark offline | [`qwen3-4b-dspark-offline.yaml`](../../examples/configs/qwen3-4b-dspark-offline.yaml) |
-| EAGLE3 offline disaggregated | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](../../examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml) |
-| Ascend NPU DFlash online | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml) |
-| Ascend NPU Domino online | [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml) |
+| EAGLE3 online | [`qwen3-8b-eagle3-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
+| EAGLE3 offline | [`qwen3-8b-eagle3-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml) |
+| DFlash online | [`qwen3-8b-dflash-online.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-dflash-online.yaml) |
+| DFlash offline | [`qwen3-8b-dflash-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml) |
+| Domino online | [`qwen3-8b-domino-online.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) |
+| Domino offline | [`qwen3-8b-domino-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) |
+| P-EAGLE online | [`qwen3-8b-peagle-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-peagle-disaggregated.yaml) |
+| DFlash disaggregated | [`qwen3-8b-dflash-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml) |
+| Domino disaggregated | [`qwen3-8b-domino-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml) |
+| DSpark disaggregated | [`qwen3-4b-dspark-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) |
+| DSpark offline | [`qwen3-4b-dspark-offline.yaml`](../../examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) |
+| EAGLE3 offline disaggregated | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](../../examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
+| Ascend NPU DFlash online | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml) |
+| Ascend NPU Domino online | [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-domino-online-npu.yaml) |
 
 ## Online and offline data
 
@@ -414,7 +414,7 @@ export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-specforge train -c examples/configs/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
 ```
 
 The unified launcher supplies rank, world-size, and rendezvous variables. The
@@ -446,7 +446,7 @@ checkpoint contract. For a local offline run, override
 
 ```bash
 specforge train \
-  --config examples/configs/qwen3-8b-eagle3-offline.yaml \
+  --config examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml \
   training.resume_from=./outputs/qwen3-8b-eagle3-offline/qwen3-8b-eagle3-offline-latest
 ```
 

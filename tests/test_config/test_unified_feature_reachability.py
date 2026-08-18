@@ -143,10 +143,10 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
     def test_all_example_configs_validate_through_the_typed_entry(self):
         paths = sorted(
             path
-            for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
+            for path in EXAMPLE_CONFIG_DIR.rglob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 66)
+        self.assertEqual(len(paths), 68)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths

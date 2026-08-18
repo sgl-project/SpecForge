@@ -89,7 +89,7 @@ ROCm. The `fa` (flash-attn) and `usp` backends, and `yunchang`-based
 Ulysses/Ring sequence parallel (`sp_ulysses_size` / `sp_ring_size` > 1), depend
 on a CUDA flash-attn build; the single-GPU / data-parallel path never loads
 `yunchang`, and selecting those backends raises a clear error. The checked-in
-[`amd/qwen3.5-4b-dflash-offline.yaml`](../../../examples/configs/amd/qwen3.5-4b-dflash-offline.yaml)
+[`amd/qwen3.5-4b-dflash-offline.yaml`](../../../examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml)
 recipe already uses `flex_attention`, so it runs on ROCm unchanged as a
 single-GPU offline DFlash example.
 
@@ -169,13 +169,13 @@ The checked-in offline recipe already uses `flex_attention` for the trainer, so
 it runs on ROCm unchanged:
 
 ```bash
-specforge train --config examples/configs/amd/qwen3.5-4b-dflash-offline.yaml
+specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml
 ```
 
 Override any field inline without copying the YAML, e.g. a quick smoke run:
 
 ```bash
-specforge train --config examples/configs/amd/qwen3.5-4b-dflash-offline.yaml \
+specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml \
   training.max_steps=20 output_dir=./outputs/dflash-offline-smoke
 ```
 
@@ -193,7 +193,7 @@ consumer trains the draft model. With `deployment.trainer.nnodes: 1` and no
 `--role`, a single `specforge train` command supervises both.
 
 This section uses the
-[`amd/qwen3.5-4b-dflash-online.yaml`](../../../examples/configs/amd/qwen3.5-4b-dflash-online.yaml)
+[`amd/qwen3.5-4b-dflash-online.yaml`](../../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml)
 recipe as a single-node smoke test. Complete Step 4 of the installation first.
 
 ### Step 1: One-time run inputs
@@ -269,7 +269,7 @@ MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
 MOONCAKE_PROTOCOL=tcp \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=$((32<<30)) \
-specforge train -c examples/configs/amd/qwen3.5-4b-dflash-online.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml \
   training.max_steps=20 training.num_epochs=1 \
   training.save_interval=20 training.log_interval=5
 ```
@@ -309,10 +309,10 @@ process pools or nodes, use the **same config** with an explicit `--role`:
 
 ```bash
 # Inference / capture pool
-specforge train -c examples/configs/amd/qwen3.5-4b-dflash-online.yaml --role producer
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml --role producer
 
 # Trainer pool
-specforge train -c examples/configs/amd/qwen3.5-4b-dflash-online.yaml --role consumer
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml --role consumer
 ```
 
 For multiple consumer nodes, record `deployment.trainer.nnodes`,
