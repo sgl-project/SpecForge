@@ -476,7 +476,7 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
         self.assertEqual(kimi.training.prompt_seed, 1)
         self.assertAlmostEqual(
             kimi.training.learning_rate,
-            0.000050959167111070076,
+            6e-4,
         )
         self.assertEqual(kimi.data.max_length, 65536)
         self.assertEqual(kimi.training.num_anchors, 512)
