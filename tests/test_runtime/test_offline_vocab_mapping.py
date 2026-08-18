@@ -11,6 +11,7 @@ import torch
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
+from specforge.modeling.draft.vocab_mixin import DraftVocabMappingMixin
 from specforge.training.assembly import (
     _ensure_offline_vocab_mapping,
     _install_dataset_vocab_mapping,
@@ -21,18 +22,19 @@ from specforge.training.vocab_mapping import count_effective_feature_tokens
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
 
-class _DraftWithMapping(torch.nn.Module):
+class _DraftWithMapping(DraftVocabMappingMixin, torch.nn.Module):
+    """Minimal draft standing in for the buffers/installation contract.
+
+    Uses the production mixin rather than re-implementing loading, so the
+    assembly path under test exercises the real installation and validation.
+    """
+
     def __init__(self, target_vocab_size=8, draft_vocab_size=4):
         super().__init__()
-        self.register_buffer("t2d", torch.zeros(target_vocab_size, dtype=torch.bool))
-        self.register_buffer("d2t", torch.zeros(draft_vocab_size, dtype=torch.long))
-        self.vocab_mapping_loaded = False
-
-    def load_vocab_mapping(self, path):
-        mapping = torch.load(path, weights_only=True)
-        self.t2d.copy_(mapping["t2d"])
-        self.d2t.copy_(mapping["d2t"])
-        self.vocab_mapping_loaded = True
+        self.register_draft_vocab_buffers(
+            vocab_size=target_vocab_size,
+            draft_vocab_size=draft_vocab_size,
+        )
 
 
 class OfflineVocabMappingTest(unittest.TestCase):

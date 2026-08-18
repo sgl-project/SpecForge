@@ -21,6 +21,7 @@ from typing_extensions import Tuple, Unpack
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .flex_attention_backend import flex_attention_backend
 from .registry import register_draft
+from .vocab_mixin import DraftVocabMappingMixin
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
@@ -356,7 +357,7 @@ def normalize_draft_head_checkpoint_keys(
 
 
 @register_draft
-class DFlashDraftModel(Qwen3PreTrainedModel):
+class DFlashDraftModel(DraftVocabMappingMixin, Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
 
@@ -395,6 +396,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
+        # Registers t2d/d2t only when draft_vocab_size < vocab_size, so
+        # full-vocabulary checkpoints keep an unchanged state dict.
+        self.register_draft_vocab_buffers(
+            vocab_size=config.vocab_size,
+            draft_vocab_size=getattr(config, "draft_vocab_size", None),
+        )
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
@@ -435,6 +442,30 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         del hidden_states, prev_token_ids
         return None
 
+    def draft_logits_from_target_head(
+        self,
+        target: nn.Module,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project hidden states through the target head, pruned when configured.
+
+        The DFlash family owns no LM head; it borrows the frozen target one. A
+        pruned draft must borrow only the rows ``t2d`` keeps, so that generation
+        proposes exactly the tokens training supervised. Unpruned drafts call the
+        head module itself, which keeps non-``nn.Linear`` heads working.
+        """
+        if not self.use_draft_vocab:
+            return target.lm_head(hidden_states)
+        self.require_vocab_mapping()
+        weight = target.lm_head.weight[self.t2d.to(dtype=torch.bool)]
+        return nn.functional.linear(hidden_states.to(weight.dtype), weight)
+
+    def draft_ids_to_target_ids(self, draft_ids: torch.Tensor) -> torch.Tensor:
+        """Map draft-vocabulary ids back to target ids (identity when unpruned)."""
+        if not self.use_draft_vocab:
+            return draft_ids
+        return draft_ids + self.d2t[draft_ids]
+
     def _sample_draft_tokens(
         self,
         target: nn.Module,
@@ -448,8 +479,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         duplicating the target-cache and acceptance logic in ``spec_generate``.
         """
         del block_output_ids
-        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
-        return sample(draft_logits)
+        draft_logits = self.draft_logits_from_target_head(
+            target, draft_hidden[:, -self.block_size + 1 :, :]
+        )
+        return self.draft_ids_to_target_ids(sample(draft_logits))
 
     def forward(
         self,

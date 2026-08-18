@@ -240,6 +240,12 @@ class AlgorithmCapabilities:
     supports_compact_teacher: bool = False
     supports_trim_loss_positions: bool = False
     supports_vocab_mapping: bool = False
+    #: Whether the draft still owns t2d/d2t when draft_vocab_size == vocab_size.
+    #: EAGLE3 and P-EAGLE register the buffers unconditionally, so a redundant
+    #: mapping path merely installs an identity map and is harmless. The DFlash
+    #: family registers them only when pruning -- so for it the same config is a
+    #: hard failure at model construction, and validation must reject it early.
+    keeps_vocab_buffers_when_unpruned: bool = True
     allows_aux_layer_override: bool = False
 
     def __post_init__(self) -> None:
@@ -257,6 +263,7 @@ class AlgorithmCapabilities:
             "supports_compact_teacher",
             "supports_trim_loss_positions",
             "supports_vocab_mapping",
+            "keeps_vocab_buffers_when_unpruned",
             "allows_aux_layer_override",
         ):
             if not isinstance(getattr(self, field_name), bool):

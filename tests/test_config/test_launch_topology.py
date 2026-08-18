@@ -54,6 +54,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3-8b-domino-online.yaml": 8,
     "qwen3-8b-dpace-online.yaml": 8,
     "qwen3-8b-dspark-disaggregated.yaml": 1,
+    "qwen3-8b-dspark-draftvocab32k-offline.yaml": 1,
     "qwen3-8b-eagle3-offline-disaggregated.yaml": 1,
     "qwen3-8b-eagle3-offline.yaml": 1,
     "qwen3-8b-eagle3-disaggregated.yaml": 1,

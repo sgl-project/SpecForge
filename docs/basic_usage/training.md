@@ -288,6 +288,53 @@ assembly. In particular:
 
 There is no fallback to a removed training script.
 
+## Draft vocabulary pruning
+
+A draft can predict over a subset of the target vocabulary. This is worth doing
+when the target vocabulary is large relative to the draft: the output head and,
+for DSpark, the Markov head scale with it, while a domain corpus supervises only
+a fraction of the ids.
+
+It is off by default and enabled entirely by the draft config — add
+`draft_vocab_size` below `vocab_size` and change nothing in the run config:
+
+```json
+{
+  "architectures": ["DSparkDraftModel"],
+  "vocab_size": 151936,
+  "draft_vocab_size": 32000
+}
+```
+
+`configs/qwen3-8b-dspark-draftvocab32k.json` and
+`examples/configs/qwen3-8b-dspark-draftvocab32k-offline.yaml` are a complete
+worked pair.
+
+The mapping itself (`t2d`/`d2t`) comes from one of two places:
+
+- **Local offline runs** derive and cache it from the feature corpus when
+  `model.vocab_mapping_path` is empty, the same way EAGLE3 does.
+- **Disaggregated runs** require an explicit `model.vocab_mapping_path`:
+  producer and consumer would otherwise derive different mappings from
+  different shards.
+
+Two constraints are worth knowing before you start a long run:
+
+- A checkpoint that was trained with a pruned vocabulary records its
+  `draft_vocab_size`, and resuming it against a mapping with different contents
+  is rejected — same-sized mappings that select different tokens would silently
+  repoint every draft id at another token. Keep the mapping file next to the
+  checkpoint.
+- `draft_vocab_coverage` and, when the target's hidden states are available,
+  `teacher_kept_mass` are logged during training. They are the ceiling on
+  acceptance: coverage is how often the realized next token is even proposable,
+  and kept mass is how much of the teacher's belief survives pruning. Check them
+  on the first few hundred steps rather than at evaluation time.
+
+A run whose `draft_vocab_size` equals `vocab_size` is not pruned: the draft
+registers no mapping buffers, so `model.vocab_mapping_path` is rejected at
+config validation rather than failing later inside the model.
+
 Step limits are global optimizer updates. `training.max_steps` is a stop cap and,
 when set without `training.total_steps`, the fallback optimizer/loss schedule
 horizon. `training.total_steps` can describe a longer schedule, but does not by

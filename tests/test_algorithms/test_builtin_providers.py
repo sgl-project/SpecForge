@@ -173,11 +173,12 @@ class BuiltinProviderContractTest(unittest.TestCase):
         )
         config = SimpleNamespace(training=training)
         draft = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=2),
+            config=SimpleNamespace(num_hidden_layers=2, vocab_size=128),
             layers=[object(), object()],
             norm_before_residual=True,
             target_layer_ids=[3, 7],
             pure_draft_prefix_len=2,
+            draft_vocab_size=32,
         )
         dflash_family = SimpleNamespace(
             block_size=16,

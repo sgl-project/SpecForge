@@ -84,8 +84,14 @@ def _warm_start(
 
 
 def _load_vocab_mapping(cfg: Config, draft_model: Any) -> None:
-    if cfg.model.vocab_mapping_path:
-        draft_model.load_vocab_mapping(cfg.model.vocab_mapping_path)
+    if not cfg.model.vocab_mapping_path:
+        return
+    if not hasattr(draft_model, "load_vocab_mapping"):
+        raise ValueError(
+            f"{type(draft_model).__name__} does not support vocabulary mapping, "
+            "but model.vocab_mapping_path is set"
+        )
+    draft_model.load_vocab_mapping(cfg.model.vocab_mapping_path)
 
 
 def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
@@ -155,6 +161,9 @@ def _finish_registered_draft(
     draft_model: Any,
 ):
     _warm_start(cfg, draft_model, draft_config)
+    # Same order as EAGLE3: warm-started buffers are then overwritten by the
+    # run's own mapping, so an explicit path always wins over the checkpoint's.
+    _load_vocab_mapping(cfg, draft_model)
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
 
 

@@ -34,8 +34,21 @@ ONLINE_DEPLOYMENT = {
 }
 
 
+#: Algorithms that accept model.vocab_mapping_path. Others now reject it rather
+#: than ignoring it, so payloads derived from MINIMAL must drop the key.
+VOCAB_MAPPING_STRATEGIES = {"eagle3", "peagle", "dspark"}
+
+
+def _payload(strategy: str | None = None, base: dict | None = None) -> dict:
+    """Copy MINIMAL, dropping the mapping path when the strategy cannot use it."""
+    payload = copy.deepcopy(base if base is not None else MINIMAL)
+    if strategy is not None and strategy not in VOCAB_MAPPING_STRATEGIES:
+        payload["model"].pop("vocab_mapping_path", None)
+    return payload
+
+
 def _online_payload(strategy: str = "eagle3") -> dict:
-    payload = copy.deepcopy(MINIMAL)
+    payload = _payload(strategy)
     payload["model"]["target_backend"] = "sglang"
     payload["data"] = {"train_data_path": "/train.jsonl"}
     payload["training"] = {"strategy": strategy, "max_steps": 1}
@@ -361,7 +374,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 }
             )
         offline_dflash = Config.model_validate(
-            {**MINIMAL, "training": {"strategy": "dflash"}}
+            {**_payload("dflash"), "training": {"strategy": "dflash"}}
         )
         resolve_run(offline_dflash)
         self.assertEqual(offline_dflash.mode, "offline")
