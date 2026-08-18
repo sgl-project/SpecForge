@@ -83,6 +83,9 @@ class ModelConfig(StrictConfigModel):
     sglang_mem_fraction_static: float = Field(default=0.4, gt=0.0, le=1.0)
     #: Keep the historical managed-local behavior by default. Hybrid targets
     #: such as Inkling require the radix tree and can opt back in explicitly.
+    #: Disabling it is also required for hybrid linear-attention/Mamba targets
+    #: on ROCm, whose mamba radix-cache ``extra_buffer`` strategy asserts
+    #: CUDA/MUSA/NPU (FLA) at server init.
     sglang_disable_radix_cache: bool = True
     sglang_context_length: Optional[int] = Field(default=None, gt=0)
     sglang_enable_nccl_nvls: bool = False
@@ -287,6 +290,12 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
+    #: Master key-lease TTL (ms) forwarded to ``mooncake_master
+    #: --default_kv_lease_ttl``. The consumer's teardown drain allows about
+    #: 19.5s for leases to settle. Keep the managed-local default at 500ms so
+    #: normal shutdown does not spend several seconds waiting for an expired
+    #: read lease; set null to inherit Mooncake's server default.
+    default_kv_lease_ttl_ms: Optional[int] = Field(default=500, gt=0)
 
     @model_validator(mode="after")
     def _validate_endpoint(self):
@@ -305,7 +314,11 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
 
 
 class ManagedLocalCaptureServerConfig(StrictConfigModel):
-    """One patched SGLang capture server owned by the local supervisor."""
+    """One patched SGLang capture server owned by the local supervisor.
+
+    ``cuda_visible_devices`` holds plain device ordinals; the launcher maps
+    them to the accelerator's visibility env var.
+    """
 
     port: int = Field(gt=0, le=65535)
     cuda_visible_devices: List[str] = Field(min_length=1)
@@ -331,7 +344,11 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
 
 
 class ManagedLocalStackConfig(StrictConfigModel):
-    """Opt-in ownership of a complete single-node online capture stack."""
+    """Opt-in ownership of a complete single-node online capture stack.
+
+    ``trainer_cuda_visible_devices`` holds plain device ordinals; the
+    launcher maps them to the accelerator's visibility env var.
+    """
 
     trainer_cuda_visible_devices: List[str] = Field(min_length=1)
     mooncake: ManagedLocalMooncakeConfig = Field(
@@ -533,6 +550,12 @@ class TrainingConfig(StrictConfigModel):
     lk_loss_type: Optional[Literal["lambda", "alpha"]] = None
     kl_scale: float = 1.0
     kl_decay: float = 1.0
+    #: Compute the teacher target_p, draft logits and loss only at supervised
+    #: (loss-masked) positions instead of over the full sequence. Mathematically
+    #: equivalent (the mean denominator is rescaled) and saves memory/compute on
+    #: prompt-heavy data. Falls back to the full-length path for batch > 1 or when
+    #: an lk_loss objective is used.
+    trim_loss_positions: bool = False
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None

@@ -78,8 +78,14 @@ class TestDominoDraftModel(unittest.TestCase):
         )
         fixed_hidden = torch.randn(1, block_size, hidden_size)
 
-        def fixed_draft_blocks(self, input_ids, hidden_states, loss_mask):
-            del hidden_states, loss_mask
+        def fixed_draft_blocks(
+            self,
+            input_ids,
+            hidden_states,
+            loss_mask,
+            max_valid_anchors=None,
+        ):
+            del hidden_states, loss_mask, max_valid_anchors
             return (
                 torch.zeros(1, 1, dtype=torch.long, device=input_ids.device),
                 torch.ones(1, 1, dtype=torch.bool, device=input_ids.device),
@@ -87,12 +93,13 @@ class TestDominoDraftModel(unittest.TestCase):
             )
 
         model._forward_draft_blocks = MethodType(fixed_draft_blocks, model)
-        loss, _accuracy, _metrics = model(
+        loss, _accuracy, metrics = model(
             input_ids=torch.tensor([[1, 2, 3, 4]]),
             hidden_states=torch.zeros(1, block_size, hidden_size),
             loss_mask=torch.ones(1, block_size),
             lambda_base=0.0,
         )
+        self.assertIsInstance(metrics["lambda_base"], float)
         loss.backward()
 
         for module in (draft.prefix_gru, draft.embed_proj):
@@ -147,8 +154,20 @@ class TestDominoDraftModel(unittest.TestCase):
                 chunked_hidden = full_hidden.detach().clone().requires_grad_()
 
                 def fixed_blocks(output_hidden):
-                    def _forward(self, input_ids, hidden_states, loss_mask):
-                        del self, input_ids, hidden_states, loss_mask
+                    def _forward(
+                        self,
+                        input_ids,
+                        hidden_states,
+                        loss_mask,
+                        max_valid_anchors=None,
+                    ):
+                        del (
+                            self,
+                            input_ids,
+                            hidden_states,
+                            loss_mask,
+                            max_valid_anchors,
+                        )
                         return anchors, keep_mask, output_hidden
 
                     return _forward

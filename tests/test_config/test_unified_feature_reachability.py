@@ -146,7 +146,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 67)
+        self.assertEqual(len(paths), 66)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths
@@ -206,6 +206,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             {
                 **OFFLINE_EAGLE3,
                 "training": {
+                    "trim_loss_positions": True,
                     "compact_teacher": True,
                     "compact_teacher_chunk_size": 2048,
                 },
@@ -216,10 +217,28 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         self.assertEqual(
             resolved.algorithm.providers.step.options(cfg),
             {
+                "trim_loss_positions": True,
                 "compact_teacher": True,
                 "compact_teacher_chunk_size": 2048,
             },
         )
+
+    def test_trim_loss_positions_rejects_non_eagle3_strategy(self):
+        cfg = Config.model_validate(
+            {
+                **OFFLINE_EAGLE3,
+                "training": {
+                    "strategy": "dflash",
+                    "trim_loss_positions": True,
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "algorithm 'dflash' does not support training.trim_loss_positions",
+        ):
+            resolve_run(cfg)
 
     def test_loader_and_profiler_options_reach_the_canonical_trainer(self):
         eagle = resolve_run(Config.model_validate(OFFLINE_EAGLE3))

@@ -30,6 +30,7 @@ from specforge.launch_plan import (
 from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
 from specforge.training.capture_contract import ServerCaptureContract
+from tests.utils import wait_for_processes_to_stop
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
@@ -667,6 +668,7 @@ class LaunchPlanTest(unittest.TestCase):
                 "--rpc_port=35551",
                 "--http_metadata_server_port=35880",
                 "--metrics_port=35903",
+                "--default_kv_lease_ttl=500",
             ),
         )
         self.assertEqual(mooncake.readiness.kind, "mooncake")
@@ -1494,6 +1496,7 @@ plan = LaunchPlan(
             (sys.executable, "-c", {child_code!r}, {marker!r}),
         ),
     ),
+    shutdown_grace_s=1.0,
 )
 raise SystemExit(run_commands(plan))
 """
@@ -1505,6 +1508,7 @@ raise SystemExit(run_commands(plan))
                 text=True,
             )
             child_pid = None
+            grandchild_pid = None
             try:
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
@@ -1512,12 +1516,15 @@ raise SystemExit(run_commands(plan))
                         with open(marker, encoding="utf-8") as stream:
                             raw = stream.read().strip()
                         if len(raw.split()) == 2:
-                            child_pid = int(raw.split()[0])
+                            child_pid, grandchild_pid = map(int, raw.split())
                             break
                     if runner.poll() is not None:
                         break
                     time.sleep(0.02)
                 self.assertIsNotNone(child_pid, "managed child never became ready")
+                self.assertIsNotNone(
+                    grandchild_pid, "managed grandchild never became ready"
+                )
                 self.assertEqual(os.getpgid(child_pid), child_pid)
 
                 os.kill(runner.pid, signal.SIGTERM)
@@ -1528,15 +1535,13 @@ raise SystemExit(run_commands(plan))
                     f"stdout={stdout!r} stderr={stderr!r}",
                 )
 
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    try:
-                        os.killpg(child_pid, 0)
-                    except ProcessLookupError:
-                        break
-                    time.sleep(0.02)
-                else:
-                    self.fail(f"managed process group {child_pid} survived SIGTERM")
+                survivors = wait_for_processes_to_stop(
+                    (child_pid, grandchild_pid), timeout_s=5
+                )
+                self.assertFalse(
+                    survivors,
+                    f"managed processes survived SIGTERM: {survivors}",
+                )
             finally:
                 if runner.poll() is None:
                     runner.kill()

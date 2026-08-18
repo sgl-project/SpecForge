@@ -38,9 +38,11 @@ class _CaptureLayer(nn.Module):
     def __init__(self):
         super().__init__()
         self.attention_mask = None
+        self.kernel_options = None
 
-    def forward(self, *, hidden_states, attention_mask, **_):
+    def forward(self, *, hidden_states, attention_mask, kernel_options=None, **_):
         self.attention_mask = attention_mask
+        self.kernel_options = kernel_options
         return hidden_states
 
 
@@ -128,6 +130,46 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
         self.assertEqual(create_mask.call_count, 2)
         self.assertIs(layers[0].attention_mask, sliding_mask)
         self.assertIs(layers[1].attention_mask, full_mask)
+        self.assertTrue(all(layer.kernel_options is None for layer in layers))
+
+    def test_online_wrapper_forces_standard_triton_flex_backend(self):
+        model, layers = _capture_model(["full_attention"])
+        wrapper = OnlineDFlashModel(
+            draft_model=model,
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(32, model.config.hidden_size),
+            mask_token_id=31,
+            block_size=2,
+            attention_backend="flex_attention",
+            num_anchors=1,
+        )
+        anchors = torch.tensor([[2]])
+        keep = torch.tensor([[True]])
+
+        with (
+            mock.patch.object(
+                wrapper,
+                "_sample_anchor_positions",
+                return_value=(anchors, keep),
+            ),
+            mock.patch.object(
+                wrapper,
+                "_create_noise_embed",
+                return_value=torch.randn(1, 2, model.config.hidden_size),
+            ),
+            mock.patch(
+                "specforge.algorithms.common.dflash_family_model."
+                "create_dflash_block_mask",
+                return_value=torch.tensor([1]),
+            ),
+        ):
+            wrapper._forward_draft_blocks(
+                input_ids=torch.ones(1, 4, dtype=torch.long),
+                hidden_states=torch.randn(1, 4, model.config.hidden_size),
+                loss_mask=torch.ones(1, 4),
+            )
+
+        self.assertEqual(layers[0].kernel_options, {"BACKEND": "TRITON"})
 
 
 class TestDFlashSlidingConfig(unittest.TestCase):

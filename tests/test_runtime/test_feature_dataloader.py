@@ -174,6 +174,25 @@ class TestFeatureDataLoader(unittest.TestCase):
             self.assertEqual(q.in_flight(), 0)
             self.assertEqual(q.depth(), 0)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "pinned memory requires CUDA")
+    def test_pin_memory_pins_collated_cpu_tensors(self):
+        store = LocalFeatureStore("st")
+        ref = store.put(
+            {"x": torch.arange(8)},
+            sample_id="sample-0",
+            metadata={"run_id": "run", "target_repr": "hidden_state"},
+        )
+        loader = FeatureDataLoader(
+            store,
+            refs=[ref],
+            drop_last=False,
+            pin_memory=True,
+        )
+
+        batch = next(iter(loader))
+
+        self.assertTrue(batch.tensors["x"].is_pinned())
+
     def test_drop_last(self):
         with tempfile.TemporaryDirectory() as d:
             self._write_offline_files(d, n=3)

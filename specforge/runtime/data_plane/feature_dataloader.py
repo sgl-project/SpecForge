@@ -106,6 +106,7 @@ class FeatureDataLoader:
         ack: bool = True,
         gc_interval_s: Optional[float] = 15.0,
         num_workers: int = 0,
+        pin_memory: bool = False,
     ) -> None:
         if (queue is None) == (refs is None):
             raise ValueError(
@@ -129,6 +130,7 @@ class FeatureDataLoader:
         if num_workers < 0:
             raise ValueError("num_workers must be >= 0")
         self.num_workers = int(num_workers)
+        self.pin_memory = bool(pin_memory)
         self._seek_batches = 0
         # Remote stores defer a physical free while the get() read-lease is live
         # (Mooncake remove -> -706): release() parks it and gc() must retry.
@@ -213,6 +215,15 @@ class FeatureDataLoader:
         ]
         if non_tensors:
             raise TypeError(f"collate_fn returned non-tensors for {non_tensors}")
+        if self.pin_memory:
+            batch_tensors = {
+                name: (
+                    value.pin_memory()
+                    if value.device.type == "cpu" and not value.is_pinned()
+                    else value
+                )
+                for name, value in batch_tensors.items()
+            }
         return TrainBatch(
             sample_ids=[r.sample_id for r in refs],
             strategy=self.strategy,

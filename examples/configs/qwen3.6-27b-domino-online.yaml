@@ -16,6 +16,7 @@ training:
   strategy: "domino"
   num_epochs: 6
   batch_size: 1
+  accumulation_steps: 8
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1
@@ -31,11 +32,24 @@ training:
 run_id: "qwen3.6-27b-domino-online"
 output_dir: "./outputs/qwen3.6-27b-domino-online"
 
+profiling:
+  enabled: false
+  start_step: 0
+  num_steps: 20
+  record_shapes: false
+
+runtime:
+  producer_lease: 64
+  producer_concurrency: 32
+  in_flight_high_watermark: 1024
+  in_flight_low_watermark: 512
+
+
 deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 8
+    nproc_per_node: 1
   disaggregated:
     control_dir: outputs/qwen3.6-27b-domino-online/control
     consumer_state_dir: outputs/qwen3.6-27b-domino-online/consumer-state
@@ -44,4 +58,5 @@ deployment:
       - http://127.0.0.1:30000
     mooncake_metadata_server: http://127.0.0.1:35880/metadata
     mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_local_hostname: 127.0.0.1
     mooncake_protocol: tcp

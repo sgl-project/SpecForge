@@ -54,6 +54,7 @@ a tombstone-then-free protocol — a follow-up tied to the shared metadata index
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -90,6 +91,51 @@ class _InjectedReplicateConfig:
         self.with_soft_pin = with_soft_pin
 
 
+# Ascend's CUDA_VISIBLE_DEVICES equivalent; its presence marks an Ascend
+# host even before torch_npu is imported.
+_ASCEND_VISIBLE_DEVICE_ENVS = ("ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES")
+
+
+def _ascend_runtime_available() -> bool:
+    """Whether a usable Ascend NPU runtime is present.
+
+    ``torch.npu`` exists only after ``torch_npu`` is imported; do that here,
+    but only on hosts already selecting Ascend devices via env var, so the
+    import never fires on CUDA/CPU hosts.
+    """
+    if getattr(torch, "npu", None) is None:
+        if not any(os.environ.get(name) for name in _ASCEND_VISIBLE_DEVICE_ENVS):
+            return False
+        try:
+            import torch_npu  # noqa: F401
+        except Exception:
+            return False
+    npu = getattr(torch, "npu", None)
+    try:
+        return npu is not None and bool(npu.is_available())
+    except Exception:  # pragma: no cover - defensive against driver faults
+        return False
+
+
+def _bind_transport_device() -> None:
+    """Bind this process's local NPU before Mooncake installs its transport.
+
+    Ascend's transport calls ``aclrtGetDevice`` in ``setup()`` and fails with
+    ``ACL_ERROR_RT_CONTEXT_NULL`` when no device context exists — the case in
+    a capture producer, which never runs ``init_distributed``. No-op on CUDA,
+    where the transport defaults to device 0.
+    """
+    from specforge.utils import get_device_type
+
+    device_type = get_device_type()
+    if device_type == "cuda":
+        return
+    if device_type == "npu" or (device_type == "cpu" and _ascend_runtime_available()):
+        from specforge.distributed import _bind_local_device
+
+        _bind_local_device("npu")
+
+
 def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
     """Construct a real store and return its required config type."""
     try:
@@ -104,6 +150,13 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
             "official wheel (`mooncake-transfer-engine` for CUDA < 13, or "
             "`mooncake-transfer-engine-cuda13` for CUDA >= 13)."
         ) from e
+    # Ascend's transport needs a bound device context (see _bind_transport_device).
+    _bind_transport_device()
+    setup_kwargs = dict(setup_kwargs)
+    if _ascend_runtime_available():
+        # Ascend rejects the wildcard-location staging-buffer registration
+        # ("location:* is not supported"); zero-copy clients can drop it.
+        setup_kwargs["local_buffer_size"] = 0
     store = MooncakeDistributedStore()
     rc = store.setup(**setup_kwargs)
     if rc is not None and int(rc) != 0:
@@ -209,7 +262,24 @@ class MooncakeFeatureStore(FeatureStore):
         _require_store_api(store)
         self._store = store
         put_config.replica_num = replica_num
-        put_config.with_hard_pin = hard_pin
+        # Prefer true hard pinning when the installed Mooncake supports it.
+        # Older ROCm builds expose only `with_soft_pin`; that is a best-effort
+        # fallback rather than the same no-eviction guarantee. Some older
+        # Ascend builds expose neither field and must use the store default.
+        if hasattr(put_config, "with_hard_pin"):
+            put_config.with_hard_pin = hard_pin
+        elif hasattr(put_config, "with_soft_pin"):
+            put_config.with_soft_pin = hard_pin
+            if hard_pin:
+                logger.warning(
+                    "Mooncake ReplicateConfig has no with_hard_pin field; "
+                    "falling back to with_soft_pin"
+                )
+        elif hard_pin:
+            logger.warning(
+                "Mooncake ReplicateConfig exposes neither with_hard_pin nor "
+                "with_soft_pin; objects use the store's default pin behavior"
+            )
         self._put_config = put_config
         self.max_resident_bytes = max_resident_bytes
         self.max_hold_age_s = max_hold_age_s
@@ -670,11 +740,57 @@ class MooncakeFeatureStore(FeatureStore):
             sleep=sleep,
         )
 
+    def retry_sample_removals(self, sample_ids: List[str]) -> Dict[str, Any]:
+        """Try selected removals once, without probing or sleeping.
+
+        The optimizer path calls this only for samples made durable at an
+        earlier boundary.  A failed remove remains in ``_release_pending`` for
+        the next batched attempt; avoiding ``is_exist`` here is important
+        because that probe renews Mooncake's read lease.
+        """
+        target_ids = set(sample_ids)
+        removed = removed_bytes = 0
+        with self._lock:
+            pending = [
+                sample_id
+                for sample_id in self._release_pending
+                if sample_id in target_ids
+            ]
+            for sample_id in pending:
+                physically_removed = self._try_physical_free(
+                    sample_id,
+                    force=True,
+                    confirm_absent_on_failure=False,
+                )
+                if physically_removed:
+                    sample_bytes = self._free_bookkeeping_locked(sample_id)
+                    removed += 1
+                    removed_bytes += sample_bytes
+                    self._stats["force_freed"] += 1
+                    self._stats["force_freed_bytes"] += sample_bytes
+                else:
+                    self._release_pending[sample_id] = min(
+                        self.max_release_attempts,
+                        self._release_pending.get(sample_id, 0) + 1,
+                    )
+            remaining = [
+                sample_id
+                for sample_id in self._release_pending
+                if sample_id in target_ids
+            ]
+        return {
+            "removed": removed,
+            "removed_bytes": removed_bytes,
+            "release_pending": len(remaining),
+            "remaining_ids": remaining,
+            "attempts": 1 if pending else 0,
+        }
+
     def drain_pending_removals(
         self,
         *,
-        max_attempts: int = 8,
-        retry_interval_s: float = 0.25,
+        max_attempts: int = 40,
+        retry_interval_s: float = 0.5,
         sleep: Callable[[float], None] = time.sleep,
     ) -> Dict[str, int]:
         """Retry deferred removes at lifecycle shutdown or fail loudly.

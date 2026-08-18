@@ -7,7 +7,6 @@ from .dflash import (
 )
 from .domino import DominoDraftModel
 from .dspark import DSparkDraftModel
-from .kimi_k3_dspark import KimiK3DSpark4KDA1MLADraftModel, KimiK3DSpark5MLADraftModel
 from .llama3_eagle import LlamaForCausalLMEagle3
 from .peagle import PEagleDraftModel
 from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
@@ -17,8 +16,6 @@ __all__ = [
     "DFlashDraftModel",
     "DominoDraftModel",
     "DSparkDraftModel",
-    "KimiK3DSpark4KDA1MLADraftModel",
-    "KimiK3DSpark5MLADraftModel",
     "LlamaForCausalLMEagle3",
     "PEagleDraftModel",
     "build_target_layer_ids",

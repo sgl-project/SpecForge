@@ -315,6 +315,7 @@ class CompactTeacherStrategyTest(unittest.TestCase):
         self.assertEqual(head.forward_calls, 1)
         self.assertEqual(model.kwargs["target"].shape, (1, 3, 8))
         self.assertNotIn("target_hidden_for_compact", model.kwargs)
+        self.assertFalse(model.kwargs["trim_loss_positions"])
 
     def test_compact_path_rejects_online_target_repr(self):
         strategy = Eagle3TrainStrategy(
@@ -323,13 +324,18 @@ class CompactTeacherStrategyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "offline-only"):
             strategy.forward_loss(_batch(target_repr="logits"))
 
-    def test_step_provider_forwards_compact_strategy_kwargs(self):
+    def test_step_provider_forwards_eagle3_strategy_kwargs(self):
+        model = _Eagle3()
         strategy = EAGLE3.providers.step.build(
-            _Eagle3(),
+            model,
             target_head=_TargetHead(),
+            trim_loss_positions=True,
             compact_teacher=True,
             compact_teacher_chunk_size=4,
         )
+        strategy.forward_loss(_batch())
+        self.assertTrue(strategy.trim_loss_positions)
+        self.assertTrue(model.kwargs["trim_loss_positions"])
         self.assertTrue(strategy.compact_teacher)
         self.assertEqual(strategy.compact_teacher_chunk_size, 4)
 

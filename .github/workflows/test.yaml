@@ -13,7 +13,24 @@ permissions:
   contents: read
 
 jobs:
+  cleanup-runner:
+    if: (github.repository == 'sgl-project/SpecForge' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: [self-hosted]
+    concurrency:
+      group: specforge-gpu-ci
+      cancel-in-progress: false
+      queue: max
+    timeout-minutes: 5
+    steps:
+      # Job containers need a fresh Docker network before any container step can
+      # run, so stale networks must be pruned in a host-side prerequisite job.
+      - name: Prune stale Docker networks
+        shell: bash
+        run: docker network prune --force --filter "until=1h"
+
   unit-test:
+    needs: cleanup-runner
     if: (github.repository == 'sgl-project/SpecForge' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
     runs-on: [self-hosted]

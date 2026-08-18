@@ -12,16 +12,30 @@ Online training uses one of these source-specific patches:
 
 | Target | Patch | Capture methods |
 |---|---|---|
-| SGLang v0.5.14 / `inkling-support` | [`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch) | EAGLE3, DFlash |
+| SGLang v0.5.14 / `inkling-support` | [`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 | Kimi K3 SGLang `9acd9cb` (`f8493a4` compatible) | [`patches/sglang/kimi-k3-f8493a4/spec-capture.patch`](../../patches/sglang/kimi-k3-f8493a4/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 
 The patch adds `--enable-spec-capture` and a server-side sink that:
 
 1. captures requested auxiliary and final hidden states during prefill;
-2. writes tensors directly into Mooncake using
-   `MooncakeFeatureStore`'s key layout; and
+2. writes tensors into Mooncake using `MooncakeFeatureStore`'s key layout
+   from a background writer thread (one `batch_put_from` RPC per scheduler
+   batch), off the scheduler's critical path; and
 3. returns only key, shape, and dtype metadata in
-   `meta_info["spec_capture"]`.
+   `meta_info["spec_capture"]`, and only after every feature object of the
+   request has been durably published — a response therefore guarantees the
+   refs it names are readable.
+
+Capture transfers overlap the next target prefill instead of blocking it:
+the aux/last-hidden D2H rides the overlap scheduler's `copy_to_cpu` copy
+stream, per-request tensors stay zero-copy views into the batch-level host
+buffer, and the scheduler retains at most
+`SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES` (default 2) in-flight batches
+before it blocks on the oldest — bounding pinned-host memory while keeping
+backpressure. The idle loop never enters the sleeper while a transfer is
+outstanding, so a lone in-flight response cannot deadlock a waiting
+producer. Set `SGLANG_SPEC_CAPTURE_TIMING=1` to log per-stage
+materialize/register/put timings and queue-to-stream latency.
 
 The client boundary is
 [`adapters/server_capture.py`](adapters/server_capture.py). Algorithm-owned
@@ -44,8 +58,12 @@ the same multiplier into the frozen target head used during training.
 Apply the default patch with `scripts/apply_sglang_spec_capture_patch.sh`, or
 the K3 patch with
 `scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb`.
-The K3 patch routes `--spec-capture-method dspark` to the model's dedicated
-`set_dspark_layers_to_capture` hook. It also keeps 64K capture correct by using
+On the default patch, `--spec-capture-method dspark` rides the DFlash aux
+plumbing (`set_dflash_layers_to_capture`), which both stock v0.5.14 targets
+and `inkling-support`'s Inkling model implement; DSpark and DFlash capture
+the same aux/last-hidden artifacts, so managed-local DSpark launches work
+unchanged. The K3 patch instead routes `--spec-capture-method dspark` to the
+model's dedicated `set_dspark_layers_to_capture` hook. It also keeps 64K capture correct by using
 64-bit Triton pointer arithmetic, scale-stable residual scoring, and a generic
 Marlin reduction fallback when the token dimension exceeds CUDA grid.y's
 65,535 limit. The server-capture unit and GPU gates must pass before updating
