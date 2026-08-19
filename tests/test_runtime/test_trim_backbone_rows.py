@@ -271,7 +271,10 @@ class TestEquivTrimBackboneFa(_SingleRankEquivBase):
     # step 0 stays on flash while the reference path keeps flash at every
     # step; the trimmed steps change implementation, so bit-level equality is
     # not expected even for the all-ones mask.
-    allones_tol = 1e-5
+    # 1e-4 absorbs cross-hardware kernel noise (1.2e-5 measured on CI's GPUs
+    # vs <1e-5 locally) while staying ~250x below the smallest possible
+    # discrete row/denominator error (~loss/C).
+    allones_tol = 1e-4
 
 
 def _write_usp_workdir(workdir):
