@@ -411,7 +411,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: shared-filesystem requirement between trainer nodes while keeping the
     #: authority-owned source channel and SQLite/WAL on trainer node 0.
     inbox_server_url: Optional[str] = None
-    backend: Literal["shared_dir", "mooncake"]
+    backend: Literal["shared_dir", "mooncake", "mooncake_gpu_direct"]
     store_root: Optional[str] = None
     store_id: Optional[str] = None
     server_urls: List[str] = Field(default_factory=list)
@@ -469,6 +469,16 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
         if self.backend == "shared_dir" and not self.store_root:
             raise ValueError(
                 "deployment.disaggregated.store_root is required for shared_dir"
+            )
+        if (
+            self.backend == "mooncake_gpu_direct"
+            and self.mooncake_protocol is not None
+            and self.mooncake_protocol
+            not in ("nvlink", "nvlink_intra", "mnnvl", "rdma")
+        ):
+            raise ValueError(
+                "mooncake_gpu_direct requires mooncake_protocol=nvlink, "
+                "nvlink_intra, or rdma"
             )
         if self.managed_local is not None:
             if self.backend != "mooncake":
@@ -788,11 +798,21 @@ class Config(StrictConfigModel):
             mode == "online"
             and deployment == "disaggregated"
             and self.deployment.disaggregated is not None
-            and self.deployment.disaggregated.backend != "mooncake"
+            and self.deployment.disaggregated.backend
+            not in {"mooncake", "mooncake_gpu_direct"}
         ):
             raise ValueError(
                 "online disaggregated training requires "
-                "deployment.disaggregated.backend=mooncake"
+                "deployment.disaggregated.backend=mooncake or mooncake_gpu_direct"
+            )
+        if (
+            mode != "online"
+            and deployment == "disaggregated"
+            and self.deployment.disaggregated is not None
+            and self.deployment.disaggregated.backend == "mooncake_gpu_direct"
+        ):
+            raise ValueError(
+                "deployment.disaggregated.backend=mooncake_gpu_direct requires online mode"
             )
         managed_local = (
             self.deployment.disaggregated.managed_local

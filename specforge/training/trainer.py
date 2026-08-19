@@ -150,6 +150,8 @@ class Trainer:
             batch_size=batch_size,
             collate_fn=collate_fn,
             per_sample_transform=per_sample_transform,
+            device=getattr(store, "materialize_device", "cpu"),
+            clone_on_fetch=getattr(store, "clone_on_fetch", True),
             drop_last=True,
             strategy=algorithm_name,
             ack=not defer_queue_ack,

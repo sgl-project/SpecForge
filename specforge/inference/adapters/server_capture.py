@@ -6,15 +6,14 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Server-side spec-capture rollout source (zero-copy Mooncake transport).
+"""Server-side spec-capture rollout source (Mooncake tensor transport).
 
 An external SGLang server patched with
 ``patches/sglang/v0.5.14/spec-capture.patch`` runs
-the prefill and writes captured features straight into Mooncake in
-:class:`MooncakeFeatureStore`'s key layout. Tensors never pass through this
-process — the ``/generate`` response's ``meta_info["spec_capture"]`` carries
-only key/shape/dtype, from which :meth:`SGLangServerCaptureAdapter.produce_refs`
-builds committed-ready ``SampleRef``s.
+the prefill and publishes captured features through Mooncake Store or the
+GPU-direct TransferEngine path. Tensors never pass through this process; the
+``/generate`` response carries object metadata or GPU buffer descriptors from
+which :meth:`SGLangServerCaptureAdapter.produce_refs` builds ``SampleRef``s.
 
 The server knows only generic artifacts (``aux`` = capture layers
 concatenated, ``last_hidden`` = post-norm final hidden) plus passthrough
@@ -119,10 +118,9 @@ class SGLangServerCaptureAdapter:
     are verified against the :class:`CaptureConfig` from their FeatureSpecs
     alone — same loud extraction-boundary guarantee, no tensor fetch.
 
-    ``store`` must be the run's :class:`MooncakeFeatureStore` (its ``store_id``
-    namespaces the keys and ``adopt()`` registers each ref so a later
-    ``abort()``/``gc()`` on the producer side can free server-written objects).
-    ``post_fn`` is injectable for tests.
+    ``store`` supplies the run's namespace and adopts server-owned references;
+    it can be the object-store backend or ``MooncakeGpuDirectFeatureStore``.
+    ``post_fn`` is injectable for callers that own the HTTP transport.
     """
 
     def __init__(
@@ -241,7 +239,7 @@ class SGLangServerCaptureAdapter:
                     "dtype": "int64",
                 }
             )
-        return {
+        payload = {
             "store_id": self.store.store_id,
             "sample_id": self._sample_id(task),
             # A task id is unique within a run, and retries happen only before
@@ -254,6 +252,10 @@ class SGLangServerCaptureAdapter:
             "features": features,
             "passthrough": passthrough,
         }
+        transport = getattr(self.store, "transport", None)
+        if transport is not None:
+            payload["transport"] = str(transport)
+        return payload
 
     # -- ref construction ------------------------------------------------------
     def _ref_from_result(
@@ -278,6 +280,24 @@ class SGLangServerCaptureAdapter:
                     }
             specs[name] = FeatureSpec(name=name, shape=shape, dtype=dtype, **extra)
             nbytes += _spec_nbytes(shape, dtype)
+        gpu_direct = "session_id" in result
+        if gpu_direct:
+            required = (
+                "transport",
+                "session_id",
+                "control_endpoint",
+                "control_token",
+            )
+            missing = [name for name in required if not result.get(name)]
+            if missing:
+                raise RuntimeError(
+                    f"GPU-direct capture result is missing {missing}"
+                )
+            for name, meta in feats.items():
+                if int(meta.get("address", 0)) <= 0 or int(meta.get("nbytes", 0)) <= 0:
+                    raise RuntimeError(
+                        f"GPU-direct feature {name!r} has an invalid buffer descriptor"
+                    )
         num_tokens = int(task.metadata.get("num_tokens", 0)) or len(
             task.payload["input_ids"]
         )
@@ -285,7 +305,11 @@ class SGLangServerCaptureAdapter:
             sample_id=sample_id,
             run_id=self.run_id,
             source_task_id=task.task_id,
-            feature_store_uri=f"mooncake://{result['store_id']}/{sample_id}",
+            feature_store_uri=(
+                f"mooncake+gpu://{result['session_id']}/{result['store_id']}/{sample_id}"
+                if gpu_direct
+                else f"mooncake://{result['store_id']}/{sample_id}"
+            ),
             feature_keys={n: f"{sample_id}/{n}" for n in specs},
             feature_specs=specs,
             strategy=self.strategy,
@@ -300,9 +324,32 @@ class SGLangServerCaptureAdapter:
                 "strategy": self.strategy,
                 "target_repr": capture.target_repr,
                 "vocab_map_version": capture.vocab_map_version,
-                "transport": "sglang_server_capture",
+                "transport": (
+                    "sglang_server_capture_gpu_direct"
+                    if gpu_direct
+                    else "sglang_server_capture"
+                ),
                 "server": self.base_url,  # which server captured it (provenance)
                 "generation": gen,  # the zero-copy get() locator
+                **(
+                    {
+                        "mooncake_gpu_direct": {
+                            "transport": str(result["transport"]),
+                            "session_id": str(result["session_id"]),
+                            "control_endpoint": str(result["control_endpoint"]),
+                            "control_token": str(result["control_token"]),
+                            "features": {
+                                name: {
+                                    "address": int(meta["address"]),
+                                    "nbytes": int(meta["nbytes"]),
+                                }
+                                for name, meta in feats.items()
+                            },
+                        }
+                    }
+                    if gpu_direct
+                    else {}
+                ),
             },
         )
 
