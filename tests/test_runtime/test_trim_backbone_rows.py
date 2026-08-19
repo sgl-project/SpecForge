@@ -145,10 +145,10 @@ class _SingleRankEquivBase(unittest.TestCase):
 
     @classmethod
     def _build(cls, workdir):
-        from tests.test_runtime import _fixtures as fx
         from specforge.algorithms.eagle3.model import OnlineEagle3Model
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
+        from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port="29881")
         torch.manual_seed(0)
