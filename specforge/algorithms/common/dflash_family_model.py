@@ -166,6 +166,7 @@ class OnlineDFlashModel(nn.Module):
         objective_chunk_blocks: int = 128,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
+        selector_loss_alpha: float = 1.0,
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -176,6 +177,13 @@ class OnlineDFlashModel(nn.Module):
             raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
         if objective_chunk_blocks < 0:
             raise ValueError("objective_chunk_blocks must be >= 0")
+        if selector_loss_alpha < 0:
+            raise ValueError("selector_loss_alpha must be >= 0")
+        candidate_selector = getattr(draft_model, "candidate_selector", None)
+        if candidate_selector is not None and loss_type != "dflash":
+            raise ValueError(
+                "DFlash2 candidate selection currently requires loss_type='dflash'"
+            )
 
         self.draft_model = draft_model
         self.lm_head = target_lm_head
@@ -188,6 +196,7 @@ class OnlineDFlashModel(nn.Module):
         self.objective_chunk_blocks = int(objective_chunk_blocks)
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        self.selector_loss_alpha = float(selector_loss_alpha)
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -379,6 +388,7 @@ class OnlineDFlashModel(nn.Module):
         hidden: torch.Tensor,
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
+        predecessor_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive DFlash/D-PACE loss and accuracy terms."""
 
@@ -392,8 +402,8 @@ class OnlineDFlashModel(nn.Module):
             reduction="none",
         ).reshape_as(target_ids)
 
+        loss_weights = weight_mask
         if self.loss_type == "dflash":
-            loss_weights = weight_mask
             if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
                 positions = torch.arange(
                     self.block_size,
@@ -419,13 +429,87 @@ class OnlineDFlashModel(nn.Module):
         else:  # defensive: __init__ validates the configured loss type.
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
+        selector_loss_num = loss_num.new_zeros(())
+        selector_loss_den = loss_num.new_zeros(())
+        selector_correct_num = loss_num.new_zeros(())
+        selector_covered_num = loss_num.new_zeros(())
+        candidate_selector = getattr(self.draft_model, "candidate_selector", None)
+        if candidate_selector is not None and self.selector_loss_alpha > 0:
+            # Serving always re-ranks the strict top-k. During training, replace
+            # the weakest candidate with the gold token when it is missing. This
+            # gives the selector a useful gradient before the randomly initialized
+            # draft head has meaningful top-k coverage, while retaining the
+            # strongest K-1 inference negatives.
+            selector_source_logits = self.draft_model.transform_unary_logits(logits)
+            unary_logits, candidate_ids = selector_source_logits.topk(
+                candidate_selector.top_k,
+                dim=-1,
+            )
+            target_matches = candidate_ids.eq(target_ids.unsqueeze(-1))
+            target_is_candidate = target_matches.any(dim=-1)
+            target_candidate_index = torch.where(
+                target_is_candidate,
+                target_matches.long().argmax(dim=-1),
+                torch.full_like(target_ids, candidate_selector.top_k - 1),
+            )
+            missing_target = ~target_is_candidate
+            candidate_ids = candidate_ids.clone()
+            unary_logits = unary_logits.clone()
+            candidate_ids[..., -1] = torch.where(
+                missing_target,
+                target_ids,
+                candidate_ids[..., -1],
+            )
+            gold_unary = selector_source_logits.gather(
+                -1,
+                target_ids.unsqueeze(-1),
+            ).squeeze(-1)
+            unary_logits[..., -1] = torch.where(
+                missing_target,
+                gold_unary,
+                unary_logits[..., -1],
+            )
+            selector_logits = candidate_selector.score_candidates(
+                candidate_ids=candidate_ids,
+                unary_logits=unary_logits,
+                hidden_states=hidden,
+                predecessor_ids=predecessor_ids,
+            )
+            selector_ce = F.cross_entropy(
+                selector_logits.float().reshape(-1, selector_logits.shape[-1]),
+                target_candidate_index.reshape(-1),
+                reduction="none",
+            ).reshape_as(target_ids)
+            selector_weights = loss_weights
+            selector_loss_num = (selector_ce * selector_weights).sum()
+            selector_loss_den = selector_weights.sum()
+            selector_covered_num = (weight_mask * target_is_candidate.float()).sum()
+            with torch.no_grad():
+                selected_ids = candidate_ids.gather(
+                    -1,
+                    selector_logits.argmax(dim=-1, keepdim=True),
+                ).squeeze(-1)
+                selector_correct_num = (
+                    (selected_ids == target_ids).float() * selector_weights
+                ).sum()
+            loss_num = loss_num + self.selector_loss_alpha * selector_loss_num
+
         with torch.no_grad():
             predicted_ids = logits.argmax(dim=-1)
             correct_num = (
                 ((predicted_ids == target_ids) & (weight_mask > 0.5)).sum().float()
             )
             accuracy_den = weight_mask.sum()
-        return loss_num, loss_den, correct_num, accuracy_den
+        return (
+            loss_num,
+            loss_den,
+            correct_num,
+            accuracy_den,
+            selector_loss_num,
+            selector_loss_den,
+            selector_correct_num,
+            selector_covered_num,
+        )
 
     def forward(
         self,
@@ -461,6 +545,10 @@ class OnlineDFlashModel(nn.Module):
             2,
             safe_label_indices,
         )
+        predecessor_ids = torch.cat(
+            [target_ids[:, :, :1], target_ids[:, :, :-1]],
+            dim=-1,
+        )
 
         # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
         weight_mask = (
@@ -484,17 +572,47 @@ class OnlineDFlashModel(nn.Module):
             self.block_size,
             -1,
         )
-        loss_num, loss_den, correct_num, accuracy_denom = checkpointed_chunk_reduce(
+        (
+            loss_num,
+            loss_den,
+            correct_num,
+            accuracy_denom,
+            selector_loss_num,
+            selector_loss_den,
+            selector_correct_num,
+            selector_covered_num,
+        ) = checkpointed_chunk_reduce(
             self._dflash_objective_chunk_terms,
             hidden_4d,
             target_ids,
             weight_mask,
+            predecessor_ids,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
         ratio_metrics = {
             "acc": (correct_num.detach(), accuracy_denom.detach()),
         }
+        if (
+            getattr(self.draft_model, "candidate_selector", None) is not None
+            and self.selector_loss_alpha > 0
+        ):
+            ratio_metrics.update(
+                {
+                    "selector_loss": (
+                        selector_loss_num.detach(),
+                        selector_loss_den.detach(),
+                    ),
+                    "selector_accuracy": (
+                        selector_correct_num.detach(),
+                        selector_loss_den.detach(),
+                    ),
+                    "selector_coverage": (
+                        selector_covered_num.detach(),
+                        accuracy_denom.detach(),
+                    ),
+                }
+            )
         metrics: Dict[str, object] = {
             "accuracy_denom": accuracy_denom.detach(),
             "ratio_metrics": ratio_metrics,

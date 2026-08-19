@@ -212,11 +212,14 @@ def resolve_eagle_capture_layers(
 
 
 def _validate_dflash_block_size(draft_config: Any) -> None:
-    block_size = (
-        draft_config.get("block_size")
-        if isinstance(draft_config, dict)
-        else getattr(draft_config, "block_size", None)
-    )
+    if isinstance(draft_config, dict):
+        method_config = draft_config.get("dflash_config", {}) or {}
+        block_size = draft_config.get("block_size", method_config.get("block_size"))
+    else:
+        method_config = getattr(draft_config, "dflash_config", {}) or {}
+        block_size = getattr(draft_config, "block_size", None)
+        if block_size is None:
+            block_size = method_config.get("block_size")
     if (
         not isinstance(block_size, int)
         or isinstance(block_size, bool)
@@ -388,6 +391,7 @@ def build_dflash_model(
             **common,
             loss_type=cfg.training.loss_type,
             dpace_alpha=cfg.training.dpace_alpha,
+            selector_loss_alpha=cfg.training.dflash2_selector_loss_alpha,
         ),
     )
 
@@ -481,6 +485,11 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
         resolve_dflash_attention_layout,
     )
 
+    method_config = dict(getattr(draft_config, "dflash_config", None) or {})
+    if cfg.model.draft_block_size is not None:
+        method_config["block_size"] = cfg.model.draft_block_size
+        draft_config.dflash_config = method_config
+
     requested_layers = cfg.model.draft_num_hidden_layers
     if requested_layers is not None:
         layer_types = draft_config.layer_types
@@ -494,7 +503,7 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
             draft_config.layer_types = [layer_types[0]] * requested_layers
 
         draft_config.dflash_config = {
-            **dict(getattr(draft_config, "dflash_config", None) or {}),
+            **method_config,
             "target_layer_ids": build_target_layer_ids(
                 int(draft_config.num_target_layers),
                 requested_layers,

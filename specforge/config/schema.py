@@ -568,6 +568,8 @@ class TrainingConfig(StrictConfigModel):
         "dpace-continuation-value-only",
     ] = "dflash"
     dpace_alpha: float = 0.5
+    #: Weight of the top-k path-selector objective for DFlash2 drafts.
+    dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1

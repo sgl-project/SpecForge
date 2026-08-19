@@ -335,6 +335,19 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "dspark_objective_chunk_blocks"):
             Config.model_validate(payload)
 
+    def test_dflash2_selector_loss_alpha_is_non_negative(self):
+        payload = _online_payload("dflash")
+        payload["training"]["dflash2_selector_loss_alpha"] = 0.25
+        config = Config.model_validate(payload)
+        self.assertEqual(config.training.dflash2_selector_loss_alpha, 0.25)
+
+        payload["training"]["dflash2_selector_loss_alpha"] = -0.1
+        with self.assertRaisesRegex(
+            ValidationError,
+            "dflash2_selector_loss_alpha",
+        ):
+            Config.model_validate(payload)
+
     def test_unknown_fields_and_unsupported_modes_fail_early(self):
         with self.assertRaises(ValidationError):
             Config.model_validate(

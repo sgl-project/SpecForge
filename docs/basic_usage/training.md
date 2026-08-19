@@ -179,6 +179,46 @@ mixed layout must be edited explicitly in the draft JSON.
 
 The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
 
+### DFlash 2
+
+DFlash 2 is a draft-architecture variant of DFlash, not a separate capture
+strategy. Keep `training.strategy: dflash` and select it with a draft config
+whose architecture is `DFlash2DraftModel`. The target server still captures
+the same selected hidden states with `--spec-capture-method dflash`.
+
+The DFlash 2 config additionally defines `conv_kernel_size` and
+`conv_group_size` for the local convolution, plus `selector_rank` and
+`selector_top_k` for candidate-path selection. During training, the ordinary
+DFlash cross-entropy remains active. The selector receives an additional
+teacher-forced cross-entropy. Inference always uses the target head's strict
+top-k. For training only, when the gold successor is outside that set, it
+replaces the weakest candidate and is compared with the strongest K-1 unary
+negatives. This keeps selector gradients useful before the draft head has good
+top-k coverage; `selector_coverage` still reports the unmodified inference
+candidate coverage. Set
+`training.dflash2_selector_loss_alpha` to scale this auxiliary objective.
+
+The exported computation and parameter names match the public SGLang DFlash 2
+contract, including optional `output_multiplier` and
+`final_logit_softcapping` transforms from `dflash_config`. Public DFlash 2
+sources do not publish their selector supervision or training schedule, so the
+gold-candidate insertion above is SpecForge's training objective rather than a
+claim that the private training recipe has been reproduced.
+
+The checked-in Qwen3.6-27B recipe owns the full two-GPU local stack: GPU 0 runs
+the target capture server and GPU 1 runs the trainer.
+
+```bash
+specforge train \
+  -c examples/configs/qwen3.6-27b-dflash2-disaggregated.yaml \
+  model.target_model_path=/path/to/Qwen3.6-27B
+```
+
+Export the result with `specforge export --to hf`. Serving requires an SGLang
+version that includes DFlash 2 support (SGLang PR #35371); the serving algorithm
+name remains `DFLASH`, and the exported `DFlash2DraftModel` config enables the
+new path automatically.
+
 Domino and DSpark need their projector/head metadata, so they require an
 explicit draft config (or a pretrained warm-start source that contains
 `config.json`). The old Domino parser exposed an optional config flag, but its
@@ -481,7 +521,7 @@ specforge export --to sglang \
 ```
 
 `--to sglang` currently implements the EAGLE3 serving-key contract. Use
-`--to hf` for DFlash, Domino, DSpark, and P-EAGLE model directories. For an
+`--to hf` for DFlash, DFlash 2, Domino, DSpark, and P-EAGLE model directories. For an
 EAGLE-family self-contained Hugging Face directory, provide the target model as
 the source of the frozen embedding when it is absent from the runtime
 checkpoint:

@@ -105,6 +105,11 @@ EXPECTED_TRACKING = {
         "wandb_project": "qwen36-dflash-disagg",
         "wandb_name": "qwen36-27b-dflash-server-capture-dp2",
     },
+    "qwen3.6-27b-dflash2-disaggregated.yaml": {
+        "report_to": "wandb",
+        "wandb_project": "qwen36-dflash2",
+        "wandb_name": "qwen36-27b-dflash2-1srv-1trainer",
+    },
     "qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml": {
         "report_to": "none",
         "wandb_project": "qwen36-dflash-disagg",
@@ -146,7 +151,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 66)
+        self.assertEqual(len(paths), 67)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths

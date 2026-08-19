@@ -35,6 +35,7 @@ NPU, offline, and managed/external-service variants, is in
 | `examples/configs/qwen3-4b-dspark-offline.yaml` | Precomputed features | DSpark |
 | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
 | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` | Managed local one capture server + DP2 | DFlash |
+| `examples/configs/qwen3.6-27b-dflash2-disaggregated.yaml` | Managed local GPU 0 capture + GPU 1 trainer | DFlash 2 |
 | `examples/configs/qwen3.5-4b-dflash-online-npu.yaml` | Disaggregated NPU SGLang capture | DFlash |
 | `examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml` | Managed local NPU full stack | DFlash |
 | `examples/configs/qwen3.5-4b-domino-online-npu.yaml` | Disaggregated NPU SGLang capture | Domino |
