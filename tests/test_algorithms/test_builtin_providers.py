@@ -166,6 +166,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         training = SimpleNamespace(
             attention_backend="flex_attention",
             trim_loss_positions=True,
+            trim_backbone_rows=False,
             compact_teacher=True,
             compact_teacher_chunk_size=1024,
             lambda_base_start=0.75,
@@ -217,6 +218,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "eagle3_kl_scale",
                 "eagle3_kl_decay",
                 "eagle3_trim_loss_positions",
+                "eagle3_trim_backbone_rows",
                 "eagle3_compact_teacher",
             },
             "peagle": {
@@ -264,6 +266,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             training=SimpleNamespace(
                 attention_backend="flex_attention",
                 trim_loss_positions=False,
+                trim_backbone_rows=False,
                 compact_teacher=False,
                 compact_teacher_chunk_size=None,
             )
@@ -299,6 +302,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             (
                 ("compact_teacher", False),
                 ("compact_teacher_chunk_size", None),
+                ("trim_backbone_rows", False),
                 ("trim_loss_positions", False),
             ),
         )
