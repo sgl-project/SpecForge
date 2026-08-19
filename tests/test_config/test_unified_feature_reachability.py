@@ -59,6 +59,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             resolved.algorithm.providers.step.options(cfg),
             {
                 "trim_loss_positions": True,
+                "trim_backbone_rows": False,
                 "compact_teacher": True,
                 "compact_teacher_chunk_size": 2048,
             },
@@ -80,6 +81,66 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             "algorithm 'dflash' does not support training.trim_loss_positions",
         ):
             resolve_run(cfg)
+
+    def test_trim_backbone_rows_reaches_the_eagle3_step_provider(self):
+        cfg = Config.model_validate(
+            {
+                **OFFLINE_EAGLE3,
+                "training": {
+                    "attention_backend": "sdpa",
+                    "trim_loss_positions": True,
+                    "trim_backbone_rows": True,
+                },
+            }
+        )
+        resolved = resolve_run(cfg)
+
+        self.assertEqual(
+            resolved.algorithm.providers.step.options(cfg)["trim_backbone_rows"],
+            True,
+        )
+
+    def test_trim_backbone_rows_requires_trim_loss_positions(self):
+        with self.assertRaisesRegex(
+            ValueError, "requires\\s+training.trim_loss_positions"
+        ):
+            Config.model_validate(
+                {
+                    **OFFLINE_EAGLE3,
+                    "training": {
+                        "attention_backend": "sdpa",
+                        "trim_backbone_rows": True,
+                    },
+                }
+            )
+
+    def test_trim_backbone_rows_rejects_flex_attention(self):
+        with self.assertRaisesRegex(ValueError, "sdpa/fa/usp only"):
+            Config.model_validate(
+                {
+                    **OFFLINE_EAGLE3,
+                    "training": {
+                        "attention_backend": "flex_attention",
+                        "trim_loss_positions": True,
+                        "trim_backbone_rows": True,
+                    },
+                }
+            )
+
+    def test_trim_backbone_rows_rejects_compact_teacher(self):
+        with self.assertRaisesRegex(ValueError, "incompatible with"):
+            Config.model_validate(
+                {
+                    **OFFLINE_EAGLE3,
+                    "training": {
+                        "attention_backend": "sdpa",
+                        "trim_loss_positions": True,
+                        "trim_backbone_rows": True,
+                        "compact_teacher": True,
+                        "compact_teacher_chunk_size": 2048,
+                    },
+                }
+            )
 
     def test_loader_and_profiler_options_reach_the_canonical_trainer(self):
         eagle = resolve_run(Config.model_validate(OFFLINE_EAGLE3))

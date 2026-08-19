@@ -437,6 +437,7 @@ def build_dspark_model(
 def eagle3_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
     return {
         "trim_loss_positions": cfg.training.trim_loss_positions,
+        "trim_backbone_rows": cfg.training.trim_backbone_rows,
         "compact_teacher": cfg.training.compact_teacher,
         "compact_teacher_chunk_size": cfg.training.compact_teacher_chunk_size,
     }

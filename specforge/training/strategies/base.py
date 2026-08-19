@@ -173,6 +173,7 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         target_head: Optional[nn.Module] = None,
         ploss_decay: float = 0.8,
         trim_loss_positions: bool = False,
+        trim_backbone_rows: bool = False,
         compact_teacher: bool = False,
         compact_teacher_chunk_size: Optional[int] = None,
     ) -> None:
@@ -180,6 +181,7 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         self.target_head = target_head
         self.ploss_decay = ploss_decay
         self.trim_loss_positions = trim_loss_positions
+        self.trim_backbone_rows = trim_backbone_rows
         self.compact_teacher = compact_teacher
         self.compact_teacher_chunk_size = compact_teacher_chunk_size
         if compact_teacher:
@@ -320,6 +322,7 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
                 else None
             ),
             trim_loss_positions=self.trim_loss_positions,
+            trim_backbone_rows=self.trim_backbone_rows,
             **compact_kwargs,
         )
         weights = [self.ploss_decay**i for i in range(len(plosses))]

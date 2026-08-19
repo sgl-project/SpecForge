@@ -556,6 +556,15 @@ class TrainingConfig(StrictConfigModel):
     #: prompt-heavy data. Falls back to the full-length path for batch > 1 or when
     #: an lk_loss objective is used.
     trim_loss_positions: bool = False
+    #: Additionally run the draft backbone at TTT steps >= 1 only on the rows
+    #: that can still emit loss at that or a later step (their union, since
+    #: hidden states chain between steps). Step 0 stays full-length -- it
+    #: provides the cross-position K/V context. Intended for prompt-heavy data
+    #: (small supervised fraction): the trimmed steps use explicit masked-matmul
+    #: attention, so with dense supervision they degenerate to eager full
+    #: attention. Requires trim_loss_positions and an attention backend in
+    #: {sdpa, fa, usp}.
+    trim_backbone_rows: bool = False
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None
@@ -625,6 +634,25 @@ class TrainingConfig(StrictConfigModel):
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
             )
+        if self.trim_backbone_rows:
+            if not self.trim_loss_positions:
+                raise ValueError(
+                    "training.trim_backbone_rows requires "
+                    "training.trim_loss_positions=true (it builds on the same "
+                    "supervised-row bookkeeping)"
+                )
+            if self.attention_backend not in ("sdpa", "fa", "usp"):
+                raise ValueError(
+                    "training.trim_backbone_rows supports attention_backend "
+                    "sdpa/fa/usp only (flex_attention's cache semantics differ)"
+                )
+            if self.compact_teacher:
+                raise ValueError(
+                    "training.trim_backbone_rows is incompatible with "
+                    "training.compact_teacher (the compact-teacher branch "
+                    "bypasses the trim bookkeeping, so the flag would "
+                    "silently do nothing)"
+                )
         return self
 
 

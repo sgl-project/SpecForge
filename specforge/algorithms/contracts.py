@@ -239,6 +239,7 @@ class AlgorithmCapabilities:
     required_batch_size: int | None = None
     supports_compact_teacher: bool = False
     supports_trim_loss_positions: bool = False
+    supports_trim_backbone_rows: bool = False
     supports_vocab_mapping: bool = False
     allows_aux_layer_override: bool = False
 
@@ -256,6 +257,7 @@ class AlgorithmCapabilities:
         for field_name in (
             "supports_compact_teacher",
             "supports_trim_loss_positions",
+            "supports_trim_backbone_rows",
             "supports_vocab_mapping",
             "allows_aux_layer_override",
         ):

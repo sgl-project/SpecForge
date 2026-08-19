@@ -28,6 +28,9 @@ class StepState(BackboneStepState):
 
 
 class BackendAdapter:
+    #: sequence-parallel world size; UspAdapter overrides in __init__.
+    sp_world_size = 1
+
     def __init__(self, model: "OnlineEagle3Model"):
         self.m = model
 

@@ -658,6 +658,22 @@ class LlamaAttention(nn.Module):
             .contiguous()
         )
 
+    def _trim_step0_kv(self, cache_hidden):
+        """Step-0 K/V for the trimmed path, as [B, KVH, {G|1}, L0, D].
+
+        The sdpa TTT branch caches step-0 K/V already expanded to the full
+        head count ([B, H, L, D], repeat_kv layout: head h maps to kv head
+        h // G), so viewing it grouped is free.
+        """
+        k0, v0 = cache_hidden[0][0], cache_hidden[1][0]
+        bsz, _, l0, hd = k0.shape
+        kvh = self.num_key_value_heads
+        groups = self.num_key_value_groups
+        return (
+            k0.view(bsz, kvh, groups, l0, hd),
+            v0.view(bsz, kvh, groups, l0, hd),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -667,7 +683,12 @@ class LlamaAttention(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        trim_rows_ctx: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if trim_rows_ctx is not None:
+            return _trimmed_rows_attention(
+                self, hidden_states, cache_hidden, trim_rows_ctx
+            )
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -804,7 +825,12 @@ class LlamaFlexAttention(LlamaAttention):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        trim_rows_ctx: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if trim_rows_ctx is not None:
+            raise NotImplementedError(
+                "trim_backbone_rows is not supported with flex_attention"
+            )
         bsz, q_len, _ = hidden_states.size()
 
         past_seen_tokens = (
@@ -1291,6 +1317,13 @@ class LlamaFlashAttention(LlamaAttention):
         ):
             _raise_standard_flash_attn_unavailable()
 
+    def _trim_step0_kv(self, cache_hidden):
+        """fa caches step-0 K/V as [B, L, KVH, D]; keep KV heads un-repeated
+        and let the grouped matmul broadcast over query groups."""
+        k0 = cache_hidden[0][0].transpose(1, 2).unsqueeze(2)  # [B, KVH, 1, L, D]
+        v0 = cache_hidden[1][0].transpose(1, 2).unsqueeze(2)
+        return k0, v0
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1300,7 +1333,12 @@ class LlamaFlashAttention(LlamaAttention):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        trim_rows_ctx: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if trim_rows_ctx is not None:
+            return _trimmed_rows_attention(
+                self, hidden_states, cache_hidden, trim_rows_ctx
+            )
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -1384,6 +1422,35 @@ class LlamaUSPFlashAttention(LlamaAttention):
         self.gather_idx = 1
         self.use_sync = False
 
+    def _trim_step0_kv(self, cache_hidden):
+        """Gather step-0 K/V to GLOBAL length once for the trimmed steps.
+
+        Trimmed steps bypass Ulysses/ring entirely: per-rank row counts differ
+        (all-to-all needs equal lengths) and flash cannot express causal masks
+        over non-contiguous rows. ``torch.distributed.nn.functional.all_gather``
+        is used deliberately instead of ``specforge.distributed.Gather``: its
+        backward is the reduce-scatter SUM of every rank's gradient, which is
+        the correct semantics here because each rank computes a different loss
+        from the gathered K/V (Gather's world-size-scaled slice backward
+        assumes identical per-rank computation). KV heads stay un-repeated;
+        the grouped matmul broadcasts over query groups.
+        """
+        import torch.distributed.nn.functional as dist_nn
+
+        # step-0 entries are post-a2a: [B, C*ulysses, H/ulysses, D]
+        k0 = cache_hidden[0][0]
+        v0 = cache_hidden[1][0]
+        if self.sp_ulysses_degree > 1:
+            k0 = torch.cat(dist_nn.all_gather(k0, group=self.ulysses_pg), dim=2)
+            v0 = torch.cat(dist_nn.all_gather(v0, group=self.ulysses_pg), dim=2)
+        if self.sp_ring_degree > 1:
+            k0 = torch.cat(dist_nn.all_gather(k0, group=self.ring_pg), dim=1)
+            v0 = torch.cat(dist_nn.all_gather(v0, group=self.ring_pg), dim=1)
+        return (
+            k0.transpose(1, 2).unsqueeze(2),  # [B, KVH, 1, L_global, D]
+            v0.transpose(1, 2).unsqueeze(2),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1393,8 +1460,14 @@ class LlamaUSPFlashAttention(LlamaAttention):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        trim_rows_ctx: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         from yunchang.comm import SeqAllToAll4D
+
+        if trim_rows_ctx is not None:
+            return _trimmed_rows_attention(
+                self, hidden_states, cache_hidden, trim_rows_ctx
+            )
 
         bsz, q_len, _ = hidden_states.size()
         local_q_len = q_len
@@ -1567,6 +1640,241 @@ class LlamaRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
+def _trimmed_attention_core(qg, k0, v0, positions, scale, neg_inf, *diag_kv):
+    """Pure-local attention math for one trimmed step (checkpoint-friendly).
+
+    Recomputed in backward via activation checkpointing: the [n_i, L0]-sized
+    fp32 softmax tensors would otherwise stay resident once per trimmed step,
+    which at long global lengths dwarfs every saving the trimming made.
+    Collectives are deliberately kept OUTSIDE (k0/v0 arrive pre-gathered):
+    a collective inside a recomputed region would re-issue during backward in
+    rank-dependent order and deadlock.
+
+    Rows are processed in chunks of ``_TRIM_ROW_CHUNK`` so the transient
+    [rows, L0] fp32 attention block stays bounded at long global lengths
+    (at 64k global and full rows it would otherwise be a >10 GiB single
+    allocation). Per-row math is independent, so chunking is exact.
+    """
+    n = qg.shape[3]
+    if n <= _TRIM_ROW_CHUNK:
+        return _trimmed_attention_rows(qg, k0, v0, positions, scale, neg_inf, *diag_kv)
+    outs = []
+    for s in range(0, n, _TRIM_ROW_CHUNK):
+        e = min(s + _TRIM_ROW_CHUNK, n)
+        chunk_diag = [d[:, :, s:e] for d in diag_kv]
+        outs.append(
+            _trimmed_attention_rows(
+                qg[:, :, :, s:e],
+                k0,
+                v0,
+                positions[:, s:e],
+                scale,
+                neg_inf,
+                *chunk_diag,
+            )
+        )
+    return torch.cat(outs, dim=3)
+
+
+_TRIM_ROW_CHUNK = 512
+
+#: Above this step-0 K/V length the trimmed step switches from the exact
+#: eager core to one fused memory-efficient SDPA call (no [rows, L] tensor is
+#: ever materialized). Short lengths keep the eager core, whose math is
+#: bit-aligned with the native sdpa TTT branch.
+_TRIM_SDPA_MIN_K0 = 8192
+
+
+def _trimmed_attention_sdpa(q, k0, v0, positions, *diag_kv):
+    """Long-k0 core: one fused memory-efficient SDPA call per step.
+
+    ``q`` is [B, KVH, G, m, D]; ``k0``/``v0`` are [B, KVH, L0, D]
+    (un-expanded); diagonal entries are [B, KVH, m, D]. Query groups are
+    folded into the row axis so q and k share ``num_heads`` (the fused
+    kernels require equal head counts), and the diagonal-private K/V join as
+    extra key/value columns visible only to their own row via the boolean
+    mask. The kernel keeps softmax internal, so nothing [rows, L0]-sized in
+    fp32 ever reaches HBM.
+    """
+    bsz, kvh, groups, m, d = q.shape
+    half = len(diag_kv) // 2
+    diag_ks, diag_vs = diag_kv[:half], diag_kv[half:]
+    k_ext = torch.cat((k0, *diag_ks), dim=2) if diag_ks else k0
+    v_ext = torch.cat((v0, *diag_vs), dim=2) if diag_vs else v0
+    col = torch.arange(k0.shape[2], device=q.device)
+    allow = col[None, :] <= positions.view(-1, 1)  # [m, L0]
+    if diag_ks:
+        eye = torch.eye(m, dtype=torch.bool, device=q.device)
+        allow = torch.cat([allow] + [eye] * len(diag_ks), dim=1)
+    allow = allow.unsqueeze(0).expand(groups, m, -1).reshape(groups * m, -1)
+    qf = q.reshape(bsz, kvh, groups * m, d)
+    out = nn.functional.scaled_dot_product_attention(
+        qf, k_ext, v_ext, attn_mask=allow[None, None]
+    )
+    return out.view(bsz, kvh, groups, m, d)
+
+
+def _trimmed_attention_rows(qg, k0, v0, positions, scale, neg_inf, *diag_kv):
+    attn_weights = torch.matmul(qg, k0.transpose(-1, -2)) * scale
+    col = torch.arange(k0.shape[-2], device=qg.device)
+    causal = col[None, :] > positions.view(-1, 1)  # [rows, L0]
+    attn_weights = attn_weights.masked_fill(causal[None, None, None], neg_inf)
+    half = len(diag_kv) // 2
+    diag_ks, diag_vs = diag_kv[:half], diag_kv[half:]
+    for ke in diag_ks:
+        w = (qg * ke.unsqueeze(2)).sum(-1) * scale  # [B, KVH, G, rows]
+        attn_weights = torch.cat((attn_weights, w[..., None]), dim=-1)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        qg.dtype
+    )
+    L0 = k0.shape[-2]
+    attn_output = torch.matmul(attn_weights[..., :L0], v0)  # [B, KVH, G, rows, D]
+    for i, ve in enumerate(diag_vs):
+        attn_output = attn_output + attn_weights[..., L0 + i, None] * ve.unsqueeze(2)
+    return attn_output
+
+
+def _trimmed_rows_attention(attn, hidden_states, cache_hidden, ctx):
+    """TTT steps >= 1 with backbone-row trimming (``--trim-backbone-rows``).
+
+    ``hidden_states`` holds only the surviving rows R_i (the union of every row
+    that can still emit loss at this or a later step). The math mirrors the
+    sdpa TTT branch: full cross attention against step-0 K/V plus one
+    diagonal-private term per later step. It is shared by every backend
+    because it is plain matmul math -- the causal mask is built from the rows'
+    absolute positions, so non-contiguous row sets (which flash kernels cannot
+    express) are fine. Assumes batch=1 with no padding mask (the position-built
+    causal mask is the only masking applied). Everything runs in
+    grouped-query layout so the step-0
+    K/V stay at ``num_key_value_heads`` and are never materialized per query
+    head.
+
+    ``ctx`` carries per-step fields set by the TTT loop:
+      positions  LongTensor [1, n_i]  absolute RoPE positions (global under USP)
+      diag_sels  dict: cache entry e -> positions of R_i within R_e
+    per-forward constants: ``k0_len`` (number of step-0 K/V rows; global length
+    under USP), and persistent fields ``k0``/``v0`` ([B, KVH, {G|1}, L0, D]),
+    prepared once via the backend's ``_trim_step0_kv``.
+
+    Later steps' K/V are appended un-repeated as [B, KVH, n_i, D]; they are
+    only ever consumed by this function (via ``diag_sels``), never by the
+    step-0 native paths.
+    """
+    if isinstance(attn.rotary_emb, LlamaMutiRotaryEmbedding):
+        # Multimodal RoPE carries 3D position ids and a different rotary call
+        # signature; the trimmed path's absolute-position bookkeeping does not
+        # support it yet. Fail fast rather than mis-slice positions.
+        raise NotImplementedError(
+            "trim_backbone_rows does not support multimodal RoPE (mrope) drafts"
+        )
+    bsz, q_len, _ = hidden_states.size()
+    lck = len(cache_hidden[0])
+    kvh = attn.num_key_value_heads
+    groups = attn.num_key_value_groups
+
+    query_states = attn.q_proj(hidden_states).view(
+        bsz, q_len, attn.num_heads, attn.head_dim
+    )
+    key_states = attn.k_proj(hidden_states).view(bsz, q_len, kvh, attn.head_dim)
+    value_states = attn.v_proj(hidden_states).view(bsz, q_len, kvh, attn.head_dim)
+
+    # RoPE at the rows' absolute positions. The cos/sin cache must cover the
+    # largest absolute position, not q_len (the rows are a sparse subset).
+    cos, sin = attn.rotary_emb(query_states, seq_len=ctx["k0_len"] + lck)
+    cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+    query_states, key_states = apply_rotary_pos_emb(
+        query_states, key_states, cos, sin, ctx["positions"] + lck, unsqueeze_dim=2
+    )
+
+    key_states = key_states.transpose(1, 2)  # [B, KVH, n_i, D]
+    value_states = value_states.transpose(1, 2)
+    cache_hidden[0] = cache_hidden[0] + [key_states]
+    cache_hidden[1] = cache_hidden[1] + [value_states]
+
+    if ctx.get("k0") is None:
+        ctx["k0"], ctx["v0"] = attn._trim_step0_kv(cache_hidden)
+    k0, v0 = ctx["k0"], ctx["v0"]  # [B, KVH, {G|1}, L0, D]
+    scale = 1.0 / math.sqrt(attn.head_dim)
+
+    # Grouped-query layout: [B, n, H, D] -> [B, KVH, G, n, D]
+    qg = query_states.view(bsz, q_len, kvh, groups, attn.head_dim).permute(
+        0, 2, 3, 1, 4
+    )
+
+    # Row-align the diagonal-private K/V (cheap index_selects, kept outside
+    # the checkpointed region so the core is pure math on plain tensors).
+    diag_ks, diag_vs = [], []
+    n_entries = len(cache_hidden[0])
+    for e in range(1, n_entries):
+        ke = cache_hidden[0][e]
+        ve = cache_hidden[1][e]
+        if e < n_entries - 1:
+            sel = ctx["diag_sels"][e]
+            ke = ke.index_select(2, sel)
+            ve = ve.index_select(2, sel)
+        diag_ks.append(ke)
+        diag_vs.append(ve)
+
+    # The heavy part (cross attention against step-0 K/V + diagonal terms) is
+    # activation-checkpointed: its [n_i, L0] fp32 softmax tensors are the
+    # dominant residency and are cheap to recompute.
+    neg_inf = torch.finfo(qg.dtype).min
+    if ctx["k0_len"] >= _TRIM_SDPA_MIN_K0:
+        # k0 arrives as [B, KVH, {G|1}, L0, D]; index 0 of dim 2 recovers the
+        # un-expanded [B, KVH, L0, D] view in both layouts for free.
+        k0f, v0f = k0[:, :, 0], v0[:, :, 0]
+        if torch.is_grad_enabled() and qg.requires_grad:
+            from torch.utils.checkpoint import checkpoint
+
+            attn_output = checkpoint(
+                _trimmed_attention_sdpa,
+                qg,
+                k0f,
+                v0f,
+                ctx["positions"],
+                *diag_ks,
+                *diag_vs,
+                use_reentrant=False,
+            )
+        else:
+            attn_output = _trimmed_attention_sdpa(
+                qg, k0f, v0f, ctx["positions"], *diag_ks, *diag_vs
+            )
+    elif torch.is_grad_enabled() and qg.requires_grad:
+        # Checkpoint PER ROW-CHUNK: backward recomputes one chunk at a time,
+        # so the [rows, L0] fp32 transients stay bounded in both directions.
+        from torch.utils.checkpoint import checkpoint
+
+        n = qg.shape[3]
+        outs = []
+        for s in range(0, n, _TRIM_ROW_CHUNK):
+            e = min(s + _TRIM_ROW_CHUNK, n)
+            chunk_diag = [d[:, :, s:e] for d in (*diag_ks, *diag_vs)]
+            outs.append(
+                checkpoint(
+                    _trimmed_attention_rows,
+                    qg[:, :, :, s:e],
+                    k0,
+                    v0,
+                    ctx["positions"][:, s:e],
+                    scale,
+                    neg_inf,
+                    *chunk_diag,
+                    use_reentrant=False,
+                )
+            )
+        attn_output = outs[0] if len(outs) == 1 else torch.cat(outs, dim=3)
+    else:
+        attn_output = _trimmed_attention_core(
+            qg, k0, v0, ctx["positions"], scale, neg_inf, *diag_ks, *diag_vs
+        )
+
+    attn_output = attn_output.permute(0, 3, 1, 2, 4).reshape(
+        bsz, q_len, attn.head_dim * attn.num_heads
+    )
+    return attn.o_proj(attn_output)
+
+
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config, attention_backend: str = "sdpa"):
         super().__init__()
@@ -1605,6 +1913,7 @@ class LlamaDecoderLayer(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        trim_rows_ctx: Optional[dict] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -1637,6 +1946,7 @@ class LlamaDecoderLayer(nn.Module):
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            trim_rows_ctx=trim_rows_ctx,
         )
         hidden_states = residual + hidden_states
 
@@ -1785,6 +2095,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
+        trim_rows_ctx: Optional[dict] = None,
     ) -> torch.Tensor:
         return self.midlayer(
             input_emb=input_embeds,
@@ -1795,4 +2106,5 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             past_key_values=past_key_values,
             output_attentions=False,
             use_cache=False,
+            trim_rows_ctx=trim_rows_ctx,
         )

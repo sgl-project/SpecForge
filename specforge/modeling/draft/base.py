@@ -103,6 +103,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
+        trim_rows_ctx: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         The backbone of the draft model.

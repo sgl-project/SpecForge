@@ -126,6 +126,12 @@ def _validate_algorithm_capabilities(
             "training.trim_loss_positions"
         )
 
+    if training.trim_backbone_rows and not capabilities.supports_trim_backbone_rows:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} does not support "
+            "training.trim_backbone_rows"
+        )
+
 
 def _validate_training_topology(
     cfg: Config,

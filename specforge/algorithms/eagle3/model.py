@@ -262,6 +262,7 @@ class OnlineEagle3Model(Eagle3Model):
         target_head_weight: Optional[torch.Tensor] = None,
         compact_teacher_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
         trim_loss_positions: bool = False,
+        trim_backbone_rows: bool = False,
     ) -> Tuple[
         List[torch.Tensor],
         List[torch.Tensor],
@@ -285,6 +286,10 @@ class OnlineEagle3Model(Eagle3Model):
                 states in draft-vocab space and ``target`` is ignored.
             trim_loss_positions: compute the teacher, draft logits and loss only at
                 supervised positions when the batch/objective supports it.
+            trim_backbone_rows: additionally run the draft backbone at TTT steps
+                >= 1 only on the rows that can still emit loss at that or a later
+                step (requires trim_loss_positions; step 0 stays full-length as it
+                provides the cross-position K/V context).
         """
         adapter = self._make_adapter()
         # Step 1: handle vocab size
@@ -338,6 +343,7 @@ class OnlineEagle3Model(Eagle3Model):
                     loss_mask,
                     self.length,
                     chunk_len=trim_chunk_len,
+                    backbone_rows=trim_backbone_rows,
                 )
             if trim_pack is not None:
                 target_p_padded = None
@@ -413,8 +419,81 @@ class OnlineEagle3Model(Eagle3Model):
         else:
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
+        b_enabled = trim_pack is not None and "b_rows_steps" in trim_pack
+        if trim_backbone_rows and self.attention_backend == "usp":
+            # Backbone-row trimming changes the backbone's collective pattern
+            # (one K/V all-gather instead of per-step ring attention), so the
+            # decision must be rank-uniform: a rank whose pack fell back to
+            # None (no reachable supervision) would otherwise keep issuing
+            # ring collectives that trimmed ranks never join -> deadlock.
+            # Agree by MIN across the sequence-parallel group; on disagreement
+            # every rank drops to the A-level path, whose backbone collectives
+            # are identical to the full path's.
+            flag = torch.tensor(1 if b_enabled else 0, device=hidden_states.device)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=adapter.sp_group
+            )
+            if int(flag.item()) == 0:
+                # b_enabled alone gates every B-level read below; the pack's
+                # b_* entries are simply never consulted again.
+                b_enabled = False
+        if b_enabled and position_ids is not None and position_ids.dim() == 3:
+            # Multimodal RoPE carries [axes, batch, seq] position ids; the
+            # row-selection below would slice the batch axis. Fail fast here
+            # (the attention-level guard cannot be reached for this layout).
+            raise NotImplementedError(
+                "trim_backbone_rows does not support multimodal RoPE (mrope) "
+                "drafts (3D position_ids)"
+            )
+        if b_enabled:
+            # The trimmed path builds its causal mask from position VALUES
+            # (row at position p attends step-0 keys 0..p), which matches the
+            # full path's index-based mask only when positions are the row
+            # indices themselves (plain arange locally, or the collator's
+            # contiguous global arange under USP). Packed sequences with
+            # per-segment position resets would silently diverge -- reject.
+            _pos = position_ids[:, : trim_pack["full_len"]]
+            if not bool((_pos.diff(dim=-1) == 1).all()):
+                raise NotImplementedError(
+                    "trim_backbone_rows requires contiguous ascending "
+                    "position_ids (packed/segment-reset positions are not "
+                    "supported)"
+                )
+        # Persistent across steps: the trimmed-attention path stashes the
+        # (possibly all-gathered) step-0 K/V here at the first trimmed step.
+        # k0_len is the step-0 K/V row count (global length under USP).
+        trim_ctx = (
+            {
+                "k0": None,
+                "v0": None,
+                "k0_len": trim_pack["full_len"] * adapter.sp_world_size,
+            }
+            if b_enabled
+            else None
+        )
         for idx in range(self.length):
-            if trim_pack is not None:
+            b_active = b_enabled and idx >= 1
+            if b_active:
+                # B-level: this step's backbone runs only R_i = the union of all
+                # rows that can still emit loss at this or a later step. hidden
+                # chains through per-step row maps (R_i is nested in R_{i-1});
+                # input_ids/positions follow the absolute rows so RoPE and the
+                # causal mask stay position-correct inside the trimmed path.
+                rows_b = trim_pack["b_rows_steps"][idx]
+                # R_i nested in R_{i-1}: positions of R_i inside the previous
+                # step's compact output are exactly the last diagonal map.
+                prev_sel = (
+                    rows_b if idx == 1 else trim_pack["b_diag_sels"][idx][idx - 1]
+                )
+                step_hidden = hidden_states.index_select(1, prev_sel)
+                step_input_ids = global_input_ids.index_select(1, rows_b)
+                step_pos = position_ids[:, : trim_pack["full_len"]].index_select(
+                    1, rows_b
+                )
+                step_attn = None  # the trimmed path builds its own causal mask
+                trim_ctx["positions"] = step_pos
+                trim_ctx["diag_sels"] = trim_pack["b_diag_sels"][idx]
+            elif trim_pack is not None:
                 # A-level: the teacher tables are already compacted to supervised
                 # positions; the backbone runs exactly the same inputs as the full
                 # path (per-rank chunk under USP, full length otherwise) and only
@@ -464,6 +543,7 @@ class OnlineEagle3Model(Eagle3Model):
                 position_ids=step_pos,
                 past_key_values=past_key_values,
                 use_cache=True,
+                **({"trim_rows_ctx": trim_ctx} if b_active else {}),
             )
 
             # update hidden states for next step
@@ -477,8 +557,14 @@ class OnlineEagle3Model(Eagle3Model):
                 rows_j = trim_pack["rows_steps"][idx]
                 keep_j = trim_pack["keep_steps"][idx]
                 nrows_j = trim_pack["nrows_steps"][idx]
+                if b_active:
+                    # backbone output is compacted to R_i rows; select loss rows
+                    # by their position inside R_i rather than absolute index.
+                    loss_sel = trim_pack["b_loss_sel"][idx]
+                else:
+                    loss_sel = rows_j
                 logits = self.draft_model.compute_logits(
-                    hidden_states.index_select(1, rows_j)
+                    hidden_states.index_select(1, loss_sel)
                 )
                 pm_j = trim_pack["position_mask_sup"].index_select(1, keep_j)
                 lm_j = trim_pack["loss_mask_sup"].index_select(1, keep_j)
@@ -657,7 +743,9 @@ def _compute_target_p_eager(target, t2d, loss_mask, row_chunk=256):
     )
 
 
-def _build_trim_pack(target, t2d, loss_mask, length, chunk_len=None):
+def _build_trim_pack(
+    target, t2d, loss_mask, length, chunk_len=None, backbone_rows=False
+):
     """A-level trim (--trim-loss-positions): keep only the rows that can carry loss.
 
     Derivation of the per-step row set. On the full-length path the loop applies
@@ -722,13 +810,15 @@ def _build_trim_pack(target, t2d, loss_mask, length, chunk_len=None):
         )
         lm_sup = loss_mask.view(-1)[sup].view(1, -1, 1)
 
-        rows_steps, keep_steps, nrows_steps = [], [], []
+        rows_steps, keep_steps, nrows_steps, raw_rows = [], [], [], []
         pad_idx = torch.zeros(1, dtype=sup.dtype, device=sup.device)
         for j in range(length):
             keep = (
                 ((sup >= j) & (sup - j < chunk_len)).nonzero(as_tuple=False).squeeze(-1)
             )
             n = int(keep.numel())
+            if backbone_rows:
+                raw_rows.append(sup[keep] - j)
             if n == 0:
                 # Dead step: pad with one dummy entry; the caller zeroes its
                 # masks so it contributes nothing.
@@ -739,7 +829,45 @@ def _build_trim_pack(target, t2d, loss_mask, length, chunk_len=None):
             rows_steps.append(rows)
             keep_steps.append(keep)
             nrows_steps.append(n)
+
+        extra = {}
+        if backbone_rows and length > 1:
+            # B-level (--trim-backbone-rows): the rows step i must forward are
+            #   R_i = union_{j >= i} { s - j : s in sup, 0 <= s - j < chunk_len }
+            # -- every row that can still emit loss at this or a later step
+            # (hidden chains between steps, so a row needed at step j must be
+            # forwarded at every step i <= j). The sets are nested
+            # (R_i \subseteq R_{i-1}), which makes the per-step row maps plain
+            # searchsorted lookups. Step 0 always runs full-length: it produces
+            # the K/V context every later row attends to.
+            b_rows_steps, b_diag_sels, b_loss_sel = {}, {}, {}
+            prev = None
+            for i in range(1, length):
+                nonempty = [r for r in raw_rows[i:] if r.numel()]
+                if nonempty:
+                    uni = torch.unique(torch.cat(nonempty))
+                else:
+                    # Dead tail: keep one row from the previous set so the
+                    # nested chain (and kernel/collective alignment across
+                    # ranks) survives; its loss is zero-masked by nrows == 0.
+                    uni = (prev[:1] if prev is not None else pad_idx).clone()
+                b_rows_steps[i] = uni
+                b_diag_sels[i] = {
+                    e: torch.searchsorted(b_rows_steps[e], uni) for e in range(1, i)
+                }
+                b_loss_sel[i] = (
+                    torch.searchsorted(uni, rows_steps[i])
+                    if nrows_steps[i] > 0
+                    else pad_idx
+                )
+                prev = uni
+            extra = dict(
+                b_rows_steps=b_rows_steps,
+                b_diag_sels=b_diag_sels,
+                b_loss_sel=b_loss_sel,
+            )
         return dict(
+            **extra,
             sup=sup,
             rows_steps=rows_steps,
             keep_steps=keep_steps,
