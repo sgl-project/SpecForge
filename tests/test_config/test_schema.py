@@ -348,6 +348,14 @@ class ConfigSchemaTest(unittest.TestCase):
         ):
             Config.model_validate(payload)
 
+    def test_tv_is_a_supported_acceptance_loss_type(self):
+        payload = _online_payload("dflash")
+        payload["training"]["lk_loss_type"] = "tv"
+
+        config = Config.model_validate(payload)
+
+        self.assertEqual(config.training.lk_loss_type, "tv")
+
     def test_unknown_fields_and_unsupported_modes_fail_early(self):
         with self.assertRaises(ValidationError):
             Config.model_validate(

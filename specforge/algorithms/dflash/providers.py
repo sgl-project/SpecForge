@@ -66,6 +66,9 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_loss_decay_gamma": training_model.loss_decay_gamma,
         "dflash_loss_type": str(training_model.loss_type),
         "dflash_dpace_alpha": float(training_model.dpace_alpha),
+        "dflash_lk_loss_type": training_model.lk_loss_type,
+        "dflash_kl_scale": float(training_model.kl_scale),
+        "dflash_kl_decay": float(training_model.kl_decay),
     }
     if getattr(draft_model, "candidate_selector", None) is not None:
         method_config = dict(getattr(draft_model.config, "dflash_config", None) or {})
