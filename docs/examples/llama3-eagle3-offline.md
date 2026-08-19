@@ -42,7 +42,7 @@ settings used by this walkthrough; edit the checked-in recipe or use dotted
 overrides instead of copying its YAML into another document.
 
 The recipe carries a conventional `model.vocab_mapping_path` for deployments
-that prepare and share a mapping artifact. For a local offline run, leaving
+that prepare and share a mapping artifact. For an offline colocated run, leaving
 that field empty makes SpecForge count effective tokens in the exact feature
 corpus, derive `t2d`/`d2t` deterministically, and cache the reusable mapping
 under `data.cache_dir/vocab_mapping`. Equal target and draft vocabularies need

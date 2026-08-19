@@ -48,8 +48,10 @@ python -m pip install -e . --no-deps
 ```
 
 For the complete container setup and an end-to-end walkthrough covering
-installation, data preparation, and offline / online / disaggregated training on
-AMD Instinct GPUs, follow the [AMD ROCm Tutorial](../basic_usage/AMD/amd_rocm.md).
+installation, data preparation, offline colocated training, online
+disaggregated training, and its single-supervisor and split external launch
+forms on AMD Instinct GPUs, follow the
+[AMD ROCm Tutorial](../basic_usage/AMD/amd_rocm.md).
 
 ### Ascend NPU
 

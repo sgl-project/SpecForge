@@ -8,13 +8,45 @@ specforge train --config examples/configs/online/disaggregated/external/qwen3-8b
 ```
 
 The YAML file is the run contract. It selects the draft strategy, target model,
-data source, optimizer settings, and deployment mode. Method-specific Python
-trainers are not part of the public interface.
+data source, optimizer settings, and deployment topology. Method-specific
+Python trainers are not part of the public interface.
 
 This is an intentional hard cutover. The old `scripts/train_*.py` commands and
 temporary move-only Python import paths were removed rather than deprecated.
 Downstream launchers should migrate to a typed run config and `specforge train`;
 there is no compatibility dispatch to the previous trainers.
+
+## Choose a recipe
+
+The config catalog separates three concepts that older filenames sometimes
+mixed together:
+
+| Question | Config source | Catalog level |
+| --- | --- | --- |
+| Are target features captured during training or prepared earlier? | `data.train_data_path` / `data.prompts_path` versus `data.hidden_states_path` | `online/` versus `offline/` |
+| Does the trainer read offline files directly or consume refs from a producer? | `deployment.mode: local_colocated` versus `deployment.mode: disaggregated` | `colocated/` versus `disaggregated/` |
+| Who starts Mooncake and SGLang for online disaggregation? | Presence of `deployment.disaggregated.managed_local` | `external/` versus `managed-local/` |
+
+The supported catalog layout is:
+
+```text
+examples/configs/
+├── offline/
+│   ├── colocated/
+│   └── disaggregated/
+└── online/
+    ├── colocated/                 # reserved; currently unsupported
+    └── disaggregated/
+        ├── external/
+        └── managed-local/
+```
+
+`external` is an ownership boundary, not a statement that the services are on
+another machine. A loopback SGLang URL is still external when the user starts
+the server. `managed-local` owns those services on one host, while producer and
+consumer remain separate SpecForge roles. The runtime reads the YAML fields,
+not filename suffixes, to determine these semantics. See the complete
+[recipe catalog](../../examples/configs/README.md) for representative configs.
 
 ### Defaults when migrating removed trainers
 
@@ -218,22 +250,21 @@ Set exactly one data source:
 
 The checked-in examples are the canonical starting points:
 
-| Strategy and mode | Config |
-| --- | --- |
-| EAGLE3 online | [`qwen3-8b-eagle3-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
-| EAGLE3 offline | [`qwen3-8b-eagle3-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml) |
-| DFlash online | [`qwen3-8b-dflash-online.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-dflash-online.yaml) |
-| DFlash offline | [`qwen3-8b-dflash-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml) |
-| Domino online | [`qwen3-8b-domino-online.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) |
-| Domino offline | [`qwen3-8b-domino-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) |
-| P-EAGLE online | [`qwen3-8b-peagle-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-peagle-disaggregated.yaml) |
-| DFlash disaggregated | [`qwen3-8b-dflash-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml) |
-| Domino disaggregated | [`qwen3-8b-domino-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml) |
-| DSpark disaggregated | [`qwen3-4b-dspark-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) |
-| DSpark offline | [`qwen3-4b-dspark-offline.yaml`](../../examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) |
-| EAGLE3 offline disaggregated | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](../../examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
-| Ascend NPU DFlash online | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml) |
-| Ascend NPU Domino online | [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-domino-online-npu.yaml) |
+| Strategy | Category | Config |
+| --- | --- | --- |
+| EAGLE3 | Online disaggregated, external | [`qwen3-8b-eagle3-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
+| EAGLE3 | Offline colocated | [`qwen3-8b-eagle3-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml) |
+| EAGLE3 | Offline disaggregated | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](../../examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
+| P-EAGLE | Online disaggregated, external | [`qwen3-8b-peagle-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-peagle-disaggregated.yaml) |
+| DFlash | Online disaggregated, external | [`qwen3-8b-dflash-online.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-dflash-online.yaml) |
+| DFlash | Online disaggregated, managed-local | [`qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](../../examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+| DFlash | Offline colocated | [`qwen3-8b-dflash-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml) |
+| Domino | Online disaggregated, external | [`qwen3-8b-domino-online.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) |
+| Domino | Online disaggregated, managed-local | [`qwen3-8b-domino-multiserver-disaggregated.yaml`](../../examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
+| Domino | Offline colocated | [`qwen3-8b-domino-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) |
+| DSpark | Online disaggregated, external | [`qwen3-4b-dspark-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) |
+| DSpark | Offline colocated | [`qwen3-4b-dspark-offline.yaml`](../../examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) |
+| DFlash (Ascend) | Online disaggregated, external | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml) |
 
 ## Online and offline data
 
@@ -245,7 +276,7 @@ more storage.
 
 | Mode | Target during training | Disk use | Data config |
 | --- | --- | --- | --- |
-| Online | External/managed SGLang capture server | Low | `train_data_path` or `prompts_path` |
+| Online | External or managed-local SGLang capture server; never the trainer | Low | `train_data_path` or `prompts_path` |
 | Offline | Not loaded by the trainer | High | `hidden_states_path` |
 
 Prepare raw datasets and offline features as described in [Data
@@ -256,7 +287,7 @@ launching it.
 
 The unified runtime supports text training in these combinations:
 
-| Strategy | SGLang server online | Local/dataflow offline | Disaggregated offline |
+| Strategy | Online disaggregated | Offline colocated | Offline disaggregated |
 | --- | --- | --- | --- |
 | EAGLE3 | Yes, consumer DP | Yes, DP + USP | Yes, consumer DP |
 | DFlash | Yes, consumer DP | Yes, DP | Yes, consumer DP |
@@ -281,7 +312,7 @@ assembly. In particular:
 - every online run is disaggregated and uses `model.target_backend=sglang`;
   finite runs may omit both step fields so the producer can publish the exact
   optimizer horizon derived from the prepared prompt plan;
-- EAGLE3 local offline runs derive and cache a deterministic vocabulary mapping
+- EAGLE3 offline colocated runs derive and cache a deterministic vocabulary mapping
   from the feature corpus when `model.vocab_mapping_path` is empty. EAGLE3
   disaggregated runs require an explicit shared mapping so producer and
   consumer cannot derive different artifacts.
@@ -423,13 +454,15 @@ is active.
 
 ## Disaggregated roles
 
-A single-node disaggregated config supervises producer and consumer with one
-command. Split deployments use the same config with `--role producer` or
-`--role consumer`; multi-node consumers add only `--node-rank` on each host.
-The optional `examples/disagg/run_online.sh` and `run_offline.sh` files are thin
-delegates, not topology wrappers. See the
-[disaggregated training guide](disaggregated_training.md) for external
-Mooncake/SGLang prerequisites, freshness rules, and both launch forms.
+A single-node disaggregated config supervises the SpecForge producer and
+consumer with one command. This does not make the run colocated: the roles and
+their data-plane contract remain separate. For an external recipe, the command
+also does not start Mooncake or SGLang. Split deployments use the same config
+with `--role producer` or `--role consumer`; multi-node consumers add only
+`--node-rank` on each host. The optional `examples/disagg/run_online.sh` and
+`run_offline.sh` files are thin delegates, not topology wrappers. See the
+[disaggregated training guide](disaggregated_training.md) for external-service
+prerequisites, managed-local ownership, freshness rules, and both launch forms.
 
 ## Checkpoints and resume
 
@@ -439,9 +472,9 @@ Mooncake/SGLang prerequisites, freshness rules, and both launch forms.
 even when `save_interval` is zero or the final step is not an interval boundary.
 The `<run_id>-latest` symlink resolves to the newest complete checkpoint.
 
-Local offline runs restore draft weights, optimizer/scheduler, epoch/step/data
+Offline colocated runs restore draft weights, optimizer/scheduler, epoch/step/data
 position, and per-rank RNG. Offline disaggregated consumers have the same
-checkpoint contract. For a local offline run, override
+checkpoint contract. For an offline colocated run, override
 `training.resume_from`:
 
 ```bash

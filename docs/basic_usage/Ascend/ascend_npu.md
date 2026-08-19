@@ -1,9 +1,10 @@
 # Ascend NPU Tutorial
 
 This is an end-to-end tutorial for running SpecForge on Ascend NPU hosts. It
-walks through **installation → data preparation → online training → the
-managed-local full stack → multi-node disaggregation**, using Qwen3.5-4B DFlash
-as the running example. Validated on a 16-card A3 (64GB) host.
+walks through **installation → data preparation → online disaggregated training
+with external services → the managed-local full stack → split multi-node
+roles**, using Qwen3.5-4B DFlash as the running example. Validated on a 16-card
+A3 (64GB) host.
 
 ---
 
@@ -203,7 +204,7 @@ rm -rf outputs/qwen3.5-4b-dflash-npu-managed
 
 ---
 
-## 5. Multi-node disaggregation
+## 5. Split producer and consumer roles across nodes
 
 The same configs split across nodes with an explicit `--role`:
 

@@ -1,7 +1,8 @@
 # Disaggregated examples
 
-Disaggregated training uses the same typed config and public command as every
-other run:
+This directory contains optional launch helpers for producer/consumer runs; the
+YAML recipes themselves live under `examples/configs`. Disaggregated training
+uses the same typed config and public command as every other run:
 
 ```bash
 specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml
@@ -11,6 +12,19 @@ For a single trainer node, that command supervises the SpecForge producer and
 consumer together. The producer is one direct process; the consumer topology
 comes from `deployment.trainer` and is launched through torch distributed when
 `nproc_per_node > 1`.
+
+Choose the YAML from the category that matches the data flow:
+
+| Category | Recipe directory | What the launcher owns |
+| --- | --- | --- |
+| Offline disaggregated | `examples/configs/offline/disaggregated/` | Producer and consumer; feature storage is `shared_dir` or Mooncake |
+| Online disaggregated, external | `examples/configs/online/disaggregated/external/` | Producer and consumer only; Mooncake and SGLang already exist |
+| Online disaggregated, managed-local | `examples/configs/online/disaggregated/managed-local/` | Producer, consumer, local Mooncake, and local SGLang servers |
+
+`external` is a lifecycle boundary, not a network-location label. Services on
+`127.0.0.1` are external when the user started them. Similarly, supervising
+producer and consumer with one command does not make the topology colocated;
+they remain separate roles connected through the disaggregated data plane.
 
 The scripts in this directory are optional thin examples. The single-node
 wrappers only add the config path and forward arguments to `specforge train`;
@@ -149,14 +163,15 @@ validated against both v0.5.14 and #31847 commit `b7252cc`.
 
 ## External and managed-local services
 
-By default, online capture requires an already-running Mooncake deployment and
-patched SGLang capture server. Those long-lived services are not started or
-stopped by `specforge train`. Put stable, non-secret topology in the typed
-`deployment.disaggregated` section; inject authentication tokens, each node's
-Mooncake hostname, and device visibility through the deployment environment.
-The checked-in external-service recipes point at the standard local demo ports;
-replace those endpoint fields, or override them with environment values, for a
-remote deployment.
+Recipes under `online/disaggregated/external` require an already-running
+Mooncake deployment and patched SGLang capture server. Those services are not
+started or stopped by `specforge train`. Put stable, non-secret topology in the
+typed `deployment.disaggregated` section; inject authentication tokens, each
+node's Mooncake hostname, and device visibility through the deployment
+environment.
+The checked-in external recipes point at standard local demo ports; replace
+those endpoint fields, or override them with environment values, for another
+deployment.
 
 For a self-contained single-node development run, the managed-local recipes
 record Mooncake, one or more capture servers, their GPU placement, and the DP

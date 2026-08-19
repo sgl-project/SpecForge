@@ -1,6 +1,7 @@
 # Online colocated recipes
 
-This directory is reserved for online runs whose target capture and draft-model
-training share one process topology. SpecForge does not currently implement
-that topology, so there are no YAML recipes here. Current online recipes use
-the producer/consumer data plane under `../disaggregated/`.
+This directory is reserved so the catalog keeps the same mode/topology axes for
+online and offline recipes. SpecForge does not currently implement online
+colocated target capture, so no YAML belongs here. All supported online recipes
+use separate producer and consumer roles under `../disaggregated/`, regardless
+of whether one supervisor starts both roles.
