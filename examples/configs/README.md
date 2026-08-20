@@ -56,6 +56,13 @@ two-node migration of the 64K Kimi K3 continual run. Its dedicated
 SGLang revision and patch target, preserves the old effective global batch and
 prompt order, and documents the TP8 capture plus four-rank trainer topology.
 
+The `deepseek-v4-flash-dspark-disaggregated.yaml` recipe trains a DSpark
+drafter for DeepSeek-V4-Flash-0731 from scratch on ShareGPT. Its
+[runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
+documents the mHC-aware capture hook in the v0.5.14 SGLang patch, the bundled
+`deepseek-v4` chat template (the checkpoint ships no Jinja template), and a
+single-node TP4-capture plus four-rank-trainer topology on loopback endpoints.
+
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
 intentionally record their GPU allocation and loopback services. External

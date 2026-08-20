@@ -360,19 +360,43 @@ class MooncakeFeatureStore(FeatureStore):
 
         The receive buffer is registered with the transfer engine for the get_into
         (required by the raw-buffer path), then unregistered.
+
+        A negative status is retried with backoff before failing the run:
+        Mooncake's TCP data plane can time out a transfer under transient
+        source-side contention (observed as TRANSFER_FAIL/-800 after its
+        60-second batch deadline while the capture server is under load), and
+        one stalled transfer must not kill an otherwise healthy attempt. A
+        genuinely missing object keeps failing and still raises KeyError.
         """
         nb = _nbytes(out)
-        try:
-            self._store.register_buffer(out.data_ptr(), nb)
-        except Exception:  # pragma: no cover - some builds auto-register
-            pass
-        try:
-            rc = self._store.get_into(key, out.data_ptr(), nb)
-        finally:
+        attempts = 4
+        rc = None
+        for attempt in range(attempts):
             try:
-                self._store.unregister_buffer(out.data_ptr())
-            except Exception:  # pragma: no cover
+                self._store.register_buffer(out.data_ptr(), nb)
+            except Exception:  # pragma: no cover - some builds auto-register
                 pass
+            try:
+                rc = self._store.get_into(key, out.data_ptr(), nb)
+            finally:
+                try:
+                    self._store.unregister_buffer(out.data_ptr())
+                except Exception:  # pragma: no cover
+                    pass
+            if rc is not None and int(rc) >= 0:
+                break
+            if attempt < attempts - 1:
+                delay = 2.0 * (2**attempt)
+                logger.warning(
+                    "mooncake get_into failed (status %s) for %s; "
+                    "retry %d/%d in %.0fs",
+                    rc,
+                    key,
+                    attempt + 1,
+                    attempts - 1,
+                    delay,
+                )
+                time.sleep(delay)
         if rc is None or int(rc) < 0:
             raise KeyError(f"mooncake get_into failed (status {rc}) for {key}")
         # get_into returns the number of bytes read; a full read returns exactly
