@@ -22,7 +22,7 @@ Choose the YAML from the category that matches the data flow:
 | Online disaggregated, managed-local | `examples/configs/online/disaggregated/managed-local/` | Producer, consumer, local Mooncake, and local SGLang servers |
 
 `external` is a lifecycle boundary, not a network-location label. Services on
-`127.0.0.1` are external when the user started them. Similarly, supervising
+`127.0.0.1` are `external` when the user started them. Similarly, supervising
 producer and consumer with one command does not make the topology colocated;
 they remain separate roles connected through the disaggregated data plane.
 

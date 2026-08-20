@@ -8,8 +8,7 @@ specforge train -c run.yaml
 ```
 
 The producer captures or ingests features and the consumer runs the canonical
-trainer. Disaggregation alone does not say when features are produced or who
-owns the capture services:
+trainer.
 
 | Category | Producer responsibility | Feature store | Service ownership |
 | --- | --- | --- | --- |

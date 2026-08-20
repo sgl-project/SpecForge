@@ -247,7 +247,7 @@ to create the text. SpecForge uses it to identify assistant spans and build the
 loss mask.
 
 ```bash
-# After copying an online/disaggregated recipe, set these data fields:
+# After copying an online disaggregated example YAML, set these data fields:
 # data:
 #   train_data_path: ./your_preformatted_dataset.jsonl
 #   is_preformatted: true

@@ -34,13 +34,6 @@ examples/configs/
 | `online/disaggregated/external` | Live SGLang capture | Producer + consumer | User or scheduler starts Mooncake and SGLang |
 | `online/disaggregated/managed-local` | Live SGLang capture | Producer + consumer | SpecForge starts local Mooncake and SGLang from `managed_local` |
 
-`external` describes process ownership, not network distance. An external
-capture server may still run on `127.0.0.1`. Likewise, `managed-local` does not
-merge the producer and consumer: they remain separate roles under one local
-supervisor. Running a single-node external recipe without `--role` also
-supervises both SpecForge roles, but it never takes ownership of the external
-services.
-
 The directory is the source of truth for mode, topology, and service ownership.
 Some filenames retain historical `-online`, `-offline`, or `-disaggregated`
 labels so existing recipe identities and run names remain recognizable.
