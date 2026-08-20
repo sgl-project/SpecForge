@@ -23,7 +23,11 @@ data:
   chat_template: deepseek-v4
   cache_dir: cache
   build_dataset_num_proc: 64
-  dataloader_num_workers: 0
+  # Enables the loader's async prefetch (queue depth = workers): with 0 the
+  # streaming iterator fetches every ~330 MiB sample inline on the training
+  # thread and the whole Mooncake fetch lands on the critical path (~7 s of a
+  # ~16 s step). get_into releases the GIL, so prefetch genuinely overlaps.
+  dataloader_num_workers: 8
 
 training:
   strategy: dspark
@@ -60,10 +64,12 @@ runtime:
   producer_concurrency: 8
   # One 8K sample is ~0.4 GiB of BF16 DSpark features (five aux layers plus the
   # pre-head hidden state at width 4096). A complete optimizer quantum is 128
-  # samples (~51 GiB); keep at least one full quantum in flight so consumers
-  # can always dispatch complete optimizer windows without a backpressure
-  # deadlock.
-  in_flight_high_watermark: 128
+  # samples (~51 GiB). Keep TWO quanta in flight so the producer runs one
+  # window ahead and the consumer prefetch overlaps the ~10 GiB/rank fetch
+  # with the previous window's compute; the low watermark stays at one full
+  # quantum so complete optimizer windows always dispatch without a
+  # backpressure deadlock.
+  in_flight_high_watermark: 256
   in_flight_low_watermark: 128
   resident_high_watermark_bytes: 137438953472
   resident_low_watermark_bytes: 103079215104
@@ -82,8 +88,11 @@ deployment:
     consumer_state_dir: outputs/deepseek-v4-flash-dspark-disaggregated/consumer-state
     backend: mooncake
     store_id: deepseek-v4-flash-dspark-specforge-disaggregated
+    # Two TP2 capture servers out-produce one TP4 server (TP prefill scaling
+    # is sublinear) and keep the producer ahead of a four-rank consumer.
     server_urls:
       - http://127.0.0.1:30000
+      - http://127.0.0.1:30001
     mooncake_metadata_server: http://127.0.0.1:35880/metadata
     mooncake_master_server_addr: 127.0.0.1:35551
     mooncake_local_hostname: 127.0.0.1

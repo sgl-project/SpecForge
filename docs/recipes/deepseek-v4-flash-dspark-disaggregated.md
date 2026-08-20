@@ -8,10 +8,14 @@ confidence head. The drafter ties the target's `embed.weight` /
 `head.weight`; mask token `128799` is a reserved placeholder token (the same
 id DeepSeek reserves as `dspark_noise_token_id`).
 
-The recipe fits one 8-GPU B200 node: a TP4 capture server on four GPUs and a
-four-rank FSDP trainer on the other four (global batch 128 = 4 ranks x 32
-microbatches). Splitting capture and training across two nodes only changes
-the endpoints and `CUDA_VISIBLE_DEVICES`.
+The recipe fits one 8-GPU B200 node: two TP2 capture servers on four GPUs
+and a four-rank FSDP trainer on the other four (global batch 128 = 4 ranks x
+32 microbatches). Two TP2 servers out-produce one TP4 server (TP prefill
+scaling is sublinear), and with `dataloader_num_workers: 8` parallelizing the
+consumer's Mooncake fetches the measured step time is ~4.6 s (~780 optimizer
+steps/hour, data wait ~0.6 s) versus ~16 s for the naive
+one-TP4-server/synchronous-loader setup. Splitting capture and training
+across two nodes only changes the endpoints and `CUDA_VISIBLE_DEVICES`.
 
 ## Required source revisions
 
@@ -46,7 +50,7 @@ python scripts/prepare_data.py --dataset sharegpt
 
 writes `cache/dataset/sharegpt_train.jsonl`, which the recipe points at.
 
-## Capture node (GPUs 0-3)
+## Capture servers (GPUs 0-3)
 
 Start Mooncake with a global segment sized for at least one optimizer quantum
 of features (128 samples x ~0.4 GiB at 8K tokens), then the patched server.
@@ -84,14 +88,15 @@ export MOONCAKE_LOCAL_BUFFER_SIZE=$((1 << 30))
 # CUDA backends. The QUANT knob is honored via the checked-in capture patch.
 export FLASHINFER_USE_CUDA_NORM=1
 export FLASHINFER_USE_CUDA_QUANT=1
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
+# One server per GPU pair; repeat with CUDA_VISIBLE_DEVICES=2,3 --port 30001.
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
   --host 0.0.0.0 \
   --port 30000 \
   --model-path deepseek-ai/DeepSeek-V4-Flash-0731 \
   --trust-remote-code \
   --skip-tokenizer-init \
-  --tp-size 4 \
-  --mem-fraction-static 0.85 \
+  --tp-size 2 \
+  --mem-fraction-static 0.88 \
   --context-length 8704 \
   --max-running-requests 8 \
   --chunked-prefill-size -1 \

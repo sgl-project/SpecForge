@@ -52,6 +52,9 @@ class _QueuePrefetchState:
         self.buffer: queue_module.Queue[Any] = queue_module.Queue(maxsize=depth)
         self.stop = threading.Event()
         self.thread: Optional[threading.Thread] = None
+        # Optional second stage (e.g. the ref-leasing thread of the pipelined
+        # online prefetcher); joined by the same shutdown path.
+        self.aux_thread: Optional[threading.Thread] = None
         self.outstanding: "OrderedDict[str, _OutstandingRef]" = OrderedDict()
         self.outstanding_lock = threading.Lock()
         self.shutdown_lock = threading.Lock()
@@ -379,13 +382,37 @@ class FeatureDataLoader:
                 )
             return self.queue.get(self.batch_size, timeout_s=_PREFETCH_POLL_S)
 
-        def _worker() -> None:
+        # Materialize up to `depth` batches concurrently: a single fetch
+        # stream tops out well below what one optimizer window needs per
+        # step. A dedicated ref stage leases refs (it may block on the ref
+        # queue indefinitely between windows) and submits fetches to a small
+        # pool; the emit stage waits only on already-submitted fetches, so a
+        # completed batch is always deliverable to the trainer even while the
+        # ref stage is blocked waiting for the next window. Batches are
+        # emitted in submission order and lease/ack semantics are unchanged —
+        # a batch's refs are tracked on lease and handed to the trainer (or
+        # failed) exactly once.
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=depth, thread_name_prefix="loader-fetch")
+        order: queue_module.Queue = queue_module.Queue(maxsize=depth)
+
+        def put_order_interruptibly(item: Any) -> bool:
+            while not state.stop.is_set():
+                try:
+                    order.put(item, timeout=_PREFETCH_POLL_S)
+                    return True
+                except queue_module.Full:
+                    continue
+            return False
+
+        def _ref_worker() -> None:
             try:
                 while not state.stop.is_set():
                     refs = get_refs_interruptibly()
                     if not refs:
                         if not state.stop.is_set():
-                            put_interruptibly(eos)
+                            put_order_interruptibly(eos)
                         return
                     state.track(refs)
                     if state.stop.is_set():
@@ -395,10 +422,30 @@ class FeatureDataLoader:
                             self._settle_incomplete_queue_batch(refs)
                         finally:
                             state.mark_yielded_or_failed(refs)
+                        put_order_interruptibly(eos)
+                        return
+                    future = pool.submit(self._make_batch, refs)
+                    if not put_order_interruptibly((future, refs)):
+                        return
+            except BaseException as exc:  # loud failure, never a silent hang
+                put_order_interruptibly(exc)
+
+        def _worker() -> None:
+            try:
+                while not state.stop.is_set():
+                    try:
+                        item = order.get(timeout=_PREFETCH_POLL_S)
+                    except queue_module.Empty:
+                        continue
+                    if item is eos:
                         put_interruptibly(eos)
                         return
+                    if isinstance(item, BaseException):
+                        put_interruptibly(item)
+                        return
+                    future, refs = item
                     try:
-                        batch = self._make_batch(refs)
+                        batch = future.result()
                     except Exception as exc:
                         self.queue.fail(
                             refs, reason=f"materialize:{exc}", retryable=False
@@ -411,6 +458,18 @@ class FeatureDataLoader:
                         return
             except BaseException as exc:  # loud failure, never a silent hang
                 put_interruptibly(exc)
+            finally:
+                # Never block worker shutdown on in-flight fetches; refs of
+                # unemitted batches stay tracked and are settled by
+                # _shutdown_prefetch like any other never-yielded lease.
+                pool.shutdown(wait=False, cancel_futures=True)
+
+        ref_worker = threading.Thread(
+            target=_ref_worker,
+            name="loader-refs",
+            daemon=True,
+        )
+        state.aux_thread = ref_worker
 
         worker = threading.Thread(
             target=_worker,
@@ -426,6 +485,7 @@ class FeatureDataLoader:
             if self._prefetch_state is not None:
                 raise RuntimeError("FeatureDataLoader already has an active iterator")
             self._prefetch_state = state
+            ref_worker.start()
             worker.start()
 
         try:
@@ -456,15 +516,17 @@ class FeatureDataLoader:
             if state.shutdown_complete:
                 return
             state.stop.set()
-            worker = state.thread
-            if worker is not None and worker is not threading.current_thread():
+            for worker in (state.thread, state.aux_thread):
+                if worker is None or worker is threading.current_thread():
+                    continue
                 worker.join(timeout=_PREFETCH_JOIN_TIMEOUT_S)
                 if worker.is_alive():
                     outstanding_ids = state.outstanding_ids()
                     raise RuntimeError(
-                        "FeatureDataLoader prefetch worker did not stop within "
-                        f"{_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend get/materialize "
-                        f"is still blocked, outstanding_refs={outstanding_ids}"
+                        f"FeatureDataLoader prefetch worker {worker.name!r} did "
+                        f"not stop within {_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend "
+                        "get/materialize is still blocked, "
+                        f"outstanding_refs={outstanding_ids}"
                     )
 
             outstanding = state.outstanding_entries()
