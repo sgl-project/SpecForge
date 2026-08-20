@@ -60,6 +60,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             {
                 "trim_loss_positions": True,
                 "trim_backbone_rows": False,
+                "trim_backbone_rows_max_density": 0.35,
                 "compact_teacher": True,
                 "compact_teacher_chunk_size": 2048,
             },

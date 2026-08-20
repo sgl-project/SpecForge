@@ -23,7 +23,9 @@ Layers (CI keeps guarding the union-row math even without GPUs):
    falling back to the untrimmed path).
 """
 
+import io
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -142,6 +144,7 @@ def _masks_single():
 class _SingleRankEquivBase(unittest.TestCase):
     backend = "sdpa"
     allones_tol = 1e-6
+    max_density = 1.0
 
     @classmethod
     def _build(cls, workdir):
@@ -194,6 +197,11 @@ class _SingleRankEquivBase(unittest.TestCase):
             plosses, *_ = model(
                 trim_loss_positions=True,
                 trim_backbone_rows=trim_backbone,
+                # Pin the density guard off: these cases (allones in particular)
+                # sit above the default threshold, so with the guard active they
+                # would fall back to the full path and stop exercising the
+                # trimmed kernels while still passing.
+                trim_backbone_rows_max_density=self.max_density,
                 **batch,
             )
         return [float(p.item()) for p in plosses]
@@ -201,7 +209,10 @@ class _SingleRankEquivBase(unittest.TestCase):
     def _grad_norm(self, model, batch, trim_backbone):
         model.zero_grad(set_to_none=True)
         plosses, *_ = model(
-            trim_loss_positions=True, trim_backbone_rows=trim_backbone, **batch
+            trim_loss_positions=True,
+            trim_backbone_rows=trim_backbone,
+            trim_backbone_rows_max_density=self.max_density,
+            **batch,
         )
         loss = sum(0.8**i * plosses[i] for i in range(len(plosses)))
         loss.backward()
@@ -277,6 +288,57 @@ class TestEquivTrimBackboneFa(_SingleRankEquivBase):
     allones_tol = 1e-4
 
 
+@unittest.skipUnless(CUDA, "requires one CUDA device")
+class TestDensityGateTrimSide(_SingleRankEquivBase):
+    """Budget wide open: every mask must still take (and match on) the B path."""
+
+    backend = "sdpa"
+    allones_tol = 1e-6
+    max_density = 1.0
+
+    def test_gate_open_matches_full(self):
+        masks = _masks_single()
+        for name in ("blocks", "prompt_heavy", "isolated"):
+            with self.subTest(mask=name):
+                self._run_case(name, masks[name], lambda a: max(1e-3 * abs(a), 1e-4))
+
+
+@unittest.skipUnless(CUDA, "requires one CUDA device")
+class TestDensityGateFullSide(_SingleRankEquivBase):
+    """Budget closed: the guard drops to the A-level path, results unchanged.
+
+    The guard exists because trimmed steps use a costlier per-row kernel, so it
+    must be able to turn the B path off without changing what training sees.
+    Both sides of the threshold are therefore checked against the same
+    untrimmed reference.
+    """
+
+    backend = "sdpa"
+    allones_tol = 1e-6
+    max_density = 0.01
+
+    def test_gate_closed_matches_full(self):
+        masks = _masks_single()
+        for name in ("blocks", "prompt_heavy", "isolated", "allones"):
+            with self.subTest(mask=name):
+                self._run_case(name, masks[name], lambda a: max(1e-3 * abs(a), 1e-4))
+
+    def test_gate_closed_actually_skips_trim(self):
+        # Guard against the silent-pass failure mode: a gate that never fires
+        # would make the case above vacuous, so assert the model said so.
+        workdir = tempfile.mkdtemp(prefix="trim_b_gate_")
+        self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
+        model, head = self._build(workdir)
+        model.train()
+        batch = self._batch(head, _masks_single()["blocks"])
+        with self.assertLogs("specforge.algorithms.eagle3.model", level="INFO") as cm:
+            self._step_losses(model, batch, True)
+        self.assertTrue(
+            any("trim_backbone_rows skipped" in line for line in cm.output),
+            f"gate should have closed, got: {cm.output}",
+        )
+
+
 def _write_usp_workdir(workdir):
     from tests.test_runtime import _fixtures as fx
 
@@ -293,6 +355,19 @@ def _write_usp_workdir(workdir):
     m4 = torch.zeros(SEQ, dtype=torch.long)
     m4[[12, 13]] = 1
     masks["tailonly"] = m4
+    # Ranks land on opposite sides of the density budget: the first quarter is
+    # fully supervised (its local row sets are near-full, so that rank alone
+    # would refuse to trim) while the rest carries one supervised position per
+    # quarter. Without a rank-uniform decision the ranks would run different
+    # code paths and their collectives would not line up.
+    m5 = torch.zeros(SEQ, dtype=torch.long)
+    m5[: SEQ // 4] = 1
+    # Every rank's shard needs an adjacent supervised pair of its own: the data
+    # filter drops shards without one, which empties the loader on those ranks.
+    for q in (1, 2, 3):
+        base = q * (SEQ // 4)
+        m5[[base + 2, base + 3]] = 1
+    masks["rank_split"] = m5
     g = torch.Generator().manual_seed(11)
     base_input = torch.randint(0, fx.V, (SEQ,), generator=g)
     base_hid = torch.randn(1, SEQ, fx.H, generator=g).to(torch.bfloat16)
@@ -346,7 +421,7 @@ def _usp_worker(rank, world_size, port, workdir):
         provider = algorithm.providers.offline_for("text")
 
         results = {}
-        for case in ("allones", "boundary", "tailonly"):
+        for case in ("allones", "boundary", "tailonly", "rank_split"):
             refs = provider.build_reader(
                 os.path.join(workdir, f"features_{case}"),
                 run_id=f"trimb-{case}",
@@ -365,18 +440,40 @@ def _usp_worker(rank, world_size, port, workdir):
             )
             batch = next(iter(loader))
 
-            def step_losses(trim_backbone):
+            def step_losses(trim_backbone, density=1.0, capture=False):
                 strat = algorithm.providers.step.build(
                     model,
                     target_head=target_head,
                     trim_loss_positions=True,
                     trim_backbone_rows=trim_backbone,
+                    trim_backbone_rows_max_density=density,
                 )
-                with torch.no_grad():
-                    out = strat.forward_loss(batch)
-                return [float(p.item()) for p in out.metrics["plosses"]]
+                # capture=True records whether this rank's gate closed, by
+                # listening for the model's own skip log.
+                buf = io.StringIO()
+                handler = logging.StreamHandler(buf)
+                target = logging.getLogger("specforge.algorithms.eagle3.model")
+                if capture:
+                    target.addHandler(handler)
+                    target.setLevel(logging.INFO)
+                try:
+                    with torch.no_grad():
+                        out = strat.forward_loss(batch)
+                finally:
+                    if capture:
+                        target.removeHandler(handler)
+                losses = [float(p.item()) for p in out.metrics["plosses"]]
+                return (losses, buf.getvalue()) if capture else losses
 
-            results[case] = {"off": step_losses(False), "on": step_losses(True)}
+            entry = {"off": step_losses(False), "on": step_losses(True)}
+            if case == "rank_split":
+                # Ranks sit on opposite sides of the budget here; the decision
+                # must still come out identical everywhere or the collectives
+                # would diverge. Capture the flag each rank actually used.
+                gated, out = step_losses(True, density=0.35, capture=True)
+                entry["gated"] = gated
+                entry["trim_flag"] = 0 if "trim_backbone_rows skipped" in out else 1
+            results[case] = entry
 
         gathered = [None] * world_size
         dist.all_gather_object(gathered, results)
@@ -401,6 +498,45 @@ def _usp_worker_forced_sdpa(rank, world_size, port, workdir):
     CUDA and NGPU >= WORLD_SIZE and _has_standard_flash_attention(),
     "requires four CUDA devices and the standard flash-attn USP interfaces",
 )
+class TestDensityGateUspAgreement(unittest.TestCase):
+    """The density decision must be identical on every rank.
+
+    Per-rank chunks carry different supervision, so the row-count budget can
+    land on opposite sides of the threshold across ranks. A rank that trims
+    while another runs the full path issues a different sequence of
+    collectives, which hangs the job rather than producing a wrong number --
+    so this asserts the agreed flag, not just the losses.
+    """
+
+    def test_gate_flag_is_rank_uniform(self):
+        import torch.multiprocessing as mp
+
+        workdir = tempfile.mkdtemp(prefix="trim_b_gate_usp_")
+        self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
+        _write_usp_workdir(workdir)
+        mp.spawn(
+            _usp_worker,
+            args=(WORLD_SIZE, 29887, workdir),
+            nprocs=WORLD_SIZE,
+            join=True,
+        )
+        with open(os.path.join(workdir, "results.json")) as fh:
+            gathered = json.load(fh)
+        flags = [res["rank_split"]["trim_flag"] for res in gathered]
+        self.assertNotIn(-1, flags, "gate instrumentation did not fire on some rank")
+        self.assertEqual(
+            len(set(flags)), 1, f"ranks disagreed on the density gate: {flags}"
+        )
+        for rank, res in enumerate(gathered):
+            off, gated = res["rank_split"]["off"], res["rank_split"]["gated"]
+            for j, (a, b) in enumerate(zip(off, gated)):
+                self.assertLessEqual(
+                    abs(a - b),
+                    max(1e-3 * abs(a), 2e-4),
+                    msg=f"rank_split rank{rank} step{j}: off={a} gated={b}",
+                )
+
+
 class TestEquivTrimBackboneUspFourRank(unittest.TestCase):
     def test_sdpa_core_matches_on_ring4(self):
         import torch.multiprocessing as mp

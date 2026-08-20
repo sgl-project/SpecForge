@@ -272,6 +272,7 @@ Common fields:
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
 | `training.trim_backbone_rows` | `false` | Also run the draft backbone at TTT steps >= 1 only on rows that can still emit loss (union across remaining steps); step 0 stays full-length. Requires `trim_loss_positions` and attention backend sdpa/fa/usp. |
+| `training.trim_backbone_rows_max_density` | `0.35` | Per-sample guard for `trim_backbone_rows`: trimmed steps use a costlier per-row attention kernel, so the trim is skipped when the kept rows summed over TTT steps exceed this fraction of the full-length work. Set to `1.0` to always trim. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |

@@ -167,6 +167,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             attention_backend="flex_attention",
             trim_loss_positions=True,
             trim_backbone_rows=False,
+            trim_backbone_rows_max_density=0.35,
             compact_teacher=True,
             compact_teacher_chunk_size=1024,
             lambda_base_start=0.75,
@@ -267,6 +268,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 attention_backend="flex_attention",
                 trim_loss_positions=False,
                 trim_backbone_rows=False,
+                trim_backbone_rows_max_density=0.35,
                 compact_teacher=False,
                 compact_teacher_chunk_size=None,
             )
@@ -303,6 +305,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 ("compact_teacher", False),
                 ("compact_teacher_chunk_size", None),
                 ("trim_backbone_rows", False),
+                ("trim_backbone_rows_max_density", 0.35),
                 ("trim_loss_positions", False),
             ),
         )

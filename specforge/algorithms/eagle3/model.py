@@ -22,6 +22,7 @@
 
 """EAGLE3 training model implementation."""
 
+import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -38,6 +39,8 @@ from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
+
+logger = logging.getLogger(__name__)
 
 
 class Eagle3Model(nn.Module):
@@ -263,6 +266,7 @@ class OnlineEagle3Model(Eagle3Model):
         compact_teacher_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
         trim_loss_positions: bool = False,
         trim_backbone_rows: bool = False,
+        trim_backbone_rows_max_density: float = 0.35,
     ) -> Tuple[
         List[torch.Tensor],
         List[torch.Tensor],
@@ -290,6 +294,9 @@ class OnlineEagle3Model(Eagle3Model):
                 >= 1 only on the rows that can still emit loss at that or a later
                 step (requires trim_loss_positions; step 0 stays full-length as it
                 provides the cross-position K/V context).
+            trim_backbone_rows_max_density: steps whose kept-row set exceeds this
+                fraction of the chunk run the full-length path instead -- trimming
+                costs more per row, so it stops paying once few rows are dropped.
         """
         adapter = self._make_adapter()
         # Step 1: handle vocab size
@@ -471,6 +478,55 @@ class OnlineEagle3Model(Eagle3Model):
             if b_enabled
             else None
         )
+        # Cost guard. A trimmed step swaps flash attention for an explicit
+        # masked-matmul kernel that costs more per row, so trimming only pays
+        # while the kept-row sets are small. Measured on this repo (8192-token
+        # chunk, TTT=7, RTX 6000 Ada): flash attention costs ~16.7 us/row and
+        # the trimmed kernel 28-62 us/row, so the step time breaks even near
+        # 40% density and degrades to 2.4x slower at full supervision, where
+        # no row can be dropped at all. Compare the two sides directly:
+        #   trimmed rows  sum_i |R_i|   vs   full rows  (k-1) * chunk
+        # and keep the B path only while the former stays under the budget.
+        # The decision is per sample, not per step: |R_i| barely varies across
+        # steps for contiguous supervision (it shrinks by one row per
+        # supervised run per step), and a mixed full/trimmed unroll would need
+        # per-backend K/V layout conversion plus an extra head-dimension
+        # gather under USP -- new collectives for a safety guard is a bad
+        # trade.
+        if b_enabled:
+            chunk = trim_pack["full_len"]
+            rows_sum = sum(
+                int(trim_pack["b_rows_steps"][i].numel()) for i in range(1, self.length)
+            )
+            budget = trim_backbone_rows_max_density * (self.length - 1) * chunk
+            trim_pays = rows_sum <= budget
+            if self.attention_backend == "usp":
+                # Same reason as the b_enabled agreement above: per-rank row
+                # counts differ, so ranks can land on opposite sides of the
+                # budget, and a mixed trimmed/full unroll across ranks would
+                # mismatch collectives. Agree by MIN -- running the full path
+                # is always correct, it only forgoes savings.
+                flag = torch.tensor(1 if trim_pays else 0, device=hidden_states.device)
+                torch.distributed.all_reduce(
+                    flag, op=torch.distributed.ReduceOp.MIN, group=adapter.sp_group
+                )
+                trim_pays = bool(flag.item())
+            if not trim_pays:
+                # Surface it: the user asked for row trimming and did not get
+                # it, and the reason (dense supervision) is a property of their
+                # data, not a bug.
+                logger.info(
+                    "trim_backbone_rows skipped for this sample: kept rows "
+                    "%d exceed the budget %d (%.2f x %d steps x %d chunk); "
+                    "the trimmed attention kernel costs more per row than "
+                    "flash attention, so trimming this sample would be slower",
+                    rows_sum,
+                    int(budget),
+                    trim_backbone_rows_max_density,
+                    self.length - 1,
+                    chunk,
+                )
+                b_enabled = False
         for idx in range(self.length):
             b_active = b_enabled and idx >= 1
             if b_active:
