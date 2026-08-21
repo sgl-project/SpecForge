@@ -92,7 +92,7 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
 
     def test_every_online_recipe_uses_the_server_data_plane(self):
         online_recipes = []
-        for path in sorted(EXAMPLE_CONFIG_DIR.glob("*.yaml")):
+        for path in sorted(EXAMPLE_CONFIG_DIR.rglob("*.yaml")):
             payload = yaml.safe_load(path.read_text())
             data = payload["data"]
             if not (data.get("train_data_path") or data.get("prompts_path")):
@@ -106,10 +106,10 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
             )
         self.assertTrue(online_recipes)
         self.assertFalse(
-            (EXAMPLE_CONFIG_DIR / "qwen2.5-vl-7b-eagle3-online.yaml").exists()
+            any(EXAMPLE_CONFIG_DIR.rglob("qwen2.5-vl-7b-eagle3-online.yaml"))
         )
         self.assertFalse(
-            (EXAMPLE_CONFIG_DIR / "qwen2.5-vl-32b-eagle3-online.yaml").exists()
+            any(EXAMPLE_CONFIG_DIR.rglob("qwen2.5-vl-32b-eagle3-online.yaml"))
         )
 
     def test_application_resolution_accepts_the_server_only_contract(self):

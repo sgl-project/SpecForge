@@ -392,6 +392,9 @@ def build_dflash_model(
             loss_type=cfg.training.loss_type,
             dpace_alpha=cfg.training.dpace_alpha,
             selector_loss_alpha=cfg.training.dflash2_selector_loss_alpha,
+            lk_loss_type=cfg.training.lk_loss_type,
+            kl_scale=cfg.training.kl_scale,
+            kl_decay=cfg.training.kl_decay,
         ),
     )
 

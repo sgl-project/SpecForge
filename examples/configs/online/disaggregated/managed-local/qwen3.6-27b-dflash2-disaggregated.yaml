@@ -28,6 +28,8 @@ training:
   attention_backend: flex_attention
   num_anchors: 512
   loss_decay_gamma: 7.0
+  lk_loss_type: lambda
+  loss_type: dpace
   objective_chunk_blocks: 128
   dflash2_selector_loss_alpha: 1.0
   save_interval: 200
@@ -35,10 +37,13 @@ training:
   dist_timeout: 30
   seed: 42
 
+# tracking:
+#   report_to: wandb
+#   wandb_project: qwen36-dflash2
+#   wandb_name: qwen36-27b-dflash2-1srv-1trainer
+
 tracking:
-  report_to: wandb
-  wandb_project: qwen36-dflash2
-  wandb_name: qwen36-27b-dflash2-1srv-1trainer
+  report_to: tensorboard
 
 runtime:
   producer_lease: 64
@@ -53,14 +58,13 @@ deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 1
+    nproc_per_node: 4
   disaggregated:
     control_dir: outputs/qwen3.6-27b-dflash2-disaggregated/control
     consumer_state_dir: outputs/qwen3.6-27b-dflash2-disaggregated/consumer-state
     backend: mooncake
     managed_local:
-      trainer_cuda_visible_devices:
-        - "1"
+      trainer_cuda_visible_devices: ["4", "5", "6", "3"]
       mooncake:
         protocol: tcp
         global_segment_size_bytes: 68719476736
@@ -70,4 +74,14 @@ deployment:
           cuda_visible_devices:
             - "0"
           tp_size: 1
-          mem_fraction_static: 0.7
+          mem_fraction_static: 0.8
+        - port: 30010
+          cuda_visible_devices:
+            - "1"
+          tp_size: 1
+          mem_fraction_static: 0.8
+        - port: 30020
+          cuda_visible_devices:
+            - "2"
+          tp_size: 1
+          mem_fraction_static: 0.8

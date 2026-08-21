@@ -546,8 +546,9 @@ class TrainingConfig(StrictConfigModel):
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
     dist_timeout: int = Field(default=10, gt=0)
-    #: EAGLE3 objective.
-    lk_loss_type: Optional[Literal["lambda", "alpha"]] = None
+    #: Acceptance-aware token objective. DFlash-family hard targets make
+    #: ``alpha`` equivalent to CE; ``lambda`` mixes CE and TV.
+    lk_loss_type: Optional[Literal["lambda", "alpha", "tv"]] = None
     kl_scale: float = 1.0
     kl_decay: float = 1.0
     #: Compute the teacher target_p, draft logits and loss only at supervised

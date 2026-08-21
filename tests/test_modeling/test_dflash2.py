@@ -84,6 +84,9 @@ class DFlash2ArchitectureTest(unittest.TestCase):
             dpace_alpha=0.1,
             loss_decay_gamma=0.9,
             loss_type="dflash",
+            lk_loss_type="lambda",
+            kl_scale=0.9,
+            kl_decay=0.8,
             mask_token_id=31,
             num_anchors=8,
             selector_loss_alpha=0.75,
@@ -96,6 +99,7 @@ class DFlash2ArchitectureTest(unittest.TestCase):
         self.assertEqual(contract["dflash2_selector_rank"], 4)
         self.assertEqual(contract["dflash2_selector_top_k"], 3)
         self.assertEqual(contract["dflash2_selector_loss_alpha"], 0.75)
+        self.assertEqual(contract["dflash_lk_loss_type"], "lambda")
 
     def test_backward_reaches_convolution_parameters(self):
         config = _tiny_config()
@@ -166,6 +170,42 @@ class DFlash2GroupedConvTest(unittest.TestCase):
 
 
 class CandidateSelectorTest(unittest.TestCase):
+    def test_training_objective_uses_serving_unary_transform(self):
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = object()
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float() * 0.5
+
+        model = OnlineDFlashModel(
+            draft_model=Draft(),
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(3, 3),
+            mask_token_id=2,
+            block_size=2,
+            attention_backend="eager",
+            selector_loss_alpha=0.0,
+        )
+        hidden = torch.tensor([[[[0.0, 0.0, 0.0], [0.0, 2.0, 1.0]]]])
+        target_ids = torch.tensor([[[0, 0]]])
+        weights = torch.tensor([[[0.0, 1.0]]])
+
+        terms = model._dflash_objective_chunk_terms(
+            hidden,
+            target_ids,
+            weights,
+            target_ids,
+        )
+
+        expected = torch.nn.functional.cross_entropy(
+            hidden[0, 0, 1].unsqueeze(0) * 0.5,
+            torch.tensor([0]),
+        )
+        torch.testing.assert_close(terms[0], expected)
+
     def test_scores_unary_plus_predecessor_transition(self):
         selector = CandidateSelector(
             hidden_size=2,
@@ -282,7 +322,10 @@ class CandidateSelectorTest(unittest.TestCase):
             predecessors,
         )
 
-        combined_num, _, _, _, selector_num, selector_den, _, covered = terms
+        base_num = terms[0]
+        selector_num = terms[6]
+        selector_den = terms[10]
+        covered = terms[11]
         base_ce = torch.nn.functional.cross_entropy(
             hidden[0, 0, 1].unsqueeze(0),
             torch.tensor([0]),
@@ -292,9 +335,25 @@ class CandidateSelectorTest(unittest.TestCase):
             torch.tensor([1]),
         )
         torch.testing.assert_close(selector_num, selector_ce)
-        torch.testing.assert_close(combined_num, base_ce + selector_ce)
+        torch.testing.assert_close(base_num + selector_num, base_ce + selector_ce)
         self.assertEqual(selector_den.item(), 1.0)
         self.assertEqual(covered.item(), 0.0)
+
+        # D-PACE uses the unary target probability to derive one detached
+        # position weight, and that same weight must scale both objectives.
+        model.loss_type = "dpace"
+        model.dpace_alpha = 0.5
+        dpace_terms = model._dflash_objective_chunk_terms(
+            hidden,
+            targets,
+            weights,
+            predecessors,
+        )
+        unary_probability = torch.exp(-base_ce)
+        dpace_weight = 0.5 * unary_probability + 0.5
+        torch.testing.assert_close(dpace_terms[0], base_ce * dpace_weight)
+        torch.testing.assert_close(dpace_terms[6], selector_ce * dpace_weight)
+        torch.testing.assert_close(dpace_terms[10], dpace_weight)
 
     def test_selector_objective_backpropagates_to_all_selector_factors(self):
         class Draft(nn.Module):
@@ -331,7 +390,7 @@ class CandidateSelectorTest(unittest.TestCase):
             torch.tensor([[[0.0, 1.0]]]),
             torch.tensor([[[0, 1]]]),
         )
-        terms[0].backward()
+        (terms[0] + terms[6]).backward()
 
         selector = draft.candidate_selector
         for parameter in (

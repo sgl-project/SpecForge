@@ -1,6 +1,7 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -32,6 +33,7 @@ _VALID_LOSS_TYPES = {
     "dpace-continuation-value-only",
 }
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
+_VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
 
 
 def compute_accept_len(
@@ -167,6 +169,9 @@ class OnlineDFlashModel(nn.Module):
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
         selector_loss_alpha: float = 1.0,
+        lk_loss_type: Optional[str] = None,
+        kl_scale: float = 1.0,
+        kl_decay: float = 1.0,
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -179,10 +184,9 @@ class OnlineDFlashModel(nn.Module):
             raise ValueError("objective_chunk_blocks must be >= 0")
         if selector_loss_alpha < 0:
             raise ValueError("selector_loss_alpha must be >= 0")
-        candidate_selector = getattr(draft_model, "candidate_selector", None)
-        if candidate_selector is not None and loss_type != "dflash":
+        if lk_loss_type not in _VALID_LK_LOSS_TYPES:
             raise ValueError(
-                "DFlash2 candidate selection currently requires loss_type='dflash'"
+                "lk_loss_type must be one of None, 'alpha', 'lambda', or 'tv'"
             )
 
         self.draft_model = draft_model
@@ -197,6 +201,9 @@ class OnlineDFlashModel(nn.Module):
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
         self.selector_loss_alpha = float(selector_loss_alpha)
+        self.lk_loss_type = lk_loss_type
+        self.kl_scale = float(kl_scale)
+        self.kl_decay = float(kl_decay)
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -390,18 +397,25 @@ class OnlineDFlashModel(nn.Module):
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
-        """Return additive DFlash/D-PACE loss and accuracy terms."""
+        """Return additive token-objective, weighting, and metric terms."""
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         logits = self.lm_head(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
+        candidate_selector = getattr(self.draft_model, "candidate_selector", None)
+        objective_logits = (
+            self.draft_model.transform_unary_logits(logits)
+            if candidate_selector is not None
+            else logits
+        )
         neg_log_q = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
+            objective_logits.reshape(-1, objective_logits.shape[-1]),
             target_ids.reshape(-1),
             reduction="none",
         ).reshape_as(target_ids)
 
+        target_probability = torch.exp(-neg_log_q)
         loss_weights = weight_mask
         if self.loss_type == "dflash":
             if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
@@ -413,34 +427,40 @@ class OnlineDFlashModel(nn.Module):
                     -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
                 )
                 loss_weights = loss_weights * decay_weights
-            loss_num = (neg_log_q * loss_weights).sum()
             loss_den = loss_weights.sum()
         elif self.loss_type in _DPACE_LOSS_TYPES:
             with torch.no_grad():
-                target_probability = torch.exp(-neg_log_q)
                 dpace_weights = self._dpace_weight(
-                    target_probability,
+                    target_probability.detach(),
                     weight_mask,
                     weight_mask > 0,
                     self.loss_type,
                 )
-            loss_num = (neg_log_q * weight_mask * dpace_weights).sum()
-            loss_den = loss_num.new_zeros(())
+            loss_weights = weight_mask * dpace_weights
+            loss_den = neg_log_q.new_zeros(())
         else:  # defensive: __init__ validates the configured loss type.
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
-        selector_loss_num = loss_num.new_zeros(())
-        selector_loss_den = loss_num.new_zeros(())
-        selector_correct_num = loss_num.new_zeros(())
-        selector_covered_num = loss_num.new_zeros(())
-        candidate_selector = getattr(self.draft_model, "candidate_selector", None)
+        ce_loss_num = (neg_log_q * loss_weights).sum()
+        if self.lk_loss_type in {"lambda", "tv"}:
+            tv_loss_num = ((1.0 - target_probability) * loss_weights).sum()
+        else:
+            tv_loss_num = ce_loss_num.new_zeros(())
+        target_probability_num = (target_probability.detach() * weight_mask).sum()
+
+        selector_ce_num = ce_loss_num.new_zeros(())
+        selector_tv_num = ce_loss_num.new_zeros(())
+        selector_probability_num = ce_loss_num.new_zeros(())
+        selector_correct_num = ce_loss_num.new_zeros(())
+        selector_weight_den = ce_loss_num.new_zeros(())
+        selector_covered_num = ce_loss_num.new_zeros(())
         if candidate_selector is not None and self.selector_loss_alpha > 0:
             # Serving always re-ranks the strict top-k. During training, replace
             # the weakest candidate with the gold token when it is missing. This
             # gives the selector a useful gradient before the randomly initialized
             # draft head has meaningful top-k coverage, while retaining the
             # strongest K-1 inference negatives.
-            selector_source_logits = self.draft_model.transform_unary_logits(logits)
+            selector_source_logits = objective_logits
             unary_logits, candidate_ids = selector_source_logits.topk(
                 candidate_selector.top_k,
                 dim=-1,
@@ -480,9 +500,14 @@ class OnlineDFlashModel(nn.Module):
                 target_candidate_index.reshape(-1),
                 reduction="none",
             ).reshape_as(target_ids)
-            selector_weights = loss_weights
-            selector_loss_num = (selector_ce * selector_weights).sum()
-            selector_loss_den = selector_weights.sum()
+            selector_probability = torch.exp(-selector_ce)
+            selector_ce_num = (selector_ce * loss_weights).sum()
+            if self.lk_loss_type in {"lambda", "tv"}:
+                selector_tv_num = ((1.0 - selector_probability) * loss_weights).sum()
+            selector_probability_num = (
+                selector_probability.detach() * weight_mask
+            ).sum()
+            selector_weight_den = loss_weights.sum()
             selector_covered_num = (weight_mask * target_is_candidate.float()).sum()
             with torch.no_grad():
                 selected_ids = candidate_ids.gather(
@@ -490,26 +515,49 @@ class OnlineDFlashModel(nn.Module):
                     selector_logits.argmax(dim=-1, keepdim=True),
                 ).squeeze(-1)
                 selector_correct_num = (
-                    (selected_ids == target_ids).float() * selector_weights
+                    (selected_ids == target_ids).float() * loss_weights
                 ).sum()
-            loss_num = loss_num + self.selector_loss_alpha * selector_loss_num
 
         with torch.no_grad():
-            predicted_ids = logits.argmax(dim=-1)
+            predicted_ids = objective_logits.argmax(dim=-1)
             correct_num = (
                 ((predicted_ids == target_ids) & (weight_mask > 0.5)).sum().float()
             )
             accuracy_den = weight_mask.sum()
         return (
-            loss_num,
+            ce_loss_num,
+            tv_loss_num,
             loss_den,
+            target_probability_num,
             correct_num,
             accuracy_den,
-            selector_loss_num,
-            selector_loss_den,
+            selector_ce_num,
+            selector_tv_num,
+            selector_probability_num,
             selector_correct_num,
+            selector_weight_den,
             selector_covered_num,
         )
+
+    def _compose_token_objective(
+        self,
+        ce_num: torch.Tensor,
+        tv_num: torch.Tensor,
+        probability_num: torch.Tensor,
+        probability_den: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compose a hard-target CE/TV/LK numerator after chunk reduction."""
+
+        if self.lk_loss_type is None or self.lk_loss_type == "alpha":
+            # With a one-hot target distribution, LK-alpha is exactly NLL/CE.
+            return ce_num
+        if self.lk_loss_type == "tv":
+            return tv_num
+        if self.lk_loss_type == "lambda":
+            acceptance = probability_num / probability_den.clamp_min(1.0)
+            kl_weight = self.kl_scale * torch.exp(-self.kl_decay * acceptance.detach())
+            return kl_weight * ce_num + (1.0 - kl_weight) * tv_num
+        raise ValueError(f"unknown lk_loss_type {self.lk_loss_type!r}")
 
     def forward(
         self,
@@ -573,13 +621,17 @@ class OnlineDFlashModel(nn.Module):
             -1,
         )
         (
-            loss_num,
+            ce_loss_num,
+            tv_loss_num,
             loss_den,
+            target_probability_num,
             correct_num,
             accuracy_denom,
-            selector_loss_num,
-            selector_loss_den,
+            selector_ce_num,
+            selector_tv_num,
+            selector_probability_num,
             selector_correct_num,
+            selector_weight_den,
             selector_covered_num,
         ) = checkpointed_chunk_reduce(
             self._dflash_objective_chunk_terms,
@@ -590,25 +642,53 @@ class OnlineDFlashModel(nn.Module):
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
-        ratio_metrics = {
-            "acc": (correct_num.detach(), accuracy_denom.detach()),
-        }
-        if (
+        loss_num = self._compose_token_objective(
+            ce_loss_num,
+            tv_loss_num,
+            target_probability_num,
+            accuracy_denom,
+        )
+        selector_loss_num = loss_num.new_zeros(())
+        has_selector_objective = (
             getattr(self.draft_model, "candidate_selector", None) is not None
             and self.selector_loss_alpha > 0
-        ):
+        )
+        if has_selector_objective:
+            selector_loss_num = self._compose_token_objective(
+                selector_ce_num,
+                selector_tv_num,
+                selector_probability_num,
+                accuracy_denom,
+            )
+            loss_num = loss_num + self.selector_loss_alpha * selector_loss_num
+
+        loss_denominator = (
+            loss_den if self.loss_type == "dflash" else loss_num.new_tensor(float(bsz))
+        )
+        ratio_metrics = {
+            "acc": (correct_num.detach(), accuracy_denom.detach()),
+            "target_probability": (
+                target_probability_num.detach(),
+                accuracy_denom.detach(),
+            ),
+        }
+        if has_selector_objective:
             ratio_metrics.update(
                 {
                     "selector_loss": (
                         selector_loss_num.detach(),
-                        selector_loss_den.detach(),
+                        loss_denominator.detach(),
                     ),
                     "selector_accuracy": (
                         selector_correct_num.detach(),
-                        selector_loss_den.detach(),
+                        selector_weight_den.detach(),
                     ),
                     "selector_coverage": (
                         selector_covered_num.detach(),
+                        accuracy_denom.detach(),
+                    ),
+                    "selector_target_probability": (
+                        selector_probability_num.detach(),
                         accuracy_denom.detach(),
                     ),
                 }
@@ -617,9 +697,6 @@ class OnlineDFlashModel(nn.Module):
             "accuracy_denom": accuracy_denom.detach(),
             "ratio_metrics": ratio_metrics,
         }
-        loss_denominator = (
-            loss_den if self.loss_type == "dflash" else loss_num.new_tensor(float(bsz))
-        )
         loss = loss_num / loss_denominator
         metrics["loss_terms"] = (loss_num, loss_denominator.detach())
         accuracy = correct_num / accuracy_denom
@@ -655,6 +732,9 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_type="dflash",
         )
         self.shift_label = shift_label
+        self._use_fused_domino_ce = (
+            os.environ.get("SPECFORGE_DOMINO_TRITON_CE", "1") == "1"
+        )
 
     def _build_domino_head_inputs(
         self,
@@ -682,21 +762,6 @@ class OnlineDominoModel(OnlineDFlashModel):
 
         return hidden4d, prev_ids
 
-    def _apply_domino_head(
-        self,
-        base_logits4d: torch.Tensor,
-        hidden4d: torch.Tensor,
-        prev_ids: torch.Tensor,
-        target_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        head_token_ids = prev_ids if self.shift_label else target_ids
-        head_token_embeddings = self.embed_tokens(head_token_ids)
-        return self.draft_model.apply_logits_head(
-            base_logits4d,
-            hidden_states=hidden4d,
-            prev_token_embeddings=head_token_embeddings,
-        )
-
     def _domino_objective_chunk_terms(
         self,
         hidden: torch.Tensor,
@@ -706,34 +771,34 @@ class OnlineDominoModel(OnlineDFlashModel):
         eval_weight_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive Domino loss and telemetry terms for one block slice."""
+        from specforge.core.domino_loss import domino_weighted_cross_entropy
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         base_logits = self.lm_head(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
-        final_logits = self._apply_domino_head(
-            base_logits4d=base_logits,
-            hidden4d=hidden,
-            prev_ids=prev_ids,
-            target_ids=target_ids,
+        head_token_ids = prev_ids if self.shift_label else target_ids
+        head_token_embeddings = self.embed_tokens(head_token_ids)
+        correction_logits = self.draft_model.compute_correction_logits(
+            hidden_states=hidden,
+            prev_token_embeddings=head_token_embeddings,
         )
-        final_ce = F.cross_entropy(
-            final_logits.reshape(-1, final_logits.shape[-1]),
-            target_ids.reshape(-1),
-            reduction="none",
-        ).reshape_as(target_ids)
-        base_ce = F.cross_entropy(
-            base_logits.reshape(-1, base_logits.shape[-1]),
-            target_ids.reshape(-1),
-            reduction="none",
-        ).reshape_as(target_ids)
-        final_num = (final_ce * weight_mask).sum()
-        base_num = (base_ce * weight_mask).sum()
+        final_num, base_num, predicted_ids, base_predicted_ids = (
+            domino_weighted_cross_entropy(
+                base_logits.reshape(-1, base_logits.shape[-1]),
+                correction_logits.reshape(-1, correction_logits.shape[-1]),
+                target_ids.reshape(-1),
+                weight_mask.reshape(-1),
+                block_size=block_size,
+                suffix_start=self.draft_model.suffix_start,
+                use_fused=self._use_fused_domino_ce and base_logits.is_cuda,
+            )
+        )
         loss_den = weight_mask.sum()
 
         with torch.no_grad():
-            predicted_ids = final_logits.argmax(dim=-1)
-            base_predicted_ids = base_logits.argmax(dim=-1)
+            predicted_ids = predicted_ids.reshape_as(target_ids)
+            base_predicted_ids = base_predicted_ids.reshape_as(target_ids)
             binary_accuracy_mask = eval_weight_mask > 0.5
             correct_num = (
                 ((predicted_ids == target_ids) & binary_accuracy_mask).sum().float()

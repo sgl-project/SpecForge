@@ -9,17 +9,19 @@ effective global batch, constant learning rate, and DSpark loss weights.
 
 - SpecForge with configurable LR scheduling, an independent online prompt
   seed, and dedicated DSpark capture support.
-- Kimi K3 SGLang revision `ee560a2b2df5dafe18fd835d2e546eff019ca5ba`
-  (the current public `kimi-k3` branch tip validated by this recipe).
+- Kimi K3 SGLang revision `ee560a2b2df5dafe18fd835d2e546eff019ca5ba`,
+  the recommended deployment revision and reproducibility baseline validated
+  by this recipe.
 - The K3 SGLang tree patched with:
 
   ```bash
   scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-ee560a2
   ```
 
-The patch is generated against `ee560a2` and compatibility-checked against
-`f8493a4`, `9acd9cb`, and `ee560a2`; its historical directory name is retained
-for existing automation. It makes `--spec-capture-method dspark` call K3's
+The patch is generated against `ee560a2`. `f8493a4` and `9acd9cb` are
+compatibility-validation targets only; their accepted `--target` names remain
+aliases for existing automation. The patch's historical directory name is also
+retained. It makes `--spec-capture-method dspark` call K3's
 `set_dspark_layers_to_capture` hook. The generic DFlash capture method is not
 equivalent for K3. The same versioned patch carries the three required 64K
 correctness guards: 64-bit Triton token offsets, scale-stable residual scoring,
@@ -105,7 +107,7 @@ export WANDB_API_KEY="$(< /protected/path/wandb-api-key)"
 export WANDB_ENTITY=your-entity
 unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT NODE_RANK
 CUDA_VISIBLE_DEVICES=0,1,2,3 specforge train \
-  -c examples/configs/kimi-k3-dspark-disaggregated.yaml \
+  -c examples/configs/online/disaggregated/external/kimi-k3-dspark-disaggregated.yaml \
   --role both \
   "deployment.disaggregated.server_urls=[\"http://$CAPTURE_IP:30000\"]" \
   "deployment.disaggregated.mooncake_metadata_server=http://$CAPTURE_IP:35880/metadata" \
@@ -127,7 +129,7 @@ fixture and shrink the optimizer quantum:
 
 ```bash
 specforge train \
-  -c examples/configs/kimi-k3-dspark-disaggregated.yaml \
+  -c examples/configs/online/disaggregated/external/kimi-k3-dspark-disaggregated.yaml \
   --role both \
   data.train_data_path= \
   data.prompts_path=/workspace/k3_dspark/data/longest-smoke-pretokenized-4rows-65536.jsonl \
