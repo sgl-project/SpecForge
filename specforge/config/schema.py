@@ -202,6 +202,9 @@ class RuntimeConfig(StrictConfigModel):
     producer_ordered_publish: bool = False
     producer_prompt_prefetch_batches: int = Field(default=1, ge=0)
     producer_reorder_buffer: Optional[int] = Field(default=None, ge=0)
+    producer_prompt_routing: Literal["shared", "least_tokens"] = "shared"
+    producer_prompt_batching: Literal["shuffle", "length_bucketed"] = "shuffle"
+    producer_prompt_ingest_batch_size: int = Field(default=4096, gt=0)
     in_flight_high_watermark: int = Field(default=256, gt=0)
     in_flight_low_watermark: int = Field(default=192, ge=0)
     resident_high_watermark_bytes: Optional[int] = Field(default=None, gt=0)

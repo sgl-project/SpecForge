@@ -811,6 +811,8 @@ def build_disagg_online_producer(
     producer_ordered_publish: bool = False,
     producer_prompt_prefetch_batches: int = 1,
     producer_reorder_buffer: Optional[int] = None,
+    producer_prompt_routing: str = "shared",
+    producer_prompt_batching: str = "shuffle",
     in_flight_high_watermark: int = 256,
     in_flight_low_watermark: Optional[int] = None,
     resident_high_watermark_bytes: Optional[int] = None,
@@ -920,6 +922,15 @@ def build_disagg_online_producer(
     producer_reorder_buffer = int(producer_reorder_buffer)
     if producer_reorder_buffer < 0:
         raise ValueError("producer_reorder_buffer must be >= 0")
+    if producer_prompt_routing not in ("shared", "least_tokens"):
+        raise ValueError(
+            "producer_prompt_routing must be either 'shared' or 'least_tokens'"
+        )
+    if producer_prompt_batching not in ("shuffle", "length_bucketed"):
+        raise ValueError(
+            "producer_prompt_batching must be either 'shuffle' or "
+            "'length_bucketed'"
+        )
     prompt_ingest_batch_size = int(prompt_ingest_batch_size)
     if prompt_ingest_batch_size < 1:
         raise ValueError("prompt_ingest_batch_size must be >= 1")
@@ -961,6 +972,7 @@ def build_disagg_online_producer(
         f"concurrency={producer_concurrency} "
         f"ordered_publish={producer_ordered_publish} "
         f"prompt_prefetch_batches={producer_prompt_prefetch_batches} "
+        f"prompt_batching={producer_prompt_batching} "
         f"reorder_buffer={producer_reorder_buffer} "
         f"watermarks={in_flight_high_watermark}/"
         f"{flow_control.limits.resolved_low_watermark_refs}"
@@ -971,6 +983,7 @@ def build_disagg_online_producer(
         metadata_store=NoOpMetadataStore(),
         max_prompt_attempts=max_prompt_attempts,
         enable_sample_queue=False,
+        prompt_routing=producer_prompt_routing,
     )
     producer_timing(f"DataFlowController created elapsed={elapsed(phase)}")
 
@@ -1017,6 +1030,8 @@ def build_disagg_online_producer(
             f"concurrency={producer_concurrency} max_rounds={max_rounds} "
             f"prompt_prefetch_batches={producer_prompt_prefetch_batches} "
             f"reorder_buffer={producer_reorder_buffer} "
+            f"prompt_routing={producer_prompt_routing} "
+            f"prompt_batching={producer_prompt_batching} "
             f"watermarks={in_flight_high_watermark}/"
             f"{flow_control.limits.resolved_low_watermark_refs} "
             f"progress_interval={progress_interval}"
@@ -1360,6 +1375,11 @@ def build_disagg_online_producer(
                     raise
 
         def ingest_prompt_batch(epoch: int, batch_index: int, epoch_prompts) -> None:
+            if producer_prompt_batching == "length_bucketed":
+                epoch_prompts.sort(
+                    key=lambda prompt: len(prompt["payload"]["input_ids"]),
+                    reverse=True,
+                )
             phase = time.perf_counter()
             producer_timing(
                 "controller.ingest_prompts start "

@@ -703,6 +703,8 @@ def _build_online(
                 cfg.runtime.producer_prompt_prefetch_batches
             ),
             producer_reorder_buffer=cfg.runtime.producer_reorder_buffer,
+            producer_prompt_routing=cfg.runtime.producer_prompt_routing,
+            producer_prompt_batching=cfg.runtime.producer_prompt_batching,
             run_id=cfg.run_id,
             target_hidden_size=hidden_size,
             target_vocab_size=target_vocab,
@@ -728,6 +730,9 @@ def _build_online(
                 cfg.runtime.feature_store_max_resident_bytes
             ),
             peer_wait_timeout_s=peer_wait_timeout_s,
+            prompt_ingest_batch_size=(
+                cfg.runtime.producer_prompt_ingest_batch_size
+            ),
         )
 
         def produce() -> int:
