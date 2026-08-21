@@ -565,14 +565,16 @@ class TrainingConfig(StrictConfigModel):
     #: attention. Requires trim_loss_positions and an attention backend in
     #: {sdpa, fa, usp}.
     trim_backbone_rows: bool = False
-    #: Per-step guard for trim_backbone_rows. A trimmed step replaces flash
+    #: Cost guard for trim_backbone_rows. A trimmed step replaces flash
     #: attention with an explicit masked-matmul kernel that costs more per row,
-    #: so trimming only pays while the kept-row set is small: measured on a
-    #: 8192-token sequence the step time breaks even around 40% density and
-    #: degrades to 2.4x slower at full supervision. Steps whose kept-row count
-    #: exceeds this fraction of the sequence therefore run the full-length path
-    #: instead. |R_i| is non-increasing in i, so the full-length steps are
-    #: always a prefix. Set to 1.0 to disable the guard (always trim).
+    #: so trimming only pays while the kept-row sets are small: measured on a
+    #: 8192-token sequence the step time breaks even around 40% supervision
+    #: density and degrades to 2.4x slower at full supervision. The guard
+    #: compares the trimmed work sum_i |R_i| against this fraction of the full
+    #: work (k-1) * chunk and, when it is exceeded, runs the whole sample on
+    #: the full-length path -- the decision is per sample, not per step, so a
+    #: single unroll never mixes trimmed and full steps. Set to 1.0 to disable
+    #: the guard (always trim).
     trim_backbone_rows_max_density: float = Field(default=0.35, gt=0.0, le=1.0)
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
