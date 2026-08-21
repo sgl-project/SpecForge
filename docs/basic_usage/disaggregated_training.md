@@ -351,11 +351,8 @@ The `external`/`managed-local` subdivision applies only to online
 disaggregation. Offline disaggregation has no capture-server lifecycle and is
 instead distinguished by its `shared_dir` or Mooncake feature-store backend.
 
-The repository's strict e2e gate remains a full local test-stack orchestrator:
-
-```bash
-bash scripts/gates/run_disaggregated_overfit_gate.sh
-```
+For the strict e2e one-sample overfit and serving validation procedure, follow
+[`scripts/gates/README.md`](../../scripts/gates/README.md).
 
 It starts and health-checks Mooncake and SGLang, invokes the canonical training
 entry, verifies overfit and serving behavior, and cleans up every process it
