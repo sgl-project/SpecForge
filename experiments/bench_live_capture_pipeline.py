@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -23,9 +24,23 @@ def main() -> None:
     parser.add_argument("--local-hostname", required=True)
     parser.add_argument("--rdma-devices", required=True)
     parser.add_argument("--concurrency", type=int, default=32)
+    parser.add_argument("--lease", type=int, default=1)
     parser.add_argument("--prefetch-batches", type=int, default=0)
     parser.add_argument("--ingest-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--prompt-routing", choices=("shared", "least_tokens"), default="shared"
+    )
+    parser.add_argument(
+        "--prompt-batching",
+        choices=("shuffle", "length_bucketed"),
+        default="shuffle",
+    )
     parser.add_argument("--materialize", action="store_true")
+    parser.add_argument(
+        "--materialize-mode",
+        choices=("serial", "overlap"),
+        default="serial",
+    )
     args = parser.parse_args()
 
     sys.path.insert(0, str(Path(args.specforge_root).resolve()))
@@ -104,9 +119,11 @@ def main() -> None:
         target_hidden_size=5120,
         target_repr=None,
         aux_hidden_state_layer_ids=[5, 19, 33, 47, 61],
-        lease=1,
+        lease=args.lease,
         producer_concurrency=args.concurrency,
         producer_ordered_publish=True,
+        producer_prompt_routing=args.prompt_routing,
+        producer_prompt_batching=args.prompt_batching,
         prompt_ingest_batch_size=args.ingest_batch_size,
         in_flight_high_watermark=args.samples + 32,
         in_flight_low_watermark=args.samples + 16,
@@ -117,30 +134,87 @@ def main() -> None:
         **optional,
     )
 
+    refs = []
+    materialize_result = {
+        "active_elapsed_s": 0.0,
+        "bytes": 0,
+        "elapsed_s": 0.0,
+        "error": None,
+    }
+    materializer_failed = threading.Event()
+
+    def materialize_refs(ref_stream) -> None:
+        torch = __import__("torch")
+        torch.cuda.set_device(0)
+        started = time.perf_counter()
+        active_elapsed = 0.0
+        try:
+            for ref in ref_stream:
+                get_started = time.perf_counter()
+                tensors, handle = store.get(ref, device="cuda:0")
+                active_elapsed += time.perf_counter() - get_started
+                materialize_result["bytes"] += sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in tensors.values()
+                )
+                store.release(handle, reason="live-pipeline-readback")
+                refs.append(ref)
+                del tensors
+            sync_started = time.perf_counter()
+            torch.cuda.synchronize()
+            active_elapsed += time.perf_counter() - sync_started
+        except BaseException as exc:
+            materialize_result["error"] = exc
+            materializer_failed.set()
+            try:
+                channel.mark_consumer_failed(
+                    f"{type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                pass
+        finally:
+            materialize_result["active_elapsed_s"] = active_elapsed
+            materialize_result["elapsed_s"] = time.perf_counter() - started
+
+    pipeline_started = time.perf_counter()
+    materializer = None
+    if args.materialize and args.materialize_mode == "overlap":
+        materializer = threading.Thread(
+            target=materialize_refs,
+            args=(channel.stream(poll_s=0.001, idle_timeout_s=300),),
+            name="streaming-rdma-materializer",
+        )
+        materializer.start()
+
     capture_started = time.perf_counter()
-    produced = drive()
+    capture_error = None
+    try:
+        produced = drive(should_stop=materializer_failed.is_set)
+    except BaseException as exc:
+        capture_error = exc
+        produced = channel.published
     capture_elapsed = time.perf_counter() - capture_started
-    refs = channel.poll()
+
+    if materializer is not None:
+        materializer.join()
+    else:
+        captured_refs = channel.poll()
+        if args.materialize:
+            materialize_refs(iter(captured_refs))
+        else:
+            refs.extend(captured_refs)
+
+    pipeline_elapsed = time.perf_counter() - pipeline_started
+    if materialize_result["error"] is not None:
+        raise RuntimeError("streaming RDMA materializer failed") from materialize_result[
+            "error"
+        ]
+    if capture_error is not None:
+        raise capture_error
     if produced != args.samples or len(refs) != args.samples:
         raise RuntimeError(
             f"capture count mismatch produced={produced} refs={len(refs)}"
         )
-
-    materialized_bytes = 0
-    materialize_elapsed = 0.0
-    if args.materialize:
-        torch = __import__("torch")
-        materialize_started = time.perf_counter()
-        for ref in refs:
-            tensors, handle = store.get(ref, device="cuda:0")
-            materialized_bytes += sum(
-                tensor.numel() * tensor.element_size()
-                for tensor in tensors.values()
-            )
-            store.release(handle, reason="live-pipeline-readback")
-            del tensors
-        torch.cuda.synchronize()
-        materialize_elapsed = time.perf_counter() - materialize_started
 
     cleanup_started = time.perf_counter()
     sample_ids = [ref.sample_id for ref in refs]
@@ -162,9 +236,23 @@ def main() -> None:
                 "cleanup_elapsed_s": cleanup_elapsed,
                 "consumer_health": health,
                 "id_sha256": hashlib.sha256("\n".join(sample_ids).encode()).hexdigest(),
-                "materialize_bytes": materialized_bytes,
-                "materialize_elapsed_s": materialize_elapsed,
+                "materialize_active_elapsed_s": materialize_result[
+                    "active_elapsed_s"
+                ],
+                "materialize_bytes": materialize_result["bytes"],
+                "materialize_elapsed_s": materialize_result["elapsed_s"],
+                "materialize_mode": args.materialize_mode,
+                "materialize_samples_per_s": (
+                    len(refs) / materialize_result["active_elapsed_s"]
+                    if materialize_result["active_elapsed_s"]
+                    else 0.0
+                ),
+                "pipeline_elapsed_s": pipeline_elapsed,
+                "pipeline_samples_per_s": produced / pipeline_elapsed,
+                "lease": args.lease,
                 "prefetch_batches": args.prefetch_batches,
+                "prompt_routing": args.prompt_routing,
+                "prompt_batching": args.prompt_batching,
                 "produced": produced,
                 "removed": removed,
                 "run_id": run_id,
