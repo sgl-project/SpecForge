@@ -20,7 +20,7 @@ torchrun --standalone --nproc_per_node 8 \
   scripts/prepare_hidden_states.py \
   --strategy eagle3 \
   --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-  --draft-model-config configs/llama3.1-8b-eagle3.json \
+  --draft-model-config configs/llama3-8B-eagle3.json \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
   --chat-template llama3 \
