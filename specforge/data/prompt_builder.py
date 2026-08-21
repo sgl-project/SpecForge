@@ -32,15 +32,17 @@ def prepare_prompt_tasks(
     max_prompts: int | None = None,
     loss_mask_filter: Callable[[Sequence[int]], bool] | None = None,
 ) -> Sequence[PromptTaskDict]:
-    """Prepare runtime prompt dictionaries from a JSONL file.
+    """Prepare runtime prompt dictionaries from JSONL or a disk HF dataset.
 
     Each returned item has the control-plane shape
     ``{"payload": {"input_ids": [...], "loss_mask": [...]}}`` and contains no
     tensors. Files whose first record contains ``input_ids`` and ``loss_mask``
-    are treated as pre-tokenized. Other files are treated as raw conversation
-    data and processed through :func:`build_eagle3_dataset`, then exposed as a
-    lazy random-access sequence so large Arrow datasets are not expanded into
-    Python token lists before rollout starts.
+    are treated as pre-tokenized. A directory created by
+    :meth:`datasets.Dataset.save_to_disk` is exposed as a lazy random-access
+    sequence. Other files are treated as raw conversation data and processed
+    through :func:`build_eagle3_dataset`, then exposed as a lazy random-access
+    sequence so large Arrow datasets are not expanded into Python token lists
+    before rollout starts.
 
     ``max_prompts`` caps accepted prompts; ``None`` and ``0`` mean no cap.
     """
@@ -54,6 +56,31 @@ def prepare_prompt_tasks(
         loss_mask_filter=loss_mask_filter,
     )
     path_string = os.fspath(path)
+    limit = None if max_prompts in (None, 0) else max_prompts
+    if os.path.isdir(path_string):
+        try:
+            from datasets import load_from_disk
+        except ImportError as exc:  # pragma: no cover - production dependency
+            raise ImportError(
+                "loading a disk prompt dataset requires the datasets package"
+            ) from exc
+        dataset = load_from_disk(path_string)
+        required = {"input_ids", "loss_mask"}
+        missing = required.difference(dataset.column_names)
+        if missing:
+            raise ValueError(
+                f"disk prompt dataset {path_string!r} is missing columns "
+                f"{sorted(missing)}"
+            )
+        if limit is not None and limit < len(dataset):
+            dataset = dataset.select(range(limit))
+        return _ProcessedPromptSequence(
+            dataset,
+            max_length=max_length,
+            min_loss_tokens=min_loss_tokens,
+            loss_mask_filter=loss_mask_filter,
+        )
+
     first_record = next(_iter_records(path_string), None)
     if first_record is None:
         return []
@@ -68,7 +95,6 @@ def prepare_prompt_tasks(
             f"loss_mask; missing {missing} in {path_string!r}"
         )
 
-    limit = None if max_prompts in (None, 0) else max_prompts
     if has_input_ids:
         rows = (
             (record, f"{path_string}:{line_number}")
@@ -169,6 +195,39 @@ class _ProcessedPromptSequence(Sequence[PromptTaskDict]):
     def __iter__(self) -> Iterator[PromptTaskDict]:
         for index in range(len(self)):
             yield self[index]
+
+    def get_many(self, indices: Sequence[int]) -> list[PromptTaskDict]:
+        """Materialize processed rows with one Arrow gather operation.
+
+        Hugging Face ``Dataset.__getitem__`` accepts an index list and returns
+        each requested column as a list.  Using that path avoids thousands of
+        independent Arrow lookups while retaining the exact per-row validation
+        and normalization performed by ``__getitem__``.
+        """
+        resolved = [int(index) for index in indices]
+        if not resolved:
+            return []
+        records = self._dataset[resolved]
+        input_rows = records["input_ids"]
+        mask_rows = records["loss_mask"]
+        prompts: list[PromptTaskDict] = []
+        for offset, index in enumerate(resolved):
+            prompt = _prompt_from_record(
+                {
+                    "input_ids": input_rows[offset],
+                    "loss_mask": mask_rows[offset],
+                },
+                source=f"processed dataset row {index}",
+                max_length=self._max_length,
+                min_loss_tokens=self._min_loss_tokens,
+            )
+            if prompt is None:
+                raise ValueError(
+                    f"processed dataset row {index} violates the preprocessing "
+                    f"minimum of {self._min_loss_tokens} trainable tokens"
+                )
+            prompts.append(prompt)
+        return prompts
 
     def __getitem__(self, index):
         if isinstance(index, slice):

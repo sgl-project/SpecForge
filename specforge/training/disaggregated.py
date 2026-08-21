@@ -698,6 +698,11 @@ def _build_online(
             feature_source=adapters if len(adapters) > 1 else adapters[0],
             num_rollout_workers=len(adapters),
             producer_concurrency=cfg.runtime.producer_concurrency,
+            producer_ordered_publish=cfg.runtime.producer_ordered_publish,
+            producer_prompt_prefetch_batches=(
+                cfg.runtime.producer_prompt_prefetch_batches
+            ),
+            producer_reorder_buffer=cfg.runtime.producer_reorder_buffer,
             run_id=cfg.run_id,
             target_hidden_size=hidden_size,
             target_vocab_size=target_vocab,

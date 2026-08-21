@@ -9,6 +9,7 @@ into trainer CUDA allocations.  TCP is restricted to release acknowledgements.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import socket
@@ -43,6 +44,7 @@ def _nbytes(tensor: torch.Tensor) -> int:
 def _control_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     host, port_text = endpoint.rsplit(":", 1)
     with socket.create_connection((host, int(port_text)), timeout=30.0) as conn:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conn.sendall(
             json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
         )
@@ -99,6 +101,9 @@ class MooncakeGpuDirectFeatureStore(FeatureStore):
             "aborts": 0,
             "gpu_direct_bytes": 0,
             "host_payload_bytes": 0,
+            "release_batch_requests": 0,
+            "release_batch_items": 0,
+            "release_batch_fallbacks": 0,
         }
         if enable_transfers:
             self._ensure_engine()
@@ -349,19 +354,115 @@ class MooncakeGpuDirectFeatureStore(FeatureStore):
             },
         )
 
-    def _finish_release(self, ref: SampleRef, *, op: str, reason: str) -> bool:
-        try:
-            self._release_remote(ref, op=op, reason=reason)
-        except Exception:
-            with self._lock:
-                self._release_pending[ref.sample_id] = ref
-            return False
-        generation = int(ref.metadata["generation"])
+    @staticmethod
+    def _release_remote_batch(
+        refs: List[SampleRef], *, op: str, reason: str
+    ) -> None:
+        if not refs:
+            return
+        descriptors = [
+            MooncakeGpuDirectFeatureStore._descriptor(ref) for ref in refs
+        ]
+        endpoint = str(descriptors[0]["control_endpoint"])
+        token = str(descriptors[0]["control_token"])
+        for descriptor in descriptors[1:]:
+            if str(descriptor["control_endpoint"]) != endpoint:
+                raise ValueError("GPU-direct release batch spans control endpoints")
+            if str(descriptor["control_token"]) != token:
+                raise ValueError("GPU-direct release batch spans control tokens")
+        _control_request(
+            endpoint,
+            {
+                "op": f"{op}_batch",
+                "token": token,
+                "items": [
+                    {
+                        "sample_id": ref.sample_id,
+                        "generation": int(ref.metadata["generation"]),
+                    }
+                    for ref in refs
+                ],
+                "reason": reason,
+            },
+        )
+
+    def _finish_release_many(
+        self, refs: List[SampleRef], *, op: str, reason: str
+    ) -> int:
+        unique = {ref.sample_id: ref for ref in refs}
+        groups: Dict[Tuple[str, str], List[SampleRef]] = {}
+        for ref in unique.values():
+            descriptor = self._descriptor(ref)
+            key = (
+                str(descriptor["control_endpoint"]),
+                str(descriptor["control_token"]),
+            )
+            groups.setdefault(key, []).append(ref)
+
+        def release_group(group: List[SampleRef]):
+            if len(group) == 1:
+                ref = group[0]
+                try:
+                    self._release_remote(ref, op=op, reason=reason)
+                except Exception:
+                    return {ref.sample_id: False}, False
+                return {ref.sample_id: True}, False
+            try:
+                self._release_remote_batch(group, op=op, reason=reason)
+            except Exception as exc:
+                if "unsupported control operation" not in str(exc):
+                    return {ref.sample_id: False for ref in group}, False
+                outcomes = {}
+                for ref in group:
+                    try:
+                        self._release_remote(ref, op=op, reason=reason)
+                    except Exception:
+                        outcomes[ref.sample_id] = False
+                    else:
+                        outcomes[ref.sample_id] = True
+                return outcomes, True
+            return {ref.sample_id: True for ref in group}, False
+
+        outcomes: Dict[str, bool] = {}
+        fallbacks = 0
+        grouped = list(groups.values())
+        if len(grouped) == 1:
+            group_outcomes, fallback = release_group(grouped[0])
+            outcomes.update(group_outcomes)
+            fallbacks += int(fallback)
+        elif grouped:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(grouped),
+                thread_name_prefix="gpudirect-release",
+            ) as executor:
+                futures = [executor.submit(release_group, group) for group in grouped]
+                for future in futures:
+                    group_outcomes, fallback = future.result()
+                    outcomes.update(group_outcomes)
+                    fallbacks += int(fallback)
+
+        released = 0
         with self._lock:
-            self._release_pending.pop(ref.sample_id, None)
-            self._known_refs.pop(ref.sample_id, None)
-            self._freed.add((ref.sample_id, generation))
-        return True
+            self._stats["release_batch_requests"] += sum(
+                len(group) > 1 for group in grouped
+            )
+            self._stats["release_batch_items"] += sum(
+                len(group) for group in grouped if len(group) > 1
+            )
+            self._stats["release_batch_fallbacks"] += fallbacks
+            for sample_id, ref in unique.items():
+                if not outcomes.get(sample_id, False):
+                    self._release_pending[sample_id] = ref
+                    continue
+                generation = int(ref.metadata["generation"])
+                self._release_pending.pop(sample_id, None)
+                self._known_refs.pop(sample_id, None)
+                self._freed.add((sample_id, generation))
+                released += 1
+        return released
+
+    def _finish_release(self, ref: SampleRef, *, op: str, reason: str) -> bool:
+        return bool(self._finish_release_many([ref], op=op, reason=reason))
 
     def release(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
         with self._lock:
@@ -383,6 +484,19 @@ class MooncakeGpuDirectFeatureStore(FeatureStore):
             with self._lock:
                 self._stats["aborts"] += 1
 
+    def abort_many(self, sample_ids: List[str], *, reason: str) -> int:
+        target = set(sample_ids)
+        with self._lock:
+            refs = [
+                ref
+                for sample_id, ref in self._known_refs.items()
+                if sample_id in target
+            ]
+        removed = self._finish_release_many(refs, op="abort", reason=reason)
+        with self._lock:
+            self._stats["aborts"] += removed
+        return removed
+
     def retry_sample_removals(self, sample_ids: List[str]) -> Dict[str, Any]:
         target = set(sample_ids)
         with self._lock:
@@ -391,11 +505,9 @@ class MooncakeGpuDirectFeatureStore(FeatureStore):
                 for sample_id, ref in self._release_pending.items()
                 if sample_id in target
             ]
-        removed = 0
-        for ref in pending:
-            removed += int(
-                self._finish_release(ref, op="abort", reason="release-retry")
-            )
+        removed = self._finish_release_many(
+            pending, op="abort", reason="release-retry"
+        )
         with self._lock:
             remaining = [sid for sid in self._release_pending if sid in target]
         return {

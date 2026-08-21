@@ -178,13 +178,29 @@ class DPAckController(DataFlowController):
             self._cleanup_boundary += 1
             boundary = self._cleanup_boundary
             failures = []
-            for sample_id in local_ids:
+            abort_many = getattr(self.feature_store, "abort_many", None)
+            if callable(abort_many):
                 try:
-                    self.feature_store.abort(
-                        sample_id, reason="optimizer-boundary-durable-ack"
+                    abort_many(
+                        local_ids,
+                        reason="optimizer-boundary-durable-ack",
                     )
                 except BaseException as exc:
-                    failures.append(f"{sample_id}: {type(exc).__name__}: {exc}")
+                    failures.append(
+                        "batched optimizer-boundary cleanup: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            else:
+                for sample_id in local_ids:
+                    try:
+                        self.feature_store.abort(
+                            sample_id, reason="optimizer-boundary-durable-ack"
+                        )
+                    except BaseException as exc:
+                        failures.append(
+                            f"{sample_id}: {type(exc).__name__}: {exc}"
+                        )
+            for sample_id in local_ids:
                 self._cleanup_pending.setdefault(sample_id, boundary)
 
             eligible_ids = [

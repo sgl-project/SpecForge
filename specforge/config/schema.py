@@ -199,6 +199,9 @@ class RuntimeConfig(StrictConfigModel):
 
     producer_lease: int = Field(default=8, gt=0)
     producer_concurrency: int = Field(default=1, gt=0)
+    producer_ordered_publish: bool = False
+    producer_prompt_prefetch_batches: int = Field(default=1, ge=0)
+    producer_reorder_buffer: Optional[int] = Field(default=None, ge=0)
     in_flight_high_watermark: int = Field(default=256, gt=0)
     in_flight_low_watermark: int = Field(default=192, ge=0)
     resident_high_watermark_bytes: Optional[int] = Field(default=None, gt=0)

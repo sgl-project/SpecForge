@@ -150,10 +150,14 @@ def _validate_training_topology(
                 "requires model.target_backend=sglang"
             )
         deployment = cfg.deployment.disaggregated
-        if deployment is None or deployment.backend != "mooncake":
+        if deployment is None or deployment.backend not in {
+            "mooncake",
+            "mooncake_gpu_direct",
+        }:
             raise ValueError(
                 "online disaggregated training requires "
-                "deployment.disaggregated.backend=mooncake"
+                "deployment.disaggregated.backend=mooncake or "
+                "mooncake_gpu_direct"
             )
         if cfg.model.shard_target_output:
             raise ValueError(
