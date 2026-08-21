@@ -230,6 +230,7 @@ The checked-in examples are the canonical starting points:
 | DSpark | Online disaggregated, external | [`qwen3-4b-dspark-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) |
 | DSpark | Offline colocated | [`qwen3-4b-dspark-offline.yaml`](../../examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) |
 | DFlash (Ascend) | Online disaggregated, external | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml) |
+| MTP (Ascend) | Online disaggregated, managed-local | [`qwen3.5-4b-mtp-disaggregated-npu.yaml`](../../examples/configs/online/disaggregated/managed-local/qwen3.5-4b-mtp-disaggregated-npu.yaml) |
 
 ## Online and offline data
 
@@ -258,6 +259,7 @@ The unified runtime supports text training in these combinations:
 | DFlash | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | Domino | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | DSpark | Yes, consumer DP | Yes, DP | Yes, consumer DP |
+| MTP | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | P-EAGLE | Yes, consumer DP, batch size 1 | No | No |
 
 Unsupported combinations fail explicitly during config validation or run
@@ -270,10 +272,10 @@ assembly. In particular:
 - attention backends are strategy-specific: EAGLE3 accepts `sdpa`,
   `flex_attention`, `fa`, or offline `usp`; P-EAGLE requires
   `flex_attention`; DFlash, Domino, and DSpark accept `eager`, `sdpa`, or
-  `flex_attention`;
+  `flex_attention`; MTP accepts `eager` or `sdpa`;
 - P-EAGLE requires `training.batch_size=1` and reuses EAGLE3's server capture
   schema;
-- offline feature training supports EAGLE3, DFlash, Domino, and DSpark;
+- offline feature training supports EAGLE3, DFlash, Domino, DSpark, and MTP;
 - every online run is disaggregated and uses `model.target_backend=sglang`;
   finite runs may omit both step fields so the producer can publish the exact
   optimizer horizon derived from the prepared prompt plan;
@@ -507,6 +509,23 @@ specforge export --to hf \
 
 Pass `--vocab-mapping /path/to/mapping.pt` when the checkpoint predates the
 mapping buffers or when you intentionally need to refresh them.
+
+MTP is deployed by merging its trained native head back into the target model.
+The merge command accepts the same runtime checkpoint shapes as the generic
+exporter (`training_state.pt`, a step/latest directory, or the run output
+directory):
+
+```bash
+python scripts/merge_mtp_to_base.py \
+  --base-model-path Qwen/Qwen3.5-4B \
+  --mtp-checkpoint-path ./outputs/qwen3.5-4b-mtp/qwen3.5-4b-mtp-latest \
+  --draft-config configs/qwen3.5-4b-mtp.json \
+  --output-path ./exports/Qwen3.5-4B-MTP
+```
+
+An already-exported HF MTP draft directory can also be passed as
+`--mtp-checkpoint-path`; in that case its own `config.json` is used and
+`--draft-config` may be omitted.
 
 ## Troubleshooting
 
