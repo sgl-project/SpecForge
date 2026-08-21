@@ -544,18 +544,18 @@ measurement as serving-time accepted length.</p>
 <section id="unified-entry-for-a-new-run">
 <h2>Unified entry for a new run<a class="headerlink" href="#unified-entry-for-a-new-run" title="Link to this heading">#</a></h2>
 <p>The current equivalent recipe is
-<code class="docutils literal notranslate"><span class="pre">examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml</span></code>. To place the
+<code class="docutils literal notranslate"><span class="pre">examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml</span></code>. To place the
 offline producer and consumer on different nodes, run one checked-in command
 through the cluster launcher:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rcli<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>--per-node<span class="w"> </span>&lt;job&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="s1">'CONFIG=examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'</span>
+<span class="w">  </span><span class="s1">'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'</span>
 </pre></div>
 </div>
 <p>Rank 0 invokes <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span> <span class="pre">--role</span> <span class="pre">producer</span></code>; rank 1 invokes
 <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span> <span class="pre">--role</span> <span class="pre">consumer</span></code>. Both nodes must resolve the config’s
 <code class="docutils literal notranslate"><span class="pre">control_dir</span></code>, <code class="docutils literal notranslate"><span class="pre">store_root</span></code>, hidden-state input, and vocabulary mapping to the
 same data. Use a fresh attempt directory, then compare against the colocated
-<code class="docutils literal notranslate"><span class="pre">examples/configs/qwen2.5-7b-eagle3-offline.yaml</span></code> recipe with the same inputs,
+<code class="docutils literal notranslate"><span class="pre">examples/configs/offline/colocated/qwen2.5-7b-eagle3-offline.yaml</span></code> recipe with the same inputs,
 seed, and training overrides.</p>
 </section>
 </section>

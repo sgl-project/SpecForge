@@ -523,12 +523,12 @@ and <code class="docutils literal notranslate"><span class="pre">vocab_mapping/v
 <section id="use-the-checked-in-run-config">
 <h2>3. Use the checked-in run config<a class="headerlink" href="#use-the-checked-in-run-config" title="Link to this heading">#</a></h2>
 <p>The canonical recipe is
-<a class="reference download internal" download="" href="../_downloads/023115005d23433955acc565c655cc65/llama3.1-8b-eagle3-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">examples/configs/llama3.1-8b-eagle3-offline.yaml</span></code></span></a>.
+<a class="reference download internal" download="" href="../_downloads/317c97abcbcfc7c476167639aea6fa7a/llama3.1-8b-eagle3-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">examples/configs/offline/colocated/llama3.1-8b-eagle3-offline.yaml</span></code></span></a>.
 It records the same target, feature directory, draft architecture, and trainer
 settings used by this walkthrough; edit the checked-in recipe or use dotted
 overrides instead of copying its YAML into another document.</p>
 <p>The recipe carries a conventional <code class="docutils literal notranslate"><span class="pre">model.vocab_mapping_path</span></code> for deployments
-that prepare and share a mapping artifact. For a local offline run, leaving
+that prepare and share a mapping artifact. For an offline colocated run, leaving
 that field empty makes SpecForge count effective tokens in the exact feature
 corpus, derive <code class="docutils literal notranslate"><span class="pre">t2d</span></code>/<code class="docutils literal notranslate"><span class="pre">d2t</span></code> deterministically, and cache the reusable mapping
 under <code class="docutils literal notranslate"><span class="pre">data.cache_dir/vocab_mapping</span></code>. Equal target and draft vocabularies need
@@ -537,7 +537,7 @@ no mapping.</p>
 <section id="train">
 <h2>4. Train<a class="headerlink" href="#train" title="Link to this heading">#</a></h2>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--config<span class="w"> </span>examples/configs/llama3.1-8b-eagle3-offline.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/offline/colocated/llama3.1-8b-eagle3-offline.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>model.vocab_mapping_path<span class="o">=</span>./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct/vocab_mapping/vocab_mapping.pt
 </pre></div>
 </div>

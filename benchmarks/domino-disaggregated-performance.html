@@ -524,7 +524,7 @@ use distinct URLs to fan out across distinct servers:</p>
 <span class="nb">export</span><span class="w"> </span><span class="nv">MOONCAKE_RDMA_DEVICES</span><span class="o">=</span>mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 
 <span class="c1"># Start the external capture server with --mem-fraction-static 0.5, then run:</span>
-specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3-8b-domino-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="s1">'deployment.disaggregated.server_urls=["http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000"]'</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>deployment.trainer.nproc_per_node<span class="o">=</span><span class="m">7</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.batch_size<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
@@ -542,7 +542,7 @@ driving one server.</p>
 managed-local recipe. One command owns Mooncake, a capture server on GPU 0, and
 seven trainer ranks on GPUs 1–7:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+<span class="w">  </span>examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml
 </pre></div>
 </div>
 <p>The recipe records batch size 2, accumulation 8, and capture-server memory

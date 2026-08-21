@@ -1,31 +1,39 @@
 # Disaggregated training
 
-Disaggregation is a launch topology of the canonical training command:
+Disaggregation is a producer/consumer launch topology of the canonical training
+command:
 
 ```bash
 specforge train -c run.yaml
 ```
 
 The producer captures or ingests features and the consumer runs the canonical
-trainer. Online training always uses this producer/consumer topology; there is
-no colocated target-inference path and no separate Python training entry.
+trainer.
 
-The checked-in recipes are:
+| Category | Producer responsibility | Feature store | Service ownership |
+| --- | --- | --- | --- |
+| Offline disaggregated | Ingest existing feature files and publish a static manifest | `shared_dir` or Mooncake | No SGLang lifecycle; configure the storage backend directly |
+| Online disaggregated, external | Send prompts to existing capture endpoints and publish streaming refs | Mooncake | User or scheduler owns Mooncake and SGLang |
+| Online disaggregated, managed-local | Send prompts to endpoints started from the same run config | Mooncake | SpecForge owns local Mooncake and SGLang |
 
-| Workflow | Config |
-| --- | --- |
-| Online EAGLE3 | `examples/configs/qwen3-8b-eagle3-disaggregated.yaml` |
-| Online P-EAGLE | `examples/configs/qwen3-8b-peagle-disaggregated.yaml` |
-| Online DFlash | `examples/configs/qwen3-8b-dflash-disaggregated.yaml` |
-| Online one-server + DP7 Qwen3-8B DFlash | `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` |
-| Online Domino | `examples/configs/qwen3-8b-domino-disaggregated.yaml` |
-| Online two-server Qwen3-8B Domino | `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` |
-| Online DSpark | `examples/configs/qwen3-4b-dspark-disaggregated.yaml` |
-| Online Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-disaggregated.yaml` |
-| Online one-server + DP2 Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` |
-| Online two-server Qwen3.6 DFlash | `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` |
-| Offline EAGLE3 | `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` |
-| Offline Qwen2.5-7B EAGLE3 | `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` |
+Online training always uses the producer/consumer topology; there is currently
+no colocated online target-inference path. `external` describes ownership, not
+distance—a loopback service started by the user is still external. Conversely,
+`managed-local` still uses distinct producer and consumer roles even though one
+supervisor owns the local process tree.
+
+Choose checked-in recipes by directory:
+
+| Workflow | Catalog | Representative config |
+| --- | --- | --- |
+| Offline disaggregated | [`offline/disaggregated/`](../../examples/configs/offline/disaggregated/) | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](../../examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
+| Online, external services | [`online/disaggregated/external/`](../../examples/configs/online/disaggregated/external/) | [`qwen3-8b-dflash-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml) |
+| Online, managed-local stack | [`online/disaggregated/managed-local/`](../../examples/configs/online/disaggregated/managed-local/) | [`qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](../../examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+
+The full model and strategy index is in the
+[recipe catalog](../../examples/configs/README.md). Filename suffixes are
+historical identifiers; the directory and typed YAML fields define the runtime
+semantics.
 
 ## One config owns the launch topology
 
@@ -84,14 +92,14 @@ With `deployment.trainer.nnodes: 1`, omitting `--role` starts a supervisor for
 both SpecForge roles:
 
 ```bash
-specforge train -c examples/configs/qwen3-8b-dflash-disaggregated.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml
 ```
 
-The checked-in online recipes use the local demo endpoints shown above, so the
-command and `--plan` need no hidden topology variables. Point those typed fields
-at the real services for a remote deployment. Environment values override the
-typed Mooncake endpoint fields when the same recipe runs on another node;
-`MOONCAKE_LOCAL_HOSTNAME` remains node-local.
+The checked-in external online recipes use the local demo endpoints shown
+above, so the command and `--plan` need no hidden topology variables. Point
+those typed fields at the actual services for another deployment. Environment
+values override the typed Mooncake endpoint fields when the same recipe runs on
+another node; `MOONCAKE_LOCAL_HOSTNAME` remains node-local.
 
 The producer is a direct single process. The consumer is automatically launched
 with the configured local process count. If either role fails, the supervisor
@@ -102,7 +110,7 @@ canceling it.
 Inspect the resolved plan without starting processes:
 
 ```bash
-specforge train -c examples/configs/qwen3-8b-dflash-disaggregated.yaml --plan
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml --plan
 ```
 
 Plan output redacts secret-shaped overrides and credentials embedded in URLs.
@@ -144,7 +152,7 @@ four producer workers against one server while keeping the checked-in YAML as
 the source of every other setting:
 
 ```bash
-specforge train -c examples/configs/qwen3-8b-domino-disaggregated.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml \
   'deployment.disaggregated.server_urls=["http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000"]'
 ```
 
@@ -164,10 +172,10 @@ TP=1 capture server on GPU 0 and a DP=7 trainer on GPUs 1–7:
 
 ```bash
 specforge train -c \
-  examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
 
 specforge train -c \
-  examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml
 ```
 
 The checked-in multi-server Qwen3-8B Domino recipe records two TP=1 capture
@@ -177,7 +185,7 @@ the unified training entry:
 
 ```bash
 specforge train -c \
-  examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml
 ```
 
 The Qwen3.6 DFlash one-server recipe owns a TP=1 server on GPU 0 and a DP=2
@@ -186,10 +194,10 @@ GPUs 0–3 and a DP=2 trainer on GPUs 4–5:
 
 ```bash
 specforge train -c \
-  examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
 
 specforge train -c \
-  examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
 ```
 
 The launcher starts Mooncake first, waits for its metadata and RPC endpoints,
@@ -220,7 +228,7 @@ the launcher-provided rank to those same two commands:
 
 ```bash
 rcli exec --per-node <job> \
-  'CONFIG=examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
+  'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
 ```
 
 `RCLI_NODE_RANK=0` selects the producer and rank 1 selects the consumer. The
@@ -297,10 +305,12 @@ path. This split-state form currently supports one trainer node only.
 ## External and managed-local services
 
 Without `deployment.disaggregated.managed_local`, the unified supervisor owns
-only SpecForge producer and consumer processes. Mooncake and patched SGLang are
-external, usually long-lived services managed by Kubernetes, Slurm, systemd, or
-the development environment. In this default mode, the training CLI does not
-start, stop, or assign GPUs to them.
+only the requested SpecForge roles. With the default single-node launch it
+starts producer and consumer; with an explicit `--role` it starts only that
+role. Mooncake and patched SGLang remain external, usually long-lived services
+managed by Kubernetes, Slurm, systemd, or the development environment. They may
+also run on the same host: external means that the training CLI does not start,
+stop, or assign GPUs to them.
 
 Install a Mooncake client compatible with the store's `put_from`/`get_into`
 wire contract on the producer and consumer images:
@@ -337,8 +347,17 @@ cannot truncate the captured sequence. Online capture is text-only: VLM
 training, including Qwen2.5-VL, is not supported. Online evaluation is also not
 supported.
 
+The `external`/`managed-local` subdivision applies only to online
+disaggregation. Offline disaggregation has no capture-server lifecycle and is
+instead distinguished by its `shared_dir` or Mooncake feature-store backend.
+
 For the strict e2e one-sample overfit and serving validation procedure, follow
 [`scripts/gates/README.md`](../../scripts/gates/README.md).
+
+It starts and health-checks Mooncake and SGLang, invokes the canonical training
+entry, verifies overfit and serving behavior, and cleans up every process it
+owns. This preserves complete automated validation without turning the training
+CLI into a production service manager.
 
 ## Online runtime contract
 

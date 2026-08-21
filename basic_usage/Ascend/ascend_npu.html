@@ -491,7 +491,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cleanup-between-runs">Cleanup between runs</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-node-disaggregation">5. Multi-node disaggregation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#split-producer-and-consumer-roles-across-nodes">5. Split producer and consumer roles across nodes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#npu-notes-and-troubleshooting">6. NPU notes and troubleshooting</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-results-on-16x-a3-64gb">Reference results on 16x A3 (64GB)</a></li>
 </ul>
@@ -508,9 +508,10 @@
   <section class="tex2jax_ignore mathjax_ignore" id="ascend-npu-tutorial">
 <h1>Ascend NPU Tutorial<a class="headerlink" href="#ascend-npu-tutorial" title="Link to this heading">#</a></h1>
 <p>This is an end-to-end tutorial for running SpecForge on Ascend NPU hosts. It
-walks through <strong>installation → data preparation → online training → the
-managed-local full stack → multi-node disaggregation</strong>, using Qwen3.5-4B DFlash
-as the running example. Validated on a 16-card A3 (64GB) host.</p>
+walks through <strong>installation → data preparation → online disaggregated training
+with external services → the managed-local full stack → split multi-node
+roles</strong>, using Qwen3.5-4B DFlash as the running example. Validated on a 16-card
+A3 (64GB) host.</p>
 <hr class="docutils" />
 <section id="installation">
 <h2>1. Installation<a class="headerlink" href="#installation" title="Link to this heading">#</a></h2>
@@ -589,7 +590,7 @@ guide.</p>
 <p>Online training is always <strong>disaggregated</strong>: a producer drives prompts through
 a patched SGLang capture server, features stream through Mooncake, and a
 consumer trains the draft. The checked-in
-<a class="reference download internal" download="" href="../../_downloads/80fb60b7b4b579275dcfe77789f8b58b/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a>
+<a class="reference download internal" download="" href="../../_downloads/d06712daee1c8beb3f5fb494eb8f8fab/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a>
 recipe targets an externally started capture server.</p>
 <section id="step-1-start-mooncake-and-the-capture-server">
 <h3>Step 1: Start Mooncake and the capture server<a class="headerlink" href="#step-1-start-mooncake-and-the-capture-server" title="Link to this heading">#</a></h3>
@@ -626,7 +627,7 @@ python<span class="w"> </span>-m<span class="w"> </span>sglang.launch_server<spa
 <h3>Step 2: Launch training<a class="headerlink" href="#step-2-launch-training" title="Link to this heading">#</a></h3>
 <p>On the remaining NPUs:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ASCEND_RT_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">1</span>,2,3,4,5,6,7,8<span class="w"> </span><span class="se">\</span>
-specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3.5-4b-dflash-online-npu.yaml
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
 </pre></div>
 </div>
 <p>Before rerunning, clear stale control state:
@@ -647,7 +648,7 @@ installed SpecForge predates the NPU transport bind — upgrade past #722.</p></
 <section id="managed-local-full-stack-one-command">
 <h2>4. Managed-local full stack (one command)<a class="headerlink" href="#managed-local-full-stack-one-command" title="Link to this heading">#</a></h2>
 <p>Instead of starting Mooncake and capture servers by hand, the
-<a class="reference download internal" download="" href="../../_downloads/fe448ec9ace6d871ffd07467f1a1befd/qwen3.5-4b-dflash-disaggregated-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-disaggregated-npu.yaml</span></code></span></a>
+<a class="reference download internal" download="" href="../../_downloads/67b9d7aff256917117887d1c85eab708/qwen3.5-4b-dflash-disaggregated-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-disaggregated-npu.yaml</span></code></span></a>
 recipe lets a single <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span></code> command own the whole single-node
 stack — Mooncake, capture server(s), and the trainer — and derives their
 endpoints and device assignments:</p>
@@ -655,7 +656,7 @@ endpoints and device assignments:</p>
 <span class="nb">export</span><span class="w"> </span><span class="nv">HCCL_CONNECT_TIMEOUT</span><span class="o">=</span><span class="m">7200</span><span class="w"> </span><span class="nv">HCCL_EXEC_TIMEOUT</span><span class="o">=</span><span class="m">7200</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">PYTORCH_NPU_ALLOC_CONF</span><span class="o">=</span>expandable_segments:True
 
-specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-disaggregated-npu.yaml
 </pre></div>
 </div>
 <p>The checked-in layout parks the capture server on device 0 and runs a 14-rank
@@ -666,7 +667,7 @@ trainer on devices 2-15 (8-card hosts: trainer on devices 1-7 with
 <p>One capture server is enough for correctness but bounds the pipeline: the
 trainer’s data wait then dominates step time. To give capture more cards,
 override the layout inline — e.g. a 6:10 split with six TP=1 capture servers:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-disaggregated-npu.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="s1">'deployment.trainer.nproc_per_node=10'</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="s1">'deployment.disaggregated.managed_local.trainer_cuda_visible_devices=["6","7","8","9","10","11","12","13","14","15"]'</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="s1">'deployment.disaggregated.managed_local.capture_servers=[{port: 40000, cuda_visible_devices: ["0"], tp_size: 1}, {port: 40001, cuda_visible_devices: ["1"], tp_size: 1}, {port: 40002, cuda_visible_devices: ["2"], tp_size: 1}, {port: 40003, cuda_visible_devices: ["3"], tp_size: 1}, {port: 40004, cuda_visible_devices: ["4"], tp_size: 1}, {port: 40005, cuda_visible_devices: ["5"], tp_size: 1}]'</span>
@@ -685,8 +686,8 @@ rm<span class="w"> </span>-rf<span class="w"> </span>outputs/qwen3.5-4b-dflash-n
 </section>
 </section>
 <hr class="docutils" />
-<section id="multi-node-disaggregation">
-<h2>5. Multi-node disaggregation<a class="headerlink" href="#multi-node-disaggregation" title="Link to this heading">#</a></h2>
+<section id="split-producer-and-consumer-roles-across-nodes">
+<h2>5. Split producer and consumer roles across nodes<a class="headerlink" href="#split-producer-and-consumer-roles-across-nodes" title="Link to this heading">#</a></h2>
 <p>The same configs split across nodes with an explicit <code class="docutils literal notranslate"><span class="pre">--role</span></code>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>producer<span class="w">   </span><span class="c1"># inference / capture pool</span>
 specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>run.yaml<span class="w"> </span>--role<span class="w"> </span>consumer<span class="w"> </span>--node-rank<span class="w"> </span><span class="m">0</span><span class="w">   </span><span class="c1"># trainer-0</span>
@@ -806,7 +807,7 @@ a tuned performance benchmark.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cleanup-between-runs">Cleanup between runs</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-node-disaggregation">5. Multi-node disaggregation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#split-producer-and-consumer-roles-across-nodes">5. Split producer and consumer roles across nodes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#npu-notes-and-troubleshooting">6. NPU notes and troubleshooting</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-results-on-16x-a3-64gb">Reference results on 16x A3 (64GB)</a></li>
 </ul>

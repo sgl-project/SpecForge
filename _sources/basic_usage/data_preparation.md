@@ -247,7 +247,7 @@ to create the text. SpecForge uses it to identify assistant spans and build the
 loss mask.
 
 ```bash
-# After copying a disaggregated online example YAML, set these data fields:
+# After copying an online disaggregated example YAML, set these data fields:
 # data:
 #   train_data_path: ./your_preformatted_dataset.jsonl
 #   is_preformatted: true
@@ -277,7 +277,7 @@ torchrun --nproc_per_node=8 \
     --batch-size 32
 ```
 
-Use these strategy/model pairs for the checked-in local offline recipes:
+Use these strategy/model pairs for the checked-in offline colocated recipes:
 
 | Strategy | Target model | Draft config | Output path used by the recipe |
 | --- | --- | --- | --- |
@@ -334,7 +334,7 @@ Launch the matching recipe after its `data.hidden_states_path` points at the
 generated directory:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-dflash-offline.yaml
+specforge train --config examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml
 ```
 
 See the [Training](training.md) guide for the complete run schema and supported

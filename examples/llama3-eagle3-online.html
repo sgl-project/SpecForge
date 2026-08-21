@@ -503,7 +503,7 @@ target-regenerated dataset is recommended for production checkpoints.</p>
 <section id="use-the-checked-in-run-config">
 <h2>2. Use the checked-in run config<a class="headerlink" href="#use-the-checked-in-run-config" title="Link to this heading">#</a></h2>
 <p>The canonical recipe is
-<a class="reference download internal" download="" href="../_downloads/aa00e80eaea05b0c37853b432ffe211b/llama3.1-8b-eagle3-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">examples/configs/llama3.1-8b-eagle3-online.yaml</span></code></span></a>.
+<a class="reference download internal" download="" href="../_downloads/a6cd424eca6fc71d20ea53e16b706970/llama3.1-8b-eagle3-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">examples/configs/online/disaggregated/external/llama3.1-8b-eagle3-online.yaml</span></code></span></a>.
 It already points at the ShareGPT output from step 1 and records the target,
 draft architecture, SGLang backend, optimizer settings, and output directory in
 the same typed contract used by every other training method. Edit that file or
@@ -512,7 +512,7 @@ create a second copy of the recipe in documentation.</p>
 </section>
 <section id="train">
 <h2>3. Train<a class="headerlink" href="#train" title="Link to this heading">#</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/llama3.1-8b-eagle3-online.yaml
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/online/disaggregated/external/llama3.1-8b-eagle3-online.yaml
 </pre></div>
 </div>
 <p>The recipe points at an external SGLang capture server and starts the

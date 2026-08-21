@@ -473,7 +473,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#defaults-when-migrating-removed-trainers">Defaults when migrating removed trainers</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#choose-a-recipe">Choose a recipe</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-a-run">Launch a run</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-config">Run config</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-configuration-and-model-initialization">Draft configuration and model initialization</a></li>
@@ -509,92 +509,70 @@
 <h1>Training<a class="headerlink" href="#training" title="Link to this heading">#</a></h1>
 <p>SpecForge has one public training entry point for every strategy and runtime
 topology:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 </pre></div>
 </div>
 <p>The YAML file is the run contract. It selects the draft strategy, target model,
-data source, optimizer settings, and deployment mode. Method-specific Python
-trainers are not part of the public interface.</p>
+data source, optimizer settings, and deployment topology. Method-specific
+Python trainers are not part of the public interface.</p>
 <p>This is an intentional hard cutover. The old <code class="docutils literal notranslate"><span class="pre">scripts/train_*.py</span></code> commands and
 temporary move-only Python import paths were removed rather than deprecated.
 Downstream launchers should migrate to a typed run config and <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span></code>;
 there is no compatibility dispatch to the previous trainers.</p>
-<section id="defaults-when-migrating-removed-trainers">
-<h2>Defaults when migrating removed trainers<a class="headerlink" href="#defaults-when-migrating-removed-trainers" title="Link to this heading">#</a></h2>
-<p>The typed schema defaults existed before the old trainers were removed, but
-they are not identical to defaults embedded in every deleted script. If an old
-launch omitted these flags, write the legacy value explicitly in its new YAML
-when reproducing that run:</p>
+<section id="choose-a-recipe">
+<h2>Choose a recipe<a class="headerlink" href="#choose-a-recipe" title="Link to this heading">#</a></h2>
+<p>The config catalog separates three concepts:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
-<tr class="row-odd"><th class="head"><p>Removed CLI default</p></th>
-<th class="head"><p>Typed run field and default</p></th>
-<th class="head"><p>Legacy value to preserve</p></th>
+<tr class="row-odd"><th class="head"><p>Question</p></th>
+<th class="head"><p>Config source</p></th>
+<th class="head"><p>Catalog level</p></th>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>DFlash/Domino <code class="docutils literal notranslate"><span class="pre">--num-epochs=6</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">training.num_epochs:</span> <span class="pre">1</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">6</span></code></p></td>
+<tr class="row-even"><td><p>Are target features captured during training or prepared earlier?</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">data.train_data_path</span></code> / <code class="docutils literal notranslate"><span class="pre">data.prompts_path</span></code> versus <code class="docutils literal notranslate"><span class="pre">data.hidden_states_path</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">online/</span></code> versus <code class="docutils literal notranslate"><span class="pre">offline/</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p>DFlash/Domino <code class="docutils literal notranslate"><span class="pre">--learning-rate=6e-4</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">training.learning_rate:</span> <span class="pre">1e-4</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">6e-4</span></code></p></td>
+<tr class="row-odd"><td><p>Does the trainer read offline hidden states files directly or consume refs from a producer?</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">deployment.mode:</span> <span class="pre">local_colocated</span></code> versus <code class="docutils literal notranslate"><span class="pre">deployment.mode:</span> <span class="pre">disaggregated</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">colocated/</span></code> versus <code class="docutils literal notranslate"><span class="pre">disaggregated/</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p>DFlash/Domino <code class="docutils literal notranslate"><span class="pre">--warmup-ratio=0.04</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">training.warmup_ratio:</span> <span class="pre">0.015</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">0.04</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>DFlash/Domino <code class="docutils literal notranslate"><span class="pre">--max-grad-norm=1.0</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">training.max_grad_norm:</span> <span class="pre">0.5</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>DFlash/Domino <code class="docutils literal notranslate"><span class="pre">--max-length=3072</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">data.max_length:</span> <span class="pre">2048</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">3072</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>DFlash/Domino <code class="docutils literal notranslate"><span class="pre">--chat-template=qwen</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">data.chat_template:</span> <span class="pre">llama3</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">qwen</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>DFlash/Domino <code class="docutils literal notranslate"><span class="pre">--save-interval=1000</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">training.save_interval:</span> <span class="pre">0</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1000</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>DFlash/Domino <code class="docutils literal notranslate"><span class="pre">--dist-timeout=30</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">training.dist_timeout:</span> <span class="pre">10</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">30</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p>EAGLE3 <code class="docutils literal notranslate"><span class="pre">--kl-decay=3.0</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">training.kl_decay:</span> <span class="pre">1.0</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">3.0</span></code></p></td>
+<tr class="row-even"><td><p>Who starts Mooncake and SGLang for online disaggregation?</p></td>
+<td><p>Presence of <code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.managed_local</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">external/</span></code> versus <code class="docutils literal notranslate"><span class="pre">managed-local/</span></code></p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>The old DFlash/Domino <code class="docutils literal notranslate"><span class="pre">--eval-interval=1000</span></code> did not identify an evaluation
-source by itself. In the unified runtime, evaluation is deliberately off by
-default and must be paired with <code class="docutils literal notranslate"><span class="pre">data.eval_hidden_states_path</span></code>.</p>
-<p>Two numerical lifecycle details are also deliberate. All unified FSDP methods
-keep buffers in float32; the removed EAGLE3 and DFlash scripts used bfloat16
-buffers, while the removed Domino script already used float32. Consequently,
-bit-for-bit comparisons to old EAGLE3/DFlash baselines must account for that
-dtype change. Also, <code class="docutils literal notranslate"><span class="pre">global_step</span></code>, LR/loss horizons, logging, saving, and Domino
-lambda decay are all expressed in completed optimizer updates. Fixed datasets
-are validated before backend/optimizer assembly to contain complete accumulation windows;
-finite online plans train only complete global optimizer quanta. The old
-scripts mixed micro-batch counters with a ceil-derived optimizer horizon, so
-accumulation greater than one did not have the same boundary semantics.</p>
+<p>The supported catalog layout is:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>examples/configs/
+├── offline/
+│   ├── colocated/
+│   └── disaggregated/
+└── online/
+    ├── colocated/                 # reserved; currently unsupported
+    └── disaggregated/
+        ├── external/
+        └── managed-local/
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">external</span></code> is an ownership boundary, not a statement that the services are on
+another machine. It is <code class="docutils literal notranslate"><span class="pre">external</span></code> when the user starts
+the server. <code class="docutils literal notranslate"><span class="pre">managed-local</span></code> owns those services on one host, while producer and
+consumer remain separate SpecForge roles. The runtime reads the YAML fields,
+not filename suffixes, to determine these semantics. See the complete
+<span class="xref myst">recipe catalog</span> for representative configs.</p>
 </section>
 <section id="launch-a-run">
 <h2>Launch a run<a class="headerlink" href="#launch-a-run" title="Link to this heading">#</a></h2>
 <p>Use the command directly for every checked-in topology:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>--config<span class="w"> </span>examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">deployment.trainer.nproc_per_node</span></code> records the audited local process count.
 When it is greater than one, the CLI starts torch distributed itself:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3-30b-a3b-eagle3-online.yaml
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3-online.yaml
 </pre></div>
 </div>
 <p>Online target inference never runs in the trainer. A patched SGLang server owns
@@ -607,7 +585,7 @@ configs assume that the command is run from the repository root.</p>
 <p>You can override an existing value without copying the YAML. Overrides use
 validated <code class="docutils literal notranslate"><span class="pre">section.field=value</span></code> syntax:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3-8b-eagle3-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.learning_rate<span class="o">=</span>5e-5<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.max_steps<span class="o">=</span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="nv">output_dir</span><span class="o">=</span>./outputs/eagle3-smoke
@@ -748,52 +726,63 @@ and <code class="docutils literal notranslate"><span class="pre">loss_mask</span
 <p>The checked-in examples are the canonical starting points:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
-<tr class="row-odd"><th class="head"><p>Strategy and mode</p></th>
+<tr class="row-odd"><th class="head"><p>Strategy</p></th>
+<th class="head"><p>Category</p></th>
 <th class="head"><p>Config</p></th>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>EAGLE3 online</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/4560bb741a4469e62026371af37200db/qwen3-8b-eagle3-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-eagle3-disaggregated.yaml</span></code></span></a></p></td>
+<tr class="row-even"><td><p>EAGLE3</p></td>
+<td><p>Online disaggregated, external</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/db4d1aa30f768426fdcace0f31e7d0e9/qwen3-8b-eagle3-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-eagle3-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>EAGLE3 offline</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/3a6e9874c340f1350c742616629b762c/qwen3-8b-eagle3-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-eagle3-offline.yaml</span></code></span></a></p></td>
+<tr class="row-odd"><td><p>EAGLE3</p></td>
+<td><p>Offline colocated</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/94390db80aa876a328a622a629502300/qwen3-8b-eagle3-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-eagle3-offline.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>DFlash online</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/64af86ae8e76f89e51f05dc2dcfea360/qwen3-8b-dflash-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-dflash-online.yaml</span></code></span></a></p></td>
+<tr class="row-even"><td><p>EAGLE3</p></td>
+<td><p>Offline disaggregated</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/f50e82f05b0e701d0525ec5671ce058e/qwen3-8b-eagle3-offline-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-eagle3-offline-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>DFlash offline</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/d0c1721a7dd156ccc83f5be8b6026f79/qwen3-8b-dflash-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-dflash-offline.yaml</span></code></span></a></p></td>
+<tr class="row-odd"><td><p>P-EAGLE</p></td>
+<td><p>Online disaggregated, external</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/4a3acea5d736f1c0eee8db94c6edc854/qwen3-8b-peagle-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-peagle-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>Domino online</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/36ba98a0397008b5f77a7d7e56b45b24/qwen3-8b-domino-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-online.yaml</span></code></span></a></p></td>
+<tr class="row-even"><td><p>DFlash</p></td>
+<td><p>Online disaggregated, external</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/e231cf767f4d970748e8c94fb7d65142/qwen3-8b-dflash-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-dflash-online.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>Domino offline</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/92414cf938071d088cb457d632b661e1/qwen3-8b-domino-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-offline.yaml</span></code></span></a></p></td>
+<tr class="row-odd"><td><p>DFlash</p></td>
+<td><p>Online disaggregated, managed-local</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/477a2ce8ec39b9004519230bb3d6cbcf/qwen3-8b-dflash-1server-dp7-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-dflash-1server-dp7-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>P-EAGLE online</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/e321e9972357ed60f0ac4d3e955659ae/qwen3-8b-peagle-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-peagle-disaggregated.yaml</span></code></span></a></p></td>
+<tr class="row-even"><td><p>DFlash</p></td>
+<td><p>Offline colocated</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/35a8e9683ae71e64c2b498943ea055e0/qwen3-8b-dflash-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-dflash-offline.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>DFlash disaggregated</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/d844355ac067479f04aca6b7fcc98cbc/qwen3-8b-dflash-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-dflash-disaggregated.yaml</span></code></span></a></p></td>
+<tr class="row-odd"><td><p>Domino</p></td>
+<td><p>Online disaggregated, external</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/b25bb8fde120f954f24bf1ca49609742/qwen3-8b-domino-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-online.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>Domino disaggregated</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/3b3863f2f0c610bc2daa07983fa0a10d/qwen3-8b-domino-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-disaggregated.yaml</span></code></span></a></p></td>
+<tr class="row-even"><td><p>Domino</p></td>
+<td><p>Online disaggregated, managed-local</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/bcc9b9cfaf5a2bbdfbf4b7cf2c235638/qwen3-8b-domino-multiserver-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-multiserver-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>DSpark disaggregated</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/3b04a47840176ad95c4f194dd698d1e3/qwen3-4b-dspark-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-4b-dspark-disaggregated.yaml</span></code></span></a></p></td>
+<tr class="row-odd"><td><p>Domino</p></td>
+<td><p>Offline colocated</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/06f5ceef4b03d926fd0707119bd5d14a/qwen3-8b-domino-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-offline.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>DSpark offline</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/907990ab87710fbc1fa037fb5f0094b3/qwen3-4b-dspark-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-4b-dspark-offline.yaml</span></code></span></a></p></td>
+<tr class="row-even"><td><p>DSpark</p></td>
+<td><p>Online disaggregated, external</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/ff70fa2ec0156813b3d5ad4e0a059796/qwen3-4b-dspark-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-4b-dspark-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>EAGLE3 offline disaggregated</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/978c3354c1aa0e7c3492342dd0c48ca1/qwen3-8b-eagle3-offline-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-eagle3-offline-disaggregated.yaml</span></code></span></a></p></td>
+<tr class="row-odd"><td><p>DSpark</p></td>
+<td><p>Offline colocated</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/eedc0142a92beebda530d02ac9c6a244/qwen3-4b-dspark-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-4b-dspark-offline.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>Ascend NPU DFlash online</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/80fb60b7b4b579275dcfe77789f8b58b/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a></p></td>
-</tr>
-<tr class="row-odd"><td><p>Ascend NPU Domino online</p></td>
-<td><p><a class="reference download internal" download="" href="../_downloads/f820e4a2c09b8871f7e1152d39b78da7/qwen3.5-4b-domino-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-domino-online-npu.yaml</span></code></span></a></p></td>
+<tr class="row-even"><td><p>DFlash (Ascend)</p></td>
+<td><p>Online disaggregated, external</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/d06712daee1c8beb3f5fb494eb8f8fab/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a></p></td>
 </tr>
 </tbody>
 </table>
@@ -817,7 +806,7 @@ more storage.</p>
 </thead>
 <tbody>
 <tr class="row-even"><td><p>Online</p></td>
-<td><p>External/managed SGLang capture server</p></td>
+<td><p>External or managed-local SGLang capture server</p></td>
 <td><p>Low</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">train_data_path</span></code> or <code class="docutils literal notranslate"><span class="pre">prompts_path</span></code></p></td>
 </tr>
@@ -839,9 +828,9 @@ launching it.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Strategy</p></th>
-<th class="head"><p>SGLang server online</p></th>
-<th class="head"><p>Local/dataflow offline</p></th>
-<th class="head"><p>Disaggregated offline</p></th>
+<th class="head"><p>Online disaggregated</p></th>
+<th class="head"><p>Offline colocated</p></th>
+<th class="head"><p>Offline disaggregated</p></th>
 </tr>
 </thead>
 <tbody>
@@ -890,16 +879,18 @@ schema;</p></li>
 <li><p>every online run is disaggregated and uses <code class="docutils literal notranslate"><span class="pre">model.target_backend=sglang</span></code>;
 finite runs may omit both step fields so the producer can publish the exact
 optimizer horizon derived from the prepared prompt plan;</p></li>
-<li><p>EAGLE3 local offline runs derive and cache a deterministic vocabulary mapping
+<li><p>EAGLE3 offline colocated runs derive and cache a deterministic vocabulary mapping
 from the feature corpus when <code class="docutils literal notranslate"><span class="pre">model.vocab_mapping_path</span></code> is empty. EAGLE3
 disaggregated runs require an explicit shared mapping so producer and
 consumer cannot derive different artifacts.</p></li>
 </ul>
-<p>There is no fallback to a removed training script.</p>
-<p>Step limits are global optimizer updates. <code class="docutils literal notranslate"><span class="pre">training.max_steps</span></code> is a stop cap and,
-when set without <code class="docutils literal notranslate"><span class="pre">training.total_steps</span></code>, the fallback optimizer/loss schedule
-horizon. <code class="docutils literal notranslate"><span class="pre">training.total_steps</span></code> can describe a longer schedule, but does not by
-itself stop an online stream. When a finite online run omits both, the producer
+<p>Step limits, LR/loss horizons, logging, saving, and Domino lambda decay are
+expressed in completed optimizer updates. Fixed datasets are validated to
+contain complete accumulation windows, and finite online plans do not train an
+incomplete final quantum. <code class="docutils literal notranslate"><span class="pre">training.max_steps</span></code> is a stop cap and, when set
+without <code class="docutils literal notranslate"><span class="pre">training.total_steps</span></code>, the fallback optimizer/loss schedule horizon.
+<code class="docutils literal notranslate"><span class="pre">training.total_steps</span></code> can describe a longer schedule, but does not by itself
+stop an online stream. When a finite online run omits both, the producer
 publishes the exact schedule horizon and the consumer trains to EOF.</p>
 </section>
 <section id="parallel-topologies">
@@ -1007,7 +998,7 @@ and SDPA consumers. A four-device launch is:</p>
 <span class="nb">export</span><span class="w"> </span><span class="nv">HCCL_EXEC_TIMEOUT</span><span class="o">=</span><span class="m">7200</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">PYTORCH_NPU_ALLOC_CONF</span><span class="o">=</span>expandable_segments:True
 
-specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3.5-4b-dflash-online-npu.yaml
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
 </pre></div>
 </div>
 <p>The unified launcher supplies rank, world-size, and rendezvous variables. The
@@ -1016,13 +1007,15 @@ is active.</p>
 </section>
 <section id="disaggregated-roles">
 <h2>Disaggregated roles<a class="headerlink" href="#disaggregated-roles" title="Link to this heading">#</a></h2>
-<p>A single-node disaggregated config supervises producer and consumer with one
-command. Split deployments use the same config with <code class="docutils literal notranslate"><span class="pre">--role</span> <span class="pre">producer</span></code> or
-<code class="docutils literal notranslate"><span class="pre">--role</span> <span class="pre">consumer</span></code>; multi-node consumers add only <code class="docutils literal notranslate"><span class="pre">--node-rank</span></code> on each host.
-The optional <code class="docutils literal notranslate"><span class="pre">examples/disagg/run_online.sh</span></code> and <code class="docutils literal notranslate"><span class="pre">run_offline.sh</span></code> files are thin
-delegates, not topology wrappers. See the
-<a class="reference internal" href="disaggregated_training.html"><span class="std std-doc">disaggregated training guide</span></a> for external
-Mooncake/SGLang prerequisites, freshness rules, and both launch forms.</p>
+<p>A single-node disaggregated config supervises the SpecForge producer and
+consumer with one command. This does not make the run colocated: the roles and
+their data-plane contract remain separate. For an external recipe, the command
+also does not start Mooncake or SGLang. Split deployments use the same config
+with <code class="docutils literal notranslate"><span class="pre">--role</span> <span class="pre">producer</span></code> or <code class="docutils literal notranslate"><span class="pre">--role</span> <span class="pre">consumer</span></code>; multi-node consumers add only
+<code class="docutils literal notranslate"><span class="pre">--node-rank</span></code> on each host. The optional <code class="docutils literal notranslate"><span class="pre">examples/disagg/run_online.sh</span></code> and
+<code class="docutils literal notranslate"><span class="pre">run_offline.sh</span></code> files are thin delegates, not topology wrappers. See the
+<a class="reference internal" href="disaggregated_training.html"><span class="std std-doc">disaggregated training guide</span></a> for external-service
+prerequisites, managed-local ownership, freshness rules, and both launch forms.</p>
 </section>
 <section id="checkpoints-and-resume">
 <h2>Checkpoints and resume<a class="headerlink" href="#checkpoints-and-resume" title="Link to this heading">#</a></h2>
@@ -1031,12 +1024,12 @@ Mooncake/SGLang prerequisites, freshness rules, and both launch forms.</p>
 <code class="docutils literal notranslate"><span class="pre">output_dir</span></code>. A completed trainer run always saves its final runtime checkpoint,
 even when <code class="docutils literal notranslate"><span class="pre">save_interval</span></code> is zero or the final step is not an interval boundary.
 The <code class="docutils literal notranslate"><span class="pre">&lt;run_id&gt;-latest</span></code> symlink resolves to the newest complete checkpoint.</p>
-<p>Local offline runs restore draft weights, optimizer/scheduler, epoch/step/data
+<p>Offline colocated runs restore draft weights, optimizer/scheduler, epoch/step/data
 position, and per-rank RNG. Offline disaggregated consumers have the same
-checkpoint contract. For a local offline run, override
+checkpoint contract. For an offline colocated run, override
 <code class="docutils literal notranslate"><span class="pre">training.resume_from</span></code>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3-8b-eagle3-offline.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.resume_from<span class="o">=</span>./outputs/qwen3-8b-eagle3-offline/qwen3-8b-eagle3-offline-latest
 </pre></div>
 </div>
@@ -1163,7 +1156,7 @@ earlier in this page.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#defaults-when-migrating-removed-trainers">Defaults when migrating removed trainers</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#choose-a-recipe">Choose a recipe</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-a-run">Launch a run</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-config">Run config</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-configuration-and-model-initialization">Draft configuration and model initialization</a></li>

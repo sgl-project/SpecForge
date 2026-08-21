@@ -539,16 +539,18 @@ python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </sp
 </pre></div>
 </div>
 <p>For the complete container setup and an end-to-end walkthrough covering
-installation, data preparation, and offline / online / disaggregated training on
-AMD Instinct GPUs, follow the <a class="reference internal" href="../basic_usage/AMD/amd_rocm.html"><span class="std std-doc">AMD ROCm Tutorial</span></a>.</p>
+installation, data preparation, offline colocated training, online
+disaggregated training, and its single-supervisor and split external launch
+forms on AMD Instinct GPUs, follow the
+<a class="reference internal" href="../basic_usage/AMD/amd_rocm.html"><span class="std std-doc">AMD ROCm Tutorial</span></a>.</p>
 </section>
 <section id="ascend-npu">
 <h3>Ascend NPU<a class="headerlink" href="#ascend-npu" title="Link to this heading">#</a></h3>
 <p>Install the vendor-matched PyTorch and <code class="docutils literal notranslate"><span class="pre">torch_npu</span></code> packages first, then install
 SpecForge. The checked-in
-<a class="reference download internal" download="" href="../_downloads/80fb60b7b4b579275dcfe77789f8b58b/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a>
+<a class="reference download internal" download="" href="../_downloads/d06712daee1c8beb3f5fb494eb8f8fab/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a>
 and
-<a class="reference download internal" download="" href="../_downloads/f820e4a2c09b8871f7e1152d39b78da7/qwen3.5-4b-domino-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-domino-online-npu.yaml</span></code></span></a>
+<a class="reference download internal" download="" href="../_downloads/6590eaa84b0b318b6330581522a173ef/qwen3.5-4b-domino-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-domino-online-npu.yaml</span></code></span></a>
 recipes use external SGLang server capture with SDPA consumers. Install a
 compatible SGLang/Mooncake service first. The unified launcher detects the NPU
 device, self-launches the process count recorded in YAML, and selects HCCL; see

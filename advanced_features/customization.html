@@ -498,7 +498,7 @@ change model and data paths, and keep the same training entry point:</p>
 </div>
 <p>For one-off changes, use dotted overrides rather than adding another launcher:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3-8b-eagle3-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>model.target_model_path<span class="o">=</span>/models/my-target<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>data.train_data_path<span class="o">=</span>/datasets/my-training-data.jsonl<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.learning_rate<span class="o">=</span>5e-5
