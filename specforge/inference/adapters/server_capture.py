@@ -24,6 +24,7 @@ tensors.  The application composition root injects an algorithm-owned
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
@@ -62,14 +63,6 @@ class ServerCaptureFailure:
     task_id: str
     reason: str
     retryable: bool = True
-
-
-def _default_post(url: str, json_body: Dict[str, Any], timeout: float):
-    import requests
-
-    resp = requests.post(url, json=json_body, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
 
 
 def _flatten_list_wrappers(value: Any) -> List[Any]:
@@ -167,9 +160,30 @@ class SGLangServerCaptureAdapter:
             )
         self.request_input_adapter = request_input_adapter
         self.timeout_s = timeout_s
-        self.post_fn = post_fn or _default_post
+        self._post_local = threading.local()
+        self.post_fn = post_fn or self._pooled_post
         self.target_model_version = target_model_version
         self._healthy = True
+
+    def _pooled_post(self, url: str, json_body: Dict[str, Any], timeout: float):
+        """Reuse one keep-alive HTTP connection per capture executor thread."""
+        import requests
+
+        session = getattr(self._post_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=1,
+                pool_maxsize=1,
+                pool_block=True,
+                max_retries=0,
+            )
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self._post_local.session = session
+        response = session.post(url, json=json_body, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
 
     # -- request construction -------------------------------------------------
     def _sample_id(self, task: PromptTask) -> str:
