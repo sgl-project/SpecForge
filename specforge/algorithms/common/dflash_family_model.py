@@ -1,6 +1,7 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -731,6 +732,9 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_type="dflash",
         )
         self.shift_label = shift_label
+        self._use_fused_domino_ce = (
+            os.environ.get("SPECFORGE_DOMINO_TRITON_CE", "1") == "1"
+        )
 
     def _build_domino_head_inputs(
         self,
@@ -758,21 +762,6 @@ class OnlineDominoModel(OnlineDFlashModel):
 
         return hidden4d, prev_ids
 
-    def _apply_domino_head(
-        self,
-        base_logits4d: torch.Tensor,
-        hidden4d: torch.Tensor,
-        prev_ids: torch.Tensor,
-        target_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        head_token_ids = prev_ids if self.shift_label else target_ids
-        head_token_embeddings = self.embed_tokens(head_token_ids)
-        return self.draft_model.apply_logits_head(
-            base_logits4d,
-            hidden_states=hidden4d,
-            prev_token_embeddings=head_token_embeddings,
-        )
-
     def _domino_objective_chunk_terms(
         self,
         hidden: torch.Tensor,
@@ -782,34 +771,34 @@ class OnlineDominoModel(OnlineDFlashModel):
         eval_weight_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive Domino loss and telemetry terms for one block slice."""
+        from specforge.core.domino_loss import domino_weighted_cross_entropy
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         base_logits = self.lm_head(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
-        final_logits = self._apply_domino_head(
-            base_logits4d=base_logits,
-            hidden4d=hidden,
-            prev_ids=prev_ids,
-            target_ids=target_ids,
+        head_token_ids = prev_ids if self.shift_label else target_ids
+        head_token_embeddings = self.embed_tokens(head_token_ids)
+        correction_logits = self.draft_model.compute_correction_logits(
+            hidden_states=hidden,
+            prev_token_embeddings=head_token_embeddings,
         )
-        final_ce = F.cross_entropy(
-            final_logits.reshape(-1, final_logits.shape[-1]),
-            target_ids.reshape(-1),
-            reduction="none",
-        ).reshape_as(target_ids)
-        base_ce = F.cross_entropy(
-            base_logits.reshape(-1, base_logits.shape[-1]),
-            target_ids.reshape(-1),
-            reduction="none",
-        ).reshape_as(target_ids)
-        final_num = (final_ce * weight_mask).sum()
-        base_num = (base_ce * weight_mask).sum()
+        final_num, base_num, predicted_ids, base_predicted_ids = (
+            domino_weighted_cross_entropy(
+                base_logits.reshape(-1, base_logits.shape[-1]),
+                correction_logits.reshape(-1, correction_logits.shape[-1]),
+                target_ids.reshape(-1),
+                weight_mask.reshape(-1),
+                block_size=block_size,
+                suffix_start=self.draft_model.suffix_start,
+                use_fused=self._use_fused_domino_ce and base_logits.is_cuda,
+            )
+        )
         loss_den = weight_mask.sum()
 
         with torch.no_grad():
-            predicted_ids = final_logits.argmax(dim=-1)
-            base_predicted_ids = base_logits.argmax(dim=-1)
+            predicted_ids = predicted_ids.reshape_as(target_ids)
+            base_predicted_ids = base_predicted_ids.reshape_as(target_ids)
             binary_accuracy_mask = eval_weight_mask > 0.5
             correct_num = (
                 ((predicted_ids == target_ids) & binary_accuracy_mask).sum().float()

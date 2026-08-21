@@ -1,10 +1,47 @@
 # Unified training recipe catalog
 
 Every draft model JSON under `configs/` has at least one typed YAML recipe in
-this directory. Run any recipe through the one public training entry:
+this catalog. Choose a recipe by answering three separate questions:
+
+1. **When are target features produced?** `online` captures them during the
+   run; `offline` reads feature files prepared earlier.
+2. **How are feature supply and training deployed?** `colocated` maps to
+   `deployment.mode: local_colocated` and lets the trainer read offline files
+   directly; `disaggregated` uses separate producer and consumer roles.
+3. **Who owns the online infrastructure?** `external` means the user or
+   scheduler owns Mooncake and SGLang; `managed-local` means SpecForge starts
+   and stops those services on the local host.
+
+Those decisions map directly to the directory tree:
+
+```text
+examples/configs/
+├── offline/
+│   ├── colocated/
+│   └── disaggregated/
+└── online/
+    ├── colocated/
+    └── disaggregated/
+        ├── external/
+        └── managed-local/
+```
+
+| Directory | Feature source | SpecForge roles | Infrastructure ownership |
+| --- | --- | --- | --- |
+| `offline/colocated` | Precomputed `.ckpt` files | Trainer only | Not applicable |
+| `offline/disaggregated` | Precomputed files ingested into `shared_dir` or Mooncake | Producer + consumer | Storage is configured separately; there is no `external`/`managed-local` subdivision |
+| `online/colocated` | — | — | Reserved; the current runtime does not support online colocated training |
+| `online/disaggregated/external` | Live SGLang capture | Producer + consumer | User or scheduler starts Mooncake and SGLang |
+| `online/disaggregated/managed-local` | Live SGLang capture | Producer + consumer | SpecForge starts local Mooncake and SGLang from `managed_local` |
+
+The directory is the source of truth for mode, topology, and service ownership.
+Some filenames retain historical `-online`, `-offline`, or `-disaggregated`
+labels so existing recipe identities and run names remain recognizable.
+
+Run any recipe through the one public training entry:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
 `model.draft_model_config` may name a local JSON file, a local model directory,
@@ -18,13 +55,13 @@ Every recipe records its audited process count under `deployment.trainer`.
 Multi-process configs self-launch through torch distributed:
 
 ```bash
-specforge train -c examples/configs/qwen3-30b-a3b-eagle3-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3-online.yaml
 ```
 
 The Qwen3-30B-A3B EAGLE3.1 variant uses the same unified entry point:
 
 ```bash
-specforge train -c examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1-online.yaml
 ```
 
 Its draft config enables per-layer RMS normalization before the three captured
@@ -32,26 +69,14 @@ target hidden states are concatenated and projected. It remains registered as
 the `eagle3` strategy; EAGLE3.1 is a draft-model configuration variant, not a
 second runtime or launch path.
 
-The filename is the index: `*-online.yaml` performs SGLang server capture while
-training, `*-offline.yaml` consumes precomputed features, and
-`*-disaggregated.yaml` highlights a producer/consumer topology. Every online
-recipe is disaggregated even when its historical filename only says `online`.
-VLM training is not supported, so the catalog contains text-only recipes.
-
-The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
-`qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
-`qwen3-8b-domino-multiserver-disaggregated.yaml`,
-`qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml`,
-`qwen3.6-27b-dflash2-disaggregated.yaml`, and
-`qwen3.6-27b-dflash-multiserver-disaggregated.yaml`, and
-`qwen3.6-27b-dspark-disaggregated.yaml` recipes are opt-in local
+Recipes under `online/disaggregated/managed-local` are opt-in, single-node
 full-stack examples. Their typed `managed_local` blocks own Mooncake, one or
-two patched SGLang capture servers, and the trainer GPU allocation; the same
-`specforge train -c ...` command starts and cleans up each complete stack.
-Disaggregated recipes without `managed_local` keep Mooncake and SGLang external
-for scheduler- or service-managed deployments.
+more patched SGLang capture servers, and the trainer GPU allocation; the same
+`specforge train -c ...` command starts and cleans up the complete stack.
+Recipes under `online/disaggregated/external` omit `managed_local`, so Mooncake
+and SGLang remain owned by the user, scheduler, or service platform.
 
-The `kimi-k3-dspark-disaggregated.yaml` recipe is the external-service
+The `kimi-k3-dspark-disaggregated.yaml` recipe is the external
 two-node migration of the 64K Kimi K3 continual run. Its dedicated
 [runbook](../../docs/recipes/kimi-k3-dspark-disaggregated.md) pins the K3
 SGLang revision and patch target, preserves the old effective global batch and
@@ -74,7 +99,8 @@ errors; YAML files and dotted CLI overrides go through the same validation.
 New checked-in recipes should explicitly set `training.strategy`,
 `deployment.mode`, `deployment.trainer.nnodes`,
 `deployment.trainer.nproc_per_node`, `run_id`, and `output_dir`, even when the
-schema has the same default. A minimal server-only online recipe looks like:
+schema has the same default. A minimal online recipe with externally managed
+services looks like:
 
 ```yaml
 model:
@@ -119,16 +145,18 @@ assume the command runs from the repository root.
 
 | Workflow | Canonical starting point |
 | --- | --- |
-| EAGLE3 colocated offline | `qwen3-8b-eagle3-offline.yaml` |
-| DFlash colocated offline | `qwen3-8b-dflash-offline.yaml` |
-| Domino colocated offline | `qwen3-8b-domino-offline.yaml` |
-| DSpark colocated offline | `qwen3-4b-dspark-offline.yaml` |
-| External-service online | `qwen3-8b-eagle3-disaggregated.yaml` |
-| Managed-local disaggregated online | `qwen3-8b-domino-multiserver-disaggregated.yaml` |
-| Disaggregated offline | `qwen3-8b-eagle3-offline-disaggregated.yaml` |
+| EAGLE3 offline, colocated | [`offline/colocated/qwen3-8b-eagle3-offline.yaml`](offline/colocated/qwen3-8b-eagle3-offline.yaml) |
+| DFlash offline, colocated | [`offline/colocated/qwen3-8b-dflash-offline.yaml`](offline/colocated/qwen3-8b-dflash-offline.yaml) |
+| Domino offline, colocated | [`offline/colocated/qwen3-8b-domino-offline.yaml`](offline/colocated/qwen3-8b-domino-offline.yaml) |
+| DSpark offline, colocated | [`offline/colocated/qwen3-4b-dspark-offline.yaml`](offline/colocated/qwen3-4b-dspark-offline.yaml) |
+| EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
+| EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
+| DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+| Domino online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
 
-The online/offline mode is derived from the selected `data` source, not from
-the filename. The filename is a discoverability convention.
+The runtime derives online/offline mode from the selected `data` source and
+reads topology from `deployment.mode`; it does not parse the filename or its
+historical suffixes.
 
 ### Top-level fields
 
@@ -152,7 +180,7 @@ should make their training strategy and topology explicit.
 | `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
 | `model.target_backend` | `sglang` | `sglang` is the only accepted value; retired `hf`/`custom` names fail at config load. Offline feature consumers do not instantiate a target inference backend. |
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
-| `model.shard_target_output` | `false` | Retained for config migration; leave it false on the server-only online path. |
+| `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
 | `model.use_liger_kernel` | `false` | Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash training. Requires the `specforge[liger]` extra. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
@@ -243,7 +271,7 @@ Common fields:
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
-| `training.role` | `all` | Use `all` for local offline training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
+| `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
 
@@ -431,17 +459,17 @@ unless tuning throughput or memory pressure.
 - Online evaluation is not supported. Offline `data.eval_hidden_states_path`
   and `training.eval_interval` must be configured together.
 
-Validate the complete schema and inspect the resolved processes without
-starting a run:
+After copying a checked-in recipe to `./my-run.yaml` and editing it, validate
+the complete schema and inspect the resolved processes without starting a run:
 
 ```bash
-specforge train -c examples/configs/my-run.yaml --plan
+specforge train -c ./my-run.yaml --plan
 ```
 
 Use validated dotted overrides for temporary changes:
 
 ```bash
-specforge train -c examples/configs/my-run.yaml \
+specforge train -c ./my-run.yaml \
   training.learning_rate=5e-5 \
   'deployment.disaggregated.server_urls=["http://capture-0:30000"]'
 ```
@@ -452,7 +480,7 @@ For deeper lifecycle and recovery semantics, see the
 
 ## Capability matrix
 
-| Strategy | SGLang server online | Local offline | Disaggregated offline |
+| Strategy | Online disaggregated | Offline colocated | Offline disaggregated |
 | --- | --- | --- | --- |
 | EAGLE3 | consumer DP | DP + USP | consumer DP |
 | DFlash | consumer DP | DP | consumer DP |
@@ -499,14 +527,14 @@ export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-specforge train -c examples/configs/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
 ```
 
 The unified launcher provides rank/world/rendezvous variables and the runtime
 selects HCCL when `torch_npu` is active. For AMD GPUs, install
 `requirements-rocm.txt`; HF + SDPA is the portable ROCm starting point.
 
-Local offline and disaggregated offline resume are supported.
+Offline colocated and offline disaggregated resume are supported.
 Disaggregated online recovery resumes only the consumer against retained
 control/data-plane state; capture producers always start a fresh attempt.
 

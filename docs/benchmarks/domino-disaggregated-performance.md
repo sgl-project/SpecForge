@@ -32,7 +32,7 @@ export MOONCAKE_PROTOCOL=rdma
 export MOONCAKE_RDMA_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 
 # Start the external capture server with --mem-fraction-static 0.5, then run:
-specforge train -c examples/configs/qwen3-8b-domino-disaggregated.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml \
   'deployment.disaggregated.server_urls=["http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000"]' \
   deployment.trainer.nproc_per_node=7 \
   training.batch_size=2 \
@@ -52,7 +52,7 @@ seven trainer ranks on GPUs 1–7:
 
 ```bash
 specforge train -c \
-  examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml
 ```
 
 The recipe records batch size 2, accumulation 8, and capture-server memory
