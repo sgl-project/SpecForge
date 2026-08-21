@@ -18,6 +18,7 @@ def main() -> None:
     parser.add_argument("--dataset-file", required=True)
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--max-length", type=int, default=8192)
+    parser.add_argument("--min-loss-tokens", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -31,7 +32,7 @@ def main() -> None:
     prompts = _ProcessedPromptSequence(
         dataset,
         max_length=args.max_length,
-        min_loss_tokens=1,
+        min_loss_tokens=args.min_loss_tokens,
         loss_mask_filter=None,
     )
     started = time.perf_counter()
