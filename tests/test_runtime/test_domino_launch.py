@@ -63,7 +63,7 @@ class TestDominoLambdaSchedule(unittest.TestCase):
                 }
 
             def forward(self, **kwargs):
-                del kwargs
+                self.last_kwargs = kwargs
                 return self.weight.square(), torch.tensor(0.75), self.model_metrics
 
         model = DiagnosticModel()
@@ -90,6 +90,7 @@ class TestDominoLambdaSchedule(unittest.TestCase):
         for name, value in model.model_metrics.items():
             self.assertIs(output.metrics[name], value)
         self.assertEqual(float(output.metrics["accuracy"]), 0.75)
+        self.assertEqual(model.last_kwargs["max_valid_anchors"], 1)
 
 
 @unittest.skipUnless(CUDA, "Domino offline launcher path requires CUDA")

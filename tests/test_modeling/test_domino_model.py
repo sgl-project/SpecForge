@@ -78,8 +78,14 @@ class TestDominoDraftModel(unittest.TestCase):
         )
         fixed_hidden = torch.randn(1, block_size, hidden_size)
 
-        def fixed_draft_blocks(self, input_ids, hidden_states, loss_mask):
-            del hidden_states, loss_mask
+        def fixed_draft_blocks(
+            self,
+            input_ids,
+            hidden_states,
+            loss_mask,
+            max_valid_anchors=None,
+        ):
+            del hidden_states, loss_mask, max_valid_anchors
             return (
                 torch.zeros(1, 1, dtype=torch.long, device=input_ids.device),
                 torch.ones(1, 1, dtype=torch.bool, device=input_ids.device),
@@ -87,12 +93,13 @@ class TestDominoDraftModel(unittest.TestCase):
             )
 
         model._forward_draft_blocks = MethodType(fixed_draft_blocks, model)
-        loss, _accuracy, _metrics = model(
+        loss, _accuracy, metrics = model(
             input_ids=torch.tensor([[1, 2, 3, 4]]),
             hidden_states=torch.zeros(1, block_size, hidden_size),
             loss_mask=torch.ones(1, block_size),
             lambda_base=0.0,
         )
+        self.assertIsInstance(metrics["lambda_base"], float)
         loss.backward()
 
         for module in (draft.prefix_gru, draft.embed_proj):
@@ -147,8 +154,20 @@ class TestDominoDraftModel(unittest.TestCase):
                 chunked_hidden = full_hidden.detach().clone().requires_grad_()
 
                 def fixed_blocks(output_hidden):
-                    def _forward(self, input_ids, hidden_states, loss_mask):
-                        del self, input_ids, hidden_states, loss_mask
+                    def _forward(
+                        self,
+                        input_ids,
+                        hidden_states,
+                        loss_mask,
+                        max_valid_anchors=None,
+                    ):
+                        del (
+                            self,
+                            input_ids,
+                            hidden_states,
+                            loss_mask,
+                            max_valid_anchors,
+                        )
                         return anchors, keep_mask, output_hidden
 
                     return _forward
@@ -219,6 +238,86 @@ class TestDominoDraftModel(unittest.TestCase):
                             rtol=1e-6,
                             atol=1e-7,
                         )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Triton loss requires CUDA")
+    def test_fused_loss_matches_standard_model_path(self):
+        from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
+
+        torch.manual_seed(19)
+        hidden_size, vocab_size, block_size = 4, 7, 4
+        draft = _bare_domino(
+            hidden_size=hidden_size,
+            gru_hidden_size=3,
+            embedding_size=2,
+            vocab_size=vocab_size,
+            block_size=block_size,
+        )
+        model = OnlineDominoModel(
+            draft_model=draft,
+            target_lm_head=nn.Linear(hidden_size, vocab_size, bias=False),
+            target_embed_tokens=nn.Embedding(vocab_size, hidden_size),
+            mask_token_id=0,
+            block_size=block_size,
+            attention_backend="sdpa",
+            num_anchors=2,
+            objective_chunk_blocks=1,
+            shift_label=False,
+        ).cuda()
+        fixed_hidden = torch.randn(
+            1, 2 * block_size, hidden_size, device="cuda", requires_grad=True
+        )
+
+        def fixed_draft_blocks(
+            self,
+            input_ids,
+            hidden_states,
+            loss_mask,
+            max_valid_anchors=None,
+        ):
+            del hidden_states, loss_mask, max_valid_anchors
+            return (
+                torch.tensor([[0, 4]], device=input_ids.device),
+                torch.ones(1, 2, dtype=torch.bool, device=input_ids.device),
+                fixed_hidden,
+            )
+
+        model._forward_draft_blocks = MethodType(fixed_draft_blocks, model)
+        inputs = {
+            "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 0, 1]], device="cuda"),
+            "hidden_states": torch.zeros(1, 2 * block_size, hidden_size, device="cuda"),
+            "loss_mask": torch.ones(1, 2 * block_size, device="cuda"),
+            "lambda_base": 0.25,
+        }
+        model._use_fused_domino_ce = False
+        standard = model(**inputs)
+        standard[0].backward()
+        standard_hidden_grad = fixed_hidden.grad.clone()
+        standard_parameter_grads = {
+            name: None if parameter.grad is None else parameter.grad.clone()
+            for name, parameter in model.named_parameters()
+        }
+        fixed_hidden.grad = None
+        model.zero_grad(set_to_none=True)
+
+        model._use_fused_domino_ce = True
+        fused = model(**inputs)
+        fused[0].backward()
+
+        torch.testing.assert_close(fused[0], standard[0])
+        torch.testing.assert_close(fused[1], standard[1])
+        for key in standard[2]:
+            torch.testing.assert_close(fused[2][key], standard[2][key])
+
+        torch.testing.assert_close(
+            fixed_hidden.grad, standard_hidden_grad, rtol=1e-4, atol=1e-4
+        )
+        for name, parameter in model.named_parameters():
+            standard_grad = standard_parameter_grads[name]
+            self.assertEqual(parameter.grad is None, standard_grad is None, name)
+            if standard_grad is not None:
+                torch.testing.assert_close(
+                    parameter.grad, standard_grad, rtol=1e-4, atol=1e-4
+                )
 
     def test_npu_bf16_gru_gradients_reach_registered_weights(self):
         torch.manual_seed(7)

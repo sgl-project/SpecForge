@@ -1,9 +1,6 @@
 model:
-  target_model_path: /workspace/models/Kimi-K3-cdd2e49a
+  target_model_path: moonshotai/Kimi-K3
   draft_model_config: configs/kimi-k3-dspark.json
-  # Weights-only initialization: optimizer, scheduler, counters, and RNG start
-  # fresh for the regenerated agentic data.
-  draft_checkpoint_path: /workspace/k3_dspark/checkpoints/kimi-k3-dspark/epoch_0_step_0
   target_backend: sglang
   trust_remote_code: true
   embedding_key: language_model.model.embed_tokens.weight
@@ -20,10 +17,10 @@ model:
   sglang_max_mamba_cache_size: 5
 
 data:
-  train_data_path: /workspace/k3_dspark/data/kimi-k3-agentic-regen.jsonl
+  train_data_path: ./cache/dataset/kimi_k3_dspark_train.jsonl
   max_length: 65536
   chat_template: kimi-k3-thinking
-  cache_dir: /workspace/k3_dspark/cache
+  cache_dir: cache
   build_dataset_num_proc: 64
   dataloader_num_workers: 0
 
@@ -34,7 +31,7 @@ training:
   # effective global batch of 128 sequences.
   batch_size: 1
   accumulation_steps: 32
-  learning_rate: 0.000050959167111070076
+  learning_rate: 0.0006
   lr_scheduler: constant
   warmup_ratio: 0
   max_grad_norm: 1
@@ -55,7 +52,7 @@ tracking:
   report_to: wandb
   wandb_project: specforge-dspark
   wandb_name: kimi-k3-dspark-specforge-disaggregated
-  wandb_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/wandb
+  wandb_dir: outputs/kimi-k3-dspark-disaggregated/wandb
 
 runtime:
   producer_lease: 1
@@ -71,8 +68,8 @@ runtime:
   resident_low_watermark_bytes: 697932185600
   feature_store_max_resident_bytes: 966367641600
 
-run_id: kimi-k3-dspark-specforge-disaggregated
-output_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/output
+run_id: kimi-k3-dspark-disaggregated
+output_dir: outputs/kimi-k3-dspark-disaggregated
 
 deployment:
   mode: disaggregated
@@ -80,8 +77,8 @@ deployment:
     nnodes: 1
     nproc_per_node: 4
   disaggregated:
-    control_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/control
-    consumer_state_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/consumer-state
+    control_dir: outputs/kimi-k3-dspark-disaggregated/control
+    consumer_state_dir: outputs/kimi-k3-dspark-disaggregated/consumer-state
     backend: mooncake
     store_id: kimi-k3-dspark-specforge-disaggregated
     server_urls:

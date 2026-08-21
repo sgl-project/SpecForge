@@ -1,6 +1,7 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -194,7 +195,11 @@ class OnlineDFlashModel(nn.Module):
         self._cached_bsz: Optional[int] = None
 
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        max_valid_anchors: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample anchors whose clean token and first target are supervised."""
 
@@ -203,7 +208,12 @@ class OnlineDFlashModel(nn.Module):
             loss_mask[:, 1 : num_candidates + 1] > 0.5
         )
         valid_counts = valid.sum(dim=1)
-        width = min(self.num_anchors, int(valid_counts.max().item()))
+        if max_valid_anchors is None:
+            # Direct model callers may supply an already-device-resident mask.
+            # Training strategies pass the CPU-computed value and avoid this
+            # synchronizing fallback on CUDA.
+            max_valid_anchors = int(valid_counts.max().item())
+        width = min(self.num_anchors, max(0, int(max_valid_anchors)))
         if width == 0:
             raise ValueError(
                 "DFlash-family training requires two consecutive supervised tokens"
@@ -296,12 +306,16 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        max_valid_anchors: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+            seq_len,
+            loss_mask,
+            device,
+            max_valid_anchors=max_valid_anchors,
         )
 
         noise_embedding = self._create_noise_embed(
@@ -344,11 +358,20 @@ class OnlineDFlashModel(nn.Module):
                 ),
             }
 
+        draft_kwargs = {}
+        if self.attention_backend == "flex_attention":
+            # DFlash's dynamic short-query batches are training/prefill shaped,
+            # not autoregressive decoding.  AUTO may route q_len < 128 to the
+            # more restrictive flex-decoding kernel, whose config set can be
+            # empty for DFlash's sparse BlockMask.  Keep the general Triton
+            # Flex Attention kernel for every DFlash-family batch.
+            draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **draft_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
 
@@ -410,6 +433,7 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        max_valid_anchors: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -424,6 +448,7 @@ class OnlineDFlashModel(nn.Module):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            max_valid_anchors=max_valid_anchors,
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
@@ -513,6 +538,9 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_type="dflash",
         )
         self.shift_label = shift_label
+        self._use_fused_domino_ce = (
+            os.environ.get("SPECFORGE_DOMINO_TRITON_CE", "1") == "1"
+        )
 
     def _build_domino_head_inputs(
         self,
@@ -540,21 +568,6 @@ class OnlineDominoModel(OnlineDFlashModel):
 
         return hidden4d, prev_ids
 
-    def _apply_domino_head(
-        self,
-        base_logits4d: torch.Tensor,
-        hidden4d: torch.Tensor,
-        prev_ids: torch.Tensor,
-        target_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        head_token_ids = prev_ids if self.shift_label else target_ids
-        head_token_embeddings = self.embed_tokens(head_token_ids)
-        return self.draft_model.apply_logits_head(
-            base_logits4d,
-            hidden_states=hidden4d,
-            prev_token_embeddings=head_token_embeddings,
-        )
-
     def _domino_objective_chunk_terms(
         self,
         hidden: torch.Tensor,
@@ -564,34 +577,34 @@ class OnlineDominoModel(OnlineDFlashModel):
         eval_weight_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive Domino loss and telemetry terms for one block slice."""
+        from specforge.core.domino_loss import domino_weighted_cross_entropy
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         base_logits = self.lm_head(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
-        final_logits = self._apply_domino_head(
-            base_logits4d=base_logits,
-            hidden4d=hidden,
-            prev_ids=prev_ids,
-            target_ids=target_ids,
+        head_token_ids = prev_ids if self.shift_label else target_ids
+        head_token_embeddings = self.embed_tokens(head_token_ids)
+        correction_logits = self.draft_model.compute_correction_logits(
+            hidden_states=hidden,
+            prev_token_embeddings=head_token_embeddings,
         )
-        final_ce = F.cross_entropy(
-            final_logits.reshape(-1, final_logits.shape[-1]),
-            target_ids.reshape(-1),
-            reduction="none",
-        ).reshape_as(target_ids)
-        base_ce = F.cross_entropy(
-            base_logits.reshape(-1, base_logits.shape[-1]),
-            target_ids.reshape(-1),
-            reduction="none",
-        ).reshape_as(target_ids)
-        final_num = (final_ce * weight_mask).sum()
-        base_num = (base_ce * weight_mask).sum()
+        final_num, base_num, predicted_ids, base_predicted_ids = (
+            domino_weighted_cross_entropy(
+                base_logits.reshape(-1, base_logits.shape[-1]),
+                correction_logits.reshape(-1, correction_logits.shape[-1]),
+                target_ids.reshape(-1),
+                weight_mask.reshape(-1),
+                block_size=block_size,
+                suffix_start=self.draft_model.suffix_start,
+                use_fused=self._use_fused_domino_ce and base_logits.is_cuda,
+            )
+        )
         loss_den = weight_mask.sum()
 
         with torch.no_grad():
-            predicted_ids = final_logits.argmax(dim=-1)
-            base_predicted_ids = base_logits.argmax(dim=-1)
+            predicted_ids = predicted_ids.reshape_as(target_ids)
+            base_predicted_ids = base_predicted_ids.reshape_as(target_ids)
             binary_accuracy_mask = eval_weight_mask > 0.5
             correct_num = (
                 ((predicted_ids == target_ids) & binary_accuracy_mask).sum().float()
@@ -633,6 +646,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         lambda_base: float = 0.0,
+        max_valid_anchors: Optional[int] = None,
     ):
         """Parallel Domino training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -646,6 +660,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            max_valid_anchors=max_valid_anchors,
         )
 
         label_start = 1 if self.shift_label else 0
@@ -727,7 +742,10 @@ class OnlineDominoModel(OnlineDFlashModel):
             "base_accuracy": (base_correct_num / (accuracy_denom + 1e-6)).detach(),
             "accept_len": (accept_num / (accept_den + 1e-6)).detach(),
             "base_accept_len": (base_accept_num / (accept_den + 1e-6)).detach(),
-            "lambda_base": torch.tensor(lambda_base, device=loss.device),
+            # Telemetry does not participate in the objective. Keeping this as
+            # a host scalar avoids a tiny H2D copy that otherwise synchronizes
+            # the whole forward stream once per micro-step.
+            "lambda_base": float(lambda_base),
             "accuracy_denom": accuracy_denom.detach(),
         }
 
@@ -1091,6 +1109,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        max_valid_anchors: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -1101,6 +1120,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            max_valid_anchors=max_valid_anchors,
         )
 
         (

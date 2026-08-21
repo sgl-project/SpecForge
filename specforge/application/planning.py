@@ -120,6 +120,12 @@ def _validate_algorithm_capabilities(
             f"mode={mode.value!r}, modality={cfg.model.input_modality!r}"
         )
 
+    if training.trim_loss_positions and not capabilities.supports_trim_loss_positions:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} does not support "
+            "training.trim_loss_positions"
+        )
+
 
 def _validate_training_topology(
     cfg: Config,

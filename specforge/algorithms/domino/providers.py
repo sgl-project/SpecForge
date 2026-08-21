@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import partial
 
 from specforge.algorithms.common.defaults import no_missing_checkpoint_keys
-from specforge.algorithms.common.dflash_family_data import (
+from specforge.algorithms.common.hidden_states_data import (
     NORMALIZER_ID,
     build_collator,
     build_offline_normalizer,
