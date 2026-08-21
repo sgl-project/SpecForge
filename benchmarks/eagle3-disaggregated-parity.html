@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 17, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 21, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -236,6 +236,10 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Recipes</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../recipes/kimi-k3-dspark-disaggregated.html">Kimi K3 DSpark disaggregated reproduction</a></li>
 </ul>
 
     </div>
@@ -544,7 +548,7 @@ measurement as serving-time accepted length.</p>
 offline producer and consumer on different nodes, run one checked-in command
 through the cluster launcher:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rcli<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>--per-node<span class="w"> </span>&lt;job&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="s1">&#39;CONFIG=examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh&#39;</span>
+<span class="w">  </span><span class="s1">'CONFIG=examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'</span>
 </pre></div>
 </div>
 <p>Rank 0 invokes <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">train</span> <span class="pre">--role</span> <span class="pre">producer</span></code>; rank 1 invokes
@@ -638,7 +642,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 17, 2026.
+  Last updated on Aug 21, 2026.
   <br/>
 </p>
   </div>

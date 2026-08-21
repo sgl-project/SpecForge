@@ -337,16 +337,8 @@ cannot truncate the captured sequence. Online capture is text-only: VLM
 training, including Qwen2.5-VL, is not supported. Online evaluation is also not
 supported.
 
-The repository's strict e2e gate remains a full local test-stack orchestrator:
-
-```bash
-bash scripts/gates/run_disaggregated_overfit_gate.sh
-```
-
-It starts and health-checks Mooncake and SGLang, invokes the canonical training
-entry, verifies overfit and serving behavior, and cleans up every process it
-owns. This preserves complete automated validation without turning the training
-CLI into a production service manager.
+For the strict e2e one-sample overfit and serving validation procedure, follow
+[`scripts/gates/README.md`](../../scripts/gates/README.md).
 
 ## Online runtime contract
 

@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 17, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 21, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -236,6 +236,10 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Recipes</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../recipes/kimi-k3-dspark-disaggregated.html">Kimi K3 DSpark disaggregated reproduction</a></li>
 </ul>
 
     </div>
@@ -521,7 +525,7 @@ use distinct URLs to fan out across distinct servers:</p>
 
 <span class="c1"># Start the external capture server with --mem-fraction-static 0.5, then run:</span>
 specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/qwen3-8b-domino-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="s1">&#39;deployment.disaggregated.server_urls=[&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;,&quot;http://127.0.0.1:30000&quot;]&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">'deployment.disaggregated.server_urls=["http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000"]'</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>deployment.trainer.nproc_per_node<span class="o">=</span><span class="m">7</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.batch_size<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>training.accumulation_steps<span class="o">=</span><span class="m">8</span>
@@ -871,7 +875,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 17, 2026.
+  Last updated on Aug 21, 2026.
   <br/>
 </p>
   </div>

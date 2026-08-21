@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 17, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 21, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -236,6 +236,10 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Recipes</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../recipes/kimi-k3-dspark-disaggregated.html">Kimi K3 DSpark disaggregated reproduction</a></li>
 </ul>
 
     </div>
@@ -554,7 +558,7 @@ the <code class="docutils literal notranslate"><span class="pre">sharegpt</span>
 <p>The regeneration utility uses the OpenAI-compatible client to call SGLang’s
 HTTP API. Install it in the source-checkout environment before running the
 repository script:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s1">&#39;.[data]&#39;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s1">'.[data]'</span>
 </pre></div>
 </div>
 <p>We can follow the following steps to regenerate the dataset. In the example below, we will use <code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-3.1-8B-Instruct</span></code> as an example, you can replace it with your own target model.</p>
@@ -626,7 +630,7 @@ the SpecForge repository root:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MODEL_PROFILE</span><span class="o">=</span>qwen3-8b<span class="w"> </span><span class="se">\</span>
 <span class="nv">INPUT_FILE</span><span class="o">=</span>./cache/dataset/sharegpt_train.jsonl<span class="w"> </span><span class="se">\</span>
 <span class="nv">OUTPUT_FILE</span><span class="o">=</span>./cache/dataset/sharegpt_train_regen_qwen3_8b_temperature0_non_reasoning.jsonl<span class="w"> </span><span class="se">\</span>
-<span class="nv">SERVER_ADDRESSES</span><span class="o">=</span><span class="s2">&quot;localhost:30000&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="nv">SERVER_ADDRESSES</span><span class="o">=</span><span class="s2">"localhost:30000"</span><span class="w"> </span><span class="se">\</span>
 bash<span class="w"> </span>examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
 </pre></div>
 </div>
@@ -650,7 +654,7 @@ reasoning parser so the OpenAI-compatible response includes
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MODEL_PROFILE</span><span class="o">=</span>qwen3.6-27b<span class="w"> </span><span class="se">\</span>
 <span class="nv">INPUT_FILE</span><span class="o">=</span>./cache/dataset/sharegpt_train.jsonl<span class="w"> </span><span class="se">\</span>
 <span class="nv">OUTPUT_FILE</span><span class="o">=</span>./cache/dataset/sharegpt_train_regen_qwen3.6-27b_temperature0_reasoning.jsonl<span class="w"> </span><span class="se">\</span>
-<span class="nv">SERVER_ADDRESSES</span><span class="o">=</span><span class="s2">&quot;localhost:30000&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="nv">SERVER_ADDRESSES</span><span class="o">=</span><span class="s2">"localhost:30000"</span><span class="w"> </span><span class="se">\</span>
 bash<span class="w"> </span>examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
 </pre></div>
 </div>
@@ -677,7 +681,7 @@ including its conversation structure, reasoning contract, and absence of raw
 <code class="docutils literal notranslate"><span class="pre">&lt;think&gt;</span></code> markers.</p>
 <p>To distribute regeneration across independently launched servers, provide all
 addresses as a space-separated list, for example:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">SERVER_ADDRESSES</span><span class="o">=</span><span class="s2">&quot;localhost:30000 localhost:30010&quot;</span><span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">SERVER_ADDRESSES</span><span class="o">=</span><span class="s2">"localhost:30000 localhost:30010"</span><span class="w"> </span><span class="se">\</span>
 <span class="nv">CONCURRENCY</span><span class="o">=</span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
 bash<span class="w"> </span>examples/data_regeneration/run_qwen_sharegpt_regeneration.sh
 </pre></div>
@@ -691,11 +695,11 @@ bash<span class="w"> </span>examples/data_regeneration/run_qwen_sharegpt_regener
 <h3>Option 1: Conversation Format<a class="headerlink" href="#option-1-conversation-format" title="Link to this heading">#</a></h3>
 <p>You should prepare the dataset in jsonl format and the schema should look like this:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;xxxx&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;conversations&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"xxxx"</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"conversations"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
 <span class="w">        </span><span class="p">{</span>
-<span class="w">            </span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user | assistant&quot;</span><span class="p">,</span>
-<span class="w">            </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;The message content&quot;</span>
+<span class="w">            </span><span class="nt">"role"</span><span class="p">:</span><span class="w"> </span><span class="s2">"user | assistant"</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">"content"</span><span class="p">:</span><span class="w"> </span><span class="s2">"The message content"</span>
 <span class="w">        </span><span class="p">}</span>
 <span class="w">    </span><span class="p">],</span>
 <span class="p">}</span>
@@ -706,8 +710,8 @@ bash<span class="w"> </span>examples/data_regeneration/run_qwen_sharegpt_regener
 <h3>Option 2: Pre-formatted Text Format<a class="headerlink" href="#option-2-pre-formatted-text-format" title="Link to this heading">#</a></h3>
 <p>If you already have conversations formatted with a specific chat template, you can use the pre-formatted text directly:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;xxxx&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;text&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&lt;|im_start|&gt;system\nYou are a helpful assistant.&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\nHello&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\nHi there!&lt;|im_end|&gt;\n&quot;</span>
+<span class="w">    </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"xxxx"</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;|im_start|&gt;system\nYou are a helpful assistant.&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\nHello&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\nHi there!&lt;|im_end|&gt;\n"</span>
 <span class="p">}</span>
 </pre></div>
 </div>
@@ -819,7 +823,7 @@ config so the captured layer contract matches the training run.</p>
 <span class="w">    </span>scripts/prepare_hidden_states.py<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--strategy<span class="w"> </span>eagle3<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--target-model-path<span class="w"> </span>meta-llama/Llama-3.1-8B-Instruct<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--draft-model-config<span class="w"> </span>configs/llama3.1-8b-eagle3.json<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--draft-model-config<span class="w"> </span>configs/llama3-8B-eagle3.json<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--data-path<span class="w"> </span>./your_preformatted_dataset.jsonl<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--output-path<span class="w"> </span>./cache/hidden_states/llama3.1-8b-eagle3<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--chat-template<span class="w"> </span>llama3<span class="w"> </span><span class="se">\</span>
@@ -941,7 +945,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 17, 2026.
+  Last updated on Aug 21, 2026.
   <br/>
 </p>
   </div>

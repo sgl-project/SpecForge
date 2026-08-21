@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 17, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 21, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -236,6 +236,10 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-online.html">EAGLE3 for Llama 3.1 8B: online training</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/llama3-eagle3-offline.html">EAGLE3 for Llama 3.1 8B: offline training</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Recipes</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../recipes/kimi-k3-dspark-disaggregated.html">Kimi K3 DSpark disaggregated reproduction</a></li>
 </ul>
 
     </div>
@@ -510,12 +514,12 @@ and unsupported attention backends are errors. See
 <code class="docutils literal notranslate"><span class="pre">specforge/data/template.py</span></code>, then reference its name with
 <code class="docutils literal notranslate"><span class="pre">data.chat_template</span></code>:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">TEMPLATE_REGISTRY</span><span class="o">.</span><span class="n">register</span><span class="p">(</span>
-    <span class="n">name</span><span class="o">=</span><span class="s2">&quot;your-template-name&quot;</span><span class="p">,</span>
+    <span class="n">name</span><span class="o">=</span><span class="s2">"your-template-name"</span><span class="p">,</span>
     <span class="n">template</span><span class="o">=</span><span class="n">ChatTemplate</span><span class="p">(</span>
-        <span class="n">assistant_header</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span>
-        <span class="n">user_header</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span>
-        <span class="n">system_prompt</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span>
-        <span class="n">end_of_turn_token</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span>
+        <span class="n">assistant_header</span><span class="o">=</span><span class="s2">"..."</span><span class="p">,</span>
+        <span class="n">user_header</span><span class="o">=</span><span class="s2">"..."</span><span class="p">,</span>
+        <span class="n">system_prompt</span><span class="o">=</span><span class="s2">"..."</span><span class="p">,</span>
+        <span class="n">end_of_turn_token</span><span class="o">=</span><span class="s2">"..."</span><span class="p">,</span>
     <span class="p">),</span>
 <span class="p">)</span>
 </pre></div>
@@ -584,7 +588,7 @@ class name and must match the single entry in the draft JSON’s
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">MyDraftConfig</span><span class="p">(</span><span class="n">PretrainedConfig</span><span class="p">):</span>
-    <span class="n">model_type</span> <span class="o">=</span> <span class="s2">&quot;my-draft&quot;</span>
+    <span class="n">model_type</span> <span class="o">=</span> <span class="s2">"my-draft"</span>
 
 
 <span class="nd">@register_draft</span>
@@ -599,10 +603,10 @@ class name and must match the single entry in the draft JSON’s
 <p>Import the module from <code class="docutils literal notranslate"><span class="pre">specforge/modeling/draft/__init__.py</span></code> so registration
 runs before config resolution. A minimal draft config then contains:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">  </span><span class="nt">&quot;architectures&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;MyEagle3Draft&quot;</span><span class="p">],</span>
-<span class="w">  </span><span class="nt">&quot;model_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;my-draft&quot;</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">128256</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;draft_vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32000</span>
+<span class="w">  </span><span class="nt">"architectures"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"MyEagle3Draft"</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"model_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"my-draft"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"vocab_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">128256</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"draft_vocab_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">32000</span>
 <span class="p">}</span>
 </pre></div>
 </div>
@@ -702,7 +706,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 17, 2026.
+  Last updated on Aug 21, 2026.
   <br/>
 </p>
   </div>
