@@ -16,11 +16,12 @@
 SpecForge is an ecosystem project developed by the SGLang team. It is a framework for training speculative decoding models so that you can smoothly port them over to the SGLang serving framework to speed up your inference.
 
 We have seen many open-source projects for speculative decoding, but most of them are not well-maintained or not directly compatible with SGLang. We prepared this project because we wish that the open-source community can enjoy a speculative decoding framework that is
+
 - regularly maintained by the SpecForge team: the code is runnable out-of-the-box
-- directly compatible with SGLang: there is no additional efforts for porting to SGLang
-- provides local offline and server-only online-disaggregated training through
-  one runtime, including the supported data, tensor, and sequence parallel
-  topologies
+- directly compatible with SGLang: no additional porting effort is required
+- able to run online disaggregated training and both colocated and
+  disaggregated offline training through one runtime, including the supported
+  data, tensor, and sequence parallel topologies
 
 
 Check out [**our documentation**](https://docs.sglang.ai/SpecForge/) to get started.
@@ -31,23 +32,25 @@ Check out [**our documentation**](https://docs.sglang.ai/SpecForge/) to get star
 Every method uses the same typed training entry point:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
-The typed `deployment.trainer` topology self-launches trainer DP and EAGLE3
-offline USP process groups. A single-node disaggregated config also supervises
-its SpecForge producer and consumer; Mooncake and SGLang remain externally
-managed services, and online target parallelism belongs to SGLang. There are no
-method-specific Python training entry points.
+The path under `examples/configs` identifies feature mode, topology, and online
+service ownership. The command above uses an `external` recipe: SpecForge
+supervises the producer and consumer on one trainer node, while the user or
+scheduler owns Mooncake and SGLang. Recipes under `managed-local` also start
+those services on the local host. Online target parallelism belongs to SGLang;
+`deployment.trainer` owns trainer DP and offline EAGLE3 USP process groups.
+There are no method-specific Python training entry points.
 
 | Method | Description | Example config | Optimization |
 | --- | --- | --- | --- |
-| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [Online](./examples/configs/qwen3-8b-eagle3-disaggregated.yaml) / [Offline](./examples/configs/qwen3-8b-eagle3-offline.yaml) / [Disaggregated offline](./examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml) | [LK loss](https://arxiv.org/pdf/2602.23881) |
-| **[P-EAGLE](https://arxiv.org/abs/2602.01469)** | Parallel EAGLE | [Online](./examples/configs/qwen3-8b-peagle-disaggregated.yaml) | — |
-| **EAGLE3.1** | Feature-based autoregressive drafting with attention drift | [Online](./examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml) | — |
-| **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [Online](./examples/configs/qwen3-8b-dflash-online.yaml) / [Disaggregated](./examples/configs/qwen3-8b-dflash-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810) |
-| **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online](./examples/configs/qwen3-8b-domino-online.yaml) / [Disaggregated](./examples/configs/qwen3-8b-domino-disaggregated.yaml) | — |
-| **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Disaggregated](./examples/configs/qwen3-4b-dspark-disaggregated.yaml) | — |
+| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml) / [Offline disaggregated](./examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) | [LK loss](https://arxiv.org/pdf/2602.23881) |
+| **[P-EAGLE](https://arxiv.org/abs/2602.01469)** | Parallel EAGLE | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-peagle-disaggregated.yaml) | — |
+| **EAGLE3.1** | Feature-based autoregressive drafting with attention drift | [Online external](./examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1-online.yaml) | — |
+| **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-dflash-online.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810) |
+| **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) | — |
+| **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Online external](./examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) | — |
 
 See the [training guide](./docs/basic_usage/training.md) for the supported
 method/topology matrix and the

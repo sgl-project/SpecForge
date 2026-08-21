@@ -67,6 +67,8 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.5-35b-a3b-eagle3-offline.yaml": 4,
     "qwen3.5-35b-a3b-eagle3-online.yaml": 2,
     "qwen3.5-4b-dflash-online-npu.yaml": 8,
+    "qwen3.5-4b-dflash-offline-amd.yaml": 1,
+    "qwen3.5-4b-dflash-online-amd.yaml": 1,
     "qwen3.5-4b-dflash-disaggregated-npu.yaml": 14,
     "qwen3.5-4b-domino-online-npu.yaml": 8,
     "qwen3.6-27b-dflash-disaggregated.yaml": 2,
@@ -346,17 +348,21 @@ EXPECTED_DISAGGREGATED = {
 
 
 def _recipes() -> dict[str, Path]:
-    return {
-        path.name: path
-        for path in sorted(EXAMPLE_CONFIG_DIR.glob("*.yaml"))
+    paths = [
+        path
+        for path in sorted(EXAMPLE_CONFIG_DIR.rglob("*.yaml"))
         if not path.name.startswith(".")
-    }
+    ]
+    recipes = {path.name: path for path in paths}
+    if len(recipes) != len(paths):
+        raise AssertionError("example recipe filenames must be globally unique")
+    return recipes
 
 
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 66)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 68)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
@@ -403,6 +409,38 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                     self.assertGreater(payload["training"]["num_epochs"], 0)
                 self.assertEqual(set(deployment), expected_keys)
 
+    def test_every_recipe_matches_its_directory_topology(self):
+        self.assertTrue(
+            (EXAMPLE_CONFIG_DIR / "online" / "colocated" / "README.md").is_file()
+        )
+        for filename, path in _recipes().items():
+            with self.subTest(config=filename):
+                payload = yaml.safe_load(path.read_text())
+                data = payload["data"]
+                mode = (
+                    "online"
+                    if data.get("train_data_path") or data.get("prompts_path")
+                    else "offline"
+                )
+                deployment = payload["deployment"]
+                topology = (
+                    "colocated"
+                    if deployment["mode"] == "local_colocated"
+                    else "disaggregated"
+                )
+                expected_parent = Path(mode) / topology
+                if mode == "online" and topology == "disaggregated":
+                    ownership = (
+                        "managed-local"
+                        if "managed_local" in deployment["disaggregated"]
+                        else "external"
+                    )
+                    expected_parent /= ownership
+                self.assertEqual(
+                    path.relative_to(EXAMPLE_CONFIG_DIR).parent,
+                    expected_parent,
+                )
+
     def test_golden_topologies_validate_for_their_declared_world_size(self):
         for filename, path in _recipes().items():
             with self.subTest(config=filename):
@@ -433,7 +471,7 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
         }
         for filename, save_interval in expected_save_intervals.items():
             with self.subTest(config=filename):
-                config = Config.from_file(str(EXAMPLE_CONFIG_DIR / filename))
+                config = Config.from_file(str(_recipes()[filename]))
                 topology = config.deployment.trainer
                 global_batch = (
                     topology.nnodes
@@ -450,20 +488,15 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
                 self.assertEqual(config.training.objective_chunk_blocks, 128)
                 self.assertEqual(config.training.save_interval, save_interval)
 
-        qwen = Config.from_file(
-            str(EXAMPLE_CONFIG_DIR / "qwen3-8b-dspark-disaggregated.yaml")
-        )
+        recipes = _recipes()
+        qwen = Config.from_file(str(recipes["qwen3-8b-dspark-disaggregated.yaml"]))
         self.assertEqual(qwen.data.chat_template, "qwen")
 
-        qwen4b = Config.from_file(
-            str(EXAMPLE_CONFIG_DIR / "qwen3-4b-dspark-disaggregated.yaml")
-        )
+        qwen4b = Config.from_file(str(recipes["qwen3-4b-dspark-disaggregated.yaml"]))
         self.assertEqual(qwen4b.training.loss_decay_gamma, 4.0)
         self.assertEqual(qwen4b.training.objective_chunk_blocks, 128)
 
-        kimi = Config.from_file(
-            str(EXAMPLE_CONFIG_DIR / "kimi-k3-dspark-disaggregated.yaml")
-        )
+        kimi = Config.from_file(str(recipes["kimi-k3-dspark-disaggregated.yaml"]))
         kimi_topology = kimi.deployment.trainer
         self.assertEqual(
             kimi_topology.nnodes

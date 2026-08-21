@@ -66,7 +66,7 @@ export MODEL_NAME=Qwen3.6-27B
 export SPEC_METHOD=Dspark
 export DRAFT_MODEL_CONFIG=configs/qwen3.6-27b-dspark.json
 export MODEL=Qwen/Qwen3.6-27B
-export TRAINING_CONFIG=examples/configs/qwen3.6-27b-dspark-disaggregated.yaml
+export TRAINING_CONFIG=examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dspark-disaggregated.yaml
 
 specforge train \
   --config ${TRAINING_CONFIG} \
