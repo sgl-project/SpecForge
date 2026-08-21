@@ -11,6 +11,7 @@ end-to-end test against ``mooncake`` is gated below on the package import.
 import ctypes
 import importlib.util
 import unittest
+from inspect import signature
 from unittest import mock
 
 import torch
@@ -20,8 +21,13 @@ from specforge.runtime.control_plane.dp_ack import DPAckController
 from specforge.runtime.control_plane.metadata_store import InMemoryMetadataStore
 from specforge.runtime.data_plane.disaggregated import AuthPolicy
 from specforge.runtime.data_plane.feature_store import (
+    DEFAULT_PENDING_DRAIN_MAX_ATTEMPTS,
+    DEFAULT_PENDING_DRAIN_RETRY_INTERVAL_S,
+    DEFAULT_SAMPLE_DRAIN_MAX_ATTEMPTS,
+    DEFAULT_SAMPLE_DRAIN_RETRY_INTERVAL_S,
     LocalFeatureStore,
     drain_feature_store_removals,
+    drain_feature_store_sample_removals,
 )
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 
@@ -110,6 +116,35 @@ def _store(**kw):
 
 
 class TestMooncakeFeatureStore(unittest.TestCase):
+    def test_drain_interfaces_share_retry_defaults(self):
+        groups = (
+            (
+                (
+                    drain_feature_store_removals,
+                    MooncakeFeatureStore.drain_pending_removals,
+                ),
+                DEFAULT_PENDING_DRAIN_MAX_ATTEMPTS,
+                DEFAULT_PENDING_DRAIN_RETRY_INTERVAL_S,
+            ),
+            (
+                (
+                    drain_feature_store_sample_removals,
+                    MooncakeFeatureStore.drain_sample_removals,
+                ),
+                DEFAULT_SAMPLE_DRAIN_MAX_ATTEMPTS,
+                DEFAULT_SAMPLE_DRAIN_RETRY_INTERVAL_S,
+            ),
+        )
+        for drains, attempts, interval in groups:
+            for drain in drains:
+                with self.subTest(drain=drain.__qualname__):
+                    parameters = signature(drain).parameters
+                    self.assertEqual(parameters["max_attempts"].default, attempts)
+                    self.assertEqual(
+                        parameters["retry_interval_s"].default,
+                        interval,
+                    )
+
     def test_put_get_roundtrip_bit_exact(self):
         fs = _store()
         src = _tensors()

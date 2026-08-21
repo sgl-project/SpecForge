@@ -29,7 +29,7 @@ def _yaml_scalar(path: Path, key: str) -> Optional[str]:
 
 
 def _local_draft_configs():
-    for recipe in sorted(EXAMPLE_CONFIG_DIR.glob("*.yaml")):
+    for recipe in sorted(EXAMPLE_CONFIG_DIR.rglob("*.yaml")):
         source = _yaml_scalar(recipe, "draft_model_config")
         if source is None or not source.endswith(".json"):
             continue

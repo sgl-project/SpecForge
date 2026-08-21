@@ -68,6 +68,11 @@ from specforge.runtime.contracts import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PENDING_DRAIN_MAX_ATTEMPTS = 40
+DEFAULT_PENDING_DRAIN_RETRY_INTERVAL_S = 0.25
+DEFAULT_SAMPLE_DRAIN_MAX_ATTEMPTS = 40
+DEFAULT_SAMPLE_DRAIN_RETRY_INTERVAL_S = 0.25
+
 _DTYPE_BYTES = {  # best-effort; falls back to element_size() for real tensors
     "float32": 4,
     "float16": 2,
@@ -159,8 +164,8 @@ class FeatureStore(abc.ABC):
 def drain_feature_store_removals(
     store: FeatureStore,
     *,
-    max_attempts: int = 40,
-    retry_interval_s: float = 0.5,
+    max_attempts: int = DEFAULT_PENDING_DRAIN_MAX_ATTEMPTS,
+    retry_interval_s: float = DEFAULT_PENDING_DRAIN_RETRY_INTERVAL_S,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Dict[str, int]:
     """Bound lifecycle shutdown until deferred physical removes settle.
@@ -169,7 +174,7 @@ def drain_feature_store_removals(
     may expose ``drain_pending_removals`` to retry fallible RPCs.  Keeping this
     small adapter at the FeatureStore boundary lets online producer/consumer
     finalization enforce the same loud contract without depending on Mooncake's
-    concrete class. The default is bounded to forty attempts and 19.5 seconds of
+    concrete class. The default is bounded to 40 attempts and 9.75 seconds of
     inter-attempt waiting; Mooncake's implementation avoids existence probes
     between attempts so those waits let an existing read lease expire rather
     than renewing it. The window must exceed Mooncake's read-lease TTL, or
@@ -203,8 +208,8 @@ def drain_feature_store_sample_removals(
     store: FeatureStore,
     sample_ids: List[str],
     *,
-    max_attempts: int = 8,
-    retry_interval_s: float = 0.25,
+    max_attempts: int = DEFAULT_SAMPLE_DRAIN_MAX_ATTEMPTS,
+    retry_interval_s: float = DEFAULT_SAMPLE_DRAIN_RETRY_INTERVAL_S,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Dict[str, int]:
     """Physically reclaim only optimizer-durable samples from a remote store.
