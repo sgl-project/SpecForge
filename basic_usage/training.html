@@ -784,6 +784,10 @@ and <code class="docutils literal notranslate"><span class="pre">loss_mask</span
 <td><p>Online disaggregated, external</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/d06712daee1c8beb3f5fb494eb8f8fab/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a></p></td>
 </tr>
+<tr class="row-odd"><td><p>MTP (Ascend)</p></td>
+<td><p>Online disaggregated, managed-local</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/7d9a6b72b22e85c3f6f18c44fefa859d/qwen3.5-4b-mtp-disaggregated-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-mtp-disaggregated-npu.yaml</span></code></span></a></p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -854,7 +858,12 @@ launching it.</p>
 <td><p>Yes, DP</p></td>
 <td><p>Yes, consumer DP</p></td>
 </tr>
-<tr class="row-even"><td><p>P-EAGLE</p></td>
+<tr class="row-even"><td><p>MTP</p></td>
+<td><p>Yes, consumer DP</p></td>
+<td><p>Yes, DP</p></td>
+<td><p>Yes, consumer DP</p></td>
+</tr>
+<tr class="row-odd"><td><p>P-EAGLE</p></td>
 <td><p>Yes, consumer DP, batch size 1</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -872,10 +881,10 @@ features through <code class="docutils literal notranslate"><span class="pre">da
 <li><p>attention backends are strategy-specific: EAGLE3 accepts <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>,
 <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>, <code class="docutils literal notranslate"><span class="pre">fa</span></code>, or offline <code class="docutils literal notranslate"><span class="pre">usp</span></code>; P-EAGLE requires
 <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>; DFlash, Domino, and DSpark accept <code class="docutils literal notranslate"><span class="pre">eager</span></code>, <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>, or
-<code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>;</p></li>
+<code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>; MTP accepts <code class="docutils literal notranslate"><span class="pre">eager</span></code> or <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>;</p></li>
 <li><p>P-EAGLE requires <code class="docutils literal notranslate"><span class="pre">training.batch_size=1</span></code> and reuses EAGLE3’s server capture
 schema;</p></li>
-<li><p>offline feature training supports EAGLE3, DFlash, Domino, and DSpark;</p></li>
+<li><p>offline feature training supports EAGLE3, DFlash, Domino, DSpark, and MTP;</p></li>
 <li><p>every online run is disaggregated and uses <code class="docutils literal notranslate"><span class="pre">model.target_backend=sglang</span></code>;
 finite runs may omit both step fields so the producer can publish the exact
 optimizer horizon derived from the prepared prompt plan;</p></li>
@@ -1083,6 +1092,20 @@ serving validation step.</p>
 </div>
 <p>Pass <code class="docutils literal notranslate"><span class="pre">--vocab-mapping</span> <span class="pre">/path/to/mapping.pt</span></code> when the checkpoint predates the
 mapping buffers or when you intentionally need to refresh them.</p>
+<p>MTP is deployed by merging its trained native head back into the target model.
+The merge command accepts the same runtime checkpoint shapes as the generic
+exporter (<code class="docutils literal notranslate"><span class="pre">training_state.pt</span></code>, a step/latest directory, or the run output
+directory):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/merge_mtp_to_base.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--base-model-path<span class="w"> </span>Qwen/Qwen3.5-4B<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mtp-checkpoint-path<span class="w"> </span>./outputs/qwen3.5-4b-mtp/qwen3.5-4b-mtp-latest<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--draft-config<span class="w"> </span>configs/qwen3.5-4b-mtp.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-path<span class="w"> </span>./exports/Qwen3.5-4B-MTP
+</pre></div>
+</div>
+<p>An already-exported HF MTP draft directory can also be passed as
+<code class="docutils literal notranslate"><span class="pre">--mtp-checkpoint-path</span></code>; in that case its own <code class="docutils literal notranslate"><span class="pre">config.json</span></code> is used and
+<code class="docutils literal notranslate"><span class="pre">--draft-config</span></code> may be omitted.</p>
 </section>
 <section id="troubleshooting">
 <h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h2>
