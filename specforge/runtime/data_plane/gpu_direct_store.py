@@ -571,10 +571,9 @@ class MooncakeGpuDirectFeatureStore(FeatureStore):
                     "release_pending": 0,
                     "attempts": attempt,
                 }
-            for ref in pending:
-                removed += int(
-                    self._finish_release(ref, op="abort", reason="lifecycle-drain")
-                )
+            removed += self._finish_release_many(
+                pending, op="abort", reason="lifecycle-drain"
+            )
             if attempt + 1 < max_attempts and retry_interval_s:
                 sleep(retry_interval_s)
         with self._lock:

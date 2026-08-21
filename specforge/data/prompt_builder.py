@@ -196,39 +196,6 @@ class _ProcessedPromptSequence(Sequence[PromptTaskDict]):
         for index in range(len(self)):
             yield self[index]
 
-    def get_many(self, indices: Sequence[int]) -> list[PromptTaskDict]:
-        """Materialize processed rows with one Arrow gather operation.
-
-        Hugging Face ``Dataset.__getitem__`` accepts an index list and returns
-        each requested column as a list.  Using that path avoids thousands of
-        independent Arrow lookups while retaining the exact per-row validation
-        and normalization performed by ``__getitem__``.
-        """
-        resolved = [int(index) for index in indices]
-        if not resolved:
-            return []
-        records = self._dataset[resolved]
-        input_rows = records["input_ids"]
-        mask_rows = records["loss_mask"]
-        prompts: list[PromptTaskDict] = []
-        for offset, index in enumerate(resolved):
-            prompt = _prompt_from_record(
-                {
-                    "input_ids": input_rows[offset],
-                    "loss_mask": mask_rows[offset],
-                },
-                source=f"processed dataset row {index}",
-                max_length=self._max_length,
-                min_loss_tokens=self._min_loss_tokens,
-            )
-            if prompt is None:
-                raise ValueError(
-                    f"processed dataset row {index} violates the preprocessing "
-                    f"minimum of {self._min_loss_tokens} trainable tokens"
-                )
-            prompts.append(prompt)
-        return prompts
-
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[item] for item in range(*index.indices(len(self)))]

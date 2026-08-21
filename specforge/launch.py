@@ -456,19 +456,9 @@ def _iter_epoch_online_prompt_batches(
     indices = _epoch_prompt_indices(prompts, epoch, seed=seed)
     for start in range(0, len(indices), batch_size):
         batch_indices = indices[start : start + batch_size]
-        get_many = getattr(prompts, "get_many", None)
-        if callable(get_many):
-            materialized = get_many(batch_indices)
-        else:
-            materialized = [prompts[index] for index in batch_indices]
-        if len(materialized) != len(batch_indices):
-            raise RuntimeError(
-                "prompt source bulk materialization returned "
-                f"{len(materialized)} rows for {len(batch_indices)} indices"
-            )
         yield [
-            _epoch_online_prompt(prompt, index, epoch, prompt_epochs)
-            for prompt, index in zip(materialized, batch_indices)
+            _epoch_online_prompt(prompts[index], index, epoch, prompt_epochs)
+            for index in batch_indices
         ]
 
 
