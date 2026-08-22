@@ -62,6 +62,14 @@ deployment:
         # DSpark additionally streams target_last_hidden_states (~+20% over
         # DFlash); 16 GiB fits a 64GB-card host next to the target model.
         global_segment_size_bytes: 17179869184
+        # Ascend get_into does register_buffer -> transfer -> unregister per
+        # tensor; under capture/trainer startup contention this does not fit
+        # the upstream managed-local 500ms lease and fails with LEASE_EXPIRED
+        # (-707). Use Mooncake's stock 5000ms; the ~19.5s teardown drain
+        # window still covers it. If the local mooncake_master build predates
+        # the --default_kv_lease_ttl flag, set this to null instead (omits the
+        # flag, same 5000ms server default).
+        default_kv_lease_ttl_ms: 5000
       capture_servers:
         - port: 30000
           cuda_visible_devices: ["0"]
