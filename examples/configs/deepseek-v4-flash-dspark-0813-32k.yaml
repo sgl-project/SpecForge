@@ -91,13 +91,15 @@ runtime:
   # always dispatch without a backpressure deadlock.
   in_flight_high_watermark: 128
   in_flight_low_watermark: 64
-  # Two quanta of 32K features are ~218 GiB at the 1.7 GiB/sample cap (not
-  # the ~90 GiB the 30K median suggests): byte caps must cover the count
-  # watermark or the producer trips the hard cap while the consumer is still
-  # in its one-time dataset build. Sinks carry 2x192 GiB segments.
-  resident_high_watermark_bytes: 206158430208     # 192 GiB
+  # Backpressure gates only NEW dispatches: leased capture requests still
+  # complete and publish, overshooting resident bytes by up to ~140 GiB
+  # (observed on the 2026-08-22 crash: watermark 192 GiB, death at a
+  # projected 344.7 GiB > 320 GiB hard cap). The high watermark plus the
+  # lease overshoot must stay under the hard cap, and the hard cap under
+  # the 3x192 GiB sink segments.
+  resident_high_watermark_bytes: 171798691840     # 160 GiB
   resident_low_watermark_bytes: 128849018880      # 120 GiB (>= one quantum)
-  feature_store_max_resident_bytes: 343597383680  # 320 GiB
+  feature_store_max_resident_bytes: 412316860416  # 384 GiB
 
 run_id: deepseek-v4-flash-dspark-0813-32k-r2
 output_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2
@@ -111,7 +113,7 @@ deployment:
     control_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2/control
     consumer_state_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2/consumer-state
     backend: mooncake
-    store_id: deepseek-v4-flash-dspark-0813-32k-a7
+    store_id: deepseek-v4-flash-dspark-0813-32k-a8
     # Two TP2 capture servers out-produce one TP4 server (TP prefill scaling
     # is sublinear) and keep the producer ahead of a four-rank consumer.
     server_urls:
