@@ -62,6 +62,11 @@ class TestMooncakeArchitecture(unittest.TestCase):
                 and isinstance(receiver.value, ast.Name)
                 and receiver.value.id == "self"
                 and receiver.attr == "_store"
+            ) or (
+                # Fetches go through the per-thread client pool; those calls
+                # must honor the same raw-tensor transport contract.
+                isinstance(receiver, ast.Name)
+                and receiver.id == "client"
             ):
                 store_calls.add(node.func.attr)
         self.assertEqual([], serialization)

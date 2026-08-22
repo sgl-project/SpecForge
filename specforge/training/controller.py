@@ -799,6 +799,37 @@ class TrainerController:
                             ),
                         }
                     )
+                    # Loader-side wait attribution: data_wait_producer_s +
+                    # data_wait_fetch_s ~= perf/data_wait_time_s for the same
+                    # window. High producer bucket -> capture/dispatch cannot
+                    # keep up; high fetch bucket -> feature transfer is slow.
+                    perf_snapshot = getattr(data, "perf_counters_snapshot", None)
+                    if callable(perf_snapshot):
+                        loader_perf = perf_snapshot(reset=True)
+                        log_metrics.update(
+                            {
+                                "perf/data_wait_producer_s": (
+                                    float(loader_perf.get("wait_producer_s", 0.0))
+                                    / max(1, perf_window_steps)
+                                ),
+                                "perf/data_wait_fetch_s": (
+                                    float(loader_perf.get("wait_fetch_s", 0.0))
+                                    / max(1, perf_window_steps)
+                                ),
+                                "perf/fetch_seconds_per_sample": (
+                                    float(loader_perf.get("fetch_s", 0.0))
+                                    / max(
+                                        1.0,
+                                        float(loader_perf.get("fetch_batches", 0.0)),
+                                    )
+                                ),
+                                "perf/fetch_delivered_gib_per_s": (
+                                    float(loader_perf.get("fetch_bytes", 0.0))
+                                    / (1 << 30)
+                                    / max(1e-12, perf_elapsed_s)
+                                ),
+                            }
+                        )
                     self.logger(log_metrics, self.global_step)
                     perf_window_started = time.perf_counter()
                     perf_window_steps = 0

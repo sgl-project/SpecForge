@@ -1,0 +1,132 @@
+model:
+  target_model_path: deepseek-ai/DeepSeek-V4-Flash-0731
+  draft_model_config: configs/deepseek-v4-flash-dspark.json
+  target_backend: sglang
+  trust_remote_code: true
+  # Weights-only warm start from the 4-rank run's step-1536 checkpoint
+  # (optimizer state and prompt position reset; world-size changes are outside
+  # the exact-resume contract).
+  draft_checkpoint_path: outputs/deepseek-v4-flash-dspark-0813-32k/deepseek-v4-flash-dspark-0813-32k-step1024
+  # DeepSeek-V4 checkpoints use the native inference weight layout.
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_mem_fraction_static: 0.88
+  # data.max_length plus headroom: capture rejects inputs at exactly the
+  # context length.
+  sglang_context_length: 33280
+  sglang_max_running_requests: 8
+  # The checkpoint's routed experts are fp4 (`expert_dtype: "fp4"`); the
+  # default MoE path cannot run them on B200.
+  sglang_moe_runner_backend: flashinfer_mxfp4
+
+data:
+  # Recorded DSV4-Flash production traffic (2026-08-13), rendered with the
+  # native encoding_dsv4 encoder (scripts/transform_traffic_recordings.py)
+  # and trimmed to <=32768 tokens at complete-turn boundaries
+  # (scripts/trim_dataset_to_max_tokens.py) so no supervised span is cut
+  # mid-tool-call and every row keeps its trailing EOS. ~89% of rows survive
+  # the trim; median row is ~30K tokens / 8 assistant turns.
+  train_data_path: ./cache/dataset/dsv4_flash_0813_32k_train.jsonl
+  is_preformatted: true
+  max_length: 32768
+  chat_template: deepseek-v4
+  cache_dir: cache
+  cache_key: dsv4-flash-0813-32k-full
+  build_dataset_num_proc: 64
+  # Full corpus: 418,234 trimmed rows. The one-time dataset build tokenizes
+  # every row (a prefix re-encode per assistant span), ~4-5 h at 64 procs;
+  # it lands in the Arrow cache under cache_key and is instant afterwards.
+  # For a quick smoke run, set data.max_prompts (e.g. 5000) to slice the
+  # dataset BEFORE tokenization.
+  # 16 fetch threads/rank: a 32K step moves ~25 GiB per rank and one loopback
+  # TCP stream tops out ~0.3-0.6 GB/s; sink throughput scales with stream
+  # count (measured ~3.1 GB/s/sink at 16 streams).
+  dataloader_num_workers: 16
+
+training:
+  strategy: dspark
+  num_epochs: 4
+  # Rows are ~4x the 8K ShareGPT recipe, so the optimizer quantum shrinks
+  # 2x to keep feature bytes bounded: 2 ranks x 32 microbatches -> 64
+  # sequences per step. Two trainer ranks free GPUs 4-5 for a third capture
+  # server: at 32K one TP2 server prefills ~1 seq/s, so capture (not compute
+  # or transfer) binds a 4-rank trainer; 3 servers x ~0.95/s matches a
+  # 2-rank consumer's ~2.9 samples/s. Features run ~48KB/token (5 aux layers + pre-head at
+  # width 4096, bf16): ~1.4 GiB per median sample, 1.6 GiB at the 32K cap.
+  batch_size: 1
+  accumulation_steps: 32
+  learning_rate: 0.0006
+  lr_scheduler: constant
+  warmup_ratio: 0
+  max_grad_norm: 1
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  # ~26K optimizer steps over 4 epochs at ~100 x 15 GiB of checkpoints; 256
+  # also bounds the pause window (exact resume requires ack == checkpoint).
+  save_interval: 256
+  log_interval: 5
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge
+  wandb_name: deepseek-v4-flash-dspark-0813-32k-r2
+  wandb_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2/wandb
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 8
+  # One optimizer quantum is 64 samples (~90 GiB of features at the ~30K
+  # median). Two quanta stay in flight so the producer runs a window ahead;
+  # the low watermark holds one full quantum so complete optimizer windows
+  # always dispatch without a backpressure deadlock.
+  in_flight_high_watermark: 128
+  in_flight_low_watermark: 64
+  # Two quanta of 32K features are ~218 GiB at the 1.7 GiB/sample cap (not
+  # the ~90 GiB the 30K median suggests): byte caps must cover the count
+  # watermark or the producer trips the hard cap while the consumer is still
+  # in its one-time dataset build. Sinks carry 2x192 GiB segments.
+  resident_high_watermark_bytes: 206158430208     # 192 GiB
+  resident_low_watermark_bytes: 128849018880      # 120 GiB (>= one quantum)
+  feature_store_max_resident_bytes: 343597383680  # 320 GiB
+
+run_id: deepseek-v4-flash-dspark-0813-32k-r2
+output_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 2
+  disaggregated:
+    control_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2/control
+    consumer_state_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2/consumer-state
+    backend: mooncake
+    store_id: deepseek-v4-flash-dspark-0813-32k-a7
+    # Two TP2 capture servers out-produce one TP4 server (TP prefill scaling
+    # is sublinear) and keep the producer ahead of a four-rank consumer.
+    server_urls:
+      - http://127.0.0.1:30000
+      - http://127.0.0.1:30001
+      - http://127.0.0.1:30002
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_local_hostname: 127.0.0.1
+    mooncake_protocol: tcp
+    # A 32K sample is ~1.6 GiB transferred as one object; the client buffer
+    # must hold it (the 8K recipe's 1 GiB would fail the fetch).
+    client_buffer_size: 2147483648
+    # Must cover the one-time full-corpus tokenization (~3-4 h at 64 procs):
+    # consumer ranks wait on the producer's schedule file for this long before
+    # a cold-cache first launch is declared dead.
+    idle_timeout_s: 21600
+    peer_wait_timeout_s: 21600

@@ -144,6 +144,66 @@ class FeatureDataLoader:
         self._lifecycle_lock = threading.Lock()
         self._prefetch_state: Optional[_QueuePrefetchState] = None
         self._queue_closed = False
+        # Loader-side wait attribution (see perf_counters_snapshot): the
+        # trainer-visible data wait is split into "blocked on producer" (no
+        # fetch was even in flight -- nothing existed to fetch) vs "blocked on
+        # fetch" (transfers were in flight but not finished). The two buckets
+        # sum to the controller's data_wait for the same window.
+        self._perf_lock = threading.Lock()
+        self._perf = {
+            "wait_producer_s": 0.0,
+            "wait_fetch_s": 0.0,
+            "fetch_s": 0.0,
+            "fetch_bytes": 0.0,
+            "fetch_batches": 0.0,
+        }
+        self._inflight_fetches = 0
+
+    def _perf_add(self, **deltas: float) -> None:
+        with self._perf_lock:
+            for name, delta in deltas.items():
+                self._perf[name] += delta
+
+    def perf_counters_snapshot(self, reset: bool = False) -> Dict[str, float]:
+        """Loader wait attribution since the last reset.
+
+        ``wait_producer_s``/``wait_fetch_s``: trainer-visible blocked time,
+        attributed by whether any fetch was in flight at that moment; they sum
+        to the controller's data wait. ``fetch_s``: aggregate seconds spent
+        materializing batches (across fetch threads). ``fetch_bytes``:
+        estimated feature bytes fetched. ``fetch_batches``: batches
+        materialized.
+        """
+        with self._perf_lock:
+            snapshot = dict(self._perf)
+            if reset:
+                for name in self._perf:
+                    self._perf[name] = 0.0
+        return snapshot
+
+    def _timed_make_batch(self, refs: List[SampleRef]) -> TrainBatch:
+        started = time.perf_counter()
+        try:
+            batch = self._make_batch(refs)
+        finally:
+            with self._perf_lock:
+                self._inflight_fetches -= 1
+        self._perf_add(
+            fetch_s=time.perf_counter() - started,
+            fetch_bytes=float(sum(int(ref.estimated_bytes or 0) for ref in refs)),
+            fetch_batches=1.0,
+        )
+        return batch
+
+    def _submit_fetch(self, pool, refs: List[SampleRef]):
+        with self._perf_lock:
+            self._inflight_fetches += 1
+        try:
+            return pool.submit(self._timed_make_batch, refs)
+        except BaseException:
+            with self._perf_lock:
+                self._inflight_fetches -= 1
+            raise
 
     def _maybe_gc(self) -> None:
         if self.gc_interval_s is None:
@@ -345,14 +405,20 @@ class FeatureDataLoader:
             yield from self._iter_queue_prefetch(depth)
             return
         while True:
+            wait_started = time.perf_counter()
             refs = self.queue.get(self.batch_size, timeout_s=0.0)
+            self._perf_add(wait_producer_s=time.perf_counter() - wait_started)
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
                 self._settle_incomplete_queue_batch(refs)
                 return
             try:
-                batch = self._make_batch(refs)
+                with self._perf_lock:
+                    self._inflight_fetches += 1
+                fetch_started = time.perf_counter()
+                batch = self._timed_make_batch(refs)
+                self._perf_add(wait_fetch_s=time.perf_counter() - fetch_started)
             except Exception as exc:
                 self.queue.fail(refs, reason=f"materialize:{exc}", retryable=False)
                 raise
@@ -424,7 +490,7 @@ class FeatureDataLoader:
                             state.mark_yielded_or_failed(refs)
                         put_order_interruptibly(eos)
                         return
-                    future = pool.submit(self._make_batch, refs)
+                    future = self._submit_fetch(pool, refs)
                     if not put_order_interruptibly((future, refs)):
                         return
             except BaseException as exc:  # loud failure, never a silent hang
@@ -490,10 +556,25 @@ class FeatureDataLoader:
 
         try:
             while not state.stop.is_set():
+                wait_started = time.perf_counter()
                 try:
                     item = state.buffer.get(timeout=_PREFETCH_POLL_S)
                 except queue_module.Empty:
+                    # The trainer is blocked. Attribute this slice of the wait:
+                    # fetches in flight (or completed but not yet emitted)
+                    # -> transfer-bound; otherwise nothing existed to fetch
+                    # -> producer/dispatch-bound.
+                    waited = time.perf_counter() - wait_started
+                    with self._perf_lock:
+                        fetching = self._inflight_fetches > 0
+                    if fetching or not order.empty():
+                        self._perf_add(wait_fetch_s=waited)
+                    else:
+                        self._perf_add(wait_producer_s=waited)
                     continue
+                # A batch arrived after a partial poll wait: that residue was
+                # spent waiting on an in-flight fetch completing.
+                self._perf_add(wait_fetch_s=time.perf_counter() - wait_started)
                 if item is eos:
                     return
                 if isinstance(item, BaseException):

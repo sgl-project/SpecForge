@@ -250,17 +250,36 @@ class MooncakeFeatureStore(FeatureStore):
         self._credential = credential
         self.auth.check(credential)  # attach-time gate (B9)
         self.store_id = store_id or uuid.uuid4().hex[:8]
+        fetch_stores: List[Any] = []
         if store is None:
             kw = dict(_MOONCAKE_SETUP_DEFAULTS)
             kw.update(setup_kwargs or {})
             store, replicate_config_type = _connect_store(kw)
             put_config = replicate_config_type()
+            # One Mooncake client's transfer engine runs a single TCP worker
+            # thread and tops out well below what long-context fetches need
+            # (~1.4-1.8 GB/s measured at 32K features). A small pool of extra
+            # clients gives the loader's fetch threads independent engines;
+            # gets are spread across the pool while every other operation
+            # (put/exists/remove and lifecycle bookkeeping) stays on the
+            # primary client.
+            extra_clients = max(
+                0, int(os.environ.get("SPECFORGE_MOONCAKE_FETCH_CLIENTS", "1")) - 1
+            )
+            for _ in range(extra_clients):
+                extra_store, _ = _connect_store(kw)
+                _require_store_api(extra_store)
+                fetch_stores.append(extra_store)
         else:
             # Injected stores are a unit-test seam and do not require importing
             # the optional Mooncake package merely to construct its config type.
             put_config = _InjectedReplicateConfig()
         _require_store_api(store)
         self._store = store
+        self._fetch_stores: List[Any] = [store, *fetch_stores]
+        self._fetch_thread_local = threading.local()
+        self._fetch_rr_lock = threading.Lock()
+        self._fetch_rr_next = 0
         put_config.replica_num = replica_num
         # Prefer true hard pinning when the installed Mooncake supports it.
         # Older ROCm builds expose only `with_soft_pin`; that is a best-effort
@@ -355,6 +374,24 @@ class MooncakeFeatureStore(FeatureStore):
         if rc is not None and int(rc) < 0:
             raise RuntimeError(f"mooncake put_from failed (status {rc}) for {key}")
 
+    def _fetch_client(self) -> Any:
+        """Sticky per-thread fetch client, assigned round-robin over the pool.
+
+        A fetch thread keeps one client for its lifetime so its transfers ride
+        a stable set of connections; threads land on different clients so
+        concurrent fetches are not serialized behind one transfer engine.
+        """
+        stores = getattr(self, "_fetch_stores", None)
+        if not stores or len(stores) == 1:
+            return self._store
+        idx = getattr(self._fetch_thread_local, "idx", None)
+        if idx is None:
+            with self._fetch_rr_lock:
+                idx = self._fetch_rr_next % len(stores)
+                self._fetch_rr_next += 1
+            self._fetch_thread_local.idx = idx
+        return stores[idx]
+
     def _store_get_tensor(self, key: str, out: torch.Tensor) -> None:
         """Zero-copy fetch into a pre-allocated tensor. Raises KeyError if absent.
 
@@ -369,18 +406,19 @@ class MooncakeFeatureStore(FeatureStore):
         genuinely missing object keeps failing and still raises KeyError.
         """
         nb = _nbytes(out)
+        client = self._fetch_client()
         attempts = 4
         rc = None
         for attempt in range(attempts):
             try:
-                self._store.register_buffer(out.data_ptr(), nb)
+                client.register_buffer(out.data_ptr(), nb)
             except Exception:  # pragma: no cover - some builds auto-register
                 pass
             try:
-                rc = self._store.get_into(key, out.data_ptr(), nb)
+                rc = client.get_into(key, out.data_ptr(), nb)
             finally:
                 try:
-                    self._store.unregister_buffer(out.data_ptr())
+                    client.unregister_buffer(out.data_ptr())
                 except Exception:  # pragma: no cover
                     pass
             if rc is not None and int(rc) >= 0:
