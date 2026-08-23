@@ -574,6 +574,11 @@ class DSparkV4DraftModel(PreTrainedModel):
     _no_split_modules = ["DSparkV4Stage"]
 
     def __init__(self, config: DSparkV4DraftConfig) -> None:
+        # The trainer stamps training.attention_backend (``native``) onto the
+        # config; transformers validates that string even though this model
+        # implements its own attention. Coerce to a value HF accepts.
+        if getattr(config, "_attn_implementation", None) not in (None, "eager"):
+            config._attn_implementation = "eager"
         super().__init__(config)
         self.config = config
         dflash_config = dict(getattr(config, "dflash_config", None) or {})
