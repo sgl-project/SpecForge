@@ -1,0 +1,98 @@
+model:
+  target_model_path: deepseek-ai/DeepSeek-V4-Flash-0731
+  target_backend: sglang
+  # OFFICIAL drafter architecture (3 DeepSeek-V4 MoE+mHC stages, block 5,
+  # capture layers 40 41 42).
+  draft_model_config: configs/deepseek-v4-flash-dspark-official.json
+  # CONTINUE TRAINING THE OFFICIAL DRAFTER: weights-only warm start from the
+  # dequantized official DSpark head (scripts/init_dspark_v4_from_target.py
+  # --from-official). A converged drafter should start with LOW loss and high
+  # position accuracies; this bounded run is the "meaningful loss" check
+  # before the prod-traffic continuation.
+  draft_checkpoint_path: /cluster-storage/models/dspark-v4-official-roundtrip-hf
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_mem_fraction_static: 0.85
+  sglang_context_length: 8704
+  sglang_max_running_requests: 8
+  sglang_moe_runner_backend: marlin
+
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 8192
+  chat_template: deepseek-v4
+  cache_dir: cache
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 8
+
+training:
+  strategy: dspark
+  num_epochs: 1
+  # Bounded validation: enough optimizer steps to judge loss level and trend.
+  max_steps: 256
+  batch_size: 1
+  accumulation_steps: 16
+  # Continuation LR: the from-scratch recipe's 6e-4 would immediately degrade
+  # a converged drafter; 5e-5 checks that the loss starts low and improves.
+  learning_rate: 0.00005
+  lr_scheduler: constant
+  warmup_ratio: 0.02
+  max_grad_norm: 1
+  fsdp_sharding: FULL_SHARD
+  fsdp_no_sync_grad_accum: false
+  attention_backend: native
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 128
+  log_interval: 5
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-deepseek-v4-flash
+  wandb_name: deepseek-v4-flash-dspark-official-continue-sharegpt
+  wandb_offline: true
+  wandb_dir: outputs/deepseek-v4-flash-dspark-official-continue-sharegpt/wandb
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 16
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 128
+  resident_high_watermark_bytes: 85899345920
+  resident_low_watermark_bytes: 64424509440
+  feature_store_max_resident_bytes: 107374182400
+
+run_id: deepseek-v4-flash-dspark-official-continue-sharegpt
+output_dir: outputs/deepseek-v4-flash-dspark-official-continue-sharegpt
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/deepseek-v4-flash-dspark-official-continue-sharegpt/control
+    consumer_state_dir: outputs/deepseek-v4-flash-dspark-official-continue-sharegpt/consumer-state
+    backend: mooncake
+    store_id: deepseek-v4-flash-dspark-official-continue-sharegpt
+    server_urls:
+      - http://10.220.51.50:30000
+      - http://10.220.51.50:30001
+      - http://10.220.51.50:30002
+      - http://10.220.51.50:30003
+    mooncake_metadata_server: http://10.220.51.50:35880/metadata
+    mooncake_master_server_addr: 10.220.51.50:35551
+    mooncake_local_hostname: 10.220.51.52
+    mooncake_protocol: tcp
+    client_buffer_size: 1073741824
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200
