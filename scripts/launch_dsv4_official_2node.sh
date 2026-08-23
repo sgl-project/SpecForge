@@ -73,8 +73,9 @@ launch_trainer() {
   export MC_TRANSFER_TIMEOUT=300
   export SPECFORGE_MOONCAKE_FETCH_CLIENTS=4
   # ~19.9B drafter under FULL_SHARD runs close to the HBM budget; expandable
-  # segments avoids fragmentation-driven OOM across the 16 microbatches.
-  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  # segments avoids fragmentation-driven OOM across the 16 microbatches, and
+  # the GC threshold reclaims cached blocks before new segment mappings fail.
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.9
   nohup specforge train -c "$config" > "$LOGDIR/train.log" 2>&1 &
   echo "trainer supervisor pid $! -> $LOGDIR/train.log"
 }
