@@ -89,8 +89,14 @@ Differences vs the base recipe, all encoded in the yaml:
   window/block attention internally (fixed 128-token main-stream window per
   block + bidirectional intra-block attention + per-head sink logit); the
   training wrapper builds no masks.
-- `training.fsdp_sharding: FULL_SHARD` — the drafter is ~19.9B params;
-  per-rank steady state ≈ 60-65 GB (bf16 shard + grads + fp32 Adam masters).
+- `training.fsdp_sharding: FULL_SHARD` + `fsdp_no_sync_grad_accum: false` —
+  the drafter is ~19.9B params; `no_sync` accumulation would hold ~40 GiB of
+  UNSHARDED grads per rank, so grads reduce-scatter every micro-step.
+  Measured on 8xH200 with synthetic recipe-shaped batches
+  (`scripts/gates/dspark_v4_step_bench.py --steps 3 --accum 16`):
+  **~18.3 s/optimizer step, peak 117 GiB/rank** (needs
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, set by the launch
+  script). Two ShareGPT epochs (1885 steps) ≈ 9.6 h.
 - `training.warmup_ratio: 0.02` — the baseline run (constant 6e-4, no warmup)
   diverged to NaN at step ~1380.
 - feature-store byte caps rescaled for 3 capture layers (~0.25 GiB/8K sample
