@@ -289,8 +289,11 @@ class TestDSparkV4Model:
             assert stage.ffn.gate.bias.dtype == torch.float32
         model.train()
         before = [stage.ffn.gate.bias.clone() for stage in model.mtp]
-        run_forward(model.float())
-        model = model  # bias updated in-place during forward (training mode)
+        model = model.float()
+        # The update is deferred: forward N stashes counts, forward N+1
+        # applies them (keeps checkpoint recompute deterministic).
+        run_forward(model)
+        run_forward(model)
         changed = any(
             not torch.equal(before[i], model.mtp[i].ffn.gate.bias)
             for i in range(len(model.mtp))
