@@ -231,6 +231,7 @@ Common fields:
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
+| `training.fsdp_no_sync_grad_accum` | `true` | Accumulate micro-step gradients under FSDP `no_sync` (unsharded grads between optimizer steps). Set `false` for very large drafters to reduce-scatter every micro-step and accumulate into the sharded gradient instead. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |

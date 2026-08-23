@@ -76,6 +76,9 @@ train)
   export HF_HOME=/cluster-storage/models
   export MC_TRANSFER_TIMEOUT=300
   export SPECFORGE_MOONCAKE_FETCH_CLIENTS=4
+  # ~19.9B drafter under FULL_SHARD runs close to the HBM budget; expandable
+  # segments avoids fragmentation-driven OOM across the 16 microbatches.
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   nohup specforge train \
     -c examples/configs/deepseek-v4-flash-dspark-official-2node-h200.yaml \
     > "$LOGDIR/train.log" 2>&1 &

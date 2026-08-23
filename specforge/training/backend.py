@@ -308,12 +308,19 @@ class FSDPTrainingBackend(TrainingBackend):
             )
 
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
-        """Backward one micro-step with one gradient collective per window.
+        """Backward one micro-step.
 
-        Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
-        the boundary backward reduces the accumulated sum once.
+        By default non-boundary micro-steps run under the FSDP/DDP
+        ``no_sync()`` context and the boundary backward reduces the
+        accumulated sum once. Under FSDP, ``no_sync`` keeps the accumulated
+        gradients UNSHARDED (full size on every rank) — prohibitive for very
+        large drafters (~40 GiB for a 20B model). ``FSDP_NO_SYNC_ACCUM=0``
+        reduce-scatters every micro-step instead, accumulating into the
+        sharded gradient: same sum, one extra collective per micro-step,
+        1/world_size the gradient memory.
         """
-        if is_boundary or not self._wrapped:
+        no_sync_accum = os.environ.get("FSDP_NO_SYNC_ACCUM", "1") != "0"
+        if is_boundary or not self._wrapped or not no_sync_accum:
             loss.backward()
         else:
             with self.module.no_sync():

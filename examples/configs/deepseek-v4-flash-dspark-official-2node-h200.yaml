@@ -49,6 +49,9 @@ training:
   max_grad_norm: 1
   # ~19.9B drafter: shard params+grads+optimizer states across the 8 ranks.
   fsdp_sharding: FULL_SHARD
+  # no_sync accumulation would hold ~40 GiB of UNSHARDED grads per rank
+  # across the 16 microbatches; reduce-scatter every micro-step instead.
+  fsdp_no_sync_grad_accum: false
   # DSparkV4DraftModel implements the official window/block attention pattern
   # itself; the wrapper builds no masks.
   attention_backend: native

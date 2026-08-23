@@ -529,6 +529,11 @@ class TrainingConfig(StrictConfigModel):
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    #: Gradient accumulation under FSDP ``no_sync`` keeps UNSHARDED grads on
+    #: every rank between optimizer steps (~2 bytes/param). Set false for very
+    #: large drafters to reduce-scatter every micro-step and accumulate into
+    #: the sharded gradient instead (same sum, 1/world_size grad memory).
+    fsdp_no_sync_grad_accum: bool = True
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)

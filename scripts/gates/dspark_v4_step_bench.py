@@ -141,16 +141,15 @@ def main():
         t0 = time.perf_counter()
         for micro in range(args.accum):
             input_ids, hidden_states, last_hidden, loss_mask = synthetic_batch()
-            is_boundary = micro == args.accum - 1
-            ctx = model.no_sync() if not is_boundary else _nullcontext()
-            with ctx:
-                loss, accuracy, _metrics = model(
-                    input_ids=input_ids,
-                    hidden_states=hidden_states,
-                    loss_mask=loss_mask,
-                    target_last_hidden_states=last_hidden,
-                )
-                (loss / args.accum).backward()
+            # Reduce-scatter every micro-step (FSDP_NO_SYNC_ACCUM=0 semantics):
+            # no_sync would hold ~40 GiB of unsharded grads for this drafter.
+            loss, accuracy, _metrics = model(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                loss_mask=loss_mask,
+                target_last_hidden_states=last_hidden,
+            )
+            (loss / args.accum).backward()
         grad_norm = optimizer.step()  # BF16Optimizer clears grads itself
         torch.cuda.synchronize(device)
         dt = time.perf_counter() - t0
@@ -163,14 +162,6 @@ def main():
     dist.barrier()
     dist.destroy_process_group()
     log("DONE")
-
-
-class _nullcontext:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *a):
-        return False
 
 
 if __name__ == "__main__":
