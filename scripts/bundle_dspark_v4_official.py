@@ -174,7 +174,11 @@ def load_draft_state(source: str) -> Dict[str, torch.Tensor]:
                 ) as handle:
                     for key in handle.keys():
                         state[key] = handle.get_tensor(key)
-            return {k: v for k, v in state.items() if k.startswith("mtp.")}
+            return {
+                k: v
+                for k, v in state.items()
+                if k.startswith(("mtp.", "markov_head.", "confidence_head."))
+            }
     from specforge.export.checkpoint_io import resolve_training_state
 
     state = resolve_training_state(source)
