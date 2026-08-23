@@ -12,6 +12,7 @@
     "mask_token_id": 128799,
     "moe_bias_update_rate": 0.001,
     "projector_type": "dspark_v4",
+    "stage_gradient_checkpointing": true,
     "target_layer_ids": [40, 41, 42]
   },
   "dtype": "bfloat16",

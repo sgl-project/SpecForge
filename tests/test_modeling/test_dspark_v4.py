@@ -260,6 +260,29 @@ class TestDSparkV4Model:
         assert torch.equal(base[:, :block], out[:, :block])
         assert not torch.equal(base[:, block:], out[:, block:])
 
+    def test_stage_gradient_checkpointing_matches(self):
+        model = build_model()
+        model.train()
+        for stage in model.mtp:
+            stage.ffn.bias_update_rate = 0.0  # keep routing state fixed
+        out, anchors = run_forward(model)
+        model.pop_confidence_hidden()
+        out.square().sum().backward()
+        grads = {
+            n: p.grad.clone() for n, p in model.named_parameters()
+            if p.grad is not None
+        }
+        model.zero_grad(set_to_none=True)
+        model.stage_gradient_checkpointing = True
+        out2, _ = run_forward(model)
+        model.pop_confidence_hidden()
+        assert torch.equal(out, out2)
+        out2.square().sum().backward()
+        for name, expected in grads.items():
+            got = dict(model.named_parameters())[name].grad
+            assert got is not None, name
+            assert torch.allclose(got, expected, rtol=1e-5, atol=1e-7), name
+
     def test_gate_bias_stays_fp32_and_updates(self):
         model = build_model().to(torch.bfloat16)
         for stage in model.mtp:

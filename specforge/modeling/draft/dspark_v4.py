@@ -396,18 +396,40 @@ class DSparkV4MoE(nn.Module):
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
-        y = torch.zeros_like(x, dtype=torch.float32)
         counts = torch.bincount(
             indices.flatten(), minlength=self.n_routed_experts
         )
         if self.training and self.bias_update_rate > 0:
             self._update_balance_bias(counts)
-        counts_list = counts.tolist()
+
+        # Sorted dispatch: one argsort turns routing into contiguous
+        # per-expert segments. The naive per-expert `torch.where(indices==i)`
+        # loop scales its kernel-launch and autograd overhead with the number
+        # of ACTIVE experts — ~2x step time once the aux-free balancer spreads
+        # load across all 256 experts (observed 8.5s -> 18s over r1).
+        flat_expert = indices.flatten()  # [T*k]
+        order = flat_expert.argsort(stable=True)
+        token_of = order // self.gate.topk  # routed token index per slot
+        x_sorted = x.index_select(0, token_of)
+        w_sorted = weights.reshape(-1, 1).index_select(0, order).to(torch.float32)
+
+        counts_list = counts.tolist()  # one host sync per MoE forward
+
+        y_parts = []
+        offset = 0
         for i in range(self.n_routed_experts):
-            if counts_list[i] == 0:
+            n = counts_list[i]
+            if n == 0:
                 continue
-            idx, top = torch.where(indices == i)
-            y[idx] += self.experts[i](x[idx], weights[idx, top, None].to(torch.float32))
+            y_parts.append(
+                self.experts[i](
+                    x_sorted[offset : offset + n], w_sorted[offset : offset + n]
+                )
+            )
+            offset += n
+        y = torch.zeros_like(x, dtype=torch.float32)
+        if y_parts:
+            y = y.index_add(0, token_of, torch.cat(y_parts, dim=0).float())
         y = y + self.shared_experts(x)
         return y.to(x.dtype).view(shape)
 
@@ -580,6 +602,13 @@ class DSparkV4DraftModel(PreTrainedModel):
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.projector_type = dflash_config.get("projector_type", "dspark_v4")
         self.kv_fake_quant = bool(dflash_config.get("kv_fake_quant", True))
+        # Recompute each stage's forward during backward: trades ~+30% forward
+        # compute for dropping most inter-stage activations. Worth it when the
+        # allocator is running at the HBM ceiling (fragmentation-driven
+        # expandable_segments mapping failures inflate step time ~2x).
+        self.stage_gradient_checkpointing = bool(
+            dflash_config.get("stage_gradient_checkpointing", False)
+        )
         # The training wrapper consults this to build sliding masks for the
         # Qwen3 backbone; the V4 window semantics live inside the model.
         self.sliding_window = None
@@ -709,16 +738,32 @@ class DSparkV4DraftModel(PreTrainedModel):
         x = noise_embedding.unsqueeze(2).repeat(1, 1, self.config.hc_mult, 1)
         main_x = target_hidden
         final_hidden = prenorm_hidden = None
+        use_checkpoint = self.stage_gradient_checkpointing and self.training
         for stage in self.mtp:
-            x, main_x, final_hidden, prenorm_hidden = stage(
-                x,
-                main_x,
-                anchor_positions,
-                context_freqs,
-                block_freqs,
-                block,
-                self.kv_fake_quant,
-            )
+            if use_checkpoint:
+                from torch.utils.checkpoint import checkpoint
+
+                x, main_x, final_hidden, prenorm_hidden = checkpoint(
+                    stage,
+                    x,
+                    main_x,
+                    anchor_positions,
+                    context_freqs,
+                    block_freqs,
+                    block,
+                    self.kv_fake_quant,
+                    use_reentrant=False,
+                )
+            else:
+                x, main_x, final_hidden, prenorm_hidden = stage(
+                    x,
+                    main_x,
+                    anchor_positions,
+                    context_freqs,
+                    block_freqs,
+                    block,
+                    self.kv_fake_quant,
+                )
         self._confidence_hidden = prenorm_hidden
         return final_hidden
 
