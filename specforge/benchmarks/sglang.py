@@ -91,12 +91,35 @@ def _load_prompts(name: str, max_samples: Optional[int]) -> list[list[str]]:
     return prompts
 
 
-def _apply_chat_template(tokenizer, messages, enable_thinking: bool) -> str:
+def _resolve_chat_template_override(name: Optional[str]) -> Optional[str]:
+    """Jinja template from SpecForge's registry, for tokenizers that ship no
+    chat_template of their own (e.g. DeepSeek-V4 keeps it in encoding/)."""
+    if not name:
+        return None
+    from specforge.data.template import TEMPLATE_REGISTRY
+
+    template = TEMPLATE_REGISTRY.get(name)
+    jinja = getattr(template, "jinja_chat_template", None)
+    if not jinja:
+        raise ValueError(
+            f"chat template {name!r} does not define jinja_chat_template"
+        )
+    return jinja
+
+
+def _apply_chat_template(
+    tokenizer,
+    messages,
+    enable_thinking: bool,
+    chat_template: Optional[str] = None,
+) -> str:
     kwargs = {
         "tokenize": False,
         "add_generation_prompt": True,
         "enable_thinking": enable_thinking,
     }
+    if chat_template is not None:
+        kwargs["chat_template"] = chat_template
     try:
         return tokenizer.apply_chat_template(messages, **kwargs)
     except TypeError:
@@ -138,6 +161,9 @@ def _run_sglang(args) -> BenchmarkResult:
         trust_remote_code=args.trust_remote_code,
     )
     dataset = _load_prompts(args.dataset, args.max_samples)
+    chat_template = _resolve_chat_template_override(
+        getattr(args, "chat_template", None)
+    )
     prompt_count = args.num_prompts
     warmup_count = args.concurrency
     prompts = [
@@ -145,6 +171,7 @@ def _run_sglang(args) -> BenchmarkResult:
             tokenizer,
             [{"role": "user", "content": dataset[index % len(dataset)][0]}],
             args.enable_thinking,
+            chat_template=chat_template,
         )
         for index in range(prompt_count + warmup_count)
     ]

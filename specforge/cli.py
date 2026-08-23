@@ -238,6 +238,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     benchmark.add_argument("--timeout-seconds", type=int, default=3600)
     benchmark.add_argument("--enable-thinking", action="store_true")
     benchmark.add_argument("--trust-remote-code", action="store_true")
+    benchmark.add_argument(
+        "--chat-template",
+        default=None,
+        help="SpecForge template registry name (e.g. deepseek-v4) applied "
+        "when the tokenizer ships no chat_template of its own",
+    )
     benchmark.add_argument("--output-json")
     args = parser.parse_args(argv)
 
