@@ -7,7 +7,7 @@ model:
   # CONTINUE TRAINING THE OFFICIAL DRAFTER on prod traffic: weights-only warm
   # start from the dequantized official DSpark head (validated first by the
   # bounded deepseek-v4-flash-dspark-official-continue-sharegpt run).
-  draft_checkpoint_path: /cluster-storage/models/dspark-v4-official-roundtrip-hf
+  draft_checkpoint_path: /cluster-storage/models/dspark-v4-0731-drafter-hf
   embedding_key: embed.weight
   lm_head_key: head.weight
   mask_token_id: 128799

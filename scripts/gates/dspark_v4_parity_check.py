@@ -31,9 +31,12 @@ from dspark_v4_official_weights import (  # noqa: E402
     load_official_mtp_state,
 )
 
-REFERENCE_INFERENCE_DIR = os.path.join(
-    os.path.dirname(DEFAULT_SNAPSHOT), "913f0657a874f76844e2e91cbe706dbcaceeb6d7",
-    "inference",
+# Reference implementation CODE (architecture only, no weights) ships with
+# the standalone DSpark repo; the weights compared come from DEFAULT_SNAPSHOT
+# (the 0731 bundle).
+REFERENCE_INFERENCE_DIR = (
+    "/cluster-storage/models/models--deepseek-ai--DeepSeek-V4-Flash-DSpark/"
+    "snapshots/913f0657a874f76844e2e91cbe706dbcaceeb6d7/inference"
 )
 
 

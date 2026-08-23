@@ -37,6 +37,11 @@ with draft config `configs/deepseek-v4-flash-dspark-official.json`.
    python3 scripts/bundle_dspark_v4_official.py --self-test
    ```
 
+   NOTE: weights always come from the **0731 snapshot** (its shards 46-48
+   bundle the drafter). The standalone `DeepSeek-V4-Flash-DSpark` repo is a
+   different model release — byte-identical config.json, different target AND
+   drafter weights — and must not be mixed in.
+
 3. **Export-path gate**: bundle the *official-dequant* weights and serve them —
    accept length must match the official checkpoint's:
 

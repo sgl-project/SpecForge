@@ -18,9 +18,13 @@ from typing import Dict, Iterable, Optional
 
 import torch
 
+# The mtp.* drafter bundled with deepseek-ai/DeepSeek-V4-Flash-0731. NOTE:
+# the standalone DeepSeek-V4-Flash-DSpark repo is a DIFFERENT model release
+# (both its target shards and its drafter weights differ from 0731, despite a
+# byte-identical config.json) — do not mix the two.
 DEFAULT_SNAPSHOT = (
-    "/cluster-storage/models/models--deepseek-ai--DeepSeek-V4-Flash-DSpark/"
-    "snapshots/62af8fffb2f7030cac4de2f0169f5b8d1101b646"
+    "/cluster-storage/models/models--deepseek-ai--DeepSeek-V4-Flash-0731/"
+    "snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062"
 )
 
 FP4_TABLE = torch.tensor(

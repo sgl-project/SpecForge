@@ -9,7 +9,7 @@ model:
   # --from-official). A converged drafter should start with LOW loss and high
   # position accuracies; this bounded run is the "meaningful loss" check
   # before the prod-traffic continuation.
-  draft_checkpoint_path: /cluster-storage/models/dspark-v4-official-roundtrip-hf
+  draft_checkpoint_path: /cluster-storage/models/dspark-v4-0731-drafter-hf
   embedding_key: embed.weight
   lm_head_key: head.weight
   mask_token_id: 128799
