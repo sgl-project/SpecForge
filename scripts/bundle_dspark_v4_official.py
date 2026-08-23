@@ -248,15 +248,19 @@ def bundle(draft_source: str, output_dir: str, snapshot: str) -> None:
     } & set(mtp_shards)
     assert not mixed, f"target tensors share mtp shards: {sorted(mixed)}"
 
+    def _link(src: str, dst: str) -> None:
+        # HF snapshots are symlink farms into blobs/; link the real file so
+        # the bundle stands alone (a linked relative symlink would dangle).
+        if os.path.lexists(dst):
+            os.remove(dst)
+        os.link(os.path.realpath(src), dst)
+
     for name in target_shards:
-        dst = os.path.join(output_dir, name)
-        if not os.path.exists(dst):
-            os.link(os.path.join(snapshot, name), dst)
+        _link(os.path.join(snapshot, name), os.path.join(output_dir, name))
     for name in _LINK_FILES:
         src = os.path.join(snapshot, name)
-        dst = os.path.join(output_dir, name)
-        if os.path.exists(src) and not os.path.exists(dst):
-            os.link(src, dst)
+        if os.path.exists(src):
+            _link(src, os.path.join(output_dir, name))
     enc_src = os.path.join(snapshot, "encoding")
     enc_dst = os.path.join(output_dir, "encoding")
     if os.path.isdir(enc_src) and not os.path.exists(enc_dst):
