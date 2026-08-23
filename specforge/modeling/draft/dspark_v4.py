@@ -379,11 +379,22 @@ class DSparkV4MoE(nn.Module):
         )
         self.bias_update_rate = 0.0
         self.last_expert_load: Optional[torch.Tensor] = None
+        self._pending_counts: Optional[torch.Tensor] = None
 
-    def _update_balance_bias(self, counts: torch.Tensor) -> None:
-        """noaux_tc balancing: identical on every rank via all-reduced loads."""
+    def apply_pending_balance_update(self) -> None:
+        """noaux_tc balancing: identical on every rank via all-reduced loads.
+
+        Called from the MODEL forward, outside any activation-checkpoint
+        region: mutating gate.bias inside the stage forward would make the
+        checkpoint recompute route differently (different segment shapes ->
+        CheckpointError) and re-fire the all_reduce during backward.
+        """
         import torch.distributed as dist
 
+        counts = self._pending_counts
+        self._pending_counts = None
+        if counts is None or self.bias_update_rate <= 0:
+            return
         counts = counts.float()
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(counts)
@@ -399,8 +410,10 @@ class DSparkV4MoE(nn.Module):
         counts = torch.bincount(
             indices.flatten(), minlength=self.n_routed_experts
         )
-        if self.training and self.bias_update_rate > 0:
-            self._update_balance_bias(counts)
+        if self.training:
+            # Overwrite (never accumulate): a checkpoint recompute re-runs
+            # this forward and must leave identical state behind.
+            self._pending_counts = counts
 
         # Sorted dispatch: one argsort turns routing into contiguous
         # per-expert segments. The naive per-expert `torch.where(indices==i)`
@@ -735,6 +748,14 @@ class DSparkV4DraftModel(PreTrainedModel):
         # projects the captured features into the shared main stream; the last
         # stage applies hc_head and the final norm (all inside stage forwards
         # so per-stage FSDP wrapping is sound).
+        if self.training:
+            # Apply the PREVIOUS forward's balancing update before any routing
+            # this step. It must not run between a forward and its backward:
+            # activation-checkpoint recompute would then route with a mutated
+            # bias and produce different expert-segment shapes.
+            for stage in self.mtp:
+                stage.ffn.apply_pending_balance_update()
+
         x = noise_embedding.unsqueeze(2).repeat(1, 1, self.config.hc_mult, 1)
         main_x = target_hidden
         final_hidden = prenorm_hidden = None
