@@ -19,6 +19,7 @@ cd /personal/SpecForge
 case "${1:-}" in
 *32k)      RUN=deepseek-v4-flash-dspark-official-0813-32k ;;
 *continue) RUN=deepseek-v4-flash-dspark-official-continue-sharegpt ;;
+*r2)       RUN=deepseek-v4-flash-dspark-official-2node-h200-r2 ;;
 *)         RUN=deepseek-v4-flash-dspark-official-2node-h200 ;;
 esac
 LOGDIR=outputs/$RUN/logs
@@ -105,6 +106,10 @@ train)
   ;;
 train32k)
   launch_trainer examples/configs/deepseek-v4-flash-dspark-official-0813-32k.yaml
+  ;;
+trainr2)
+  # ShareGPT r2: weights-only warm start from r1's step1152, lr 3e-4, clip 0.5.
+  launch_trainer examples/configs/deepseek-v4-flash-dspark-official-2node-h200-r2.yaml
   ;;
 traincontinue)
   # Bounded "meaningful loss" check: continue the OFFICIAL drafter on
