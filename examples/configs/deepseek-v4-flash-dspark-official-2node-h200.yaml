@@ -69,7 +69,7 @@ training:
 
 tracking:
   report_to: wandb
-  wandb_project: specforge
+  wandb_project: specforge-deepseek-v4-flash
   wandb_name: deepseek-v4-flash-dspark-official-2node-h200
   # The trainer node has no wandb credentials; offline runs land in wandb_dir
   # (shared GPFS) for a later `wandb sync`.
