@@ -20,6 +20,7 @@ EXPECTED_NPROC_PER_NODE = {
     "deepseek-v4-flash-dspark-disaggregated.yaml": 4,
     "deepseek-v4-flash-dspark-official-0813-32k.yaml": 8,
     "deepseek-v4-flash-dspark-official-2node-h200.yaml": 8,
+    "deepseek-v4-flash-dspark-official-2node-h200-r2.yaml": 8,
     "deepseek-v4-flash-dspark-official-continue-sharegpt.yaml": 8,
     "gemma3-1b-eagle3-online.yaml": 1,
     "glm-5.2-dspark-disaggregated.yaml": 1,
@@ -363,7 +364,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 73)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 74)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
