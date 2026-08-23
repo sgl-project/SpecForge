@@ -78,7 +78,7 @@ train)
   # Spread each rank's fetch threads over several Mooncake clients: one
   # client's TCP transfer engine tops out ~1.4-1.8 GB/s, well below the
   # ~1.4 GB/s/rank a hidden 32K fetch needs.
-  export SPECFORGE_MOONCAKE_FETCH_CLIENTS=4
+  export SPECFORGE_MOONCAKE_FETCH_CLIENTS=8
   CUDA_VISIBLE_DEVICES=6,7 nohup specforge train \
     -c examples/configs/deepseek-v4-flash-dspark-0813-32k.yaml \
     > "$LOGDIR/train.log" 2>&1 &

@@ -3,10 +3,11 @@ model:
   draft_model_config: configs/deepseek-v4-flash-dspark.json
   target_backend: sglang
   trust_remote_code: true
-  # Weights-only warm start from the 4-rank run's step-1536 checkpoint
-  # (optimizer state and prompt position reset; world-size changes are outside
-  # the exact-resume contract).
-  draft_checkpoint_path: outputs/deepseek-v4-flash-dspark-0813-32k/deepseek-v4-flash-dspark-0813-32k-step1024
+  # Weights-only warm start (optimizer state and prompt position reset).
+  # Originally the 4-rank run's step-1024 checkpoint; now this run's own
+  # step-256 checkpoint after a missed exact-resume window. Mutually
+  # exclusive with training.resume_from.
+  draft_checkpoint_path: outputs/deepseek-v4-flash-dspark-0813-32k-r2/deepseek-v4-flash-dspark-0813-32k-r2-step256
   # DeepSeek-V4 checkpoints use the native inference weight layout.
   embedding_key: embed.weight
   lm_head_key: head.weight
@@ -47,6 +48,12 @@ data:
 
 training:
   strategy: dspark
+  # Exact resume (training.resume_from) is CONSUMER-ONLY: it needs the ack
+  # marker to equal the checkpoint step AND the original producer still
+  # running (a producer restart claims a fresh control path and a SIGTERMed
+  # producer poisons the channel). After a full-stack stop, the supported
+  # path is a weights-only warm start from the latest checkpoint via
+  # model.draft_checkpoint_path with a fresh ledger and store_id.
   num_epochs: 4
   # Rows are ~4x the 8K ShareGPT recipe, so the optimizer quantum shrinks
   # 2x to keep feature bytes bounded: 2 ranks x 32 microbatches -> 64
@@ -83,22 +90,33 @@ tracking:
   wandb_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2/wandb
 
 runtime:
-  producer_lease: 8
-  producer_concurrency: 8
+  # Lease commitment is the real backpressure overshoot: once dispatch
+  # resumes, workers(3) x concurrency x lease samples are committed and
+  # publish regardless of the watermark (observed 2026-08-22: a 152-lease
+  # refill burst pushed resident 218 -> 406 GB and tripped the hard cap).
+  # 3 x 4 x 4 = 48 samples (~82 GiB at the 1.7 GiB cap) keeps the peak at
+  # high watermark + commitment ~= 254 GB, well under the 384 GiB cap,
+  # and 16 outstanding prompts per server still covers the 8 running
+  # slots (max_running_requests) with a full queue behind them.
+  producer_lease: 4
+  producer_concurrency: 4
   # One optimizer quantum is 64 samples (~90 GiB of features at the ~30K
   # median). Two quanta stay in flight so the producer runs a window ahead;
   # the low watermark holds one full quantum so complete optimizer windows
   # always dispatch without a backpressure deadlock.
+  # Resume capture well before the buffer nears one quantum: with 8 fetch
+  # clients the consumer drains ~2.9 samples/s while 4x4 leases ramp capture
+  # gently, and a low watermark at exactly one quantum (64) let in_flight
+  # scrape 47 and starve full optimizer windows (observed 2026-08-23:
+  # 22 s steps spiking to 35 s). Narrow hysteresis keeps a steady trickle.
   in_flight_high_watermark: 128
-  in_flight_low_watermark: 64
-  # Backpressure gates only NEW dispatches: leased capture requests still
-  # complete and publish, overshooting resident bytes by up to ~140 GiB
-  # (observed on the 2026-08-22 crash: watermark 192 GiB, death at a
-  # projected 344.7 GiB > 320 GiB hard cap). The high watermark plus the
-  # lease overshoot must stay under the hard cap, and the hard cap under
+  in_flight_low_watermark: 112
+  # Backpressure gates only NEW dispatches: the high watermark plus the
+  # full lease commitment (workers x producer_concurrency x producer_lease
+  # x 1.7 GiB/sample) must stay under the hard cap, and the hard cap under
   # the 3x192 GiB sink segments.
   resident_high_watermark_bytes: 171798691840     # 160 GiB
-  resident_low_watermark_bytes: 128849018880      # 120 GiB (>= one quantum)
+  resident_low_watermark_bytes: 161061273600      # 150 GiB (narrow band, see above)
   feature_store_max_resident_bytes: 412316860416  # 384 GiB
 
 run_id: deepseek-v4-flash-dspark-0813-32k-r2
@@ -113,7 +131,7 @@ deployment:
     control_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2/control
     consumer_state_dir: outputs/deepseek-v4-flash-dspark-0813-32k-r2/consumer-state
     backend: mooncake
-    store_id: deepseek-v4-flash-dspark-0813-32k-a8
+    store_id: deepseek-v4-flash-dspark-0813-32k-a10
     # Two TP2 capture servers out-produce one TP4 server (TP prefill scaling
     # is sublinear) and keep the producer ahead of a four-rank consumer.
     server_urls:
