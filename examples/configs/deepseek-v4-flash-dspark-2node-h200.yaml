@@ -1,0 +1,113 @@
+model:
+  target_model_path: deepseek-ai/DeepSeek-V4-Flash-0731
+  draft_model_config: configs/deepseek-v4-flash-dspark.json
+  target_backend: sglang
+  trust_remote_code: true
+  # DeepSeek-V4 checkpoints use the native inference weight layout.
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_mem_fraction_static: 0.85
+  # data.max_length plus headroom: capture rejects inputs at exactly the
+  # context length.
+  sglang_context_length: 8704
+  sglang_max_running_requests: 8
+  # H200 (SM90) has no native FP4 tensor cores; the checkpoint's fp4 routed
+  # experts run through the W4A16 Marlin MoE path (the flashinfer_mxfp4
+  # TRT-LLM path used on B200 is SM100-only).
+  sglang_moe_runner_backend: marlin
+
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 8192
+  chat_template: deepseek-v4
+  cache_dir: cache
+  build_dataset_num_proc: 64
+  # Async prefetch (queue depth = workers) keeps the cross-node Mooncake
+  # fetch (~330 MiB/sample from the capture node) off the training thread.
+  dataloader_num_workers: 8
+
+training:
+  strategy: dspark
+  num_epochs: 2
+  # Eight consumer ranks x one sequence x 16 microbatches -> a global batch of
+  # 128 sequences per optimizer step (same quantum as the single-node recipe).
+  batch_size: 1
+  accumulation_steps: 16
+  learning_rate: 0.0006
+  lr_scheduler: constant
+  warmup_ratio: 0
+  max_grad_norm: 1
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 128
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge
+  wandb_name: deepseek-v4-flash-dspark-2node-h200
+  # The trainer node has no wandb credentials; offline runs land in wandb_dir
+  # (shared GPFS) for a later `wandb sync`.
+  wandb_offline: true
+  wandb_dir: outputs/deepseek-v4-flash-dspark-2node-h200/wandb
+
+runtime:
+  producer_lease: 8
+  # Four TP2 capture servers x 8 running requests: enough client concurrency
+  # to keep every server's prefill queue full.
+  producer_concurrency: 16
+  # One 8K sample is ~0.4 GiB of BF16 DSpark features. A complete optimizer
+  # quantum is 128 samples (~51 GiB). Keep TWO quanta in flight so the
+  # producer runs one window ahead and the consumer prefetch overlaps the
+  # cross-node fetch with the previous window's compute; the low watermark
+  # stays at one full quantum so complete optimizer windows always dispatch
+  # without a backpressure deadlock.
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 128
+  resident_high_watermark_bytes: 137438953472
+  resident_low_watermark_bytes: 103079215104
+  feature_store_max_resident_bytes: 171798691840
+
+run_id: deepseek-v4-flash-dspark-2node-h200
+output_dir: outputs/deepseek-v4-flash-dspark-2node-h200
+
+# Two-node split on this cluster:
+#   10.220.51.50 (capture node): mooncake_master + four TP2 capture servers
+#     on GPUs 0-7 (TP prefill scaling is sublinear, so 4xTP2 out-produces
+#     2xTP4 and 1xTP8).
+#   10.220.51.52 (trainer node): this config, `specforge train` single
+#     supervisor = CPU producer + eight-rank FSDP consumer on GPUs 0-7.
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/deepseek-v4-flash-dspark-2node-h200/control
+    consumer_state_dir: outputs/deepseek-v4-flash-dspark-2node-h200/consumer-state
+    backend: mooncake
+    store_id: deepseek-v4-flash-dspark-2node-h200
+    server_urls:
+      - http://10.220.51.50:30000
+      - http://10.220.51.50:30001
+      - http://10.220.51.50:30002
+      - http://10.220.51.50:30003
+    mooncake_metadata_server: http://10.220.51.50:35880/metadata
+    mooncake_master_server_addr: 10.220.51.50:35551
+    # The trainer node's own routable address (Mooncake TCP data plane
+    # endpoint registered by this side's clients).
+    mooncake_local_hostname: 10.220.51.52
+    mooncake_protocol: tcp
+    client_buffer_size: 1073741824
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200
