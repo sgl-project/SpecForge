@@ -181,6 +181,18 @@ def load_draft_state(source: str) -> Dict[str, torch.Tensor]:
     return dict(state["draft_state_dict"])
 
 
+def _normalize_head_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Accept module-tree head naming (warm-start dirs) alongside official."""
+    stages = {int(k.split(".")[1]) for k in state if k.startswith("mtp.")}
+    last = max(stages)
+    out = {}
+    for key, value in state.items():
+        if key.startswith(("markov_head.", "confidence_head.")):
+            key = f"mtp.{last}.{key}"
+        out[key] = value
+    return out
+
+
 def self_test(snapshot: str) -> None:
     print("quantizer round-trip self-test on official weights ...")
     headers = _official_headers(snapshot)
@@ -222,7 +234,7 @@ _LINK_FILES = (
 def bundle(draft_source: str, output_dir: str, snapshot: str) -> None:
     headers = _official_headers(snapshot)
     print(f"loading trained drafter state from {draft_source} ...")
-    state = load_draft_state(draft_source)
+    state = _normalize_head_keys(load_draft_state(draft_source))
     expected_keys = {k for k in headers if not k.endswith(".scale")}
     missing = sorted(expected_keys - set(state))
     extra = sorted(set(state) - expected_keys)

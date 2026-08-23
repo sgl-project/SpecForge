@@ -127,6 +127,7 @@ def build_target_init_state(
     state[last + "hc_head_fn"] = raw["hc_head_fn"]
     state[last + "hc_head_base"] = raw["hc_head_base"]
     state[last + "hc_head_scale"] = raw["hc_head_scale"]
+    del last  # heads below use the model's root (tree) naming
 
     # main_proj: identity on the last captured feature (or an average).
     proj = torch.zeros(hidden_size, hidden_size * n_stages)
@@ -140,13 +141,13 @@ def build_target_init_state(
     state["mtp.0.main_norm.weight"] = torch.ones(hidden_size, dtype=torch.bfloat16)
 
     # Fresh heads: LoRA-style (random w1, zero w2/confidence).
-    state[last + "markov_head.markov_w1.weight"] = (
+    state["markov_head.markov_w1.weight"] = (
         torch.randn(vocab_size, markov_rank) * 0.02
     ).to(torch.bfloat16)
-    state[last + "markov_head.markov_w2.weight"] = torch.zeros(
+    state["markov_head.markov_w2.weight"] = torch.zeros(
         vocab_size, markov_rank, dtype=torch.bfloat16
     )
-    state[last + "confidence_head.proj.weight"] = torch.zeros(
+    state["confidence_head.proj.weight"] = torch.zeros(
         1, hidden_size + markov_rank, dtype=torch.bfloat16
     )
     return state
@@ -176,6 +177,13 @@ def main():
     if args.from_official:
         print("loading official drafter weights ...")
         state = load_official_mtp_state()
+        # The model owns the heads at its root (tree naming); official
+        # checkpoints keep them under the last stage.
+        last = int(cfg["num_hidden_layers"]) - 1
+        for head in ("markov_head.", "confidence_head."):
+            prefix = f"mtp.{last}.{head}"
+            for key in [k for k in state if k.startswith(prefix)]:
+                state[key[len(f"mtp.{last}."):]] = state.pop(key)
     else:
         state = build_target_init_state(
             snapshot=args.target_snapshot,
@@ -196,7 +204,7 @@ def main():
     draft_config = load_draft_config_source(args.draft_config)
     with torch.device("meta"):
         model = AutoDraftModel.from_config(draft_config)
-    expected = model.state_dict()
+    expected = model.state_dict()  # official naming (state-dict hooks)
     missing = sorted(set(expected) - set(state))
     unexpected = sorted(set(state) - set(expected))
     assert not missing, f"missing: {missing[:8]}"

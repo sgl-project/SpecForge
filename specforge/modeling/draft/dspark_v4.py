@@ -542,17 +542,6 @@ class DSparkV4ConfidenceHead(nn.Module):
 _ROOT_HEAD_PREFIXES = ("markov_head.", "confidence_head.")
 
 
-def _rename_root_heads_on_save(module, state_dict, prefix, local_metadata):
-    """Emit root-owned heads under the official ``mtp.<last>.*`` names."""
-    del local_metadata
-    last = module.config.num_hidden_layers - 1
-    for head in _ROOT_HEAD_PREFIXES:
-        for key in [k for k in state_dict if k.startswith(prefix + head)]:
-            renamed = f"{prefix}mtp.{last}." + key[len(prefix):]
-            state_dict[renamed] = state_dict.pop(key)
-    return state_dict
-
-
 def _rename_root_heads_on_load(
     module, state_dict, prefix, *args
 ):
@@ -610,8 +599,10 @@ class DSparkV4DraftModel(PreTrainedModel):
         # the stage forwards (in the chunked objective), so they live on the
         # root module — FSDP gathers root parameters for the whole root
         # forward, while per-stage units are gathered only during their own
-        # forward. State-dict hooks below keep the official checkpoint naming
-        # (mtp.<last>.markov_head.*, mtp.<last>.confidence_head.*).
+        # forward. State dicts therefore carry them under their root names
+        # (markov_head.*, confidence_head.*); the load hook additionally
+        # accepts the official checkpoint naming (mtp.<last>.markov_head.*),
+        # and the export bundler maps root names back to official names.
         markov_rank = int(dflash_config.get("markov_rank", 256))
         self.markov_head = VanillaMarkovHead(
             vocab_size=config.vocab_size, markov_rank=markov_rank
@@ -619,7 +610,6 @@ class DSparkV4DraftModel(PreTrainedModel):
         self.confidence_head = DSparkV4ConfidenceHead(
             config.hidden_size + markov_rank
         )
-        self._register_state_dict_hook(_rename_root_heads_on_save)
         self.register_load_state_dict_pre_hook(_rename_root_heads_on_load)
 
         self._confidence_hidden: Optional[torch.Tensor] = None
@@ -627,28 +617,40 @@ class DSparkV4DraftModel(PreTrainedModel):
 
     # -- initialization ----------------------------------------------------
     def _init_weights(self, module):
+        # transformers 5 loads checkpoints BEFORE running _init_weights and
+        # relies on nn.init.* (patched to respect the per-param
+        # `_is_hf_initialized` flag) so loaded tensors are not clobbered.
+        # Guard the direct writes below the same way.
         std = self.config.initializer_range
+
+        def pending(param) -> bool:
+            return not getattr(param, "_is_hf_initialized", False)
+
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
         elif isinstance(module, DSparkV4RMSNorm):
-            module.weight.data.fill_(1.0)
+            nn.init.ones_(module.weight)
         elif isinstance(module, DSparkV4Gate):
-            module.weight.data.normal_(mean=0.0, std=std)
-            module.bias.data.zero_()
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if pending(module.bias):
+                module.bias.data.zero_()
         elif isinstance(module, DSparkV4Attention):
-            module.attn_sink.data.zero_()
+            nn.init.zeros_(module.attn_sink)
         elif isinstance(module, DSparkV4Stage):
             hc = module.hc_mult
             for fn_name in ("hc_attn_fn", "hc_ffn_fn"):
-                getattr(module, fn_name).data.zero_()
+                nn.init.zeros_(getattr(module, fn_name))
             for scale_name in ("hc_attn_scale", "hc_ffn_scale"):
-                getattr(module, scale_name).data.fill_(1.0)
+                nn.init.ones_(getattr(module, scale_name))
             for base_name in ("hc_attn_base", "hc_ffn_base"):
-                base = getattr(module, base_name).data
+                param = getattr(module, base_name)
+                if not pending(param):
+                    continue
+                base = param.data
                 base.zero_()
                 # pre ~ uniform 1/hc, post ~ 1, comb ~ identity mixing.
                 base[:hc] = -torch.log(torch.tensor(float(hc - 1)))
@@ -656,14 +658,14 @@ class DSparkV4DraftModel(PreTrainedModel):
                 comb.fill_(0.0)
                 comb.fill_diagonal_(4.0)
             if hasattr(module, "hc_head_fn"):
-                module.hc_head_fn.data.zero_()
-                module.hc_head_base.data.zero_()
-                module.hc_head_scale.data.fill_(1.0)
+                nn.init.zeros_(module.hc_head_fn)
+                nn.init.zeros_(module.hc_head_base)
+                nn.init.ones_(module.hc_head_scale)
         elif isinstance(module, DSparkV4ConfidenceHead):
-            module.proj.weight.data.zero_()
+            nn.init.zeros_(module.proj.weight)
         elif isinstance(module, VanillaMarkovHead):
             # LoRA-style init: random embedding, zero output projection.
-            module.markov_w2.weight.data.zero_()
+            nn.init.zeros_(module.markov_w2.weight)
 
     # -- draft-model protocol ---------------------------------------------
     def pop_confidence_hidden(self) -> Optional[torch.Tensor]:

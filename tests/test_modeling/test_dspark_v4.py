@@ -83,22 +83,37 @@ def run_forward(model, batch=2, seq=24, n_blocks=3, keep=None):
 
 
 class TestDSparkV4Model:
-    def test_state_dict_uses_official_mtp_names(self):
+    def test_state_dict_naming(self):
         model = build_model()
         keys = set(model.state_dict())
-        assert all(k.startswith("mtp.") for k in keys)
         assert "mtp.0.main_proj.weight" in keys
         assert "mtp.0.main_norm.weight" in keys
         assert "mtp.2.norm.weight" in keys
         assert "mtp.2.hc_head_fn" in keys
-        assert "mtp.2.markov_head.markov_w1.weight" in keys
-        assert "mtp.2.markov_head.markov_w2.weight" in keys
-        assert "mtp.2.confidence_head.proj.weight" in keys
         assert "mtp.1.ffn.gate.bias" in keys
         assert "mtp.0.attn.attn_sink" in keys
-        # main_proj/main_norm only on stage 0; head modules only on the last.
+        # The heads live at the module root (FSDP: used outside stage
+        # forwards); the bundler maps them back to the official
+        # mtp.<last>.* names at export time.
+        assert "markov_head.markov_w1.weight" in keys
+        assert "markov_head.markov_w2.weight" in keys
+        assert "confidence_head.proj.weight" in keys
+        # main_proj/main_norm only on stage 0; hc_head only on the last.
         assert "mtp.1.main_proj.weight" not in keys
-        assert "mtp.0.markov_head.markov_w1.weight" not in keys
+        assert "mtp.0.hc_head_fn" not in keys
+
+    def test_load_accepts_official_head_naming(self):
+        model = build_model()
+        state = dict(model.state_dict())
+        for head in ("markov_head.", "confidence_head."):
+            for key in [k for k in state if k.startswith(head)]:
+                state["mtp.2." + key] = state.pop(key)
+        fresh = DSparkV4DraftModel(tiny_config())
+        missing, unexpected = fresh.load_state_dict(state, strict=False)
+        assert not missing and not unexpected, (missing, unexpected)
+        assert torch.equal(
+            fresh.confidence_head.proj.weight, model.confidence_head.proj.weight
+        )
 
     def test_state_dict_round_trip(self):
         model = build_model()
@@ -109,6 +124,36 @@ class TestDSparkV4Model:
         out_a, _ = run_forward(model.eval())
         out_b, _ = run_forward(fresh.eval())
         assert torch.equal(out_a, out_b)
+
+    def test_from_pretrained_round_trip(self):
+        """Warm start loads via HF from_pretrained; transformers 5 runs
+        _init_weights AFTER loading and only per-param loaded flags prevent
+        re-initialization — raw .data writes would silently clobber every
+        loaded tensor."""
+        import os
+        import tempfile
+
+        from safetensors.torch import save_file
+
+        model = build_model()
+        state = model.state_dict()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = tiny_config()
+            cfg.architectures = ["DSparkV4DraftModel"]
+            cfg.save_pretrained(tmp)
+            save_file(
+                {k: v.contiguous() for k, v in state.items()},
+                os.path.join(tmp, "model.safetensors"),
+            )
+            from specforge.modeling.auto import AutoDraftModel
+
+            loaded, info = AutoDraftModel.from_pretrained(
+                tmp, config=cfg, output_loading_info=True
+            )
+        assert not info["missing_keys"] and not info["unexpected_keys"]
+        loaded_state = dict(loaded.state_dict())
+        for key, value in state.items():
+            assert torch.equal(loaded_state[key], value), key
 
     def test_forward_and_backward(self):
         model = build_model()
