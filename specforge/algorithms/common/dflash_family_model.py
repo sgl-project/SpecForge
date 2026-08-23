@@ -327,6 +327,23 @@ class OnlineDFlashModel(nn.Module):
         draft_position_ids = self._create_position_ids(anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
+        if self.attention_backend == "native":
+            # The draft model implements the block/window attention pattern
+            # itself (e.g. DSparkV4DraftModel) — no mask tensors are built.
+            if not getattr(self.draft_model, "native_block_attention", False):
+                raise ValueError(
+                    "training.attention_backend=native requires a draft model "
+                    "with native_block_attention support"
+                )
+            output_hidden = self.draft_model(
+                position_ids=full_position_ids,
+                noise_embedding=noise_embedding,
+                target_hidden=hidden_states,
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+            )
+            return anchor_positions, block_keep_mask, output_hidden
+
         mask_builder = (
             create_dflash_block_mask
             if self.attention_backend == "flex_attention"
@@ -880,6 +897,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         loss_weights: torch.Tensor,
         eval_mask: torch.Tensor,
         aligned_target_hidden: Optional[torch.Tensor],
+        confidence_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive loss and telemetry numerators for one block slice."""
 
@@ -933,7 +951,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 l1_num = (l1_per_token * loss_weights).sum()
 
         confidence_pred = self.draft_model.predict_confidence(
-            hidden,
+            # Some architectures (DeepSeek-V4 DSpark) feed their confidence
+            # head a different feature stream than the LM-head hidden.
+            confidence_hidden if confidence_hidden is not None else hidden,
             prev_token_ids=prev_token_ids,
         )
         if confidence_pred is not None and self.dspark_confidence_head_alpha > 0:
@@ -1031,6 +1051,20 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 safe_label_indices,
             )
 
+        confidence_hidden_4d = None
+        pop_confidence_hidden = getattr(
+            self.draft_model, "pop_confidence_hidden", None
+        )
+        if callable(pop_confidence_hidden):
+            confidence_hidden = pop_confidence_hidden()
+            if confidence_hidden is not None:
+                confidence_hidden_4d = confidence_hidden.reshape(
+                    batch_size,
+                    num_blocks,
+                    block_size,
+                    -1,
+                )
+
         totals = checkpointed_chunk_reduce(
             self._dspark_objective_chunk_terms,
             hidden_4d,
@@ -1039,6 +1073,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_weights,
             eval_mask,
             aligned_target_hidden,
+            confidence_hidden_4d,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )

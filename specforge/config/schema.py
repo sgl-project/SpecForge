@@ -537,9 +537,11 @@ class TrainingConfig(StrictConfigModel):
     #: remains on the accelerator.
     optimizer_cpu_offload: bool = False
     ttt_length: int = Field(default=7, gt=0)
-    attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
-        "flex_attention"
-    )
+    #: ``native``: the draft model implements its own attention pattern (no
+    #: mask construction by the training wrapper); DSpark-V4 only.
+    attention_backend: Literal[
+        "eager", "sdpa", "flex_attention", "fa", "usp", "native"
+    ] = "flex_attention"
     #: Trainer tensor parallelism. The unified runtime currently requires one;
     #: target-model TP belongs to external or managed capture servers.
     tp_size: int = Field(default=1, gt=0)
