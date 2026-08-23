@@ -131,3 +131,36 @@ class AIMEBenchmarker(Benchmarker):
     def get_max_new_tokens(self) -> int:
         """AIME problems require more tokens."""
         return 32768
+
+
+@BENCHMARKS.register("aime25")
+class AIME25Benchmarker(AIMEBenchmarker):
+    """AIME 2025 benchmark (30 problems, AIME I + II)."""
+
+    _DATASET_CANDIDATES = ("math-ai/aime25", "yentinglin/aime_2025")
+
+    def load_data(self) -> Tuple[List[Dict[str, Any]], List[Optional[str]]]:
+        dataset = None
+        errors = []
+        for name in self._DATASET_CANDIDATES:
+            try:
+                loaded = load_dataset(name)
+                dataset = loaded[list(loaded.keys())[0]]
+                break
+            except Exception as exc:  # noqa: BLE001 - fall through to next source
+                errors.append(f"{name}: {exc}")
+        if dataset is None:
+            raise RuntimeError(
+                "could not load an AIME 2025 dataset; tried "
+                + "; ".join(errors)
+            )
+        questions = []
+        labels = []
+        for idx, q in enumerate(dataset):
+            if self.num_samples is not None and idx >= self.num_samples:
+                break
+            problem = q.get("problem") or q.get("Problem")
+            answer = q.get("answer", q.get("Answer"))
+            questions.append({"question": problem})
+            labels.append(str(answer).strip() if answer is not None else None)
+        return questions, labels
