@@ -17,7 +17,7 @@ class SGLang0518CompatibilityTest(unittest.TestCase):
         tree = ast.parse(
             textwrap.dedent(
                 inspect.getsource(
-                    sglang_capture.OfflineSGLangCaptureBackend.capture_eagle3
+                    sglang_capture.OfflineSGLangCaptureBackend.capture_rows
                 )
             )
         )
