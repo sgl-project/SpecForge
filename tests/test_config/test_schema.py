@@ -335,18 +335,28 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "dspark_objective_chunk_blocks"):
             Config.model_validate(payload)
 
-    def test_dflash2_selector_loss_alpha_is_non_negative(self):
+    def test_dflash2_selector_objective_settings_are_bounded(self):
         payload = _online_payload("dflash")
         payload["training"]["dflash2_selector_loss_alpha"] = 0.25
+        payload["training"]["dflash2_selector_warmup_ratio"] = 0.1
+        payload["training"]["dflash2_selector_ramp_ratio"] = 0.2
         config = Config.model_validate(payload)
         self.assertEqual(config.training.dflash2_selector_loss_alpha, 0.25)
+        self.assertEqual(config.training.dflash2_selector_warmup_ratio, 0.1)
+        self.assertEqual(config.training.dflash2_selector_ramp_ratio, 0.2)
 
-        payload["training"]["dflash2_selector_loss_alpha"] = -0.1
-        with self.assertRaisesRegex(
-            ValidationError,
-            "dflash2_selector_loss_alpha",
+        for field, invalid in (
+            ("dflash2_selector_loss_alpha", -0.1),
+            ("dflash2_selector_warmup_ratio", -0.1),
+            ("dflash2_selector_warmup_ratio", 1.1),
+            ("dflash2_selector_ramp_ratio", -0.1),
+            ("dflash2_selector_ramp_ratio", 1.1),
         ):
-            Config.model_validate(payload)
+            with self.subTest(field=field, invalid=invalid):
+                invalid_payload = _online_payload("dflash")
+                invalid_payload["training"][field] = invalid
+                with self.assertRaisesRegex(ValidationError, field):
+                    Config.model_validate(invalid_payload)
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")

@@ -1,27 +1,28 @@
 model:
-  target_model_path: Qwen/Qwen3.6-27B
+  target_model_path: /disk3/wjp/pretrained_models/Qwen3.6-27B
   draft_model_config: configs/qwen3.6-27b-dflash2.json
   target_backend: sglang
   trust_remote_code: true
   embedding_key: model.language_model.embed_tokens.weight
   torch_dtype: bfloat16
   mask_token_id: 248070
+  sglang_context_length: 8250
 
 data:
-  train_data_path: ./cache/dataset/nemotron_v2_train.jsonl
-  max_length: 4096
+  train_data_path: /disk3/wjp/datasets/perfectblend/qwen3.6-27b/data/sharegpt/full-1.jsonl
+  max_length: 8192
   chat_template: qwen3.5
-  cache_dir: cache
+  cache_dir: cache/qwen3.6-27b-pbe-1
   build_dataset_num_proc: 64
 
 training:
   # DFlash2 shares DFlash capture/data semantics; the draft architecture turns
   # on the local convolutions and candidate-selector objective.
   strategy: dflash
-  num_epochs: 6
-  max_steps: 10000
+  num_epochs: 60000
+  max_steps: 100000
   batch_size: 1
-  accumulation_steps: 2
+  accumulation_steps: 4
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1.0
@@ -32,8 +33,10 @@ training:
   loss_type: dpace
   objective_chunk_blocks: 128
   dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_warmup_ratio: 0.0005
+  dflash2_selector_ramp_ratio: 0.0005
   save_interval: 200
-  log_interval: 10
+  log_interval: 1
   dist_timeout: 30
   seed: 42
 
@@ -46,42 +49,34 @@ tracking:
   report_to: tensorboard
 
 runtime:
-  producer_lease: 64
-  producer_concurrency: 32
-  in_flight_high_watermark: 1024
-  in_flight_low_watermark: 512
+  producer_lease: 4
+  producer_concurrency: 2
+  in_flight_high_watermark: 100
+  in_flight_low_watermark: 40
 
-run_id: qwen3.6-27b-dflash2-disaggregated
-output_dir: outputs/qwen3.6-27b-dflash2-disaggregated
+run_id: qwen3.6-27b-dflash2-disaggregated-with-selector
+output_dir: outputs/qwen3.6-27b-dflash2-disaggregated-with-selector
 
 deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 4
+    nproc_per_node: 1
   disaggregated:
-    control_dir: outputs/qwen3.6-27b-dflash2-disaggregated/control
-    consumer_state_dir: outputs/qwen3.6-27b-dflash2-disaggregated/consumer-state
+    control_dir: outputs/qwen3.6-27b-dflash2-disaggregated-with-selector/control
+    consumer_state_dir: outputs/qwen3.6-27b-dflash2-disaggregated-with-selector/consumer-state
     backend: mooncake
     managed_local:
-      trainer_cuda_visible_devices: ["4", "5", "6", "3"]
+      trainer_cuda_visible_devices: ["5"]
       mooncake:
         protocol: tcp
         global_segment_size_bytes: 68719476736
         local_buffer_size_bytes: 1073741824
+        default_kv_lease_ttl_ms: 5000
       capture_servers:
         - port: 30000
-          cuda_visible_devices:
-            - "0"
-          tp_size: 1
-          mem_fraction_static: 0.8
-        - port: 30010
-          cuda_visible_devices:
-            - "1"
-          tp_size: 1
-          mem_fraction_static: 0.8
-        - port: 30020
           cuda_visible_devices:
             - "2"
           tp_size: 1
           mem_fraction_static: 0.8
+        

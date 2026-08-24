@@ -230,7 +230,11 @@ class CandidateSelector(nn.Module):
             bias=False,
         )
         nn.init.normal_(self.predecessor_codebook, std=initializer_range)
-        nn.init.normal_(self.successor_codebook, std=initializer_range)
+        # The transition must start as a no-op so a fresh DFlash2 selector is
+        # numerically identical to the unary DFlash proposal. The successor
+        # factor learns first; the other bilinear factors receive signal once it
+        # becomes non-zero.
+        nn.init.zeros_(self.successor_codebook)
 
     def score_candidates(
         self,

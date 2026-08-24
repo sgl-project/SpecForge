@@ -571,6 +571,10 @@ class TrainingConfig(StrictConfigModel):
     dpace_alpha: float = 0.5
     #: Weight of the top-k path-selector objective for DFlash2 drafts.
     dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
+    #: Fraction of optimizer steps that train only the DFlash2 base objective.
+    dflash2_selector_warmup_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    #: Fraction of optimizer steps used to ramp the selector weight to its target.
+    dflash2_selector_ramp_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1

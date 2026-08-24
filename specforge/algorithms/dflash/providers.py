@@ -81,6 +81,12 @@ def resume_contract(_config, draft_model, training_model):
                 "dflash2_selector_loss_alpha": float(
                     training_model.selector_loss_alpha
                 ),
+                "dflash2_selector_warmup_ratio": float(
+                    training_model.selector_warmup_ratio
+                ),
+                "dflash2_selector_ramp_ratio": float(
+                    training_model.selector_ramp_ratio
+                ),
             }
         )
     return contract

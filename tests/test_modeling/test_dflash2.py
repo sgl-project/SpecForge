@@ -13,6 +13,7 @@ from specforge.modeling.draft.dflash2 import (
     DFlashGroupedConv,
     Qwen3DFlash2DecoderLayer,
 )
+from specforge.training.strategies.base import DFlashTrainStrategy, StepContext
 
 
 def _tiny_config(**dflash_overrides):
@@ -90,6 +91,8 @@ class DFlash2ArchitectureTest(unittest.TestCase):
             mask_token_id=31,
             num_anchors=8,
             selector_loss_alpha=0.75,
+            selector_ramp_ratio=0.2,
+            selector_warmup_ratio=0.1,
         )
 
         contract = resume_contract(None, model, training_model)
@@ -99,6 +102,8 @@ class DFlash2ArchitectureTest(unittest.TestCase):
         self.assertEqual(contract["dflash2_selector_rank"], 4)
         self.assertEqual(contract["dflash2_selector_top_k"], 3)
         self.assertEqual(contract["dflash2_selector_loss_alpha"], 0.75)
+        self.assertEqual(contract["dflash2_selector_warmup_ratio"], 0.1)
+        self.assertEqual(contract["dflash2_selector_ramp_ratio"], 0.2)
         self.assertEqual(contract["dflash_lk_loss_type"], "lambda")
 
     def test_backward_reaches_convolution_parameters(self):
@@ -170,6 +175,29 @@ class DFlash2GroupedConvTest(unittest.TestCase):
 
 
 class CandidateSelectorTest(unittest.TestCase):
+    def test_fresh_selector_is_a_unary_noop(self):
+        selector = CandidateSelector(
+            hidden_size=4,
+            vocab_size=8,
+            state_rank=3,
+            top_k=2,
+            initializer_range=0.2,
+        )
+        unary_logits = torch.randn(2, 3, 2)
+
+        scores = selector.score_candidates(
+            candidate_ids=torch.randint(0, 8, (2, 3, 2)),
+            unary_logits=unary_logits,
+            hidden_states=torch.randn(2, 3, 4),
+            predecessor_ids=torch.randint(0, 8, (2, 3)),
+        )
+
+        torch.testing.assert_close(scores, unary_logits)
+        torch.testing.assert_close(
+            selector.successor_codebook,
+            torch.zeros_like(selector.successor_codebook),
+        )
+
     def test_training_objective_uses_serving_unary_transform(self):
         class Draft(nn.Module):
             def __init__(self):
@@ -279,7 +307,7 @@ class CandidateSelectorTest(unittest.TestCase):
             selected = realized.argmax(dim=-1, keepdim=True)
             predecessor_ids = candidate_ids[:, position].gather(1, selected)[:, 0]
 
-    def test_selector_loss_uses_gold_replacement_when_target_is_not_topk(self):
+    def test_selector_loss_masks_targets_outside_strict_topk(self):
         class Draft(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -330,14 +358,32 @@ class CandidateSelectorTest(unittest.TestCase):
             hidden[0, 0, 1].unsqueeze(0),
             torch.tensor([0]),
         )
+        torch.testing.assert_close(base_num, base_ce)
+        self.assertEqual(selector_num.item(), 0.0)
+        self.assertEqual(selector_den.item(), 0.0)
+        self.assertEqual(covered.item(), 0.0)
+
+        # When the target is covered, train the selector over exactly the same
+        # strict unary top-k candidate set used by serving.
+        covered_targets = torch.tensor([[[0, 2]]])
+        covered_terms = model._dflash_objective_chunk_terms(
+            hidden,
+            covered_targets,
+            weights,
+            predecessors,
+        )
+        covered_base_ce = torch.nn.functional.cross_entropy(
+            hidden[0, 0, 1].unsqueeze(0),
+            torch.tensor([2]),
+        )
         selector_ce = torch.nn.functional.cross_entropy(
-            torch.tensor([[3.0, 0.0]]),
+            torch.tensor([[3.0, 2.0]]),
             torch.tensor([1]),
         )
-        torch.testing.assert_close(selector_num, selector_ce)
-        torch.testing.assert_close(base_num + selector_num, base_ce + selector_ce)
-        self.assertEqual(selector_den.item(), 1.0)
-        self.assertEqual(covered.item(), 0.0)
+        torch.testing.assert_close(covered_terms[0], covered_base_ce)
+        torch.testing.assert_close(covered_terms[6], selector_ce)
+        self.assertEqual(covered_terms[10].item(), 1.0)
+        self.assertEqual(covered_terms[11].item(), 1.0)
 
         # D-PACE uses the unary target probability to derive one detached
         # position weight, and that same weight must scale both objectives.
@@ -345,15 +391,71 @@ class CandidateSelectorTest(unittest.TestCase):
         model.dpace_alpha = 0.5
         dpace_terms = model._dflash_objective_chunk_terms(
             hidden,
-            targets,
+            covered_targets,
             weights,
             predecessors,
         )
-        unary_probability = torch.exp(-base_ce)
+        unary_probability = torch.exp(-covered_base_ce)
         dpace_weight = 0.5 * unary_probability + 0.5
-        torch.testing.assert_close(dpace_terms[0], base_ce * dpace_weight)
+        torch.testing.assert_close(dpace_terms[0], covered_base_ce * dpace_weight)
         torch.testing.assert_close(dpace_terms[6], selector_ce * dpace_weight)
         torch.testing.assert_close(dpace_terms[10], dpace_weight)
+
+    def test_selector_keeps_ce_when_base_uses_tv(self):
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = nn.Parameter(torch.zeros(()))
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=4,
+                    vocab_size=4,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.02,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        draft = Draft()
+        with torch.no_grad():
+            draft.candidate_selector.predecessor_codebook.zero_()
+            draft.candidate_selector.successor_codebook.zero_()
+            draft.candidate_selector.hidden_projection.weight.zero_()
+        model = OnlineDFlashModel(
+            draft_model=draft,
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(4, 4),
+            mask_token_id=3,
+            block_size=2,
+            attention_backend="eager",
+            selector_loss_alpha=1.0,
+            lk_loss_type="tv",
+        )
+        output_hidden = torch.tensor(
+            [[[0.0, 0.0, 0.0, 0.0], [0.0, 3.0, 2.0, 1.0]]]
+        )
+        model._forward_draft_blocks = lambda **_kwargs: (
+            torch.tensor([[0]]),
+            torch.tensor([[True]]),
+            output_hidden,
+        )
+
+        loss, _accuracy, metrics = model(
+            input_ids=torch.tensor([[0, 2]]),
+            hidden_states=torch.zeros(1, 2, 4),
+            loss_mask=torch.ones(1, 2),
+        )
+
+        target_probability = output_hidden[0, 1].softmax(dim=-1)[2]
+        selector_ce = torch.nn.functional.cross_entropy(
+            torch.tensor([[3.0, 2.0]]),
+            torch.tensor([1]),
+        )
+        torch.testing.assert_close(loss, (1.0 - target_probability) + selector_ce)
+        selector_num, selector_den = metrics["ratio_metrics"]["selector_loss"]
+        torch.testing.assert_close(selector_num / selector_den, selector_ce)
 
     def test_selector_objective_backpropagates_to_all_selector_factors(self):
         class Draft(nn.Module):
@@ -372,6 +474,8 @@ class CandidateSelectorTest(unittest.TestCase):
                 return logits.float()
 
         draft = Draft()
+        with torch.no_grad():
+            draft.candidate_selector.successor_codebook.normal_(std=0.2)
         model = OnlineDFlashModel(
             draft_model=draft,
             target_lm_head=nn.Identity(),
@@ -400,6 +504,46 @@ class CandidateSelectorTest(unittest.TestCase):
         ):
             self.assertIsNotNone(parameter.grad)
             self.assertGreater(parameter.grad.abs().sum().item(), 0.0)
+
+
+class DFlashSelectorScheduleTest(unittest.TestCase):
+    def test_warmup_then_linear_ramp_reaches_configured_alpha(self):
+        model = SimpleNamespace(
+            selector_loss_alpha=0.9,
+            selector_warmup_ratio=0.2,
+            selector_ramp_ratio=0.3,
+        )
+        strategy = DFlashTrainStrategy(model)
+
+        self.assertEqual(
+            strategy._selector_loss_alpha(StepContext(global_step=0, total_steps=10)),
+            0.0,
+        )
+        self.assertEqual(
+            strategy._selector_loss_alpha(StepContext(global_step=1, total_steps=10)),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            strategy._selector_loss_alpha(StepContext(global_step=2, total_steps=10)),
+            0.3,
+        )
+        self.assertAlmostEqual(
+            strategy._selector_loss_alpha(StepContext(global_step=3, total_steps=10)),
+            0.6,
+        )
+        self.assertAlmostEqual(
+            strategy._selector_loss_alpha(StepContext(global_step=4, total_steps=10)),
+            0.9,
+        )
+
+    def test_missing_schedule_context_preserves_configured_alpha(self):
+        model = SimpleNamespace(
+            selector_loss_alpha=0.75,
+            selector_warmup_ratio=0.2,
+            selector_ramp_ratio=0.3,
+        )
+
+        self.assertEqual(DFlashTrainStrategy(model)._selector_loss_alpha(None), 0.75)
 
 
 if __name__ == "__main__":

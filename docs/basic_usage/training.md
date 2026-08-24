@@ -185,22 +185,25 @@ the same selected hidden states with `--spec-capture-method dflash`.
 
 The DFlash 2 config additionally defines `conv_kernel_size` and
 `conv_group_size` for the local convolution, plus `selector_rank` and
-`selector_top_k` for candidate-path selection. During training, the ordinary
-DFlash cross-entropy remains active. The selector receives an additional
-teacher-forced cross-entropy. Inference always uses the target head's strict
-top-k. For training only, when the gold successor is outside that set, it
-replaces the weakest candidate and is compared with the strongest K-1 unary
-negatives. This keeps selector gradients useful before the draft head has good
-top-k coverage; `selector_coverage` still reports the unmodified inference
-candidate coverage. Set
-`training.dflash2_selector_loss_alpha` to scale this auxiliary objective.
+`selector_top_k` for candidate-path selection. The base draft head uses the
+configured CE/LK/TV objective. The selector always uses categorical CE over the
+target head's strict unary top-k, exactly as it will be used during inference.
+If the gold token is outside that candidate set, the token contributes no
+selector loss; `selector_coverage` reports how often the gold token is present.
+Both objectives receive the configured fixed-decay or D-PACE position weight,
+and their combined numerator is normalized by the sum of valid effective token
+weights rather than by batch or anchor count.
+
+Set `training.dflash2_selector_loss_alpha` to scale the selector objective.
+`training.dflash2_selector_warmup_ratio` keeps that scale at zero for an initial
+fraction of optimizer steps, and `training.dflash2_selector_ramp_ratio` then
+ramps it linearly to the configured value. Both schedule ratios default to
+zero. A newly initialized selector starts as a unary no-op, so enabling DFlash
+2 does not perturb the initial DFlash proposal scores.
 
 The exported computation and parameter names match the public SGLang DFlash 2
 contract, including optional `output_multiplier` and
-`final_logit_softcapping` transforms from `dflash_config`. Public DFlash 2
-sources do not publish their selector supervision or training schedule, so the
-gold-candidate insertion above is SpecForge's training objective rather than a
-claim that the private training recipe has been reproduced.
+`final_logit_softcapping` transforms from `dflash_config`.
 
 The checked-in Qwen3.6-27B recipe owns the full two-GPU local stack: GPU 0 runs
 the target capture server and GPU 1 runs the trainer.

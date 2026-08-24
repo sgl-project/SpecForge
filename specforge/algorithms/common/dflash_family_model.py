@@ -169,6 +169,8 @@ class OnlineDFlashModel(nn.Module):
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
         selector_loss_alpha: float = 1.0,
+        selector_warmup_ratio: float = 0.0,
+        selector_ramp_ratio: float = 0.0,
         lk_loss_type: Optional[str] = None,
         kl_scale: float = 1.0,
         kl_decay: float = 1.0,
@@ -184,6 +186,10 @@ class OnlineDFlashModel(nn.Module):
             raise ValueError("objective_chunk_blocks must be >= 0")
         if selector_loss_alpha < 0:
             raise ValueError("selector_loss_alpha must be >= 0")
+        if not 0.0 <= selector_warmup_ratio <= 1.0:
+            raise ValueError("selector_warmup_ratio must be in [0, 1]")
+        if not 0.0 <= selector_ramp_ratio <= 1.0:
+            raise ValueError("selector_ramp_ratio must be in [0, 1]")
         if lk_loss_type not in _VALID_LK_LOSS_TYPES:
             raise ValueError(
                 "lk_loss_type must be one of None, 'alpha', 'lambda', or 'tv'"
@@ -201,6 +207,8 @@ class OnlineDFlashModel(nn.Module):
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
         self.selector_loss_alpha = float(selector_loss_alpha)
+        self.selector_warmup_ratio = float(selector_warmup_ratio)
+        self.selector_ramp_ratio = float(selector_ramp_ratio)
         self.lk_loss_type = lk_loss_type
         self.kl_scale = float(kl_scale)
         self.kl_decay = float(kl_decay)
@@ -437,7 +445,7 @@ class OnlineDFlashModel(nn.Module):
                     self.loss_type,
                 )
             loss_weights = weight_mask * dpace_weights
-            loss_den = neg_log_q.new_zeros(())
+            loss_den = loss_weights.sum()
         else:  # defensive: __init__ validates the configured loss type.
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
@@ -455,11 +463,9 @@ class OnlineDFlashModel(nn.Module):
         selector_weight_den = ce_loss_num.new_zeros(())
         selector_covered_num = ce_loss_num.new_zeros(())
         if candidate_selector is not None and self.selector_loss_alpha > 0:
-            # Serving always re-ranks the strict top-k. During training, replace
-            # the weakest candidate with the gold token when it is missing. This
-            # gives the selector a useful gradient before the randomly initialized
-            # draft head has meaningful top-k coverage, while retaining the
-            # strongest K-1 inference negatives.
+            # Match serving exactly: train only against the strict unary top-k.
+            # Candidate misses are a backbone/recall failure, not a selector
+            # classification example, so they carry no selector gradient.
             selector_source_logits = objective_logits
             unary_logits, candidate_ids = selector_source_logits.topk(
                 candidate_selector.top_k,
@@ -467,28 +473,7 @@ class OnlineDFlashModel(nn.Module):
             )
             target_matches = candidate_ids.eq(target_ids.unsqueeze(-1))
             target_is_candidate = target_matches.any(dim=-1)
-            target_candidate_index = torch.where(
-                target_is_candidate,
-                target_matches.long().argmax(dim=-1),
-                torch.full_like(target_ids, candidate_selector.top_k - 1),
-            )
-            missing_target = ~target_is_candidate
-            candidate_ids = candidate_ids.clone()
-            unary_logits = unary_logits.clone()
-            candidate_ids[..., -1] = torch.where(
-                missing_target,
-                target_ids,
-                candidate_ids[..., -1],
-            )
-            gold_unary = selector_source_logits.gather(
-                -1,
-                target_ids.unsqueeze(-1),
-            ).squeeze(-1)
-            unary_logits[..., -1] = torch.where(
-                missing_target,
-                gold_unary,
-                unary_logits[..., -1],
-            )
+            target_candidate_index = target_matches.long().argmax(dim=-1)
             selector_logits = candidate_selector.score_candidates(
                 candidate_ids=candidate_ids,
                 unary_logits=unary_logits,
@@ -501,21 +486,21 @@ class OnlineDFlashModel(nn.Module):
                 reduction="none",
             ).reshape_as(target_ids)
             selector_probability = torch.exp(-selector_ce)
-            selector_ce_num = (selector_ce * loss_weights).sum()
-            if self.lk_loss_type in {"lambda", "tv"}:
-                selector_tv_num = ((1.0 - selector_probability) * loss_weights).sum()
+            selector_loss_weights = loss_weights * target_is_candidate.float()
+            selector_metric_mask = weight_mask * target_is_candidate.float()
+            selector_ce_num = (selector_ce * selector_loss_weights).sum()
             selector_probability_num = (
-                selector_probability.detach() * weight_mask
+                selector_probability.detach() * selector_metric_mask
             ).sum()
-            selector_weight_den = loss_weights.sum()
-            selector_covered_num = (weight_mask * target_is_candidate.float()).sum()
+            selector_weight_den = selector_loss_weights.sum()
+            selector_covered_num = selector_metric_mask.sum()
             with torch.no_grad():
                 selected_ids = candidate_ids.gather(
                     -1,
                     selector_logits.argmax(dim=-1, keepdim=True),
                 ).squeeze(-1)
                 selector_correct_num = (
-                    (selected_ids == target_ids).float() * loss_weights
+                    (selected_ids == target_ids).float() * selector_loss_weights
                 ).sum()
 
         with torch.no_grad():
@@ -565,6 +550,7 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        selector_loss_alpha: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -628,7 +614,7 @@ class OnlineDFlashModel(nn.Module):
             correct_num,
             accuracy_denom,
             selector_ce_num,
-            selector_tv_num,
+            _selector_tv_num,
             selector_probability_num,
             selector_correct_num,
             selector_weight_den,
@@ -648,23 +634,26 @@ class OnlineDFlashModel(nn.Module):
             target_probability_num,
             accuracy_denom,
         )
+        effective_selector_alpha = (
+            self.selector_loss_alpha
+            if selector_loss_alpha is None
+            else float(selector_loss_alpha)
+        )
+        if effective_selector_alpha < 0:
+            raise ValueError("selector_loss_alpha must be >= 0")
         selector_loss_num = loss_num.new_zeros(())
         has_selector_objective = (
             getattr(self.draft_model, "candidate_selector", None) is not None
             and self.selector_loss_alpha > 0
         )
         if has_selector_objective:
-            selector_loss_num = self._compose_token_objective(
-                selector_ce_num,
-                selector_tv_num,
-                selector_probability_num,
-                accuracy_denom,
-            )
-            loss_num = loss_num + self.selector_loss_alpha * selector_loss_num
+            # The selector is a categorical distribution over the serving
+            # top-k. Keep its proper, calibrated CE independent of the base
+            # model's optional LK/TV composition.
+            selector_loss_num = selector_ce_num
+            loss_num = loss_num + effective_selector_alpha * selector_loss_num
 
-        loss_denominator = (
-            loss_den if self.loss_type == "dflash" else loss_num.new_tensor(float(bsz))
-        )
+        loss_denominator = loss_den
         ratio_metrics = {
             "acc": (correct_num.detach(), accuracy_denom.detach()),
             "target_probability": (
@@ -677,7 +666,7 @@ class OnlineDFlashModel(nn.Module):
                 {
                     "selector_loss": (
                         selector_loss_num.detach(),
-                        loss_denominator.detach(),
+                        selector_weight_den.detach(),
                     ),
                     "selector_accuracy": (
                         selector_correct_num.detach(),
@@ -689,7 +678,7 @@ class OnlineDFlashModel(nn.Module):
                     ),
                     "selector_target_probability": (
                         selector_probability_num.detach(),
-                        accuracy_denom.detach(),
+                        selector_covered_num.detach(),
                     ),
                 }
             )
@@ -697,6 +686,8 @@ class OnlineDFlashModel(nn.Module):
             "accuracy_denom": accuracy_denom.detach(),
             "ratio_metrics": ratio_metrics,
         }
+        if has_selector_objective:
+            metrics["selector_loss_alpha"] = effective_selector_alpha
         loss = loss_num / loss_denominator
         metrics["loss_terms"] = (loss_num, loss_denominator.detach())
         accuracy = correct_num / accuracy_denom

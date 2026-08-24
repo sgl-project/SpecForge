@@ -14,10 +14,10 @@
     "selector_rank": 256,
     "selector_top_k": 16,
     "target_layer_ids": [
-      5,
-      19,
-      33,
-      47,
+      1,
+      16,
+      31,
+      46,
       61
     ]
   },
@@ -48,7 +48,7 @@
     "rope_theta": 10000000,
     "rope_type": "default"
   },
-  "sliding_window": 2048,
+  "sliding_window": 4096,
   "tie_word_embeddings": false,
   "transformers_version": "5.8.1",
   "use_cache": true,
