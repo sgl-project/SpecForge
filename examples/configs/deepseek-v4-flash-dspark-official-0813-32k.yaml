@@ -26,10 +26,10 @@ data:
   chat_template: deepseek-v4
   cache_dir: cache
   cache_key: dsv4-flash-0813-32k-full
-  build_dataset_num_proc: 64
-  # The one-time full-corpus tokenization (~418K rows) takes ~4-5 h at 64
-  # procs on a cold cache; it lands in the Arrow cache under cache_key and
-  # is instant afterwards.
+  build_dataset_num_proc: 176
+  # One-time full-corpus tokenization (~418K rows) on a cold cache; the
+  # trainer node has 192 cores, so use most of them. Lands in the Arrow
+  # cache under cache_key and is instant afterwards.
   dataloader_num_workers: 16
 
 training:
