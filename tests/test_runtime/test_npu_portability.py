@@ -145,6 +145,34 @@ class DistributedTeardownTest(unittest.TestCase):
             for name, value in saved.items():
                 setattr(sf_dist, name, value)
 
+    def test_failure_teardown_aborts_each_distinct_process_group(self):
+        names = NPUDistributedTest._GLOBAL_NAMES
+        saved = {name: getattr(sf_dist, name) for name in names}
+        subgroup = mock.Mock()
+        world = mock.Mock()
+        try:
+            for name in names:
+                setattr(sf_dist, name, None)
+            sf_dist._TP_GROUP = subgroup
+            sf_dist._DP_GROUP = subgroup
+            with (
+                mock.patch.object(sf_dist.dist, "is_initialized", return_value=True),
+                mock.patch.object(
+                    sf_dist.dist,
+                    "group",
+                    SimpleNamespace(WORLD=world),
+                ),
+                mock.patch.object(sf_dist.dist, "destroy_process_group") as destroy,
+            ):
+                sf_dist.destroy_distributed(abort=True)
+
+            subgroup.abort.assert_called_once_with()
+            world.abort.assert_called_once_with()
+            destroy.assert_not_called()
+        finally:
+            for name, value in saved.items():
+                setattr(sf_dist, name, value)
+
 
 class NPURNGTest(unittest.TestCase):
     def test_checkpoint_round_trip_uses_bound_npu_rng(self):
