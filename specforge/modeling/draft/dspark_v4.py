@@ -17,6 +17,7 @@ tilelang kernels in its ``kernel.py`` (``hc_split_sinkhorn``, ``act_quant``,
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -356,21 +357,103 @@ class DSparkV4Gate(nn.Module):
         return weights, indices
 
 
+class DSparkV4GroupedExperts(nn.Module):
+    """The routed experts as three stacked parameters ([E, out, in]).
+
+    Grouped-GEMM dispatch reads the stacked parameters directly (a per-call
+    ``torch.stack`` of 256 weights allocated a transient multi-GiB tensor
+    that stalled in cudaMalloc/allocator-GC under a nearly-full HBM), and
+    FSDP ``use_orig_params`` tracks 3 view tensors per stage instead of 3*E,
+    shrinking its per-microbatch unflat-view bookkeeping. State-dict hooks
+    preserve the official per-expert naming (``experts.{i}.w{1,2,3}.weight``)
+    so checkpoints, warm-start exports, and the bundler are unaffected.
+    """
+
+    _WEIGHT_NAMES = ("w1", "w2", "w3")
+
+    def __init__(
+        self, n_experts: int, dim: int, inter_dim: int, swiglu_limit: float
+    ):
+        super().__init__()
+        self.n_experts = n_experts
+        self.swiglu_limit = swiglu_limit
+        self.w1 = nn.Parameter(torch.empty(n_experts, inter_dim, dim))
+        self.w2 = nn.Parameter(torch.empty(n_experts, dim, inter_dim))
+        self.w3 = nn.Parameter(torch.empty(n_experts, inter_dim, dim))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.w1.device.type == "meta":
+            return
+        for name in self._WEIGHT_NAMES:
+            stacked = getattr(self, name)
+            for i in range(self.n_experts):
+                # per-expert slices match nn.Linear's default init exactly
+                nn.init.kaiming_uniform_(stacked[i], a=math.sqrt(5))
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        for name in self._WEIGHT_NAMES:
+            stacked = getattr(self, name)
+            for i in range(self.n_experts):
+                value = stacked[i]
+                destination[f"{prefix}{i}.{name}.weight"] = (
+                    value if keep_vars else value.detach()
+                )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        consumed = set()
+        for name in self._WEIGHT_NAMES:
+            stacked = getattr(self, name)
+            for i in range(self.n_experts):
+                key = f"{prefix}{i}.{name}.weight"
+                if key not in state_dict:
+                    missing_keys.append(key)
+                    continue
+                consumed.add(key)
+                value = state_dict[key]
+                if tuple(value.shape) != tuple(stacked[i].shape):
+                    error_msgs.append(
+                        f"size mismatch for {key}: checkpoint "
+                        f"{tuple(value.shape)}, model {tuple(stacked[i].shape)}"
+                    )
+                    continue
+                with torch.no_grad():
+                    stacked[i].copy_(value)
+        if strict:
+            for key in state_dict:
+                if key.startswith(prefix) and key not in consumed:
+                    unexpected_keys.append(key)
+
+
 class DSparkV4MoE(nn.Module):
     def __init__(self, config: DSparkV4DraftConfig):
         super().__init__()
         self.dim = config.hidden_size
         self.n_routed_experts = config.n_routed_experts
+        # Grouped dispatch runs the three expert linears as grouped GEMMs
+        # over the sorted segments (identical math, bf16-rounding-level
+        # output differences). Opt-in via dflash_config so the official
+        # H200 recipes keep their validated sorted-loop path.
+        self.grouped_dispatch = bool(
+            (getattr(config, "dflash_config", None) or {}).get(
+                "moe_grouped_dispatch", False
+            )
+        ) and hasattr(torch, "_grouped_mm")
         self.gate = DSparkV4Gate(config)
-        self.experts = nn.ModuleList(
-            [
-                DSparkV4Expert(
-                    config.hidden_size,
-                    config.moe_intermediate_size,
-                    config.swiglu_limit,
-                )
-                for _ in range(config.n_routed_experts)
-            ]
+        self.experts = DSparkV4GroupedExperts(
+            config.n_routed_experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
+            config.swiglu_limit,
         )
         if config.n_shared_experts != 1:
             raise ValueError("DSpark V4 requires exactly one shared expert")
@@ -407,9 +490,12 @@ class DSparkV4MoE(nn.Module):
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
-        counts = torch.bincount(
-            indices.flatten(), minlength=self.n_routed_experts
-        )
+        # scatter_add instead of bincount: CUDA bincount hides a device sync
+        # (~80ms of stream drain per call on the profiled B200 run).
+        flat_indices = indices.flatten()
+        counts = torch.zeros(
+            self.n_routed_experts, dtype=torch.long, device=flat_indices.device
+        ).scatter_add_(0, flat_indices, torch.ones_like(flat_indices))
         if self.training:
             # Overwrite (never accumulate): a checkpoint recompute re-runs
             # this forward and must leave identical state behind.
@@ -426,6 +512,30 @@ class DSparkV4MoE(nn.Module):
         x_sorted = x.index_select(0, token_of)
         w_sorted = weights.reshape(-1, 1).index_select(0, order).to(torch.float32)
 
+        e = self.experts
+        limit = e.swiglu_limit
+        if self.grouped_dispatch and x.is_cuda:
+            # Three grouped GEMMs over the stacked parameters; segment
+            # offsets stay on device, so no host sync in this path.
+            offs = counts.cumsum(0).to(torch.int32)
+            gate_h = torch._grouped_mm(
+                x_sorted, e.w1.transpose(-1, -2), offs=offs
+            ).float()
+            up = torch._grouped_mm(
+                x_sorted, e.w3.transpose(-1, -2), offs=offs
+            ).float()
+            if limit > 0:
+                up = torch.clamp(up, min=-limit, max=limit)
+                gate_h = torch.clamp(gate_h, max=limit)
+            h = w_sorted * (F.silu(gate_h) * up)
+            y_routed = torch._grouped_mm(
+                h.to(x.dtype), e.w2.transpose(-1, -2), offs=offs
+            )
+            y = torch.zeros_like(x, dtype=torch.float32)
+            y = y.index_add(0, token_of, y_routed.float())
+            y = y + self.shared_experts(x)
+            return y.to(x.dtype).view(shape)
+
         counts_list = counts.tolist()  # one host sync per MoE forward
 
         y_parts = []
@@ -434,11 +544,14 @@ class DSparkV4MoE(nn.Module):
             n = counts_list[i]
             if n == 0:
                 continue
-            y_parts.append(
-                self.experts[i](
-                    x_sorted[offset : offset + n], w_sorted[offset : offset + n]
-                )
-            )
+            seg = x_sorted[offset : offset + n]
+            gate_h = F.linear(seg, e.w1[i]).float()
+            up = F.linear(seg, e.w3[i]).float()
+            if limit > 0:
+                up = torch.clamp(up, min=-limit, max=limit)
+                gate_h = torch.clamp(gate_h, max=limit)
+            h = w_sorted[offset : offset + n] * (F.silu(gate_h) * up)
+            y_parts.append(F.linear(h.to(seg.dtype), e.w2[i]))
             offset += n
         y = torch.zeros_like(x, dtype=torch.float32)
         if y_parts:
@@ -596,6 +709,57 @@ def _rename_root_heads_on_load(
 class DSparkV4DraftModel(PreTrainedModel):
     config_class = DSparkV4DraftConfig
     _no_split_modules = ["DSparkV4Stage"]
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path,
+        *model_args,
+        config=None,
+        output_loading_info=False,
+        torch_dtype=None,
+        **kwargs,
+    ):
+        """Load via ``Module.load_state_dict`` instead of HF's per-key loader.
+
+        The checkpoint's per-expert names (``experts.{i}.w*.weight``) are
+        state-dict-hook aliases of the stacked expert parameters, not real
+        submodules, so transformers' key-path navigation cannot resolve
+        them. Checkpoints for this model are local export/bundle dirs.
+        """
+        import json as _json
+        import os as _os
+
+        from safetensors.torch import load_file as _load_safetensors
+
+        path = str(pretrained_model_name_or_path)
+        if config is None:
+            config = cls.config_class.from_pretrained(path)
+        model = cls(config)
+        if torch_dtype is not None and torch_dtype != "auto":
+            model = model.to(torch_dtype)
+
+        index_file = _os.path.join(path, "model.safetensors.index.json")
+        if _os.path.isfile(index_file):
+            with open(index_file) as stream:
+                shard_names = sorted(set(_json.load(stream)["weight_map"].values()))
+        elif _os.path.isfile(_os.path.join(path, "model.safetensors")):
+            shard_names = ["model.safetensors"]
+        else:
+            raise OSError(f"no model.safetensors[.index.json] under {path!r}")
+        state: Dict[str, torch.Tensor] = {}
+        for name in shard_names:
+            state.update(_load_safetensors(_os.path.join(path, name)))
+
+        result = model.load_state_dict(state, strict=False)
+        if output_loading_info:
+            return model, {
+                "missing_keys": list(result.missing_keys),
+                "unexpected_keys": list(result.unexpected_keys),
+                "mismatched_keys": [],
+                "error_msgs": [],
+            }
+        return model
 
     def __init__(self, config: DSparkV4DraftConfig) -> None:
         # The trainer stamps training.attention_backend (``native``) onto the

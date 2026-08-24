@@ -283,6 +283,58 @@ class TestDSparkV4Model:
             assert got is not None, name
             assert torch.allclose(got, expected, rtol=1e-5, atol=1e-7), name
 
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() and hasattr(torch, "_grouped_mm")),
+        reason="grouped MoE dispatch needs CUDA torch._grouped_mm",
+    )
+    def test_grouped_moe_dispatch_matches_sorted_loop(self):
+        from specforge.modeling.draft.dspark_v4 import DSparkV4MoE
+
+        # Enough experts vs tokens that some experts are guaranteed empty.
+        cfg = tiny_config(n_routed_experts=16, num_experts_per_tok=2)
+        torch.manual_seed(3)
+        moe = DSparkV4MoE(cfg)
+        for p in moe.parameters():
+            torch.nn.init.normal_(p, std=0.05)
+        moe = moe.to("cuda", torch.bfloat16).train()
+        moe.bias_update_rate = 0.0
+        x = (torch.randn(6, cfg.hidden_size, device="cuda") * 0.5).to(
+            torch.bfloat16
+        )
+
+        results = {}
+        for grouped in (False, True):
+            moe.grouped_dispatch = grouped
+            moe.zero_grad(set_to_none=True)
+            xg = x.clone().requires_grad_(True)
+            y = moe(xg)
+            y.float().square().sum().backward()
+            results[grouped] = (
+                y.detach().clone(),
+                xg.grad.clone(),
+                {
+                    n: p.grad.clone()
+                    for n, p in moe.named_parameters()
+                    if p.grad is not None
+                },
+            )
+
+        y0, dx0, g0 = results[False]
+        y1, dx1, g1 = results[True]
+        # Same math batched into grouped GEMMs: bf16-rounding-level equal.
+        assert torch.allclose(y0.float(), y1.float(), rtol=2e-2, atol=2e-2)
+        assert torch.allclose(dx0.float(), dx1.float(), rtol=2e-2, atol=2e-2)
+        # The loop leaves inactive experts' grads None; grouped GEMM emits
+        # explicit zeros for them (an FSDP-friendly superset).
+        assert set(g0) <= set(g1)
+        for name in g1:
+            if name in g0:
+                assert torch.allclose(
+                    g0[name].float(), g1[name].float(), rtol=2e-2, atol=2e-2
+                ), name
+            else:
+                assert torch.count_nonzero(g1[name]) == 0, name
+
     def test_gate_bias_stays_fp32_and_updates(self):
         model = build_model().to(torch.bfloat16)
         for stage in model.mtp:

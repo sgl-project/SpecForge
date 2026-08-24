@@ -260,10 +260,11 @@ class OnlineDFlashModel(nn.Module):
         anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
 
         flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
-        noise_ids[flat_batch_idx, block_starts] = torch.where(
-            block_keep_mask,
-            anchor_tokens,
-            torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
+        # masked_fill with a python scalar: the previous torch.tensor(...)
+        # was a pageable H2D copy per microbatch, each draining the whole
+        # queued GPU stream (~1s/step on the profiled B200 run).
+        noise_ids[flat_batch_idx, block_starts] = anchor_tokens.masked_fill(
+            ~block_keep_mask, self.mask_token_id
         )
 
         return self.embed_tokens(noise_ids)
@@ -1103,8 +1104,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
             world_size = dist.get_world_size()
             if world_size > 1:
                 dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
-        if float(global_loss_den) <= 0:
-            raise ValueError("DSpark objective has no supervised target tokens")
+        # Device-side assert: a host-side float() here is a full stream drain
+        # per microbatch right after a collective — it serialized all ranks
+        # (~1s/step each on the profiled B200 run).
+        torch._assert_async(
+            (global_loss_den > 0).any(),
+            "DSpark objective has no supervised target tokens",
+        )
         loss = (
             world_size
             * (

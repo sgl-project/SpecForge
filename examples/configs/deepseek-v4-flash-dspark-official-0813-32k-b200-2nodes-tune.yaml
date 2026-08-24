@@ -1,0 +1,130 @@
+model:
+  target_model_path: deepseek-ai/DeepSeek-V4-Flash-0731
+  target_backend: sglang
+  # OFFICIAL drafter architecture (3 DeepSeek-V4 MoE+mHC stages, block 5,
+  # capture layers 40 41 42) — see deepseek-v4-flash-dspark-official-2node-h200.yaml.
+  draft_model_config: configs/deepseek-v4-flash-dspark-official-b200.json
+  # CONTINUE TRAINING THE OFFICIAL DRAFTER on prod traffic: weights-only warm
+  # start from the dequantized official DSpark head, regenerated on this box
+  # via scripts/init_dspark_v4_from_target.py --from-official (shared FS so
+  # the trainer node can read it).
+  draft_checkpoint_path: /personal/SpecForge-2Nodes/exports/dspark-v4-0731-drafter-hf
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_mem_fraction_static: 0.85
+  sglang_context_length: 33280
+  sglang_max_running_requests: 8
+  # B200 (SM100): MXFP4 Marlin requires SM90/SM120, so the H200 recipe's
+  # marlin path is unavailable; flashinfer_mxfp4 dispatches to the native
+  # Blackwell trtllm_fp4_block_scale_moe kernels (validated by greedy smoke).
+  sglang_moe_runner_backend: flashinfer_mxfp4
+
+data:
+  # Recorded DSV4-Flash production traffic (2026-08-13) at <=32K, local copy
+  # on the shared /personal FS.
+  train_data_path: ./cache/dataset/dsv4_flash_0813_32k_train.jsonl
+  is_preformatted: true
+  max_length: 32768
+  chat_template: deepseek-v4
+  cache_dir: cache
+  # Reuses the tokenization cache already built on this box (64 shards,
+  # ~146 GiB) — keep this key unchanged.
+  cache_key: dsv4-flash-0813-32k-full
+  build_dataset_num_proc: 176
+  dataloader_num_workers: 6
+
+training:
+  strategy: dspark
+  num_epochs: 2
+  # Bounded tuning run: enough steps to reach steady state and measure.
+  max_steps: 24
+  # 8 ranks x 16 microbatches -> 128 sequences per optimizer step. Features
+  # run ~32KB/token with the 3-layer official capture (~0.94 GiB per ~30K
+  # median sample), so a 128-sample quantum is ~120 GiB.
+  batch_size: 1
+  accumulation_steps: 16
+  # Continuation of a converged drafter: far below the from-scratch 6e-4.
+  learning_rate: 0.0001
+  lr_scheduler: constant
+  # Short warmup on the data-distribution switch.
+  warmup_ratio: 0.005
+  max_grad_norm: 1
+  fsdp_sharding: FULL_SHARD
+  fsdp_no_sync_grad_accum: false
+  attention_backend: native
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 10000
+  log_interval: 5
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-deepseek-v4-flash
+  wandb_name: deepseek-v4-flash-dspark-official-0813-32k-b200-2nodes-tune
+  wandb_offline: false
+  wandb_dir: outputs/deepseek-v4-flash-dspark-official-0813-32k-b200-2nodes-tune/wandb
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 8
+  # One optimizer quantum is 128 samples (~120 GiB at the ~30K median); two
+  # quanta in flight, low watermark holds one full quantum.
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 128
+  # Lease overshoot can exceed the high watermark by up to ~8 leases x 8
+  # servers x ~1 GiB; keep high watermark + overshoot under the hard cap,
+  # and the hard cap under the 4 x 128 GiB sink segments.
+  resident_high_watermark_bytes: 257698037760     # 240 GiB
+  resident_low_watermark_bytes: 128849018880      # 120 GiB (>= one quantum)
+  feature_store_max_resident_bytes: 429496729600  # 400 GiB
+
+profiling:
+  enabled: true
+  start_step: 6
+  num_steps: 1
+
+run_id: deepseek-v4-flash-dspark-official-0813-32k-b200-2nodes-tune
+output_dir: outputs/deepseek-v4-flash-dspark-official-0813-32k-b200-2nodes-tune
+
+# Two-node B200 split (verda-b200-fin-03):
+#   10.13.114.101: mooncake_master + 4x TP2 capture servers at 33280 context
+#     (launch_dsv4_b200_2node.sh servers32k).
+#   10.13.114.105: this config, 8-rank FSDP consumer
+#     (launch_dsv4_b200_2node.sh train32k).
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/deepseek-v4-flash-dspark-official-0813-32k-b200-2nodes-tune/control
+    consumer_state_dir: outputs/deepseek-v4-flash-dspark-official-0813-32k-b200-2nodes-tune/consumer-state
+    backend: mooncake
+    store_id: deepseek-v4-flash-dspark-official-0813-32k-b200-2nodes-tune
+    server_urls:
+      - http://10.13.114.101:30000
+      - http://10.13.114.101:30001
+      - http://10.13.114.101:30002
+      - http://10.13.114.101:30003
+    mooncake_metadata_server: http://10.13.114.101:35880/metadata
+    mooncake_master_server_addr: 10.13.114.101:35551
+    mooncake_local_hostname: 10.13.114.105
+    # Measured on this pair: single TCP stream 3.3 GB/s, 4 streams 11.4 GB/s
+    # aggregate — TCP with multiple fetch clients is sufficient.
+    mooncake_protocol: tcp
+    # A 32K sample is ~1 GiB transferred as one object; the client buffer
+    # must hold it.
+    client_buffer_size: 2147483648
+    # Tokenization cache is prebuilt, but keep generous timeouts for restarts
+    # on a cold page cache.
+    idle_timeout_s: 21600
+    peer_wait_timeout_s: 21600
