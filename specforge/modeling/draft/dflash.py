@@ -96,8 +96,17 @@ def _prepare_dflash_eager_mask(
     return additive_mask, valid_queries
 
 
-class Qwen3DFlashAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+class Qwen3DFlashAttentionBase(nn.Module):
+    """Shared scaffold for the DFlash-family attention modes.
+
+    Subclasses own only the projection parameterization: ``_init_projections``
+    builds the weights and must define ``scaling``, ``num_key_value_groups``,
+    and ``o_proj`` (the shared forward relies on them); ``_compute_qkv``
+    returns rotated ``(q, k, v)`` in ``(batch, heads, seq, dim)`` layout with
+    keys ordered context-then-draft. Everything the modes must agree on —
+    KV-cache updates, backend dispatch, fully-masked-query zeroing, and the
+    output projection — lives here so it is maintained in exactly one place.
+    """
 
     def __init__(
         self,
@@ -108,46 +117,33 @@ class Qwen3DFlashAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
-        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         if config._attn_implementation == "flex_attention":
             assert (
                 config.attention_dropout == 0.0
             ), "DFlash FlexAttention requires attention_dropout=0.0"
         self.is_causal = False
-        self.q_proj = nn.Linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
-        self.q_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
-        self.k_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
         self.sliding_window = (
             config.sliding_window
             if config.layer_types[layer_idx] == SLIDING_ATTENTION
             else None
         )
+        self._init_projections(config, kernels)
+        for attribute in ("scaling", "num_key_value_groups", "o_proj"):
+            assert hasattr(
+                self, attribute
+            ), f"_init_projections must define {attribute}"
+
+    def _init_projections(self, config: Qwen3Config, kernels: DFlashKernels) -> None:
+        raise NotImplementedError
+
+    def _compute_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        target_hidden: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
 
     def forward(
         self,
@@ -160,25 +156,9 @@ class Qwen3DFlashAttention(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
-        ctx_len = target_hidden.shape[1]
-        q = self.q_proj(hidden_states)
-        q = q.view(bsz, q_len, -1, self.head_dim)
-        q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(hidden_states)
-        k = torch.cat([k_ctx, k_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        v = torch.cat([v_ctx, v_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q, k, v = self._compute_qkv(hidden_states, target_hidden, position_embeddings)
         if past_key_values is not None:
+            cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         valid_queries = None
@@ -228,6 +208,68 @@ class Qwen3DFlashAttention(nn.Module):
                 0,
             )
         return attn_output, attn_weights
+
+
+class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
+    """GQA/MHA projections over the family's context-then-draft KV layout."""
+
+    def _init_projections(self, config: Qwen3Config, kernels: DFlashKernels) -> None:
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
+        self.scaling = self.head_dim**-0.5
+        self.q_proj = nn.Linear(
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
+        self.q_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
+
+    def _compute_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        target_hidden: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, q_len = hidden_states.shape[:-1]
+        ctx_len = target_hidden.shape[1]
+        q = self.q_proj(hidden_states)
+        q = q.view(bsz, q_len, -1, self.head_dim)
+        q = self.q_norm(q).transpose(1, 2)
+        k_ctx = self.k_proj(target_hidden)
+        k_noise = self.k_proj(hidden_states)
+        v_ctx = self.v_proj(target_hidden)
+        v_noise = self.v_proj(hidden_states)
+        k = torch.cat([k_ctx, k_noise], dim=1).view(
+            bsz, ctx_len + q_len, -1, self.head_dim
+        )
+        v = torch.cat([v_ctx, v_noise], dim=1).view(
+            bsz, ctx_len + q_len, -1, self.head_dim
+        )
+        k = self.k_norm(k).transpose(1, 2)
+        v = v.transpose(1, 2)
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        return q, k, v
 
 
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
