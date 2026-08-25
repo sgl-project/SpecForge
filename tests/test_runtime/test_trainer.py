@@ -213,7 +213,11 @@ class TestTrainerCore(unittest.TestCase):
     def test_global_loss_normalization_compensates_rank_averaging(self):
         strategy = FakeStrategy()
         backend = FakeBackend(strategy.model)
-        backend.parallel_config = mock.Mock(fsdp_process_group="dp")
+        # reduction_process_group=None models every non-HSDP ParallelConfig,
+        # whose reductions fall back to the FSDP group.
+        backend.parallel_config = mock.Mock(
+            fsdp_process_group="dp", reduction_process_group=None
+        )
         core = TrainerCore(strategy, backend)
         strategy.model.w.grad = torch.tensor([9.0])
 

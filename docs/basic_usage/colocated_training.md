@@ -74,6 +74,44 @@ and releases the other slices' allocation before draft training begins.
 `training.tp_size * training.batch_size` requests of that length per island.
 Explicit values override the defaults; the schema rejects values below them.
 
+## HSDP across islands
+
+For multi-node targets, `training.fsdp_sharding: HYBRID_SHARD` uses the target
+TP group as the FSDP shard group and the target-DP group for replication:
+
+| Target shape | Suggested topology | Draft sharding |
+| --- | --- | --- |
+| Qwen3-8B on 8 H200 | 8 islands of TP1 | `SHARD_GRAD_OP` across all 8 ranks |
+| One-node target | one TP island per node | `HYBRID_SHARD` |
+| K3-class target on 4x8 B300 | 4 islands of TP8 | `HYBRID_SHARD` |
+
+For a TP8 target on four eight-GPU nodes:
+
+```yaml
+training:
+  batch_size: 1
+  tp_size: 8
+  fsdp_sharding: HYBRID_SHARD
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 4
+    nproc_per_node: 8
+    master_addr: trainer-0
+```
+
+The complete K3 starting recipe is
+[`kimi-k3-dspark-colocated.yaml`](../../examples/configs/online/colocated/kimi-k3-dspark-colocated.yaml).
+
+HSDP shards the draft inside each island and replicates corresponding shards
+across islands, so parameter all-gathers stay inside the island and only replica
+synchronization crosses islands. That traffic is node-local only when an island
+does not span nodes, so `training.tp_size` must divide
+`deployment.trainer.nproc_per_node` (validated at config load). Loss and metric
+reductions remain WORLD-wide, and the gradient norm counts each replicated shard
+once.
+
 Prompt-cache preparation is coordinated: rank zero builds the tokenized Arrow
 cache first (node-local caches are then built once per remaining node) and all
 other ranks take the cache-hit path. The coordination collective runs inside

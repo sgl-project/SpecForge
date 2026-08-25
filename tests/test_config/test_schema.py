@@ -135,6 +135,32 @@ class ConfigSchemaTest(unittest.TestCase):
             with self.subTest(modality=modality), self.assertRaises(ValidationError):
                 Config.model_validate(invalid)
 
+    def test_hybrid_shard_requires_multiple_colocated_target_islands(self):
+        payload = _online_payload("dspark")
+        payload["deployment"] = {
+            "mode": "local_colocated",
+            "trainer": {
+                "nnodes": 2,
+                "nproc_per_node": 8,
+                "master_addr": "trainer-0",
+            },
+        }
+        payload["training"].update({"tp_size": 8, "fsdp_sharding": "HYBRID_SHARD"})
+
+        config = Config.model_validate(payload)
+
+        self.assertEqual(config.training.fsdp_sharding, "HYBRID_SHARD")
+        config.validate_world_size(16)
+
+        # A TP8 island spanning two 4-GPU nodes defeats node-local sharding.
+        payload["deployment"]["trainer"].update({"nnodes": 4, "nproc_per_node": 4})
+        with self.assertRaisesRegex(ValidationError, "divide deployment.trainer"):
+            Config.model_validate(payload)
+
+        payload["deployment"]["trainer"] = {"nnodes": 1, "nproc_per_node": 8}
+        with self.assertRaisesRegex(ValidationError, "two colocated target islands"):
+            Config.model_validate(payload)
+
     def test_target_output_sharding_is_unavailable_with_server_capture(self):
         payload = _online_payload()
         payload["model"]["shard_target_output"] = True
