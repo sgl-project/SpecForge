@@ -5,51 +5,37 @@ its model and data paths, and launch it directly; multi-process topology is
 already recorded in the YAML:
 
 ```bash
-specforge train --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
-The representative configs are below. The complete recipe catalog, including
-NPU, offline, and managed/external-service variants, is in
-[`examples/configs/README.md`](./configs/README.md).
+The directory path identifies feature mode, topology, and—in the online
+disaggregated case—service ownership. Start with one of these categories, then
+choose the model and strategy inside it:
 
-| Config | Mode | Strategy |
+| Category | Use it when | Representative config |
 | --- | --- | --- |
-| `examples/configs/qwen3-8b-eagle3-disaggregated.yaml` | Disaggregated SGLang server capture | EAGLE3 |
-| `examples/configs/qwen3-8b-eagle3-offline.yaml` | Precomputed features | EAGLE3 |
-| `examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
-| `examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml` | Disaggregated precomputed features | EAGLE3 |
-| `examples/configs/qwen3-30b-a3b-eagle3.1-online.yaml` | Disaggregated SGLang server capture with normalized EAGLE3 inputs | EAGLE3.1 |
-| `examples/configs/qwen3-8b-dflash-online.yaml` | Disaggregated SGLang server capture | DFlash |
-| `examples/configs/qwen3-8b-dflash-offline.yaml` | Precomputed features | DFlash |
-| `examples/configs/qwen3-8b-dpace-online.yaml` | Online D-PACE objective | DFlash |
-| `examples/configs/qwen3-8b-dflash-disaggregated.yaml` | Disaggregated server capture | DFlash |
-| `examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | DFlash |
-| `examples/configs/qwen3-8b-domino-online.yaml` | Disaggregated SGLang server capture | Domino |
-| `examples/configs/qwen3-8b-domino-offline.yaml` | Precomputed features | Domino |
-| `examples/configs/qwen3-8b-domino-disaggregated.yaml` | Disaggregated server capture | Domino |
-| `examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml` | Managed local one capture server + DP7 | Domino |
-| `examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | Domino |
-| `examples/configs/qwen3-8b-peagle-disaggregated.yaml` | Disaggregated SGLang server capture | P-EAGLE |
-| `examples/configs/qwen3-4b-dspark-disaggregated.yaml` | Disaggregated server capture | DSpark |
-| `examples/configs/kimi-k3-dspark-disaggregated.yaml` | External-service TP8 capture + four-rank trainer | DSpark |
-| `examples/configs/qwen3-4b-dspark-offline.yaml` | Precomputed features | DSpark |
-| `examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml` | Managed local Mooncake + two capture servers | DFlash |
-| `examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml` | Managed local one capture server + DP2 | DFlash |
-| `examples/configs/qwen3.5-4b-dflash-online-npu.yaml` | Disaggregated NPU SGLang capture | DFlash |
-| `examples/configs/qwen3.5-4b-dflash-disaggregated-npu.yaml` | Managed local NPU full stack | DFlash |
-| `examples/configs/qwen3.5-4b-domino-online-npu.yaml` | Disaggregated NPU SGLang capture | Domino |
+| Offline colocated | Feature checkpoints already exist and the trainer can read them directly | [`offline/colocated/qwen3-8b-eagle3-offline.yaml`](./configs/offline/colocated/qwen3-8b-eagle3-offline.yaml) |
+| Offline disaggregated | A producer must ingest existing features for a separate trainer pool | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](./configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
+| Online disaggregated, external | Mooncake and patched SGLang are started by the user or scheduler | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](./configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
+| Online disaggregated, managed-local | One command should own a single-node Mooncake/SGLang/trainer stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](./configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+
+The complete model, strategy, CUDA/ROCm/Ascend, and resource-layout catalog is
+documented in [`examples/configs/README.md`](./configs/README.md). The
+`online/colocated` directory is reserved for a topology that the current
+runtime does not implement.
 
 Online configs point `data.train_data_path` at raw conversation data. Offline
 configs expect strategy-specific feature checkpoints in
 `data.hidden_states_path`.
-Local offline EAGLE3 derives and caches its vocabulary map when no path is set;
+Offline colocated EAGLE3 derives and caches its vocabulary map when no path is set;
 disaggregated EAGLE3 requires one explicit shared `model.vocab_mapping_path`.
 
-Online training always uses an external or managed SGLang capture server and
-the disaggregated producer/consumer data plane. Colocated online target loading
-and the HF/custom online backends are intentionally unsupported. Online capture
-is text-only: VLM training, including Qwen2.5-VL, is not supported. Online
-evaluation is also not supported.
+Online training always uses the disaggregated producer/consumer data plane and
+an external or managed-local SGLang capture server. Here `external` means that
+SpecForge does not own the service lifecycle; the server may still be on the
+same host. Colocated online target loading and the HF/custom online backends are
+intentionally unsupported. Online capture is text-only: VLM training,
+including Qwen2.5-VL, is not supported. Online evaluation is also unsupported.
 
 The same CLI owns offline DP, EAGLE3 offline USP, and managed capture-server
 topology. Trainer `tp_size` remains 1; target TP belongs to SGLang capture
@@ -70,7 +56,7 @@ projection for offline text EAGLE3, and W&B, TensorBoard, SwanLab, or MLflow
 tracking. See the [training guide](../docs/basic_usage/training.md) for the full
 capability matrix, ROCm installation, and Ascend NPU/HCCL launch example.
 
-Local offline and disaggregated offline resume are supported.
+Offline colocated and offline disaggregated resume are supported.
 Disaggregated online resume is consumer-only and requires the retained SQLite
 ledger, channel/inboxes, Mooncake data, and an exactly matching checkpoint; the
 producer is never resumed.

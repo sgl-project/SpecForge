@@ -114,7 +114,9 @@ def _draft_config_from_dict(payload: Dict[str, Any]) -> "PretrainedConfig":
     payload["architectures"] = [architecture]
     payload["tie_word_embeddings"] = False
     payload.setdefault("use_cache", True)
-    if payload.get("draft_vocab_size") is None:
+    if "draft_vocab_size" in payload and payload["draft_vocab_size"] is None:
+        raise ValueError("draft config draft_vocab_size cannot be null")
+    if "draft_vocab_size" not in payload:
         payload["draft_vocab_size"] = payload.get("vocab_size")
     return DRAFT_REGISTRY[architecture].config_class.from_dict(payload)
 

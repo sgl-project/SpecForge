@@ -1,10 +1,10 @@
 # One-sample overfit validation
 
-This guide contains only two stages:
+This guide contains three stages:
 
 1. regenerate a small subset of datasets by target model;
-1. overfit one sample on Qwen3.6-27B Dspark training with `specforge train`;
-2. export the checkpoint, serve it with SGLang, and verify that one complete
+2. overfit one sample on Qwen3.6-27B Dspark training with `specforge train`;
+3. export the checkpoint, serve it with SGLang, and verify that one complete
    16-token draft block is accepted.
 
 The commands below use GPU 0 for target capture and GPU 1 for training and
@@ -28,7 +28,7 @@ gate_report_tcp_ports python 127.0.0.1 \
 
 The check always returns to the shell. If one or more ports are occupied, it
 prints every conflict without stopping or killing the owning processes.
-s
+
 ## Prepare one sample
 ### Stage 1: Regen the datasets
 Launch the sglang server:
@@ -66,7 +66,7 @@ export MODEL_NAME=Qwen3.6-27B
 export SPEC_METHOD=Dspark
 export DRAFT_MODEL_CONFIG=configs/qwen3.6-27b-dspark.json
 export MODEL=Qwen/Qwen3.6-27B
-export TRAINING_CONFIG=examples/configs/qwen3.6-27b-dspark-disaggregated.yaml
+export TRAINING_CONFIG=examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dspark-disaggregated.yaml
 
 specforge train \
   --config ${TRAINING_CONFIG} \
@@ -117,7 +117,7 @@ The `control` and `consumer-state` directories must be fresh. To repeat the
 experiment, use a new suffix consistently in `run_id`, `output_dir`,
 `control_dir`, `consumer_state_dir`, and the sample paths.
 
-### Stage 2: serve with SGLang and check accept length
+### Stage 3: serve with SGLang and check accept length
 
 First export the trained draft:
 
@@ -198,5 +198,5 @@ The validation passes only when the result contains:
 ```
 
 `spec_accept_length >= 16` and `target_prefix_match_tokens >= 16` mean that the
-complete DFlash block was accepted and agrees with the target continuation.
+complete DSpark block was accepted and agrees with the target continuation.
 Stop the SGLang server with `Ctrl-C` after validation.

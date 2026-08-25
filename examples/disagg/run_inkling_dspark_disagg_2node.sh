@@ -12,7 +12,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-export CONFIG="${CONFIG:-$ROOT_DIR/examples/configs/inkling-dspark-disaggregated.yaml}"
+export CONFIG="${CONFIG:-$ROOT_DIR/examples/configs/online/disaggregated/external/inkling-dspark-disaggregated.yaml}"
 export RUN_LABEL="${RUN_LABEL:-inkling-dspark-2node}"
 export TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-thinkingmachines/Inkling}"
 

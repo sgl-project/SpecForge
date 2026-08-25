@@ -13,7 +13,7 @@ For one-off changes, use dotted overrides rather than adding another launcher:
 
 ```bash
 specforge train \
-  --config examples/configs/qwen3-8b-eagle3-disaggregated.yaml \
+  --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml \
   model.target_model_path=/models/my-target \
   data.train_data_path=/datasets/my-training-data.jsonl \
   training.learning_rate=5e-5
