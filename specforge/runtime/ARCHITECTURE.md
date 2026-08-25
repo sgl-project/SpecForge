@@ -2,10 +2,11 @@
 
 SpecForge has one public training entry point, `specforge train`. A typed run
 configuration selects an algorithm and a topology; it does not select a second
-trainer. The launch layer exposes exactly four topology builders:
+trainer. The launch layer exposes exactly five topology builders:
 
 - `build_offline_runtime`
 - `build_disagg_offline_runtime`
+- `build_colocated_online_runtime`
 - `build_disagg_online_producer`
 - `build_disagg_online_consumer`
 
@@ -19,7 +20,8 @@ the reference source and feature-store backend change.
 | --- | --- | --- | --- | --- |
 | Colocated offline | Precomputed feature files | Fixed `SampleRef` list | `LocalFeatureStore` reads `file://` refs | Re-iterable; epochs and checkpoint resume are supported |
 | Disaggregated offline | `CONFIG=path/to/offline-disagg.yaml run_offline.sh --role producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
-| Online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
+| Colocated online | In-process SGLang capture on trainer demand | Bounded `LocalRolloutStream` | Rank-private `LocalFeatureStore` | Consume once; deterministic prompt planning supports epochs and resume |
+| Disaggregated online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
 
 `training.num_epochs` on an online run controls how many prompt passes the
 producer creates. Each pass receives new task and sample ids. The consumer

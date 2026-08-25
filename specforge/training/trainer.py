@@ -112,6 +112,7 @@ class Trainer:
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
         dataloader_num_workers: int = 0,
+        clone_on_fetch: bool = True,
         profiling_options=None,
         fit_context=None,
         on_fit_success: Optional[Callable[[int], None]] = None,
@@ -154,6 +155,7 @@ class Trainer:
             strategy=algorithm_name,
             ack=not defer_queue_ack,
             num_workers=dataloader_num_workers,
+            clone_on_fetch=clone_on_fetch,
             # Pin in the existing loader workers so Domino's non-blocking H2D
             # copies do not add pinning work to the training thread.
             pin_memory=dataloader_num_workers > 0 and torch.cuda.is_available(),
@@ -474,6 +476,7 @@ class Trainer:
             start_samples=resume["epoch_samples"] if resume else 0,
             data_prepositioned=data_prepositioned,
             profiling_options=profiling_options,
+            runtime_metrics_provider=getattr(fit_context, "perf_metrics", None),
         )
         if resume is not None:
             # The loaded checkpoint already represents this durable step. If a

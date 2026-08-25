@@ -34,12 +34,18 @@ flowchart TD
     IN --> QN[rank N StreamingRefQueue]
   end
 
+  subgraph CON[online colocated]
+    LSG[SGLang target shard] --> LSTORE[rank-private LocalFeatureStore]
+    LRS[LocalRolloutStream] --> LSTORE
+  end
+
   OFF[local offline file refs] --> DL[FeatureDataLoader]
   MAN --> DL
   Q0 --> DL
   QN --> DL
   DSTORE -.-> DL
   MC -.-> DL
+  LSTORE --> DL
   DL --> TB[TrainBatch]
 ```
 
@@ -54,8 +60,8 @@ directly.
 
 [`feature_store.py`](feature_store.py) defines storage lifecycle operations:
 `put`, `get`, `release`, `abort`, and `gc`. `LocalFeatureStore` supports
-`file://` samples for colocated offline training. Its in-memory mode remains a
-useful test utility but is not a canonical online topology.
+`file://` samples for colocated offline training. Its in-memory mode is the
+canonical tensor path for bounded colocated online rollout.
 
 `get` returns tensors plus a lease handle. The loader clones when required and
 then releases the handle. Offline file refs remain available for later epochs.
@@ -136,7 +142,12 @@ control-plane terminal-drop state is required before that can be supported.
 [`feature_dataloader.py`](feature_dataloader.py) has two input modes:
 
 - `refs`: a fixed, re-iterable offline list;
-- `queue`: a rank's consume-once online `StreamingRefQueue`.
+- `queue`: a rank's consume-once online queue implementing
+  `get`/`ack`/`fail`/`depth`/`in_flight` — `StreamingRefQueue` for
+  disaggregated runs, `LocalRolloutStream` for colocated runs. A queue whose
+  `get` performs device work on the calling thread sets
+  `loader_prefetch_safe = False`; the loader then stays synchronous regardless
+  of `dataloader_num_workers` / `LOADER_PREFETCH`.
 
 For every ref it performs `store.get -> clone if needed -> store.release`, then
 applies the injected per-sample transform and collator. The loader contains no

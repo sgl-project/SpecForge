@@ -338,6 +338,11 @@ class FeatureDataLoader:
         # inline. Ack still happens on the consuming thread AFTER the trainer
         # has taken the batch (same in-flight semantics as the sync path).
         depth = self.num_workers or int(os.environ.get("LOADER_PREFETCH", "0"))
+        if depth > 0 and not getattr(self.queue, "loader_prefetch_safe", True):
+            # A queue that produces its data on the calling thread (see the
+            # queue contract in DESIGN.md) cannot be driven from a prefetch
+            # thread without racing its device work against training.
+            depth = 0
         if depth > 0:
             yield from self._iter_queue_prefetch(depth)
             return
@@ -354,6 +359,9 @@ class FeatureDataLoader:
                 self.queue.fail(refs, reason=f"materialize:{exc}", retryable=False)
                 raise
             yield batch
+            # Drop this frame's reference before queue.get() may produce the
+            # next batch on demand, so two batches are never resident here.
+            del batch
             if self.ack:
                 self.queue.ack(refs)
 
