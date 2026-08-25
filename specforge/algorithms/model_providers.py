@@ -479,6 +479,7 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
     from specforge.modeling.draft.dflash import (
         build_target_layer_ids,
         resolve_dflash_attention_layout,
+        validate_dflash_attention_config,
     )
 
     requested_layers = cfg.model.draft_num_hidden_layers
@@ -502,6 +503,7 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
         }
 
     resolve_dflash_attention_layout(draft_config)
+    validate_dflash_attention_config(draft_config)
 
 
 __all__ = [
