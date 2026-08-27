@@ -25,7 +25,6 @@ except ImportError:
 if hasattr(torch, "npu") and torch.npu.is_available():
     FLEX_ATTENTION_AVAILABLE = False
 
-
 _VALID_LOSS_TYPES = {
     "dflash",
     "dpace",
@@ -363,9 +362,20 @@ class OnlineDFlashModel(nn.Module):
             # DFlash's dynamic short-query batches are training/prefill shaped,
             # not autoregressive decoding.  AUTO may route q_len < 128 to the
             # more restrictive flex-decoding kernel, whose config set can be
-            # empty for DFlash's sparse BlockMask.  Keep the general Triton
+            # empty for DFlash's sparse BlockMask.  Force the general Triton
             # Flex Attention kernel for every DFlash-family batch.
-            draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
+            #
+            # The "BACKEND" kernel_option only exists on torch >= 2.11, where
+            # the inductor lowering sanitizes it out of the generated Triton
+            # constexprs.  On older builds (including current torch ROCm wheels)
+            # the string leaks into the kernel as a bare identifier and fails to
+            # compile (NameError: 'TRITON' is not defined), so we fall back to
+            # FORCE_USE_FLEX_ATTENTION, which selects the same kernel and has
+            # been supported since torch 2.5.
+            if torch.__version__ >= "2.11":
+                draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
+            else:
+                draft_kwargs["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
