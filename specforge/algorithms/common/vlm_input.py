@@ -16,7 +16,7 @@ Owns the three modality seams for ``modality="multimodal"``:
 - ``prepare_prompts``: ShareGPT-style JSONL (+ optional ``image`` field) ->
   payload dicts with expanded ``input_ids``/``loss_mask`` (what the trainer
   and the passthrough capture use) plus ``request_input_ids`` (single
-  placeholder) and base64 ``image_data`` (what the capture request sends).
+  placeholder) and ``data:``-URI ``image_data`` (what the capture request sends).
 - ``build_request_inputs``: batch payloads -> the ``/generate`` model-input
   fields ``{"input_ids", "image_data"}``.
 

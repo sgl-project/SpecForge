@@ -28,11 +28,10 @@ class MultimodalRegistrationTest(unittest.TestCase):
         )
         self.assertEqual(
             set(contract.required_tensors),
-            {"input_ids", "loss_mask", "hidden_states", "position_ids"},
+            {"input_ids", "loss_mask", "hidden_states"},
         )
         provider = registration.providers.server_streaming_for("multimodal")
         self.assertEqual(provider.capture_method, "dflash")
-        self.assertEqual(provider.layout.position_ids_feature, "position_ids")
         self.assertEqual(provider.layout.aux_feature, "hidden_states")
 
     def test_other_builtins_have_no_multimodal_contract(self):
@@ -78,6 +77,75 @@ class VlmExpansionMathTest(unittest.TestCase):
             )
 
 
+class ExtractImageFieldTest(unittest.TestCase):
+    def _extract(self, record):
+        from specforge.data.vlm_preprocessing import _extract_image_field
+
+        return _extract_image_field(record, source="t")
+
+    def test_image_and_image_path_fields(self):
+        self.assertEqual(self._extract({"image": "a.jpg"}), "a.jpg")
+        self.assertEqual(self._extract({"image_path": "b.jpg"}), "b.jpg")
+        self.assertIsNone(self._extract({}))
+
+    def test_images_list_takes_the_single_element(self):
+        self.assertEqual(self._extract({"images": ["a.jpg"]}), "a.jpg")
+        self.assertIsNone(self._extract({"images": []}))
+
+    def test_multi_image_sample_is_fatal(self):
+        from specforge.data.vlm_preprocessing import ImageDataError
+
+        with self.assertRaises(ImageDataError):
+            self._extract({"images": ["a.jpg", "b.jpg"]})
+
+    def test_non_list_images_and_non_string_element_are_fatal(self):
+        from specforge.data.vlm_preprocessing import ImageDataError
+
+        with self.assertRaises(ImageDataError):
+            self._extract({"images": "a.jpg"})
+        with self.assertRaises(ImageDataError):
+            self._extract({"images": [123]})
+
+    def test_conflicting_image_fields_are_fatal(self):
+        from specforge.data.vlm_preprocessing import ImageDataError
+
+        with self.assertRaises(ImageDataError):
+            self._extract({"image": "a.jpg", "images": ["b.jpg"]})
+
+    def test_unreadable_image_is_fatal_not_skipped(self):
+        from specforge.data.vlm_preprocessing import ImageDataError, _load_image
+
+        with self.assertRaises(ImageDataError):
+            _load_image("/nonexistent/path/to/image.jpg", source="t")
+        with self.assertRaises(ImageDataError):
+            _load_image("not-valid-base64!!!", source="t")
+
+    def test_load_image_returns_data_uri(self):
+        import base64 as b64mod
+
+        from specforge.data.vlm_preprocessing import _load_image
+
+        # 1x1 white PNG
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4"
+            "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+        )
+        _, uri = _load_image(png_b64, source="t")
+        self.assertTrue(uri.startswith("data:image/jpeg;base64,"))
+        raw = b64mod.b64decode(uri.split(",", 1)[1])
+        self.assertEqual(raw, b64mod.b64decode(png_b64))
+
+    def test_load_image_preserves_input_media_type(self):
+        from specforge.data.vlm_preprocessing import _load_image
+
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4"
+            "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+        )
+        _, uri = _load_image(f"data:image/png;base64,{png_b64}", source="t")
+        self.assertTrue(uri.startswith("data:image/png;base64,"))
+
+
 class VlmRequestInputsTest(unittest.TestCase):
     def test_build_request_inputs_uses_collapsed_ids_and_image_data(self):
         adapter = VlmServerInputAdapter(config=SimpleNamespace())
@@ -102,111 +170,56 @@ class VlmRequestInputsTest(unittest.TestCase):
         self.assertEqual(request["image_data"], ["aGVsbG8=", None])
 
 
-class ServerCapturePositionIdsTest(unittest.TestCase):
-    def _adapter(self, position_ids_feature):
-        from specforge.inference.adapters.server_capture import (
-            ServerCaptureSchema,
-            SGLangServerCaptureAdapter,
-        )
-
-        class _FakeStore:
-            store_id = "store"
-
-            def adopt(self, ref):
-                pass
-
-            def discard_external_attempts(self, *args, **kwargs):
-                pass
-
-            def track_external_attempt(self, *args, **kwargs):
-                pass
-
-        schema = ServerCaptureSchema(
-            aux_feature="hidden_states",
-            last_hidden_feature=None,
-            passthrough=(
-                ("input_ids", "input_ids", ()),
-                ("loss_mask", "loss_mask", ()),
-            ),
-            position_ids_feature=position_ids_feature,
-        )
-        return SGLangServerCaptureAdapter(
-            "http://localhost:1",
-            _FakeStore(),
-            run_id="run",
-            algorithm="dflash",
-            schema=schema,
-        )
-
-    def _task(self):
-        return SimpleNamespace(
-            task_id="t0",
-            attempt=0,
-            payload={"input_ids": [5, 6, 7], "loss_mask": [0, 1, 1]},
-            metadata={},
-        )
-
-    def test_payload_requests_position_ids_artifact_when_configured(self):
-        adapter = self._adapter("position_ids")
-        payload = adapter._spec_capture_payload(self._task())
-        self.assertEqual(
-            payload["features"],
-            {"aux": "hidden_states", "position_ids": "position_ids"},
-        )
-
-    def test_payload_omits_position_ids_artifact_when_unset(self):
-        adapter = self._adapter(None)
-        payload = adapter._spec_capture_payload(self._task())
-        self.assertEqual(payload["features"], {"aux": "hidden_states"})
-
-
 @unittest.skipUnless(TORCH_AVAILABLE, "requires torch")
-class VlmCollatorTest(unittest.TestCase):
-    def test_collator_pads_position_ids_like_other_features(self):
-        from specforge.algorithms.common.dflash_family_data import build_vlm_collator
+class DraftPositionsTest(unittest.TestCase):
+    """Drafts always train on the plain 1D position convention, identical to
+    the text-only path; multimodal capture stores no position ids."""
 
-        collate = build_vlm_collator()
-        features = [
-            {
-                "input_ids": torch.tensor([[1, 2, 3]]),
-                "loss_mask": torch.tensor([[0, 1, 1]]),
-                "hidden_states": torch.zeros(1, 3, 8),
-                "position_ids": torch.arange(9).reshape(1, 3, 3),
-            },
-            {
-                "input_ids": torch.tensor([[4]]),
-                "loss_mask": torch.tensor([[1]]),
-                "hidden_states": torch.zeros(1, 1, 8),
-                "position_ids": torch.arange(3).reshape(1, 1, 3),
-            },
-        ]
-        batch = collate(features)
-        self.assertEqual(tuple(batch["input_ids"].shape), (2, 3))
-        self.assertEqual(tuple(batch["position_ids"].shape), (2, 3, 3))
-        # Padding is zeros on the sequence axis.
-        self.assertTrue((batch["position_ids"][1, 1:] == 0).all())
-        self.assertEqual(batch["position_ids"][0, 2].tolist(), [6, 7, 8])
-
-
-@unittest.skipUnless(TORCH_AVAILABLE, "requires torch")
-class MropeDraftPositionsTest(unittest.TestCase):
-    def test_gathered_draft_positions_follow_anchor_offsets(self):
+    def _build_model(self):
         import torch as t
+        from torch import nn
 
         from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 
-        model = OnlineDFlashModel.__new__(OnlineDFlashModel)
-        model.block_size = 2
-        anchors = t.tensor([[1, 3]])
-        stored = t.arange(5 * 3).reshape(1, 5, 3)
-        offsets = t.arange(model.block_size).view(1, 1, -1)
-        draft_indices = (anchors.unsqueeze(-1) + offsets).view(1, -1)
-        gathered = t.gather(stored, 1, draft_indices.unsqueeze(-1).expand(-1, -1, 3))
-        full = t.cat([stored, gathered], dim=1).permute(2, 0, 1)
-        self.assertEqual(tuple(full.shape), (3, 1, 5 + 4))
-        # Draft slot for anchor=1: positions of indices 1 and 2.
-        self.assertEqual(full[:, 0, 5].tolist(), [3, 4, 5])
-        self.assertEqual(full[:, 0, 6].tolist(), [6, 7, 8])
+        class _StubDraftModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.recorded = {}
+                self.sliding_window = None
+
+            def forward(
+                self,
+                position_ids=None,
+                noise_embedding=None,
+                target_hidden=None,
+                attention_mask=None,
+            ):
+                self.recorded["position_ids"] = position_ids
+                return t.zeros(1)
+
+        return OnlineDFlashModel(
+            draft_model=_StubDraftModel(),
+            target_lm_head=nn.Linear(8, 32, bias=False),
+            target_embed_tokens=nn.Embedding(32, 8),
+            mask_token_id=31,
+            block_size=2,
+            attention_backend="sdpa",
+            num_anchors=4,
+        )
+
+    def test_positions_follow_the_1d_convention(self):
+        import torch as t
+
+        model = self._build_model()
+        b, s = 2, 8
+        input_ids = t.randint(0, 31, (b, s))
+        hidden_states = t.randn(b, s, 16)
+        loss_mask = t.ones(b, s)
+        t.manual_seed(0)
+        model._forward_draft_blocks(input_ids, hidden_states, loss_mask)
+        got = model.draft_model.recorded["position_ids"]
+        self.assertEqual(got.ndim, 2)
+        self.assertTrue(t.equal(got[:, :s], t.arange(s).unsqueeze(0).expand(b, -1)))
 
 
 if __name__ == "__main__":

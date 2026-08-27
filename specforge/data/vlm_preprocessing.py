@@ -19,13 +19,16 @@ The multimodal online path needs, per sample:
   (``SGLANG_MM_AVOID_RETOKENIZE=1``), which is guaranteed to reproduce the
   client expansion because both sides run the target model's own HF processor
   on the same image.
-- ``image_data``: a base64 image string for the capture request (the image
+- ``image_data``: a ``data:``-URI image string for the capture request (the image
   itself never enters the feature store; only text tokens and captured hidden
   states do).
 
 Limitations (v1): at most one image per sample; the image is attached to the
 first user turn (matching the Qwen-VL chat layout); text-only samples are
-supported in the same run (``image_data=None``).
+supported in the same run (``image_data=None``). Image references are read
+from ``image`` / ``image_path`` (string) or ``images`` (one-element list);
+unreadable images and multi-image samples are fatal ``ImageDataError``s,
+never a silent text-only downgrade.
 """
 
 from __future__ import annotations
@@ -52,32 +55,92 @@ def _image_token_count(image_grid_thw, merge_size: int) -> int:
     return count // (merge_size * merge_size)
 
 
+class ImageDataError(ValueError):
+    """Fatal image-contract violation (unreadable image, multi-image sample).
+
+    Raised instead of silently degrading an image-bearing sample to text-only
+    training; the prompt-preparation loop re-raises it to abort loudly.
+    """
+
+
+def _extract_image_field(record: Dict[str, Any], *, source: str) -> Optional[str]:
+    """Resolve the single image reference of one record, or None.
+
+    Accepts ``image`` / ``image_path`` (string) and ``images`` (a one-element
+    list, the convention used by common VLM corpora). A record carrying more
+    than one image is a fatal error in v1 (single-image contract), and so is
+    an ``images`` list whose element is not a string.
+    """
+
+    image_field = record.get("image") or record.get("image_path")
+    images = record.get("images")
+    if image_field and images:
+        raise ImageDataError(
+            f"{source}: record has both 'image' and 'images' fields; use one"
+        )
+    if images is None:
+        return image_field
+    if not isinstance(images, list):
+        raise ImageDataError(
+            f"{source}: 'images' must be a list, got {type(images).__name__}"
+        )
+    if len(images) == 0:
+        return image_field
+    if len(images) > 1:
+        raise ImageDataError(
+            f"{source}: multi-image samples are not supported (got "
+            f"{len(images)} images); the v1 contract is one image per sample"
+        )
+    first = images[0]
+    if not isinstance(first, str):
+        raise ImageDataError(
+            f"{source}: 'images[0]' must be a path or base64 string, got "
+            f"{type(first).__name__}"
+        )
+    return first
+
+
+def _as_data_uri(raw: bytes, *, media_type: str = "image/jpeg") -> str:
+    """Wrap raw image bytes as a data URI.
+
+    Some SGLang builds (e.g. the Ascend 0.5.14 line) only route ``data:``
+    URIs through base64 decoding and treat every other string as a file
+    path; the data-URI form is accepted by all supported server versions.
+    """
+
+    return f"data:{media_type};base64," + base64.b64encode(raw).decode("ascii")
+
+
 def _load_image(image_field: Any, *, source: str):
-    """Return (pil_image, base64_str) from a path / base64 / data-URI field."""
+    """Return (pil_image, data_uri) from a path / base64 / data-URI field."""
 
     from PIL import Image
 
     if not isinstance(image_field, str) or not image_field:
-        raise ValueError(
+        raise ImageDataError(
             f"{source}: image field must be a file path or base64 string, got "
             f"{type(image_field).__name__}"
         )
     if os.path.isfile(image_field):
         with open(image_field, "rb") as image_file:
             raw = image_file.read()
-        return Image.open(io.BytesIO(raw)).convert("RGB"), base64.b64encode(raw).decode(
-            "ascii"
-        )
+        return Image.open(io.BytesIO(raw)).convert("RGB"), _as_data_uri(raw)
     encoded = image_field
     if encoded.startswith("data:"):
+        media_type = encoded[5 : encoded.index(";")] if ";" in encoded else "image/jpeg"
         encoded = encoded.split(",", 1)[-1]
+    else:
+        media_type = "image/jpeg"
     try:
         raw = base64.b64decode(encoded, validate=True)
     except Exception as exc:
-        raise ValueError(
+        raise ImageDataError(
             f"{source}: image field is neither an existing file nor valid base64"
         ) from exc
-    return Image.open(io.BytesIO(raw)).convert("RGB"), encoded
+    return (
+        Image.open(io.BytesIO(raw)).convert("RGB"),
+        _as_data_uri(raw, media_type=media_type),
+    )
 
 
 def _render_conversation_text(
@@ -181,6 +244,7 @@ def build_vlm_prompt_payloads(
     merge_size = int(getattr(processor.image_processor, "merge_size", 2))
 
     payloads: List[Dict[str, Any]] = []
+    skipped = 0
     for line_number, record in _iter_records(path):
         source = f"{path}:{line_number}"
         try:
@@ -195,14 +259,24 @@ def build_vlm_prompt_payloads(
                 max_length=max_length,
                 min_loss_tokens=min_loss_tokens,
             )
+        except ImageDataError:
+            # Image-contract violations are fatal: never degrade an
+            # image-bearing sample to text-only training silently.
+            raise
         except ValueError as exc:
             print(f"WARNING: skipping {source}: {exc}")
+            skipped += 1
             continue
         if prepared is None:
+            skipped += 1
             continue
         payloads.append(prepared)
         if max_prompts not in (None, 0) and len(payloads) >= max_prompts:
             break
+    print(
+        f"VLM prompt preparation done: {len(payloads)} prepared, "
+        f"{skipped} skipped ({path})"
+    )
     return payloads
 
 
@@ -223,7 +297,7 @@ def _prepare_one_record(
     conversations = record.get("conversations")
     if not conversations:
         raise ValueError("record has no 'conversations' field")
-    image_field = record.get("image") or record.get("image_path")
+    image_field = _extract_image_field(record, source=source)
 
     text = _render_conversation_text(
         tokenizer,
@@ -284,4 +358,4 @@ def _prepare_one_record(
     }
 
 
-__all__ = ["build_vlm_prompt_payloads"]
+__all__ = ["ImageDataError", "build_vlm_prompt_payloads"]

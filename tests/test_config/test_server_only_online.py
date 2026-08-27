@@ -73,7 +73,7 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
         resolved = resolve_run(Config.model_validate(payload))
         self.assertEqual(resolved.algorithm.name, "dflash")
         streaming = resolved.algorithm.providers.server_streaming_for("multimodal")
-        self.assertEqual(streaming.layout.position_ids_feature, "position_ids")
+        self.assertEqual(streaming.layout.aux_feature, "hidden_states")
         self.assertIsNotNone(streaming.create_input_adapter(resolved.config))
 
     def test_multimodal_modality_is_rejected_for_text_only_algorithms(self):

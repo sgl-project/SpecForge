@@ -69,12 +69,12 @@ target hidden states are concatenated and projected. It remains registered as
 the `eagle3` strategy; EAGLE3.1 is a draft-model configuration variant, not a
 second runtime or launch path.
 
-Recipes under `online/disaggregated/managed-local` are opt-in, single-node
-
 Multimodal (image+text) training is supported for `training.strategy=dflash`
 via `model.input_modality: multimodal` (see
-`qwen3.5-4b-vl-dflash-disaggregated.yaml`); the remaining catalog is
-text-only.
+`online/disaggregated/external/qwen3.5-4b-vl-dflash-disaggregated.yaml`); the
+remaining catalog is text-only.
+
+Recipes under `online/disaggregated/managed-local` are opt-in, single-node
 full-stack examples. Their typed `managed_local` blocks own Mooncake, one or
 more patched SGLang capture servers, and the trainer GPU allocation; the same
 `specforge train -c ...` command starts and cleans up the complete stack.
@@ -198,6 +198,7 @@ should make their training strategy and topology explicit.
 | `model.mask_token_id` | `null` | DFlash-family/P-EAGLE mask token override. Otherwise it resolves from the draft config and then the tokenizer. |
 | `model.tokenizer_pad_token_id` | `null` | Explicit non-negative tokenizer pad ID. Use it for released tokenizers that omit padding metadata. |
 | `model.sglang_attention_backend` | `flashinfer` | SGLang attention implementation for an in-process or managed capture server. |
+| `model.sglang_mm_attention_backend` | `null` | Vision-encoder attention backend for capture servers. On Ascend NPU with a non-text `model.input_modality` it defaults to `ascend_attn` (fused); `sdpa` materializes N² vision scores and can OOM on large images. |
 | `model.sglang_mem_fraction_static` | `0.4` | SGLang static-memory fraction in `(0, 1]`; inherited by managed capture servers unless they override it. |
 | `model.sglang_disable_radix_cache` | `true` | Preserve the historical managed-capture behavior. Set `false` for hybrid targets such as Inkling that require the radix tree. Unique per-attempt cache namespaces still force complete capture prefills. |
 | `model.sglang_context_length` | `null` | Positive explicit context limit. Managed capture requires at least `data.max_length + 7`; omitting it derives that value. |
@@ -460,9 +461,10 @@ unless tuning throughput or memory pressure.
   requires batch size 1.
 - `training.compact_teacher` is offline text EAGLE3 only.
 - Multimodal (image+text) training requires `training.strategy=dflash` with
-  `model.input_modality: multimodal`, a VLM draft config
-  (`configs/*-dflash-vlm-*.json`), and the v0.5.14 spec-capture patch with the
-  `position_ids` artifact. Vendor modalities such as `qwen2_5_vl` remain
+  `model.input_modality: multimodal`, a plain-rope DFlash draft config (e.g.
+  `configs/qwen3.5-4b-dflash.json`; the draft needs no mRoPE - visual
+  information arrives through the captured target hidden states), and the
+  v0.5.14 spec-capture patch. Vendor modalities such as `qwen2_5_vl` remain
   unsupported.
 - Online evaluation is not supported. Offline `data.eval_hidden_states_path`
   and `training.eval_interval` must be configured together.

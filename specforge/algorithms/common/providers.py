@@ -511,25 +511,18 @@ class OfflineDataProvider:
 
 @dataclass(frozen=True)
 class ServerCaptureLayout:
-    """Maps generic server artifacts onto algorithm-ready feature names.
-
-    ``position_ids_feature`` names an optional server-produced position-id
-    artifact (mRoPE positions for multimodal targets), stored ``(1, L, 3)``
-    int64. Text providers leave it unset.
-    """
+    """Maps generic server artifacts onto algorithm-ready feature names."""
 
     aux_feature: str | None
     last_hidden_feature: str | None
     passthrough: Tuple[Tuple[str, str, Tuple[int, ...]], ...]
     attention_mask_feature: str | None = None
-    position_ids_feature: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
             "aux_feature",
             "last_hidden_feature",
             "attention_mask_feature",
-            "position_ids_feature",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -761,7 +754,6 @@ def make_registration(
                     layout.aux_feature,
                     layout.last_hidden_feature,
                     layout.attention_mask_feature,
-                    layout.position_ids_feature,
                 )
                 if feature is not None
             ),

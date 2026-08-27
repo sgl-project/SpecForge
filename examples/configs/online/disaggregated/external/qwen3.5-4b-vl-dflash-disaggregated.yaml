@@ -1,13 +1,13 @@
 # Multimodal (image+text) DFlash on Qwen3.5-4B: disaggregated online training
 # against an external patched SGLang capture server. Requires sglang v0.5.14
-# with patches/sglang/v0.5.14/spec-capture.patch (position_ids artifact) and
+# with patches/sglang/v0.5.14/spec-capture.patch and
 # SGLANG_MM_AVOID_RETOKENIZE=1 on the capture server.
 #
 # Data: ShareGPT-style JSONL with an optional top-level "image" field (file
 # path or base64) per record; text-only records are supported in the same run.
 model:
   target_model_path: Qwen/Qwen3.5-4B
-  draft_model_config: configs/qwen3.5-4b-vl-dflash.json
+  draft_model_config: configs/qwen3.5-4b-dflash.json
   target_backend: sglang
   trust_remote_code: true
   input_modality: multimodal

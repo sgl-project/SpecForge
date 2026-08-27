@@ -515,6 +515,16 @@ def _managed_local_services(
         ):
             # flashinfer does not exist on Ascend; default to the NPU backend.
             attention_backend = "ascend"
+        mm_attention_backend = cfg.model.sglang_mm_attention_backend
+        if (
+            mm_attention_backend is None
+            and cfg.model.input_modality != "text"
+            and device_visibility_env == "ASCEND_RT_VISIBLE_DEVICES"
+        ):
+            # The sdpa vision backend materializes [heads, N, N] attention
+            # scores and OOMs on large images; ascend_attn is the fused
+            # (flash-style) vision attention on NPU.
+            mm_attention_backend = "ascend_attn"
         argv.extend(
             _sglang_argv(
                 cfg.model,
@@ -526,6 +536,7 @@ def _managed_local_services(
                         else cfg.model.sglang_mem_fraction_static
                     ),
                     "sglang_attention_backend": attention_backend,
+                    "sglang_mm_attention_backend": mm_attention_backend,
                 },
             )
         )

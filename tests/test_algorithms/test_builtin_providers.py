@@ -161,6 +161,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "domino": {"text"},
             "dspark": {"text"},
             "eagle3": {"text"},
+            "mtp": {"text"},
             "peagle": {"text"},
         }
         for registration in self.registry:

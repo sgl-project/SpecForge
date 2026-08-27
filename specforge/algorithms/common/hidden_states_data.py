@@ -168,29 +168,6 @@ def build_collator():
     return collate
 
 
-def build_vlm_collator():
-    """Collator for multimodal capture: text tensors + mRoPE position ids.
-
-    ``position_ids`` arrives as ``(1, L, 3)`` int64 per sample (temporal /
-    height / width mRoPE rows produced by the capture server) and is padded
-    along the sequence axis like every other per-token feature.
-    """
-
-    def collate(features):
-        return pad_and_concatenate_features(
-            features,
-            sequence_axes={
-                "input_ids": 1,
-                "loss_mask": 1,
-                "hidden_states": 1,
-                "position_ids": 1,
-            },
-            required_keys=("input_ids", "loss_mask", "hidden_states", "position_ids"),
-        )
-
-    return collate
-
-
 def build_dspark_collator():
     def collate(features):
         return pad_and_concatenate_features(
@@ -304,7 +281,6 @@ __all__ = [
     "build_mtp_offline_reader",
     "build_offline_normalizer",
     "build_offline_reader",
-    "build_vlm_collator",
     "normalize_dspark_offline_sample",
     "normalize_mtp_offline_sample",
     "normalize_offline_sample",
