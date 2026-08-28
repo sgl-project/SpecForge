@@ -35,7 +35,7 @@ class MultimodalRegistrationTest(unittest.TestCase):
         self.assertEqual(provider.layout.aux_feature, "hidden_states")
 
     def test_other_builtins_have_no_multimodal_contract(self):
-        for name in ("domino", "dspark", "eagle3", "peagle"):
+        for name in ("domino", "eagle3", "peagle"):
             with self.subTest(algorithm=name):
                 registration = self.registry.resolve(name)
                 with self.assertRaises(KeyError):

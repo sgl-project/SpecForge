@@ -62,7 +62,7 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
         self.assertEqual(config.model.input_modality, "qwen2_5_vl")
         with self.assertRaisesRegex(
             ValueError,
-            "no streaming feature contract and provider for modality " "'qwen2_5_vl'",
+            "no streaming feature contract and provider for modality 'qwen2_5_vl'",
         ):
             resolve_run(config)
 
@@ -76,11 +76,24 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
         self.assertEqual(streaming.layout.aux_feature, "hidden_states")
         self.assertIsNotNone(streaming.create_input_adapter(resolved.config))
 
+    def test_multimodal_modality_resolves_for_dspark(self):
+        payload = _online_payload(modality="multimodal")
+        payload["training"]["strategy"] = "dspark"
+        del payload["model"]["vocab_mapping_path"]
+        resolved = resolve_run(Config.model_validate(payload))
+        self.assertEqual(resolved.algorithm.name, "dspark")
+        streaming = resolved.algorithm.providers.server_streaming_for("multimodal")
+        self.assertEqual(streaming.layout.aux_feature, "hidden_states")
+        self.assertEqual(
+            streaming.layout.last_hidden_feature, "target_last_hidden_states"
+        )
+        self.assertIsNotNone(streaming.create_input_adapter(resolved.config))
+
     def test_multimodal_modality_is_rejected_for_text_only_algorithms(self):
         payload = _online_payload(modality="multimodal")
         with self.assertRaisesRegex(
             ValueError,
-            "no streaming feature contract and provider for modality " "'multimodal'",
+            "no streaming feature contract and provider for modality 'multimodal'",
         ):
             resolve_run(Config.model_validate(payload))
 
