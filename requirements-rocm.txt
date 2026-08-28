@@ -1,9 +1,9 @@
-# PyTorch 2.11 publishes Linux ROCm 7.2 wheels on this index.
+# PyTorch 2.13 publishes Linux ROCm 7.2 wheels on this index.
 --extra-index-url https://download.pytorch.org/whl/rocm7.2
 
 pre-commit
-torch==2.11.0+rocm7.2
-transformers==5.8.1
+torch==2.13.0+rocm7.2
+transformers==5.12.1
 datasets
 setuptools
 tqdm
@@ -15,7 +15,7 @@ pydantic
 pyyaml
 requests
 safetensors
-sglang[all]==0.5.14
+sglang[all]==0.5.18
 openai-harmony
 tensorboard
 typing-extensions

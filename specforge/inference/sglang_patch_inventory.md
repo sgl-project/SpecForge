@@ -1,10 +1,10 @@
 # SGLang patch inventory and supported version
 
-SpecForge pins `sglang==0.5.14` by default. The online patch is also kept
-compatible with SGLang's public `inkling-support` layout, and a separately
+SpecForge pins `sglang==0.5.18` by default. The previous v0.5.14 online patch
+is retained for SGLang's public `inkling-support` layout, and a separately
 versioned patch supports the Kimi K3 SGLang fork at the current validated
 `kimi-k3` branch tip `9acd9cb` (and its original `f8493a4` integration point).
-There are two deliberately separate SGLang integration surfaces.
+There are deliberately separate SGLang integration surfaces.
 
 ## Online: external spec-capture server
 
@@ -12,6 +12,7 @@ Online training uses one of these source-specific patches:
 
 | Target | Patch | Capture methods |
 |---|---|---|
+| SGLang v0.5.18 | [`patches/sglang/v0.5.18/spec-capture.patch`](../../patches/sglang/v0.5.18/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 | SGLang v0.5.14 / `inkling-support` | [`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 | Kimi K3 SGLang `9acd9cb` (`f8493a4` compatible) | [`patches/sglang/kimi-k3-f8493a4/spec-capture.patch`](../../patches/sglang/kimi-k3-f8493a4/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 
@@ -43,12 +44,12 @@ providers map generic server artifacts (`aux`, `last_hidden`, passthrough
 inputs) to training feature names. No trainer or producer process imports
 SGLang model-runner internals or loads a target model.
 
-The same patch is dry-run validated against the v0.5.14 tag and SGLang #31847
-commit `b7252cc`. Capture requests carry a unique `extra_key`, so every
-training sample executes a full prefill even when radix cache support is
-present. Managed-local launch preserves the historical disabled-cache default;
-hybrid targets that require the unified radix tree set
-`model.sglang_disable_radix_cache: false`.
+The default patch is dry-run validated against the v0.5.18 tag. The retained
+v0.5.14 patch is also dry-run validated against SGLang #31847 commit `b7252cc`.
+Capture requests carry a unique `extra_key`, so every training sample executes
+a full prefill even when radix cache support is present. Managed-local launch
+preserves the historical disabled-cache default; hybrid targets that require
+the unified radix tree set `model.sglang_disable_radix_cache: false`.
 
 For targets that declare `logits_mup_width_multiplier`, the SGLang model passes
 an LM-head-scaled hidden state into the logits processor. The capture patch
@@ -59,8 +60,8 @@ Apply the default patch with `scripts/apply_sglang_spec_capture_patch.sh`, or
 the K3 patch with
 `scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb`.
 On the default patch, `--spec-capture-method dspark` rides the DFlash aux
-plumbing (`set_dflash_layers_to_capture`), which both stock v0.5.14 targets
-and `inkling-support`'s Inkling model implement; DSpark and DFlash capture
+plumbing (`set_dflash_layers_to_capture`), which stock v0.5.18 and v0.5.14
+targets and `inkling-support`'s Inkling model implement; DSpark and DFlash capture
 the same aux/last-hidden artifacts, so managed-local DSpark launches work
 unchanged. The K3 patch instead routes `--spec-capture-method dspark` to the
 model's dedicated `set_dspark_layers_to_capture` hook. It also keeps 64K capture correct by using
@@ -88,7 +89,7 @@ K3 DSpark state capture needed by the preprocessing script. It does not provide
 HF/custom backends, VLM capture, online rollout, or a general target-engine
 factory.
 
-`tests/test_runtime/test_sglang_0514_compat.py` guards the patched 0.5.14 API
+`tests/test_runtime/test_sglang_0518_compat.py` guards the patched 0.5.18 API
 seams, and
 `tests/test_offline_capture/test_sglang_backend.py`
 provides the GPU smoke coverage for dense and MoE offline capture.

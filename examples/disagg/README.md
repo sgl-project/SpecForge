@@ -158,8 +158,8 @@ FSDP trainer ranks. Override `TARGET_MODEL_PATH`, `SERVER_GPUS`,
 the unified radix tree enabled and does not pass `--disable-radix-cache`.
 Until #31847 is available in a supported SGLang release, install that PR's
 checkout into both nodes' environment. The wrapper applies SpecForge's
-checked-in capture patch before starting the server; the patch is dry-run
-validated against both v0.5.14 and #31847 commit `b7252cc`.
+checked-in capture patch before starting the server; its explicit v0.5.14
+target remains dry-run validated against #31847 commit `b7252cc`.
 
 ## External and managed-local services
 

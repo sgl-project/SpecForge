@@ -20,7 +20,7 @@ What is pinned here:
 
 The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
 GPU, sglang patched with
-``patches/sglang/v0.5.14/spec-capture.patch`` (see
+``patches/sglang/v0.5.18/spec-capture.patch`` (see
 ``scripts/apply_sglang_spec_capture_patch.sh``), the ``mooncake`` package, and
 a reachable/spawnable ``mooncake_master``; opt in locally with
 ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
@@ -83,7 +83,7 @@ class TestServerCaptureGate(unittest.TestCase):
         if not _patched_sglang():
             raise unittest.SkipTest(
                 "installed sglang lacks spec_capture_sink — apply "
-                "patches/sglang/v0.5.14/spec-capture.patch "
+                "patches/sglang/v0.5.18/spec-capture.patch "
                 "(scripts/apply_sglang_spec_capture_patch.sh)"
             )
         if not _mooncake_available():
