@@ -34,11 +34,14 @@ request (single-placeholder ids + base64 image) -> patched SGLang server
 expands, runs the ViT, captures aux hidden states -> Mooncake -> collator ->
 training forward on plain 1D positions**.
 
-- `model.input_modality: multimodal` (DFlash only): a `FeatureContract`
-  (`{input_ids, loss_mask, hidden_states}`) and a
+- `model.input_modality: multimodal` (DFlash and DSpark): a `FeatureContract`
+  (`{input_ids, loss_mask, hidden_states}`; DSpark adds
+  `target_last_hidden_states`, matching its text streaming contract) and a
   `ServerStreamingProvider` with a VLM `ServerInputAdapter`
-  (`specforge/algorithms/common/vlm_input.py`). Multimodal capture stores the
-  same three tensors as text capture - no `position_ids` artifact is requested
+  (`specforge/algorithms/common/vlm_input.py`). The adapter's
+  `minimum_loss_tokens` floor is injected per algorithm (DFlash keeps its
+  default; DSpark passes its own provider hook). Multimodal capture stores the
+  same tensors as text capture - no `position_ids` artifact is requested
   or consumed.
 - `specforge/data/vlm_preprocessing.py`: ShareGPT-style records with an
   optional `image` field (path or base64); the target's own chat template and
@@ -55,10 +58,13 @@ training forward on plain 1D positions**.
 - Training: `OnlineDFlashModel._forward_draft_blocks` builds positions with
   the unconditional text-path 1D `arange` convention; multimodal batches flow
   through the identical forward as text batches. Text runs are
-  byte-identical to before.
-- Recipe: `examples/configs/online/disaggregated/external/qwen3.5-4b-vl-dflash-disaggregated.yaml`
-  (single-node Ascend NPU managed stack; draft config
-  `configs/qwen3.5-4b-dflash.json`).
+  byte-identical to before. `OnlineDSparkModel` inherits the same forward, so
+  DSpark multimodal training needed no wrapper-model changes.
+- Recipes: `examples/configs/online/disaggregated/external/qwen3.5-4b-vl-dflash-disaggregated.yaml`
+  (draft config `configs/qwen3.5-4b-dflash.json`) and
+  `examples/configs/online/disaggregated/external/qwen3.5-4b-vl-dspark-disaggregated.yaml`
+  (draft config `configs/qwen3.5-4b-dspark.json`). Both are single-node Ascend
+  NPU managed stacks.
 
 ## Not ported (by design)
 
@@ -83,7 +89,8 @@ training forward on plain 1D positions**.
 - **Verified (CPU, this repo)**: registration parity and provider gates,
   request/payload construction, expansion math, collator, golden
   topology/recipe tests - `tests/test_algorithms/test_dflash_multimodal.py`
-  plus the updated `test_config` suites.
+  and `tests/test_algorithms/test_dspark_multimodal.py` plus the updated
+  `test_config` suites.
 - **Verified statically**: the regenerated patch applies cleanly both ways to
   pristine sglang v0.5.14 (`git apply --check` / `--reverse --check`).
 - **Not yet verified (needs GPU/NPU)**: a live multimodal capture run

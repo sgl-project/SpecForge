@@ -159,7 +159,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         expected = {
             "dflash": {"text", "multimodal"},
             "domino": {"text"},
-            "dspark": {"text"},
+            "dspark": {"text", "multimodal"},
             "eagle3": {"text"},
             "mtp": {"text"},
             "peagle": {"text"},

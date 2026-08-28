@@ -27,14 +27,25 @@ drift); the managed launcher sets this for ``input_modality="multimodal"``.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 class VlmServerInputAdapter:
-    """Image+text input adapter for the SGLang server-capture transport."""
+    """Image+text input adapter for the SGLang server-capture transport.
 
-    def __init__(self, config: Any) -> None:
+    ``minimum_loss_tokens`` is the algorithm-owned eligibility floor injected
+    by the registering provider (e.g. DSpark passes its own); ``None`` keeps
+    the DFlash default.
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        minimum_loss_tokens: Callable[[Any, Any], int] | None = None,
+    ) -> None:
         self._config = config
+        self._minimum_loss_tokens = minimum_loss_tokens
 
     def load_input_tools(self, config: Any) -> Any:
         from transformers import AutoTokenizer
@@ -59,8 +70,13 @@ class VlmServerInputAdapter:
     ) -> list[dict[str, Any]]:
         from transformers import AutoProcessor
 
-        from specforge.algorithms.model_providers import dflash_min_loss_tokens
         from specforge.data.vlm_preprocessing import build_vlm_prompt_payloads
+
+        minimum_loss_tokens = self._minimum_loss_tokens
+        if minimum_loss_tokens is None:
+            from specforge.algorithms.model_providers import dflash_min_loss_tokens
+
+            minimum_loss_tokens = dflash_min_loss_tokens
 
         tokenizer = input_tools
         # The processor must inherit the target's own preprocessor config
@@ -80,7 +96,7 @@ class VlmServerInputAdapter:
             processor,
             chat_template=config.data.chat_template,
             max_length=config.data.max_length,
-            min_loss_tokens=dflash_min_loss_tokens(config, draft_config),
+            min_loss_tokens=minimum_loss_tokens(config, draft_config),
             max_prompts=config.data.max_prompts,
         )
 
@@ -94,8 +110,12 @@ class VlmServerInputAdapter:
         }
 
 
-def build_vlm_input_adapter(config: Any) -> VlmServerInputAdapter:
-    return VlmServerInputAdapter(config)
+def build_vlm_input_adapter(
+    config: Any,
+    *,
+    minimum_loss_tokens: Callable[[Any, Any], int] | None = None,
+) -> VlmServerInputAdapter:
+    return VlmServerInputAdapter(config, minimum_loss_tokens=minimum_loss_tokens)
 
 
 __all__ = ["VlmServerInputAdapter", "build_vlm_input_adapter"]
