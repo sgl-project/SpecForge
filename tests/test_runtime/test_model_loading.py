@@ -225,6 +225,31 @@ assert not torch.cuda.is_initialized()
                     provider=_draft_config_provider("dflash"),
                 )
 
+    def test_dflash_layer_override_rejects_kda_hybrid_resize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "draft.json")
+            payload = _draft_payload("DFlashDraftModel", layers=3, block_size=16)
+            payload["dflash_config"] = {"attention_modes": ["kda", "gqa", "kda"]}
+            payload["linear_attn_config"] = {
+                "head_dim": 8,
+                "num_heads": 4,
+                "short_conv_kernel_size": 3,
+                "backend": "reference",
+            }
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+            cfg = _run_config(
+                "dflash",
+                draft_model_config=path,
+                draft_num_hidden_layers=2,
+            )
+
+            with self.assertRaisesRegex(ValueError, "mixed DFlash attention_modes"):
+                resolve_draft_config(
+                    cfg,
+                    provider=_draft_config_provider("dflash"),
+                )
+
     def test_dflash_resolution_validates_mla_before_model_construction(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "draft.json")
