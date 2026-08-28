@@ -229,8 +229,9 @@ class OfflineSGLangCaptureBackend:
                 sampling_params=sampling_params,
             )
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.fill_len = len(req.full_untruncated_fill_ids)
-            req.extend_input_len = req.fill_len - len(req.prefix_indices)
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
             req.logprob_start_len = len(req.origin_input_ids) - 1
             reqs.append(req)
             data.append((input_row, attention_row, loss_row))

@@ -13,6 +13,24 @@ from specforge.offline_capture.sglang_backend import utils as sglang_utils
 
 
 class SGLang0518CompatibilityTest(unittest.TestCase):
+    def test_offline_requests_initialize_current_extend_range(self):
+        tree = ast.parse(
+            textwrap.dedent(
+                inspect.getsource(
+                    sglang_capture.OfflineSGLangCaptureBackend.capture_eagle3
+                )
+            )
+        )
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set_extend_range"
+        ]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0].args), 2)
+
     def test_tp_and_pdmux_calls_omit_removed_keywords(self):
         tree = ast.parse(
             textwrap.dedent(inspect.getsource(sglang_patch.initialize_model_parallel))
