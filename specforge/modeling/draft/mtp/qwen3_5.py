@@ -430,6 +430,7 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        return_hidden: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         inputs_embeds = self.embed_tokens(input_ids)
@@ -440,7 +441,10 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
             position_ids=position_ids,
         )
         logits = self.mtp.lm_head(hidden_states)
-        return CausalLMOutputWithPast(logits=logits)
+        # Multi-step training feeds the pre-lm_head hidden into the next step.
+        return CausalLMOutputWithPast(
+            logits=logits, hidden_states=(hidden_states,) if return_hidden else None
+        )
 
     @torch.inference_mode()
     def spec_generate(

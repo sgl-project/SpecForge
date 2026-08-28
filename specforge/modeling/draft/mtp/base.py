@@ -51,10 +51,14 @@ class MTPDraftModel(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        return_hidden: bool = False,
     ):
         """Run the draft on shifted tokens plus target last hidden states.
 
         Returns an object exposing ``logits`` of shape [batch, seq, vocab].
+        When ``return_hidden`` is set (multi-step training), the output also
+        carries ``hidden_states`` whose last entry is the pre-lm_head hidden
+        state to feed the next draft step.
         """
         raise NotImplementedError
 

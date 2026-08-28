@@ -573,6 +573,10 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+    #: MTP multi-step training knobs (FastMTP-style per-step loss weighting;
+    #: 1 = single-step native fine-tune, unchanged from the base recipe).
+    mtp_num_speculative_steps: int = Field(default=1, ge=1)
+    mtp_step_weight_beta: float = Field(default=0.6, gt=0.0, le=1.0)
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8

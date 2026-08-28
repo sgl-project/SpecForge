@@ -77,6 +77,10 @@ def resume_contract(_config, draft_model, training_model):
         "mtp_attention_backend": str(
             getattr(draft_model.config, "_attn_implementation", "")
         ),
+        "mtp_num_speculative_steps": int(
+            getattr(training_model, "num_speculative_steps", 1)
+        ),
+        "mtp_step_weight_beta": float(getattr(training_model, "step_weight_beta", 0.6)),
     }
 
 
@@ -204,7 +208,11 @@ def build_training_model(config, draft_model, draft_config, target_config, token
     from specforge.core.mtp import OnlineMTPModel
 
     return AlgorithmModelParts(
-        model=OnlineMTPModel(draft_model=draft_model),
+        model=OnlineMTPModel(
+            draft_model=draft_model,
+            num_speculative_steps=config.training.mtp_num_speculative_steps,
+            step_weight_beta=config.training.mtp_step_weight_beta,
+        ),
         capture_layers=None,
     )
 

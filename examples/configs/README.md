@@ -283,6 +283,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | DFlash / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
+| MTP | `training.mtp_num_speculative_steps` (`1`; `>1` enables FastMTP-style teacher-forced multi-step training), `training.mtp_step_weight_beta` (`0.6`; exponential-decay base for per-step loss weights) |
 
 New recipes must not write the loader-only migration fields
 `training.deployment_mode`, `training.server_urls`, or

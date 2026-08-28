@@ -14,6 +14,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def compute_step_weights(beta: float = 0.6, num_steps: int = 3) -> List[float]:
+    """Compute normalized exponential-decay step weights.
+
+    alpha_k = beta^(k-1) / sum(beta^(j-1) for j=1..K)
+
+    See FastMTP (arXiv:2509.18362), Equation 2.
+    """
+    raw = [beta**k for k in range(num_steps)]
+    total = sum(raw)
+    return [w / total for w in raw]
+
+
 class OnlineMTPModel(nn.Module):
     """
     Online MTP training wrapper.
@@ -27,16 +39,35 @@ class OnlineMTPModel(nn.Module):
         draft_model: The MTP draft model (e.g. ``modeling/draft/mtp/qwen3_5.py``).
         ploss_decay: Per-layer loss decay.  For a single MTP layer this is
             unused, but kept for multi-layer extension.
+        num_speculative_steps: Number of teacher-forced draft steps per
+            position (1 = single-step native fine-tune, the default).
+        step_weight_beta: FastMTP exponential-decay base for per-step loss
+            weights (only used when num_speculative_steps > 1).
+        step_weights: Explicit per-step loss weights; overrides
+            ``step_weight_beta`` when given.
     """
 
     def __init__(
         self,
         draft_model: nn.Module,
         ploss_decay: float = 1.0,
+        num_speculative_steps: int = 1,
+        step_weight_beta: float = 0.6,
+        step_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         self.draft_model = draft_model
         self.ploss_decay = ploss_decay
+        self.num_speculative_steps = num_speculative_steps
+        self.step_weight_beta = step_weight_beta
+        if step_weights is None and num_speculative_steps > 1:
+            step_weights = compute_step_weights(step_weight_beta, num_speculative_steps)
+        if step_weights is not None and len(step_weights) != num_speculative_steps:
+            raise ValueError(
+                f"step_weights has {len(step_weights)} entries but "
+                f"num_speculative_steps={num_speculative_steps}"
+            )
+        self.step_weights = step_weights
 
     def _shift_for_next_token(
         self,
@@ -81,6 +112,11 @@ class OnlineMTPModel(nn.Module):
             acc_corrects: per-layer per-position correct tensors.
             acc_denoms: per-layer per-position denominator tensors.
         """
+        if self.num_speculative_steps > 1:
+            return self._forward_multi_step(
+                input_ids, hidden_states, loss_mask, attention_mask, position_ids
+            )
+
         # Draft input is the target sequence shifted right by one.  The last
         # position is padded because there is no x_{T+1}; the corresponding
         # logit is dropped in _shift_for_next_token.
@@ -142,3 +178,87 @@ class OnlineMTPModel(nn.Module):
 
         # Single-layer MTP: wrap in length-1 lists for E1 evaluator compatibility.
         return loss, [corrects], [denoms]
+
+    def _forward_multi_step(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        """Teacher-forced multi-step MTP training (FastMTP-style).
+
+        At step k the draft consumes the ground-truth token x[t+k+1] (embedded)
+        fused with the previous step's MTP output (the target's last hidden
+        state at step 0), and predicts x[t+k+2].  Each step's loss is weighted
+        by the normalized exponential-decay schedule from ``step_weights``.
+
+        Follows the reference implementation in vllm-project/speculators
+        (models/mtp/core.py): hidden states are fed recursively and every step
+        reuses the base window positions.
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        effective_steps = min(self.num_speculative_steps, max(0, seq_len - 2))
+        valid_len = seq_len - effective_steps - 1
+        if valid_len <= 0 or effective_steps == 0:
+            zero = torch.zeros((), device=device, requires_grad=True)
+            empty = torch.zeros(batch_size, 0, device=device)
+            return zero, [empty], [empty]
+
+        if position_ids is None:
+            position_ids = (
+                torch.arange(seq_len, dtype=torch.long, device=device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+        elif position_ids.shape != input_ids.shape:
+            raise ValueError(
+                "position_ids must have the same [batch, seq_len] shape as "
+                f"input_ids; got {tuple(position_ids.shape)} and "
+                f"{tuple(input_ids.shape)}"
+            )
+        step_pos_ids = position_ids[:, :valid_len]
+        step_attn_mask = (
+            attention_mask[:, :valid_len] if attention_mask is not None else None
+        )
+
+        total_loss = torch.zeros((), device=device)
+        step0_corrects = step0_denoms = None
+        current_hidden = hidden_states
+        for step in range(effective_steps):
+            step_input_ids = input_ids[:, step + 1 : step + 1 + valid_len]
+            outputs = self.draft_model(
+                input_ids=step_input_ids,
+                hidden_states=current_hidden[:, :valid_len],
+                attention_mask=step_attn_mask,
+                position_ids=step_pos_ids,
+                return_hidden=True,
+            )
+            logits = outputs.logits
+
+            step_targets = input_ids[:, step + 2 : step + 2 + valid_len]
+            step_mask = loss_mask[:, step + 2 : step + 2 + valid_len]
+            unreduced = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                step_targets.reshape(-1),
+                reduction="none",
+            )
+            flat_mask = step_mask.reshape(-1).float()
+            weight = self.step_weights[step]
+            total_loss = total_loss + weight * (unreduced * flat_mask).sum() / (
+                flat_mask.sum().clamp_min(1)
+            )
+
+            if step == 0:
+                with torch.no_grad():
+                    preds = logits.argmax(dim=-1)
+                    step0_corrects = (preds == step_targets).float() * step_mask
+                    step0_denoms = step_mask.float()
+
+            # The next step fuses its token embeddings with this step's output.
+            current_hidden = outputs.hidden_states[-1]
+
+        return total_loss, [step0_corrects], [step0_denoms]

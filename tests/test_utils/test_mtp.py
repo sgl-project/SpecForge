@@ -587,6 +587,106 @@ class ExportRoundTripTest(unittest.TestCase):
             self.assertTrue(torch.equal(merged["mtp.fc.weight"], trained))
 
 
+class StepWeightsTest(unittest.TestCase):
+    def test_compute_step_weights_normalizes_exponential_decay(self):
+        from specforge.core.mtp import compute_step_weights
+
+        weights = compute_step_weights(beta=0.6, num_steps=3)
+        self.assertAlmostEqual(1.0, sum(weights))
+        # FastMTP Eq. 2: [1, 0.6, 0.36] / 1.96
+        self.assertAlmostEqual(1.0 / 1.96, weights[0], places=4)
+        self.assertAlmostEqual(0.6 / 1.96, weights[1], places=4)
+        self.assertAlmostEqual(0.36 / 1.96, weights[2], places=4)
+
+    def test_explicit_step_weights_validate_length(self):
+        with self.assertRaisesRegex(ValueError, "step_weights"):
+            OnlineMTPModel(
+                Qwen3_5MTPDraftModel(_tiny_config()),
+                num_speculative_steps=2,
+                step_weights=[1.0],
+            )
+
+
+class _EchoDraft(torch.nn.Module):
+    """Draft stub whose logits one-hot the current input token."""
+
+    def __init__(self, vocab: int):
+        super().__init__()
+        self.vocab = vocab
+        self.config = SimpleNamespace(pad_token_id=0)
+
+    def forward(
+        self,
+        input_ids,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        return_hidden=False,
+    ):
+        bsz, seq_len = input_ids.shape
+        logits = torch.zeros(bsz, seq_len, self.vocab)
+        logits.scatter_(2, input_ids.unsqueeze(-1), 10.0)
+        return SimpleNamespace(logits=logits, hidden_states=(hidden_states,))
+
+
+class MultiStepForwardTest(unittest.TestCase):
+    def test_aligned_targets_give_near_zero_loss(self):
+        # constant sequence: at every step the echo draft's prediction
+        # (x[t+k+1]) equals the target (x[t+k+2]) only if offsets are right
+        model = OnlineMTPModel(_EchoDraft(vocab=32), num_speculative_steps=3)
+        input_ids = torch.full((2, 16), 7, dtype=torch.long)
+        hidden_states = torch.randn(2, 16, 32)
+        loss_mask = torch.ones(2, 16)
+
+        loss, corrects, denoms = model(
+            input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
+        )
+
+        # floor = ln(1 + (vocab-1)*e^-10) ≈ 0.0029 for the one-hot stub at 10.0
+        self.assertLess(loss.item(), 0.01)
+        # step-0 accuracy is all-correct over the valid window
+        self.assertEqual((2, 12), corrects[0].shape)
+        self.assertTrue(torch.all(corrects[0] == denoms[0]))
+
+    def test_shifted_targets_give_positive_loss(self):
+        model = OnlineMTPModel(_EchoDraft(vocab=64), num_speculative_steps=3)
+        input_ids = torch.arange(16).unsqueeze(0).expand(2, -1) + 1
+        hidden_states = torch.randn(2, 16, 32)
+        loss_mask = torch.ones(2, 16)
+
+        loss, _, _ = model(
+            input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
+        )
+
+        self.assertGreater(loss.item(), 1.0)
+
+    def test_multi_step_grads_flow_through_recursion(self):
+        config = _tiny_config()
+        draft = Qwen3_5MTPDraftModel(config)
+        model = OnlineMTPModel(draft, num_speculative_steps=3)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+
+        loss, _, _ = model(
+            input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
+        )
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(draft.mtp.fc.weight.grad)
+
+    def test_default_single_step_path_unchanged(self):
+        config = _tiny_config()
+        model = OnlineMTPModel(Qwen3_5MTPDraftModel(config))
+        self.assertEqual(1, model.num_speculative_steps)
+        self.assertIsNone(model.step_weights)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+        loss, corrects, denoms = model(
+            input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual((2, 15), corrects[0].shape)
+
+
 class MTPRegistrationTest(unittest.TestCase):
     def test_draft_architecture_is_registered(self):
         self.assertIn("Qwen3_5MTPDraftModel", available_drafts())
