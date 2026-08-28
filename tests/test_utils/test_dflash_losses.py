@@ -697,6 +697,113 @@ class TestDFlashLosses(unittest.TestCase):
             check_dtype=False,
         )
 
+    def test_dspark_distribution_objectives_match_position_pooled_formulas(self):
+        torch.manual_seed(322)
+        target_logits = torch.randn_like(self.logits)
+        targets, eval_mask = _dspark_targets_and_mask(
+            self.input_ids,
+            self.loss_mask,
+            self.anchors,
+            self.keep_mask,
+            self.logits.shape[2],
+        )
+        del targets
+        weights = eval_mask.float()
+        position_den = weights.sum(dim=(0, 1))
+        valid_positions = position_den > 0
+
+        draft_log_probs = F.log_softmax(self.logits.float(), dim=-1)
+        draft_probs = draft_log_probs.exp()
+        target_probs = torch.softmax(target_logits.float(), dim=-1)
+        acceptance = torch.minimum(draft_probs, target_probs).sum(dim=-1)
+        tv = 0.5 * (draft_probs - target_probs).abs().sum(dim=-1)
+        lk_alpha = -torch.log(acceptance.clamp_min(torch.finfo(acceptance.dtype).tiny))
+        forward_kl = F.kl_div(
+            draft_log_probs,
+            target_probs,
+            reduction="none",
+        ).sum(dim=-1)
+
+        cases = (
+            ("tv", "alpha", 1.0, 3.0),
+            ("lk", "alpha", 1.0, 3.0),
+            ("lk", "lambda", 0.7, 2.5),
+        )
+        for primary_loss, lk_type, kl_scale, kl_decay in cases:
+            with self.subTest(primary_loss=primary_loss, lk_type=lk_type):
+                model = _make_dspark_model(
+                    self.logits,
+                    self.anchors,
+                    self.keep_mask,
+                    lm_head=_DualFixedHead(self.logits, target_logits).double(),
+                    dspark_ce_loss_alpha=91.0,
+                    dspark_l1_loss_alpha=73.0,
+                    dspark_confidence_head_alpha=0.0,
+                    dspark_primary_loss=primary_loss,
+                    dspark_lk_loss_type=lk_type,
+                    dspark_kl_scale=kl_scale,
+                    dspark_kl_decay=kl_decay,
+                )
+                loss, _accuracy, metrics = model(
+                    input_ids=self.input_ids,
+                    hidden_states=self.hidden_states,
+                    loss_mask=self.loss_mask,
+                    target_last_hidden_states=torch.zeros_like(self.hidden_states),
+                )
+
+                if primary_loss == "tv":
+                    per_token = tv
+                elif lk_type == "alpha":
+                    per_token = lk_alpha
+                else:
+                    mean_acceptance = (acceptance * weights).sum(
+                        dim=(0, 1)
+                    ) / position_den.clamp_min(1.0)
+                    lk_lambda = kl_scale * torch.exp(-kl_decay * mean_acceptance)
+                    per_token = (
+                        lk_lambda.view(1, 1, -1) * forward_kl
+                        + (1.0 - lk_lambda).view(1, 1, -1) * tv
+                    )
+                want = (
+                    (per_token * weights).sum(dim=(0, 1))[valid_positions]
+                    / position_den[valid_positions]
+                ).sum()
+                torch.testing.assert_close(
+                    loss,
+                    want,
+                    rtol=1e-6,
+                    atol=1e-7,
+                    check_dtype=False,
+                )
+
+                ratios = metrics["ratio_metrics"]
+                accept_num, accept_den = ratios["expected_acceptance"]
+                torch.testing.assert_close(
+                    accept_num / accept_den,
+                    (acceptance * weights).sum() / weights.sum(),
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+                self.assertEqual("lk_lambda" in ratios, lk_type == "lambda")
+
+    def test_dspark_distribution_objective_validation(self):
+        invalid = (
+            ({"dspark_primary_loss": "invalid"}, "dspark_primary_loss"),
+            ({"dspark_lk_loss_type": "invalid"}, "dspark_lk_loss_type"),
+            ({"dspark_kl_scale": -0.1}, "dspark_kl_scale"),
+            ({"dspark_kl_scale": 1.1}, "dspark_kl_scale"),
+            ({"dspark_kl_decay": -0.1}, "dspark_kl_decay"),
+        )
+        for kwargs, message in invalid:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, message):
+                    _make_dspark_model(
+                        self.logits,
+                        self.anchors,
+                        self.keep_mask,
+                        **kwargs,
+                    )
+
     def test_dspark_requires_target_hidden_states_for_l1_or_confidence(self):
         model = _make_dspark_model(
             self.logits,
@@ -737,6 +844,64 @@ class TestDFlashLosses(unittest.TestCase):
             dspark_l1_loss_alpha=0.9,
             dspark_confidence_head_alpha=1.0,
             objective_chunk_blocks=1,
+        )
+        chunked.load_state_dict(full.state_dict())
+        target_hidden = torch.randn_like(self.hidden_states)
+
+        full_loss, _full_acc, full_metrics = full(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=target_hidden,
+        )
+        chunked_loss, _chunked_acc, chunked_metrics = chunked(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=target_hidden,
+        )
+        torch.testing.assert_close(chunked_loss, full_loss, rtol=1e-6, atol=1e-8)
+        for name, full_pair in full_metrics["ratio_metrics"].items():
+            chunked_pair = chunked_metrics["ratio_metrics"][name]
+            torch.testing.assert_close(chunked_pair[0], full_pair[0])
+            torch.testing.assert_close(chunked_pair[1], full_pair[1])
+
+        full_loss.backward()
+        chunked_loss.backward()
+        torch.testing.assert_close(
+            chunked.draft_model.signal.grad,
+            full.draft_model.signal.grad,
+            rtol=1e-6,
+            atol=1e-7,
+        )
+
+    def test_dspark_lk_chunking_matches_full_loss_and_gradient(self):
+        torch.manual_seed(100)
+        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
+        common = {
+            "dspark_ce_loss_alpha": 0.0,
+            "dspark_l1_loss_alpha": 0.0,
+            "dspark_confidence_head_alpha": 0.0,
+            "dspark_primary_loss": "lk",
+            "dspark_lk_loss_type": "alpha",
+        }
+        full = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=head,
+            objective_chunk_blocks=0,
+            **common,
+        )
+        chunked = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=copy.deepcopy(head),
+            objective_chunk_blocks=1,
+            **common,
         )
         chunked.load_state_dict(full.state_dict())
         target_hidden = torch.randn_like(self.hidden_states)

@@ -317,6 +317,36 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "dspark_objective_mode"):
             Config.model_validate(payload)
 
+    def test_dspark_distribution_objective_is_typed_and_bounded(self):
+        payload = _online_payload("dspark")
+        payload["training"].update(
+            {
+                "dspark_primary_loss": "lk",
+                "dspark_lk_loss_type": "lambda",
+                "dspark_kl_scale": 0.7,
+                "dspark_kl_decay": 2.5,
+            }
+        )
+        training = Config.model_validate(payload).training
+        self.assertEqual(training.dspark_primary_loss, "lk")
+        self.assertEqual(training.dspark_lk_loss_type, "lambda")
+        self.assertEqual(training.dspark_kl_scale, 0.7)
+        self.assertEqual(training.dspark_kl_decay, 2.5)
+
+        invalid_values = (
+            ("dspark_primary_loss", "cross_entropy"),
+            ("dspark_lk_loss_type", "invalid"),
+            ("dspark_kl_scale", -0.1),
+            ("dspark_kl_scale", 1.1),
+            ("dspark_kl_decay", -0.1),
+        )
+        for field, value in invalid_values:
+            invalid = _online_payload("dspark")
+            invalid["training"][field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValidationError, field):
+                    Config.model_validate(invalid)
+
     def test_objective_chunk_blocks_is_shared_and_typed(self):
         for strategy in ("dflash", "domino", "dspark"):
             payload = _online_payload(strategy)

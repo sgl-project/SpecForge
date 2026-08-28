@@ -65,6 +65,10 @@ def resume_contract(_config, draft_model, training_model):
         "dspark_confidence_head_alpha": float(
             training_model.dspark_confidence_head_alpha
         ),
+        "dspark_primary_loss": str(training_model.dspark_primary_loss),
+        "dspark_lk_loss_type": str(training_model.dspark_lk_loss_type),
+        "dspark_kl_scale": float(training_model.dspark_kl_scale),
+        "dspark_kl_decay": float(training_model.dspark_kl_decay),
     }
 
 

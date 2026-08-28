@@ -430,6 +430,10 @@ def build_dspark_model(
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
             dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
+            dspark_primary_loss=cfg.training.dspark_primary_loss,
+            dspark_lk_loss_type=cfg.training.dspark_lk_loss_type,
+            dspark_kl_scale=cfg.training.dspark_kl_scale,
+            dspark_kl_decay=cfg.training.dspark_kl_decay,
         ),
     )
 
