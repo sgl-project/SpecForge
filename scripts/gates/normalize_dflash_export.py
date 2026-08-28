@@ -81,14 +81,28 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
             "export is not DFlash-family: "
             f"dflash_config.projector_type={projector_type!r}"
         )
-    attention_mode = method_config.get("attention_mode", "gqa")
-    if not isinstance(attention_mode, str) or attention_mode.lower() not in {
-        "gqa",
-        "mha",
-    }:
+    attention_mode = method_config.get("attention_mode")
+    attention_modes = method_config.get("attention_modes")
+    if attention_mode is not None and attention_modes is not None:
+        raise ValueError(
+            "DFlash export must set only one of attention_mode or attention_modes"
+        )
+    if attention_modes is None:
+        attention_modes = [attention_mode or "gqa"]
+    if not isinstance(attention_modes, list) or not all(
+        isinstance(mode, str) for mode in attention_modes
+    ):
+        raise ValueError(
+            "DFlash export attention mode(s) must be strings, "
+            f"got {attention_modes!r}"
+        )
+    unsupported_modes = {
+        mode.lower() for mode in attention_modes if mode.lower() not in {"gqa", "mha"}
+    }
+    if unsupported_modes:
         raise ValueError(
             "SGLang DFlash-family serving supports only GQA/MHA exports, "
-            f"got dflash_config.attention_mode={attention_mode!r}"
+            f"got {sorted(unsupported_modes)}"
         )
 
     if projector_type == "dspark":

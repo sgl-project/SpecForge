@@ -197,6 +197,28 @@ class TestNormalizeDFlashExport(unittest.TestCase):
 
             self.assertEqual(json.loads(path.read_text()), original)
 
+    def test_rejects_kda_hybrid_before_rewriting_the_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            original = {
+                "architectures": ["DSparkDraftModel"],
+                "auto_map": {"AutoModel": "dspark.DSparkDraftModel"},
+                "block_size": 16,
+                "model_type": "qwen3",
+                "dflash_config": {
+                    "projector_type": "dspark",
+                    "attention_modes": ["kda", "gqa", "kda"],
+                    "markov_rank": 256,
+                    "markov_head_type": "vanilla",
+                },
+            }
+            path.write_text(json.dumps(original), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "only GQA/MHA"):
+                self.module.normalize_export(str(path), 16)
+
+            self.assertEqual(json.loads(path.read_text()), original)
+
     def test_rejects_dspark_without_a_positive_markov_rank(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

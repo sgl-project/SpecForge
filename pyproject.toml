@@ -43,6 +43,7 @@ dev = [
     "pre-commit",
 ]
 fa = ["flash-attn", "ninja", "packaging"]
+kda = ["fla-core==0.5.1"]
 liger = ["liger-kernel"]
 
 [tool.setuptools.dynamic]

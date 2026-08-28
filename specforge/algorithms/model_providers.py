@@ -494,8 +494,19 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
                 )
             draft_config.layer_types = [layer_types[0]] * requested_layers
 
+        dflash_config = dict(getattr(draft_config, "dflash_config", None) or {})
+        attention_modes = dflash_config.get("attention_modes")
+        if attention_modes is not None and len(attention_modes) != requested_layers:
+            if len(set(attention_modes)) > 1:
+                raise ValueError(
+                    "model.draft_num_hidden_layers cannot resize mixed DFlash "
+                    "attention_modes; provide a draft config with exactly the "
+                    "requested per-layer architecture"
+                )
+            dflash_config["attention_modes"] = [attention_modes[0]] * requested_layers
+
         draft_config.dflash_config = {
-            **dict(getattr(draft_config, "dflash_config", None) or {}),
+            **dflash_config,
             "target_layer_ids": build_target_layer_ids(
                 int(draft_config.num_target_layers),
                 requested_layers,
