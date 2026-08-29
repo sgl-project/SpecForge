@@ -50,9 +50,9 @@ class ApplySglangSpecCapturePatchTest(unittest.TestCase):
             "SPECFORGE_SPEC_CAPTURE_PATCH": str(self.new_patch),
         }
 
-    def run_script(self) -> subprocess.CompletedProcess[str]:
+    def run_script(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(SCRIPT)],
+            ["bash", str(SCRIPT), *args],
             check=False,
             capture_output=True,
             env=self.env,
@@ -96,6 +96,12 @@ class ApplySglangSpecCapturePatchTest(unittest.TestCase):
         )
         self.assertEqual(self.sink.read_text(encoding="utf-8"), "old sink\n")
         self.assertEqual(self.record.read_text(encoding="utf-8"), old_patch)
+
+    def test_rejects_removed_v0514_target(self) -> None:
+        result = self.run_script("--target", "v0.5.14")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unsupported SGLang patch target: v0.5.14", result.stderr)
 
 
 if __name__ == "__main__":

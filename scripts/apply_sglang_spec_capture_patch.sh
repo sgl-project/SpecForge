@@ -13,7 +13,7 @@
 # replaces package-owned files but leaves our added sink and patch record.
 #
 # Usage: scripts/apply_sglang_spec_capture_patch.sh
-#          [--target v0.5.18|v0.5.14|kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4]
+#          [--target v0.5.18|kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4]
 #          [--reverse]
 set -euo pipefail
 
@@ -45,10 +45,6 @@ done
 case "$TARGET" in
     v0.5.18)
         EXPECTED_VERSION_PREFIX="0.5.18"
-        PATCH_TARGET="$TARGET"
-        ;;
-    v0.5.14)
-        EXPECTED_VERSION_PREFIX="0.5.14"
         PATCH_TARGET="$TARGET"
         ;;
     kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4)
