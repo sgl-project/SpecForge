@@ -138,6 +138,12 @@ class DataConfig(StrictConfigModel):
     #: offline evaluation — directory of precomputed hidden-state .ckpt files.
     eval_hidden_states_path: str = ""
     max_length: int = Field(default=2048, gt=0)
+    #: 'static' = classic fixed dataset. 'stream' = persistent trainer consuming
+    #: READY-marked chunk directories from stream_dir; one chunk == one epoch.
+    data_mode: Literal["static", "stream"] = "static"
+    stream_dir: str = ""
+    #: Fixed per-epoch ref count in stream mode (short chunks are cycle-padded).
+    stream_chunk_rows: int = Field(default=256, gt=0)
     chat_template: str = "llama3"
     is_preformatted: bool = False
     train_only_last_turn: bool = False
@@ -543,6 +549,11 @@ class TrainingConfig(StrictConfigModel):
     kl_decay: float = 1.0
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
+    #: stream mode: write a trainable-weights-only safetensors export every N
+    #: consumed chunks (0 = never). Cheap (~5GB); independent of save_interval,
+    #: which remains the FULL resume checkpoint (weights+optimizer+RNG).
+    export_every_chunks: int = Field(default=0, ge=0)
+    export_dir: str = ""
     loss_decay_gamma: Optional[float] = None
     #: Anchor blocks per objective slice (0 = materialize all objective logits).
     objective_chunk_blocks: int = Field(default=128, ge=0)

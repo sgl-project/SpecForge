@@ -569,6 +569,8 @@ def build_offline_runtime(
     strategy_kwargs: Optional[Mapping[str, Any]] = None,
     dataloader_num_workers: int = 0,
     profiling_options=None,
+    stream_dir: str = "",
+    stream_chunk_rows: int = 256,
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
@@ -590,19 +592,53 @@ def build_offline_runtime(
         metadata_store=NoOpMetadataStore(),
         enable_sample_queue=False,
     )
-    source_refs = provider.build_reader(
-        hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
-    ).read()
+    stream_source = None
+    if stream_dir:
+        from specforge.training.streaming import StreamingChunkSource
 
-    def refs_for_epoch(epoch):
-        return _shard_offline_refs(
+        stream_source = StreamingChunkSource(
+            provider=provider,
+            stream_dir=stream_dir,
+            run_id=run_id,
+            ttt_length=ttt_length,
+            max_len=max_len,
+            chunk_rows=stream_chunk_rows,
+        )
+
+        def refs_for_epoch(epoch):
+            return _shard_offline_refs(
+                stream_source.next_chunk_refs(epoch),
+                use_usp_preprocess=use_usp_preprocess,
+                seed=seed,
+                epoch=epoch,
+            )
+
+        source_refs = stream_source.peek_refs()
+    else:
+        source_refs = provider.build_reader(
+            hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
+        ).read()
+
+        def refs_for_epoch(epoch):
+            return _shard_offline_refs(
+                source_refs,
+                use_usp_preprocess=use_usp_preprocess,
+                seed=seed,
+                epoch=epoch,
+            )
+
+    if stream_source is not None:
+        # build-time sizing only: shard the peeked refs; the controller calls
+        # set_epoch(start_epoch) before any batch is read, which performs the
+        # real (consuming) grab at the correct, possibly-resumed epoch.
+        refs = _shard_offline_refs(
             source_refs,
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
-            epoch=epoch,
+            epoch=0,
         )
-
-    refs = refs_for_epoch(0)
+    else:
+        refs = refs_for_epoch(0)
     store = LocalFeatureStore(run_id)
     if eval_hidden_states_path:
         if eval_data_factory is not None:
@@ -620,7 +656,7 @@ def build_offline_runtime(
             use_usp_preprocess=use_usp_preprocess,
             dataloader_num_workers=dataloader_num_workers,
         )
-    return _assemble_trainer(
+    trainer = _assemble_trainer(
         algorithm=algorithm,
         controller=controller,
         store=store,
@@ -659,6 +695,40 @@ def build_offline_runtime(
         dataloader_num_workers=dataloader_num_workers,
         profiling_options=profiling_options,
     )
+    if stream_source is not None:
+        trainer._stream_source = stream_source
+        ctl = getattr(trainer, "_controller", None)
+        eb = getattr(ctl, "_epoch_batch", 0) if ctl is not None else 0
+        if eb:
+            # Streams cannot replay an epoch, so translate the restored position:
+            #   eb == batches_per_epoch -> the chunk COMPLETED before the kill but
+            #     was never deleted (deletion happens at the next boundary):
+            #     delete the oldest READY chunk and advance -> exact continuation.
+            #   0 < eb < batches_per_epoch -> mid-epoch crash: advance without
+            #     deleting; the partial chunk retrains in full (bounded duplicate
+            #     steps, never silent data loss).
+            import torch.distributed as _dist
+
+            ws = _dist.get_world_size() if _dist.is_initialized() else 1
+            bpe = stream_chunk_rows // (batch_size * ws)
+            if eb >= bpe:
+                if (not _dist.is_initialized()) or _dist.get_rank() == 0:
+                    import glob as _g, shutil as _sh
+
+                    ready = sorted(
+                        c
+                        for c in _g.glob(os.path.join(stream_dir, "chunk_*"))
+                        if os.path.exists(os.path.join(c, "READY.marker"))
+                    )
+                    if ready:
+                        print(f"[streaming] resume at epoch end: dropping completed chunk {os.path.basename(ready[0])}", flush=True)
+                        _sh.rmtree(ready[0], ignore_errors=True)
+                if _dist.is_initialized():
+                    _dist.barrier()
+            print(f"[streaming] resume: epoch {ctl.epoch} -> {ctl.epoch+1}, epoch_batch {eb} -> 0 (batches_per_epoch={bpe})", flush=True)
+            ctl.epoch += 1
+            ctl._epoch_batch = 0
+    return trainer
 
 
 def build_disagg_offline_runtime(

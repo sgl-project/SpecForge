@@ -628,6 +628,7 @@ def build_training_run(
     _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
     run_logger = _configured_logger(cfg)
     try:
+        _stream = cfg.data.data_mode == "stream"
         trainer = build_offline_runtime(
             hidden_states_path=cfg.data.hidden_states_path,
             eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
@@ -635,7 +636,9 @@ def build_training_run(
             target_head=bundle.target_head,
             ttt_length=t.ttt_length,
             max_len=cfg.data.max_length,
-            num_epochs=t.num_epochs,
+            num_epochs=(1_000_000_000 if _stream else t.num_epochs),
+            stream_dir=(cfg.data.stream_dir if _stream else ""),
+            stream_chunk_rows=cfg.data.stream_chunk_rows,
             use_usp_preprocess=(t.attention_backend == "usp"),
             seed=t.seed,
             resume_from=t.resume_from,
@@ -649,6 +652,16 @@ def build_training_run(
     except BaseException:
         _close_configured_logger(run_logger)
         raise
+    _src = getattr(trainer, "_stream_source", None)
+    if _src is not None and t.export_every_chunks > 0:
+        _src.bind_export(
+            model=bundle.model,
+            export_dir=(t.export_dir or os.path.join(cfg.output_dir, "export_head")),
+            every_chunks=t.export_every_chunks,
+            get_step=lambda: getattr(
+                getattr(trainer, "controller", trainer), "global_step", -1
+            ),
+        )
     return TrainingRun(trainer=trainer)
 
 
