@@ -272,7 +272,7 @@ def _disaggregated_env(
     if deployment.inbox_server_url:
         values["DISAGG_INBOX_SERVER_URL"] = deployment.inbox_server_url
     if cfg.mode == "online":
-        if deployment.backend != "mooncake":
+        if deployment.backend not in {"mooncake", "mooncake_gpu_direct"}:
             raise ValueError("online disaggregated training requires Mooncake")
         # Online feature objects are allocated by the external capture server.
         # SpecForge roles only read or publish references to those objects.
@@ -339,6 +339,15 @@ def _disaggregated_env(
             raise ValueError(
                 "Mooncake endpoints must be provided by deployment config or "
                 f"environment: {missing}"
+            )
+    if deployment.backend == "mooncake_gpu_direct":
+        protocol = values.get("MOONCAKE_PROTOCOL") or base_env.get(
+            "MOONCAKE_PROTOCOL"
+        )
+        if protocol not in {"nvlink", "nvlink_intra", "mnnvl", "rdma"}:
+            raise ValueError(
+                "mooncake_gpu_direct requires MOONCAKE_PROTOCOL=nvlink, "
+                "nvlink_intra, or rdma"
             )
     return values
 

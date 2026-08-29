@@ -44,8 +44,14 @@ class DataFlowController:
         metadata_store: Optional[MetadataStore] = None,
         max_prompt_attempts: Optional[int] = None,
         enable_sample_queue: bool = True,
+        prompt_routing: str = "shared",
     ) -> None:
+        if prompt_routing not in ("shared", "least_tokens"):
+            raise ValueError(
+                "prompt_routing must be either 'shared' or 'least_tokens'"
+            )
         self.run_id = run_id
+        self.prompt_routing = prompt_routing
         self.sample_queue = SampleRefQueue() if enable_sample_queue else None
         self.store = metadata_store or InMemoryMetadataStore()
         # Retryable-failure bound: a task failed this many attempts goes
@@ -54,6 +60,10 @@ class DataFlowController:
         self.max_prompt_attempts = max_prompt_attempts
         self._prompts: "OrderedDict[str, PromptTask]" = OrderedDict()
         self._prompt_pending: Deque[str] = deque()
+        self._prompt_pending_by_worker: Dict[str, Deque[str]] = {}
+        self._prompt_route: Dict[str, str] = {}
+        self._prompt_cost: Dict[str, int] = {}
+        self._worker_outstanding_cost: Dict[str, int] = {}
         self._prompt_leased: Dict[str, str] = {}  # task_id -> worker_id
         self._prompt_failed: Dict[str, str] = {}  # task_id -> terminal reason
         self._workers: Dict[str, Dict[str, Any]] = {}
@@ -66,6 +76,8 @@ class DataFlowController:
         worker_id = info.get("worker_id") or f"rollout-{uuid.uuid4().hex[:8]}"
         with self._lock:
             self._workers[worker_id] = dict(info)
+            self._prompt_pending_by_worker.setdefault(worker_id, deque())
+            self._worker_outstanding_cost.setdefault(worker_id, 0)
         return worker_id
 
     def register_trainer(self, info: Dict[str, Any]) -> str:
@@ -104,21 +116,56 @@ class DataFlowController:
         # Validation and object construction can be expensive for large prompt
         # batches, so keep them outside the controller's global state lock.
         with self._lock:
+            worker_ids = sorted(self._workers)
+            if self.prompt_routing == "least_tokens" and not worker_ids:
+                raise RuntimeError(
+                    "least_tokens prompt routing requires a registered rollout worker"
+                )
             for task in prepared:
                 self._prompts[task.task_id] = task
-                self._prompt_pending.append(task.task_id)
+                if self.prompt_routing == "shared":
+                    self._prompt_pending.append(task.task_id)
+                    continue
+                input_ids = task.payload.get("input_ids", ())
+                cost = max(1, len(input_ids))
+                worker_id = min(
+                    worker_ids,
+                    key=lambda candidate: (
+                        self._worker_outstanding_cost[candidate],
+                        candidate,
+                    ),
+                )
+                self._prompt_route[task.task_id] = worker_id
+                self._prompt_cost[task.task_id] = cost
+                self._worker_outstanding_cost[worker_id] += cost
+                self._prompt_pending_by_worker[worker_id].append(task.task_id)
         return task_ids
 
     def lease_prompt_tasks(self, worker_id: str, max_tasks: int) -> List[PromptTask]:
         out: List[PromptTask] = []
         with self._lock:
+            pending = (
+                self._prompt_pending_by_worker.setdefault(worker_id, deque())
+                if self.prompt_routing == "least_tokens"
+                else self._prompt_pending
+            )
             for _ in range(max_tasks):
-                if not self._prompt_pending:
+                if not pending:
                     break
-                task_id = self._prompt_pending.popleft()
+                task_id = pending.popleft()
                 self._prompt_leased[task_id] = worker_id
                 out.append(self._prompts[task_id])
         return out
+
+    def _retire_prompt_locked(self, task_id: str) -> None:
+        worker_id = self._prompt_route.pop(task_id, None)
+        cost = self._prompt_cost.pop(task_id, 0)
+        if worker_id is not None:
+            self._worker_outstanding_cost[worker_id] = max(
+                0, self._worker_outstanding_cost.get(worker_id, 0) - cost
+            )
+        self._prompt_leased.pop(task_id, None)
+        self._prompts.pop(task_id, None)
 
     def complete_prompt_tasks(self, worker_id: str, task_ids: List[str]) -> None:
         """Retire successfully captured prompts that belong to another TP rank.
@@ -133,8 +180,7 @@ class DataFlowController:
                 owner = self._prompt_leased.get(task_id)
                 if owner is not None and owner != worker_id:
                     continue
-                self._prompt_leased.pop(task_id, None)
-                self._prompts.pop(task_id, None)
+                self._retire_prompt_locked(task_id)
 
     def fail_prompt_tasks(
         self, worker_id: str, task_ids: List[str], reason: str, retryable: bool
@@ -161,16 +207,21 @@ class DataFlowController:
                     self._prompts[task_id] = dataclasses.replace(
                         task, attempt=task.attempt + 1
                     )
-                    if task_id not in self._prompt_pending:
+                    if self.prompt_routing == "least_tokens":
+                        route = self._prompt_route[task_id]
+                        pending = self._prompt_pending_by_worker[route]
+                        if task_id not in pending:
+                            pending.append(task_id)
+                    elif task_id not in self._prompt_pending:
                         self._prompt_pending.append(task_id)
                 elif retryable:
                     self._prompt_failed[task_id] = (
                         f"{reason} (attempts exhausted: {task.attempt + 1})"
                     )
-                    self._prompts.pop(task_id, None)
+                    self._retire_prompt_locked(task_id)
                 else:
                     self._prompt_failed[task_id] = reason
-                    self._prompts.pop(task_id, None)
+                    self._retire_prompt_locked(task_id)
 
     def commit_samples(self, worker_id: str, refs: List[SampleRef]) -> List[SampleRef]:
         """Commit refs and return the subset newly accepted by the ledger.
@@ -194,8 +245,7 @@ class DataFlowController:
         with self._lock:
             for ref in fresh:
                 if ref.source_task_id is not None:
-                    self._prompt_leased.pop(ref.source_task_id, None)
-                    self._prompts.pop(ref.source_task_id, None)
+                    self._retire_prompt_locked(ref.source_task_id)
         if fresh and self.sample_queue is not None:
             self.sample_queue.put(fresh)
         return fresh
@@ -271,7 +321,11 @@ class DataFlowController:
     def status(self) -> Dict[str, Any]:
         with self._lock:
             prompts = len(self._prompts)
-            pending = len(self._prompt_pending)
+            pending = (
+                sum(len(queue) for queue in self._prompt_pending_by_worker.values())
+                if self.prompt_routing == "least_tokens"
+                else len(self._prompt_pending)
+            )
             leased = len(self._prompt_leased)
             failed = len(self._prompt_failed)
             workers = len(self._workers)

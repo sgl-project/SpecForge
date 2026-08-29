@@ -154,6 +154,39 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     )
 
 
+def _mooncake_gpu_direct_store(
+    cfg: Config, *, retain_on_release: bool = False
+):
+    from specforge.runtime.data_plane.gpu_direct_store import (
+        MooncakeGpuDirectFeatureStore,
+    )
+
+    transport = os.environ.get("MOONCAKE_PROTOCOL", "rdma")
+    if transport == "mnnvl":
+        transport = "nvlink"
+    return MooncakeGpuDirectFeatureStore(
+        store_id=os.environ.get("DISAGG_STORE_ID", cfg.run_id),
+        local_hostname=os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"),
+        transport=transport,
+        rdma_devices=os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
+        retain_on_release=retain_on_release,
+        enable_transfers=cfg.training.role == "consumer",
+    )
+
+
+def _online_store(cfg: Config, *, retain_on_release: bool = False):
+    backend = os.environ.get("DISAGG_BACKEND", "mooncake")
+    if backend == "mooncake_gpu_direct":
+        return _mooncake_gpu_direct_store(
+            cfg, retain_on_release=retain_on_release
+        )
+    if backend == "mooncake":
+        return _mooncake_store(cfg, retain_on_release=retain_on_release)
+    raise ValueError(
+        f"online disaggregated training does not support backend {backend!r}"
+    )
+
+
 def _offline_store(cfg: Config, *, retain_on_release: bool = False):
     backend = os.environ.get("DISAGG_BACKEND", "shared_dir")
     if backend == "mooncake":
@@ -581,7 +614,9 @@ def _build_online(
     # The producer owns capture and explicit attempt cleanup. The consumer must
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
-    store = _mooncake_store(cfg, retain_on_release=cfg.training.role == "consumer")
+    store = _online_store(
+        cfg, retain_on_release=cfg.training.role == "consumer"
+    )
     from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
@@ -663,6 +698,13 @@ def _build_online(
             feature_source=adapters if len(adapters) > 1 else adapters[0],
             num_rollout_workers=len(adapters),
             producer_concurrency=cfg.runtime.producer_concurrency,
+            producer_ordered_publish=cfg.runtime.producer_ordered_publish,
+            producer_prompt_prefetch_batches=(
+                cfg.runtime.producer_prompt_prefetch_batches
+            ),
+            producer_reorder_buffer=cfg.runtime.producer_reorder_buffer,
+            producer_prompt_routing=cfg.runtime.producer_prompt_routing,
+            producer_prompt_batching=cfg.runtime.producer_prompt_batching,
             run_id=cfg.run_id,
             target_hidden_size=hidden_size,
             target_vocab_size=target_vocab,
@@ -688,6 +730,9 @@ def _build_online(
                 cfg.runtime.feature_store_max_resident_bytes
             ),
             peer_wait_timeout_s=peer_wait_timeout_s,
+            prompt_ingest_batch_size=(
+                cfg.runtime.producer_prompt_ingest_batch_size
+            ),
         )
 
         def produce() -> int:

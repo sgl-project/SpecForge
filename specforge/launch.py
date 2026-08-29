@@ -455,9 +455,10 @@ def _iter_epoch_online_prompt_batches(
     """Yield a shuffled epoch while bounding expanded token-list residency."""
     indices = _epoch_prompt_indices(prompts, epoch, seed=seed)
     for start in range(0, len(indices), batch_size):
+        batch_indices = indices[start : start + batch_size]
         yield [
             _epoch_online_prompt(prompts[index], index, epoch, prompt_epochs)
-            for index in indices[start : start + batch_size]
+            for index in batch_indices
         ]
 
 
@@ -807,6 +808,11 @@ def build_disagg_online_producer(
     feature_source=None,
     lease: int = 8,
     producer_concurrency: int = 1,
+    producer_ordered_publish: bool = False,
+    producer_prompt_prefetch_batches: int = 1,
+    producer_reorder_buffer: Optional[int] = None,
+    producer_prompt_routing: str = "shared",
+    producer_prompt_batching: str = "shuffle",
     in_flight_high_watermark: int = 256,
     in_flight_low_watermark: Optional[int] = None,
     resident_high_watermark_bytes: Optional[int] = None,
@@ -846,6 +852,13 @@ def build_disagg_online_producer(
     keeping a reconstructed plan stable across restarts. Prompt payloads are
     normalized and ingested in ``prompt_ingest_batch_size`` chunks so a large
     memory-mapped dataset does not expand every token list before rollout.
+    ``producer_ordered_publish`` retains concurrent capture while publishing
+    completed request batches in submission order. ``producer_reorder_buffer``
+    bounds completed out-of-order requests separately from active capture calls,
+    preventing one long request from collapsing target concurrency while
+    preserving request order across paired runs. A positive
+    ``producer_prompt_prefetch_batches`` keeps rollout workers alive and prepares
+    and ingests prompt chunks on a background feeder while capture is running.
 
     Failure semantics: a worker whose source raises (dead/unreachable server)
     has already failed its leases retryable — the surviving workers re-lease
@@ -901,6 +914,23 @@ def build_disagg_online_producer(
     producer_concurrency = int(producer_concurrency)
     if producer_concurrency < 1:
         raise ValueError("producer_concurrency must be >= 1")
+    producer_prompt_prefetch_batches = int(producer_prompt_prefetch_batches)
+    if producer_prompt_prefetch_batches < 0:
+        raise ValueError("producer_prompt_prefetch_batches must be >= 0")
+    if producer_reorder_buffer is None:
+        producer_reorder_buffer = producer_concurrency
+    producer_reorder_buffer = int(producer_reorder_buffer)
+    if producer_reorder_buffer < 0:
+        raise ValueError("producer_reorder_buffer must be >= 0")
+    if producer_prompt_routing not in ("shared", "least_tokens"):
+        raise ValueError(
+            "producer_prompt_routing must be either 'shared' or 'least_tokens'"
+        )
+    if producer_prompt_batching not in ("shuffle", "length_bucketed"):
+        raise ValueError(
+            "producer_prompt_batching must be either 'shuffle' or "
+            "'length_bucketed'"
+        )
     prompt_ingest_batch_size = int(prompt_ingest_batch_size)
     if prompt_ingest_batch_size < 1:
         raise ValueError("prompt_ingest_batch_size must be >= 1")
@@ -940,6 +970,10 @@ def build_disagg_online_producer(
         f"prompt_ingest_batch_size={prompt_ingest_batch_size} "
         f"lease={worker_lease} workers={num_rollout_workers} "
         f"concurrency={producer_concurrency} "
+        f"ordered_publish={producer_ordered_publish} "
+        f"prompt_prefetch_batches={producer_prompt_prefetch_batches} "
+        f"prompt_batching={producer_prompt_batching} "
+        f"reorder_buffer={producer_reorder_buffer} "
         f"watermarks={in_flight_high_watermark}/"
         f"{flow_control.limits.resolved_low_watermark_refs}"
     )
@@ -949,6 +983,7 @@ def build_disagg_online_producer(
         metadata_store=NoOpMetadataStore(),
         max_prompt_attempts=max_prompt_attempts,
         enable_sample_queue=False,
+        prompt_routing=producer_prompt_routing,
     )
     producer_timing(f"DataFlowController created elapsed={elapsed(phase)}")
 
@@ -993,6 +1028,10 @@ def build_disagg_online_producer(
             "drive_producer enter "
             f"workers={len(workers)} lease={worker_lease} "
             f"concurrency={producer_concurrency} max_rounds={max_rounds} "
+            f"prompt_prefetch_batches={producer_prompt_prefetch_batches} "
+            f"reorder_buffer={producer_reorder_buffer} "
+            f"prompt_routing={producer_prompt_routing} "
+            f"prompt_batching={producer_prompt_batching} "
             f"watermarks={in_flight_high_watermark}/"
             f"{flow_control.limits.resolved_low_watermark_refs} "
             f"progress_interval={progress_interval}"
@@ -1059,12 +1098,20 @@ def build_disagg_online_producer(
         published_sizes = deque()
         last_publish_log = {"t": time.perf_counter()}
         dead: dict = {}  # worker_id -> last failure reason
+        prompt_feed_done = threading.Event()
+        prompt_feed_abort = threading.Event()
+        if producer_prompt_prefetch_batches == 0:
+            prompt_feed_done.set()
 
         def pool_drained() -> bool:
             st = controller.status()
             # leased counts too: a peer's in-flight lease may fail retryable
             # and come back — leaving then would strand it.
-            return st["prompts_pending"] == 0 and st["prompts_leased"] == 0
+            return (
+                prompt_feed_done.is_set()
+                and st["prompts_pending"] == 0
+                and st["prompts_leased"] == 0
+            )
 
         def reconcile_consumed_locked() -> int:
             consumed = channel.consumed_remote()
@@ -1146,23 +1193,27 @@ def build_disagg_online_producer(
                     state["first_ref_logged"] = True
                     last_publish_log["t"] = now
 
-        def abort_unpublished(futures) -> None:
+        def abort_unpublished(futures, ready=()) -> None:
             """Drain active capture calls and free refs after a fatal driver error."""
+            unpublished = []
             for future in futures:
                 try:
-                    refs = future.result()
+                    unpublished.extend(future.result())
                 except BaseException:
                     continue
-                for ref in refs:
-                    try:
-                        feature_store.abort(
-                            ref.sample_id,
-                            reason="producer-driver-failed-before-publication",
-                        )
-                    except Exception:
-                        logger.exception(
-                            "failed to abort unpublished ref %s", ref.sample_id
-                        )
+            for _request_start, refs, exc in ready:
+                if exc is None:
+                    unpublished.extend(refs)
+            for ref in unpublished:
+                try:
+                    feature_store.abort(
+                        ref.sample_id,
+                        reason="producer-driver-failed-before-publication",
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to abort unpublished ref %s", ref.sample_id
+                    )
 
         def run_worker(w) -> None:
             failures = 0
@@ -1171,6 +1222,35 @@ def build_disagg_online_producer(
             backpressure_started = None
             last_backpressure_log = 0.0
             futures = {}
+            ready = {}
+            next_publish_sequence = 0
+
+            def finish_request(request_start, refs, exc) -> None:
+                nonlocal failures, accepting
+                if exc is not None:
+                    # The worker already failed this call's leases retryable.
+                    # Other active calls keep draining.
+                    failures += 1
+                    logger.warning(
+                        "rollout worker %s capture call failed (%d/%d): %s",
+                        w.worker_id,
+                        failures,
+                        max_worker_failures,
+                        exc,
+                    )
+                    if failures >= max_worker_failures:
+                        accepting = False
+                        dead[w.worker_id] = str(exc)
+                        logger.error(
+                            "dropping rollout worker %s after %d consecutive "
+                            "capture failures; health=%s",
+                            w.worker_id,
+                            failures,
+                            w.health(),
+                        )
+                    return
+                failures = 0
+                publish_refs(w, refs, request_start)
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=producer_concurrency,
@@ -1207,7 +1287,7 @@ def build_disagg_online_producer(
                                 producer_timing(
                                     "backpressure wait "
                                     f"worker={w.worker_id} "
-                                    f"active_requests={len(futures)} "
+                                    f"active_requests={len(futures) + len(ready)} "
                                     f"produced={state['produced']} "
                                     f"in_flight={in_flight} "
                                     f"resident_bytes={current_resident_bytes} "
@@ -1236,6 +1316,13 @@ def build_disagg_online_producer(
                             and not paused
                             and submitted < max_rounds
                             and len(futures) < producer_concurrency
+                            and len(futures) + len(ready)
+                            < producer_concurrency
+                            + (
+                                producer_reorder_buffer
+                                if producer_ordered_publish
+                                else 0
+                            )
                             and status["prompts_pending"] > 0
                         ):
                             request_start = time.perf_counter()
@@ -1243,11 +1330,11 @@ def build_disagg_online_producer(
                                 w.run_once,
                                 max_tasks=worker_lease,
                             )
-                            futures[future] = request_start
+                            futures[future] = (submitted, request_start)
                             submitted += 1
                             status = controller.status()
 
-                        if not futures:
+                        if not futures and not ready:
                             if pool_drained():
                                 producer_timing(
                                     "pool drained "
@@ -1267,38 +1354,32 @@ def build_disagg_online_producer(
                             return_when=concurrent.futures.FIRST_COMPLETED,
                         )
                         for future in done:
-                            request_start = futures.pop(future)
+                            sequence, request_start = futures.pop(future)
                             try:
                                 refs = future.result()
                             except Exception as exc:
-                                # The worker already failed this call's leases
-                                # retryable. Other active calls keep draining.
-                                failures += 1
-                                logger.warning(
-                                    "rollout worker %s capture call failed (%d/%d): %s",
-                                    w.worker_id,
-                                    failures,
-                                    max_worker_failures,
-                                    exc,
-                                )
-                                if failures >= max_worker_failures:
-                                    accepting = False
-                                    dead[w.worker_id] = str(exc)
-                                    logger.error(
-                                        "dropping rollout worker %s after %d "
-                                        "consecutive capture failures; health=%s",
-                                        w.worker_id,
-                                        failures,
-                                        w.health(),
-                                    )
-                                continue
-                            failures = 0
-                            publish_refs(w, refs, request_start)
+                                outcome = (request_start, (), exc)
+                            else:
+                                outcome = (request_start, refs, None)
+                            if producer_ordered_publish:
+                                ready[sequence] = outcome
+                            else:
+                                finish_request(*outcome)
+                        if producer_ordered_publish:
+                            while next_publish_sequence in ready:
+                                outcome = ready.pop(next_publish_sequence)
+                                next_publish_sequence += 1
+                                finish_request(*outcome)
                 except BaseException:
-                    abort_unpublished(futures)
+                    abort_unpublished(futures, ready.values())
                     raise
 
         def ingest_prompt_batch(epoch: int, batch_index: int, epoch_prompts) -> None:
+            if producer_prompt_batching == "length_bucketed":
+                epoch_prompts.sort(
+                    key=lambda prompt: len(prompt["payload"]["input_ids"]),
+                    reverse=True,
+                )
             phase = time.perf_counter()
             producer_timing(
                 "controller.ingest_prompts start "
@@ -1322,6 +1403,7 @@ def build_disagg_online_producer(
                     run_worker(w)
                 except BaseException as exc:  # e.g. a channel publish failure
                     fatal.append((w.worker_id, exc))
+                    prompt_feed_abort.set()
 
             if len(live_workers) == 1:
                 run_worker(live_workers[0])
@@ -1342,51 +1424,127 @@ def build_disagg_online_producer(
             if fatal:
                 raise fatal[0][1]
 
+        def run_prefetched_prompt_stream(live_workers) -> None:
+            """Feed prompt chunks concurrently while one persistent worker pool runs."""
+            feeder_failures: list = []
+            max_outstanding = (
+                producer_prompt_prefetch_batches * prompt_ingest_batch_size
+            )
+
+            def feed_prompts() -> None:
+                try:
+                    for epoch in range(prompt_epochs):
+                        if prompt_feed_abort.is_set() or (
+                            should_stop is not None and should_stop()
+                        ):
+                            return
+                        epoch_batches = _iter_epoch_online_prompt_batches(
+                            prompts,
+                            epoch,
+                            prompt_epochs,
+                            seed=prompt_seed,
+                            batch_size=prompt_ingest_batch_size,
+                        )
+                        queued = 0
+                        for batch_index, prompt_batch in enumerate(epoch_batches):
+                            while True:
+                                if prompt_feed_abort.is_set() or (
+                                    should_stop is not None and should_stop()
+                                ):
+                                    return
+                                if len(dead) >= len(workers):
+                                    raise RuntimeError(
+                                        "all rollout workers were dropped while "
+                                        "the prompt feeder still had work"
+                                    )
+                                status = controller.status()
+                                outstanding = (
+                                    status["prompts_pending"]
+                                    + status["prompts_leased"]
+                                )
+                                if outstanding <= max_outstanding:
+                                    break
+                                sleep(backpressure_poll_s)
+                            ingest_prompt_batch(epoch, batch_index, prompt_batch)
+                            queued += len(prompt_batch)
+                        producer_timing(
+                            "epoch enqueued "
+                            f"epoch={epoch + 1}/{prompt_epochs} "
+                            f"prompts={queued} elapsed={elapsed(drive_start)}"
+                        )
+                except BaseException as exc:
+                    feeder_failures.append(exc)
+                finally:
+                    prompt_feed_done.set()
+
+            feeder = threading.Thread(
+                target=feed_prompts,
+                name="prompt-feeder",
+                daemon=True,
+            )
+            feeder.start()
+            try:
+                run_epoch_workers(live_workers)
+            except BaseException:
+                prompt_feed_abort.set()
+                feeder.join()
+                raise
+            feeder.join()
+            if feeder_failures:
+                raise feeder_failures[0]
+
         try:
             live_workers = list(workers)
-            for epoch in range(prompt_epochs):
-                if should_stop is not None and should_stop():
-                    break
-                epoch_batches = _iter_epoch_online_prompt_batches(
-                    prompts,
-                    epoch,
-                    prompt_epochs,
-                    seed=prompt_seed,
-                    batch_size=prompt_ingest_batch_size,
-                )
-                stopped = False
-                for batch_index, prompt_batch in enumerate(epoch_batches):
+            if producer_prompt_prefetch_batches > 0:
+                run_prefetched_prompt_stream(live_workers)
+            else:
+                for epoch in range(prompt_epochs):
                     if should_stop is not None and should_stop():
-                        stopped = True
                         break
-                    ingest_prompt_batch(epoch, batch_index, prompt_batch)
-                    if not live_workers:
-                        raise RuntimeError(
-                            f"all rollout workers were already dropped before "
-                            f"epoch {epoch + 1}/{prompt_epochs} batch "
-                            f"{batch_index + 1} could run — dead workers: {dead}"
-                        )
-                    run_epoch_workers(live_workers)
-                    stopped = should_stop is not None and should_stop()
-                    live_workers = [w for w in live_workers if w.worker_id not in dead]
-                    if dead and not stopped and not pool_drained():
-                        raise RuntimeError(
-                            f"all rollout workers exited with {len(dead)} dropped "
-                            f"as dead and prompts remaining — dead workers: {dead}"
-                        )
+                    epoch_batches = _iter_epoch_online_prompt_batches(
+                        prompts,
+                        epoch,
+                        prompt_epochs,
+                        seed=prompt_seed,
+                        batch_size=prompt_ingest_batch_size,
+                    )
+                    stopped = False
+                    for batch_index, prompt_batch in enumerate(epoch_batches):
+                        if should_stop is not None and should_stop():
+                            stopped = True
+                            break
+                        ingest_prompt_batch(epoch, batch_index, prompt_batch)
+                        if not live_workers:
+                            raise RuntimeError(
+                                f"all rollout workers were already dropped before "
+                                f"epoch {epoch + 1}/{prompt_epochs} batch "
+                                f"{batch_index + 1} could run — dead workers: {dead}"
+                            )
+                        run_epoch_workers(live_workers)
+                        stopped = should_stop is not None and should_stop()
+                        live_workers = [
+                            w for w in live_workers if w.worker_id not in dead
+                        ]
+                        if dead and not stopped and not pool_drained():
+                            raise RuntimeError(
+                                f"all rollout workers exited with {len(dead)} "
+                                f"dropped as dead and prompts remaining — "
+                                f"dead workers: {dead}"
+                            )
+                        if stopped:
+                            break
                     if stopped:
                         break
-                if stopped:
-                    break
-                st = controller.status()
-                producer_timing(
-                    "epoch drained "
-                    f"epoch={epoch + 1}/{prompt_epochs} "
-                    f"produced={state['produced']} "
-                    f"prompts_failed={st['prompts_failed']} "
-                    f"pending={st['prompts_pending']} leased={st['prompts_leased']} "
-                    f"elapsed={elapsed(drive_start)}"
-                )
+                    st = controller.status()
+                    producer_timing(
+                        "epoch drained "
+                        f"epoch={epoch + 1}/{prompt_epochs} "
+                        f"produced={state['produced']} "
+                        f"prompts_failed={st['prompts_failed']} "
+                        f"pending={st['prompts_pending']} "
+                        f"leased={st['prompts_leased']} "
+                        f"elapsed={elapsed(drive_start)}"
+                    )
             st = controller.status()
             stopped = should_stop is not None and should_stop()
             if st["prompts_failed"] and not stopped:

@@ -199,6 +199,12 @@ class RuntimeConfig(StrictConfigModel):
 
     producer_lease: int = Field(default=8, gt=0)
     producer_concurrency: int = Field(default=1, gt=0)
+    producer_ordered_publish: bool = False
+    producer_prompt_prefetch_batches: int = Field(default=1, ge=0)
+    producer_reorder_buffer: Optional[int] = Field(default=None, ge=0)
+    producer_prompt_routing: Literal["shared", "least_tokens"] = "shared"
+    producer_prompt_batching: Literal["shuffle", "length_bucketed"] = "shuffle"
+    producer_prompt_ingest_batch_size: int = Field(default=4096, gt=0)
     in_flight_high_watermark: int = Field(default=256, gt=0)
     in_flight_low_watermark: int = Field(default=192, ge=0)
     resident_high_watermark_bytes: Optional[int] = Field(default=None, gt=0)
@@ -411,7 +417,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: shared-filesystem requirement between trainer nodes while keeping the
     #: authority-owned source channel and SQLite/WAL on trainer node 0.
     inbox_server_url: Optional[str] = None
-    backend: Literal["shared_dir", "mooncake"]
+    backend: Literal["shared_dir", "mooncake", "mooncake_gpu_direct"]
     store_root: Optional[str] = None
     store_id: Optional[str] = None
     server_urls: List[str] = Field(default_factory=list)
@@ -469,6 +475,16 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
         if self.backend == "shared_dir" and not self.store_root:
             raise ValueError(
                 "deployment.disaggregated.store_root is required for shared_dir"
+            )
+        if (
+            self.backend == "mooncake_gpu_direct"
+            and self.mooncake_protocol is not None
+            and self.mooncake_protocol
+            not in ("nvlink", "nvlink_intra", "mnnvl", "rdma")
+        ):
+            raise ValueError(
+                "mooncake_gpu_direct requires mooncake_protocol=nvlink, "
+                "nvlink_intra, or rdma"
             )
         if self.managed_local is not None:
             if self.backend != "mooncake":
@@ -788,11 +804,21 @@ class Config(StrictConfigModel):
             mode == "online"
             and deployment == "disaggregated"
             and self.deployment.disaggregated is not None
-            and self.deployment.disaggregated.backend != "mooncake"
+            and self.deployment.disaggregated.backend
+            not in {"mooncake", "mooncake_gpu_direct"}
         ):
             raise ValueError(
                 "online disaggregated training requires "
-                "deployment.disaggregated.backend=mooncake"
+                "deployment.disaggregated.backend=mooncake or mooncake_gpu_direct"
+            )
+        if (
+            mode != "online"
+            and deployment == "disaggregated"
+            and self.deployment.disaggregated is not None
+            and self.deployment.disaggregated.backend == "mooncake_gpu_direct"
+        ):
+            raise ValueError(
+                "deployment.disaggregated.backend=mooncake_gpu_direct requires online mode"
             )
         managed_local = (
             self.deployment.disaggregated.managed_local

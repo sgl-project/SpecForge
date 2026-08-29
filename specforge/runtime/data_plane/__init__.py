@@ -21,6 +21,7 @@ __all__ = [
     "list_feature_files",
     "SharedDirFeatureStore",
     "MooncakeFeatureStore",
+    "MooncakeGpuDirectFeatureStore",
     "AuthPolicy",
 ]
 
@@ -38,6 +39,7 @@ _EXPORT_MODULE = {
     "list_feature_files": "offline_reader",
     "SharedDirFeatureStore": "disaggregated",
     "MooncakeFeatureStore": "mooncake_store",
+    "MooncakeGpuDirectFeatureStore": "gpu_direct_store",
     "AuthPolicy": "disaggregated",
 }
 
