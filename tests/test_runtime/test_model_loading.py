@@ -225,6 +225,29 @@ assert not torch.cuda.is_initialized()
                     provider=_draft_config_provider("dflash"),
                 )
 
+    def test_dflash_resolution_validates_mla_before_model_construction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "draft.json")
+            payload = _draft_payload("DFlashDraftModel", block_size=16)
+            payload.update(
+                q_lora_rank=16,
+                kv_lora_rank=8,
+                qk_nope_head_dim=4,
+                qk_rope_head_dim=4,
+                v_head_dim=8,
+                rope_interleave="false",
+            )
+            payload["dflash_config"] = {"attention_mode": "mla"}
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+
+            cfg = _run_config("dflash", draft_model_config=path)
+            with self.assertRaisesRegex(ValueError, "rope_interleave"):
+                resolve_draft_config(
+                    cfg,
+                    provider=_draft_config_provider("dflash"),
+                )
+
     def test_local_json_and_directory_are_equivalent_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "config.json")
