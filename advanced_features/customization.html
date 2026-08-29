@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 21, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 29, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -475,6 +475,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#chat-templates">Chat templates</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#target-models">Target models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash-family-attention-modes">DFlash-family attention modes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-architectures">Draft architectures</a></li>
 </ul>
             </nav>
@@ -576,6 +577,44 @@ Offline feature training performs no target inference.</p>
 tracking are also config features rather than custom launchers; see the
 <a class="reference internal" href="../basic_usage/training.html"><span class="std std-doc">training guide</span></a> for their validated combinations.</p>
 </section>
+<section id="dflash-family-attention-modes">
+<h2>DFlash-family attention modes<a class="headerlink" href="#dflash-family-attention-modes" title="Link to this heading">#</a></h2>
+<p>DFlash-family draft models select their attention parameterization with
+<code class="docutils literal notranslate"><span class="pre">dflash_config.attention_mode</span></code>: <code class="docutils literal notranslate"><span class="pre">gqa</span></code> (the default), <code class="docutils literal notranslate"><span class="pre">mha</span></code>, or <code class="docutils literal notranslate"><span class="pre">mla</span></code>. The mode
+swaps only the attention projections inside the shared decoder layer; the
+<code class="docutils literal notranslate"><span class="pre">DFlashDraftModel</span></code>, <code class="docutils literal notranslate"><span class="pre">DominoDraftModel</span></code>, and <code class="docutils literal notranslate"><span class="pre">DSparkDraftModel</span></code> architectures,
+target-context injection, per-layer full/sliding masks, objectives, capture
+contract, and <code class="docutils literal notranslate"><span class="pre">eager</span></code>/<code class="docutils literal notranslate"><span class="pre">sdpa</span></code>/<code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> backend selection are identical
+across modes. Multi-head Latent Attention is therefore a draft JSON change,
+not a new architecture:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"architectures"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"DSparkDraftModel"</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"hidden_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"num_attention_heads"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"q_lora_rank"</span><span class="p">:</span><span class="w"> </span><span class="mi">1536</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"kv_lora_rank"</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"qk_nope_head_dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">128</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"qk_rope_head_dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"v_head_dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">128</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"dflash_config"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"projector_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"dspark"</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"attention_mode"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mla"</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>MLA dimensions and behavior use the standard top-level Hugging Face fields:
+<code class="docutils literal notranslate"><span class="pre">q_lora_rank</span></code> (<code class="docutils literal notranslate"><span class="pre">null</span></code> selects a direct query projection), <code class="docutils literal notranslate"><span class="pre">kv_lora_rank</span></code>, the
+head dims (<code class="docutils literal notranslate"><span class="pre">qk_nope_head_dim</span></code> may be zero; <code class="docutils literal notranslate"><span class="pre">qk_rope_head_dim</span></code> must be even),
+and <code class="docutils literal notranslate"><span class="pre">rope_interleave</span></code> for the rotation convention (omitted means interleaved,
+the DeepSeek default; <code class="docutils literal notranslate"><span class="pre">false</span></code> selects NeoX-style half rotation). Omitting
+<code class="docutils literal notranslate"><span class="pre">attention_mode</span></code> preserves the existing GQA path; <code class="docutils literal notranslate"><span class="pre">&quot;mha&quot;</span></code> requires equal
+query/KV head counts.</p>
+<p>MLA is a training-side mode: checkpoints train, evaluate through
+<code class="docutils literal notranslate"><span class="pre">spec_generate</span></code>, and export through <code class="docutils literal notranslate"><span class="pre">--to</span> <span class="pre">hf</span></code>. SGLang serving of DFlash-family
+drafts currently implements the GQA/MHA layout only, so plan benchmarks
+accordingly.</p>
+</section>
 <section id="draft-architectures">
 <h2>Draft architectures<a class="headerlink" href="#draft-architectures" title="Link to this heading">#</a></h2>
 <p>Draft classes register through <code class="docutils literal notranslate"><span class="pre">&#64;register_draft</span></code>. The key defaults to the
@@ -672,6 +711,7 @@ method-specific launcher or a second mutable registry.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#chat-templates">Chat templates</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#target-models">Target models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash-family-attention-modes">DFlash-family attention modes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-architectures">Draft architectures</a></li>
 </ul>
   </nav></div>
@@ -706,7 +746,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 21, 2026.
+  Last updated on Aug 29, 2026.
   <br/>
 </p>
   </div>
