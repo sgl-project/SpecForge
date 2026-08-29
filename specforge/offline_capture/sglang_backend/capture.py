@@ -193,6 +193,7 @@ class OfflineSGLangCaptureBackend:
             batch,
             self.model_runner,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
         )
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         output = self.model_runner.forward(forward_batch)

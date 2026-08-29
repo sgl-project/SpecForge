@@ -95,6 +95,27 @@ class SGLang0518CompatibilityTest(unittest.TestCase):
         )
         self.assertIn("model_runner", {keyword.arg for keyword in mlp_call.keywords})
 
+        forward_tree = ast.parse(
+            textwrap.dedent(
+                inspect.getsource(
+                    sglang_capture.OfflineSGLangCaptureBackend._forward_extend
+                )
+            )
+        )
+        forward_call = next(
+            node
+            for node in ast.walk(forward_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "init_new"
+        )
+        forward_keywords = {
+            keyword.arg: keyword.value for keyword in forward_call.keywords
+        }
+        return_before_norm = forward_keywords.get("return_hidden_states_before_norm")
+        self.assertIsInstance(return_before_norm, ast.Constant)
+        self.assertFalse(return_before_norm.value)
+
     def test_dp_attention_rank_uses_current_runtime_flags(self):
         import sglang.srt.layers.dp_attention as dp_attention
 
