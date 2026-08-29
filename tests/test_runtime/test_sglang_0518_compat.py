@@ -108,6 +108,8 @@ class SGLang0518CompatibilityTest(unittest.TestCase):
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "init_new"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "ForwardBatch"
         )
         forward_keywords = {
             keyword.arg: keyword.value for keyword in forward_call.keywords
