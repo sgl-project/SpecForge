@@ -24,6 +24,42 @@ python -m pip install -e . --no-deps
 torch/sglang. If a later step reports a missing lightweight dependency, install
 just that package, also with `--no-deps`.
 
+### Install Mooncake (Ascend)
+
+Online runs move features through Mooncake; the launcher checks for the
+`mooncake_master` binary and the `mooncake` Python package at startup. The
+fastest path is the official NPU wheel:
+
+```bash
+pip install mooncake-transfer-engine-npu
+```
+
+If the wheel does not cover your platform, build from source instead (see the
+[vLLM-Ascend Mooncake guide](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/features/pd_colocated_mooncake_multi_instance.html)
+for the full walkthrough):
+
+```bash
+git clone -b v0.3.9 --depth 1 https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+git submodule update --init --recursive
+apt-get install -y mpich libmpich-dev
+bash dependencies.sh -y
+mkdir build && cd build
+cmake .. -DUSE_ASCEND_DIRECT=ON   # mandatory on Ascend
+make -j && make install
+```
+
+Either way, verify both pieces before continuing:
+
+```bash
+mooncake_master --help >/dev/null && echo mooncake_master ok
+python -c "from mooncake.store import MooncakeDistributedStore; print('mooncake.store ok')"
+```
+
+If the capture server later dies with "no `allocate_and_mount_segment`", the
+Mooncake build is too old for the companion patch below — upgrade or rebuild
+it first.
+
 ### Apply the SGLang capture patches (online runs only)
 
 Online capture needs two patches on top of the installed SGLang, applied **in
@@ -36,7 +72,7 @@ bash scripts/apply_sglang_spec_capture_patch.sh
 # Ascend companion patch: skip the wildcard segment mount that Ascend
 # Mooncake rejects, and mount the feature segment with location="cpu"
 SGLANG_DIR=$(python -c "import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))")
-cd "$SGLANG_DIR" && git apply /path/to/SpecForge/patches/sglang/v0.5.14/spec-capture-ascend-mount.patch
+cd "$SGLANG_DIR" && git apply -p2 /path/to/SpecForge/patches/sglang/v0.5.14/spec-capture-ascend-mount.patch
 ```
 
 Skip both for offline training, which reads features from disk. The companion
