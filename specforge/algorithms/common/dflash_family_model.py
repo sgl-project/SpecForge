@@ -2,7 +2,7 @@
 """DFlash-family training models and shared masking helpers."""
 
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,7 +25,6 @@ except ImportError:
 if hasattr(torch, "npu") and torch.npu.is_available():
     FLEX_ATTENTION_AVAILABLE = False
 
-
 _VALID_LOSS_TYPES = {
     "dflash",
     "dpace",
@@ -34,6 +33,48 @@ _VALID_LOSS_TYPES = {
 }
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
 _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
+
+
+class SelectorTerms(NamedTuple):
+    """Additive selector objective and metric terms for one objective chunk."""
+
+    ce_num: torch.Tensor
+    probability_num: torch.Tensor
+    correct_num: torch.Tensor
+    weight_den: torch.Tensor
+    covered_num: torch.Tensor
+
+    @classmethod
+    def zeros(cls, reference: torch.Tensor) -> "SelectorTerms":
+        return cls(
+            reference.new_zeros(()),
+            reference.new_zeros(()),
+            reference.new_zeros(()),
+            reference.new_zeros(()),
+            reference.new_zeros(()),
+        )
+
+
+class DFlashObjectiveTerms(NamedTuple):
+    """Additive terms for ``OnlineDFlashModel``'s block objective.
+
+    This tuple covers the standard DFlash and D-PACE loss variants, including
+    the optional DFlash2 selector terms. It is not shared with Domino or DSpark;
+    those models define separate objective reductions. The fields stay flat and
+    tensor-only to satisfy ``checkpointed_chunk_reduce``'s chunk-function contract.
+    """
+
+    ce_loss_num: torch.Tensor
+    tv_loss_num: torch.Tensor
+    loss_den: torch.Tensor
+    target_probability_num: torch.Tensor
+    correct_num: torch.Tensor
+    accuracy_den: torch.Tensor
+    selector_ce_num: torch.Tensor
+    selector_probability_num: torch.Tensor
+    selector_correct_num: torch.Tensor
+    selector_weight_den: torch.Tensor
+    selector_covered_num: torch.Tensor
 
 
 def compute_accept_len(
@@ -213,6 +254,20 @@ class OnlineDFlashModel(nn.Module):
         self.kl_scale = float(kl_scale)
         self.kl_decay = float(kl_decay)
 
+        candidate_selector = getattr(self.draft_model, "candidate_selector", None)
+        self._selector_objective_enabled = (
+            candidate_selector is not None and self.selector_loss_alpha > 0
+        )
+        if (
+            candidate_selector is not None
+            and not self._selector_objective_enabled
+            and isinstance(candidate_selector, nn.Module)
+        ):
+            # A zero configured weight statically disables selector training.
+            # Freezing keeps those parameters out of BF16Optimizer and prevents
+            # DDP(find_unused_parameters=False) from waiting for their gradients.
+            candidate_selector.requires_grad_(False)
+
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
@@ -386,9 +441,20 @@ class OnlineDFlashModel(nn.Module):
             # DFlash's dynamic short-query batches are training/prefill shaped,
             # not autoregressive decoding.  AUTO may route q_len < 128 to the
             # more restrictive flex-decoding kernel, whose config set can be
-            # empty for DFlash's sparse BlockMask.  Keep the general Triton
+            # empty for DFlash's sparse BlockMask.  Force the general Triton
             # Flex Attention kernel for every DFlash-family batch.
-            draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
+            #
+            # The "BACKEND" kernel_option only exists on torch >= 2.11, where
+            # the inductor lowering sanitizes it out of the generated Triton
+            # constexprs.  On older builds (including current torch ROCm wheels)
+            # the string leaks into the kernel as a bare identifier and fails to
+            # compile (NameError: 'TRITON' is not defined), so we fall back to
+            # FORCE_USE_FLEX_ATTENTION, which selects the same kernel and has
+            # been supported since torch 2.5.
+            if torch.__version__ >= "2.11":
+                draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
+            else:
+                draft_kwargs["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
@@ -398,14 +464,78 @@ class OnlineDFlashModel(nn.Module):
         )
         return anchor_positions, block_keep_mask, output_hidden
 
+    def _selector_chunk_terms(
+        self,
+        candidate_selector: nn.Module,
+        objective_logits: torch.Tensor,
+        hidden: torch.Tensor,
+        target_ids: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        loss_weights: torch.Tensor,
+        weight_mask: torch.Tensor,
+    ) -> SelectorTerms:
+        """Return additive selector terms for one enabled objective chunk.
+
+        The caller gates this helper only on the model-static selector
+        configuration, never on the per-step effective selector alpha. During
+        warmup the zero-scaled CE term must remain in the autograd graph so DDP
+        with ``find_unused_parameters=False`` observes every selector parameter.
+        The caller flattens these fields into ``DFlashObjectiveTerms`` to preserve
+        ``checkpointed_chunk_reduce``'s flat tuple contract.
+        """
+
+        # Match serving exactly: train only against the strict unary top-k.
+        # Candidate misses are a backbone/recall failure, not a selector
+        # classification example, so they carry no selector gradient.
+        unary_logits, candidate_ids = objective_logits.topk(
+            candidate_selector.top_k,
+            dim=-1,
+        )
+        target_matches = candidate_ids.eq(target_ids.unsqueeze(-1))
+        target_is_candidate = target_matches.any(dim=-1)
+        target_candidate_index = target_matches.long().argmax(dim=-1)
+        selector_logits = candidate_selector.score_candidates(
+            candidate_ids=candidate_ids,
+            unary_logits=unary_logits,
+            hidden_states=hidden,
+            predecessor_ids=predecessor_ids,
+        )
+        selector_ce = F.cross_entropy(
+            selector_logits.float().reshape(-1, selector_logits.shape[-1]),
+            target_candidate_index.reshape(-1),
+            reduction="none",
+        ).reshape_as(target_ids)
+        selector_probability = torch.exp(-selector_ce)
+        selector_loss_weights = loss_weights * target_is_candidate.float()
+        selector_metric_mask = weight_mask * target_is_candidate.float()
+        ce_num = (selector_ce * selector_loss_weights).sum()
+        probability_num = (selector_probability.detach() * selector_metric_mask).sum()
+        weight_den = selector_loss_weights.sum()
+        covered_num = selector_metric_mask.sum()
+        with torch.no_grad():
+            selected_ids = candidate_ids.gather(
+                -1,
+                selector_logits.argmax(dim=-1, keepdim=True),
+            ).squeeze(-1)
+            correct_num = (
+                (selected_ids == target_ids).float() * selector_loss_weights
+            ).sum()
+        return SelectorTerms(
+            ce_num=ce_num,
+            probability_num=probability_num,
+            correct_num=correct_num,
+            weight_den=weight_den,
+            covered_num=covered_num,
+        )
+
     def _dflash_objective_chunk_terms(
         self,
         hidden: torch.Tensor,
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, ...]:
-        """Return additive token-objective, weighting, and metric terms."""
+    ) -> DFlashObjectiveTerms:
+        """Return a flat tuple of additive objective and metric tensors."""
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         logits = self.lm_head(
@@ -456,52 +586,17 @@ class OnlineDFlashModel(nn.Module):
             tv_loss_num = ce_loss_num.new_zeros(())
         target_probability_num = (target_probability.detach() * weight_mask).sum()
 
-        selector_ce_num = ce_loss_num.new_zeros(())
-        selector_tv_num = ce_loss_num.new_zeros(())
-        selector_probability_num = ce_loss_num.new_zeros(())
-        selector_correct_num = ce_loss_num.new_zeros(())
-        selector_weight_den = ce_loss_num.new_zeros(())
-        selector_covered_num = ce_loss_num.new_zeros(())
-        if candidate_selector is not None and self.selector_loss_alpha > 0:
-            # Match serving exactly: train only against the strict unary top-k.
-            # Candidate misses are a backbone/recall failure, not a selector
-            # classification example, so they carry no selector gradient.
-            selector_source_logits = objective_logits
-            unary_logits, candidate_ids = selector_source_logits.topk(
-                candidate_selector.top_k,
-                dim=-1,
-            )
-            target_matches = candidate_ids.eq(target_ids.unsqueeze(-1))
-            target_is_candidate = target_matches.any(dim=-1)
-            target_candidate_index = target_matches.long().argmax(dim=-1)
-            selector_logits = candidate_selector.score_candidates(
-                candidate_ids=candidate_ids,
-                unary_logits=unary_logits,
-                hidden_states=hidden,
+        selector_terms = SelectorTerms.zeros(ce_loss_num)
+        if self._selector_objective_enabled:
+            selector_terms = self._selector_chunk_terms(
+                candidate_selector=candidate_selector,
+                objective_logits=objective_logits,
+                hidden=hidden,
+                target_ids=target_ids,
                 predecessor_ids=predecessor_ids,
+                loss_weights=loss_weights,
+                weight_mask=weight_mask,
             )
-            selector_ce = F.cross_entropy(
-                selector_logits.float().reshape(-1, selector_logits.shape[-1]),
-                target_candidate_index.reshape(-1),
-                reduction="none",
-            ).reshape_as(target_ids)
-            selector_probability = torch.exp(-selector_ce)
-            selector_loss_weights = loss_weights * target_is_candidate.float()
-            selector_metric_mask = weight_mask * target_is_candidate.float()
-            selector_ce_num = (selector_ce * selector_loss_weights).sum()
-            selector_probability_num = (
-                selector_probability.detach() * selector_metric_mask
-            ).sum()
-            selector_weight_den = selector_loss_weights.sum()
-            selector_covered_num = selector_metric_mask.sum()
-            with torch.no_grad():
-                selected_ids = candidate_ids.gather(
-                    -1,
-                    selector_logits.argmax(dim=-1, keepdim=True),
-                ).squeeze(-1)
-                selector_correct_num = (
-                    (selected_ids == target_ids).float() * selector_loss_weights
-                ).sum()
 
         with torch.no_grad():
             predicted_ids = objective_logits.argmax(dim=-1)
@@ -509,19 +604,18 @@ class OnlineDFlashModel(nn.Module):
                 ((predicted_ids == target_ids) & (weight_mask > 0.5)).sum().float()
             )
             accuracy_den = weight_mask.sum()
-        return (
-            ce_loss_num,
-            tv_loss_num,
-            loss_den,
-            target_probability_num,
-            correct_num,
-            accuracy_den,
-            selector_ce_num,
-            selector_tv_num,
-            selector_probability_num,
-            selector_correct_num,
-            selector_weight_den,
-            selector_covered_num,
+        return DFlashObjectiveTerms(
+            ce_loss_num=ce_loss_num,
+            tv_loss_num=tv_loss_num,
+            loss_den=loss_den,
+            target_probability_num=target_probability_num,
+            correct_num=correct_num,
+            accuracy_den=accuracy_den,
+            selector_ce_num=selector_terms.ce_num,
+            selector_probability_num=selector_terms.probability_num,
+            selector_correct_num=selector_terms.correct_num,
+            selector_weight_den=selector_terms.weight_den,
+            selector_covered_num=selector_terms.covered_num,
         )
 
     def _compose_token_objective(
@@ -614,7 +708,6 @@ class OnlineDFlashModel(nn.Module):
             correct_num,
             accuracy_denom,
             selector_ce_num,
-            _selector_tv_num,
             selector_probability_num,
             selector_correct_num,
             selector_weight_den,
@@ -642,10 +735,7 @@ class OnlineDFlashModel(nn.Module):
         if effective_selector_alpha < 0:
             raise ValueError("selector_loss_alpha must be >= 0")
         selector_loss_num = loss_num.new_zeros(())
-        has_selector_objective = (
-            getattr(self.draft_model, "candidate_selector", None) is not None
-            and self.selector_loss_alpha > 0
-        )
+        has_selector_objective = self._selector_objective_enabled
         if has_selector_objective:
             # The selector is a categorical distribution over the serving
             # top-k. Keep its proper, calibrated CE independent of the base
@@ -688,7 +778,10 @@ class OnlineDFlashModel(nn.Module):
         }
         if has_selector_objective:
             metrics["selector_loss_alpha"] = effective_selector_alpha
-        loss = loss_num / loss_denominator
+        # Reduce all chunks before flooring the denominator so the result does
+        # not depend on how many chunks happen to contain no effective weight.
+        denominator_floor = torch.finfo(loss_denominator.dtype).tiny
+        loss = loss_num / loss_denominator.clamp_min(denominator_floor)
         metrics["loss_terms"] = (loss_num, loss_denominator.detach())
         accuracy = correct_num / accuracy_denom
         return loss, accuracy, metrics

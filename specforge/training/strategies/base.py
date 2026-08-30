@@ -481,8 +481,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             return 0.0
 
         ramp_steps = int(
-            total_steps
-            * float(getattr(self.dflash_model, "selector_ramp_ratio", 0.0))
+            total_steps * float(getattr(self.dflash_model, "selector_ramp_ratio", 0.0))
         )
         if ramp_steps <= 0:
             return target

@@ -508,6 +508,27 @@ class TestDFlashLosses(unittest.TestCase):
         torch.testing.assert_close(metrics["loss_terms"][0], weighted_sum)
         torch.testing.assert_close(metrics["loss_terms"][1], effective_weight_sum)
 
+    def test_dpace_zero_effective_weight_has_finite_local_loss(self):
+        logits = torch.zeros_like(self.logits)
+        logits.scatter_(-1, self.targets.unsqueeze(-1), -1000.0)
+        model = _make_model(
+            logits,
+            self.anchors,
+            self.keep_mask,
+            loss_type="dpace",
+            dpace_alpha=0.0,
+        )
+
+        loss, _accuracy, metrics = model(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(loss.item(), 0.0)
+        self.assertEqual(metrics["loss_terms"][1].item(), 0.0)
+
     def test_alpha_changes_dpace_loss(self):
         low_alpha = self._forward_loss(loss_type="dpace", dpace_alpha=0.1)
         high_alpha = self._forward_loss(loss_type="dpace", dpace_alpha=0.9)

@@ -169,7 +169,12 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
                 loss_mask=torch.ones(1, 4),
             )
 
-        self.assertEqual(layers[0].kernel_options, {"BACKEND": "TRITON"})
+        expected_kernel_options = (
+            {"BACKEND": "TRITON"}
+            if torch.__version__ >= "2.11"
+            else {"FORCE_USE_FLEX_ATTENTION": True}
+        )
+        self.assertEqual(layers[0].kernel_options, expected_kernel_options)
 
 
 class TestDFlashSlidingConfig(unittest.TestCase):

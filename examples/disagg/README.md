@@ -156,10 +156,9 @@ Rank 0 uses four GPUs for TP4 ModelOpt-FP4 capture; rank 1 defaults to four
 FSDP trainer ranks. Override `TARGET_MODEL_PATH`, `SERVER_GPUS`,
 `TRAINER_GPUS`, or `TRAINER_NPROC` for another allocation. The launcher keeps
 the unified radix tree enabled and does not pass `--disable-radix-cache`.
-Until #31847 is available in a supported SGLang release, install that PR's
-checkout into both nodes' environment. The wrapper applies SpecForge's
-checked-in capture patch before starting the server; the patch is dry-run
-validated against both v0.5.14 and #31847 commit `b7252cc`.
+SGLang v0.5.18 includes the Inkling support from #31847. Install v0.5.18 in
+both nodes' environment; the wrapper applies SpecForge's checked-in v0.5.18
+capture patch before starting the server.
 
 ## External and managed-local services
 

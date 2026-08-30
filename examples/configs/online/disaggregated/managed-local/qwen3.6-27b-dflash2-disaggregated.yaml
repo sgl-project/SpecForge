@@ -79,4 +79,3 @@ deployment:
             - "2"
           tp_size: 1
           mem_fraction_static: 0.8
-        

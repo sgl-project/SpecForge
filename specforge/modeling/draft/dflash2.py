@@ -12,10 +12,14 @@ The module and parameter names intentionally match SGLang's
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
+from transformers.cache_utils import Cache
+from transformers.models.qwen3.modeling_qwen3 import FlashAttentionKwargs, Qwen3Config
+from typing_extensions import Tuple, Unpack
 
 from .dflash import DFlashDraftModel, Qwen3DFlashDecoderLayer
 from .dflash_kernels import DFlashKernels
@@ -65,6 +69,7 @@ class DFlashGroupedConv(nn.Module):
             2 * self.taps * self.num_groups,
             bias=False,
         )
+        nn.init.zeros_(self.kernel_projection.weight)
 
     def _convolve(
         self,
@@ -150,38 +155,33 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         self.attention_conv = attention_conv
         self.mlp_conv = mlp_conv
 
-    def forward(self, **kwargs):
-        target_hidden = kwargs.get("target_hidden")
-        hidden_states = kwargs.get("hidden_states")
+    def forward(
+        self,
+        target_hidden: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
-            attention_mask=kwargs.get("attention_mask"),
-            position_ids=kwargs.get("position_ids"),
-            past_key_values=kwargs.get("past_key_value"),
-            output_attentions=kwargs.get("output_attentions", False),
-            use_cache=kwargs.get("use_cache", False),
-            cache_position=kwargs.get("cache_position"),
-            position_embeddings=kwargs.get("position_embeddings"),
-            **{
-                key: value
-                for key, value in kwargs.items()
-                if key
-                not in {
-                    "target_hidden",
-                    "hidden_states",
-                    "attention_mask",
-                    "position_ids",
-                    "past_key_value",
-                    "output_attentions",
-                    "use_cache",
-                    "cache_position",
-                    "position_embeddings",
-                }
-            },
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
         )[0]
         hidden_states = self.attention_conv.finish(
             hidden_states,
@@ -309,6 +309,15 @@ class DFlash2DraftModel(DFlashDraftModel):
 
     _no_split_modules = ["Qwen3DFlash2DecoderLayer"]
     decoder_layer_class = Qwen3DFlash2DecoderLayer
+
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module) -> None:
+        super()._init_weights(module)
+        if isinstance(module, DFlashGroupedConv):
+            # DFlashDraftModel.post_init() reinitializes child Linear modules.
+            # Restore the additive dynamic-kernel branch to an exact no-op after
+            # that pass; checkpoint loading can still overwrite these weights.
+            nn.init.zeros_(module.kernel_projection.weight)
 
     def _dflash2_config(self) -> dict:
         return dict(getattr(self.config, "dflash_config", None) or {})
