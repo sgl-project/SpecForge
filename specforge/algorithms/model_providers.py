@@ -488,6 +488,7 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
     from specforge.modeling.draft.dflash import (
         build_target_layer_ids,
         resolve_dflash_attention_layout,
+        validate_dflash_attention_config,
     )
 
     method_config = dict(getattr(draft_config, "dflash_config", None) or {})
@@ -516,6 +517,7 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
         }
 
     resolve_dflash_attention_layout(draft_config)
+    validate_dflash_attention_config(draft_config)
 
 
 __all__ = [

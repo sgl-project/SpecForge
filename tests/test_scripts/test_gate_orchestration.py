@@ -227,6 +227,25 @@ class TestNormalizeDFlashExport(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "selector_top_k"):
                 self.module.normalize_export(str(path), 8)
 
+    def test_rejects_mla_before_rewriting_the_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            original = {
+                "architectures": ["DFlashDraftModel"],
+                "auto_map": {"AutoModel": "dflash.DFlashDraftModel"},
+                "block_size": 16,
+                "dflash_config": {
+                    "projector_type": "dflash",
+                    "attention_mode": "mla",
+                },
+            }
+            path.write_text(json.dumps(original), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "only GQA/MHA"):
+                self.module.normalize_export(str(path), 16)
+
+            self.assertEqual(json.loads(path.read_text()), original)
+
     def test_rejects_dspark_without_a_positive_markov_rank(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

@@ -591,6 +591,63 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         }
 
 
+class MTPTrainStrategy(DraftTrainStrategy):
+    """MTP strategy over ``OnlineMTPModel`` with final-hidden supervision."""
+
+    name = "mtp"
+    required_features = {
+        "input_ids",
+        "loss_mask",
+        "target_last_hidden_states",
+    }
+
+    def __init__(self, mtp_model: nn.Module) -> None:
+        self.mtp_model = mtp_model
+
+    def trainable_module(self) -> nn.Module:
+        return self.mtp_model
+
+    def _device(self) -> torch.device:
+        return next(self.mtp_model.parameters()).device
+
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
+        self.validate_batch(batch)
+        t = batch.tensors
+        device = self._device()
+        # OnlineMTPModel performs the next-token shift internally and returns
+        # per-position correct/denominator tensors (single-layer: length-1 lists).
+        loss, corrects, denoms = self.mtp_model(
+            input_ids=t["input_ids"].to(device),
+            hidden_states=t["target_last_hidden_states"].to(device),
+            loss_mask=t["loss_mask"].to(device),
+        )
+        correct_sum = corrects[0].sum()
+        denom_sum = denoms[0].sum()
+        metrics = {
+            "accuracy": (correct_sum / denom_sum.clamp_min(1)).detach(),
+            "accuracy_denom": denom_sum.detach(),
+        }
+        return StepOutput(
+            loss=loss,
+            metrics=metrics,
+            ratio_metrics={"accuracy": (correct_sum, denom_sum)},
+            # TrainerCore backpropagates additive numerators and divides by the
+            # global token denominator across accumulation steps / DP ranks.
+            loss_terms=(loss * denom_sum, denom_sum),
+        )
+
+    def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        # Everything trainable lives under draft_model.; persisting the stripped
+        # keys (embed_tokens.* + mtp.*) matches the native serving layout.
+        return {
+            k.replace("draft_model.", ""): v
+            for k, v in state_dict.items()
+            if "draft_model." in k
+        }
+
+
 class DominoTrainStrategy(DraftTrainStrategy):
     """Domino block-parallel strategy wrapping ``OnlineDominoModel``.
 

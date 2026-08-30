@@ -8,7 +8,7 @@ from specforge.algorithms.common.defaults import (
     empty_options,
     no_missing_checkpoint_keys,
 )
-from specforge.algorithms.common.dflash_family_data import (
+from specforge.algorithms.common.hidden_states_data import (
     NORMALIZER_ID,
     build_collator,
     build_offline_normalizer,
