@@ -1,8 +1,8 @@
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
-index 4955e11..902f0b1 100644
+index d54b920040..f831b03287 100644
 --- a/python/sglang/srt/spec_capture_sink.py
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -81,18 +81,31 @@ class SpecCaptureSink:
+@@ -87,18 +87,28 @@ class SpecCaptureSink:
              from mooncake.store import MooncakeDistributedStore, ReplicateConfig
  
              store = MooncakeDistributedStore()
@@ -38,7 +38,7 @@ index 4955e11..902f0b1 100644
                  rdma_devices=os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
                  master_server_addr=os.environ.get(
                      "MOONCAKE_MASTER_SERVER_ADDR", "localhost:50051"
-@@ -100,12 +113,34 @@ class SpecCaptureSink:
+@@ -106,6 +116,25 @@ class SpecCaptureSink:
              )
              if rc is not None and int(rc) != 0:
                  raise RuntimeError(f"spec-capture mooncake setup failed (status {rc})")
@@ -64,13 +64,3 @@ index 4955e11..902f0b1 100644
              # Hard-pin every object: SpecForge (not Mooncake's LRU) is the
              # lifetime authority — a committed feature must never be evicted
              # before the trainer consumes it.
-             cfg = ReplicateConfig()
-             cfg.replica_num = 1
--            cfg.with_hard_pin = True
-+            # Older Mooncake builds expose no with_hard_pin field; objects
-+            # then follow the store's default pin behavior until remove().
-+            if hasattr(cfg, "with_hard_pin"):
-+                cfg.with_hard_pin = True
-             self._put_config = cfg
-             self._store = store
-             logger.info("spec-capture mooncake sink connected")
