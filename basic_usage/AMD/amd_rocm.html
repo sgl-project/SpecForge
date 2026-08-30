@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 29, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 30, 2026"/>
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -546,10 +546,10 @@ cloned and installed on top.</p>
 <p>The accelerator is baked into the tag, so use the image that matches your
 hardware:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># AMD Instinct MI300X (gfx942)</span>
-docker<span class="w"> </span>pull<span class="w"> </span>lmsysorg/sglang:v0.5.14-rocm720-mi30x
+docker<span class="w"> </span>pull<span class="w"> </span>lmsysorg/sglang:v0.5.18-rocm720-mi30x
 
 <span class="c1"># AMD Instinct MI355X (gfx950)</span>
-docker<span class="w"> </span>pull<span class="w"> </span>lmsysorg/sglang:v0.5.14-rocm700-mi35x
+docker<span class="w"> </span>pull<span class="w"> </span>lmsysorg/sglang:v0.5.18-rocm700-mi35x
 </pre></div>
 </div>
 </section>
@@ -561,7 +561,7 @@ and omit <code class="docutils literal notranslate"><span class="pre">--rm</span
 <span class="w">  </span>--device<span class="o">=</span>/dev/kfd<span class="w"> </span>--device<span class="o">=</span>/dev/dri<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--group-add<span class="w"> </span>video<span class="w"> </span>--cap-add<span class="w"> </span>SYS_PTRACE<span class="w"> </span>--security-opt<span class="w"> </span><span class="nv">seccomp</span><span class="o">=</span>unconfined<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--ipc<span class="o">=</span>host<span class="w"> </span>--shm-size<span class="o">=</span>16g<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>lmsysorg/sglang:v0.5.14-rocm720-mi30x<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>lmsysorg/sglang:v0.5.18-rocm720-mi30x<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>bash
 </pre></div>
 </div>
@@ -585,11 +585,11 @@ also with <code class="docutils literal notranslate"><span class="pre">--no-deps
 </section>
 <section id="step-4-apply-the-capture-patch-online-runs-only">
 <h3>Step 4: Apply the capture patch (online runs only)<a class="headerlink" href="#step-4-apply-the-capture-patch-online-runs-only" title="Link to this heading">#</a></h3>
-<p>These images pin SGLang to exactly <code class="docutils literal notranslate"><span class="pre">0.5.14</span></code> (editable at <code class="docutils literal notranslate"><span class="pre">/sgl-workspace/sglang</span></code>),
+<p>These images pin SGLang to exactly <code class="docutils literal notranslate"><span class="pre">0.5.18</span></code> (editable at <code class="docutils literal notranslate"><span class="pre">/sgl-workspace/sglang</span></code>),
 so the online capture patch applies with a plain <code class="docutils literal notranslate"><span class="pre">git</span> <span class="pre">apply</span></code>. Skip this step for
 offline training, which reads features from disk and needs no capture service:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/sgl-workspace/sglang
-git<span class="w"> </span>apply<span class="w"> </span>/workspace/SpecForge/patches/sglang/v0.5.14/spec-capture.patch
+git<span class="w"> </span>apply<span class="w"> </span>/workspace/SpecForge/patches/sglang/v0.5.18/spec-capture.patch
 <span class="nb">cd</span><span class="w"> </span>/workspace/SpecForge
 </pre></div>
 </div>
@@ -1154,7 +1154,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 29, 2026.
+  Last updated on Aug 30, 2026.
   <br/>
 </p>
   </div>

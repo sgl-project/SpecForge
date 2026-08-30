@@ -28,10 +28,10 @@ hardware:
 
 ```bash
 # AMD Instinct MI300X (gfx942)
-docker pull lmsysorg/sglang:v0.5.14-rocm720-mi30x
+docker pull lmsysorg/sglang:v0.5.18-rocm720-mi30x
 
 # AMD Instinct MI355X (gfx950)
-docker pull lmsysorg/sglang:v0.5.14-rocm700-mi35x
+docker pull lmsysorg/sglang:v0.5.18-rocm700-mi35x
 ```
 
 ### Step 2: Start the container
@@ -44,7 +44,7 @@ docker run -it --name specforge \
   --device=/dev/kfd --device=/dev/dri \
   --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   --ipc=host --shm-size=16g \
-  lmsysorg/sglang:v0.5.14-rocm720-mi30x \
+  lmsysorg/sglang:v0.5.18-rocm720-mi30x \
   bash
 ```
 
@@ -70,13 +70,13 @@ also with `--no-deps`.
 
 ### Step 4: Apply the capture patch (online runs only)
 
-These images pin SGLang to exactly `0.5.14` (editable at `/sgl-workspace/sglang`),
+These images pin SGLang to exactly `0.5.18` (editable at `/sgl-workspace/sglang`),
 so the online capture patch applies with a plain `git apply`. Skip this step for
 offline training, which reads features from disk and needs no capture service:
 
 ```bash
 cd /sgl-workspace/sglang
-git apply /workspace/SpecForge/patches/sglang/v0.5.14/spec-capture.patch
+git apply /workspace/SpecForge/patches/sglang/v0.5.18/spec-capture.patch
 cd /workspace/SpecForge
 ```
 
