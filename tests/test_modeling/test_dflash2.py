@@ -641,6 +641,157 @@ class CandidateSelectorTest(unittest.TestCase):
             self.assertIsNotNone(parameter.grad)
             self.assertGreater(parameter.grad.abs().sum().item(), 0.0)
 
+    def test_candidate_mass_and_accepted_length_metrics(self):
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=6,
+                    vocab_size=6,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.02,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        draft = Draft()
+        # Zeroed selector factors make the selector a unary no-op, so the
+        # realized path always takes the unary top-1 candidate.
+        with torch.no_grad():
+            draft.candidate_selector.predecessor_codebook.zero_()
+            draft.candidate_selector.successor_codebook.zero_()
+            draft.candidate_selector.hidden_projection.weight.zero_()
+        model = OnlineDFlashModel(
+            draft_model=draft,
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(6, 6),
+            mask_token_id=5,
+            block_size=3,
+            attention_backend="eager",
+            selector_loss_alpha=1.0,
+        )
+        # Two blocks of three slots; slot 0 is the unsupervised anchor.
+        # Block 0: slot 1 covers the gold token at rank 1 (realized path
+        # misses), slot 2 has it at rank 0. Block 1: slot 1 misses the top-k
+        # entirely (oracle path dies at once), slot 2 covers at rank 0.
+        hidden = torch.tensor(
+            [
+                [
+                    [
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 2.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0, 3.0, 0.0],
+                    ],
+                    [
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0, 2.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0, 0.0, 3.0],
+                    ],
+                ]
+            ]
+        )
+        target_ids = torch.tensor([[[4, 2, 4], [4, 1, 5]]])
+        weights = torch.tensor([[[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]])
+        predecessors = torch.tensor([[[4, 4, 2], [4, 4, 1]]])
+
+        terms = model._dflash_objective_chunk_terms(
+            hidden,
+            target_ids,
+            weights,
+            predecessors,
+        )
+
+        def topk_mass(slot_logits):
+            return torch.exp(
+                slot_logits.topk(2).values.logsumexp(dim=-1)
+                - slot_logits.logsumexp(dim=-1)
+            )
+
+        # Every supervised slot except block-1 slot 1 covers its gold token.
+        self.assertEqual(terms.selector_covered_num.item(), 3.0)
+
+        expected_mass = (
+            topk_mass(hidden[0, 0, 1])
+            + topk_mass(hidden[0, 0, 2])
+            + topk_mass(hidden[0, 1, 1])
+            + topk_mass(hidden[0, 1, 2])
+        )
+        torch.testing.assert_close(terms.selector_topk_mass_num, expected_mass)
+
+        # Oracle: block 0 accepts anchor + slots 1-2, block 1 stops at the
+        # anchor because slot 1 is outside the unary top-k.
+        self.assertEqual(terms.selector_oracle_accepted_length_num.item(), 4.0)
+        # Realized path: both blocks miss at slot 1 (rank-1 / uncovered gold),
+        # so each accepts only the anchor.
+        self.assertEqual(terms.selector_path_accepted_length_num.item(), 2.0)
+        self.assertEqual(terms.selector_path_correct_num.item(), 0.0)
+        self.assertEqual(terms.selector_path_position_den.item(), 2.0)
+        self.assertEqual(terms.selector_block_valid_den.item(), 2.0)
+
+    def test_forward_reports_candidate_path_ratio_metrics(self):
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=4,
+                    vocab_size=4,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.02,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        draft = Draft()
+        with torch.no_grad():
+            draft.candidate_selector.predecessor_codebook.zero_()
+            draft.candidate_selector.successor_codebook.zero_()
+            draft.candidate_selector.hidden_projection.weight.zero_()
+        model = OnlineDFlashModel(
+            draft_model=draft,
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(4, 4),
+            mask_token_id=3,
+            block_size=2,
+            attention_backend="eager",
+            selector_loss_alpha=1.0,
+        )
+        output_hidden = torch.tensor([[[0.0, 0.0, 0.0, 0.0], [0.0, 3.0, 2.0, 1.0]]])
+        model._forward_draft_blocks = lambda **_kwargs: (
+            torch.tensor([[0]]),
+            torch.tensor([[True]]),
+            output_hidden,
+        )
+
+        _loss, _accuracy, metrics = model(
+            input_ids=torch.tensor([[0, 2]]),
+            hidden_states=torch.zeros(1, 2, 4),
+            loss_mask=torch.ones(1, 2),
+        )
+
+        ratio_metrics = metrics["ratio_metrics"]
+        for name in (
+            "unary_topk_probability_mass",
+            "unary_topk_oracle_accepted_length",
+            "selector_path_accepted_length",
+            "selector_path_accuracy",
+        ):
+            self.assertIn(name, ratio_metrics)
+
+        # Slot 1 covers the gold token at rank 1: the oracle block accepts
+        # anchor + 1, but the realized path takes the unary top-1 and misses.
+        oracle_num, oracle_den = ratio_metrics["unary_topk_oracle_accepted_length"]
+        torch.testing.assert_close(oracle_num / oracle_den, torch.tensor(2.0))
+        path_num, path_den = ratio_metrics["selector_path_accepted_length"]
+        torch.testing.assert_close(path_num / path_den, torch.tensor(1.0))
+        correct_num, position_den = ratio_metrics["selector_path_accuracy"]
+        torch.testing.assert_close(correct_num / position_den, torch.tensor(0.0))
+
     def test_zero_effective_selector_alpha_keeps_selector_in_autograd_graph(self):
         class Draft(nn.Module):
             def __init__(self):

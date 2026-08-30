@@ -43,15 +43,17 @@ class SelectorTerms(NamedTuple):
     correct_num: torch.Tensor
     weight_den: torch.Tensor
     covered_num: torch.Tensor
+    topk_mass_num: torch.Tensor
+    oracle_accepted_length_num: torch.Tensor
+    path_accepted_length_num: torch.Tensor
+    path_correct_num: torch.Tensor
+    path_position_den: torch.Tensor
+    block_valid_den: torch.Tensor
 
     @classmethod
     def zeros(cls, reference: torch.Tensor) -> "SelectorTerms":
         return cls(
-            reference.new_zeros(()),
-            reference.new_zeros(()),
-            reference.new_zeros(()),
-            reference.new_zeros(()),
-            reference.new_zeros(()),
+            *([reference.new_zeros(())] * len(cls._fields)),
         )
 
 
@@ -75,6 +77,12 @@ class DFlashObjectiveTerms(NamedTuple):
     selector_correct_num: torch.Tensor
     selector_weight_den: torch.Tensor
     selector_covered_num: torch.Tensor
+    selector_topk_mass_num: torch.Tensor
+    selector_oracle_accepted_length_num: torch.Tensor
+    selector_path_accepted_length_num: torch.Tensor
+    selector_path_correct_num: torch.Tensor
+    selector_path_position_den: torch.Tensor
+    selector_block_valid_den: torch.Tensor
 
 
 def compute_accept_len(
@@ -520,12 +528,84 @@ class OnlineDFlashModel(nn.Module):
             correct_num = (
                 (selected_ids == target_ids).float() * selector_loss_weights
             ).sum()
+
+            # --- Candidate-set and accepted-length telemetry -------------
+            # Draft softmax mass inside its own strict unary top-k: how much
+            # score mass a reranker can ever move as selector_top_k changes.
+            topk_mass_num = (
+                torch.exp(
+                    torch.logsumexp(unary_logits, dim=-1)
+                    - torch.logsumexp(objective_logits, dim=-1)
+                )
+                * weight_mask
+            ).sum()
+
+            # Per-block accepted-length proxies for the serving path. The
+            # verified anchor counts as one accepted token, and a block extends
+            # only while every earlier draft slot is supervised and accepted.
+            # The oracle walk credits any slot whose gold token sits in the
+            # unary top-k; the realized walk re-scores each slot with its own
+            # greedy predecessor instead of the gold one.
+            batch_size, num_blocks, block_size = target_ids.shape
+            valid_positions = weight_mask > 0.5
+            block_valid = valid_positions[:, :, 1:].any(dim=-1)
+            block_valid_den = block_valid.float().sum()
+
+            oracle_alive = torch.ones(
+                batch_size, num_blocks, dtype=torch.bool, device=hidden.device
+            )
+            oracle_accepted = torch.ones(
+                batch_size, num_blocks, dtype=torch.float32, device=hidden.device
+            )
+            path_alive = torch.ones_like(oracle_alive)
+            path_accepted = torch.ones_like(oracle_accepted)
+            realized_predecessor = target_ids[:, :, 0]
+            path_correct_num = correct_num.new_zeros(())
+            path_position_den = correct_num.new_zeros(())
+            for position in range(1, block_size):
+                oracle_alive &= (
+                    valid_positions[:, :, position]
+                    & target_is_candidate[:, :, position]
+                )
+                oracle_accepted += oracle_alive.float()
+
+                conditioned = path_alive & valid_positions[:, :, position]
+                step_logits = candidate_selector.score_candidates(
+                    candidate_ids=candidate_ids[:, :, position],
+                    unary_logits=unary_logits[:, :, position],
+                    hidden_states=hidden[:, :, position],
+                    predecessor_ids=realized_predecessor,
+                )
+                realized_predecessor = (
+                    candidate_ids[:, :, position]
+                    .gather(
+                        -1,
+                        step_logits.argmax(dim=-1, keepdim=True),
+                    )
+                    .squeeze(-1)
+                )
+                step_hit = conditioned & (
+                    realized_predecessor == target_ids[:, :, position]
+                )
+                path_correct_num += step_hit.float().sum()
+                path_position_den += conditioned.float().sum()
+                path_accepted += step_hit.float()
+                path_alive &= step_hit
+
+            oracle_accepted_length_num = (oracle_accepted * block_valid.float()).sum()
+            path_accepted_length_num = (path_accepted * block_valid.float()).sum()
         return SelectorTerms(
             ce_num=ce_num,
             probability_num=probability_num,
             correct_num=correct_num,
             weight_den=weight_den,
             covered_num=covered_num,
+            topk_mass_num=topk_mass_num,
+            oracle_accepted_length_num=oracle_accepted_length_num,
+            path_accepted_length_num=path_accepted_length_num,
+            path_correct_num=path_correct_num,
+            path_position_den=path_position_den,
+            block_valid_den=block_valid_den,
         )
 
     def _dflash_objective_chunk_terms(
@@ -616,6 +696,14 @@ class OnlineDFlashModel(nn.Module):
             selector_correct_num=selector_terms.correct_num,
             selector_weight_den=selector_terms.weight_den,
             selector_covered_num=selector_terms.covered_num,
+            selector_topk_mass_num=selector_terms.topk_mass_num,
+            selector_oracle_accepted_length_num=(
+                selector_terms.oracle_accepted_length_num
+            ),
+            selector_path_accepted_length_num=selector_terms.path_accepted_length_num,
+            selector_path_correct_num=selector_terms.path_correct_num,
+            selector_path_position_den=selector_terms.path_position_den,
+            selector_block_valid_den=selector_terms.block_valid_den,
         )
 
     def _compose_token_objective(
@@ -712,6 +800,12 @@ class OnlineDFlashModel(nn.Module):
             selector_correct_num,
             selector_weight_den,
             selector_covered_num,
+            selector_topk_mass_num,
+            selector_oracle_accepted_length_num,
+            selector_path_accepted_length_num,
+            selector_path_correct_num,
+            selector_path_position_den,
+            selector_block_valid_den,
         ) = checkpointed_chunk_reduce(
             self._dflash_objective_chunk_terms,
             hidden_4d,
@@ -769,6 +863,22 @@ class OnlineDFlashModel(nn.Module):
                     "selector_target_probability": (
                         selector_probability_num.detach(),
                         selector_covered_num.detach(),
+                    ),
+                    "unary_topk_probability_mass": (
+                        selector_topk_mass_num.detach(),
+                        accuracy_denom.detach(),
+                    ),
+                    "unary_topk_oracle_accepted_length": (
+                        selector_oracle_accepted_length_num.detach(),
+                        selector_block_valid_den.detach(),
+                    ),
+                    "selector_path_accepted_length": (
+                        selector_path_accepted_length_num.detach(),
+                        selector_block_valid_den.detach(),
+                    ),
+                    "selector_path_accuracy": (
+                        selector_path_correct_num.detach(),
+                        selector_path_position_den.detach(),
                     ),
                 }
             )
