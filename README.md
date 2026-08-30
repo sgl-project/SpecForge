@@ -49,6 +49,7 @@ There are no method-specific Python training entry points.
 | **[P-EAGLE](https://arxiv.org/abs/2602.01469)** | Parallel EAGLE | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-peagle-disaggregated.yaml) | — |
 | **EAGLE3.1** | Feature-based autoregressive drafting with attention drift | [Online external](./examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1-online.yaml) | — |
 | **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-dflash-online.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810) |
+| **[DFlash2](https://inco.ai/blog/dflash2/)** | DFlash with grouped dynamic convolution and top-k path selection | [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810)|
 | **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) | — |
 | **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Online external](./examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) | — |
 
@@ -72,6 +73,7 @@ SpecBundle is a collection of production-grade speculative decoding models that 
 
 
 ## 🎉 News
+- [2026-08] 🔥 Added DFlash2 online training for DFlash draft models.
 - [2026-08] 🎉 Released SpecBundle (phase 2) and SpecForge v0.3.0. Check out our blog at [LMSYS.org](https://www.lmsys.org/blog/2026-08-04-specforge-v0-3)
 - [2026-07] 🚀 Day0 supported two flagship dspark draft model, [Inkling](https://huggingface.co/RadixArk/Inkling-DSpark-Preview) and [Kimi-K3](https://huggingface.co/RadixArk/Kimi-K3-DSpark).
 - [2026-07] 🔥 Supported full disaggregation of training and inference in online training.
