@@ -11,7 +11,7 @@ A3 (64GB) host.
 ## 1. Installation
 
 You need an Ascend host with the driver, CANN, and a `torch_npu`-enabled
-PyTorch already installed, plus SGLang `0.5.14` with NPU support. Then install
+PyTorch already installed, plus SGLang `0.5.18` with NPU support. Then install
 SpecForge without touching that stack:
 
 ```bash
@@ -36,7 +36,7 @@ bash scripts/apply_sglang_spec_capture_patch.sh
 # Ascend companion patch: skip the wildcard segment mount that Ascend
 # Mooncake rejects, and mount the feature segment with location="cpu"
 SGLANG_DIR=$(python -c "import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))")
-cd "$SGLANG_DIR" && git apply /path/to/SpecForge/patches/sglang/v0.5.14/spec-capture-ascend-mount.patch
+cd "$SGLANG_DIR" && git apply /path/to/SpecForge/patches/sglang/v0.5.18/spec-capture-ascend-mount.patch
 ```
 
 Skip both for offline training, which reads features from disk. The companion

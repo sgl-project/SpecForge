@@ -5,7 +5,7 @@ A stub ``post_fn`` stands in for the patched SGLang server: it writes raw
 tensor bytes into the shared fake Mooncake backend at the sink's key layout
 (``{store_id}/{sample_id}/g{gen}/{name}``) and returns the
 ``meta_info["spec_capture"]`` result rows — i.e. it emulates
-``patches/sglang/v0.5.14/spec-capture.patch``'s ``SpecCaptureSink`` byte-for-
+``patches/sglang/v0.5.18/spec-capture.patch``'s ``SpecCaptureSink`` byte-for-
 byte. The tests then drive the REAL client stack over it:
 ``SGLangServerCaptureAdapter.produce_refs`` -> contract verification from
 FeatureSpecs -> ``MooncakeFeatureStore.adopt`` -> ``RolloutWorker`` commit ->
