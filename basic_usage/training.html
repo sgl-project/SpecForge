@@ -477,6 +477,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-a-run">Launch a run</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-config">Run config</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-configuration-and-model-initialization">Draft configuration and model initialization</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash-2">DFlash 2</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-and-offline-data">Online and offline data</a></li>
@@ -677,6 +678,43 @@ entry corresponds to one draft layer; sliding layers share one positive window:<
 <code class="docutils literal notranslate"><span class="pre">num_hidden_layers</span></code>. A layer-count override may resize a uniform layout, but a
 mixed layout must be edited explicitly in the draft JSON.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">eager</span></code>, <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>, and <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> backends support both layouts.</p>
+</section>
+<section id="dflash-2">
+<h3>DFlash 2<a class="headerlink" href="#dflash-2" title="Link to this heading">#</a></h3>
+<p>DFlash 2 is a draft-architecture variant of DFlash, not a separate capture
+strategy. Keep <code class="docutils literal notranslate"><span class="pre">training.strategy:</span> <span class="pre">dflash</span></code> and select it with a draft config
+whose architecture is <code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code>. The target server still captures
+the same selected hidden states with <code class="docutils literal notranslate"><span class="pre">--spec-capture-method</span> <span class="pre">dflash</span></code>.</p>
+<p>The DFlash 2 config additionally defines <code class="docutils literal notranslate"><span class="pre">conv_kernel_size</span></code> and
+<code class="docutils literal notranslate"><span class="pre">conv_group_size</span></code> for the local convolution, plus <code class="docutils literal notranslate"><span class="pre">selector_rank</span></code> and
+<code class="docutils literal notranslate"><span class="pre">selector_top_k</span></code> for candidate-path selection. The base draft head uses the
+configured CE/LK/TV objective. The selector always uses categorical CE over the
+target head’s strict unary top-k, exactly as it will be used during inference.
+If the gold token is outside that candidate set, the token contributes no
+selector loss; <code class="docutils literal notranslate"><span class="pre">selector_coverage</span></code> reports how often the gold token is present.
+Both objectives receive the configured fixed-decay or D-PACE position weight,
+and their combined numerator is normalized by the sum of valid effective token
+weights rather than by batch or anchor count.</p>
+<p>Set <code class="docutils literal notranslate"><span class="pre">training.dflash2_selector_loss_alpha</span></code> to scale the selector objective.
+<code class="docutils literal notranslate"><span class="pre">training.dflash2_selector_warmup_ratio</span></code> keeps that scale at zero for an initial
+fraction of optimizer steps, and <code class="docutils literal notranslate"><span class="pre">training.dflash2_selector_ramp_ratio</span></code> then
+ramps it linearly to the configured value. Both schedule ratios default to
+zero. A newly initialized selector starts as a unary no-op, so enabling DFlash
+2 does not perturb the initial DFlash proposal scores.</p>
+<p>The exported computation and parameter names match the public SGLang DFlash 2
+contract, including optional <code class="docutils literal notranslate"><span class="pre">output_multiplier</span></code> and
+<code class="docutils literal notranslate"><span class="pre">final_logit_softcapping</span></code> transforms from <code class="docutils literal notranslate"><span class="pre">dflash_config</span></code>.</p>
+<p>The checked-in Qwen3.6-27B recipe owns the full two-GPU local stack: GPU 0 runs
+the target capture server and GPU 1 runs the trainer.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-c<span class="w"> </span>examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>model.target_model_path<span class="o">=</span>/path/to/Qwen3.6-27B
+</pre></div>
+</div>
+<p>Export the result with <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">export</span> <span class="pre">--to</span> <span class="pre">hf</span></code>. Serving requires an SGLang
+version that includes DFlash 2 support (SGLang PR #35371); the serving algorithm
+name remains <code class="docutils literal notranslate"><span class="pre">DFLASH</span></code>, and the exported <code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code> config enables the
+new path automatically.</p>
 <p>Domino and DSpark need their projector/head metadata, so they require an
 explicit draft config (or a pretrained warm-start source that contains
 <code class="docutils literal notranslate"><span class="pre">config.json</span></code>). The old Domino parser exposed an optional config flag, but its
@@ -1068,7 +1106,7 @@ Transformers.</p>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">--to</span> <span class="pre">sglang</span></code> currently implements the EAGLE3 serving-key contract. Use
-<code class="docutils literal notranslate"><span class="pre">--to</span> <span class="pre">hf</span></code> for DFlash, Domino, DSpark, and P-EAGLE model directories. For an
+<code class="docutils literal notranslate"><span class="pre">--to</span> <span class="pre">hf</span></code> for DFlash, DFlash 2, Domino, DSpark, and P-EAGLE model directories. For an
 EAGLE-family self-contained Hugging Face directory, provide the target model as
 the source of the frozen embedding when it is absent from the runtime
 checkpoint:</p>
@@ -1183,6 +1221,7 @@ earlier in this page.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-a-run">Launch a run</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-config">Run config</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-configuration-and-model-initialization">Draft configuration and model initialization</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash-2">DFlash 2</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-and-offline-data">Online and offline data</a></li>
