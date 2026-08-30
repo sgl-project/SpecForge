@@ -266,9 +266,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[
-        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
