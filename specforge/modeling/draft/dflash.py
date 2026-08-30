@@ -580,9 +580,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[
-        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -673,6 +671,7 @@ def normalize_draft_head_checkpoint_keys(
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
+    decoder_layer_class = Qwen3DFlashDecoderLayer
 
     def __init__(
         self,
@@ -684,13 +683,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
         self.attention_mode = validate_dflash_attention_config(config)
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
+        dflash_config = getattr(config, "dflash_config", {}) or {}
+        block_size = getattr(config, "block_size", None)
+        if block_size is None:
+            block_size = dflash_config.get("block_size")
+        if not isinstance(block_size, int) or isinstance(block_size, bool):
+            raise ValueError(
+                "DFlash config must define an integer block_size either at "
+                "config.block_size or config.dflash_config.block_size"
+            )
+        self.block_size = block_size
         self.layers = nn.ModuleList(
             [
-                Qwen3DFlashDecoderLayer(config, layer_idx, kernels)
+                self._build_decoder_layer(config, layer_idx, kernels)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        dflash_config = getattr(config, "dflash_config", {}) or {}
         self.target_layer_ids = dflash_config.get(
             "target_layer_ids",
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
@@ -707,7 +715,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
-        self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
@@ -715,6 +722,16 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+
+    def _build_decoder_layer(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        kernels: DFlashKernels,
+    ) -> nn.Module:
+        """Build one backbone layer; architecture variants override this seam."""
+
+        return self.decoder_layer_class(config, layer_idx, kernels)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config

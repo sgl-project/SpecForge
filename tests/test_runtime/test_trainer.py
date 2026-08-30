@@ -238,6 +238,15 @@ class TestTrainerCore(unittest.TestCase):
             torch.tensor([1.8]),
         )
 
+    def test_global_loss_normalization_rejects_invalid_denominator(self):
+        strategy = FakeStrategy()
+        core = TrainerCore(strategy, FakeBackend(strategy.model))
+
+        for denominator in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(denominator=denominator):
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    core._normalize_gradients(torch.tensor(denominator))
+
     def test_strategy_scalar_metrics_are_preserved(self):
         strat = FakeStrategy()
         core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
