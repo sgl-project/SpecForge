@@ -573,6 +573,15 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+    #: DSpark primary distribution objective. ``legacy`` preserves the
+    #: historical hard-CE + L1 mixture; ``tv`` and ``lk`` replace that mixture
+    #: while retaining the separately weighted confidence-head auxiliary.
+    dspark_primary_loss: Literal["legacy", "tv", "lk"] = "legacy"
+    #: LK variant used when ``dspark_primary_loss`` is ``lk``. ``alpha`` is
+    #: negative log acceptance; ``lambda`` adaptively blends forward KL and TV.
+    dspark_lk_loss_type: Literal["alpha", "lambda"] = "alpha"
+    dspark_kl_scale: float = Field(default=1.0, ge=0.0, le=1.0)
+    dspark_kl_decay: float = Field(default=3.0, ge=0.0)
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8

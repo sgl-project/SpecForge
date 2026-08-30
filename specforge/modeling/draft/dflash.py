@@ -1,5 +1,7 @@
 import copy
 import math
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
@@ -27,6 +29,22 @@ from .registry import register_draft
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
 _VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
+_CONTEXT_ATTENTION_MODES = {"gqa", "mha", "mla"}
+_VALID_DFLASH_ATTENTION_MODES = _CONTEXT_ATTENTION_MODES | {"kda"}
+
+
+@dataclass(frozen=True)
+class DFlashGenerationOutput:
+    """Speculative sequences and per-verification accepted-token counts."""
+
+    sequences: torch.LongTensor
+    acceptance_lengths: tuple[int, ...]
+
+    @property
+    def mean_acceptance_length(self) -> float:
+        if not self.acceptance_lengths:
+            return 0.0
+        return sum(self.acceptance_lengths) / len(self.acceptance_lengths)
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -72,22 +90,62 @@ def resolve_dflash_attention_layout(
     return layer_types, sliding_window
 
 
-def resolve_dflash_attention_mode(config: Qwen3Config) -> str:
-    """Validate and return the configured draft attention mode.
+def resolve_dflash_attention_modes(config: Qwen3Config) -> tuple[str, ...]:
+    """Return one normalized attention mode for every draft layer.
 
-    ``gqa`` and ``mha`` share :class:`Qwen3DFlashAttention`; ``mla`` swaps in
-    the latent parameterization while retaining the family decoder,
-    target-context injection, masks, and objectives.
+    ``attention_mode`` remains the compact, backwards-compatible spelling for
+    a uniform stack. ``attention_modes`` describes a hybrid stack explicitly.
+    Keeping the two forms mutually exclusive prevents a stale uniform value
+    from silently overriding a per-layer architecture.
     """
 
     dflash_config = getattr(config, "dflash_config", None) or {}
-    attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
-    if attention_mode not in _DFLASH_ATTENTION_CLASSES:
+    has_uniform_mode = "attention_mode" in dflash_config
+    has_layer_modes = "attention_modes" in dflash_config
+    if has_uniform_mode and has_layer_modes:
         raise ValueError(
-            "DFlash dflash_config.attention_mode must be one of "
-            f"{sorted(_DFLASH_ATTENTION_CLASSES)}, got {attention_mode!r}"
+            "DFlash dflash_config must set only one of attention_mode or "
+            "attention_modes"
         )
-    return attention_mode
+
+    if has_layer_modes:
+        raw_modes = dflash_config["attention_modes"]
+        if not isinstance(raw_modes, (list, tuple)):
+            raise ValueError(
+                "DFlash dflash_config.attention_modes must be a list with one "
+                f"entry per draft layer, got {raw_modes!r}"
+            )
+        if len(raw_modes) != int(config.num_hidden_layers):
+            raise ValueError(
+                "DFlash dflash_config.attention_modes must contain exactly "
+                f"num_hidden_layers={config.num_hidden_layers} entries, got "
+                f"{len(raw_modes)}"
+            )
+    else:
+        raw_modes = [dflash_config.get("attention_mode", "gqa")] * int(
+            config.num_hidden_layers
+        )
+
+    modes = tuple(str(mode).lower() for mode in raw_modes)
+    invalid = set(modes) - _VALID_DFLASH_ATTENTION_MODES
+    if invalid:
+        raise ValueError(
+            "DFlash dflash_config attention_mode(s) must be selected from "
+            f"{sorted(_VALID_DFLASH_ATTENTION_MODES)}, got {sorted(invalid)}"
+        )
+    return modes
+
+
+def resolve_dflash_attention_mode(config: Qwen3Config) -> str:
+    """Return the uniform attention mode used by legacy callers."""
+
+    modes = resolve_dflash_attention_modes(config)
+    if len(set(modes)) != 1:
+        raise ValueError(
+            "DFlash uses a hybrid attention stack; inspect attention_modes "
+            "instead of attention_mode"
+        )
+    return modes[0]
 
 
 def _require_bool_config(value: object, field: str) -> bool:
@@ -138,11 +196,28 @@ def validate_dflash_mla_config(config: Qwen3Config) -> None:
     _resolve_mla_rope_interleaved(config)
 
 
-def validate_dflash_attention_config(config: Qwen3Config) -> str:
-    """Validate the selected attention parameterization and return its mode."""
+def validate_dflash_attention_config(config: Qwen3Config) -> tuple[str, ...]:
+    """Validate the selected attention parameterizations and their composition."""
 
-    attention_mode = resolve_dflash_attention_mode(config)
-    if attention_mode == "mha" and int(config.num_key_value_heads) != int(
+    attention_modes = resolve_dflash_attention_modes(config)
+    context_modes = set(attention_modes) & _CONTEXT_ATTENTION_MODES
+    if not context_modes:
+        raise ValueError(
+            "KDA draft stacks require at least one GQA, MHA, or MLA layer "
+            "to inject target context"
+        )
+    if len(context_modes) != 1:
+        raise ValueError(
+            "DFlash stacks require one consistent target-context attention "
+            f"mode, got {sorted(context_modes)}"
+        )
+    if "kda" in attention_modes:
+        from .kda import validate_dflash_kda_config
+
+        validate_dflash_kda_config(config)
+
+    context_mode = next(iter(context_modes))
+    if context_mode == "mha" and int(config.num_key_value_heads) != int(
         config.num_attention_heads
     ):
         raise ValueError(
@@ -150,9 +225,9 @@ def validate_dflash_attention_config(config: Qwen3Config) -> str:
             f"num_attention_heads, got {config.num_key_value_heads} and "
             f"{config.num_attention_heads}"
         )
-    if attention_mode == "mla":
+    if context_mode == "mla":
         validate_dflash_mla_config(config)
-    return attention_mode
+    return attention_modes
 
 
 def _rope_config(config: Qwen3Config, attention_mode: str) -> Qwen3Config:
@@ -216,8 +291,41 @@ def _prepare_dflash_eager_mask(
     return additive_mask, valid_queries
 
 
-class Qwen3DFlashAttentionBase(nn.Module):
-    """Shared scaffold for the DFlash-family attention modes.
+class Qwen3DFlashAttentionBase(nn.Module, ABC):
+    """Stable decoder-facing contract for DFlash-family attention.
+
+    Dense/latent attention and recurrent KDA do not share cache or mask math,
+    but decoder layers, FSDP wrapping, and algorithms should not need to know
+    which parameterization is installed. This base owns that narrow contract.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        kernels: DFlashKernels,
+    ) -> None:
+        super().__init__()
+        del kernels
+        self.config = config
+        self.layer_idx = layer_idx
+
+    @abstractmethod
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        target_hidden: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply one attention layer to the proposal hidden states."""
+
+
+class Qwen3DFlashKVAttentionBase(Qwen3DFlashAttentionBase):
+    """Shared cache, mask, and backend scaffold for GQA/MHA/MLA.
 
     Subclasses own only the projection parameterization: ``_init_projections``
     builds the weights and must define ``scaling``, ``num_key_value_groups``,
@@ -234,9 +342,7 @@ class Qwen3DFlashAttentionBase(nn.Module):
         layer_idx: int,
         kernels: DFlashKernels,
     ):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
+        super().__init__(config, layer_idx, kernels)
         self.attention_dropout = config.attention_dropout
         if config._attn_implementation == "flex_attention":
             assert (
@@ -330,7 +436,7 @@ class Qwen3DFlashAttentionBase(nn.Module):
         return attn_output, attn_weights
 
 
-class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
+class Qwen3DFlashAttention(Qwen3DFlashKVAttentionBase):
     """GQA/MHA projections over the family's context-then-draft KV layout."""
 
     def _init_projections(self, config: Qwen3Config, kernels: DFlashKernels) -> None:
@@ -392,7 +498,7 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
         return q, k, v
 
 
-class Qwen3DFlashMLAAttention(Qwen3DFlashAttentionBase):
+class Qwen3DFlashMLAAttention(Qwen3DFlashKVAttentionBase):
     """Multi-head Latent Attention projections for DFlash-family drafts.
 
     Standard MLA parameterization: an optional low-rank Q path, a shared
@@ -543,6 +649,25 @@ _DFLASH_ATTENTION_CLASSES = {
 }
 
 
+def build_dflash_attention(
+    config: Qwen3Config,
+    layer_idx: int,
+    kernels: DFlashKernels,
+) -> Qwen3DFlashAttentionBase:
+    """Build one configured attention layer without algorithm-specific dispatch."""
+
+    attention_mode = resolve_dflash_attention_modes(config)[layer_idx]
+    if attention_mode == "kda":
+        # KDA depends on the base contract above; keeping the import at the
+        # construction boundary also keeps fla-core optional for non-KDA runs.
+        from .kda import Qwen3DFlashKDAAttention
+
+        attention_cls = Qwen3DFlashKDAAttention
+    else:
+        attention_cls = _DFLASH_ATTENTION_CLASSES[attention_mode]
+    return attention_cls(config=config, layer_idx=layer_idx, kernels=kernels)
+
+
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     def __init__(
         self,
@@ -552,12 +677,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        attention_cls = _DFLASH_ATTENTION_CLASSES[resolve_dflash_attention_mode(config)]
-        self.self_attn = attention_cls(
-            config=config,
-            layer_idx=layer_idx,
-            kernels=kernels,
-        )
+        self.self_attn = build_dflash_attention(config, layer_idx, kernels)
         self.mlp = kernels.make_mlp(config)
         self.input_layernorm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
@@ -682,7 +802,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
-        self.attention_mode = validate_dflash_attention_config(config)
+        self.attention_modes = validate_dflash_attention_config(config)
+        unique_modes = set(self.attention_modes)
+        self.attention_mode = (
+            self.attention_modes[0] if len(unique_modes) == 1 else "hybrid"
+        )
+        self.context_attention_mode = next(
+            mode for mode in self.attention_modes if mode != "kda"
+        )
+        self.context_cache_layer_idx = next(
+            index for index, mode in enumerate(self.attention_modes) if mode != "kda"
+        )
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         self.layers = nn.ModuleList(
             [
@@ -697,7 +827,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         )
         self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(
-            _rope_config(config, self.attention_mode)
+            _rope_config(config, self.context_attention_mode)
         )
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
@@ -807,7 +937,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
-    ):
+        *,
+        return_dict: bool = False,
+    ) -> torch.LongTensor | DFlashGenerationOutput:
         self.eval()
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
@@ -855,7 +987,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[
-                    :, past_key_values_draft.get_seq_length() : start + block_size
+                    :,
+                    past_key_values_draft.get_seq_length(
+                        self.context_cache_layer_idx
+                    ) : start
+                    + block_size,
                 ],
                 past_key_values=past_key_values_draft,
                 use_cache=True,
@@ -912,4 +1048,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     :, : num_input_tokens + stop_token_indices[0] + 1
                 ]
 
+        if return_dict:
+            return DFlashGenerationOutput(
+                sequences=output_ids,
+                acceptance_lengths=tuple(acceptance_lengths),
+            )
         return output_ids

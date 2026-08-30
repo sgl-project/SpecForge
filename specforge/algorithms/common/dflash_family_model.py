@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
+from specforge.core.lk_loss import expected_acceptance_rate
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
@@ -778,6 +779,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_ce_loss_alpha: float = 0.1,
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
+        dspark_primary_loss: str = "legacy",
+        dspark_lk_loss_type: str = "alpha",
+        dspark_kl_scale: float = 1.0,
+        dspark_kl_decay: float = 3.0,
         objective_chunk_blocks: int = 128,
     ):
         super().__init__(
@@ -798,10 +803,28 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError("dspark_l1_loss_alpha must be >= 0")
         if dspark_confidence_head_alpha < 0:
             raise ValueError("dspark_confidence_head_alpha must be >= 0")
+        if dspark_primary_loss not in {"legacy", "tv", "lk"}:
+            raise ValueError(
+                "dspark_primary_loss must be one of 'legacy', 'tv', or 'lk', "
+                f"got {dspark_primary_loss!r}"
+            )
+        if dspark_lk_loss_type not in {"alpha", "lambda"}:
+            raise ValueError(
+                "dspark_lk_loss_type must be 'alpha' or 'lambda', "
+                f"got {dspark_lk_loss_type!r}"
+            )
+        if not 0.0 <= dspark_kl_scale <= 1.0:
+            raise ValueError("dspark_kl_scale must be in [0, 1]")
+        if dspark_kl_decay < 0:
+            raise ValueError("dspark_kl_decay must be >= 0")
         self.loss_type = "dspark"
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        self.dspark_primary_loss = dspark_primary_loss
+        self.dspark_lk_loss_type = dspark_lk_loss_type
+        self.dspark_kl_scale = float(dspark_kl_scale)
+        self.dspark_kl_decay = float(dspark_kl_decay)
 
     def _build_dspark_labels_and_mask(
         self,
@@ -908,6 +931,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
         draft_top1_num = zero
         tau_num = zero
         tau_den = zero
+        position_zero = torch.zeros(
+            block_size,
+            dtype=ce_num.dtype,
+            device=ce_num.device,
+        )
+        tv_position_num = position_zero
+        kl_position_num = position_zero
+        lk_alpha_position_num = position_zero
+        accept_position_num = position_zero
         accept_probability = None
 
         draft_probabilities = None
@@ -923,11 +955,46 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 ).reshape_as(draft_logits)
                 target_probabilities = torch.softmax(target_logits.float(), dim=-1)
                 teacher_ids = target_logits.argmax(dim=-1)
-            draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
+            draft_log_probabilities = None
+            if self.dspark_primary_loss == "legacy":
+                # Preserve both the arithmetic and cost of the historical path.
+                draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
+            else:
+                draft_log_probabilities = F.log_softmax(
+                    draft_logits.float(),
+                    dim=-1,
+                )
+                draft_probabilities = draft_log_probabilities.exp()
             l1_per_token = (
                 (draft_probabilities - target_probabilities).abs().sum(dim=-1)
             )
-            accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+            if self.dspark_primary_loss == "legacy":
+                accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+            else:
+                accept_probability = expected_acceptance_rate(
+                    target_probs=target_probabilities,
+                    draft_probs=draft_probabilities,
+                )
+                tv_per_token = 0.5 * l1_per_token
+                lk_alpha_per_token = -torch.log(
+                    accept_probability.clamp_min(
+                        torch.finfo(accept_probability.dtype).tiny
+                    )
+                )
+                assert draft_log_probabilities is not None
+                kl_per_token = F.kl_div(
+                    draft_log_probabilities,
+                    target_probabilities,
+                    reduction="none",
+                ).sum(dim=-1)
+                tv_position_num = (tv_per_token * loss_weights).sum(dim=(0, 1))
+                kl_position_num = (kl_per_token * loss_weights).sum(dim=(0, 1))
+                lk_alpha_position_num = (lk_alpha_per_token * loss_weights).sum(
+                    dim=(0, 1)
+                )
+            accept_position_num = (accept_probability.detach() * eval_mask).sum(
+                dim=(0, 1)
+            )
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
 
@@ -992,6 +1059,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_top1_num,
             tau_num,
             tau_den,
+            tv_position_num,
+            kl_position_num,
+            lk_alpha_position_num,
+            accept_position_num,
         )
 
     def _compute_dspark_loss(
@@ -1015,15 +1086,21 @@ class OnlineDSparkModel(OnlineDFlashModel):
         )
         loss_weights = self._dspark_loss_weight_mask(eval_mask)
         local_loss_den = loss_weights.sum()
-        need_target = self.dspark_l1_loss_alpha > 0 or (
-            self.dspark_confidence_head_alpha > 0
-            and getattr(self.draft_model, "confidence_head", None) is not None
+        loss_position_den = loss_weights.sum(dim=(0, 1))
+        need_target = (
+            self.dspark_primary_loss != "legacy"
+            or self.dspark_l1_loss_alpha > 0
+            or (
+                self.dspark_confidence_head_alpha > 0
+                and getattr(self.draft_model, "confidence_head", None) is not None
+            )
         )
         aligned_target_hidden = None
         if need_target:
             if target_last_hidden_states is None:
                 raise ValueError(
-                    "DSpark L1/confidence loss requires target_last_hidden_states"
+                    "DSpark distribution/confidence loss requires "
+                    "target_last_hidden_states"
                 )
             aligned_target_hidden = self._aligned_target_hidden(
                 target_last_hidden_states,
@@ -1057,6 +1134,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_top1_num,
             tau_num,
             tau_den,
+            tv_position_num,
+            kl_position_num,
+            lk_alpha_position_num,
+            accept_position_num,
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
@@ -1069,15 +1150,59 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
         if float(global_loss_den) <= 0:
             raise ValueError("DSpark objective has no supervised target tokens")
-        loss = (
-            world_size
-            * (
-                self.dspark_ce_loss_alpha * ce_num
-                + self.dspark_l1_loss_alpha * l1_num
-                + self.dspark_confidence_head_alpha * confidence_num
+
+        lk_lambda = None
+        if self.dspark_primary_loss == "legacy":
+            primary_loss = (
+                world_size
+                * (
+                    self.dspark_ce_loss_alpha * ce_num
+                    + self.dspark_l1_loss_alpha * l1_num
+                )
+                / global_loss_den
             )
+        else:
+            global_position_den = position_den.detach().clone()
+            if world_size > 1:
+                dist.all_reduce(global_position_den, op=dist.ReduceOp.SUM)
+            if not bool((global_position_den > 0).any()):
+                raise ValueError("DSpark distribution objective has no valid positions")
+            safe_position_den = global_position_den.clamp_min(1.0)
+            if self.dspark_primary_loss == "tv":
+                distribution_position_num = tv_position_num
+            elif self.dspark_lk_loss_type == "alpha":
+                distribution_position_num = lk_alpha_position_num
+            else:
+                global_accept_position_num = accept_position_num.detach().clone()
+                if world_size > 1:
+                    dist.all_reduce(
+                        global_accept_position_num,
+                        op=dist.ReduceOp.SUM,
+                    )
+                mean_acceptance = global_accept_position_num / safe_position_den
+                lk_lambda = (
+                    self.dspark_kl_scale
+                    * torch.exp(-self.dspark_kl_decay * mean_acceptance)
+                ).detach()
+                distribution_position_num = (
+                    lk_lambda * kl_position_num + (1.0 - lk_lambda) * tv_position_num
+                )
+            valid_positions = global_position_den > 0
+            primary_loss = (
+                world_size
+                * (
+                    distribution_position_num[valid_positions]
+                    / safe_position_den[valid_positions]
+                ).sum()
+            )
+
+        confidence_loss = (
+            world_size
+            * self.dspark_confidence_head_alpha
+            * confidence_num
             / global_loss_den
         )
+        loss = primary_loss + confidence_loss
 
         ratio_metrics = {
             "acc": (correct_num, eval_den),
@@ -1094,6 +1219,53 @@ class OnlineDSparkModel(OnlineDFlashModel):
             "ce_position": (ce_position_num, position_den),
             "accuracy_position": (correct_position_num, position_den),
         }
+        if aligned_target_hidden is not None:
+            ratio_metrics.update(
+                {
+                    "expected_acceptance": (
+                        accept_position_num.detach().sum(),
+                        position_den.detach().sum(),
+                    ),
+                    "expected_acceptance_position": (
+                        accept_position_num.detach(),
+                        position_den.detach(),
+                    ),
+                }
+            )
+        if self.dspark_primary_loss != "legacy":
+            ratio_metrics.update(
+                {
+                    "tv_loss": (
+                        tv_position_num.detach().sum(),
+                        local_loss_den.detach(),
+                    ),
+                    "kl_loss": (
+                        kl_position_num.detach().sum(),
+                        local_loss_den.detach(),
+                    ),
+                    "lk_alpha_loss": (
+                        lk_alpha_position_num.detach().sum(),
+                        local_loss_den.detach(),
+                    ),
+                    "tv_position": (
+                        tv_position_num.detach(),
+                        loss_position_den.detach(),
+                    ),
+                    "kl_position": (
+                        kl_position_num.detach(),
+                        loss_position_den.detach(),
+                    ),
+                    "lk_alpha_position": (
+                        lk_alpha_position_num.detach(),
+                        loss_position_den.detach(),
+                    ),
+                }
+            )
+        if lk_lambda is not None:
+            ratio_metrics["lk_lambda"] = (
+                lk_lambda.detach().sum(),
+                lk_lambda.new_tensor(lk_lambda.numel()),
+            )
         if aligned_target_hidden is not None:
             ratio_metrics.update(
                 {

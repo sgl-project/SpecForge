@@ -149,6 +149,7 @@ assume the command runs from the repository root.
 | DFlash offline, colocated | [`offline/colocated/qwen3-8b-dflash-offline.yaml`](offline/colocated/qwen3-8b-dflash-offline.yaml) |
 | Domino offline, colocated | [`offline/colocated/qwen3-8b-domino-offline.yaml`](offline/colocated/qwen3-8b-domino-offline.yaml) |
 | DSpark offline, colocated | [`offline/colocated/qwen3-4b-dspark-offline.yaml`](offline/colocated/qwen3-4b-dspark-offline.yaml) |
+| DSpark KDA offline, colocated | [`offline/colocated/qwen3-4b-dspark-kda-offline.yaml`](offline/colocated/qwen3-4b-dspark-kda-offline.yaml) |
 | EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
 | EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
 | DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
@@ -157,6 +158,11 @@ assume the command runs from the repository root.
 The runtime derives online/offline mode from the selected `data` source and
 reads topology from `deployment.mode`; it does not parse the filename or its
 historical suffixes.
+
+The Qwen3-4B KDA recipe is offline-only until SGLang's DFlash serving loader
+supports recurrent KDA draft layers. It uses the same captured target features
+as the GQA recipe and selects a hybrid `4×KDA + 1×GQA` draft stack. Install the
+optional kernel dependency with `pip install -e '.[kda]'` before running it.
 
 ### Top-level fields
 
@@ -281,7 +287,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | --- | --- |
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda` or `alpha`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
 | DFlash / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
-| DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
+| DSpark | Valid-first-target anchors with distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits). `training.dspark_primary_loss` selects the historical token-pooled CE/L1 mixture (`legacy`, default), total variation (`tv`), or acceptance-native LK (`lk`); `training.dspark_lk_loss_type` selects negative-log acceptance (`alpha`) or an adaptive forward-KL/TV blend (`lambda`) controlled by `training.dspark_kl_scale` (`1.0`) and `training.dspark_kl_decay` (`3.0`). Legacy weights are `training.dspark_ce_loss_alpha` (`0.1`) and `training.dspark_l1_loss_alpha` (`0.9`); `training.dspark_confidence_head_alpha` (`1.0`) remains a separate auxiliary for every primary objective. |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 
 New recipes must not write the loader-only migration fields
