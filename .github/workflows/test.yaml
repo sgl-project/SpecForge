@@ -39,7 +39,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     container:
-      image: lmsysorg/sglang:v0.5.14-cu130 # we lock to this version to avoid repeated docker pull
+      image: lmsysorg/sglang:v0.5.18-cu130 # we lock to this version to avoid repeated docker pull
       options: --gpus all --shm-size=2g --rm -v /dev/shm --privileged --pid=host
     steps:
       - name: Checkout code
@@ -76,9 +76,12 @@ jobs:
           fi
           source sf/bin/activate
           uv pip install wheel setuptools psutil packaging ninja
-          uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+          uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
           MAX_JOBS=8  uv pip install -v flash-attn --no-build-isolation
           uv pip install -v . --prerelease=allow
+          # SGLang 0.5.18 installs cubin separately and requires it to match
+          # flashinfer-python; replace the 0.6.12 copy in cached venvs.
+          uv pip install flashinfer-cubin==0.6.17 --index-url https://flashinfer.ai/whl
           # The live server-capture gate needs the Mooncake client AND the
           # mooncake_master console script; the isolated venv cannot see the
           # container's site-packages. cu130 image -> the cuda13 wheel.

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import os
 import sys
 import time
@@ -454,8 +455,9 @@ class TrainerCore:
                     op=dist.ReduceOp.SUM,
                     group=process_group,
                 )
-        if denominator.item() <= 0:
-            raise ValueError("global loss denominator must be positive")
+        denominator_value = denominator.item()
+        if not math.isfinite(denominator_value) or denominator_value <= 0:
+            raise ValueError("global loss denominator must be finite and positive")
         scale = (
             denominator.new_tensor(world_size * self.accumulation_steps) / denominator
         )

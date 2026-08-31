@@ -279,8 +279,8 @@ Strategy-specific fields should be written only when tuning that objective:
 
 | Strategy | Fields and defaults |
 | --- | --- |
-| EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda` or `alpha`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
-| DFlash / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
+| EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
+| DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), and `training.dflash2_selector_ramp_ratio` (`0.0`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 | MTP | `training.mtp_num_speculative_steps` (`1`; `>1` enables FastMTP-style teacher-forced multi-step training), `training.mtp_step_weight_beta` (`0.6`; exponential-decay base for per-step loss weights) |
@@ -492,6 +492,23 @@ For deeper lifecycle and recovery semantics, see the
 `qwen3-8b-dpace-online.yaml` is the D-PACE recipe. It deliberately uses the
 shared DFlash strategy with `training.loss_type: dpace`; D-PACE is an objective
 selection inside the unified trainer, not another training entry.
+
+DFlash 2 treats the token objective and position weighting as independent A/B
+axes. `training.lk_loss_type: null` keeps hard-target CE, `tv` minimizes the
+one-hot total-variation objective, and `lambda` adaptively mixes CE with TV;
+`alpha` is equivalent to CE for these hard targets. Independently,
+`training.loss_type: dflash` uses `loss_decay_gamma`, while `dpace` applies one
+detached dynamic position weight to both the unary and candidate-selector
+objectives. For example, LK-lambda with D-PACE uses:
+
+```yaml
+training:
+  lk_loss_type: lambda
+  kl_scale: 1.0
+  kl_decay: 1.0
+  loss_type: dpace
+  dpace_alpha: 0.5
+```
 
 Evaluation is currently offline-only and pairs `training.eval_interval` with
 `data.eval_hidden_states_path`. Best checkpoints are
