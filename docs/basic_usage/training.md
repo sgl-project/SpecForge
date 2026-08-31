@@ -201,6 +201,11 @@ ramps it linearly to the configured value. Both schedule ratios default to
 zero. A newly initialized selector starts as a unary no-op, so enabling DFlash
 2 does not perturb the initial DFlash proposal scores.
 
+Set `training.dflash2_selector_stop_gradient: true` to keep the selector CE
+from updating the unary logits and draft hidden states. The selector parameters
+still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
+gradient path. The option defaults to `false`, preserving coupled training.
+
 The exported computation and parameter names match the public SGLang DFlash 2
 contract, including optional `output_multiplier` and
 `final_logit_softcapping` transforms from `dflash_config`.
