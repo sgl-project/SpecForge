@@ -583,8 +583,59 @@ class ExportRoundTripTest(unittest.TestCase):
 
             merged = load_selected_tensors(out, lambda _key: True)
             self.assertTrue(torch.equal(merged["mtp.embed_tokens.weight"], shared))
-            self.assertTrue(torch.equal(merged["mtp.lm_head.weight"], shared))
             self.assertTrue(torch.equal(merged["mtp.fc.weight"], trained))
+            # tied serving modules reconstruct the head from mtp.embed_tokens;
+            # the merged checkpoint follows the native tied layout
+            self.assertNotIn("mtp.lm_head.weight", merged)
+
+    def test_merge_keeps_lm_head_for_untied_targets(self):
+        from safetensors.torch import save_file
+
+        from specforge.export.mtp import merge_mtp_into_base
+        from specforge.modeling.target.checkpoint import load_selected_tensors
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = os.path.join(tmpdir, "base")
+            runtime = os.path.join(tmpdir, "run-step1")
+            out = os.path.join(tmpdir, "out")
+            draft_config = os.path.join(tmpdir, "draft-config.json")
+            os.makedirs(base)
+            os.makedirs(runtime)
+
+            base_head = torch.randn(128, 64)
+            save_file(
+                {
+                    "model.embed_tokens.weight": torch.randn(128, 64),
+                    "lm_head.weight": base_head,
+                },
+                os.path.join(base, "model.safetensors"),
+            )
+            with open(os.path.join(base, "config.json"), "w") as f:
+                json.dump({"hidden_size": 64, "tie_word_embeddings": False}, f)
+            with open(draft_config, "w") as f:
+                json.dump(
+                    {
+                        "architectures": ["Qwen3_5MTPDraftModel"],
+                        "hidden_size": 64,
+                        "head_dim": 16,
+                    },
+                    f,
+                )
+
+            trained = torch.ones(64, 128)
+            torch.save(
+                {
+                    "strategy": "mtp",
+                    "draft_state_dict": {"mtp.fc.weight": trained},
+                },
+                os.path.join(runtime, "training_state.pt"),
+            )
+
+            merge_mtp_into_base(base, runtime, out, draft_config_path=draft_config)
+
+            merged = load_selected_tensors(out, lambda _key: True)
+            # untied targets need (and here backfill) a separate mtp.lm_head
+            self.assertTrue(torch.equal(merged["mtp.lm_head.weight"], base_head))
 
 
 class StepWeightsTest(unittest.TestCase):
@@ -685,6 +736,51 @@ class MultiStepForwardTest(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual((2, 15), corrects[0].shape)
+
+
+class MultiLayerMTPTest(unittest.TestCase):
+    def test_draft_respects_num_hidden_layers(self):
+        config = _tiny_config(num_hidden_layers=3)
+        draft = Qwen3_5MTPDraftModel(config)
+        self.assertEqual(3, len(draft.mtp.layers))
+        self.assertIn("mtp.layers.2.self_attn.q_proj.weight", draft.native_state_dict())
+
+    def test_patch_text_config_dual_writes_layer_count(self):
+        from specforge.export.mtp import _patch_text_config
+
+        base = {"text_config": {"hidden_size": 64}}
+        draft = {"num_hidden_layers": 3, "hidden_size": 64}
+        patched = _patch_text_config(base, draft)
+        self.assertEqual(3, patched["text_config"]["mtp_num_hidden_layers"])
+        self.assertEqual(3, patched["text_config"]["num_mtp_layers"])
+
+    def test_native_init_clones_layer0_into_extra_layers(self):
+        """A 3-layer draft must initialize from a native 1-layer checkpoint:
+        layers.1/2 are cloned from layers.0 and strict coverage passes."""
+        from safetensors.torch import save_file
+
+        config = _tiny_config(num_hidden_layers=3)
+        draft = Qwen3_5MTPDraftModel(config)
+        all_native = draft.native_state_dict()
+        required = draft.required_native_state_keys()
+        # native checkpoint carries only layers.0 (plus the non-layer keys)
+        state = {
+            key: torch.ones_like(value)
+            for key, value in all_native.items()
+            if key in required
+            and not key.startswith("mtp.layers.1.")
+            and not key.startswith("mtp.layers.2.")
+        }
+
+        with tempfile.TemporaryDirectory(prefix="mtp-native-init-") as tmpdir:
+            save_file(state, f"{tmpdir}/model.safetensors")
+            _init_from_native_mtp(_cfg(tmpdir), draft)  # must not raise
+
+        for key in required:
+            value = draft.native_state_dict()[key]
+            self.assertTrue(
+                torch.all(value == 1), f"{key} was not initialized from native weights"
+            )
 
 
 class MTPRegistrationTest(unittest.TestCase):

@@ -216,6 +216,17 @@ def _patch_text_config(base_config: dict, draft_config: dict) -> dict:
             target[key] = new
             print(f"  overriding text_config.{key}: {old} -> {new}")
 
+    # MTP layer count: vLLM builds the predictor from `mtp_num_hidden_layers`
+    # (default 1), not the draft's `num_hidden_layers`. Dual-write both
+    # spellings so a multi-layer trained head gets a matching serving module.
+    num_mtp_layers = source.get("num_hidden_layers")
+    if num_mtp_layers is not None:
+        for key in ("mtp_num_hidden_layers", "num_mtp_layers"):
+            old = target.get(key)
+            if old != num_mtp_layers:
+                target[key] = num_mtp_layers
+                print(f"  overriding text_config.{key}: {old} -> {num_mtp_layers}")
+
     return base_config
 
 
@@ -334,6 +345,13 @@ def merge_mtp_into_base(
             head_key_candidates,
             prefix,
         )
+
+    if tie_word_embeddings:
+        # Tied serving modules (e.g. vLLM's Qwen3_5MultiTokenPredictor) have no
+        # lm_head parameter and reject the key; the head is reconstructed from
+        # mtp.embed_tokens.weight at load time.  This also matches the native
+        # tied checkpoint layout, which ships no mtp.lm_head.weight.
+        mtp_state.pop(head_target, None)
 
     # The generic merge machinery (copy, prefix-key replacement, shard/index
     # writing) lives in modeling/target/checkpoint.py.

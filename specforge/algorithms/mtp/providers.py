@@ -84,6 +84,44 @@ def resume_contract(_config, draft_model, training_model):
     }
 
 
+def _expand_native_layers(native_mtp: dict, draft_model) -> dict:
+    """Clone native ``layers.0`` weights into extra layers the checkpoint lacks.
+
+    Native checkpoints ship a single MTP layer; a multi-layer draft would
+    otherwise fail strict native coverage (layers.1..N-1 missing).  Cloning
+    layer 0 is the standard multi-layer MTP initialization.
+    """
+
+    prefix = draft_model.NATIVE_KEY_PREFIX
+    layer_prefix = f"{prefix}layers."
+    layer0_prefix = f"{prefix}layers.0."
+    model_keys = set(draft_model.native_state_dict())
+    missing = sorted(
+        key
+        for key in model_keys
+        if key.startswith(layer_prefix)
+        and not key.startswith(layer0_prefix)
+        and key not in native_mtp
+    )
+    if not missing:
+        return native_mtp
+
+    expanded = dict(native_mtp)
+    for key in missing:
+        layer0_key = layer0_prefix + key[len(layer_prefix) :].split(".", 1)[1]
+        if layer0_key not in native_mtp:
+            raise RuntimeError(
+                f"[mtp] cannot initialize {key}: native checkpoint has no "
+                f"{layer0_key} to clone from"
+            )
+        expanded[key] = native_mtp[layer0_key].clone()
+    print(
+        f"[mtp] cloned {len(missing)} native weights from layers.0 into "
+        "the extra MTP layers."
+    )
+    return expanded
+
+
 def _init_from_native_mtp(cfg, draft_model) -> None:
     """Initialize the draft's ``mtp.*`` weights from the target checkpoint.
 
@@ -122,6 +160,7 @@ def _init_from_native_mtp(cfg, draft_model) -> None:
         scan_error = exc
 
     if native_mtp:
+        native_mtp = _expand_native_layers(native_mtp, draft_model)
         model_keys = set(draft_model.native_state_dict())
         required_keys = set(draft_model.required_native_state_keys())
         extra_keys = set(draft_model.allowed_extra_native_state_keys())
