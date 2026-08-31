@@ -28,6 +28,11 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1
   attention_backend: "sdpa"
+  # FastMTP multi-step training: 3 teacher-forced draft steps with
+  # exponential-decay loss weights [0.51, 0.31, 0.18]. Serve the trained head
+  # with num_speculative_tokens=3 to match.
+  mtp_num_speculative_steps: 3
+  mtp_step_weight_beta: 0.6
   save_interval: 10000
   log_interval: 50
   dist_timeout: 30
