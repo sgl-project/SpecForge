@@ -212,6 +212,7 @@ class OnlineDFlashModel(nn.Module):
         selector_loss_alpha: float = 1.0,
         selector_warmup_ratio: float = 0.0,
         selector_ramp_ratio: float = 0.0,
+        selector_stop_gradient: bool = False,
         lk_loss_type: Optional[str] = None,
         kl_scale: float = 1.0,
         kl_decay: float = 1.0,
@@ -250,6 +251,7 @@ class OnlineDFlashModel(nn.Module):
         self.selector_loss_alpha = float(selector_loss_alpha)
         self.selector_warmup_ratio = float(selector_warmup_ratio)
         self.selector_ramp_ratio = float(selector_ramp_ratio)
+        self.selector_stop_gradient = bool(selector_stop_gradient)
         self.lk_loss_type = lk_loss_type
         self.kl_scale = float(kl_scale)
         self.kl_decay = float(kl_decay)
@@ -483,6 +485,12 @@ class OnlineDFlashModel(nn.Module):
         The caller flattens these fields into ``DFlashObjectiveTerms`` to preserve
         ``checkpointed_chunk_reduce``'s flat tuple contract.
         """
+
+        if self.selector_stop_gradient:
+            # Isolate only the selector objective. The caller still uses the
+            # original tensors for the primary DFlash/D-PACE/LK objective.
+            objective_logits = objective_logits.detach()
+            hidden = hidden.detach()
 
         # Match serving exactly: train only against the strict unary top-k.
         # Candidate misses are a backbone/recall failure, not a selector

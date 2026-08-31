@@ -340,10 +340,15 @@ class ConfigSchemaTest(unittest.TestCase):
         payload["training"]["dflash2_selector_loss_alpha"] = 0.25
         payload["training"]["dflash2_selector_warmup_ratio"] = 0.1
         payload["training"]["dflash2_selector_ramp_ratio"] = 0.2
+        payload["training"]["dflash2_selector_stop_gradient"] = True
         config = Config.model_validate(payload)
         self.assertEqual(config.training.dflash2_selector_loss_alpha, 0.25)
         self.assertEqual(config.training.dflash2_selector_warmup_ratio, 0.1)
         self.assertEqual(config.training.dflash2_selector_ramp_ratio, 0.2)
+        self.assertTrue(config.training.dflash2_selector_stop_gradient)
+
+        default_config = Config.model_validate(_online_payload("dflash"))
+        self.assertFalse(default_config.training.dflash2_selector_stop_gradient)
 
         for field, invalid in (
             ("dflash2_selector_loss_alpha", -0.1),
