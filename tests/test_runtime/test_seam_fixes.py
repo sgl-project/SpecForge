@@ -151,10 +151,19 @@ class _FakeDFlashModel(nn.Module):
         super().__init__()
         self.w = nn.Parameter(torch.ones(1))
         self.max_valid_anchors = None
+        self.received_selector_loss_alpha = None
 
-    def forward(self, input_ids, hidden_states, loss_mask, max_valid_anchors=None):
+    def forward(
+        self,
+        input_ids,
+        hidden_states,
+        loss_mask,
+        max_valid_anchors=None,
+        selector_loss_alpha=None,
+    ):
         # mirrors OnlineDFlashModel's (loss, accuracy, metrics) contract
         self.max_valid_anchors = max_valid_anchors
+        self.received_selector_loss_alpha = selector_loss_alpha
         loss = (self.w * hidden_states.float().sum()).abs()
         acc = torch.tensor(0.5)
         return loss, acc, {"accuracy_denom": loss_mask.sum()}
@@ -180,6 +189,7 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
         self.assertTrue(rep.optimizer_stepped)  # optimizer stepped via the shared core
         self.assertEqual(backend.steps, 1)
         self.assertEqual(model.max_valid_anchors, 3)
+        self.assertEqual(model.received_selector_loss_alpha, 0.0)
         self.assertAlmostEqual(rep.metrics["acc"], 0.5)
         out = strat.forward_loss(batch)
         self.assertAlmostEqual(float(out.metrics["accuracy"]), 0.5)

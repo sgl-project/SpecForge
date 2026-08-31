@@ -178,6 +178,74 @@ class TestNormalizeDFlashExport(unittest.TestCase):
             )
             self.assertEqual(json.loads(path.read_text()), normalized)
 
+    def test_preserves_dflash2_architecture_and_nested_block_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "architectures": ["DFlash2DraftModel"],
+                        "auto_map": {"AutoModel": "dflash2.DFlash2DraftModel"},
+                        "dflash_config": {
+                            "block_size": 8,
+                            "conv_group_size": 16,
+                            "conv_kernel_size": 2,
+                            "selector_rank": 256,
+                            "selector_top_k": 16,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            normalized = self.module.normalize_export(str(path), 8)
+
+            self.assertEqual(normalized["architectures"], ["DFlash2DraftModel"])
+            self.assertNotIn("auto_map", normalized)
+            self.assertNotIn("block_size", normalized)
+            self.assertEqual(normalized["dflash_config"]["block_size"], 8)
+            self.assertEqual(json.loads(path.read_text()), normalized)
+
+    def test_rejects_incomplete_dflash2_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "architectures": ["DFlash2DraftModel"],
+                        "dflash_config": {
+                            "block_size": 8,
+                            "conv_group_size": 16,
+                            "conv_kernel_size": 2,
+                            "selector_rank": 256,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "selector_top_k"):
+                self.module.normalize_export(str(path), 8)
+
+    def test_rejects_mla_before_rewriting_the_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            original = {
+                "architectures": ["DFlashDraftModel"],
+                "auto_map": {"AutoModel": "dflash.DFlashDraftModel"},
+                "block_size": 16,
+                "dflash_config": {
+                    "projector_type": "dflash",
+                    "attention_mode": "mla",
+                },
+            }
+            path.write_text(json.dumps(original), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "only GQA/MHA"):
+                self.module.normalize_export(str(path), 16)
+
+            self.assertEqual(json.loads(path.read_text()), original)
+
     def test_rejects_dspark_without_a_positive_markov_rank(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

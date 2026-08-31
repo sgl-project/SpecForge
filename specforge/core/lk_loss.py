@@ -92,6 +92,8 @@ def compute_lk_loss(
     """Compute LK loss from KL loss and acceptance rate."""
     if lk_loss_type == "alpha":
         return -log_acceptance_rate
+    if lk_loss_type == "tv":
+        return 1 - acceptance_rate
     if lk_loss_type == "lambda":
         acc_det = acceptance_rate.detach()
         kl_weight = kl_scale * torch.exp(-kl_decay * acc_det)

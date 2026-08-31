@@ -38,6 +38,10 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "dflash"
 DRAFT_ARCHITECTURE = "DFlashDraftModel"
+DFLASH2_DRAFT_ARCHITECTURE = "DFlash2DraftModel"
+COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
+    {DRAFT_ARCHITECTURE, DFLASH2_DRAFT_ARCHITECTURE}
+)
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
@@ -50,7 +54,7 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DFlash architecture, sampling, and loss semantics."""
 
-    return {
+    contract = {
         "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dflash_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -62,7 +66,30 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_loss_decay_gamma": training_model.loss_decay_gamma,
         "dflash_loss_type": str(training_model.loss_type),
         "dflash_dpace_alpha": float(training_model.dpace_alpha),
+        "dflash_lk_loss_type": training_model.lk_loss_type,
+        "dflash_kl_scale": float(training_model.kl_scale),
+        "dflash_kl_decay": float(training_model.kl_decay),
     }
+    if getattr(draft_model, "candidate_selector", None) is not None:
+        method_config = dict(getattr(draft_model.config, "dflash_config", None) or {})
+        contract.update(
+            {
+                "dflash2_conv_kernel_size": int(method_config["conv_kernel_size"]),
+                "dflash2_conv_group_size": int(method_config["conv_group_size"]),
+                "dflash2_selector_rank": int(method_config["selector_rank"]),
+                "dflash2_selector_top_k": int(method_config["selector_top_k"]),
+                "dflash2_selector_loss_alpha": float(
+                    training_model.selector_loss_alpha
+                ),
+                "dflash2_selector_warmup_ratio": float(
+                    training_model.selector_warmup_ratio
+                ),
+                "dflash2_selector_ramp_ratio": float(
+                    training_model.selector_ramp_ratio
+                ),
+            }
+        )
+    return contract
 
 
 def resolve_dflash_kernels(config):
@@ -136,7 +163,7 @@ def algorithm_spec() -> AlgorithmSpec:
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
-            compatible_architectures={DRAFT_ARCHITECTURE},
+            compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
             default_architecture=DRAFT_ARCHITECTURE,
             supported_overrides={"num_hidden_layers", "block_size"},
         ),
@@ -177,6 +204,7 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
+                compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
                 expected_auto_map_model="dflash.DFlashDraftModel",
                 target_defaults=TargetDerivedDraftDefaults(
                     model_type="qwen3",
