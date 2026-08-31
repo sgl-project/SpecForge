@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 30, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -701,6 +701,10 @@ fraction of optimizer steps, and <code class="docutils literal notranslate"><spa
 ramps it linearly to the configured value. Both schedule ratios default to
 zero. A newly initialized selector starts as a unary no-op, so enabling DFlash
 2 does not perturb the initial DFlash proposal scores.</p>
+<p>Set <code class="docutils literal notranslate"><span class="pre">training.dflash2_selector_stop_gradient:</span> <span class="pre">true</span></code> to keep the selector CE
+from updating the unary logits and draft hidden states. The selector parameters
+still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
+gradient path. The option defaults to <code class="docutils literal notranslate"><span class="pre">false</span></code>, preserving coupled training.</p>
 <p>The exported computation and parameter names match the public SGLang DFlash 2
 contract, including optional <code class="docutils literal notranslate"><span class="pre">output_multiplier</span></code> and
 <code class="docutils literal notranslate"><span class="pre">final_logit_softcapping</span></code> transforms from <code class="docutils literal notranslate"><span class="pre">dflash_config</span></code>.</p>
@@ -1272,7 +1276,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 30, 2026.
+  Last updated on Aug 31, 2026.
   <br/>
 </p>
   </div>
