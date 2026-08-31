@@ -207,6 +207,11 @@ from an identity kernel with a zero-initialized dynamic projection, and the
 selector starts as a unary no-op, so both additions initially preserve the
 corresponding DFlash computation.
 
+Set `training.dflash2_selector_stop_gradient: true` to keep the selector CE
+from updating the unary logits and draft hidden states. The selector parameters
+still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
+gradient path. The option defaults to `false`, preserving coupled training.
+
 The exported computation and parameter names match the public SGLang DFlash2
 contract, including optional `output_multiplier` and
 `final_logit_softcapping` transforms from `dflash_config`.

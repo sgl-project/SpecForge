@@ -87,6 +87,9 @@ def resume_contract(_config, draft_model, training_model):
                 "dflash2_selector_ramp_ratio": float(
                     training_model.selector_ramp_ratio
                 ),
+                "dflash2_selector_stop_gradient": bool(
+                    training_model.selector_stop_gradient
+                ),
             }
         )
     return contract

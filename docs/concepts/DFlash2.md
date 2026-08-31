@@ -73,6 +73,7 @@ training:
   dflash2_selector_loss_alpha: 1.0
   dflash2_selector_warmup_ratio: 0.0005
   dflash2_selector_ramp_ratio: 0.0005
+  dflash2_selector_stop_gradient: false
 ```
 
 The effective selector weight is zero during warmup, increases linearly during
@@ -82,6 +83,13 @@ a positive configured alpha the selector remains in the optimizer and autograd
 graph during warmup, which keeps DDP behavior stable. Setting the configured
 alpha to exactly zero statically disables selector training, freezes its
 parameters, and excludes them from the optimizer.
+
+`dflash2_selector_stop_gradient` controls whether the selector CE also trains
+the parameters it reads. It defaults to `false`, which keeps the coupled
+behavior: selector CE flows back into the unary logits and draft hidden states.
+Setting it to `true` detaches both inputs inside the selector term, so only the
+selector's own parameters receive that gradient while the primary
+DFlash/D-PACE/LK objective keeps its unchanged gradient path.
 
 The combined base and selector numerator is normalized with the DFlash valid
 effective-token denominator. Selector metrics retain their own denominators so

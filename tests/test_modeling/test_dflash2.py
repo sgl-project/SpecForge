@@ -176,6 +176,7 @@ class DFlash2ArchitectureTest(unittest.TestCase):
             num_anchors=8,
             selector_loss_alpha=0.75,
             selector_ramp_ratio=0.2,
+            selector_stop_gradient=True,
             selector_warmup_ratio=0.1,
         )
 
@@ -188,6 +189,7 @@ class DFlash2ArchitectureTest(unittest.TestCase):
         self.assertEqual(contract["dflash2_selector_loss_alpha"], 0.75)
         self.assertEqual(contract["dflash2_selector_warmup_ratio"], 0.1)
         self.assertEqual(contract["dflash2_selector_ramp_ratio"], 0.2)
+        self.assertTrue(contract["dflash2_selector_stop_gradient"])
         self.assertEqual(contract["dflash_lk_loss_type"], "lambda")
 
     def test_backward_reaches_convolution_parameters(self):
@@ -638,6 +640,57 @@ class CandidateSelectorTest(unittest.TestCase):
             selector.successor_codebook,
             selector.hidden_projection.weight,
         ):
+            self.assertIsNotNone(parameter.grad)
+            self.assertGreater(parameter.grad.abs().sum().item(), 0.0)
+
+    def test_selector_stop_gradient_isolates_backbone_inputs(self):
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=4,
+                    vocab_size=4,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.2,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        draft = Draft()
+        with torch.no_grad():
+            draft.candidate_selector.successor_codebook.normal_(std=0.2)
+        model = OnlineDFlashModel(
+            draft_model=draft,
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(4, 4),
+            mask_token_id=3,
+            block_size=2,
+            attention_backend="eager",
+            selector_stop_gradient=True,
+        )
+        hidden = torch.tensor(
+            [[[[0.0, 0.0, 0.0, 0.0], [0.0, 3.0, 2.0, 1.0]]]],
+            requires_grad=True,
+        )
+        terms = model._dflash_objective_chunk_terms(
+            hidden,
+            torch.tensor([[[0, 2]]]),
+            torch.tensor([[[0.0, 1.0]]]),
+            torch.tensor([[[0, 1]]]),
+        )
+        (terms.ce_loss_num + terms.selector_ce_num).backward()
+
+        reference = hidden.detach().clone().requires_grad_(True)
+        base_ce = torch.nn.functional.cross_entropy(
+            reference[0, 0, 1].unsqueeze(0),
+            torch.tensor([2]),
+        )
+        base_ce.backward()
+        torch.testing.assert_close(hidden.grad, reference.grad)
+        for parameter in draft.candidate_selector.parameters():
             self.assertIsNotNone(parameter.grad)
             self.assertGreater(parameter.grad.abs().sum().item(), 0.0)
 
