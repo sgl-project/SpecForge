@@ -453,11 +453,12 @@ names consistently.
 ## CUDA, ROCm, and Ascend NPU
 
 CUDA and ROCm runs use the same YAML and entry point. For ROCm, install the
-checked-in environment before installing SpecForge:
+checked-in environment before installing SpecForge without dependencies
+so pip does not pull CUDA wheels over the ROCm stack:
 
 ```bash
 python -m pip install -r requirements-rocm.txt
-python -m pip install -e .
+python -m pip install -e . --no-deps
 ```
 
 Use a model/backend combination supported by that PyTorch ROCm environment;
