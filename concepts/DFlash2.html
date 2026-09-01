@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>📈 Performance Dashboard &#8212; SpecForge</title>
+    <title>DFlash2 &#8212; SpecForge</title>
   
   
   
@@ -46,13 +46,13 @@
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'community_resources/dashboard';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'concepts/DFlash2';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="EAGLE3 for Llama 3.1 8B: online training" href="../examples/llama3-eagle3-online.html" />
-    <link rel="prev" title="🔥 SpecBundle" href="specbundle.html" />
+    <link rel="next" title="📝 Data Preparation" href="../basic_usage/data_preparation.html" />
+    <link rel="prev" title="🦅 EAGLE3" href="EAGLE3.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
@@ -205,10 +205,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../get_started/about.html">⚡️ About SpecForge</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../concepts/DFlash2.html">DFlash2</a></li>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="speculative_decoding.html">💭 Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="EAGLE3.html">🦅 EAGLE3</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">DFlash2</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="nav bd-sidenav">
@@ -229,9 +229,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../benchmarks/domino-disaggregated-performance.html">Domino disaggregated performance findings</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Community Resources</span></p>
-<ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="specbundle.html">🔥 SpecBundle</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">📈 Performance Dashboard</a></li>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/specbundle.html">🔥 SpecBundle</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community_resources/dashboard.html">📈 Performance Dashboard</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
 <ul class="nav bd-sidenav">
@@ -317,7 +317,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/community_resources/dashboard.md?plain=1" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/blob/main/concepts/DFlash2.md?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -334,7 +334,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/community_resources/dashboard.md" target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/edit/main/concepts/DFlash2.md" target="_blank"
    class="btn btn-sm btn-source-edit-button dropdown-item"
    title="Suggest edit"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -351,7 +351,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Fcommunity_resources/dashboard.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/sgl-project/SpecForge/issues/new?title=Issue%20on%20page%20%2Fconcepts/DFlash2.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -381,7 +381,7 @@
       
       
       
-      <li><a href="../_sources/community_resources/dashboard.md" target="_blank"
+      <li><a href="../_sources/concepts/DFlash2.md" target="_blank"
    class="btn btn-sm btn-download-source-button dropdown-item"
    title="Download source file"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -464,7 +464,7 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>📈 Performance Dashboard</h1>
+    <h1>DFlash2</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
@@ -474,7 +474,10 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture">Architecture</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#selector-objective-and-schedule">Selector objective and schedule</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#train-online-or-offline">Train online or offline</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#export-and-serve">Export and serve</a></li>
 </ul>
             </nav>
         </div>
@@ -486,37 +489,161 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="performance-dashboard">
-<h1>📈 Performance Dashboard<a class="headerlink" href="#performance-dashboard" title="Link to this heading">#</a></h1>
-<section id="overview">
-<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
-<p>To better visualize the performance of the SpecBundle draft models, we have built a dashboard to offer interactive experiences to users to explore the evaluation results. We evaluate the performance of SpecBundle draft models under different speculative decoding configurations (i.e. steps, topk, num_draft_tokens) on various benchmarks, the benchmarks include:</p>
-<ul class="simple">
-<li><p>Conversation</p>
-<ul>
-<li><p>MTBench</p></li>
-</ul>
-</li>
-<li><p>General Knowledge</p>
-<ul>
-<li><p>GPQA</p></li>
-<li><p>FinanceQA</p></li>
-</ul>
-</li>
-<li><p>Math</p>
-<ul>
-<li><p>GSM8K</p></li>
-<li><p>Math500</p></li>
-</ul>
-</li>
-<li><p>Coding</p>
-<ul>
-<li><p>HumanEval</p></li>
-<li><p>LiveCodeBench</p></li>
-</ul>
-</li>
-</ul>
-<p>Check out the <a class="reference external" href="https://docs.sglang.io/SpecForge/SpecBundle/index.html">Performance Dashboard</a> for more details.</p>
+  <section class="tex2jax_ignore mathjax_ignore" id="dflash2">
+<h1>DFlash2<a class="headerlink" href="#dflash2" title="Link to this heading">#</a></h1>
+<p>DFlash2 extends the one-pass DFlash draft with grouped dynamic convolutions and
+a low-rank selector that chooses a coherent path through the target head’s
+top-k candidates. In SpecForge it is a <strong>draft architecture</strong>, not a separate
+training strategy or feature protocol.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Boundary</p></th>
+<th class="head"><p>DFlash2 value</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Training strategy</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">training.strategy:</span> <span class="pre">dflash</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Draft architecture</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Online server capture</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--spec-capture-method</span> <span class="pre">dflash</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Offline feature schema</p></td>
+<td><p>DFlash <code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_mask</span></code>, <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Export target</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">export</span> <span class="pre">--to</span> <span class="pre">hf</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>SGLang serving algorithm</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DFLASH</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>This reuse is intentional. The convolution and selector run entirely in the
+draft, so the target server captures the same layers and the trainer consumes
+the same tensors as standard DFlash.</p>
+<section id="architecture">
+<h2>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h2>
+<p>Every attention and MLP sublayer is wrapped by a grouped, dynamic depthwise
+convolution. <code class="docutils literal notranslate"><span class="pre">conv_kernel_size</span></code> controls its number of causal taps and
+<code class="docutils literal notranslate"><span class="pre">conv_group_size</span></code> controls how channels share dynamic kernel coefficients. The
+base kernel is an identity and the kernel projection is zero-initialized, so a
+new convolution starts as an exact no-op.</p>
+<p>The candidate selector first takes the target LM head’s unary top-k at every
+proposal position. It then adds a low-rank transition score conditioned on the
+draft hidden state and the predecessor token. The successor codebook is
+zero-initialized, so a new selector initially preserves unary DFlash scores.</p>
+<p>A DFlash2 draft config must explicitly select the architecture and provide its
+four additional model fields:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"architectures"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"DFlash2DraftModel"</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">"dflash_config"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">"block_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"target_layer_ids"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span><span class="w"> </span><span class="mi">31</span><span class="p">,</span><span class="w"> </span><span class="mi">46</span><span class="p">,</span><span class="w"> </span><span class="mi">61</span><span class="p">],</span>
+<span class="w">    </span><span class="nt">"mask_token_id"</span><span class="p">:</span><span class="w"> </span><span class="mi">248070</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"conv_kernel_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"conv_group_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"selector_rank"</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"selector_top_k"</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">conv_kernel_size</span></code> must be positive and no larger than <code class="docutils literal notranslate"><span class="pre">block_size</span></code>;
+<code class="docutils literal notranslate"><span class="pre">conv_group_size</span></code> must divide <code class="docutils literal notranslate"><span class="pre">hidden_size</span></code>; <code class="docutils literal notranslate"><span class="pre">selector_rank</span></code> must be positive;
+and <code class="docutils literal notranslate"><span class="pre">selector_top_k</span></code> must be between 1 and <code class="docutils literal notranslate"><span class="pre">vocab_size</span></code>. The checked-in complete
+configuration is
+<a class="reference download internal" download="" href="../_downloads/bfd74c58cdb21b5b45e2336c89b93a17/qwen3.6-27b-dflash2.json"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">configs/qwen3.6-27b-dflash2.json</span></code></span></a>.
+Unlike a standard DFlash draft, DFlash2 cannot be selected through
+target-derived defaults: provide this config or a pretrained DFlash2 directory
+whose <code class="docutils literal notranslate"><span class="pre">config.json</span></code> declares <code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code>.</p>
+</section>
+<section id="selector-objective-and-schedule">
+<h2>Selector objective and schedule<a class="headerlink" href="#selector-objective-and-schedule" title="Link to this heading">#</a></h2>
+<p>The base head keeps the configured DFlash, D-PACE, CE/LK, and TV behavior. The
+selector has a separate categorical cross-entropy objective over the strict
+unary top-k candidate set. Tokens whose gold target is outside that set do not
+contribute selector CE; <code class="docutils literal notranslate"><span class="pre">selector_coverage</span></code> measures how often it is present.</p>
+<p>Configure its weight and optimizer-step schedule in the training YAML:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">training</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">strategy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dflash</span>
+<span class="w">  </span><span class="nt">dflash2_selector_loss_alpha</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0</span>
+<span class="w">  </span><span class="nt">dflash2_selector_warmup_ratio</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.0005</span>
+<span class="w">  </span><span class="nt">dflash2_selector_ramp_ratio</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.0005</span>
+<span class="w">  </span><span class="nt">dflash2_selector_stop_gradient</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+</pre></div>
+</div>
+<p>The effective selector weight is zero during warmup, increases linearly during
+the ramp, and then stays at <code class="docutils literal notranslate"><span class="pre">dflash2_selector_loss_alpha</span></code>. Warmup and ramp are
+fractions of the resolved optimizer-step horizon, not micro-batch counts. With
+a positive configured alpha the selector remains in the optimizer and autograd
+graph during warmup, which keeps DDP behavior stable. Setting the configured
+alpha to exactly zero statically disables selector training, freezes its
+parameters, and excludes them from the optimizer.</p>
+<p><code class="docutils literal notranslate"><span class="pre">dflash2_selector_stop_gradient</span></code> controls whether the selector CE also trains
+the parameters it reads. It defaults to <code class="docutils literal notranslate"><span class="pre">false</span></code>, which keeps the coupled
+behavior: selector CE flows back into the unary logits and draft hidden states.
+Setting it to <code class="docutils literal notranslate"><span class="pre">true</span></code> detaches both inputs inside the selector term, so only the
+selector’s own parameters receive that gradient while the primary
+DFlash/D-PACE/LK objective keeps its unchanged gradient path.</p>
+<p>The combined base and selector numerator is normalized with the DFlash valid
+effective-token denominator. Selector metrics retain their own denominators so
+coverage, accuracy, probability, and CE remain interpretable when only part of
+the unary candidate set covers the target.</p>
+</section>
+<section id="train-online-or-offline">
+<h2>Train online or offline<a class="headerlink" href="#train-online-or-offline" title="Link to this heading">#</a></h2>
+<p>The managed-local Qwen3.6-27B example owns one target capture process and one
+trainer process. Update its model/data paths and GPU allocation, then run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-c<span class="w"> </span>examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml
+</pre></div>
+</div>
+<p>For external online services, use the same YAML model and training fields but
+omit <code class="docutils literal notranslate"><span class="pre">deployment.disaggregated.managed_local</span></code>, provide the Mooncake endpoints
+and <code class="docutils literal notranslate"><span class="pre">server_urls</span></code>, and start SGLang with <code class="docutils literal notranslate"><span class="pre">--spec-capture-method</span> <span class="pre">dflash</span></code>. Its
+auxiliary layer IDs must exactly match <code class="docutils literal notranslate"><span class="pre">dflash_config.target_layer_ids</span></code>.</p>
+<p>Offline DFlash2 uses the normal DFlash feature preparation path:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>scripts/prepare_hidden_states.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--strategy<span class="w"> </span>dflash<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--target-model-path<span class="w"> </span>/path/to/Qwen3.6-27B<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--draft-model-config<span class="w"> </span>configs/qwen3.6-27b-dflash2.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--data-path<span class="w"> </span>/path/to/train.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-path<span class="w"> </span>./cache/hidden_states/qwen3.6-27b-dflash2<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--chat-template<span class="w"> </span>qwen3.5<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--max-length<span class="w"> </span><span class="m">8192</span>
+</pre></div>
+</div>
+<p>Point an offline training YAML at that directory with
+<code class="docutils literal notranslate"><span class="pre">data.hidden_states_path</span></code>; keep <code class="docutils literal notranslate"><span class="pre">training.strategy:</span> <span class="pre">dflash</span></code> and the same draft
+config. DFlash2 supports the DFlash <code class="docutils literal notranslate"><span class="pre">eager</span></code>, <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>, and <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>
+training backends and the same full/sliding per-layer layouts.</p>
+</section>
+<section id="export-and-serve">
+<h2>Export and serve<a class="headerlink" href="#export-and-serve" title="Link to this heading">#</a></h2>
+<p>Export the runtime checkpoint as a Hugging Face draft directory:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span><span class="nb">export</span><span class="w"> </span>--to<span class="w"> </span>hf<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--checkpoint<span class="w"> </span>./outputs/qwen3.6-27b-dflash2-disaggregated-with-selector/qwen3.6-27b-dflash2-disaggregated-with-selector-latest<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--draft-config<span class="w"> </span>configs/qwen3.6-27b-dflash2.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-dir<span class="w"> </span>./exports/qwen3.6-27b-dflash2
+</pre></div>
+</div>
+<p>Use an SGLang release or revision that contains DFlash2 support
+(<a class="reference external" href="https://github.com/sgl-project/sglang/pull/35371">SGLang PR #35371</a>). The
+serving algorithm remains <code class="docutils literal notranslate"><span class="pre">DFLASH</span></code>; <code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code> in the exported config
+selects the convolution and path-selector implementation. Optional
+<code class="docutils literal notranslate"><span class="pre">dflash_config.output_multiplier</span></code> and <code class="docutils literal notranslate"><span class="pre">final_logit_softcapping</span></code> are applied to
+unary logits in both SpecForge’s local generation path and the matching serving
+contract.</p>
+<p>Training supports the shared DFlash-family <code class="docutils literal notranslate"><span class="pre">gqa</span></code>, <code class="docutils literal notranslate"><span class="pre">mha</span></code>, and <code class="docutils literal notranslate"><span class="pre">mla</span></code> attention
+modes. SGLang DFlash-family serving currently supports GQA/MHA layouts, so do
+not use an MLA DFlash2 export for a serving benchmark until the corresponding
+loader and kernels are available.</p>
 </section>
 </section>
 
@@ -532,20 +659,20 @@
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="specbundle.html"
+       href="EAGLE3.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">🔥 SpecBundle</p>
+        <p class="prev-next-title">🦅 EAGLE3</p>
       </div>
     </a>
     <a class="right-next"
-       href="../examples/llama3-eagle3-online.html"
+       href="../basic_usage/data_preparation.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">EAGLE3 for Llama 3.1 8B: online training</p>
+        <p class="prev-next-title">📝 Data Preparation</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -567,7 +694,10 @@
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture">Architecture</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#selector-objective-and-schedule">Selector objective and schedule</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#train-online-or-offline">Train online or offline</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#export-and-serve">Export and serve</a></li>
 </ul>
   </nav></div>
 

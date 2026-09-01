@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -208,6 +208,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/DFlash2.html">DFlash2</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="nav bd-sidenav">
@@ -547,8 +548,9 @@ exists. The same recipe supports offline data parallelism through the typed
 <p>For long sequences, EAGLE3 offline can instead use USP by setting
 <code class="docutils literal notranslate"><span class="pre">training.attention_backend=usp</span></code> and choosing
 <code class="docutils literal notranslate"><span class="pre">training.sp_ulysses_size</span></code>/<code class="docutils literal notranslate"><span class="pre">training.sp_ring_size</span></code>. Offline feature training
-also supports DFlash, Domino, and DSpark when the feature checkpoints and draft
-config use that strategy’s contract. <code class="docutils literal notranslate"><span class="pre">training.compact_teacher:</span> <span class="pre">true</span></code> enables
+also supports DFlash, DFlash2, Domino, and DSpark when the feature
+checkpoints and draft config use that strategy’s contract.
+<code class="docutils literal notranslate"><span class="pre">training.compact_teacher:</span> <span class="pre">true</span></code> enables
 the exact lower-memory teacher projection for offline text EAGLE3. See
 <a class="reference internal" href="../basic_usage/training.html#parallel-topologies"><span class="std std-ref">Parallel topologies</span></a> for the
 multi-process launch contract.</p>
@@ -639,7 +641,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 31, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

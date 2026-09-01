@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -208,6 +208,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/DFlash2.html">DFlash2</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="nav bd-sidenav">
@@ -547,7 +548,7 @@ strategy-specific set:</p>
 <tr class="row-odd"><td><p>P-EAGLE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">flex_attention</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p>DFlash, Domino, DSpark</p></td>
+<tr class="row-even"><td><p>DFlash, DFlash2, Domino, DSpark</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">eager</span></code>, <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>, <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code></p></td>
 </tr>
 </tbody>
@@ -582,11 +583,12 @@ tracking are also config features rather than custom launchers; see the
 <p>DFlash-family draft models select their attention parameterization with
 <code class="docutils literal notranslate"><span class="pre">dflash_config.attention_mode</span></code>: <code class="docutils literal notranslate"><span class="pre">gqa</span></code> (the default), <code class="docutils literal notranslate"><span class="pre">mha</span></code>, or <code class="docutils literal notranslate"><span class="pre">mla</span></code>. The mode
 swaps only the attention projections inside the shared decoder layer; the
-<code class="docutils literal notranslate"><span class="pre">DFlashDraftModel</span></code>, <code class="docutils literal notranslate"><span class="pre">DominoDraftModel</span></code>, and <code class="docutils literal notranslate"><span class="pre">DSparkDraftModel</span></code> architectures,
-target-context injection, per-layer full/sliding masks, objectives, capture
-contract, and <code class="docutils literal notranslate"><span class="pre">eager</span></code>/<code class="docutils literal notranslate"><span class="pre">sdpa</span></code>/<code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> backend selection are identical
-across modes. Multi-head Latent Attention is therefore a draft JSON change,
-not a new architecture:</p>
+<code class="docutils literal notranslate"><span class="pre">DFlashDraftModel</span></code>, <code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code>, <code class="docutils literal notranslate"><span class="pre">DominoDraftModel</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">DSparkDraftModel</span></code> architectures, target-context injection, per-layer
+full/sliding masks, objectives, capture contract, and
+<code class="docutils literal notranslate"><span class="pre">eager</span></code>/<code class="docutils literal notranslate"><span class="pre">sdpa</span></code>/<code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> backend selection are identical across modes.
+Multi-head Latent Attention is therefore a draft JSON change, not a new
+architecture:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
 <span class="w">  </span><span class="nt">"architectures"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"DSparkDraftModel"</span><span class="p">],</span>
 <span class="w">  </span><span class="nt">"hidden_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
@@ -613,7 +615,8 @@ query/KV head counts.</p>
 <p>MLA is a training-side mode: checkpoints train, evaluate through
 <code class="docutils literal notranslate"><span class="pre">spec_generate</span></code>, and export through <code class="docutils literal notranslate"><span class="pre">--to</span> <span class="pre">hf</span></code>. SGLang serving of DFlash-family
 drafts currently implements the GQA/MHA layout only, so plan benchmarks
-accordingly.</p>
+accordingly. DFlash2 otherwise follows the same mode selection; its convolution
+and selector do not change the attention projection contract.</p>
 </section>
 <section id="draft-architectures">
 <h2>Draft architectures<a class="headerlink" href="#draft-architectures" title="Link to this heading">#</a></h2>
@@ -746,7 +749,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 31, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

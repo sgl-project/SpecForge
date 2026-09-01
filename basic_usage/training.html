@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -208,6 +208,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/DFlash2.html">DFlash2</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="current nav bd-sidenav">
@@ -477,7 +478,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-a-run">Launch a run</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-config">Run config</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-configuration-and-model-initialization">Draft configuration and model initialization</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash-2">DFlash 2</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash2">DFlash2</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-and-offline-data">Online and offline data</a></li>
@@ -649,16 +650,18 @@ misspelled or retired option from being silently ignored.</p>
 <p>It may be omitted for EAGLE3, P-EAGLE, and DFlash. In that case SpecForge
 derives a registered draft config from the target config. The defaults preserve
 the former trainers: one EAGLE3 layer, four P-EAGLE layers, and one DFlash layer
-with block size 16. Typed overrides are available when creating a different
-fresh architecture:</p>
+with block size 16. This DFlash default selects <code class="docutils literal notranslate"><span class="pre">DFlashDraftModel</span></code>; DFlash2
+always requires an explicit draft config or pretrained config source. Typed
+overrides are available when creating a different fresh architecture:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">target_model_path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Qwen/Qwen3-8B</span>
 <span class="w">  </span><span class="nt">draft_num_hidden_layers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w">  </span><span class="c1"># P-EAGLE or DFlash; EAGLE3 remains one layer</span>
 <span class="w">  </span><span class="nt">draft_block_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span><span class="w">         </span><span class="c1"># DFlash only</span>
 </pre></div>
 </div>
-<p>For DFlash, configure the attention layout in the referenced draft JSON. Each
-entry corresponds to one draft layer; sliding layers share one positive window:</p>
+<p>For DFlash-family drafts, including DFlash2, configure the attention layout in
+the referenced draft JSON. Each entry corresponds to one draft layer; sliding
+layers share one positive window:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
 <span class="w">  </span><span class="nt">"num_hidden_layers"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
 <span class="w">  </span><span class="nt">"layer_types"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
@@ -679,13 +682,13 @@ entry corresponds to one draft layer; sliding layers share one positive window:<
 mixed layout must be edited explicitly in the draft JSON.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">eager</span></code>, <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>, and <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> backends support both layouts.</p>
 </section>
-<section id="dflash-2">
-<h3>DFlash 2<a class="headerlink" href="#dflash-2" title="Link to this heading">#</a></h3>
-<p>DFlash 2 is a draft-architecture variant of DFlash, not a separate capture
+<section id="dflash2">
+<h3>DFlash2<a class="headerlink" href="#dflash2" title="Link to this heading">#</a></h3>
+<p>DFlash2 is a draft-architecture variant of DFlash, not a separate capture
 strategy. Keep <code class="docutils literal notranslate"><span class="pre">training.strategy:</span> <span class="pre">dflash</span></code> and select it with a draft config
 whose architecture is <code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code>. The target server still captures
 the same selected hidden states with <code class="docutils literal notranslate"><span class="pre">--spec-capture-method</span> <span class="pre">dflash</span></code>.</p>
-<p>The DFlash 2 config additionally defines <code class="docutils literal notranslate"><span class="pre">conv_kernel_size</span></code> and
+<p>The DFlash2 config additionally defines <code class="docutils literal notranslate"><span class="pre">conv_kernel_size</span></code> and
 <code class="docutils literal notranslate"><span class="pre">conv_group_size</span></code> for the local convolution, plus <code class="docutils literal notranslate"><span class="pre">selector_rank</span></code> and
 <code class="docutils literal notranslate"><span class="pre">selector_top_k</span></code> for candidate-path selection. The base draft head uses the
 configured CE/LK/TV objective. The selector always uses categorical CE over the
@@ -699,26 +702,34 @@ weights rather than by batch or anchor count.</p>
 <code class="docutils literal notranslate"><span class="pre">training.dflash2_selector_warmup_ratio</span></code> keeps that scale at zero for an initial
 fraction of optimizer steps, and <code class="docutils literal notranslate"><span class="pre">training.dflash2_selector_ramp_ratio</span></code> then
 ramps it linearly to the configured value. Both schedule ratios default to
-zero. A newly initialized selector starts as a unary no-op, so enabling DFlash
-2 does not perturb the initial DFlash proposal scores.</p>
+zero. A configured alpha of zero disables selector training and freezes its
+parameters; a positive alpha keeps the selector in the optimizer and autograd
+graph even while its effective warmup weight is zero. The convolution starts
+from an identity kernel with a zero-initialized dynamic projection, and the
+selector starts as a unary no-op, so both additions initially preserve the
+corresponding DFlash computation.</p>
 <p>Set <code class="docutils literal notranslate"><span class="pre">training.dflash2_selector_stop_gradient:</span> <span class="pre">true</span></code> to keep the selector CE
 from updating the unary logits and draft hidden states. The selector parameters
 still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
 gradient path. The option defaults to <code class="docutils literal notranslate"><span class="pre">false</span></code>, preserving coupled training.</p>
-<p>The exported computation and parameter names match the public SGLang DFlash 2
+<p>The exported computation and parameter names match the public SGLang DFlash2
 contract, including optional <code class="docutils literal notranslate"><span class="pre">output_multiplier</span></code> and
 <code class="docutils literal notranslate"><span class="pre">final_logit_softcapping</span></code> transforms from <code class="docutils literal notranslate"><span class="pre">dflash_config</span></code>.</p>
-<p>The checked-in Qwen3.6-27B recipe owns the full two-GPU local stack: GPU 0 runs
-the target capture server and GPU 1 runs the trainer.</p>
+<p>The checked-in Qwen3.6-27B recipe owns a two-GPU local stack: one configured
+GPU runs the target capture server and another runs the trainer. Update its
+model/data paths and <code class="docutils literal notranslate"><span class="pre">cuda_visible_devices</span></code> lists for the local host.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>specforge<span class="w"> </span>train<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-c<span class="w"> </span>examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>model.target_model_path<span class="o">=</span>/path/to/Qwen3.6-27B
 </pre></div>
 </div>
 <p>Export the result with <code class="docutils literal notranslate"><span class="pre">specforge</span> <span class="pre">export</span> <span class="pre">--to</span> <span class="pre">hf</span></code>. Serving requires an SGLang
-version that includes DFlash 2 support (SGLang PR #35371); the serving algorithm
+version that includes DFlash2 support (SGLang PR #35371); the serving algorithm
 name remains <code class="docutils literal notranslate"><span class="pre">DFLASH</span></code>, and the exported <code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code> config enables the
 new path automatically.</p>
+<p>See the dedicated <a class="reference internal" href="../concepts/DFlash2.html"><span class="std std-doc">DFlash2 guide</span></a> for the complete
+model-field constraints, offline feature workflow, selector schedule, and
+serving compatibility boundary.</p>
 <p>Domino and DSpark need their projector/head metadata, so they require an
 explicit draft config (or a pretrained warm-start source that contains
 <code class="docutils literal notranslate"><span class="pre">config.json</span></code>). The old Domino parser exposed an optional config flag, but its
@@ -802,31 +813,35 @@ and <code class="docutils literal notranslate"><span class="pre">loss_mask</span
 <td><p>Offline colocated</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/35a8e9683ae71e64c2b498943ea055e0/qwen3-8b-dflash-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-dflash-offline.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>Domino</p></td>
+<tr class="row-odd"><td><p>DFlash2</p></td>
+<td><p>Online disaggregated, managed-local</p></td>
+<td><p><a class="reference download internal" download="" href="../_downloads/11e05e0fc80abd6621c5f0e6809c2e17/qwen3.6-27b-dflash2-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.6-27b-dflash2-disaggregated.yaml</span></code></span></a></p></td>
+</tr>
+<tr class="row-even"><td><p>Domino</p></td>
 <td><p>Online disaggregated, external</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/b25bb8fde120f954f24bf1ca49609742/qwen3-8b-domino-online.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-online.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>Domino</p></td>
+<tr class="row-odd"><td><p>Domino</p></td>
 <td><p>Online disaggregated, managed-local</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/bcc9b9cfaf5a2bbdfbf4b7cf2c235638/qwen3-8b-domino-multiserver-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-multiserver-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>Domino</p></td>
+<tr class="row-even"><td><p>Domino</p></td>
 <td><p>Offline colocated</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/06f5ceef4b03d926fd0707119bd5d14a/qwen3-8b-domino-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-8b-domino-offline.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>DSpark</p></td>
+<tr class="row-odd"><td><p>DSpark</p></td>
 <td><p>Online disaggregated, external</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/ff70fa2ec0156813b3d5ad4e0a059796/qwen3-4b-dspark-disaggregated.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-4b-dspark-disaggregated.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>DSpark</p></td>
+<tr class="row-even"><td><p>DSpark</p></td>
 <td><p>Offline colocated</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/eedc0142a92beebda530d02ac9c6a244/qwen3-4b-dspark-offline.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3-4b-dspark-offline.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-even"><td><p>DFlash (Ascend)</p></td>
+<tr class="row-odd"><td><p>DFlash (Ascend)</p></td>
 <td><p>Online disaggregated, external</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/d06712daee1c8beb3f5fb494eb8f8fab/qwen3.5-4b-dflash-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash-online-npu.yaml</span></code></span></a></p></td>
 </tr>
-<tr class="row-odd"><td><p>MTP (Ascend)</p></td>
+<tr class="row-even"><td><p>MTP (Ascend)</p></td>
 <td><p>Online disaggregated, managed-local</p></td>
 <td><p><a class="reference download internal" download="" href="../_downloads/7d9a6b72b22e85c3f6f18c44fefa859d/qwen3.5-4b-mtp-disaggregated-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-mtp-disaggregated-npu.yaml</span></code></span></a></p></td>
 </tr>
@@ -885,7 +900,7 @@ launching it.</p>
 <td><p>Yes, DP + USP</p></td>
 <td><p>Yes, consumer DP</p></td>
 </tr>
-<tr class="row-odd"><td><p>DFlash</p></td>
+<tr class="row-odd"><td><p>DFlash/DFlash2</p></td>
 <td><p>Yes, consumer DP</p></td>
 <td><p>Yes, DP</p></td>
 <td><p>Yes, consumer DP</p></td>
@@ -922,11 +937,12 @@ currently accepts text inputs only;</p></li>
 features through <code class="docutils literal notranslate"><span class="pre">data.eval_hidden_states_path</span></code>;</p></li>
 <li><p>attention backends are strategy-specific: EAGLE3 accepts <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>,
 <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>, <code class="docutils literal notranslate"><span class="pre">fa</span></code>, or offline <code class="docutils literal notranslate"><span class="pre">usp</span></code>; P-EAGLE requires
-<code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>; DFlash, Domino, and DSpark accept <code class="docutils literal notranslate"><span class="pre">eager</span></code>, <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>, or
-<code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>; MTP accepts <code class="docutils literal notranslate"><span class="pre">eager</span></code> or <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>;</p></li>
+<code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>; DFlash, DFlash2, Domino, and DSpark accept
+<code class="docutils literal notranslate"><span class="pre">eager</span></code>, <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>, or <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>; MTP accepts <code class="docutils literal notranslate"><span class="pre">eager</span></code> or <code class="docutils literal notranslate"><span class="pre">sdpa</span></code>;</p></li>
 <li><p>P-EAGLE requires <code class="docutils literal notranslate"><span class="pre">training.batch_size=1</span></code> and reuses EAGLE3’s server capture
 schema;</p></li>
-<li><p>offline feature training supports EAGLE3, DFlash, Domino, DSpark, and MTP;</p></li>
+<li><p>offline feature training supports EAGLE3, DFlash, DFlash2, Domino,
+DSpark, and MTP;</p></li>
 <li><p>every online run is disaggregated and uses <code class="docutils literal notranslate"><span class="pre">model.target_backend=sglang</span></code>;
 finite runs may omit both step fields so the producer can publish the exact
 optimizer horizon derived from the prepared prompt plan;</p></li>
@@ -1110,8 +1126,8 @@ Transformers.</p>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">--to</span> <span class="pre">sglang</span></code> currently implements the EAGLE3 serving-key contract. Use
-<code class="docutils literal notranslate"><span class="pre">--to</span> <span class="pre">hf</span></code> for DFlash, DFlash 2, Domino, DSpark, and P-EAGLE model directories. For an
-EAGLE-family self-contained Hugging Face directory, provide the target model as
+<code class="docutils literal notranslate"><span class="pre">--to</span> <span class="pre">hf</span></code> for DFlash, DFlash2, Domino, DSpark, and P-EAGLE model directories.
+For an EAGLE-family self-contained Hugging Face directory, provide the target model as
 the source of the frozen embedding when it is absent from the runtime
 checkpoint:</p>
 <p>Serving weight names are a fail-silent boundary in SGLang: an unrecognized key
@@ -1225,7 +1241,7 @@ earlier in this page.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-a-run">Launch a run</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-config">Run config</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-configuration-and-model-initialization">Draft configuration and model initialization</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash-2">DFlash 2</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash2">DFlash2</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#online-and-offline-data">Online and offline data</a></li>
@@ -1276,7 +1292,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 31, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

@@ -52,11 +52,11 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Training" href="training.html" />
-    <link rel="prev" title="🦅 EAGLE3" href="../concepts/EAGLE3.html" />
+    <link rel="prev" title="DFlash2" href="../concepts/DFlash2.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -208,6 +208,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../concepts/speculative_decoding.html">💭 Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../concepts/EAGLE3.html">🦅 EAGLE3</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/DFlash2.html">DFlash2</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="current nav bd-sidenav">
@@ -732,8 +733,9 @@ specforge<span class="w"> </span>train<span class="w"> </span>--config<span clas
 </section>
 <section id="prepare-offline-target-features">
 <h2>💾 Prepare offline target features<a class="headerlink" href="#prepare-offline-target-features" title="Link to this heading">#</a></h2>
-<p>Offline EAGLE3, DFlash, Domino, and DSpark runs consume target features created
-by <code class="docutils literal notranslate"><span class="pre">scripts/prepare_hidden_states.py</span></code>. Select the same strategy and draft
+<p>Offline EAGLE3, DFlash, DFlash2, Domino, and DSpark runs consume
+target features created by <code class="docutils literal notranslate"><span class="pre">scripts/prepare_hidden_states.py</span></code>. Select the same
+strategy and draft
 configuration that the later training recipe uses; these values determine both
 the target layers captured and the checkpoint schema. For example, prepare the
 checked-in Qwen3-8B DFlash recipe with:</p>
@@ -800,7 +802,7 @@ target-derived defaults for legacy configs that do not define
 <tr class="row-even"><td><p>EAGLE3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_mask</span></code>, <code class="docutils literal notranslate"><span class="pre">hidden_state</span></code>, <code class="docutils literal notranslate"><span class="pre">aux_hidden_state</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p>DFlash and Domino</p></td>
+<tr class="row-odd"><td><p>DFlash, DFlash2, and Domino</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, <code class="docutils literal notranslate"><span class="pre">loss_mask</span></code>, <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p>DSpark</p></td>
@@ -814,6 +816,11 @@ by the draft config. DSpark additionally stores the target model’s final hidde
 state for its L1 and confidence objectives. Keep each strategy in a separate
 output directory; the offline reader validates the contract instead of
 silently adapting incompatible features.</p>
+<p>DFlash2 feature preparation still uses <code class="docutils literal notranslate"><span class="pre">--strategy</span> <span class="pre">dflash</span></code>; pass a
+<code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code> config such as <code class="docutils literal notranslate"><span class="pre">configs/qwen3.6-27b-dflash2.json</span></code> so capture
+uses the intended <code class="docutils literal notranslate"><span class="pre">target_layer_ids</span></code>. Its convolution, selector, and selector
+loss schedule are draft/trainer concerns and do not add tensors to the offline
+record.</p>
 <p>D-PACE uses <code class="docutils literal notranslate"><span class="pre">training.strategy:</span> <span class="pre">dflash</span></code> and the DFlash feature schema. DTA also
 uses <code class="docutils literal notranslate"><span class="pre">--strategy</span> <span class="pre">dflash</span></code>, but feature preparation must receive its DTA draft
 config so the captured layer contract matches the training run.</p>
@@ -863,12 +870,12 @@ combinations.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="../concepts/EAGLE3.html"
+       href="../concepts/DFlash2.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">🦅 EAGLE3</p>
+        <p class="prev-next-title">DFlash2</p>
       </div>
     </a>
     <a class="right-next"
@@ -945,7 +952,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 31, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

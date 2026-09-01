@@ -63,8 +63,9 @@ exists. The same recipe supports offline data parallelism through the typed
 For long sequences, EAGLE3 offline can instead use USP by setting
 `training.attention_backend=usp` and choosing
 `training.sp_ulysses_size`/`training.sp_ring_size`. Offline feature training
-also supports DFlash, Domino, and DSpark when the feature checkpoints and draft
-config use that strategy's contract. `training.compact_teacher: true` enables
+also supports DFlash, DFlash2, Domino, and DSpark when the feature
+checkpoints and draft config use that strategy's contract.
+`training.compact_teacher: true` enables
 the exact lower-memory teacher projection for offline text EAGLE3. See
 [Parallel topologies](../basic_usage/training.md#parallel-topologies) for the
 multi-process launch contract.
