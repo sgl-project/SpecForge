@@ -57,7 +57,7 @@ strategy-specific set:
 | --- | --- |
 | EAGLE3 | `sdpa`, `flex_attention`, `fa`, offline `usp` |
 | P-EAGLE | `flex_attention` |
-| DFlash, Domino, DSpark | `eager`, `sdpa`, `flex_attention` |
+| DFlash, DFlash2, Domino, DSpark | `eager`, `sdpa`, `flex_attention` |
 
 ## Target models
 
@@ -90,11 +90,12 @@ tracking are also config features rather than custom launchers; see the
 DFlash-family draft models select their attention parameterization with
 `dflash_config.attention_mode`: `gqa` (the default), `mha`, or `mla`. The mode
 swaps only the attention projections inside the shared decoder layer; the
-`DFlashDraftModel`, `DominoDraftModel`, and `DSparkDraftModel` architectures,
-target-context injection, per-layer full/sliding masks, objectives, capture
-contract, and `eager`/`sdpa`/`flex_attention` backend selection are identical
-across modes. Multi-head Latent Attention is therefore a draft JSON change,
-not a new architecture:
+`DFlashDraftModel`, `DFlash2DraftModel`, `DominoDraftModel`, and
+`DSparkDraftModel` architectures, target-context injection, per-layer
+full/sliding masks, objectives, capture contract, and
+`eager`/`sdpa`/`flex_attention` backend selection are identical across modes.
+Multi-head Latent Attention is therefore a draft JSON change, not a new
+architecture:
 
 ```json
 {
@@ -124,7 +125,8 @@ query/KV head counts.
 MLA is a training-side mode: checkpoints train, evaluate through
 `spec_generate`, and export through `--to hf`. SGLang serving of DFlash-family
 drafts currently implements the GQA/MHA layout only, so plan benchmarks
-accordingly.
+accordingly. DFlash2 otherwise follows the same mode selection; its convolution
+and selector do not change the attention projection contract.
 
 ## Draft architectures
 

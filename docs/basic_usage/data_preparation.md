@@ -257,8 +257,9 @@ specforge train --config ./my-eagle3-disaggregated.yaml
 
 ## 💾 Prepare offline target features
 
-Offline EAGLE3, DFlash, Domino, and DSpark runs consume target features created
-by `scripts/prepare_hidden_states.py`. Select the same strategy and draft
+Offline EAGLE3, DFlash, DFlash2, Domino, and DSpark runs consume
+target features created by `scripts/prepare_hidden_states.py`. Select the same
+strategy and draft
 configuration that the later training recipe uses; these values determine both
 the target layers captured and the checkpoint schema. For example, prepare the
 checked-in Qwen3-8B DFlash recipe with:
@@ -298,7 +299,7 @@ Each output record contains the strategy's exact offline feature contract:
 | Strategy | Tensors in each `.ckpt` or `.ckpt.gz` record |
 | --- | --- |
 | EAGLE3 | `input_ids`, `loss_mask`, `hidden_state`, `aux_hidden_state` |
-| DFlash and Domino | `input_ids`, `loss_mask`, `hidden_states` |
+| DFlash, DFlash2, and Domino | `input_ids`, `loss_mask`, `hidden_states` |
 | DSpark | `input_ids`, `loss_mask`, `hidden_states`, `target_last_hidden_states` |
 
 For the DFlash family, `hidden_states` concatenates the target layers selected
@@ -306,6 +307,12 @@ by the draft config. DSpark additionally stores the target model's final hidden
 state for its L1 and confidence objectives. Keep each strategy in a separate
 output directory; the offline reader validates the contract instead of
 silently adapting incompatible features.
+
+DFlash2 feature preparation still uses `--strategy dflash`; pass a
+`DFlash2DraftModel` config such as `configs/qwen3.6-27b-dflash2.json` so capture
+uses the intended `target_layer_ids`. Its convolution, selector, and selector
+loss schedule are draft/trainer concerns and do not add tensors to the offline
+record.
 
 D-PACE uses `training.strategy: dflash` and the DFlash feature schema. DTA also
 uses `--strategy dflash`, but feature preparation must receive its DTA draft

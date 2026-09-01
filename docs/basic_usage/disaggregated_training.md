@@ -200,6 +200,19 @@ specforge train -c \
   examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
 ```
 
+DFlash2 uses this same DFlash capture topology and feature contract. Its
+checked-in Qwen3.6-27B profile selects `DFlash2DraftModel`, adds the convolution
+and selector settings, and owns one capture process plus one trainer process:
+
+```bash
+specforge train -c \
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml
+```
+
+The selector runs only on the consumer; capture servers still use
+`--spec-capture-method dflash` and the auxiliary layer IDs from the draft
+config.
+
 The launcher starts Mooncake first, waits for its metadata and RPC endpoints,
 starts every configured capture server and waits for every health endpoint,
 then starts the existing producer/consumer plan. A service or role failure
@@ -339,9 +352,9 @@ node-local deployment values.
 The online producer sends prompts to the URLs in
 `deployment.disaggregated.server_urls`. Start a patched SGLang server separately
 with the model, capture method, and auxiliary layer ids matching the draft
-config. DFlash and Domino use the DFlash capture contract, DSpark uses its
-dedicated K3 capture contract, and EAGLE3 and P-EAGLE use the EAGLE3 capture
-contract. Capture rejects chunked prefill and
+config. DFlash, DFlash2, and Domino use the DFlash capture contract, DSpark
+uses its dedicated K3 capture contract, and EAGLE3 and P-EAGLE use the EAGLE3
+capture contract. Capture rejects chunked prefill and
 gives every request attempt a unique radix-cache namespace so cached prefixes
 cannot truncate the captured sequence. Online capture is text-only: VLM
 training, including Qwen2.5-VL, is not supported. Online evaluation is also not
@@ -421,8 +434,8 @@ deployment:
 ```
 
 Both paths must be visible at the same location from producer and consumer
-nodes. The producer ingests existing EAGLE3, DFlash, Domino, or DSpark features
-and publishes a fixed manifest. Offline epochs remain re-iterable.
+nodes. The producer ingests existing EAGLE3, DFlash/DFlash2, Domino, or DSpark
+features and publishes a fixed manifest. Offline epochs remain re-iterable.
 
 Set `backend: mooncake` instead, omit `store_root`, and provide the Mooncake
 endpoints to use the remote store. Also set a positive
