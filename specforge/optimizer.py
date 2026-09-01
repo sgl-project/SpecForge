@@ -139,6 +139,22 @@ class BF16Optimizer:
 
     def step(self):
         grad_norm, clip_coefficient = self._grad_norm_and_clip_coefficient()
+        if not bool(torch.isfinite(grad_norm)):
+            # Clipping cannot rescale a non-finite norm and one such Adam step
+            # NaNs the weights permanently. The norm is already all-reduced,
+            # so every rank skips this step deterministically.
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                logger.warning(
+                    "skipping optimizer step: non-finite global grad norm "
+                    f"(max_grad_norm={self.max_grad_norm})"
+                )
+            with torch.no_grad():
+                for p in self.model_params:
+                    p.grad = None
+                for mp in self.fp32_params:
+                    mp.grad = None
+            self.last_grad_norm = grad_norm.detach()
+            return self.last_grad_norm
         cpu_clip_coefficient = (
             float(clip_coefficient.item()) if self.offload_master else None
         )

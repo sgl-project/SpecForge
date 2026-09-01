@@ -801,6 +801,31 @@ class TrainerController:
                             ),
                         }
                     )
+                    # Loader wait attribution: producer bucket = capture or
+                    # dispatch cannot keep up, fetch bucket = transfer is slow.
+                    perf_snapshot = getattr(data, "perf_counters_snapshot", None)
+                    if callable(perf_snapshot):
+                        loader = perf_snapshot(reset=True)
+                        steps = max(1, perf_window_steps)
+                        batches = max(1.0, loader["fetch_batches"])
+                        log_metrics.update(
+                            {
+                                "perf/data_wait_producer_s": (
+                                    loader["wait_producer_s"] / steps
+                                ),
+                                "perf/data_wait_fetch_s": (
+                                    loader["wait_fetch_s"] / steps
+                                ),
+                                "perf/fetch_seconds_per_sample": (
+                                    loader["fetch_s"] / batches
+                                ),
+                                "perf/fetch_delivered_gib_per_s": (
+                                    loader["fetch_bytes"]
+                                    / (1 << 30)
+                                    / max(1e-12, perf_elapsed_s)
+                                ),
+                            }
+                        )
                     self.logger(log_metrics, self.global_step)
                     perf_window_started = time.perf_counter()
                     perf_window_steps = 0
