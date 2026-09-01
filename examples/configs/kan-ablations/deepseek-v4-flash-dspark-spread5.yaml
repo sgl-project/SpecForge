@@ -1,0 +1,118 @@
+# Kan's hidden-state ablation: DeepSeek-V4-Flash target, 5 aux layers spread
+# across the model ([1, 11, 21, 31, 41] of 43). Pair of
+# deepseek-v4-flash-dspark-last3.yaml — identical except the draft JSON's
+# dflash_config.target_layer_ids. Single-node managed_local stack: mooncake +
+# 2x TP2 capture servers (GPUs 0-3) + 4-rank FSDP trainer (GPUs 4-7).
+# Launch with HF_HUB_CACHE=/sgl-workspace/hf-cache (node-local weights copy;
+# concurrent shard opens over virtiofs can deadlock in fuse_open).
+model:
+  target_model_path: deepseek-ai/DeepSeek-V4-Flash-0731
+  draft_model_config: examples/configs/kan-ablations/deepseek-v4-flash-dspark-spread5.json
+  target_backend: sglang
+  trust_remote_code: true
+  # DeepSeek-V4 checkpoints use the native inference weight layout.
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_mem_fraction_static: 0.85
+  # data.max_length plus headroom: capture rejects inputs at exactly the
+  # context length.
+  sglang_context_length: 8704
+  sglang_max_running_requests: 8
+  # The checkpoint's routed experts are fp4 (`expert_dtype: "fp4"`); the
+  # default MoE path cannot run them on B200.
+  sglang_moe_runner_backend: flashinfer_mxfp4
+
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 8192
+  chat_template: deepseek-v4
+  cache_dir: cache
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 8
+
+training:
+  strategy: dspark
+  num_epochs: 1
+  # Four consumer ranks x one sequence x 32 microbatches -> a global batch of 128.
+  batch_size: 1
+  accumulation_steps: 32
+  # lr 6e-4 / clip 1.0 / no warmup NaN'd this from-scratch pair at steps
+  # 70 (spread5) and 210 (last3) with the same grad-norm ramp the official
+  # r1 run showed before its step-1210 NaN; r2's stabilized hparams
+  # (half LR, tighter clip) plus a short warmup hold both variants stable.
+  learning_rate: 0.0003
+  lr_scheduler: constant
+  warmup_ratio: 0.02
+  max_grad_norm: 0.5
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 128
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-kan-ablation
+  wandb_name: deepseek-v4-flash-spread5-20260824
+  wandb_dir: outputs/kan-ablate-dsv4-spread5/wandb
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 8
+  # One 8K sample is ~0.4 GiB of BF16 DSpark features (five aux layers plus
+  # the pre-head hidden state at width 4096). Watermarks kept identical across
+  # both ablation variants (conservative for the 3-layer one).
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 128
+  resident_high_watermark_bytes: 137438953472
+  resident_low_watermark_bytes: 103079215104
+  feature_store_max_resident_bytes: 171798691840
+
+run_id: kan-ablate-dsv4-spread5
+output_dir: outputs/kan-ablate-dsv4-spread5
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/kan-ablate-dsv4-spread5/control
+    consumer_state_dir: outputs/kan-ablate-dsv4-spread5/consumer-state
+    backend: mooncake
+    store_id: kan-ablate-dsv4-spread5
+    managed_local:
+      trainer_cuda_visible_devices:
+        - "4"
+        - "5"
+        - "6"
+        - "7"
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 103079215104
+        local_buffer_size_bytes: 1073741824
+        # The managed-local 500ms default expires read leases mid-transfer
+        # under fetch contention (lease_expired_before_data_transfer_completed
+        # -707 storms; killed a consumer after 4 attempts). 5s stays well
+        # inside the ~19.5s teardown drain.
+        default_kv_lease_ttl_ms: 5000
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+            - "1"
+          tp_size: 2
+        - port: 30001
+          cuda_visible_devices:
+            - "2"
+            - "3"
+          tp_size: 2

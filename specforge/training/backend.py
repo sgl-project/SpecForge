@@ -269,13 +269,21 @@ class FSDPTrainingBackend(TrainingBackend):
                 if ignored_frozen_modules:
                     fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
                 if block_classes:
+                    # SPECFORGE_FSDP_PREFETCH=0 drops the forward/backward
+                    # prefetch so only ONE unsharded block is resident at a
+                    # time: for ~25B drafters whose per-rank memory sits at
+                    # the HBM ceiling the second 16 GiB block buys allocator
+                    # GC stalls that cost far more than the lost overlap.
+                    prefetch = os.environ.get("SPECFORGE_FSDP_PREFETCH", "1") != "0"
                     fsdp_kwargs.update(
                         auto_wrap_policy=functools.partial(
                             transformer_auto_wrap_policy,
                             transformer_layer_cls=block_classes,
                         ),
-                        forward_prefetch=True,
-                        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+                        forward_prefetch=prefetch,
+                        backward_prefetch=(
+                            BackwardPrefetch.BACKWARD_PRE if prefetch else None
+                        ),
                         limit_all_gathers=True,
                     )
                 model = FSDP(model, **fsdp_kwargs)
@@ -380,22 +388,34 @@ class FSDPTrainingBackend(TrainingBackend):
         )
 
     def _module_state_dict(self) -> dict:
+        # Checkpoint FILES keep the official per-expert MoE naming; the module
+        # itself exposes native stacked expert parameters (what FSDP's
+        # use_orig_params state-dict hooks require). Convert at this boundary.
+        from specforge.modeling.draft.dspark_v4 import (
+            unstack_grouped_expert_state_dict,
+        )
+
         if self._wrapper_kind == "ddp":
             if dist.is_initialized() and dist.get_rank() != 0:
                 return {}
-            return self.module.module.state_dict()
+            return unstack_grouped_expert_state_dict(self.module.module.state_dict())
         if self._wrapper_kind != "fsdp":
-            return self.module.state_dict()
+            return unstack_grouped_expert_state_dict(self.module.state_dict())
         from torch.distributed.fsdp import FullStateDictConfig
 
         # gather to rank0 CPU only — materializing the full model on every
         # rank's GPU is wasted memory when only rank0 writes it.
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with self._full_state_ctx(cfg):
-            return self.module.state_dict()
+            return unstack_grouped_expert_state_dict(self.module.state_dict())
 
     def _load_module_state_dict(self, model_state: dict) -> None:
+        from specforge.modeling.draft.dspark_v4 import (
+            stack_grouped_expert_state_dict,
+        )
+
         # every rank loads the full state dict read from the shared file.
+        model_state = stack_grouped_expert_state_dict(model_state)
         if self._wrapper_kind == "ddp":
             self.module.module.load_state_dict(model_state)
             return

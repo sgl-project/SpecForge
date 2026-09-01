@@ -244,7 +244,17 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             layer_idx=layer_idx,
             kernels=kernels,
         )
-        self.mlp = kernels.make_mlp(config)
+        if int(getattr(config, "n_routed_experts", 0) or 0) > 0:
+            # MoE FFN variant: reuse the DeepSeek-V4 DSpark MoE block (aux-free
+            # balanced top-k routing + one shared expert) in place of the dense
+            # MLP. Configured by the draft JSON's n_routed_experts /
+            # num_experts_per_tok / moe_intermediate_size / n_shared_experts /
+            # scoring_func / routed_scaling_factor / swiglu_limit fields.
+            from .dspark_v4 import DSparkV4MoE
+
+            self.mlp = DSparkV4MoE(config)
+        else:
+            self.mlp = kernels.make_mlp(config)
         self.input_layernorm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -395,9 +405,29 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
+        moe_bias_update_rate = float(dflash_config.get("moe_bias_update_rate", 1e-3))
+        for layer in self.layers:
+            if hasattr(layer.mlp, "bias_update_rate"):
+                layer.mlp.bias_update_rate = moe_bias_update_rate
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+
+    def _init_weights(self, module):
+        # The MoE gate holds a bare weight Parameter on a custom module, so
+        # the inherited Qwen3 init never touches it; from-scratch training
+        # would otherwise start routing from uninitialized memory. (The
+        # grouped experts self-initialize in their reset_parameters.)
+        from .dspark_v4 import DSparkV4Gate
+
+        if isinstance(module, DSparkV4Gate):
+            nn.init.normal_(
+                module.weight, mean=0.0, std=self.config.initializer_range
+            )
+            if not getattr(module.bias, "_is_hf_initialized", False):
+                module.bias.data.zero_()
+            return
+        super()._init_weights(module)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config
@@ -462,6 +492,19 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
+        if self.training:
+            # Apply the PREVIOUS forward's MoE balancing update before any
+            # routing this step, outside any activation-checkpoint region: a
+            # bias mutated between a forward and its recompute would route to
+            # different expert segments (see DSparkV4Model.forward).
+            for layer in self.layers:
+                apply_update = getattr(
+                    getattr(layer, "mlp", None),
+                    "apply_pending_balance_update",
+                    None,
+                )
+                if apply_update is not None:
+                    apply_update()
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer_type, layer in zip(self.layer_types, self.layers):

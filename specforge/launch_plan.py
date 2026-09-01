@@ -1155,14 +1155,25 @@ def run_commands(
             assert plan.managed_root is not None
             Path(plan.managed_root, "logs").mkdir(parents=True, exist_ok=False)
             phases = sorted({service.phase for service in plan.services})
+            # Serial mode exists for weight shards on fuse/virtiofs mounts, where
+            # concurrent opens of the same file can deadlock in fuse_open.
+            serial_startup = (
+                os.environ.get("SPECFORGE_SERIAL_SERVICE_STARTUP", "") == "1"
+            )
             for phase in phases:
                 current_phase = [
                     service for service in plan.services if service.phase == phase
                 ]
-                for service in current_phase:
-                    services.append((service, _spawn_service(service, popen=popen)))
-                for service, process in services[-len(current_phase) :]:
-                    readiness_waiter(service, process, tuple(services))
+                if serial_startup:
+                    for service in current_phase:
+                        process = _spawn_service(service, popen=popen)
+                        services.append((service, process))
+                        readiness_waiter(service, process, tuple(services))
+                else:
+                    for service in current_phase:
+                        services.append((service, _spawn_service(service, popen=popen)))
+                    for service, process in services[-len(current_phase) :]:
+                        readiness_waiter(service, process, tuple(services))
         for command in plan.commands:
             processes.append(_spawn_command(command, popen=popen))
         remaining = set(range(len(processes)))

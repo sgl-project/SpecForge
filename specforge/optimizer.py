@@ -139,6 +139,27 @@ class BF16Optimizer:
 
     def step(self):
         grad_norm, clip_coefficient = self._grad_norm_and_clip_coefficient()
+        if not bool(torch.isfinite(grad_norm)):
+            # A single non-finite microbatch loss (bf16 overflow on a
+            # pathological sample) contaminates the whole accumulated
+            # gradient; clipping cannot rescale a non-finite norm, and one
+            # such Adam step NaNs every weight permanently (observed as
+            # abrupt all-metric NaN on otherwise healthy runs). The norm is
+            # all-reduced above, so every rank sees the same value and skips
+            # this optimizer step deterministically — the window's gradient
+            # is sacrificed, the weights survive, and the scheduler is left
+            # untouched on every rank alike.
+            print_on_rank0(
+                "skipping optimizer step: non-finite global grad norm "
+                f"(max_grad_norm={self.max_grad_norm})"
+            )
+            with torch.no_grad():
+                for p in self.model_params:
+                    p.grad = None
+                for mp in self.fp32_params:
+                    mp.grad = None
+            self.last_grad_norm = grad_norm.detach()
+            return self.last_grad_norm
         cpu_clip_coefficient = (
             float(clip_coefficient.item()) if self.offload_master else None
         )

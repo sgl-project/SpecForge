@@ -90,6 +90,8 @@ def build_target_init_state(
     snapshot: str,
     layer_ids: list[int],
     n_experts: int,
+    *,
+    n_features: int | None = None,
     hidden_size: int,
     markov_rank: int,
     vocab_size: int,
@@ -98,6 +100,10 @@ def build_target_init_state(
 ) -> dict:
     torch.manual_seed(seed)
     n_stages = len(layer_ids)
+    # Number of captured target features feeding main_proj; defaults to one
+    # per stage (the official last-3 layout). A spread capture (e.g. 5 layers
+    # [1, 11, 21, 31, 41]) still initializes the 3 stages from layers 40-42.
+    n_features = n_stages if n_features is None else int(n_features)
     prefixes = tuple(f"layers.{lid}." for lid in layer_ids) + (
         "norm.weight",
         "hc_head_fn",
@@ -130,13 +136,13 @@ def build_target_init_state(
     del last  # heads below use the model's root (tree) naming
 
     # main_proj: identity on the last captured feature (or an average).
-    proj = torch.zeros(hidden_size, hidden_size * n_stages)
+    proj = torch.zeros(hidden_size, n_features * hidden_size)
     eye = torch.eye(hidden_size)
     if main_proj_init == "average":
-        for i in range(n_stages):
-            proj[:, i * hidden_size : (i + 1) * hidden_size] = eye / n_stages
+        for i in range(n_features):
+            proj[:, i * hidden_size : (i + 1) * hidden_size] = eye / n_features
     else:
-        proj[:, (n_stages - 1) * hidden_size :] = eye
+        proj[:, (n_features - 1) * hidden_size :] = eye
     state["mtp.0.main_proj.weight"] = proj.to(torch.bfloat16)
     state["mtp.0.main_norm.weight"] = torch.ones(hidden_size, dtype=torch.bfloat16)
 
@@ -167,12 +173,27 @@ def main():
         "--main-proj-init", choices=("identity-last", "average"),
         default="identity-last",
     )
+    parser.add_argument(
+        "--stage-layers", default=None,
+        help="comma-separated target layers to copy into the mtp stages "
+        "(default: the draft config's target_layer_ids; use 40,41,42 for a "
+        "spread-capture draft whose captured layers differ from its stages)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     with open(args.draft_config) as stream:
         cfg = json.load(stream)
-    layer_ids = list(cfg["dflash_config"]["target_layer_ids"])
+    capture_ids = list(cfg["dflash_config"]["target_layer_ids"])
+    layer_ids = (
+        [int(x) for x in args.stage_layers.split(",")]
+        if args.stage_layers else capture_ids
+    )
+    if len(layer_ids) != int(cfg["num_hidden_layers"]):
+        raise SystemExit(
+            f"{len(layer_ids)} stage source layers for a "
+            f"{cfg['num_hidden_layers']}-stage draft; pass --stage-layers"
+        )
 
     if args.from_official:
         print("loading official drafter weights ...")
@@ -189,6 +210,7 @@ def main():
             snapshot=args.target_snapshot,
             layer_ids=layer_ids,
             n_experts=int(cfg["n_routed_experts"]),
+            n_features=len(capture_ids),
             hidden_size=int(cfg["hidden_size"]),
             markov_rank=int(cfg["dflash_config"]["markov_rank"]),
             vocab_size=int(cfg["vocab_size"]),
@@ -204,7 +226,12 @@ def main():
     draft_config = load_draft_config_source(args.draft_config)
     with torch.device("meta"):
         model = AutoDraftModel.from_config(draft_config)
-    expected = model.state_dict()  # official naming (state-dict hooks)
+    from specforge.modeling.draft.dspark_v4 import unstack_grouped_expert_state_dict
+
+    # The module exposes native stacked expert parameters (FSDP-compatible);
+    # checkpoint FILES use the official per-expert naming, which the loader
+    # accepts. Validate in the official naming.
+    expected = unstack_grouped_expert_state_dict(model.state_dict())
     missing = sorted(set(expected) - set(state))
     unexpected = sorted(set(state) - set(expected))
     assert not missing, f"missing: {missing[:8]}"

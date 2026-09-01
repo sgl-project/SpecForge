@@ -1,0 +1,116 @@
+# Kan's architecture ablation: DeepSeek-V4-Flash target, the OFFICIAL
+# DSparkV4 drafter with the EXACT official config (capture layers [40, 41,
+# 42], block_size 5), trained FROM SCRATCH on ShareGPT at the ablation's
+# global batch of 128 and hparams. TWO-NODE stack: 10.13.114.105 = mooncake +
+# 4x TP2 capture servers with aux layers 40 41 42 (a DIFFERENT capture stack
+# from the spread5 runs), 10.13.114.103 = 8-rank FSDP trainer.
+model:
+  target_model_path: deepseek-ai/DeepSeek-V4-Flash-0731
+  draft_model_config: examples/configs/kan-ablations/deepseek-v4-flash-dspark-official-exact.json
+  target_backend: sglang
+  trust_remote_code: true
+  # DeepSeek-V4 checkpoints use the native inference weight layout.
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_mem_fraction_static: 0.85
+  # data.max_length plus headroom: capture rejects inputs at exactly the
+  # context length.
+  sglang_context_length: 8704
+  sglang_max_running_requests: 8
+  # The checkpoint's routed experts are fp4 (`expert_dtype: "fp4"`); the
+  # default MoE path cannot run them on B200.
+  sglang_moe_runner_backend: flashinfer_mxfp4
+
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 8192
+  chat_template: deepseek-v4
+  cache_dir: cache
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 8
+
+training:
+  strategy: dspark
+  num_epochs: 1
+  # Eight consumer ranks x one sequence x 16 microbatches -> a global batch
+  # of 128, the same optimizer quantum as the dense arm.
+  batch_size: 1
+  accumulation_steps: 16
+  # lr 6e-4 / clip 1.0 / no warmup NaN'd this from-scratch pair at steps
+  # 70 (spread5) and 210 (last3) with the same grad-norm ramp the official
+  # r1 run showed before its step-1210 NaN; r2's stabilized hparams
+  # (half LR, tighter clip) plus a short warmup hold both variants stable.
+  learning_rate: 0.0003
+  lr_scheduler: constant
+  warmup_ratio: 0.02
+  max_grad_norm: 0.5
+  # DSparkV4DraftModel implements the official window/block attention
+  # itself; the wrapper builds no masks.
+  attention_backend: native
+  # ~20B drafter: shard params+grads+optimizer state across the 8 ranks;
+  # no_sync accumulation would hold UNSHARDED grads per rank.
+  fsdp_sharding: FULL_SHARD
+  fsdp_no_sync_grad_accum: false
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  # ~20B drafter: each checkpoint is ~250 GB (weights + sharded optimizer
+  # state); save at step 470 + final only: /personal is at 90%.
+  save_interval: 470
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-kan-ablation
+  wandb_name: deepseek-v4-flash-official-exact-20260826
+  wandb_dir: outputs/kan-ablate-dsv4-official-exact/wandb
+
+runtime:
+  producer_lease: 8
+  # Four+ capture servers x 8 running requests: keep every prefill queue full
+  # (the trainer node now runs ~8 s steps and would otherwise wait on data).
+  producer_concurrency: 16
+  # One 8K sample is ~0.25 GiB of BF16 DSpark features (three aux layers
+  # plus the pre-head hidden state at width 4096); watermarks kept identical
+  # to the 5-layer arms (conservative here).
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 128
+  resident_high_watermark_bytes: 137438953472
+  resident_low_watermark_bytes: 103079215104
+  feature_store_max_resident_bytes: 171798691840
+
+run_id: kan-ablate-dsv4-official-exact
+output_dir: outputs/kan-ablate-dsv4-official-exact
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/kan-ablate-dsv4-official-exact/control
+    consumer_state_dir: outputs/kan-ablate-dsv4-official-exact/consumer-state
+    backend: mooncake
+    store_id: kan-ablate-dsv4-official-exact
+    server_urls:
+      - http://10.13.114.105:30000
+      - http://10.13.114.105:30001
+      - http://10.13.114.105:30002
+      - http://10.13.114.105:30003
+    mooncake_metadata_server: http://10.13.114.105:35880/metadata
+    mooncake_master_server_addr: 10.13.114.105:35551
+    mooncake_local_hostname: 10.13.114.103
+    # Measured on this B200 pair: single TCP stream 3.3 GB/s, 4 fetch
+    # clients 11.4 GB/s aggregate.
+    mooncake_protocol: tcp
+    # An 8K spread5 sample is ~0.4 GiB transferred as one object; the client
+    # buffer must hold it with headroom.
+    client_buffer_size: 2147483648

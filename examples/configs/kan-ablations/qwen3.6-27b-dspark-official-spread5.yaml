@@ -1,0 +1,111 @@
+# Kan's architecture ablation: Qwen3.6-27B target, the OFFICIAL DSparkV4
+# drafter architecture (3 MoE+mHC stages, 256 experts) at Qwen's width/vocab,
+# trained FROM SCRATCH on ShareGPT, aligned to the other arms: spread5 capture
+# layers [2, 17, 32, 47, 62], block_size 7, global batch 128, Qwen recipe
+# hparams. Pair of qwen3.6-27b-dspark-spread5{,-moe}.yaml. TWO-NODE stack (the
+# ~25B drafter needs 8 FSDP ranks: 4 ranks + CPU-offloaded Adam ran at 102 s/
+# step): 10.13.114.105 = mooncake + 8x TP1 capture servers (ports 30000-30007,
+# aux 2 17 32 47 62, context 4103, triton attention); 10.13.114.103 = 8-rank
+# FSDP trainer (MC_TRANSFER_TIMEOUT=300, SPECFORGE_MOONCAKE_FETCH_CLIENTS=4).
+model:
+  target_model_path: Qwen/Qwen3.6-27B
+  draft_model_config: examples/configs/kan-ablations/qwen3.6-27b-dspark-official-spread5.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  mask_token_id: 248070
+  # Qwen3.6 is a hybrid GDN model; on Blackwell SGLang only allows
+  # fa4/triton/trtllm_mha attention backends; fa4 rejects head_dim=256 on SM100.
+  sglang_attention_backend: triton
+
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 4096
+  chat_template: qwen3.5
+  cache_dir: cache
+  build_dataset_num_proc: 64
+
+training:
+  strategy: dspark
+  num_epochs: 1
+  # Eight consumer ranks x one sequence x 16 microbatches -> a global batch
+  # of 128, the same optimizer quantum as the dense arm (~940 steps/epoch).
+  batch_size: 1
+  accumulation_steps: 16
+  # The Qwen recipe's 6e-4 / clip 1.0 is unstable for this from-scratch 25B
+  # drafter (grad norm 7065 at step 60, still >10 at step 400, acc 0.175 vs
+  # 0.35 dense at step 600); use the same stabilized set as the DSv4 official
+  # arms so the official-arch family is consistent across targets.
+  learning_rate: 0.0003
+  warmup_ratio: 0.02
+  max_grad_norm: 0.5
+  # DSparkV4DraftModel implements the official window/block attention
+  # itself; the wrapper builds no masks.
+  attention_backend: native
+  # ~25B drafter on 8 ranks: shard params+grads+optimizer state, reduce-
+  # scatter every micro-step instead of holding unsharded grads.
+  # 24.9B drafter: FSDP's per-stage unsharded param+grad buffers (16.6 GiB
+  # each) dominate per-rank memory. Measured on 8x B200: FULL_SHARD + CPU-
+  # offloaded Adam + SPECFORGE_FSDP_PREFETCH=0 -> 32 s/step, flat 143 GB;
+  # SHARD_GRAD_OP (+offload) -> 37-70 s/step with memory swinging to the
+  # ceiling; on-GPU Adam -> thrash. Finer FSDP units (chunked expert
+  # tensors) would be the real fix.
+  fsdp_sharding: FULL_SHARD
+  fsdp_no_sync_grad_accum: false
+  optimizer_cpu_offload: true
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  # ~25B drafter: each checkpoint is ~320 GB (weights + sharded optimizer
+  # state); save at step 470 + final only: /personal is at 90%.
+  save_interval: 470
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-kan-ablation
+  wandb_name: qwen3.6-27b-official-spread5-20260826
+  wandb_dir: outputs/kan-ablate-qwen-official-spread5/wandb
+
+runtime:
+  # Eight TP1 capture servers x 8 running requests: keep every prefill queue
+  # full (the 8-rank trainer would otherwise wait on data).
+  producer_lease: 8
+  producer_concurrency: 16
+  # Both watermarks must cover the global optimizer-step quantum
+  # (2 ranks x batch 1 x 64 accumulation = 128 refs); kept larger so the
+  # producer can run ahead a few quanta.
+  in_flight_high_watermark: 640
+  in_flight_low_watermark: 512
+
+run_id: kan-ablate-qwen-official-spread5
+output_dir: outputs/kan-ablate-qwen-official-spread5
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/kan-ablate-qwen-official-spread5/control
+    consumer_state_dir: outputs/kan-ablate-qwen-official-spread5/consumer-state
+    backend: mooncake
+    store_id: kan-ablate-qwen-official-spread5
+    server_urls:
+      - http://10.13.114.105:30000
+      - http://10.13.114.105:30001
+      - http://10.13.114.105:30002
+      - http://10.13.114.105:30003
+      - http://10.13.114.105:30004
+      - http://10.13.114.105:30005
+      - http://10.13.114.105:30006
+      - http://10.13.114.105:30007
+    mooncake_metadata_server: http://10.13.114.105:35880/metadata
+    mooncake_master_server_addr: 10.13.114.105:35551
+    mooncake_local_hostname: 10.13.114.103
+    mooncake_protocol: tcp
+    # A 4K spread5 sample is ~0.25 GiB transferred as one object.
+    client_buffer_size: 2147483648

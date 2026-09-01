@@ -18,6 +18,7 @@ tilelang kernels in its ``kernel.py`` (``hc_split_sinkhorn``, ``act_quant``,
 from __future__ import annotations
 
 import math
+import re
 from typing import Optional
 
 import torch
@@ -391,15 +392,6 @@ class DSparkV4GroupedExperts(nn.Module):
                 # per-expert slices match nn.Linear's default init exactly
                 nn.init.kaiming_uniform_(stacked[i], a=math.sqrt(5))
 
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        for name in self._WEIGHT_NAMES:
-            stacked = getattr(self, name)
-            for i in range(self.n_experts):
-                value = stacked[i]
-                destination[f"{prefix}{i}.{name}.weight"] = (
-                    value if keep_vars else value.detach()
-                )
-
     def _load_from_state_dict(
         self,
         state_dict,
@@ -410,6 +402,22 @@ class DSparkV4GroupedExperts(nn.Module):
         unexpected_keys,
         error_msgs,
     ):
+        # Native stacked keys (``experts.w1`` [E, out, in]) load through the
+        # stock path; that is also what FSDP's use_orig_params state-dict
+        # hooks require (they assert the module's own parameter FQNs exist).
+        if any(f"{prefix}{name}" in state_dict for name in self._WEIGHT_NAMES):
+            return super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+        # Official per-expert naming (``experts.{i}.w1.weight``): warm starts
+        # from the bundled drafter and checkpoints written by the trainer
+        # (see unstack_grouped_expert_state_dict).
         consumed = set()
         for name in self._WEIGHT_NAMES:
             stacked = getattr(self, name)
@@ -432,6 +440,55 @@ class DSparkV4GroupedExperts(nn.Module):
             for key in state_dict:
                 if key.startswith(prefix) and key not in consumed:
                     unexpected_keys.append(key)
+
+
+_STACKED_EXPERT_KEY = re.compile(r"^(?P<base>.*\.experts)\.(?P<w>w[123])$")
+_PER_EXPERT_KEY = re.compile(
+    r"^(?P<base>.*\.experts)\.(?P<idx>\d+)\.(?P<w>w[123])\.weight$"
+)
+
+
+def unstack_grouped_expert_state_dict(state: dict) -> dict:
+    """Rewrite native stacked expert tensors into the official per-expert
+    naming (``experts.w1`` [E, out, in] -> ``experts.{i}.w1.weight``).
+
+    The module keeps its stacked parameters under their native names so FSDP
+    (use_orig_params) state-dict hooks find every parameter FQN; checkpoint
+    FILES keep the official layout so warm starts, resumes, and the bundler
+    are unaffected. A no-op for state dicts without grouped experts.
+    """
+    out = {}
+    for key, value in state.items():
+        m = _STACKED_EXPERT_KEY.match(key)
+        if m is None or not isinstance(value, torch.Tensor) or value.dim() != 3:
+            out[key] = value
+            continue
+        for i in range(value.shape[0]):
+            out[f"{m['base']}.{i}.{m['w']}.weight"] = value[i]
+    return out
+
+
+def stack_grouped_expert_state_dict(state: dict) -> dict:
+    """Inverse of :func:`unstack_grouped_expert_state_dict`: group official
+    per-expert keys back into native stacked tensors before loading into a
+    module (or an FSDP wrapper) that owns stacked parameters."""
+    groups: dict = {}
+    out = {}
+    for key, value in state.items():
+        m = _PER_EXPERT_KEY.match(key)
+        if m is None:
+            out[key] = value
+            continue
+        groups.setdefault((m["base"], m["w"]), {})[int(m["idx"])] = value
+    for (base, w), members in groups.items():
+        n = max(members) + 1
+        if sorted(members) != list(range(n)):
+            raise KeyError(
+                f"{base}.*.{w}.weight is missing expert indices: have "
+                f"{sorted(members)}"
+            )
+        out[f"{base}.{w}"] = torch.stack([members[i] for i in range(n)], dim=0)
+    return out
 
 
 class DSparkV4MoE(nn.Module):

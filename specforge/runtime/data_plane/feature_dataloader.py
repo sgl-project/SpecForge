@@ -16,6 +16,7 @@ the handle immediately, so prefetch can never race a release.
 
 from __future__ import annotations
 
+import logging
 import os
 import queue as queue_module
 import threading
@@ -29,6 +30,8 @@ import torch
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.data_plane.feature_store import FeatureStore
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
+
+logger = logging.getLogger(__name__)
 
 PerSampleTransform = Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
 CollateFn = Callable[[List[Dict[str, torch.Tensor]]], Dict[str, Any]]
@@ -263,8 +266,41 @@ class FeatureDataLoader:
             # tensor validation failures must not strand that handle.
             self.store.release(handle, reason="loaded")
         self._maybe_gc()
+        tensors = self._sanitize_non_finite(ref, tensors)
         if self.per_sample_transform is not None:
             tensors = self.per_sample_transform(tensors)
+        return tensors
+
+    def _sanitize_non_finite(
+        self, ref: SampleRef, tensors: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Zero out non-finite values in fetched float features, loudly.
+
+        A single non-finite value in a captured feature poisons the whole
+        run: the loss goes NaN, gradient clipping cannot rescale a NaN norm,
+        and one optimizer step NaNs every weight (observed as abrupt
+        all-metric NaN on an otherwise healthy step). Dropping the sample
+        here would desync the consumer's optimizer-window accounting, so the
+        bad values are replaced with zeros instead — one sanitized sample is
+        noise, a dead run is not. The warning carries the sample id and
+        feature name so the producer-side source can be diagnosed.
+        """
+        for name, value in tensors.items():
+            if not isinstance(value, torch.Tensor) or not value.is_floating_point():
+                continue
+            finite = torch.isfinite(value)
+            if bool(finite.all()):
+                continue
+            bad = int(value.numel() - int(finite.sum().item()))
+            logger.warning(
+                "sample %s feature %r carries %d non-finite of %d values; "
+                "replacing them with zeros to keep the loss finite",
+                ref.sample_id,
+                name,
+                bad,
+                value.numel(),
+            )
+            tensors[name] = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
         return tensors
 
     def _make_batch(self, refs: List[SampleRef]) -> TrainBatch:

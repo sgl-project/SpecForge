@@ -280,6 +280,12 @@ class MooncakeFeatureStore(FeatureStore):
         self._fetch_thread_local = threading.local()
         self._fetch_rr_lock = threading.Lock()
         self._fetch_rr_next = 0
+        # Buffers targeted by a failed get_into attempt, kept referenced for
+        # the process lifetime: a transfer that hit the engine's batch
+        # deadline (TRANSFER_FAIL/-800) can still write into its destination
+        # after the call returns, so that storage must never be reused or
+        # freed (see _store_get_tensor).
+        self._quarantined_buffers: List[torch.Tensor] = []
         put_config.replica_num = replica_num
         # Prefer true hard pinning when the installed Mooncake supports it.
         # Older ROCm builds expose only `with_soft_pin`; that is a best-effort
@@ -392,11 +398,13 @@ class MooncakeFeatureStore(FeatureStore):
             self._fetch_thread_local.idx = idx
         return stores[idx]
 
-    def _store_get_tensor(self, key: str, out: torch.Tensor) -> None:
+    def _store_get_tensor(self, key: str, out: torch.Tensor) -> torch.Tensor:
         """Zero-copy fetch into a pre-allocated tensor. Raises KeyError if absent.
 
-        The receive buffer is registered with the transfer engine for the get_into
-        (required by the raw-buffer path), then unregistered.
+        Returns the tensor that holds the fetched bytes: ``out`` on the
+        first-attempt path, or a fresh replacement when an earlier attempt
+        failed. The receive buffer is registered with the transfer engine for
+        the get_into (required by the raw-buffer path), then unregistered.
 
         A negative status is retried with backoff before failing the run:
         Mooncake's TCP data plane can time out a transfer under transient
@@ -404,30 +412,39 @@ class MooncakeFeatureStore(FeatureStore):
         60-second batch deadline while the capture server is under load), and
         one stalled transfer must not kill an otherwise healthy attempt. A
         genuinely missing object keeps failing and still raises KeyError.
+
+        A timed-out transfer can still write into its destination buffer
+        after get_into returns, so a buffer targeted by a failed attempt is
+        quarantined for the process lifetime — never retried into, never
+        freed. Retrying into the same storage has corrupted the heap
+        (malloc(): invalid next size -> SIGABRT in the consumer).
         """
         nb = _nbytes(out)
         client = self._fetch_client()
         attempts = 4
         rc = None
+        dst = out
         for attempt in range(attempts):
             try:
-                client.register_buffer(out.data_ptr(), nb)
+                client.register_buffer(dst.data_ptr(), nb)
             except Exception:  # pragma: no cover - some builds auto-register
                 pass
             try:
-                rc = client.get_into(key, out.data_ptr(), nb)
+                rc = client.get_into(key, dst.data_ptr(), nb)
             finally:
                 try:
-                    client.unregister_buffer(out.data_ptr())
+                    client.unregister_buffer(dst.data_ptr())
                 except Exception:  # pragma: no cover
                     pass
             if rc is not None and int(rc) >= 0:
                 break
+            self._quarantined_buffers.append(dst)
             if attempt < attempts - 1:
+                dst = torch.empty_like(out)
                 delay = 2.0 * (2**attempt)
                 logger.warning(
                     "mooncake get_into failed (status %s) for %s; "
-                    "retry %d/%d in %.0fs",
+                    "quarantined the receive buffer; retry %d/%d in %.0fs",
                     rc,
                     key,
                     attempt + 1,
@@ -445,6 +462,7 @@ class MooncakeFeatureStore(FeatureStore):
             raise KeyError(
                 f"mooncake get_into short read for {key}: got {rc} of {nb} bytes"
             )
+        return dst
 
     def _store_remove(self, key: str, *, force: bool = False) -> bool:
         """Best-effort physical free. Returns True on confirmed removal.
@@ -700,8 +718,9 @@ class MooncakeFeatureStore(FeatureStore):
                     f"sample {sid} gen {gen} feature {n!r} not available "
                     f"(freed, stale, or never written)"
                 )
-            out[n] = _alloc_from_spec(spec)  # fresh -> clone-on-fetch for free (B5)
-            self._store_get_tensor(key, out[n])
+            # fresh alloc -> clone-on-fetch for free (B5); the store returns a
+            # replacement tensor when a failed attempt poisoned the original.
+            out[n] = self._store_get_tensor(key, _alloc_from_spec(spec))
         return out, gen
 
     # -- lifetime ----------------------------------------------------------
