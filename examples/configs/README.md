@@ -91,6 +91,13 @@ template (the checkpoint ships no Jinja template). `...-moe.yaml` is the
 MoE-FFN arm of the drafter-architecture ablation: identical to the dense
 recipe except the draft JSON's MoE fields (see
 `specforge/modeling/draft/moe.py`) and stabilized from-scratch hparams.
+The `...-official-*.yaml` recipes train the official DeepSeek-V4 DSpark
+drafter architecture (`DSparkV4DraftModel`, `training.attention_backend:
+native`) on two-node H200 or B200 stacks
+([runbook](../../docs/recipes/deepseek-v4-flash-dspark-official-2node-h200.md));
+initialize their warm-start dir with `scripts/dspark_v4_official_weights.py`
+and `scripts/init_dspark_v4_from_target.py`, and export a servable drafter
+with `scripts/bundle_dspark_v4_official.py`.
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes

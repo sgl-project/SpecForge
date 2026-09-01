@@ -750,6 +750,10 @@ class TestPackageArchitecture(unittest.TestCase):
         )
 
         allowed = {
+            Path("scripts/launch_dsv4_0813_32k.sh"),
+            Path("scripts/launch_dsv4_0813_128k.sh"),
+            Path("scripts/launch_dsv4_official_2node.sh"),
+            Path("scripts/launch_dsv4_b200_2node.sh"),
             Path("examples/disagg/run_online.sh"),
             Path("examples/disagg/run_offline.sh"),
             Path("examples/disagg/run_offline_2node.sh"),
