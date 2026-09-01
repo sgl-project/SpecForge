@@ -134,6 +134,8 @@ class GeneralParser(Parser):
         self.set_assistant_pattern(chat_template)
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
+        if self.chat_template.jinja_chat_template is not None:
+            kwargs.setdefault("chat_template", self.chat_template.jinja_chat_template)
         conversation = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -478,6 +480,8 @@ class ThinkingParser(GeneralParser):
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         """Apply chat template to all messages, handling reasoning_content and tool_calls."""
+        if self.chat_template.jinja_chat_template is not None:
+            kwargs.setdefault("chat_template", self.chat_template.jinja_chat_template)
         # See GeneralParser.apply_chat_template: pass `None` rather than an empty
         # list so templates don't enter tool-use mode when there are no tools.
         conversation = self.tokenizer.apply_chat_template(

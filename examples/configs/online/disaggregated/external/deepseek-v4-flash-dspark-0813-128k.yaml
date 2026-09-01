@@ -1,0 +1,111 @@
+model:
+  target_model_path: deepseek-ai/DeepSeek-V4-Flash-0731
+  draft_model_config: configs/deepseek-v4-flash-dspark.json
+  target_backend: sglang
+  trust_remote_code: true
+  # DeepSeek-V4 checkpoints use the native inference weight layout.
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_mem_fraction_static: 0.85
+  # data.max_length plus headroom: capture rejects inputs at exactly the
+  # context length.
+  sglang_context_length: 131584
+  sglang_max_running_requests: 4
+  # The checkpoint's routed experts are fp4 (`expert_dtype: "fp4"`); the
+  # default MoE path cannot run them on B200.
+  sglang_moe_runner_backend: flashinfer_mxfp4
+
+data:
+  # Recorded DSV4-Flash production traffic (2026-08-13), rendered with the
+  # native encoding_dsv4 encoder by scripts/transform_traffic_recordings.py.
+  # Preformatted text: the deepseek-v4 ShareGPT Jinja would silently drop the
+  # tool calls that make up ~80% of this traffic.
+  train_data_path: ./cache/dataset/dsv4_flash_0813_train.jsonl
+  is_preformatted: true
+  max_length: 131072
+  chat_template: deepseek-v4
+  cache_dir: cache
+  cache_key: dsv4-flash-0813-128k-20k
+  build_dataset_num_proc: 64
+  # Preformatted tokenization re-encodes a prefix per assistant span, so a
+  # ~100-turn 80K-token row costs seconds; 20K prompts keeps dataset build
+  # under ~1h. Raise (or drop) once the run is proven; max is 480,851 rows.
+  max_prompts: 20000
+  dataloader_num_workers: 8
+
+training:
+  strategy: dspark
+  num_epochs: 1
+  # Median row is ~80K tokens (16x the 8K ShareGPT recipe), so the optimizer
+  # quantum shrinks to keep feature bytes bounded: 4 ranks x 8 microbatches
+  # -> 32 sequences (~2.6M supervis-able tokens) per step. Features run
+  # ~48KB/token (5 aux layers + pre-head at width 4096, bf16): ~3.8 GiB per
+  # average sample, 6.3 GiB at the 128K cap.
+  batch_size: 1
+  accumulation_steps: 8
+  learning_rate: 0.0006
+  lr_scheduler: constant
+  warmup_ratio: 0
+  max_grad_norm: 1
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 32
+  log_interval: 5
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge
+  wandb_name: deepseek-v4-flash-dspark-0813-128k
+  wandb_dir: outputs/deepseek-v4-flash-dspark-0813-128k/wandb
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 8
+  # One optimizer quantum is 32 samples (~122 GiB of features at the ~80K
+  # median, ~200 GiB worst case). Keep two quanta in flight so the producer
+  # runs a window ahead; the low watermark stays at one full quantum so
+  # complete optimizer windows always dispatch without a backpressure
+  # deadlock.
+  in_flight_high_watermark: 64
+  in_flight_low_watermark: 32
+  resident_high_watermark_bytes: 343597383680     # 320 GiB
+  resident_low_watermark_bytes: 171798691840      # 160 GiB (>= one quantum)
+  feature_store_max_resident_bytes: 429496729600  # 400 GiB
+
+run_id: deepseek-v4-flash-dspark-0813-128k
+output_dir: outputs/deepseek-v4-flash-dspark-0813-128k
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/deepseek-v4-flash-dspark-0813-128k/control
+    consumer_state_dir: outputs/deepseek-v4-flash-dspark-0813-128k/consumer-state
+    backend: mooncake
+    store_id: deepseek-v4-flash-dspark-0813-128k
+    # Two TP2 capture servers out-produce one TP4 server (TP prefill scaling
+    # is sublinear) and keep the producer ahead of a four-rank consumer.
+    server_urls:
+      - http://127.0.0.1:30000
+      - http://127.0.0.1:30001
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_local_hostname: 127.0.0.1
+    mooncake_protocol: tcp
+    # A single 131K sample is ~6.3 GiB transferred as one object; the client
+    # buffer must hold it (the 8K recipe's 1 GiB would fail the fetch).
+    client_buffer_size: 8589934592
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200

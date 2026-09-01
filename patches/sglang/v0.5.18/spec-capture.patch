@@ -1,5 +1,20 @@
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+index 1f310d8..ff972fd 100644
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -583,6 +583,10 @@ def prewarm_mhc_pre(
+ 
+     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
+     max_num_tokens = get_schedule().chunked_prefill_size
++    if max_num_tokens is None or max_num_tokens <= 0:
++        # Chunked prefill disabled (-1, e.g. spec-capture servers): bound the
++        # prewarm by the prefill token budget instead of a negative size.
++        max_num_tokens = get_schedule().max_prefill_tokens
+     buckets = get_mhc_pre_token_count_representatives(
+         max_num_tokens, hc_mult * hidden_size
+     )
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index 2487072b63..12040ba6e6 100644
+index 2487072..3137662 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
 @@ -102,6 +102,9 @@ class LogitsProcessorOutput:
@@ -51,8 +66,54 @@ index 2487072b63..12040ba6e6 100644
                  mm_input_embeds=logits_metadata.mm_input_embeds,
              )
  
+@@ -421,6 +449,7 @@ class LogitsProcessor(nn.Module):
+         logits_output = LogitsProcessorOutput(
+             next_token_logits=sampled_logits,
+             hidden_states=hidden_states_to_store,
++            last_hidden_states=last_hidden_states_to_store,
+             mm_input_embeds=logits_metadata.mm_input_embeds,
+         )
+         logprobs_result.write_input_to(logits_output)
+@@ -608,10 +637,14 @@ class LogitsProcessor(nn.Module):
+         if logits_metadata.capture_hidden_mode.need_capture():
+             if logits_metadata.capture_hidden_mode.is_full():
+                 if aux_hidden_states is not None:
++                    # Explicitly configured aux capture (spec-training servers)
++                    # must win over the model's pre-norm stream: models like
++                    # DeepSeek-V4 always pass hidden_states_before_norm, which
++                    # would otherwise silently replace the per-layer aux concat.
+                     hidden_states_to_store = pack_aux_hidden_states(aux_hidden_states)
+                 else:
+                     hidden_states_to_store = hidden_states
+-                hidden_states_to_store_before_norm = hidden_states_before_norm
++                    hidden_states_to_store_before_norm = hidden_states_before_norm
+             elif logits_metadata.capture_hidden_mode.is_last():
+                 # Get the last token hidden states. If sample_indices is None,
+                 # pruned states only contain the last tokens already.
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+index f4ec27a..dc480e5 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+@@ -22,7 +22,16 @@ from sglang.srt.utils import (
+ )
+ from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
+ 
+-_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
++import os as _os
++
++# FLASHINFER_USE_CUDA_QUANT=1 forces the "cuda" mxfp8-quantize backend; the
++# CuTe-DSL kernels miscompile against some nvidia-cutlass-dsl pins.
++_MXFP8_QUANTIZE_BACKEND = (
++    "cuda"
++    if _os.environ.get("FLASHINFER_USE_CUDA_QUANT", "0") == "1"
++    or not is_sm100_supported()
++    else "cute-dsl"
++)
+ 
+ if is_flashinfer_available():
+     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
-index 2a506f88cd..20f87ecb86 100644
+index 2a506f8..20f87ec 100644
 --- a/python/sglang/srt/managers/detokenizer_manager.py
 +++ b/python/sglang/srt/managers/detokenizer_manager.py
 @@ -476,6 +476,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
@@ -64,7 +125,7 @@ index 2a506f88cd..20f87ecb86 100644
              indexer_topk=indexer_topk,
              customized_info=recv_obj.customized_info,
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 736642c7fe..5b4f46c8f2 100644
+index 736642c..5b4f46c 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
 @@ -232,6 +232,9 @@ class GenerateReqInput:
@@ -120,7 +181,7 @@ index 736642c7fe..5b4f46c8f2 100644
      token_steps: Optional[List[List[int]]] = None
  
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 3ff2a29f3f..ad8ef20dc9 100755
+index 3ff2a29..ad8ef20 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
 @@ -846,6 +846,7 @@ class Req(ReqDllmMixin):
@@ -151,7 +212,7 @@ index 3ff2a29f3f..ad8ef20dc9 100755
          # Extra key for caller-defined request classification.
          if lora_id is not None:
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 7dc5be833f..94b7671688 100644
+index 7dc5be8..e09850c 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -655,6 +655,19 @@ class Scheduler(
@@ -240,7 +301,7 @@ index 7dc5be833f..94b7671688 100644
              )
  
          # Release the closure and large GPU tensors that are no longer needed.
-@@ -3924,6 +3953,11 @@ class Scheduler(
+@@ -3924,9 +3953,18 @@ class Scheduler(
          batch: ScheduleBatch,
          result: Union[GenerationBatchResult, EmbeddingBatchResult],
      ):
@@ -252,7 +313,26 @@ index 7dc5be833f..94b7671688 100644
          # Flush async trace ops here: in overlap mode this CPU work runs while
          # the next batch's GPU forward is in flight, giving free overlap.
          flush_trace_batch(batch.reqs)
-@@ -4043,6 +4077,15 @@ class Scheduler(
++        # Complete capture transfers on the scheduler thread before processing
++        # any kind of next result (prefill, decode, or idle).  This preserves
++        # the output socket's single-thread ownership under mixed traffic.
++        self.batch_result_processor.drain_spec_captures()
+         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+ 
+         if batch.forward_mode.is_decode():
+@@ -4040,9 +4078,27 @@ class Scheduler(
+ 
+     def on_idle(self):
+         """Idle housekeeping: guard, check, metrics, reset, sleep."""
++        # A capture response is intentionally delayed until its background
++        # sink transfer completes; finish it on this thread so ownership of
++        # the ZeroMQ output socket remains single-threaded.  Do not enter the
++        # idle sleeper while a future is outstanding or the producer waiting
++        # for that response could deadlock.
++        self.batch_result_processor.drain_spec_captures()
++        if self.batch_result_processor.has_pending_spec_captures():
++            time.sleep(0.001)
++            return
          # Flush any health-check signal deferred while the engine was busy.
          self.maybe_send_health_check_signal()
  
@@ -268,7 +348,7 @@ index 7dc5be833f..94b7671688 100644
          if not self.is_fully_idle():
              return
  
-@@ -4093,6 +4136,7 @@ class Scheduler(
+@@ -4093,6 +4149,7 @@ class Scheduler(
              and not self.dllm_manager.any_staging_reqs()
              and (self.last_batch is None or self.last_batch.is_empty())
              and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -277,7 +357,7 @@ index 7dc5be833f..94b7671688 100644
          )
  
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 024781c37e..d5208452b7 100644
+index 024781c..d520845 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -1,7 +1,9 @@
@@ -584,7 +664,7 @@ index 024781c37e..d5208452b7 100644
          self,
          *,
 diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-index 18a42407af..5c1ce295eb 100644
+index 18a4240..5c1ce29 100644
 --- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
 +++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
 @@ -162,6 +162,14 @@ class SchedulerOutputStreamer:
@@ -628,7 +708,7 @@ index 18a42407af..5c1ce295eb 100644
              indexer_topk=self.indexer_topk,
              customized_info=(
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 41c9cd212e..b01fd9e64b 100644
+index 41c9cd2..b01fd9e 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -1450,6 +1450,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -651,7 +731,7 @@ index 41c9cd212e..b01fd9e64b 100644
                  val = recv_obj.routed_experts[i]
                  if val is not None:
 diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
-index 69d00c9af9..6620ef83d7 100644
+index 69d00c9..6620ef8 100644
 --- a/python/sglang/srt/managers/utils.py
 +++ b/python/sglang/srt/managers/utils.py
 @@ -120,6 +120,16 @@ class GenerationBatchResult:
@@ -672,7 +752,7 @@ index 69d00c9af9..6620ef83d7 100644
              if self.logits_output.next_token_logprobs is not None:
                  self.logits_output.next_token_logprobs = _async_d2h(
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 017198c76a..32a601fb5d 100644
+index 017198c..32a601f 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -362,6 +362,42 @@ class ModelRunner:
@@ -719,7 +799,7 @@ index 017198c76a..32a601fb5d 100644
          if server_args.show_time_cost:
              enable_show_time_cost()
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 5c4f3ff44a..c40bcc6c42 100644
+index 5c4f3ff..c40bcc6 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -3511,6 +3511,29 @@ class ServerArgs:
@@ -754,7 +834,7 @@ index 5c4f3ff44a..c40bcc6c42 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000000..7c8b6d2463
+index 0000000..7c8b6d2
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
 @@ -0,0 +1,391 @@
