@@ -9,12 +9,10 @@ model:
   mask_token_id: 128799
   torch_dtype: bfloat16
   sglang_mem_fraction_static: 0.85
-  # data.max_length plus headroom: capture rejects inputs at exactly the
-  # context length.
+  # data.max_length plus headroom: capture rejects inputs at exactly context length.
   sglang_context_length: 8704
   sglang_max_running_requests: 8
-  # The checkpoint's routed experts are fp4 (`expert_dtype: "fp4"`); the
-  # default MoE path cannot run them on B200.
+  # Routed experts are fp4; the default MoE path cannot run them on B200.
   sglang_moe_runner_backend: flashinfer_mxfp4
 
 data:
@@ -23,17 +21,13 @@ data:
   chat_template: deepseek-v4
   cache_dir: cache
   build_dataset_num_proc: 64
-  # Enables the loader's async prefetch (queue depth = workers): with 0 the
-  # streaming iterator fetches every ~330 MiB sample inline on the training
-  # thread and the whole Mooncake fetch lands on the critical path (~7 s of a
-  # ~16 s step). get_into releases the GIL, so prefetch genuinely overlaps.
+  # Async prefetch: overlaps per-sample Mooncake feature fetches with compute.
   dataloader_num_workers: 8
 
 training:
   strategy: dspark
   num_epochs: 2
-  # Four consumer ranks x one sequence x 32 microbatches -> a global batch of
-  # 128 sequences per optimizer step.
+  # 4 ranks x 32 microbatches -> global batch 128.
   batch_size: 1
   accumulation_steps: 32
   learning_rate: 0.0006
@@ -62,13 +56,8 @@ tracking:
 runtime:
   producer_lease: 8
   producer_concurrency: 8
-  # One 8K sample is ~0.4 GiB of BF16 DSpark features (five aux layers plus the
-  # pre-head hidden state at width 4096). A complete optimizer quantum is 128
-  # samples (~51 GiB). Keep TWO quanta in flight so the producer runs one
-  # window ahead and the consumer prefetch overlaps the ~10 GiB/rank fetch
-  # with the previous window's compute; the low watermark stays at one full
-  # quantum so complete optimizer windows always dispatch without a
-  # backpressure deadlock.
+  # Keep two 128-sample optimizer quanta in flight (~0.4 GiB features/sample);
+  # the low watermark is one full quantum so complete windows always dispatch.
   in_flight_high_watermark: 256
   in_flight_low_watermark: 128
   resident_high_watermark_bytes: 137438953472
@@ -88,8 +77,7 @@ deployment:
     consumer_state_dir: outputs/deepseek-v4-flash-dspark-disaggregated/consumer-state
     backend: mooncake
     store_id: deepseek-v4-flash-dspark-specforge-disaggregated
-    # Two TP2 capture servers out-produce one TP4 server (TP prefill scaling
-    # is sublinear) and keep the producer ahead of a four-rank consumer.
+    # Two TP2 servers out-produce one TP4 server (TP prefill scaling is sublinear).
     server_urls:
       - http://127.0.0.1:30000
       - http://127.0.0.1:30001

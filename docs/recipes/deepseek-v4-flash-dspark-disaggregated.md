@@ -10,11 +10,7 @@ id DeepSeek reserves as `dspark_noise_token_id`).
 
 The recipe fits one 8-GPU B200 node: two TP2 capture servers on four GPUs
 and a four-rank FSDP trainer on the other four (global batch 128 = 4 ranks x
-32 microbatches). Two TP2 servers out-produce one TP4 server (TP prefill
-scaling is sublinear), and with `dataloader_num_workers: 8` parallelizing the
-consumer's Mooncake fetches the measured step time is ~4.6 s (~780 optimizer
-steps/hour, data wait ~0.6 s) versus ~16 s for the naive
-one-TP4-server/synchronous-loader setup. Splitting capture and training
+32 microbatches; ~4.6 s/step measured). Splitting capture and training
 across two nodes only changes the endpoints and `CUDA_VISIBLE_DEVICES`.
 
 ## Required source revisions

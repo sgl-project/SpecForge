@@ -14,9 +14,8 @@ class ChatTemplate(BaseModel):
         system_prompt(str): The system prompt.
         end_of_turn_token(str): The end token of a turn of conversation.
         ignore_token(List[str]): The list of tokens to ignore when parsing the model output, e.g., for thinking token.
-        jinja_chat_template(str): Jinja template applied instead of the tokenizer's own.
-            Required for checkpoints that ship no chat template at all (e.g.
-            DeepSeek-V4 renders prompts with a reference python encoder, not Jinja).
+        jinja_chat_template(str): Jinja template applied instead of the tokenizer's
+            own, for checkpoints that ship no chat template.
     """
 
     assistant_header: Optional[str] = None
@@ -317,10 +316,8 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
-# DeepSeek-V4 checkpoints ship no Jinja chat template (prompts are rendered by
-# the repo's reference python encoder), so this template carries its own Jinja
-# mirroring that encoder's basic chat form. Loss anchors at `<｜Assistant｜>`
-# so both chat and thinking renderings supervise the think open/close token.
+# DeepSeek-V4 checkpoints ship no Jinja chat template (prompts come from a
+# reference python encoder), so this template carries its own Jinja mirroring it.
 TEMPLATE_REGISTRY.register(
     name="deepseek-v4",
     template=ChatTemplate(

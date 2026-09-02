@@ -10,16 +10,11 @@ class TestDeepseekV4Template(unittest.TestCase):
         t = TEMPLATE_REGISTRY.get("deepseek-v4")
         self.assertIsNotNone(t)
         self.assertEqual(t.parser_type, "thinking")
-        # ShareGPT-style data stores plain responses; a populated
-        # reasoning_content field is rendered inline by the bundled Jinja, so
-        # the split-field thinking path stays off.
         self.assertFalse(t.enable_thinking)
         self.assertEqual(t.assistant_header, "<｜Assistant｜>")
         self.assertEqual(t.user_header, "<｜User｜>")
         self.assertEqual(t.end_of_turn_token, "<｜end▁of▁sentence｜>")
-        # DeepSeek-V4 checkpoints ship no chat template (prompts come from the
-        # repo's reference python encoder), so the template must carry its own
-        # Jinja and it must render the encoder's chat-mode assistant scaffold.
+        # The checkpoint ships no chat template, so ours must carry its own Jinja.
         self.assertIsNotNone(t.jinja_chat_template)
         self.assertIn("<｜begin▁of▁sentence｜>", t.jinja_chat_template)
         self.assertIn("</think>", t.jinja_chat_template)
