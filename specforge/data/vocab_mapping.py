@@ -6,7 +6,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Dataset vocabulary mappings shared by online and offline EAGLE training."""
+"""Token frequencies for draft vocabulary mappings, read from offline features.
+
+Lives beside preprocessing's top-K selection rather than under training: it
+reads prepared feature files and is equally useful to scripts, which are not
+allowed to reach into specforge.training.
+"""
 
 from __future__ import annotations
 
