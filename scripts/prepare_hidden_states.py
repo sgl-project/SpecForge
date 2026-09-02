@@ -37,7 +37,7 @@ torchrun --nproc_per_node=2 \
     --num-samples 10000 \
     --strategy dspark \
     --draft-model-config configs/qwen3-8b-dspark.json \
-    --is-performatted
+    --is-preformatted
 """
 
 import argparse
