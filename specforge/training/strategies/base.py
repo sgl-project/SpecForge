@@ -52,6 +52,16 @@ class StepContext:
     total_steps: Optional[int] = None
 
 
+def _moe_metrics(model_wrapper: nn.Module) -> Dict[str, Any]:
+    """``moe/...`` load diagnostics of the wrapped draft; ``{}`` for dense drafts."""
+    from specforge.modeling.draft.moe import collect_moe_metrics
+
+    draft_model = getattr(model_wrapper, "draft_model", None)
+    if draft_model is None:
+        return {}
+    return collect_moe_metrics(draft_model)
+
+
 def linear_lambda_base(
     global_step: int,
     total_steps: int,
@@ -511,6 +521,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
         if "selector_loss_alpha" in model_metrics:
             metrics["selector_loss_alpha"] = model_metrics["selector_loss_alpha"]
+        metrics.update(_moe_metrics(self.dflash_model))
         return StepOutput(
             loss=loss,
             metrics=metrics,
@@ -577,6 +588,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         ):
             if name in model_metrics:
                 metrics[name] = model_metrics[name]
+        metrics.update(_moe_metrics(self.dspark_model))
         return StepOutput(
             loss=loss,
             metrics=metrics,
