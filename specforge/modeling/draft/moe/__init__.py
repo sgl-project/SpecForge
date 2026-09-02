@@ -25,10 +25,20 @@ Modules:
 - :mod:`.state_dict`  module layout <-> official checkpoint naming boundary
 - :mod:`.init`        warm-start plans from a target model's experts
 
-Implementations register into the registries from their own modules; this
-package defines contracts and holds no routing math itself.
+Implementations register into the registries from their own modules
+(:mod:`.topk_router`, :mod:`.noaux_tc`, :mod:`.grouped_experts`,
+:mod:`.swiglu_shared`) and presets in :mod:`.presets`; the modules above
+define contracts and hold no routing math themselves.
 """
 
+# Implementations and presets register at import time.
+from . import (  # noqa: E402,F401  isort: skip
+    grouped_experts,
+    noaux_tc,
+    presets,
+    swiglu_shared,
+    topk_router,
+)
 from .balance import (
     BALANCE_CONTROLLERS,
     BalanceController,
@@ -55,7 +65,12 @@ from .hooks import (
     collect_moe_metrics,
     iter_moe_layers,
 )
-from .init import WarmStartPlan, plan_warm_start, select_target_experts
+from .init import (
+    WarmStartPlan,
+    apply_warm_start,
+    plan_warm_start,
+    select_target_experts,
+)
 from .layer import MoELayer, build_ffn
 from .router import (
     ROUTERS,
@@ -95,6 +110,7 @@ __all__ = [
     "SharedExpert",
     "WarmStartPlan",
     "apply_pending_balance_updates",
+    "apply_warm_start",
     "available_moe_presets",
     "build_balance_controller",
     "build_ffn",
