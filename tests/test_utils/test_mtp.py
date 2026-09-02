@@ -583,8 +583,204 @@ class ExportRoundTripTest(unittest.TestCase):
 
             merged = load_selected_tensors(out, lambda _key: True)
             self.assertTrue(torch.equal(merged["mtp.embed_tokens.weight"], shared))
-            self.assertTrue(torch.equal(merged["mtp.lm_head.weight"], shared))
             self.assertTrue(torch.equal(merged["mtp.fc.weight"], trained))
+            # tied serving modules reconstruct the head from mtp.embed_tokens;
+            # the merged checkpoint follows the native tied layout
+            self.assertNotIn("mtp.lm_head.weight", merged)
+
+    def test_merge_keeps_lm_head_for_untied_targets(self):
+        from safetensors.torch import save_file
+
+        from specforge.export.mtp import merge_mtp_into_base
+        from specforge.modeling.target.checkpoint import load_selected_tensors
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = os.path.join(tmpdir, "base")
+            runtime = os.path.join(tmpdir, "run-step1")
+            out = os.path.join(tmpdir, "out")
+            draft_config = os.path.join(tmpdir, "draft-config.json")
+            os.makedirs(base)
+            os.makedirs(runtime)
+
+            base_head = torch.randn(128, 64)
+            save_file(
+                {
+                    "model.embed_tokens.weight": torch.randn(128, 64),
+                    "lm_head.weight": base_head,
+                },
+                os.path.join(base, "model.safetensors"),
+            )
+            with open(os.path.join(base, "config.json"), "w") as f:
+                json.dump({"hidden_size": 64, "tie_word_embeddings": False}, f)
+            with open(draft_config, "w") as f:
+                json.dump(
+                    {
+                        "architectures": ["Qwen3_5MTPDraftModel"],
+                        "hidden_size": 64,
+                        "head_dim": 16,
+                    },
+                    f,
+                )
+
+            trained = torch.ones(64, 128)
+            torch.save(
+                {
+                    "strategy": "mtp",
+                    "draft_state_dict": {"mtp.fc.weight": trained},
+                },
+                os.path.join(runtime, "training_state.pt"),
+            )
+
+            merge_mtp_into_base(base, runtime, out, draft_config_path=draft_config)
+
+            merged = load_selected_tensors(out, lambda _key: True)
+            # untied targets need (and here backfill) a separate mtp.lm_head
+            self.assertTrue(torch.equal(merged["mtp.lm_head.weight"], base_head))
+
+
+class StepWeightsTest(unittest.TestCase):
+    def test_compute_step_weights_normalizes_exponential_decay(self):
+        from specforge.core.mtp import compute_step_weights
+
+        weights = compute_step_weights(beta=0.6, num_steps=3)
+        self.assertAlmostEqual(1.0, sum(weights))
+        # FastMTP Eq. 2: [1, 0.6, 0.36] / 1.96
+        self.assertAlmostEqual(1.0 / 1.96, weights[0], places=4)
+        self.assertAlmostEqual(0.6 / 1.96, weights[1], places=4)
+        self.assertAlmostEqual(0.36 / 1.96, weights[2], places=4)
+
+    def test_explicit_step_weights_validate_length(self):
+        with self.assertRaisesRegex(ValueError, "step_weights"):
+            OnlineMTPModel(
+                Qwen3_5MTPDraftModel(_tiny_config()),
+                num_speculative_steps=2,
+                step_weights=[1.0],
+            )
+
+
+class _EchoDraft(torch.nn.Module):
+    """Draft stub whose logits one-hot the current input token."""
+
+    def __init__(self, vocab: int):
+        super().__init__()
+        self.vocab = vocab
+        self.config = SimpleNamespace(pad_token_id=0)
+
+    def forward(
+        self,
+        input_ids,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        return_hidden=False,
+    ):
+        bsz, seq_len = input_ids.shape
+        logits = torch.zeros(bsz, seq_len, self.vocab)
+        logits.scatter_(2, input_ids.unsqueeze(-1), 10.0)
+        return SimpleNamespace(logits=logits, hidden_states=(hidden_states,))
+
+
+class MultiStepForwardTest(unittest.TestCase):
+    def test_aligned_targets_give_near_zero_loss(self):
+        # constant sequence: at every step the echo draft's prediction
+        # (x[t+k+1]) equals the target (x[t+k+2]) only if offsets are right
+        model = OnlineMTPModel(_EchoDraft(vocab=32), num_speculative_steps=3)
+        input_ids = torch.full((2, 16), 7, dtype=torch.long)
+        hidden_states = torch.randn(2, 16, 32)
+        loss_mask = torch.ones(2, 16)
+
+        loss, corrects, denoms = model(
+            input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
+        )
+
+        # floor = ln(1 + (vocab-1)*e^-10) ≈ 0.0029 for the one-hot stub at 10.0
+        self.assertLess(loss.item(), 0.01)
+        # step-0 accuracy is all-correct over the valid window
+        self.assertEqual((2, 12), corrects[0].shape)
+        self.assertTrue(torch.all(corrects[0] == denoms[0]))
+
+    def test_shifted_targets_give_positive_loss(self):
+        model = OnlineMTPModel(_EchoDraft(vocab=64), num_speculative_steps=3)
+        input_ids = torch.arange(16).unsqueeze(0).expand(2, -1) + 1
+        hidden_states = torch.randn(2, 16, 32)
+        loss_mask = torch.ones(2, 16)
+
+        loss, _, _ = model(
+            input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
+        )
+
+        self.assertGreater(loss.item(), 1.0)
+
+    def test_multi_step_grads_flow_through_recursion(self):
+        config = _tiny_config()
+        draft = Qwen3_5MTPDraftModel(config)
+        model = OnlineMTPModel(draft, num_speculative_steps=3)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+
+        loss, _, _ = model(
+            input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
+        )
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(draft.mtp.fc.weight.grad)
+
+    def test_default_single_step_path_unchanged(self):
+        config = _tiny_config()
+        model = OnlineMTPModel(Qwen3_5MTPDraftModel(config))
+        self.assertEqual(1, model.num_speculative_steps)
+        self.assertIsNone(model.step_weights)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+        loss, corrects, denoms = model(
+            input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual((2, 15), corrects[0].shape)
+
+
+class MultiLayerMTPTest(unittest.TestCase):
+    def test_draft_respects_num_hidden_layers(self):
+        config = _tiny_config(num_hidden_layers=3)
+        draft = Qwen3_5MTPDraftModel(config)
+        self.assertEqual(3, len(draft.mtp.layers))
+        self.assertIn("mtp.layers.2.self_attn.q_proj.weight", draft.native_state_dict())
+
+    def test_patch_text_config_dual_writes_layer_count(self):
+        from specforge.export.mtp import _patch_text_config
+
+        base = {"text_config": {"hidden_size": 64}}
+        draft = {"num_hidden_layers": 3, "hidden_size": 64}
+        patched = _patch_text_config(base, draft)
+        self.assertEqual(3, patched["text_config"]["mtp_num_hidden_layers"])
+        self.assertEqual(3, patched["text_config"]["num_mtp_layers"])
+
+    def test_native_init_clones_layer0_into_extra_layers(self):
+        """A 3-layer draft must initialize from a native 1-layer checkpoint:
+        layers.1/2 are cloned from layers.0 and strict coverage passes."""
+        from safetensors.torch import save_file
+
+        config = _tiny_config(num_hidden_layers=3)
+        draft = Qwen3_5MTPDraftModel(config)
+        all_native = draft.native_state_dict()
+        required = draft.required_native_state_keys()
+        # native checkpoint carries only layers.0 (plus the non-layer keys)
+        state = {
+            key: torch.ones_like(value)
+            for key, value in all_native.items()
+            if key in required
+            and not key.startswith("mtp.layers.1.")
+            and not key.startswith("mtp.layers.2.")
+        }
+
+        with tempfile.TemporaryDirectory(prefix="mtp-native-init-") as tmpdir:
+            save_file(state, f"{tmpdir}/model.safetensors")
+            _init_from_native_mtp(_cfg(tmpdir), draft)  # must not raise
+
+        for key in required:
+            value = draft.native_state_dict()[key]
+            self.assertTrue(
+                torch.all(value == 1), f"{key} was not initialized from native weights"
+            )
 
 
 class MTPRegistrationTest(unittest.TestCase):

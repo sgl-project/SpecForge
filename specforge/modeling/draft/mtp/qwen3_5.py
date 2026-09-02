@@ -316,11 +316,16 @@ class Qwen3_5MTPModel(nn.Module):
         )
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        # Single-layer Qwen3 transformer, flat under `mtp.layers.*` / `mtp.norm`
-        # to match the native Qwen3.5 checkpoint layout consumed by SGLang.
+        # Qwen3 transformer stack, flat under `mtp.layers.*` / `mtp.norm`.
+        # The native Qwen3.5 checkpoint ships 1 layer; `config.num_hidden_layers`
+        # is honored so multi-layer MTP variants can be trained (native
+        # checkpoints then only cover layers.0 — see providers' init).
         mtp_config = copy.deepcopy(config)
-        mtp_config.num_hidden_layers = 1
-        self.layers = nn.ModuleList([Qwen3MTPDecoderLayer(mtp_config, layer_idx=0)])
+        num_layers = getattr(config, "num_hidden_layers", 1) or 1
+        mtp_config.num_hidden_layers = num_layers
+        self.layers = nn.ModuleList(
+            [Qwen3MTPDecoderLayer(mtp_config, layer_idx=i) for i in range(num_layers)]
+        )
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = PartialRotaryEmbedding(
             mtp_config,
@@ -430,6 +435,7 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        return_hidden: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         inputs_embeds = self.embed_tokens(input_ids)
@@ -440,7 +446,10 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
             position_ids=position_ids,
         )
         logits = self.mtp.lm_head(hidden_states)
-        return CausalLMOutputWithPast(logits=logits)
+        # Multi-step training feeds the pre-lm_head hidden into the next step.
+        return CausalLMOutputWithPast(
+            logits=logits, hidden_states=(hidden_states,) if return_hidden else None
+        )
 
     @torch.inference_mode()
     def spec_generate(
