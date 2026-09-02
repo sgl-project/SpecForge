@@ -83,6 +83,10 @@ class OfflineSGLangCapture:
             loss_mask=torch.cat([row[2] for row in data], dim=0),
         )
 
+    def capture_rows(self, input_ids: List[List[int]]):
+        """Capture variable-length rows without padding target compute."""
+        return self._backend.capture_rows(input_ids)
+
 
 def load_offline_capture(
     pretrained_model_name_or_path: str,
