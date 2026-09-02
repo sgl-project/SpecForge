@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Two-node Inkling DSpark recipe:
-#   rank 0: Mooncake + SGLang #31847 TP4 capture + CPU producer
+#   rank 0: Mooncake + SGLang v0.5.18 TP4 capture + CPU producer
 #   rank 1: four-rank FSDP consumer/trainer
 #
 # Launch this command on both nodes. The cluster launcher supplies
 # RCLI_NODE_RANK, RCLI_NUM_NODES, and RCLI_HEAD_IP; both nodes must share the
-# fresh DISAGG_RUN_ROOT. Install SGLang #31847 in the active environment; the
+# fresh DISAGG_RUN_ROOT. Install SGLang v0.5.18 in the active environment; the
 # shared launcher applies the checked-in SpecForge capture patch before start.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-export CONFIG="${CONFIG:-$ROOT_DIR/examples/configs/inkling-dspark-disaggregated.yaml}"
+export CONFIG="${CONFIG:-$ROOT_DIR/examples/configs/online/disaggregated/external/inkling-dspark-disaggregated.yaml}"
 export RUN_LABEL="${RUN_LABEL:-inkling-dspark-2node}"
 export TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-thinkingmachines/Inkling}"
 

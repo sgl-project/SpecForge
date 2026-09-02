@@ -728,7 +728,7 @@ class LaunchPlanTest(unittest.TestCase):
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (
             Path(__file__).resolve().parents[2]
-            / "examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml"
+            / "examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml"
         )
         cfg = Config.from_file(str(path))
         with (

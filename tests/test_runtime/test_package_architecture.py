@@ -114,26 +114,26 @@ OPERATIONAL_EXAMPLE_REPLACEMENTS = {
         "docs/benchmarks/domino-disaggregated-performance.md",
     ),
     "examples/disagg/run_qwen2.5_7b_eagle3_disagg.sh": (
-        "examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml",
+        "examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml",
         "examples/disagg/run_offline_2node.sh",
         "docs/benchmarks/eagle3-disaggregated-parity.md",
     ),
     "examples/disagg/run_qwen3.6_27b_dflash_disagg.sh": (
-        "examples/configs/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml",
-        "examples/configs/qwen3.6-27b-dflash-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml",
+        "examples/configs/online/disaggregated/external/qwen3.6-27b-dflash-disaggregated.yaml",
     ),
     "examples/disagg/run_qwen3.6_27b_dflash_disagg_multiserver.sh": (
-        "examples/configs/qwen3.6-27b-dflash-multiserver-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml",
     ),
     "examples/disagg/run_qwen3_8b_dflash_disagg_1srv_dp7.sh": (
-        "examples/configs/qwen3-8b-dflash-1server-dp7-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml",
     ),
     "examples/disagg/run_qwen3_8b_domino_disagg_1srv_dp7.sh": (
-        "examples/configs/qwen3-8b-domino-1server-dp7-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml",
         "docs/benchmarks/domino-disaggregated-performance.md",
     ),
     "examples/disagg/run_qwen3_8b_domino_disagg_multiserver.sh": (
-        "examples/configs/qwen3-8b-domino-multiserver-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml",
     ),
     "examples/disagg/run_domino_dflash_serving_gate.sh": (
         "scripts/gates/README.md",

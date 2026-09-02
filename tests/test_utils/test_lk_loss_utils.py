@@ -122,6 +122,18 @@ class TestLKLossUtils(unittest.TestCase):
         )
         torch.testing.assert_close(loss, -log_acceptance_rate)
 
+    def test_compute_lk_loss_tv(self):
+        acceptance_rate = torch.tensor(0.7, dtype=torch.float32)
+        loss = compute_lk_loss(
+            kl_loss=torch.tensor(1.2, dtype=torch.float32),
+            acceptance_rate=acceptance_rate,
+            log_acceptance_rate=torch.log(acceptance_rate),
+            lk_loss_type="tv",
+            kl_scale=1.0,
+            kl_decay=1.0,
+        )
+        torch.testing.assert_close(loss, 1.0 - acceptance_rate)
+
     def test_compute_lk_loss_unknown_type_raises(self):
         with self.assertRaises(ValueError):
             _ = compute_lk_loss(

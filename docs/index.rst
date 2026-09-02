@@ -17,6 +17,7 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
    concepts/speculative_decoding.md
    concepts/EAGLE3.md
+   concepts/DFlash2.md
 
 
 .. toctree::
@@ -56,3 +57,9 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
    examples/llama3-eagle3-online.md
    examples/llama3-eagle3-offline.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Recipes
+
+   recipes/kimi-k3-dspark-disaggregated.md

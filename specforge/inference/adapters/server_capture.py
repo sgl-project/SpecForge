@@ -9,7 +9,7 @@
 """Server-side spec-capture rollout source (zero-copy Mooncake transport).
 
 An external SGLang server patched with
-``patches/sglang/v0.5.14/spec-capture.patch`` runs
+``patches/sglang/v0.5.18/spec-capture.patch`` runs
 the prefill and writes captured features straight into Mooncake in
 :class:`MooncakeFeatureStore`'s key layout. Tensors never pass through this
 process — the ``/generate`` response's ``meta_info["spec_capture"]`` carries

@@ -106,6 +106,17 @@ def _draft_payload(architecture: str, *, layers: int = 1, block_size=None):
 
 
 class DraftConfigResolutionTest(unittest.TestCase):
+    def test_explicit_null_draft_vocab_size_does_not_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "draft.json")
+            payload = _draft_payload("LlamaForCausalLMEagle3")
+            payload["draft_vocab_size"] = None
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+
+            with self.assertRaisesRegex(ValueError, "draft_vocab_size cannot be null"):
+                load_draft_config_source(path)
+
     def test_config_resolution_does_not_initialize_cuda_model_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "draft.json")
@@ -209,6 +220,29 @@ assert not torch.cuda.is_initialized()
                 draft_num_hidden_layers=2,
             )
             with self.assertRaisesRegex(ValueError, "mixed DFlash layer_types"):
+                resolve_draft_config(
+                    cfg,
+                    provider=_draft_config_provider("dflash"),
+                )
+
+    def test_dflash_resolution_validates_mla_before_model_construction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "draft.json")
+            payload = _draft_payload("DFlashDraftModel", block_size=16)
+            payload.update(
+                q_lora_rank=16,
+                kv_lora_rank=8,
+                qk_nope_head_dim=4,
+                qk_rope_head_dim=4,
+                v_head_dim=8,
+                rope_interleave="false",
+            )
+            payload["dflash_config"] = {"attention_mode": "mla"}
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+
+            cfg = _run_config("dflash", draft_model_config=path)
+            with self.assertRaisesRegex(ValueError, "rope_interleave"):
                 resolve_draft_config(
                     cfg,
                     provider=_draft_config_provider("dflash"),

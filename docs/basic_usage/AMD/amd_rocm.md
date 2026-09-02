@@ -1,8 +1,10 @@
 # 🚀 AMD ROCm Tutorial
 
 This is an end-to-end tutorial for running SpecForge on AMD Instinct GPUs
-(ROCm). It walks through the complete flow: **installation → data preparation →
-offline training → online training → disaggregated training**.
+(ROCm). It walks through **installation → data preparation → offline colocated
+training → online disaggregated training**. Within the online workflow, it
+covers external services under one supervisor, the managed-local shortcut, and
+external producer/consumer roles split across process pools or nodes.
 
 All commands assume a ROCm host with the AMD driver stack and Docker already
 installed. Validated on MI300X (gfx942) and MI355X (gfx950).
@@ -26,10 +28,10 @@ hardware:
 
 ```bash
 # AMD Instinct MI300X (gfx942)
-docker pull lmsysorg/sglang:v0.5.14-rocm720-mi30x
+docker pull lmsysorg/sglang:v0.5.18-rocm720-mi30x
 
 # AMD Instinct MI355X (gfx950)
-docker pull lmsysorg/sglang:v0.5.14-rocm700-mi35x
+docker pull lmsysorg/sglang:v0.5.18-rocm700-mi35x
 ```
 
 ### Step 2: Start the container
@@ -42,7 +44,7 @@ docker run -it --name specforge \
   --device=/dev/kfd --device=/dev/dri \
   --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   --ipc=host --shm-size=16g \
-  lmsysorg/sglang:v0.5.14-rocm720-mi30x \
+  lmsysorg/sglang:v0.5.18-rocm720-mi30x \
   bash
 ```
 
@@ -68,13 +70,13 @@ also with `--no-deps`.
 
 ### Step 4: Apply the capture patch (online runs only)
 
-These images pin SGLang to exactly `0.5.14` (editable at `/sgl-workspace/sglang`),
+These images pin SGLang to exactly `0.5.18` (editable at `/sgl-workspace/sglang`),
 so the online capture patch applies with a plain `git apply`. Skip this step for
 offline training, which reads features from disk and needs no capture service:
 
 ```bash
 cd /sgl-workspace/sglang
-git apply /workspace/SpecForge/patches/sglang/v0.5.14/spec-capture.patch
+git apply /workspace/SpecForge/patches/sglang/v0.5.18/spec-capture.patch
 cd /workspace/SpecForge
 ```
 
@@ -89,7 +91,7 @@ ROCm. The `fa` (flash-attn) and `usp` backends, and `yunchang`-based
 Ulysses/Ring sequence parallel (`sp_ulysses_size` / `sp_ring_size` > 1), depend
 on a CUDA flash-attn build; the single-GPU / data-parallel path never loads
 `yunchang`, and selecting those backends raises a clear error. The checked-in
-[`amd/qwen3.5-4b-dflash-offline.yaml`](../../../examples/configs/amd/qwen3.5-4b-dflash-offline.yaml)
+[`qwen3.5-4b-dflash-offline-amd.yaml`](../../../examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml)
 recipe already uses `flex_attention`, so it runs on ROCm unchanged as a
 single-GPU offline DFlash example.
 
@@ -116,7 +118,7 @@ see the [Data Preparation](../data_preparation.md) guide.
 
 ---
 
-## 3. Offline training
+## 3. Offline colocated training
 
 Offline training reads target features from disk, so the trainer only has to fit
 the draft model. It uses more storage but keeps target inference out of the
@@ -169,34 +171,55 @@ The checked-in offline recipe already uses `flex_attention` for the trainer, so
 it runs on ROCm unchanged:
 
 ```bash
-specforge train --config examples/configs/amd/qwen3.5-4b-dflash-offline.yaml
+specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml
 ```
 
 Override any field inline without copying the YAML, e.g. a quick smoke run:
 
 ```bash
-specforge train --config examples/configs/amd/qwen3.5-4b-dflash-offline.yaml \
+specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml \
   training.max_steps=20 output_dir=./outputs/dflash-offline-smoke
 ```
 
 See the [Training](../training.md) guide for the full run schema,
 checkpoint/resume rules, and evaluation.
 
+### Optional: Offline disaggregated deployment
+
+The walkthrough above is offline colocated: the trainer reads prepared feature
+files directly. If a producer must ingest those files for a separate trainer
+pool, choose a recipe under
+[`examples/configs/offline/disaggregated/`](../../../examples/configs/offline/disaggregated/).
+The feature source remains offline; only the deployment topology changes. This
+path does not start SGLang. A `shared_dir` backend requires storage visible to
+the producer and consumers, while a Mooncake backend requires an existing
+Mooncake deployment. See
+[Offline shared-directory and Mooncake stores](../disaggregated_training.md#offline-shared-directory-and-mooncake-stores)
+for the complete contract.
+
 ---
 
-## 4. Online training
+## 4. Online disaggregated training
 
 Online training captures target features live from a patched SGLang server and
 streams them through Mooncake to the trainer. Every online run is
 **disaggregated**: a producer drives prompts through the capture server and a
-consumer trains the draft model. With `deployment.trainer.nnodes: 1` and no
-`--role`, a single `specforge train` command supervises both.
+consumer trains the draft model. The choices below change service ownership and
+process placement; they do not create additional training modes.
 
-This section uses the
-[`amd/qwen3.5-4b-dflash-online.yaml`](../../../examples/configs/amd/qwen3.5-4b-dflash-online.yaml)
-recipe as a single-node smoke test. Complete Step 4 of the installation first.
+### External services with a single-node supervisor
 
-### Step 1: One-time run inputs
+With `deployment.trainer.nnodes: 1` and no `--role`, one `specforge train`
+command supervises the producer and consumer. Mooncake and SGLang remain
+external services started by the user.
+
+This section uses the external
+[`qwen3.5-4b-dflash-online-amd.yaml`](../../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml)
+recipe as a single-node smoke test. `external` means that the user starts
+Mooncake and SGLang; the services still run locally in this example. Complete
+Step 4 of the installation first.
+
+#### Step 1: One-time run inputs
 
 DFlash needs **no shared vocabulary mapping** (that is an EAGLE3-only
 requirement, where a reduced draft vocabulary must be derived once and shared by
@@ -208,7 +231,7 @@ Qwen3.5-4B is also a large sharded checkpoint that already ships a
 directory or index workaround. Just make sure `cache/dataset/sharegpt_train.jsonl`
 exists (Section 2).
 
-### Step 2: Start Mooncake and the capture server
+#### Step 2: Start Mooncake and the capture server
 
 Start the Mooncake master. **Set `--default_kv_lease_ttl=500`**: the consumer's
 teardown drain now allows about 19.5s for leases to settle, while the shorter
@@ -258,7 +281,7 @@ health check can take a few minutes while AITER kernels compile).
 `--context-length` must exceed `data.max_length` (2048) or `/generate` returns
 `400 input longer than context length`.
 
-### Step 3: Launch training
+#### Step 3: Launch training
 
 One command supervises producer and consumer on GPU 1:
 
@@ -269,7 +292,7 @@ MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
 MOONCAKE_PROTOCOL=tcp \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=$((32<<30)) \
-specforge train -c examples/configs/amd/qwen3.5-4b-dflash-online.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml \
   training.max_steps=20 training.num_epochs=1 \
   training.save_interval=20 training.log_interval=5
 ```
@@ -278,7 +301,7 @@ The trainer needs no AITER env — it runs `flex_attention` on ROCm; only the
 capture server (Step 2) drives the Mamba target. Before rerunning, clear stale
 control state: `rm -rf outputs/qwen3.5-4b-dflash-online`.
 
-### Success criteria
+#### Success criteria
 
 - Producer log: `drive_producer returning produced=<N> prompts_failed=0`.
 - Consumer log: `step N: {...loss..., acc...}` lines, and **no**
@@ -296,24 +319,35 @@ Instead of starting Mooncake and the capture server by hand, a
 `deployment.disaggregated.managed_local` block lets one `specforge train`
 command own those local processes and derive their endpoints. It defaults
 `default_kv_lease_ttl_ms` to 500, so the lease-TTL fix is applied automatically.
+Managed-local owns one local process tree and cannot be launched with
+`--role producer` or `--role consumer` or split across nodes.
 See [Multi-server capture](../disaggregated_training.md#multi-server-capture)
 for the managed-local profile.
 
----
+### Split an external run across process pools or nodes
 
-## 5. Disaggregated training
-
-Online training is already a disaggregated producer/consumer topology; Section 4
-runs both roles under one single-node supervisor. To split the roles across
-process pools or nodes, use the **same config** with an explicit `--role`:
+This is the split-pool form of the external workflow above, not another
+training mode. Both roles must use the same resolved run contract, but each is
+launched explicitly:
 
 ```bash
 # Inference / capture pool
-specforge train -c examples/configs/amd/qwen3.5-4b-dflash-online.yaml --role producer
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml --role producer
 
 # Trainer pool
-specforge train -c examples/configs/amd/qwen3.5-4b-dflash-online.yaml --role consumer
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml --role consumer
 ```
+
+The checked-in AMD recipe is a single-node example and deliberately uses
+`127.0.0.1`. For separate hosts, copy it to `run.yaml` and replace the loopback
+Mooncake and SGLang endpoints with addresses reachable by the relevant roles.
+Keep these values consistent across the deployment:
+
+| Shared run contract | Node-local values |
+| --- | --- |
+| `run_id`, data/training settings, `store_id`, capture contract, routable `server_urls`, and Mooncake metadata/master endpoints | `MOONCAKE_LOCAL_HOSTNAME` and GPU visibility |
+| `control_dir`, visible to the producer and consumers unless an inbox relay is configured | `consumer_state_dir`, on reliable local storage for consumer rank 0 |
+| `output_dir`, visible to every consumer rank, and the complete `deployment.trainer` topology | `--node-rank` on each consumer host |
 
 For multiple consumer nodes, record `deployment.trainer.nnodes`,
 `nproc_per_node`, `master_addr`, and `master_port` once in the config, then pass
@@ -328,9 +362,8 @@ A fresh attempt requires fresh control and consumer-state directories, and every
 capture server must use the same target model, revision, capture method, and
 auxiliary layer ids — for this recipe `--spec-capture-method dflash` with aux ids
 `1 8 15 22 29`, and on ROCm each must run under AITER with `--disable-radix-cache`
-(Section 4, Step 2). Offline features can also be served through a disaggregated
-shared-directory or Mooncake store. For external-service prerequisites,
-freshness rules, multi-server capture, and resume, see the
+(see External services, Step 2). For external-service prerequisites, freshness
+rules, multi-server capture, inbox relays, and resume, see the
 [Disaggregated training](../disaggregated_training.md) guide.
 
 ---

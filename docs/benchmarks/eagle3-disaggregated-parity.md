@@ -29,18 +29,18 @@ measurement as serving-time accepted length.
 ## Unified entry for a new run
 
 The current equivalent recipe is
-`examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml`. To place the
+`examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml`. To place the
 offline producer and consumer on different nodes, run one checked-in command
 through the cluster launcher:
 
 ```bash
 rcli exec --per-node <job> \
-  'CONFIG=examples/configs/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
+  'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
 ```
 
 Rank 0 invokes `specforge train --role producer`; rank 1 invokes
 `specforge train --role consumer`. Both nodes must resolve the config's
 `control_dir`, `store_root`, hidden-state input, and vocabulary mapping to the
 same data. Use a fresh attempt directory, then compare against the colocated
-`examples/configs/qwen2.5-7b-eagle3-offline.yaml` recipe with the same inputs,
+`examples/configs/offline/colocated/qwen2.5-7b-eagle3-offline.yaml` recipe with the same inputs,
 seed, and training overrides.

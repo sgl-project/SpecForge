@@ -43,7 +43,7 @@ CONSUMER_STATE_DIR=${OUTPUT_DIR}/consumer-state
 
 # producer
 CUDA_VISIBLE_DEVICES=2 specforge train \
-    -c examples/configs/qwen3.6-27b-domino-online.yaml \
+    -c examples/configs/online/disaggregated/external/qwen3.6-27b-domino-online.yaml \
     --role producer \
     "run_id=${RUN_ID}" \
     "output_dir=${OUTPUT_DIR}" \
@@ -53,7 +53,7 @@ CUDA_VISIBLE_DEVICES=2 specforge train \
 
 # consumer
 CUDA_VISIBLE_DEVICES=3 specforge train \
-    -c examples/configs/qwen3.6-27b-domino-online.yaml \
+    -c examples/configs/online/disaggregated/external/qwen3.6-27b-domino-online.yaml \
     --role consumer \
     "run_id=${RUN_ID}" \
     "output_dir=${OUTPUT_DIR}" \
