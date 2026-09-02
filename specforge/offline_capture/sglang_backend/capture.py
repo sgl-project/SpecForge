@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import logging
 from array import array
 from typing import List, Optional
 
@@ -32,6 +33,17 @@ from specforge.distributed import get_tp_group
 
 from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
+
+logger = logging.getLogger(__name__)
+
+# SGLang capture hooks tried in order for each capture method. K3-class targets
+# expose a native DSpark hook; dense targets serve the same auxiliary
+# hidden-state layout through the DFlash hook, so DSpark falls back to it.
+_CAPTURE_LAYER_HOOKS = {
+    "eagle3": ("set_eagle3_layers_to_capture",),
+    "dflash": ("set_dflash_layers_to_capture",),
+    "dspark": ("set_dspark_layers_to_capture", "set_dflash_layers_to_capture"),
+}
 
 
 class OfflineSGLangCaptureBackend:
@@ -128,23 +140,29 @@ class OfflineSGLangCaptureBackend:
     ) -> None:
         """Set auxiliary layers through the strategy's SGLang capture API."""
 
-        setter_name = {
-            "eagle3": "set_eagle3_layers_to_capture",
-            "dflash": "set_dflash_layers_to_capture",
-            "dspark": "set_dspark_layers_to_capture",
-        }.get(capture_method)
-        if setter_name is None:
+        setter_names = _CAPTURE_LAYER_HOOKS.get(capture_method)
+        if setter_names is None:
             raise ValueError(
                 "offline SGLang capture method must be 'eagle3', 'dflash', or "
                 "'dspark', "
                 f"got {capture_method!r}"
             )
-        setter = getattr(self.model_runner.model, setter_name, None)
-        if not callable(setter):
-            raise RuntimeError(
-                f"target model does not expose SGLang capture hook {setter_name!r}"
-            )
-        setter(layer_ids)
+        for setter_name in setter_names:
+            setter = getattr(self.model_runner.model, setter_name, None)
+            if not callable(setter):
+                continue
+            if setter_name != setter_names[0]:
+                logger.info(
+                    "capture method %r resolved through compatibility hook %s",
+                    capture_method,
+                    setter_name,
+                )
+            setter(layer_ids)
+            return
+        raise RuntimeError(
+            "target model does not expose a compatible SGLang capture hook; "
+            f"tried {setter_names!r}"
+        )
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch) -> None:
         if require_mlp_sync(self.model_runner.server_args):
@@ -204,29 +222,25 @@ class OfflineSGLangCaptureBackend:
         self.model_runner.token_to_kv_pool_allocator.clear()
 
     @torch.no_grad()
-    def capture_eagle3(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-    ):
-        """Capture per-request auxiliary and final hidden states without logits."""
+    def capture_rows(self, input_ids: list[list[int]]):
+        """Capture variable-length request rows in one packed prefill.
 
+        Returns ``(aux_rows, last_rows)``: per-row auxiliary and final hidden
+        states split from the packed forward, so callers never build padded
+        tensors. The KV/request pools are cleared after every call.
+        """
+
+        if not input_ids:
+            return (), ()
+        if any(not row for row in input_ids):
+            raise ValueError("SGLang capture rows must contain at least one token")
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs: list[Req] = []
-        data = []
-        input_rows = torch.split(input_ids, 1, dim=0)
-        attention_rows = torch.split(attention_mask, 1, dim=0)
-        loss_rows = torch.split(loss_mask, 1, dim=0)
-
-        for idx, (input_row, attention_row, loss_row) in enumerate(
-            zip(input_rows, attention_rows, loss_rows)
-        ):
+        for idx, input_row in enumerate(input_ids):
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=input_row.view(-1).tolist(),
+                origin_input_ids=list(input_row),
                 sampling_params=sampling_params,
             )
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
@@ -235,7 +249,6 @@ class OfflineSGLangCaptureBackend:
             )
             req.logprob_start_len = len(req.origin_input_ids) - 1
             reqs.append(req)
-            data.append((input_row, attention_row, loss_row))
 
         input_lens = [len(req.origin_input_ids) for req in reqs]
         try:
@@ -244,14 +257,38 @@ class OfflineSGLangCaptureBackend:
             last_hidden_states = getattr(output, "last_hidden_states", None)
             if aux_hidden_states is None or last_hidden_states is None:
                 raise RuntimeError(
-                    "SGLang did not return the hidden states required for "
-                    "offline feature preparation"
+                    "SGLang did not return the hidden states required for capture"
                 )
             aux_rows = torch.split(aux_hidden_states, input_lens, dim=0)
             last_rows = torch.split(last_hidden_states, input_lens, dim=0)
         finally:
             self._clear_pools()
+        return aux_rows, last_rows
 
+    @torch.no_grad()
+    def capture_eagle3(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ):
+        """Capture per-request auxiliary and final hidden states without logits.
+
+        Padded rows are captured as given (padding positions included), which
+        keeps offline feature preparation byte-identical.
+        """
+
+        data = list(
+            zip(
+                torch.split(input_ids, 1, dim=0),
+                torch.split(attention_mask, 1, dim=0),
+                torch.split(loss_mask, 1, dim=0),
+            )
+        )
+        aux_rows, last_rows = self.capture_rows(
+            [input_row.view(-1).tolist() for input_row, _, _ in data]
+        )
         return data, aux_rows, last_rows
 
     def capture(
