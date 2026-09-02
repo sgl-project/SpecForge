@@ -239,6 +239,18 @@ class GeneralParser(Parser):
                         break
                 sentence = self._sanitize_message(sentence)
                 messages.append(sentence)
+
+            if not messages:
+                # A conversation that reduces to zero messages (e.g. assistant-first
+                # rows, where the leading non-user turn is dropped) must not be handed
+                # to apply_chat_template: newer transformers indexes conversation[0]
+                # and raises IndexError. Return an empty sample so the downstream
+                # loss-mask eligibility filter drops it, matching the None-source skip.
+                warnings.warn(
+                    "Conversation reduced to zero messages (no user turn); skipping this sample."
+                )
+                empty = torch.zeros(0, dtype=torch.long)
+                return empty, empty.clone()
             try:
                 conversation = self.apply_chat_template(messages, tool=tool, **kwargs)
             except (ValueError, TypeError):
