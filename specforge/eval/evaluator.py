@@ -151,6 +151,7 @@ class Evaluator:
             if ar_w > 0:
                 for i, v in enumerate((pp[2] / ar_w).tolist()):
                     metrics[f"eval/acceptance_rate_{i}"] = v
+                    metrics[f"eval/expected_acceptance_{i}"] = v
             if pl_w > 0:
                 for i, v in enumerate((pp[3] / pl_w).tolist()):
                     metrics[f"eval/ploss_{i}"] = v

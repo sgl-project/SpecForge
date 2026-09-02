@@ -155,14 +155,26 @@ def build_dspark_offline_normalizer(max_len, **_topology):
 
 def build_collator():
     def collate(features):
+        required_keys = ["input_ids", "loss_mask", "hidden_states"]
+        teacher_feature_presence = [
+            "target_last_hidden_states" in feature for feature in features
+        ]
+        if any(teacher_feature_presence) and not all(teacher_feature_presence):
+            raise KeyError(
+                "target_last_hidden_states must be present in every DFlash sample "
+                "or omitted from every sample"
+            )
+        if all(teacher_feature_presence):
+            required_keys.append("target_last_hidden_states")
         return pad_and_concatenate_features(
             features,
             sequence_axes={
                 "input_ids": 1,
                 "loss_mask": 1,
                 "hidden_states": 1,
+                "target_last_hidden_states": 1,
             },
-            required_keys=("input_ids", "loss_mask", "hidden_states"),
+            required_keys=required_keys,
         )
 
     return collate

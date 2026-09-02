@@ -332,6 +332,151 @@ class CandidateSelectorTest(unittest.TestCase):
         )
         torch.testing.assert_close(terms.ce_loss_num, expected)
 
+    def test_reports_per_position_hard_label_and_teacher_metrics(self):
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=4,
+                    vocab_size=4,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.02,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        draft = Draft()
+        with torch.no_grad():
+            draft.candidate_selector.predecessor_codebook.zero_()
+            draft.candidate_selector.successor_codebook.zero_()
+            draft.candidate_selector.hidden_projection.weight.zero_()
+        model = OnlineDFlashModel(
+            draft_model=draft,
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(4, 4),
+            mask_token_id=3,
+            block_size=3,
+            attention_backend="eager",
+            lk_loss_type="alpha",
+        )
+        output_hidden = torch.tensor(
+            [
+                [
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 4.0, 1.0, 0.0],
+                    [0.0, 3.0, 4.0, 2.0],
+                ]
+            ]
+        )
+        target_hidden = torch.tensor(
+            [
+                [
+                    [0.0, 5.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 5.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                ]
+            ]
+        )
+        model._forward_draft_blocks = lambda **_kwargs: (
+            torch.tensor([[0]]),
+            torch.tensor([[True]]),
+            output_hidden,
+        )
+
+        _loss, _accuracy, metrics = model(
+            input_ids=torch.tensor([[0, 1, 3]]),
+            hidden_states=torch.zeros(1, 3, 4),
+            loss_mask=torch.ones(1, 3),
+            target_last_hidden_states=target_hidden,
+        )
+
+        ratios = metrics["ratio_metrics"]
+        expected_keys = {
+            "lk_loss",
+            "expected_acceptance",
+            "dflash2/hard_label/unary_top1_accuracy/position_1",
+            "dflash2/hard_label/unary_top1_accuracy/position_2",
+            "dflash2/hard_label/unary_top2_recall/position_1",
+            "dflash2/hard_label/unary_top2_recall/position_2",
+            "dflash2/hard_label/selector_loss/position_1",
+            "dflash2/teacher/expected_acceptance/position_1",
+            "dflash2/teacher/expected_acceptance/position_2",
+            "dflash2/teacher/unary_top1_agreement/position_1",
+            "dflash2/teacher/unary_top2_mass/position_2",
+            "dflash2/teacher/selector_serving_agreement/position_2",
+        }
+        self.assertTrue(expected_keys.issubset(ratios))
+        self.assertFalse(any(key.endswith("position_0") for key in ratios))
+
+        def ratio(name):
+            numerator, denominator = ratios[name]
+            return float(numerator / denominator)
+
+        self.assertEqual(
+            ratio("dflash2/hard_label/unary_top1_accuracy/position_1"), 1.0
+        )
+        self.assertEqual(
+            ratio("dflash2/hard_label/unary_top1_accuracy/position_2"), 0.0
+        )
+        self.assertEqual(ratio("dflash2/hard_label/unary_top2_recall/position_1"), 1.0)
+        self.assertEqual(ratio("dflash2/hard_label/unary_top2_recall/position_2"), 0.0)
+        self.assertEqual(ratio("dflash2/teacher/unary_top1_agreement/position_1"), 1.0)
+        self.assertEqual(ratio("dflash2/teacher/unary_top1_agreement/position_2"), 0.0)
+
+    def test_detailed_metrics_can_be_disabled_between_log_steps(self):
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=4,
+                    vocab_size=4,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.02,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        model = OnlineDFlashModel(
+            draft_model=Draft(),
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(4, 4),
+            mask_token_id=3,
+            block_size=2,
+            attention_backend="eager",
+        )
+        model._forward_draft_blocks = lambda **_kwargs: (
+            torch.tensor([[0]]),
+            torch.tensor([[True]]),
+            torch.tensor([[[0.0, 0.0, 0.0, 0.0], [0.0, 2.0, 1.0, 0.0]]]),
+        )
+
+        _loss, _accuracy, metrics = model(
+            input_ids=torch.tensor([[0, 1]]),
+            hidden_states=torch.zeros(1, 2, 4),
+            loss_mask=torch.ones(1, 2),
+            collect_detailed_metrics=False,
+        )
+
+        self.assertFalse(
+            any(
+                name.startswith(
+                    (
+                        "dflash2/teacher/",
+                        "dflash2/hard_label/unary_",
+                        "dflash2/hard_label/expected_acceptance",
+                        "dflash2/hard_label/selector_serving_",
+                    )
+                )
+                for name in metrics["ratio_metrics"]
+            )
+        )
+
     def test_zero_configured_selector_alpha_freezes_selector_parameters(self):
         class Draft(nn.Module):
             def __init__(self):

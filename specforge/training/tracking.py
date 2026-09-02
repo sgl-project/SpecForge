@@ -54,14 +54,15 @@ def scalar_metrics(metrics: Mapping[str, Any]) -> Dict[str, float]:
 
 
 def training_metric_names(metrics: Mapping[str, float]) -> Dict[str, float]:
-    """Preserve the historical ``train/*`` tracker namespace.
+    """Place metrics in their stable external-tracker namespaces.
 
-    Evaluation already reports ``eval/*`` keys.  Strategy results are plain
-    names because the console logger is intentionally backend-neutral; add the
-    training namespace only at the external-tracker boundary.
+    Evaluation and performance counters already carry explicit namespaces.
+    Strategy results are plain names because the console logger is
+    intentionally backend-neutral; add ``train/`` only to those metrics at the
+    external-tracker boundary.
     """
     return {
-        key if key.startswith(("train/", "eval/")) else f"train/{key}": value
+        key if key.startswith(("train/", "eval/", "perf/")) else f"train/{key}": value
         for key, value in metrics.items()
     }
 

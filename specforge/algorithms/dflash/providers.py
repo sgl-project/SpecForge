@@ -249,7 +249,7 @@ def algorithm_providers() -> AlgorithmProviders:
                 target_representation=None,
                 layout=ServerCaptureLayout(
                     aux_feature="hidden_states",
-                    last_hidden_feature=None,
+                    last_hidden_feature="target_last_hidden_states",
                     passthrough=(
                         ("input_ids", "input_ids", ()),
                         ("loss_mask", "loss_mask", ()),

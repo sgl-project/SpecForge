@@ -183,7 +183,10 @@ The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
 DFlash2 is a draft-architecture variant of DFlash, not a separate capture
 strategy. Keep `training.strategy: dflash` and select it with a draft config
 whose architecture is `DFlash2DraftModel`. The target server still captures
-the same selected hidden states with `--spec-capture-method dflash`.
+the same selected hidden states with `--spec-capture-method dflash`. Online
+capture also retains the target's final hidden state for teacher-alignment
+telemetry; existing offline DFlash datasets remain compatible and omit only
+the teacher-only metrics.
 
 The DFlash2 config additionally defines `conv_kernel_size` and
 `conv_group_size` for the local convolution, plus `selector_rank` and
@@ -211,6 +214,16 @@ Set `training.dflash2_selector_stop_gradient: true` to keep the selector CE
 from updating the unary logits and draft hidden states. The selector parameters
 still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
 gradient path. The option defaults to `false`, preserving coupled training.
+
+External tracking reports aggregate and per-block-position DFlash2 diagnostics.
+The `train/dflash2/hard_label/*` family separates unary top-1 accuracy,
+unary top-K recall and probability, selector loss, conditional selector
+accuracy, and strict-serving selector accuracy. Online runs additionally report
+`train/dflash2/teacher/*` top-1 agreement, unary top-K teacher mass, expected
+acceptance, and strict-serving selector agreement. Per-position keys end in
+`position_1` through `position_<block_size-1>`; the verified position-zero
+anchor is omitted. Full-vocabulary alignment telemetry is computed only for
+optimizer steps that reach `training.log_interval`.
 
 The exported computation and parameter names match the public SGLang DFlash2
 contract, including optional `output_multiplier` and
@@ -447,8 +460,11 @@ tracking:
 Accepted values are `none`, `wandb`, `tensorboard`, `swanlab`, and `mlflow`.
 W&B, SwanLab, and MLflow have matching project/run fields in the typed schema;
 TensorBoard writes beneath `output_dir/runs`, and SwanLab writes beneath
-`output_dir/swanlog`. Trainer and evaluator metrics use `train/*` and `eval/*`
-names consistently.
+`output_dir/swanlog`. Optimization and evaluator metrics use `train/*` and
+`eval/*`; throughput and timing counters use the top-level `perf/*` namespace.
+Historical `ploss*`, `acceptance_rate*`, and `target_probability` names remain
+available alongside explicit `kl_loss*` or `lk_loss*`, `ce_loss`, and
+`expected_acceptance*` names.
 
 ## CUDA, ROCm, and Ascend NPU
 
