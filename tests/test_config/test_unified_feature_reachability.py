@@ -205,6 +205,28 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         self.assertEqual(output_dir, "/tmp/output")
         self.assertIs(create.call_args.kwargs["console_logger"], _logger)
 
+    def test_only_global_rank_zero_creates_an_external_tracker(self):
+        cfg = Config.model_validate(
+            {**OFFLINE_EAGLE3, "tracking": {"report_to": "wandb"}}
+        )
+        with (
+            mock.patch("specforge.training.tracking.create_tracker_logger") as create,
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_rank", return_value=3),
+        ):
+            self.assertIs(_configured_logger(cfg), _logger)
+        create.assert_not_called()
+
+    def test_primary_rank_keeps_the_console_logger_without_a_tracker(self):
+        cfg = Config.model_validate(OFFLINE_EAGLE3)
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_rank", return_value=0),
+        ):
+            self.assertIs(_configured_logger(cfg), _logger)
+
     def test_tracking_backend_is_strictly_typed(self):
         with self.assertRaises(ValidationError):
             Config.model_validate(

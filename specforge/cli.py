@@ -135,15 +135,19 @@ def _train(resolved) -> int:
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
     )
+    failed = True
     try:
         import torch.distributed as dist
 
         _validate_world_size(cfg, dist.get_world_size())
         from specforge.application import build_application_run
 
-        return build_application_run(resolved).run()
+        result = build_application_run(resolved).run()
+        failed = False
+        return result
     finally:
-        destroy_distributed()
+        # On failure abort instead of collectively destroying; see destroy_distributed.
+        destroy_distributed(abort=failed)
 
 
 def _config_for_role(cfg: Config, role: str) -> Config:
