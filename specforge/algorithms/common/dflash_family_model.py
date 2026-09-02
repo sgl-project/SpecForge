@@ -78,20 +78,30 @@ class DFlashObjectiveTerms(NamedTuple):
 
 
 class DFlashMetricTerms(NamedTuple):
-    """Additive per-position DFlash2 diagnostics for one metric chunk."""
+    """Additive DFlash2 diagnostics for one metric chunk.
+
+    Per-position fields hold one entry per block position; the accepted-length
+    fields and ``block_den`` are per-block scalars.
+    """
 
     hard_label_probability_num: torch.Tensor
     unary_correct_num: torch.Tensor
     position_den: torch.Tensor
     unary_topk_recall_num: torch.Tensor
+    unary_topk_mass_num: torch.Tensor
     selector_ce_num: torch.Tensor
     selector_weight_den: torch.Tensor
     selector_conditional_correct_num: torch.Tensor
+    selector_covered_den: torch.Tensor
     selector_serving_correct_num: torch.Tensor
+    loss_weight_num: torch.Tensor
     teacher_expected_acceptance_num: torch.Tensor
     teacher_unary_top1_agreement_num: torch.Tensor
     teacher_unary_topk_mass_num: torch.Tensor
     teacher_selector_serving_agreement_num: torch.Tensor
+    block_den: torch.Tensor
+    oracle_accepted_length_num: torch.Tensor
+    serving_accepted_length_num: torch.Tensor
 
 
 def compute_accept_len(
@@ -759,8 +769,12 @@ class OnlineDFlashModel(nn.Module):
             selector_logits.argmax(dim=-1, keepdim=True),
         ).squeeze(-1)
 
+        covered_mask = weight_mask * target_is_candidate.float()
         position_den = weight_mask.sum(dim=(0, 1))
         selector_serving_correct_num = position_den.new_zeros(block_size)
+        block_den = position_den.new_zeros(())
+        oracle_accepted_length_num = position_den.new_zeros(())
+        serving_accepted_length_num = position_den.new_zeros(())
         teacher_selector_serving_agreement_num = position_den.new_zeros(block_size)
         teacher_expected_acceptance_num = position_den.new_zeros(block_size)
         teacher_unary_top1_agreement_num = position_den.new_zeros(block_size)
@@ -810,15 +824,26 @@ class OnlineDFlashModel(nn.Module):
                 ),
                 anchor_token_ids=target_ids[:, :, 0].reshape(-1),
             ).reshape(batch_size, num_blocks, block_size - 1)
+            serving_hit = serving_ids == target_ids[:, :, 1:]
             selector_serving_correct_num = torch.cat(
                 (
                     position_den.new_zeros(1),
-                    (
-                        (serving_ids == target_ids[:, :, 1:]).float()
-                        * weight_mask[:, :, 1:]
-                    ).sum(dim=(0, 1)),
+                    (serving_hit.float() * weight_mask[:, :, 1:]).sum(dim=(0, 1)),
                 )
             )
+            # Accepted length per block: the anchor counts as one token and a
+            # block extends while every earlier slot is supervised and accepted.
+            supervised = weight_mask[:, :, 1:] > 0.5
+            block_valid = supervised.any(dim=-1).float()
+            block_den = block_valid.sum()
+            oracle_alive = (supervised & target_is_candidate[:, :, 1:]).float()
+            serving_alive = (supervised & serving_hit).float()
+            oracle_accepted_length_num = (
+                (1.0 + oracle_alive.cumprod(dim=-1).sum(dim=-1)) * block_valid
+            ).sum()
+            serving_accepted_length_num = (
+                (1.0 + serving_alive.cumprod(dim=-1).sum(dim=-1)) * block_valid
+            ).sum()
             if teacher_ids is not None:
                 teacher_selector_serving_agreement_num = torch.cat(
                     (
@@ -838,23 +863,40 @@ class OnlineDFlashModel(nn.Module):
                 dim=(0, 1)
             ),
             position_den=position_den,
-            unary_topk_recall_num=(target_is_candidate.float() * weight_mask).sum(
-                dim=(0, 1)
-            ),
+            unary_topk_recall_num=covered_mask.sum(dim=(0, 1)),
+            unary_topk_mass_num=(
+                probabilities.gather(-1, candidate_ids).sum(dim=-1) * weight_mask
+            ).sum(dim=(0, 1)),
             selector_ce_num=(selector_ce * selector_loss_weights).sum(dim=(0, 1)),
             selector_weight_den=selector_loss_weights.sum(dim=(0, 1)),
             selector_conditional_correct_num=(
-                (selector_teacher_forced_ids == target_ids).float()
-                * selector_loss_weights
+                (selector_teacher_forced_ids == target_ids).float() * covered_mask
             ).sum(dim=(0, 1)),
+            selector_covered_den=covered_mask.sum(dim=(0, 1)),
             selector_serving_correct_num=selector_serving_correct_num,
+            loss_weight_num=loss_weights.sum(dim=(0, 1)),
             teacher_expected_acceptance_num=teacher_expected_acceptance_num,
-            teacher_unary_top1_agreement_num=(teacher_unary_top1_agreement_num),
+            teacher_unary_top1_agreement_num=teacher_unary_top1_agreement_num,
             teacher_unary_topk_mass_num=teacher_unary_topk_mass_num,
             teacher_selector_serving_agreement_num=(
                 teacher_selector_serving_agreement_num
             ),
+            block_den=block_den,
+            oracle_accepted_length_num=oracle_accepted_length_num,
+            serving_accepted_length_num=serving_accepted_length_num,
         )
+
+    def _lk_kl_weight(
+        self,
+        probability_num: torch.Tensor,
+        probability_den: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Return the LK-lambda CE weight, or ``None`` for other objectives."""
+
+        if self.lk_loss_type != "lambda":
+            return None
+        acceptance = probability_num / probability_den.clamp_min(1.0)
+        return self.kl_scale * torch.exp(-self.kl_decay * acceptance.detach())
 
     def _compose_token_objective(
         self,
@@ -871,8 +913,7 @@ class OnlineDFlashModel(nn.Module):
         if self.lk_loss_type == "tv":
             return tv_num
         if self.lk_loss_type == "lambda":
-            acceptance = probability_num / probability_den.clamp_min(1.0)
-            kl_weight = self.kl_scale * torch.exp(-self.kl_decay * acceptance.detach())
+            kl_weight = self._lk_kl_weight(probability_num, probability_den)
             return kl_weight * ce_num + (1.0 - kl_weight) * tv_num
         raise ValueError(f"unknown lk_loss_type {self.lk_loss_type!r}")
 
@@ -1010,6 +1051,12 @@ class OnlineDFlashModel(nn.Module):
                 loss_denominator.detach(),
             ),
         }
+        lk_kl_weight = self._lk_kl_weight(target_probability_num, accuracy_denom)
+        if lk_kl_weight is not None:
+            ratio_metrics["objective/lk_kl_weight"] = (
+                (lk_kl_weight * accuracy_denom).detach(),
+                accuracy_denom.detach(),
+            )
         candidate_selector = getattr(self.draft_model, "candidate_selector", None)
         if candidate_selector is not None and collect_detailed_metrics:
             (
@@ -1017,14 +1064,20 @@ class OnlineDFlashModel(nn.Module):
                 unary_correct_position_num,
                 position_den,
                 unary_topk_recall_position_num,
+                unary_topk_mass_position_num,
                 selector_ce_position_num,
                 selector_weight_position_den,
                 selector_correct_position_num,
+                selector_covered_position_den,
                 selector_serving_correct_position_num,
+                loss_weight_position_num,
                 teacher_expected_acceptance_position_num,
                 teacher_unary_top1_agreement_position_num,
                 teacher_unary_topk_mass_position_num,
                 teacher_selector_serving_agreement_position_num,
+                block_den,
+                oracle_accepted_length_num,
+                serving_accepted_length_num,
             ) = checkpointed_chunk_reduce(
                 self._dflash2_metric_chunk_terms,
                 hidden_4d.detach(),
@@ -1054,6 +1107,10 @@ class OnlineDFlashModel(nn.Module):
                     unary_topk_recall_position_num,
                 ),
                 (
+                    f"dflash2/hard_label/unary_top{top_k}_mass",
+                    unary_topk_mass_position_num,
+                ),
+                (
                     "dflash2/hard_label/selector_serving_accuracy",
                     selector_serving_correct_position_num,
                 ),
@@ -1064,6 +1121,25 @@ class OnlineDFlashModel(nn.Module):
                     numerators,
                     position_den,
                 )
+            self._add_ratio_family(
+                ratio_metrics,
+                "dflash2/hard_label/selector_conditional_accuracy",
+                selector_correct_position_num,
+                selector_covered_position_den,
+            )
+            self._add_position_ratios(
+                ratio_metrics,
+                "dflash2/objective/loss_weight_share",
+                loss_weight_position_num,
+                loss_weight_position_num.sum().expand_as(loss_weight_position_num),
+            )
+            ratio_metrics[
+                f"dflash2/hard_label/unary_top{top_k}_oracle_accepted_length"
+            ] = (oracle_accepted_length_num.detach(), block_den.detach())
+            ratio_metrics["dflash2/hard_label/selector_serving_accepted_length"] = (
+                serving_accepted_length_num.detach(),
+                block_den.detach(),
+            )
             if aligned_target_hidden is not None:
                 for name, numerators in (
                     (
@@ -1112,10 +1188,6 @@ class OnlineDFlashModel(nn.Module):
                         selector_loss_num.detach(),
                         selector_weight_den.detach(),
                     ),
-                    "dflash2/hard_label/selector_conditional_accuracy": (
-                        selector_correct_num.detach(),
-                        selector_weight_den.detach(),
-                    ),
                 }
             )
             if collect_detailed_metrics:
@@ -1123,12 +1195,6 @@ class OnlineDFlashModel(nn.Module):
                     ratio_metrics,
                     "dflash2/hard_label/selector_loss",
                     selector_ce_position_num,
-                    selector_weight_position_den,
-                )
-                self._add_position_ratios(
-                    ratio_metrics,
-                    "dflash2/hard_label/selector_conditional_accuracy",
-                    selector_correct_position_num,
                     selector_weight_position_den,
                 )
         metrics: Dict[str, object] = {

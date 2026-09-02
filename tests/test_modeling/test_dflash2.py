@@ -402,6 +402,12 @@ class CandidateSelectorTest(unittest.TestCase):
             "dflash2/hard_label/unary_top2_recall/position_1",
             "dflash2/hard_label/unary_top2_recall/position_2",
             "dflash2/hard_label/selector_loss/position_1",
+            "dflash2/hard_label/unary_top2_mass/position_1",
+            "dflash2/hard_label/selector_conditional_accuracy",
+            "dflash2/hard_label/selector_conditional_accuracy/position_2",
+            "dflash2/hard_label/unary_top2_oracle_accepted_length",
+            "dflash2/hard_label/selector_serving_accepted_length",
+            "dflash2/objective/loss_weight_share/position_1",
             "dflash2/teacher/expected_acceptance/position_1",
             "dflash2/teacher/expected_acceptance/position_2",
             "dflash2/teacher/unary_top1_agreement/position_1",
@@ -410,6 +416,7 @@ class CandidateSelectorTest(unittest.TestCase):
         }
         self.assertTrue(expected_keys.issubset(ratios))
         self.assertFalse(any(key.endswith("position_0") for key in ratios))
+        self.assertNotIn("objective/lk_kl_weight", ratios)
 
         def ratio(name):
             numerator, denominator = ratios[name]
@@ -425,6 +432,149 @@ class CandidateSelectorTest(unittest.TestCase):
         self.assertEqual(ratio("dflash2/hard_label/unary_top2_recall/position_2"), 0.0)
         self.assertEqual(ratio("dflash2/teacher/unary_top1_agreement/position_1"), 1.0)
         self.assertEqual(ratio("dflash2/teacher/unary_top1_agreement/position_2"), 0.0)
+        # Position 1 is covered and served correctly, position 2 is uncovered:
+        # both accepted-length walks credit the anchor plus one slot.
+        self.assertEqual(
+            ratio("dflash2/hard_label/unary_top2_oracle_accepted_length"), 2.0
+        )
+        self.assertEqual(
+            ratio("dflash2/hard_label/selector_serving_accepted_length"), 2.0
+        )
+        # Uniform dflash weights split the objective evenly over both slots.
+        self.assertEqual(ratio("dflash2/objective/loss_weight_share/position_1"), 0.5)
+        self.assertEqual(ratio("dflash2/objective/loss_weight_share/position_2"), 0.5)
+
+    def test_metric_chunk_reports_accepted_lengths_and_unweighted_selector_terms(
+        self,
+    ):
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=6,
+                    vocab_size=6,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.02,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        draft = Draft()
+        # A zeroed selector always picks the unary top-1 candidate.
+        with torch.no_grad():
+            draft.candidate_selector.predecessor_codebook.zero_()
+            draft.candidate_selector.successor_codebook.zero_()
+            draft.candidate_selector.hidden_projection.weight.zero_()
+        model = OnlineDFlashModel(
+            draft_model=draft,
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(6, 6),
+            mask_token_id=5,
+            block_size=3,
+            attention_backend="eager",
+            loss_type="dpace",
+        )
+        # Block 0: slot 1 covers gold at rank 1 (serving misses), slot 2 at
+        # rank 0. Block 1: slot 1 misses the top-2 entirely, slot 2 at rank 0.
+        hidden = torch.tensor(
+            [
+                [
+                    [
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 2.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0, 3.0, 0.0],
+                    ],
+                    [
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0, 2.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0, 0.0, 3.0],
+                    ],
+                ]
+            ]
+        )
+        target_ids = torch.tensor([[[4, 2, 4], [4, 1, 5]]])
+        weights = torch.tensor([[[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]])
+        predecessors = torch.tensor([[[4, 4, 2], [4, 4, 1]]])
+
+        terms = model._dflash2_metric_chunk_terms(
+            hidden, target_ids, weights, predecessors
+        )
+
+        self.assertEqual(terms.block_den.item(), 2.0)
+        # Oracle: anchor + 2 slots in block 0, anchor only in block 1.
+        self.assertEqual(terms.oracle_accepted_length_num.item(), 4.0)
+        # Serving path misses slot 1 in both blocks, so each accepts the anchor.
+        self.assertEqual(terms.serving_accepted_length_num.item(), 2.0)
+        torch.testing.assert_close(
+            terms.selector_covered_den, torch.tensor([0.0, 1.0, 2.0])
+        )
+        torch.testing.assert_close(
+            terms.selector_conditional_correct_num, torch.tensor([0.0, 0.0, 2.0])
+        )
+        expected_mass = torch.stack(
+            [
+                torch.softmax(hidden[0, :, position], dim=-1)
+                .topk(2, dim=-1)
+                .values.sum()
+                for position in range(3)
+            ]
+        ) * torch.tensor([0.0, 1.0, 1.0])
+        torch.testing.assert_close(terms.unary_topk_mass_num, expected_mass)
+        self.assertEqual(terms.loss_weight_num[0].item(), 0.0)
+        self.assertGreater(
+            terms.loss_weight_num[1].item(), terms.loss_weight_num[2].item()
+        )
+
+    def test_lambda_objective_reports_its_kl_weight(self):
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=4,
+                    vocab_size=4,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.02,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        model = OnlineDFlashModel(
+            draft_model=Draft(),
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(4, 4),
+            mask_token_id=3,
+            block_size=2,
+            attention_backend="eager",
+            lk_loss_type="lambda",
+            kl_scale=1.0,
+            kl_decay=3.0,
+        )
+        model._forward_draft_blocks = lambda **_kwargs: (
+            torch.tensor([[0]]),
+            torch.tensor([[True]]),
+            torch.tensor([[[0.0, 0.0, 0.0, 0.0], [0.0, 2.0, 1.0, 0.0]]]),
+        )
+
+        _loss, _accuracy, metrics = model(
+            input_ids=torch.tensor([[0, 1]]),
+            hidden_states=torch.zeros(1, 2, 4),
+            loss_mask=torch.ones(1, 2),
+            collect_detailed_metrics=False,
+        )
+
+        ratios = metrics["ratio_metrics"]
+        probability_num, probability_den = ratios["target_probability"]
+        weight_num, weight_den = ratios["objective/lk_kl_weight"]
+        torch.testing.assert_close(
+            weight_num / weight_den,
+            torch.exp(-3.0 * probability_num / probability_den),
+        )
 
     def test_detailed_metrics_can_be_disabled_between_log_steps(self):
         class Draft(nn.Module):

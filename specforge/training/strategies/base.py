@@ -44,9 +44,9 @@ class StepOutput:
 
 @dataclass(frozen=True)
 class StepContext:
-    """Training-schedule state passed into ``forward_loss`` for objectives that
-    depend on where in training we are (e.g. Domino's decaying ``lambda_base``);
-    ``collect_detailed_metrics`` gates expensive diagnostics to log windows."""
+    """Training-schedule state passed into ``forward_loss``.
+
+    ``collect_detailed_metrics`` gates expensive diagnostics to log steps."""
 
     global_step: int = 0
     total_steps: Optional[int] = None

@@ -215,15 +215,24 @@ from updating the unary logits and draft hidden states. The selector parameters
 still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
 gradient path. The option defaults to `false`, preserving coupled training.
 
-External tracking reports aggregate and per-block-position DFlash2 diagnostics.
-The `train/dflash2/hard_label/*` family separates unary top-1 accuracy,
-unary top-K recall and probability, selector loss, conditional selector
-accuracy, and strict-serving selector accuracy. Online runs additionally report
-`train/dflash2/teacher/*` top-1 agreement, unary top-K teacher mass, expected
-acceptance, and strict-serving selector agreement. Per-position keys end in
-`position_1` through `position_<block_size-1>`; the verified position-zero
-anchor is omitted. Full-vocabulary alignment telemetry is computed only for
-optimizer steps that reach `training.log_interval`.
+External tracking reports DFlash2 diagnostics on optimizer steps that reach
+`training.log_interval`, as aggregates plus `position_1` through
+`position_<block_size-1>` breakdowns (the verified anchor is omitted):
+
+- `train/dflash2/hard_label/*`: unary top-1 accuracy, top-K recall and
+  probability mass, gold-token probability, selector loss, selector conditional
+  accuracy (uniform over covered slots, so comparable across loss types), and
+  the realized greedy serving path's per-slot accuracy. Two per-block
+  accepted-length proxies count the anchor plus the leading run of supervised
+  slots that are covered by the unary top-K (`unary_topK_oracle_accepted_length`)
+  or matched by the serving path (`selector_serving_accepted_length`).
+- `train/dflash2/objective/loss_weight_share/position_*`: the fraction of the
+  effective objective weight each block position receives under the configured
+  fixed-decay or D-PACE weighting.
+- `train/objective/lk_kl_weight`: the CE weight of the `lambda` LK objective.
+- `train/dflash2/teacher/*` (online capture only): full-vocabulary expected
+  acceptance, unary top-1 agreement, unary top-K teacher mass, and serving-path
+  agreement against the frozen target head.
 
 The exported computation and parameter names match the public SGLang DFlash2
 contract, including optional `output_multiplier` and
