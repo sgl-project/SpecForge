@@ -426,7 +426,10 @@ def warm_start_draft_model(
     if not state:
         raise ValueError(f"warm-start checkpoint {source!r} contains no draft weights")
     try:
-        result = model.load_state_dict(state, strict=False)
+        # Files use the official naming; modules may use a native MoE layout.
+        from specforge.modeling.draft.moe import from_checkpoint_state_dict
+
+        result = model.load_state_dict(from_checkpoint_state_dict(state), strict=False)
     except RuntimeError as exc:
         raise ValueError(
             f"warm-start checkpoint {source!r} has incompatible draft tensor "
