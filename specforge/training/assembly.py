@@ -292,8 +292,17 @@ def _logger(metrics, step):
 
 
 def _configured_logger(cfg: Config):
-    """Create an external tracker only for a trainer-bearing run."""
+    """Return this process's metric logger.
+
+    Every rank keeps the console logger. An external tracker (W&B, MLflow,
+    SwanLab, TensorBoard) is created on global rank zero only, so a job has one
+    run and one writer instead of world-size copies.
+    """
     if cfg.tracking.report_to == "none" or cfg.training.role == "producer":
+        return _logger
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
         return _logger
 
     from types import SimpleNamespace
