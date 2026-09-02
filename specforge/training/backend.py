@@ -43,6 +43,13 @@ class ParallelConfig:
     sharding_strategy: str = "SHARD_GRAD_OP"
     param_dtype: torch.dtype = torch.bfloat16
     fsdp_process_group: Any = None
+    #: Group for loss/metric reductions; falls back to fsdp_process_group.
+    #: HSDP separates them because its FSDP group is a (shard, replica) pair.
+    reduction_process_group: Any = None
+    #: Group over which each parameter shard exists exactly once; HSDP
+    #: replicates shards across islands, so counting them WORLD-wide would
+    #: overstate the global gradient norm.
+    grad_norm_process_group: Any = None
     dp_group: Any = None
     draft_dp_group: Any = None
     tp_group: Any = None
@@ -111,6 +118,26 @@ class ParallelConfig:
                 "ParallelConfig.from_distributed: distributed handles unavailable: %s",
                 exc,
             )
+        fsdp_process_group: Any = dist.group.WORLD
+        grad_norm_process_group: Any = dist.group.WORLD
+        if sharding_strategy == "HYBRID_SHARD":
+            shard_group = handles.get("tp_group")
+            replica_group = handles.get("dp_group")
+            if shard_group is None or replica_group is None:
+                raise RuntimeError(
+                    "HYBRID_SHARD requires initialized target-TP and target-DP groups"
+                )
+            if dist.get_world_size(shard_group) <= 1:
+                raise ValueError("HYBRID_SHARD shard group must contain multiple ranks")
+            if dist.get_world_size(replica_group) <= 1:
+                raise ValueError(
+                    "HYBRID_SHARD replica group must contain multiple target islands"
+                )
+            fsdp_process_group = (shard_group, replica_group)
+            # Each replica owns an identical copy of one parameter shard after
+            # HSDP synchronization. Count that shard once, across the shard
+            # group, when computing the global norm.
+            grad_norm_process_group = shard_group
         return cls(
             world_size=dist.get_world_size(),
             tp_size=tp_size,
@@ -118,7 +145,9 @@ class ParallelConfig:
             sp_ring_size=sp_ring_size,
             sharding_strategy=sharding_strategy,
             param_dtype=param_dtype,
-            fsdp_process_group=dist.group.WORLD,
+            fsdp_process_group=fsdp_process_group,
+            reduction_process_group=dist.group.WORLD,
+            grad_norm_process_group=grad_norm_process_group,
             **handles,
         )
 
@@ -299,8 +328,11 @@ class FSDPTrainingBackend(TrainingBackend):
     def _configure_optimizer_grad_norm(self) -> None:
         configure = getattr(self.optimizer, "configure_grad_norm_reduction", None)
         if configure is not None:
+            process_group = self.parallel_config.grad_norm_process_group
+            if process_group is None:
+                process_group = self.parallel_config.fsdp_process_group
             configure(
-                process_group=self.parallel_config.fsdp_process_group,
+                process_group=process_group,
                 enabled=(
                     self._wrapped
                     and self.parallel_config.sharding_strategy != "NO_SHARD"

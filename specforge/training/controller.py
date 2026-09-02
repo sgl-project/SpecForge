@@ -440,12 +440,24 @@ class TrainerCore:
                 denominator = previous[1] + denominator
             self._ratio_totals[name] = (numerator, denominator)
 
+    def _reduction_group(self):
+        """Group for loss/metric reductions across all sample-parallel ranks.
+
+        HSDP's fsdp_process_group is a (shard, replica) pair, so reductions use
+        the explicit WORLD-wide reduction group; every other topology falls
+        back to the FSDP group, which is a plain process group there.
+        """
+        parallel_config = getattr(self.backend, "parallel_config", None)
+        process_group = getattr(parallel_config, "reduction_process_group", None)
+        if process_group is None:
+            process_group = getattr(parallel_config, "fsdp_process_group", None)
+        return process_group
+
     def _normalize_gradients(self, local_denominator: torch.Tensor) -> None:
         import torch.distributed as dist
 
         denominator = local_denominator.clone()
-        parallel_config = getattr(self.backend, "parallel_config", None)
-        process_group = getattr(parallel_config, "fsdp_process_group", None)
+        process_group = self._reduction_group()
         world_size = 1
         if dist.is_available() and dist.is_initialized():
             world_size = dist.get_world_size(group=process_group)
@@ -479,8 +491,7 @@ class TrainerCore:
             if isinstance(out.loss, torch.Tensor)
             else torch.device("cpu")
         )
-        parallel_config = getattr(self.backend, "parallel_config", None)
-        process_group = getattr(parallel_config, "fsdp_process_group", None)
+        process_group = self._reduction_group()
         structured = _reduce_eagle3_metrics(
             out.metrics,
             device=metric_device,

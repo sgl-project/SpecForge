@@ -1,0 +1,72 @@
+# Kimi K3 DSpark, online colocated — four TP8/HSDP islands on 4x8 B300.
+model:
+  target_model_path: /workspace/models/Kimi-K3-cdd2e49a
+  draft_model_config: configs/kimi-k3-dspark.json
+  draft_checkpoint_path: /workspace/k3_dspark/checkpoints/kimi-k3-dspark/epoch_0_step_0
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.lm_head.weight
+  mask_token_id: 163824
+  torch_dtype: bfloat16
+  sglang_attention_backend: trtllm_mla
+  sglang_mem_fraction_static: 0.76
+  sglang_disable_radix_cache: false
+  sglang_context_length: 66048
+  # A TP8 island captures one distinct rank-local sequence for every peer.
+  sglang_max_running_requests: 8
+  sglang_max_total_tokens: 528384
+  sglang_moe_runner_backend: marlin
+  sglang_mamba_radix_cache_strategy: extra_buffer
+  sglang_max_mamba_cache_size: 40
+
+data:
+  train_data_path: /workspace/k3_dspark/data/kimi-k3-agentic-regen.jsonl
+  max_length: 65536
+  chat_template: kimi-k3-thinking
+  cache_dir: /workspace/k3_dspark/cache
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 0
+
+training:
+  strategy: dspark
+  num_epochs: 10
+  # 32 ranks x 1 sequence x 4 microbatches = effective global batch 128, the
+  # same global batch as the disaggregated K3 recipe (4 consumers x 32), so its
+  # learning rate carries over unchanged.
+  batch_size: 1
+  accumulation_steps: 4
+  tp_size: 8
+  fsdp_sharding: HYBRID_SHARD
+  learning_rate: 0.0006
+  lr_scheduler: constant
+  warmup_ratio: 0
+  max_grad_norm: 1
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 8
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-dspark
+  wandb_name: kimi-k3-dspark-specforge-colocated-hsdp
+  wandb_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/wandb
+
+run_id: kimi-k3-dspark-specforge-colocated
+output_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/colocated-output
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 4
+    nproc_per_node: 8
+    master_addr: trainer-0

@@ -17,6 +17,28 @@ def _make_optimizer(seed=0, **kwargs):
 
 
 class TestClipGradNormSingleProcess(unittest.TestCase):
+    def test_backend_uses_the_hsdp_shard_group_for_grad_norm(self):
+        class RecordingOptimizer:
+            def configure_grad_norm_reduction(self, **kwargs):
+                self.config = kwargs
+
+        fsdp_groups = (object(), object())
+        shard_group = object()
+        backend = FSDPTrainingBackend(
+            ParallelConfig(
+                sharding_strategy="HYBRID_SHARD",
+                fsdp_process_group=fsdp_groups,
+                grad_norm_process_group=shard_group,
+            )
+        )
+        backend._wrapped = True
+        optimizer = RecordingOptimizer()
+
+        backend.set_optimizer(optimizer)
+
+        self.assertIs(optimizer.config["process_group"], shard_group)
+        self.assertTrue(optimizer.config["enabled"])
+
     def test_matches_torch_reference(self):
         model, optimizer = _make_optimizer()
         grad = torch.randn(8, 8)
