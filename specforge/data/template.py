@@ -14,6 +14,8 @@ class ChatTemplate(BaseModel):
         system_prompt(str): The system prompt.
         end_of_turn_token(str): The end token of a turn of conversation.
         ignore_token(List[str]): The list of tokens to ignore when parsing the model output, e.g., for thinking token.
+        jinja_chat_template(str): Jinja template applied instead of the tokenizer's
+            own, for checkpoints that ship no chat template.
     """
 
     assistant_header: Optional[str] = None
@@ -24,6 +26,7 @@ class ChatTemplate(BaseModel):
     assistant_pattern_type: str = "general"
     enable_thinking: bool = False
     ignore_token: Optional[List[str]] = None
+    jinja_chat_template: Optional[str] = None
 
 
 class TemplateRegistry:
@@ -310,6 +313,40 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<｜end▁of▁sentence｜>",
         parser_type="thinking",
         enable_thinking=True,
+    ),
+)
+
+# DeepSeek-V4 checkpoints ship no Jinja chat template (prompts come from a
+# reference python encoder), so this template carries its own Jinja mirroring it.
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v4",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        parser_type="thinking",
+        enable_thinking=False,
+        jinja_chat_template=(
+            "{{ '<｜begin▁of▁sentence｜>' }}"
+            "{% if messages and messages[0]['role'] == 'system' %}"
+            "{{ messages[0]['content'] }}"
+            "{% endif %}"
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
+            "{{ '<｜User｜>' + message['content'] }}"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{ '<｜Assistant｜>' }}"
+            "{% if message['reasoning_content'] is defined and message['reasoning_content'] %}"
+            "{{ '<think>' + message['reasoning_content'] + '</think>' }}"
+            "{% else %}"
+            "{{ '</think>' }}"
+            "{% endif %}"
+            "{{ message['content'] + '<｜end▁of▁sentence｜>' }}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<｜Assistant｜>' }}{% endif %}"
+        ),
     ),
 )
 

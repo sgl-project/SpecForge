@@ -1,5 +1,19 @@
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+index 1f310d82a5..ff972fdf1a 100644
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -583,6 +583,9 @@ def prewarm_mhc_pre(
+ 
+     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
+     max_num_tokens = get_schedule().chunked_prefill_size
++    if max_num_tokens is None or max_num_tokens <= 0:
++        # Chunked prefill disabled (-1): fall back to the prefill token budget.
++        max_num_tokens = get_schedule().max_prefill_tokens
+     buckets = get_mhc_pre_token_count_representatives(
+         max_num_tokens, hc_mult * hidden_size
+     )
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index 2487072b63..12040ba6e6 100644
+index 2487072b63..098f49b627 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
 @@ -102,6 +102,9 @@ class LogitsProcessorOutput:
@@ -51,6 +65,55 @@ index 2487072b63..12040ba6e6 100644
                  mm_input_embeds=logits_metadata.mm_input_embeds,
              )
  
+@@ -421,6 +449,7 @@ class LogitsProcessor(nn.Module):
+         logits_output = LogitsProcessorOutput(
+             next_token_logits=sampled_logits,
+             hidden_states=hidden_states_to_store,
++            last_hidden_states=last_hidden_states_to_store,
+             mm_input_embeds=logits_metadata.mm_input_embeds,
+         )
+         logprobs_result.write_input_to(logits_output)
+@@ -608,10 +637,12 @@ class LogitsProcessor(nn.Module):
+         if logits_metadata.capture_hidden_mode.need_capture():
+             if logits_metadata.capture_hidden_mode.is_full():
+                 if aux_hidden_states is not None:
++                    # Explicit aux capture wins over the model-supplied
++                    # pre-norm stream (V4 always passes it).
+                     hidden_states_to_store = pack_aux_hidden_states(aux_hidden_states)
+                 else:
+                     hidden_states_to_store = hidden_states
+-                hidden_states_to_store_before_norm = hidden_states_before_norm
++                    hidden_states_to_store_before_norm = hidden_states_before_norm
+             elif logits_metadata.capture_hidden_mode.is_last():
+                 # Get the last token hidden states. If sample_indices is None,
+                 # pruned states only contain the last tokens already.
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+index f4ec27acca..e09df010a8 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -22,7 +23,13 @@ from sglang.srt.utils import (
+ )
+ from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
+ 
+-_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
++# FLASHINFER_USE_CUDA_QUANT=1 forces the "cuda" mxfp8-quantize backend; the
++# CuTe-DSL kernels miscompile against some nvidia-cutlass-dsl pins.
++_MXFP8_QUANTIZE_BACKEND = (
++    "cuda"
++    if not is_sm100_supported() or os.environ.get("FLASHINFER_USE_CUDA_QUANT") == "1"
++    else "cute-dsl"
++)
+ 
+ if is_flashinfer_available():
+     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
 index 2a506f88cd..20f87ecb86 100644
 --- a/python/sglang/srt/managers/detokenizer_manager.py
