@@ -23,7 +23,7 @@ We evaluate the performance of SpecBundle draft models on various benchmarks, pl
 
 ## Usage
 
-You can use the following command to launch the SGLang server with SpecBundle models. Please add `--tp`, `--ep` and `--mem-fraction-static` arguments when you encounter memory issues.
+You can use the following command to launch the SGLang server with SpecBundle models. Please add `--tp-size`, `--ep` and `--mem-fraction-static` arguments when you encounter memory issues.
 
 ```bash
 python3 -m sglang.launch_server \
