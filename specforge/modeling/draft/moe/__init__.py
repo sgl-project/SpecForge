@@ -11,7 +11,7 @@
 One configurable layer, not one block per target family. A draft JSON selects a
 ``moe_preset`` (the routing recipe of a target family) and may override any
 architecture knob for ablations; the expensive parts (dispatch, checkpoint
-naming, FSDP layout, deferred balance updates) are shared.
+naming, FSDP layout, deferred balance updates) are shared. See ``DESIGN.md``.
 
 Modules:
 
