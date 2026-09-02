@@ -25,6 +25,7 @@ from specforge.algorithms.common.providers import (
     StepProvider,
     make_registration,
 )
+from specforge.algorithms.common.vlm_input import build_vlm_input_adapter
 from specforge.algorithms.contracts import (
     AlgorithmCapabilities,
     AlgorithmSpec,
@@ -137,6 +138,13 @@ def algorithm_spec() -> AlgorithmSpec:
                 allowed_target_representations={"hidden_state"},
                 default_target_representation="hidden_state",
             ),
+            FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="multimodal",
+                required_tensors=ready,
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
+            ),
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
@@ -200,6 +208,24 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                 ),
                 build_collator=build_dspark_collator,
+            ),
+            ServerStreamingProvider(
+                modality="multimodal",
+                capture_method="dspark",
+                target_representation="hidden_state",
+                layout=ServerCaptureLayout(
+                    aux_feature="hidden_states",
+                    last_hidden_feature="target_last_hidden_states",
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                ),
+                build_collator=build_dspark_collator,
+                build_input_adapter=partial(
+                    build_vlm_input_adapter,
+                    minimum_loss_tokens=minimum_loss_tokens,
+                ),
             ),
         ),
     )
