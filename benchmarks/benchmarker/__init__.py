@@ -1,4 +1,4 @@
-from .aime import AIMEBenchmarker
+from .aime import AIME25Benchmarker, AIMEBenchmarker
 from .ceval import CEvalBenchmarker
 from .financeqa import FinanceQABenchmarker
 from .gpqa import GPQABenchmarker
@@ -16,6 +16,7 @@ from .simpleqa import SimpleQABenchmarker
 __all__ = [
     "BENCHMARKS",
     "AIMEBenchmarker",
+    "AIME25Benchmarker",
     "CEvalBenchmarker",
     "GSM8KBenchmarker",
     "HumanEvalBenchmarker",
