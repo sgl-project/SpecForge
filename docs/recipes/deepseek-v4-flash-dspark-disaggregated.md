@@ -82,6 +82,30 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 specforge train \
 
 Supply `HF_TOKEN` and `WANDB_API_KEY` through the environment, not YAML.
 
+## MoE-FFN arm (ablation)
+
+`examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark-moe-disaggregated.yaml`
+is the same recipe with `configs/deepseek-v4-flash-dspark-moe.json`: the
+five-layer GQA decoder keeps its attention, and each layer's dense MLP becomes
+the target's MoE (`moe_preset: deepseek_v4`: sqrt-softplus scores,
+aux-loss-free top-k with the sign-controlled selection bias, combine weights
+renormalized and scaled by 1.5, one ungated shared expert, SwiGLU clamped at
+10). Sizes are per run: 64 routed experts, top-6, width 2048, so the activated
+FFN width (6 x 2048 + 2048 shared) matches the dense 12288 at ~10x the FFN
+parameters. Run it against the dense recipe with identical hparams; the two
+YAMLs differ only in the draft JSON and run names. The capture servers are
+shared by both arms unchanged.
+
+Training-only knobs live under the draft JSON's `dflash_config`:
+`moe_bias_update_rate` (0.001, the balancing controller's step) and
+`moe_dispatch` (`grouped_mm` runs the experts as grouped GEMMs with no host
+sync; `sorted_loop` is the portable fallback). The trainer logs `moe/*` load
+metrics (max/min load ratios, unused-expert fraction, balancing-bias
+magnitude) alongside the usual scalars. Checkpoints keep the official
+per-expert naming (`layers.N.mlp.experts.{i}.w{1,2,3}.weight`,
+`layers.N.mlp.gate.bias`, `layers.N.mlp.shared_experts.w{1,2,3}.weight`), so
+exports load into SGLang's DeepSeek-V4 MoE unchanged.
+
 ## Fresh attempts
 
 Delete the run's `outputs/` directory and, whenever a capture server was

@@ -139,7 +139,7 @@ the target's `config.json`:
 
 ```json
 {
-  "moe_preset": "<target family>",
+  "moe_preset": "deepseek_v4",
   "n_routed_experts": 64,
   "num_experts_per_tok": 6,
   "moe_intermediate_size": 2048,
@@ -156,9 +156,13 @@ exports keep the official per-expert naming (`experts.{i}.w{1,2,3}.weight`),
 so an exported drafter loads into SGLang unchanged. Dense drafts are
 unaffected: with no `n_routed_experts` the kernel provider's MLP is used as-is.
 
-A new target family is a preset registration plus whichever components it
-needs (score function, balance controller, experts backend, shared expert);
-each registers by name from its own module.
+`deepseek_v4` is the checked-in preset (DeepSeek-V4 routing:
+`sqrtsoftplus` scores, aux-loss-free `noaux_tc` balancing, combine weights
+renormalized and scaled by 1.5, one ungated shared expert, SwiGLU clamp 10);
+`configs/deepseek-v4-flash-dspark-moe.json` uses it. A new target family is a
+preset registration plus whichever components it needs (score function,
+balance controller, experts backend, shared expert); each registers by name
+from its own module.
 
 ## Draft architectures
 
