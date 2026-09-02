@@ -37,7 +37,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
                     "hidden_states",
                     "target_last_hidden_states",
                 },
-                {"eager", "sdpa", "flex_attention"},
+                {"eager", "sdpa", "flex_attention", "native"},
                 None,
             ),
             "eagle3": (
