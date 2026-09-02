@@ -2,13 +2,12 @@ diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/
 index 1f310d82a5..ff972fdf1a 100644
 --- a/python/sglang/kernels/ops/layernorm/mhc.py
 +++ b/python/sglang/kernels/ops/layernorm/mhc.py
-@@ -583,6 +583,10 @@ def prewarm_mhc_pre(
+@@ -583,6 +583,9 @@ def prewarm_mhc_pre(
  
      hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
      max_num_tokens = get_schedule().chunked_prefill_size
 +    if max_num_tokens is None or max_num_tokens <= 0:
-+        # Chunked prefill disabled (-1, e.g. spec-capture servers): bound the
-+        # prewarm by the prefill token budget instead of a negative size.
++        # Chunked prefill disabled (-1): fall back to the prefill token budget.
 +        max_num_tokens = get_schedule().max_prefill_tokens
      buckets = get_mhc_pre_token_count_representatives(
          max_num_tokens, hc_mult * hidden_size
@@ -74,13 +73,12 @@ index 2487072b63..098f49b627 100644
              mm_input_embeds=logits_metadata.mm_input_embeds,
          )
          logprobs_result.write_input_to(logits_output)
-@@ -608,10 +637,13 @@ class LogitsProcessor(nn.Module):
+@@ -608,10 +637,12 @@ class LogitsProcessor(nn.Module):
          if logits_metadata.capture_hidden_mode.need_capture():
              if logits_metadata.capture_hidden_mode.is_full():
                  if aux_hidden_states is not None:
-+                    # Explicit aux capture wins: DeepSeek-V4 always passes
-+                    # hidden_states_before_norm, which would otherwise
-+                    # silently replace the aux concat.
++                    # Explicit aux capture wins over the model-supplied
++                    # pre-norm stream (V4 always passes it).
                      hidden_states_to_store = pack_aux_hidden_states(aux_hidden_states)
                  else:
                      hidden_states_to_store = hidden_states
