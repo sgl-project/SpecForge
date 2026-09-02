@@ -20,6 +20,8 @@ Modules:
 - :mod:`.balance`     ``BalanceController`` contract: balancing as a policy
 - :mod:`.experts`     ``RoutedExperts`` contract: expert weights + dispatch
 - :mod:`.shared`      ``SharedExpert`` contract
+- :mod:`.layer`       ``MoELayer`` composition; ``build_ffn`` is the dense/MoE switch
+- :mod:`.hooks`       model-level plumbing: balance updates, aux loss, metrics
 
 Implementations register into the registries from their own modules; this
 package defines contracts and holds no routing math itself.
@@ -45,6 +47,13 @@ from .experts import (
     build_routed_experts,
     register_experts_backend,
 )
+from .hooks import (
+    apply_pending_balance_updates,
+    collect_moe_aux_loss,
+    collect_moe_metrics,
+    iter_moe_layers,
+)
+from .layer import MoELayer, build_ffn
 from .router import (
     ROUTERS,
     SCORE_FUNCTIONS,
@@ -68,6 +77,7 @@ __all__ = [
     "EXPERTS_BACKENDS",
     "MOE_PRESETS",
     "MoEConfig",
+    "MoELayer",
     "ROUTERS",
     "RoutedExperts",
     "Router",
@@ -75,13 +85,18 @@ __all__ = [
     "SCORE_FUNCTIONS",
     "SHARED_EXPERTS",
     "SharedExpert",
+    "apply_pending_balance_updates",
     "available_moe_presets",
     "build_balance_controller",
+    "build_ffn",
     "build_routed_experts",
     "build_router",
     "build_shared_expert",
+    "collect_moe_aux_loss",
+    "collect_moe_metrics",
     "get_score_function",
     "is_moe_config",
+    "iter_moe_layers",
     "register_balance_controller",
     "register_experts_backend",
     "register_moe_preset",

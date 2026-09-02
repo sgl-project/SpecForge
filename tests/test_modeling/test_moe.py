@@ -1,7 +1,7 @@
 # coding=utf-8
-"""MoE FFN skeleton: config resolution and the component contracts, with stub
-components so the contracts are pinned independently of any target-family
-implementation."""
+"""MoE FFN skeleton: config resolution, component contracts, composition, and
+the model/trainer seams — exercised with stub components so the contracts are
+pinned independently of any target-family implementation."""
 
 import unittest
 from types import SimpleNamespace
@@ -9,7 +9,9 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 from transformers import Qwen3Config
+from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
+from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.moe import (
     BALANCE_CONTROLLERS,
     EXPERTS_BACKENDS,
@@ -18,10 +20,16 @@ from specforge.modeling.draft.moe import (
     SCORE_FUNCTIONS,
     SHARED_EXPERTS,
     BalanceController,
+    MoELayer,
     RoutedExperts,
     Router,
     RoutingResult,
     SharedExpert,
+    apply_pending_balance_updates,
+    build_ffn,
+    collect_moe_aux_loss,
+    collect_moe_metrics,
+    iter_moe_layers,
     register_balance_controller,
     register_experts_backend,
     register_moe_preset,
@@ -30,6 +38,7 @@ from specforge.modeling.draft.moe import (
     register_shared_expert,
     resolve_moe_config,
 )
+from specforge.training.strategies.base import _moe_metrics
 
 PRESET = "_test_family"
 
@@ -241,6 +250,154 @@ class TestMoEConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already registered"):
             register_router("_test_router")(_StubRouter.__mro__[1])
         self.assertIn("none", BALANCE_CONTROLLERS)
+
+
+class TestMoELayerComposition(unittest.TestCase):
+    def _layer(self, **overrides):
+        torch.manual_seed(0)
+        cfg = resolve_moe_config(_moe_json(**overrides))
+        layer = MoELayer(cfg, 16)
+        layer.reset_parameters(std=0.02)
+        return layer
+
+    def test_dense_config_uses_the_dense_factory_verbatim(self):
+        sentinel = nn.Identity()
+        self.assertIs(
+            build_ffn(SimpleNamespace(hidden_size=16), lambda c: sentinel), sentinel
+        )
+
+    def test_moe_config_builds_official_attribute_layout(self):
+        layer = build_ffn(SimpleNamespace(**_moe_json()), lambda c: nn.Identity())
+        self.assertIsInstance(layer, MoELayer)
+        names = {name for name, _ in layer.named_children()}
+        self.assertEqual(names, {"gate", "experts", "shared_experts"})
+        self.assertIsInstance(layer.gate.balance, _StubBalance)
+        self.assertIs(layer.balance, layer.gate.balance)
+
+    def test_forward_preserves_shape_and_adds_shared_expert(self):
+        layer = self._layer()
+        x = torch.randn(2, 3, 16)
+        y = layer(x)
+        self.assertEqual(y.shape, x.shape)
+        routed_only = self._layer(n_shared_experts=0)
+        self.assertIsNone(routed_only.shared_experts)
+        routed_only.load_state_dict(
+            {k: v for k, v in layer.state_dict().items() if "shared" not in k}
+        )
+        shared = layer.shared_experts(x.reshape(-1, 16)).view_as(x)
+        self.assertTrue(torch.allclose(y, routed_only(x) + shared, atol=1e-5))
+
+    def test_training_observes_counts_and_eval_does_not(self):
+        layer = self._layer().train()
+        x = torch.randn(5, 16)
+        layer(x)
+        self.assertEqual(len(layer.balance.observed), 1)
+        self.assertEqual(int(layer.balance.observed[0].sum()), 5 * 2)
+        self.assertTrue(torch.equal(layer.last_counts, layer.balance.observed[0]))
+        layer.eval()
+        layer(x)
+        self.assertEqual(len(layer.balance.observed), 1)
+
+    def test_model_hooks_delegate_to_the_controller(self):
+        layer = self._layer(dflash_config={"moe_aux_loss_coeff": 0.25}).train()
+        layer(torch.randn(4, 16))
+        layer.apply_pending_balance_update()
+        self.assertEqual(layer.balance.applied, 1)
+        self.assertAlmostEqual(float(layer.aux_loss()), 0.25)
+        metrics = layer.metrics()
+        self.assertEqual(
+            set(metrics),
+            {"load_max_ratio", "load_min_ratio", "experts_unused_frac", "stub_metric"},
+        )
+        self.assertGreaterEqual(float(metrics["load_max_ratio"]), 1.0)
+        self.assertLessEqual(float(metrics["load_min_ratio"]), 1.0)
+
+    def test_selection_bias_changes_choice_not_weights(self):
+        layer = self._layer().eval()
+        x = torch.randn(1, 16)
+        before = layer.gate(x)
+        layer.balance.bias[:] = -1e3
+        favored = int((before.indices[0, 0] + 1) % 8)
+        layer.balance.bias[favored] = 0.0
+        after = layer.gate(x)
+        self.assertIn(favored, after.indices[0].tolist())
+        # combine weights come from raw scores: still normalized and scaled
+        self.assertAlmostEqual(float(after.weights.detach().sum()), 1.5, places=5)
+
+
+class TestHooks(unittest.TestCase):
+    def _tree(self, **overrides):
+        cfg = resolve_moe_config(_moe_json(**overrides))
+        a, b = MoELayer(cfg, 16), MoELayer(cfg, 16)
+        for layer in (a, b):
+            layer.reset_parameters(std=0.02)
+        return nn.Sequential(nn.Linear(16, 16), a, nn.Linear(16, 16), b), (a, b)
+
+    def test_iteration_updates_and_aggregation(self):
+        tree, (a, b) = self._tree(dflash_config={"moe_aux_loss_coeff": 0.5})
+        self.assertEqual(list(iter_moe_layers(tree)), [a, b])
+        tree.train()(torch.randn(3, 16))
+        apply_pending_balance_updates(tree)
+        self.assertEqual((a.balance.applied, b.balance.applied), (1, 1))
+        self.assertAlmostEqual(float(collect_moe_aux_loss(tree)), 1.0)
+        metrics = collect_moe_metrics(tree)
+        self.assertTrue(all(key.startswith("moe/") for key in metrics))
+        self.assertAlmostEqual(float(metrics["moe/stub_metric"]), 1.0)
+
+    def test_dense_trees_are_inert(self):
+        dense = nn.Sequential(nn.Linear(16, 16))
+        apply_pending_balance_updates(dense)
+        self.assertIsNone(collect_moe_aux_loss(dense))
+        self.assertEqual(collect_moe_metrics(dense), {})
+        self.assertEqual(_moe_metrics(SimpleNamespace()), {})
+
+    def test_strategy_metrics_read_the_wrapped_draft(self):
+        tree, _ = self._tree()
+        tree.train()(torch.randn(3, 16))
+        metrics = _moe_metrics(SimpleNamespace(draft_model=tree))
+        self.assertIn("moe/load_max_ratio", metrics)
+
+
+class TestDFlashWiring(unittest.TestCase):
+    def _forward(self, model):
+        return model(
+            position_ids=torch.arange(6).unsqueeze(0),
+            noise_embedding=torch.randn(1, 2, 16),
+            target_hidden=torch.randn(1, 4, 2 * 16),
+        )
+
+    def test_dense_draft_is_unchanged(self):
+        model = DFlashDraftModel(_dflash_config(moe=False))
+        for layer in model.layers:
+            self.assertIsInstance(layer.mlp, Qwen3MLP)
+        self.assertEqual(list(iter_moe_layers(model)), [])
+
+    def test_moe_draft_layers_init_and_apply_balance_updates(self):
+        model = DFlashDraftModel(_dflash_config())
+        layers = list(iter_moe_layers(model))
+        self.assertEqual(len(layers), 2)
+        for layer in layers:
+            self.assertIs(layer, [m for m in model.layers if m.mlp is layer][0].mlp)
+            self.assertEqual(layer.cfg.bias_update_rate, 0.005)
+            # _init_weights reached the bare Parameters (no uninitialized memory)
+            self.assertTrue(torch.isfinite(layer.gate.weight).all())
+            self.assertGreater(float(layer.gate.weight.abs().sum()), 0.0)
+            self.assertTrue(torch.isfinite(layer.experts.w).all())
+        model.train()
+        self._forward(model)
+        self._forward(model)
+        self.assertEqual([layer.balance.applied for layer in layers], [2, 2])
+        self.assertEqual([len(layer.balance.observed) for layer in layers], [2, 2])
+        model.eval()
+        self._forward(model)
+        self.assertEqual([layer.balance.applied for layer in layers], [2, 2])
+
+    def test_state_dict_names_follow_the_official_layout(self):
+        model = DFlashDraftModel(_dflash_config())
+        keys = set(model.state_dict())
+        self.assertIn("layers.0.mlp.gate.weight", keys)
+        self.assertIn("layers.0.mlp.shared_experts.proj.weight", keys)
+        self.assertTrue(any(k.startswith("layers.0.mlp.experts.") for k in keys))
 
 
 if __name__ == "__main__":
