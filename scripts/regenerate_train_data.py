@@ -8,7 +8,7 @@ Usage:
 python3 -m sglang.launch_server \
 	--model Qwen/Qwen3.5-35B-A3B \
 	--mem-fraction-static 0.7 \
-	--tp 1 \
+	--tp-size 1 \
 	--trust-remote-code \
     --cuda-graph-max-bs 128 \
 	--host 0.0.0.0 \
