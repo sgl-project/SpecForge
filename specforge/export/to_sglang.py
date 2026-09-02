@@ -28,6 +28,7 @@ from specforge.export.checkpoint_io import (
     materialize_draft,
     resolve_training_state,
 )
+from specforge.modeling.draft.moe import to_checkpoint_state_dict
 
 #: per-architecture trainer-key -> serving-key renames ({} = identity).
 WEIGHT_MAPS: Dict[str, Dict[str, str]] = {
@@ -83,7 +84,11 @@ def export_to_sglang(
     # Serialize the checkpoint tensors as stored (as the HF exporter does), but
     # keep the mapping buffers materialize_draft loaded when one was requested;
     # drop the embeddings exactly as the trainer-side checkpoint filter does.
-    full = {k: v for k, v in model.state_dict().items() if "embed" not in k.lower()}
+    full = {
+        k: v
+        for k, v in to_checkpoint_state_dict(model.state_dict()).items()
+        if "embed" not in k.lower()
+    }
     full.update(
         {
             key: value

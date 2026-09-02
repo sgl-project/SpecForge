@@ -1,7 +1,7 @@
 # coding=utf-8
 """MoE FFN skeleton: config resolution, component contracts, composition, and
-the model/trainer seams — exercised with stub components so the contracts are
-pinned independently of any target-family implementation."""
+the model/trainer/checkpoint seams — exercised with stub components so the
+contracts are pinned independently of any target-family implementation."""
 
 import unittest
 from types import SimpleNamespace
@@ -29,15 +29,21 @@ from specforge.modeling.draft.moe import (
     build_ffn,
     collect_moe_aux_loss,
     collect_moe_metrics,
+    from_checkpoint_state_dict,
     iter_moe_layers,
+    plan_warm_start,
     register_balance_controller,
     register_experts_backend,
     register_moe_preset,
     register_router,
     register_score_function,
     register_shared_expert,
+    register_state_dict_converter,
     resolve_moe_config,
+    select_target_experts,
+    to_checkpoint_state_dict,
 )
+from specforge.modeling.draft.moe.state_dict import unregister_state_dict_converter
 from specforge.training.strategies.base import _moe_metrics
 
 PRESET = "_test_family"
@@ -356,6 +362,59 @@ class TestHooks(unittest.TestCase):
         tree.train()(torch.randn(3, 16))
         metrics = _moe_metrics(SimpleNamespace(draft_model=tree))
         self.assertIn("moe/load_max_ratio", metrics)
+
+
+class TestStateDictBoundary(unittest.TestCase):
+    def test_dense_state_passes_through_unchanged(self):
+        state = {"a": torch.zeros(1), "layers.0.mlp.gate_proj.weight": torch.ones(1)}
+        for convert in (to_checkpoint_state_dict, from_checkpoint_state_dict):
+            out = convert(dict(state))
+            self.assertEqual(set(out), set(state))
+            for key in state:
+                self.assertIs(out[key], state[key])
+
+    def test_registered_converters_apply_in_both_directions(self):
+        def to_ckpt(state):
+            return {k.replace("native.", "official."): v for k, v in state.items()}
+
+        def from_ckpt(state):
+            return {k.replace("official.", "native."): v for k, v in state.items()}
+
+        register_state_dict_converter(
+            "_test", to_checkpoint=to_ckpt, from_checkpoint=from_ckpt
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "already registered"):
+                register_state_dict_converter(
+                    "_test", to_checkpoint=to_ckpt, from_checkpoint=from_ckpt
+                )
+            official = to_checkpoint_state_dict({"native.w": 1, "other": 2})
+            self.assertEqual(official, {"official.w": 1, "other": 2})
+            self.assertEqual(
+                from_checkpoint_state_dict(official), {"native.w": 1, "other": 2}
+            )
+        finally:
+            unregister_state_dict_converter("_test")
+        self.assertEqual(to_checkpoint_state_dict({"native.w": 1}), {"native.w": 1})
+
+
+class TestWarmStartPlan(unittest.TestCase):
+    def test_selection_strategies(self):
+        self.assertEqual(select_target_experts(256, 4), (0, 64, 128, 192))
+        self.assertEqual(select_target_experts(8, 3, "strided"), (0, 2, 5))
+        self.assertEqual(select_target_experts(8, 3, "first"), (0, 1, 2))
+        self.assertEqual(len(set(select_target_experts(256, 64))), 64)
+        with self.assertRaises(ValueError):
+            select_target_experts(4, 8)
+        with self.assertRaises(ValueError):
+            select_target_experts(8, 2, "random")
+
+    def test_plan_follows_the_moe_config(self):
+        cfg = resolve_moe_config(_moe_json(n_shared_experts=0))
+        plan = plan_warm_start(cfg, n_target_experts=64)
+        self.assertEqual(plan.n_draft_experts, 8)
+        self.assertFalse(plan.copy_shared_expert)
+        self.assertTrue(plan.copy_gate_rows)
 
 
 class TestDFlashWiring(unittest.TestCase):

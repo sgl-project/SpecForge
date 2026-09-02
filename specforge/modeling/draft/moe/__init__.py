@@ -22,6 +22,8 @@ Modules:
 - :mod:`.shared`      ``SharedExpert`` contract
 - :mod:`.layer`       ``MoELayer`` composition; ``build_ffn`` is the dense/MoE switch
 - :mod:`.hooks`       model-level plumbing: balance updates, aux loss, metrics
+- :mod:`.state_dict`  module layout <-> official checkpoint naming boundary
+- :mod:`.init`        warm-start plans from a target model's experts
 
 Implementations register into the registries from their own modules; this
 package defines contracts and holds no routing math itself.
@@ -53,6 +55,7 @@ from .hooks import (
     collect_moe_metrics,
     iter_moe_layers,
 )
+from .init import WarmStartPlan, plan_warm_start, select_target_experts
 from .layer import MoELayer, build_ffn
 from .router import (
     ROUTERS,
@@ -70,6 +73,11 @@ from .shared import (
     build_shared_expert,
     register_shared_expert,
 )
+from .state_dict import (
+    from_checkpoint_state_dict,
+    register_state_dict_converter,
+    to_checkpoint_state_dict,
+)
 
 __all__ = [
     "BALANCE_CONTROLLERS",
@@ -85,6 +93,7 @@ __all__ = [
     "SCORE_FUNCTIONS",
     "SHARED_EXPERTS",
     "SharedExpert",
+    "WarmStartPlan",
     "apply_pending_balance_updates",
     "available_moe_presets",
     "build_balance_controller",
@@ -94,14 +103,19 @@ __all__ = [
     "build_shared_expert",
     "collect_moe_aux_loss",
     "collect_moe_metrics",
+    "from_checkpoint_state_dict",
     "get_score_function",
     "is_moe_config",
     "iter_moe_layers",
+    "plan_warm_start",
     "register_balance_controller",
     "register_experts_backend",
     "register_moe_preset",
     "register_router",
     "register_score_function",
     "register_shared_expert",
+    "register_state_dict_converter",
     "resolve_moe_config",
+    "select_target_experts",
+    "to_checkpoint_state_dict",
 ]
