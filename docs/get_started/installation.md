@@ -16,14 +16,32 @@ uv venv -p 3.11 --seed
 source .venv/bin/activate
 
 # install specforge
-uv pip install -e .
+uv pip install -e -v . --prerelease=allow
 ```
 
 - **Install from PyPI**
 
+::::{tab-set}
+
+:::{tab-item} uv
+:sync: uv
+
+```bash
+uv pip install specforge --prerelease=allow
+```
+
+:::
+
+:::{tab-item} pip
+:sync: pip
+
 ```bash
 pip install specforge
 ```
+
+:::
+
+::::
 
 ## Accelerator-specific environments
 
