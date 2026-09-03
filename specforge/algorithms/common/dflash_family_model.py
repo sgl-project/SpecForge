@@ -102,6 +102,23 @@ class DFlashMetricTerms(NamedTuple):
     block_den: torch.Tensor
     oracle_accepted_length_num: torch.Tensor
     serving_accepted_length_num: torch.Tensor
+    expected_accepted_length_num: torch.Tensor
+    teacher_expected_accepted_length_num: torch.Tensor
+
+
+def _expected_accepted_length_num(
+    acceptance: torch.Tensor,
+    supervised: torch.Tensor,
+    block_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Sum ``1 + sum_k prod_{j<=k} a_j`` over valid blocks.
+
+    ``acceptance`` holds the per-slot acceptance event or probability for the
+    predicted slots; the chain stops at the first unsupervised slot.
+    """
+
+    alive = acceptance.float() * supervised.float()
+    return ((1.0 + alive.cumprod(dim=-1).sum(dim=-1)) * block_valid).sum()
 
 
 class _DFlashUnaryDiagnostics(NamedTuple):
@@ -133,6 +150,7 @@ class _DFlashServingDiagnostics(NamedTuple):
     block_den: torch.Tensor
     oracle_accepted_length_num: torch.Tensor
     accepted_length_num: torch.Tensor
+    expected_accepted_length_num: torch.Tensor
 
 
 class _DFlashTeacherTerms(NamedTuple):
@@ -142,6 +160,7 @@ class _DFlashTeacherTerms(NamedTuple):
     unary_top1_agreement_num: torch.Tensor
     unary_topk_mass_num: torch.Tensor
     selector_serving_agreement_num: torch.Tensor
+    expected_accepted_length_num: torch.Tensor
 
     @classmethod
     def zeros(cls, position_den: torch.Tensor) -> "_DFlashTeacherTerms":
@@ -150,6 +169,7 @@ class _DFlashTeacherTerms(NamedTuple):
             position_den.new_zeros(position_den.shape),
             position_den.new_zeros(position_den.shape),
             position_den.new_zeros(position_den.shape),
+            position_den.new_zeros(()),
         )
 
 
@@ -925,6 +945,7 @@ class OnlineDFlashModel(nn.Module):
                 block_den=zero,
                 oracle_accepted_length_num=zero.clone(),
                 accepted_length_num=zero.clone(),
+                expected_accepted_length_num=zero.clone(),
             )
 
         serving_ids = candidate_selector.greedy_path(
@@ -953,21 +974,24 @@ class OnlineDFlashModel(nn.Module):
             )
         )
 
-        # A block accepts its anchor, then only its leading run of supervised hits.
+        # A block accepts its anchor, then only its leading run of supervised
+        # slots: covered (oracle), hit by the serving path (realized), or, for
+        # the smooth D-PACE surrogate, weighted by the gold-token probability.
         supervised = weight_mask[:, :, 1:] > 0.5
         block_valid = supervised.any(dim=-1).float()
-        oracle_alive = supervised & unary.target_is_candidate[:, :, 1:]
-        serving_alive = supervised & serving_hit
         return _DFlashServingDiagnostics(
             selected_ids=serving_ids,
             correct_num=correct_num,
             block_den=block_valid.sum(),
-            oracle_accepted_length_num=(
-                (1.0 + oracle_alive.float().cumprod(dim=-1).sum(dim=-1)) * block_valid
-            ).sum(),
-            accepted_length_num=(
-                (1.0 + serving_alive.float().cumprod(dim=-1).sum(dim=-1)) * block_valid
-            ).sum(),
+            oracle_accepted_length_num=_expected_accepted_length_num(
+                unary.target_is_candidate[:, :, 1:], supervised, block_valid
+            ),
+            accepted_length_num=_expected_accepted_length_num(
+                serving_hit, supervised, block_valid
+            ),
+            expected_accepted_length_num=_expected_accepted_length_num(
+                unary.hard_label_probability[:, :, 1:], supervised, block_valid
+            ),
         )
 
     def _dflash2_teacher_terms(
@@ -999,6 +1023,7 @@ class OnlineDFlashModel(nn.Module):
         ).clamp(0.0, 1.0)
 
         selector_serving_agreement_num = position_den.new_zeros(position_den.shape)
+        expected_accepted_length_num = position_den.new_zeros(())
         if block_size > 1:
             selector_serving_agreement_num = torch.cat(
                 (
@@ -1008,6 +1033,12 @@ class OnlineDFlashModel(nn.Module):
                         * weight_mask[:, :, 1:]
                     ).sum(dim=(0, 1)),
                 )
+            )
+            supervised = weight_mask[:, :, 1:] > 0.5
+            expected_accepted_length_num = _expected_accepted_length_num(
+                expected_acceptance[:, :, 1:],
+                supervised,
+                supervised.any(dim=-1).float(),
             )
         return _DFlashTeacherTerms(
             expected_acceptance_num=(expected_acceptance * weight_mask).sum(dim=(0, 1)),
@@ -1019,6 +1050,7 @@ class OnlineDFlashModel(nn.Module):
                 * weight_mask
             ).sum(dim=(0, 1)),
             selector_serving_agreement_num=selector_serving_agreement_num,
+            expected_accepted_length_num=expected_accepted_length_num,
         )
 
     @staticmethod
@@ -1065,6 +1097,8 @@ class OnlineDFlashModel(nn.Module):
             block_den=serving.block_den,
             oracle_accepted_length_num=serving.oracle_accepted_length_num,
             serving_accepted_length_num=serving.accepted_length_num,
+            expected_accepted_length_num=serving.expected_accepted_length_num,
+            teacher_expected_accepted_length_num=teacher.expected_accepted_length_num,
         )
 
     def _lk_kl_weight(
@@ -1259,6 +1293,8 @@ class OnlineDFlashModel(nn.Module):
                 block_den,
                 oracle_accepted_length_num,
                 serving_accepted_length_num,
+                expected_accepted_length_num,
+                teacher_expected_accepted_length_num,
             ) = checkpointed_chunk_reduce(
                 self._dflash2_metric_chunk_terms,
                 hidden_4d.detach(),
@@ -1321,7 +1357,15 @@ class OnlineDFlashModel(nn.Module):
                 serving_accepted_length_num.detach(),
                 block_den.detach(),
             )
+            ratio_metrics["dflash2/hard_label/expected_accepted_length"] = (
+                expected_accepted_length_num.detach(),
+                block_den.detach(),
+            )
             if aligned_target_hidden is not None:
+                ratio_metrics["dflash2/teacher/expected_accepted_length"] = (
+                    teacher_expected_accepted_length_num.detach(),
+                    block_den.detach(),
+                )
                 for name, numerators in (
                     (
                         "dflash2/teacher/expected_acceptance",

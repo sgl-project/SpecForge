@@ -441,6 +441,26 @@ class CandidateSelectorTest(unittest.TestCase):
         # Uniform dflash weights split the objective evenly over both slots.
         self.assertEqual(ratio("position_1/objective/loss_weight_share"), 0.5)
         self.assertEqual(ratio("position_2/objective/loss_weight_share"), 0.5)
+        # Expected accepted lengths chain the per-slot probabilities of the two
+        # predicted slots; the teacher rows are aligned to label index - 1.
+        draft_probabilities = torch.softmax(output_hidden[0, 1:], dim=-1)
+        teacher_probabilities = torch.softmax(target_hidden[0, :2], dim=-1)
+        gold_probability = draft_probabilities.gather(
+            -1, torch.tensor([[1], [3]])
+        ).squeeze(-1)
+        self.assertAlmostEqual(
+            ratio("dflash2/hard_label/expected_accepted_length"),
+            float(1.0 + gold_probability.cumprod(dim=-1).sum()),
+            places=5,
+        )
+        acceptance = 1.0 - 0.5 * (
+            draft_probabilities - teacher_probabilities
+        ).abs().sum(dim=-1)
+        self.assertAlmostEqual(
+            ratio("dflash2/teacher/expected_accepted_length"),
+            float(1.0 + acceptance.cumprod(dim=-1).sum()),
+            places=5,
+        )
 
     def test_metric_chunk_reports_accepted_lengths_and_unweighted_selector_terms(
         self,
@@ -521,6 +541,17 @@ class CandidateSelectorTest(unittest.TestCase):
             ]
         ) * torch.tensor([0.0, 1.0, 1.0])
         torch.testing.assert_close(terms.unary_topk_mass_num, expected_mass)
+        # Smooth surrogate: 1 + q1 + q1*q2 per block with q = gold probability.
+        gold_probability = (
+            torch.softmax(hidden[0], dim=-1)
+            .gather(-1, target_ids[0].unsqueeze(-1))
+            .squeeze(-1)
+        )
+        torch.testing.assert_close(
+            terms.expected_accepted_length_num,
+            (1.0 + gold_probability[:, 1:].cumprod(dim=-1).sum(dim=-1)).sum(),
+        )
+        self.assertEqual(terms.teacher_expected_accepted_length_num.item(), 0.0)
         self.assertEqual(terms.loss_weight_num[0].item(), 0.0)
         self.assertGreater(
             terms.loss_weight_num[1].item(), terms.loss_weight_num[2].item()

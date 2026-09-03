@@ -224,17 +224,22 @@ anchor is omitted), so each position renders as one dashboard group:
 - `hard_label/*`: unary top-1 accuracy, top-K recall and probability mass,
   gold-token probability, selector loss, selector conditional accuracy (uniform
   over covered slots, so comparable across loss types), and the realized greedy
-  serving path's per-slot accuracy. Two aggregate-only per-block accepted-length
-  proxies count the anchor plus the leading run of supervised slots that are
-  covered by the unary top-K (`unary_topK_oracle_accepted_length`) or matched by
-  the serving path (`selector_serving_accepted_length`).
+  serving path's per-slot accuracy. Three aggregate-only per-block
+  accepted-length proxies apply `1 + sum_k prod_{j<=k} a_j` over the supervised
+  slots with `a_j` being coverage by the unary top-K
+  (`unary_topK_oracle_accepted_length`), a serving-path hit
+  (`selector_serving_accepted_length`), or the gold-token probability
+  (`expected_accepted_length`, the smooth D-PACE surrogate). All three are
+  teacher-forced on the real prefix and anchor.
 - `position_<k>/objective/loss_weight_share`: the fraction of the effective
   objective weight each block position receives under the configured
   fixed-decay or D-PACE weighting.
 - `train/objective/lk_kl_weight`: the CE weight of the `lambda` LK objective.
 - `teacher/*` (online capture only): full-vocabulary expected acceptance, unary
   top-1 agreement, unary top-K teacher mass, and serving-path agreement against
-  the frozen target head.
+  the frozen target head, plus the aggregate `expected_accepted_length` that
+  chains the per-slot expected acceptance, the sampling-regime counterpart of
+  the hard-label surrogate.
 
 The exported computation and parameter names match the public SGLang DFlash2
 contract, including optional `output_multiplier` and
