@@ -257,7 +257,7 @@ specforge train --config ./my-eagle3-disaggregated.yaml
 
 ## 💾 Prepare offline target features
 
-Offline EAGLE3, DFlash, DFlash2, Domino, and DSpark runs consume
+Offline EAGLE3, DFlash, DFlash2, Domino, DSpark, and MTP runs consume
 target features created by `scripts/prepare_hidden_states.py`. Select the same
 strategy and draft
 configuration that the later training recipe uses; these values determine both
@@ -301,10 +301,12 @@ Each output record contains the strategy's exact offline feature contract:
 | EAGLE3 | `input_ids`, `loss_mask`, `hidden_state`, `aux_hidden_state` |
 | DFlash, DFlash2, and Domino | `input_ids`, `loss_mask`, `hidden_states` |
 | DSpark | `input_ids`, `loss_mask`, `hidden_states`, `target_last_hidden_states` |
+| MTP | `input_ids`, `loss_mask`, `target_last_hidden_states` |
 
 For the DFlash family, `hidden_states` concatenates the target layers selected
 by the draft config. DSpark additionally stores the target model's final hidden
-state for its L1 and confidence objectives. Keep each strategy in a separate
+state for its L1 and confidence objectives. MTP persists only that final hidden
+state (`--strategy mtp`); it does not concatenate aux layers. Keep each strategy in a separate
 output directory; the offline reader validates the contract instead of
 silently adapting incompatible features.
 
