@@ -93,6 +93,19 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertIsNone(config.training.max_steps)
         self.assertIsNone(config.training.total_steps)
 
+    def test_target_head_path_is_optional_and_typed(self):
+        cfg = Config.model_validate(MINIMAL)
+        self.assertIsNone(cfg.model.target_head_path)
+
+        payload = copy.deepcopy(MINIMAL)
+        payload["model"]["target_head_path"] = "/heads/bf16-head"
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.model.target_head_path, "/heads/bf16-head")
+
+        payload["model"]["target_head_path"] = ["/heads/bf16-head"]
+        with self.assertRaises(ValidationError):
+            Config.model_validate(payload)
+
     def test_fsdp_sharding_is_typed(self):
         payload = copy.deepcopy(MINIMAL)
         payload["training"] = {"fsdp_sharding": "NO_SHARD"}

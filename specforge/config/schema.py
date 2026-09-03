@@ -36,6 +36,12 @@ class StrictConfigModel(BaseModel):
 
 class ModelConfig(StrictConfigModel):
     target_model_path: str
+    #: Optional trainer-only checkpoint for the full-width embedding and LM-head
+    #: tensors (``embedding_key`` / ``lm_head_key``). Quantized targets such as
+    #: NVFP4 checkpoints ship a packed ``lm_head`` that the trainer cannot use;
+    #: point this at the unquantized checkpoint (or a small head-only export)
+    #: while SGLang keeps serving ``target_model_path``.
+    target_head_path: Optional[str] = None
     #: Draft config as a local JSON file, a directory containing config.json,
     #: or a Hugging Face repository. EAGLE3, P-EAGLE, and DFlash can derive it
     #: from the target when omitted.

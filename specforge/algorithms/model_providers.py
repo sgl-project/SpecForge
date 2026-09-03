@@ -283,7 +283,7 @@ def build_eagle3_model(
         from specforge.modeling.target.target_head import TargetHead
 
         target_head = TargetHead.from_pretrained(
-            cfg.model.target_model_path,
+            cfg.model.target_head_path or cfg.model.target_model_path,
             lm_head_key=cfg.model.lm_head_key,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
@@ -322,7 +322,7 @@ def build_peagle_model(
         from specforge.modeling.target.target_head import TargetHead
 
         target_head = TargetHead.from_pretrained(
-            cfg.model.target_model_path,
+            cfg.model.target_head_path or cfg.model.target_model_path,
             lm_head_key=cfg.model.lm_head_key,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
@@ -349,7 +349,7 @@ def _build_dflash_family_model(
     method_config["target_layer_ids"] = list(draft_model.target_layer_ids)
 
     target_parts = TargetEmbeddingsAndHead.from_pretrained(
-        cfg.model.target_model_path,
+        cfg.model.target_head_path or cfg.model.target_model_path,
         embed_key=cfg.model.embedding_key,
         lm_head_key=cfg.model.lm_head_key,
         cache_dir=cfg.model.cache_dir,
