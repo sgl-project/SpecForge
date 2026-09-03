@@ -379,6 +379,53 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(fake.force_values[:num_features], [False] * num_features)
         self.assertEqual(fake.force_values[num_features:], [True] * num_features)
 
+    def test_retry_treats_already_removed_keys_as_freed(self):
+        """A partially freed sample must not stay pending until the slow drain.
+
+        The first free removes the keys whose read lease has expired and fails
+        on the still-leased ones (-706). The next forced retry then sees -704
+        (OBJECT_NOT_FOUND) for the keys that are already gone; that is a
+        completed removal, not a failure.
+        """
+
+        class PartialLeaseFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.leased = set()
+                self.codes = []
+
+            def remove(self, key, force=False):
+                self.remove_calls += 1
+                if key not in self._d:
+                    rc = -704
+                elif key in self.leased and not force:
+                    rc = -706
+                else:
+                    self._d.pop(key, None)
+                    rc = 0
+                self.codes.append((key, force, rc))
+                return rc
+
+        fake = PartialLeaseFake()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, handle = fs.get(ref)
+        keys = sorted(fake._d)
+        self.assertGreaterEqual(len(keys), 2)
+        fake.leased.add(keys[-1])  # one tensor still under Mooncake's read lease
+
+        fs.release(handle)
+        self.assertEqual(fs.health()["release_pending"], 1)
+        self.assertEqual(len(fake._d), 1)  # the unleased keys were freed
+
+        report = fs.retry_sample_removals(["s0"])
+
+        self.assertEqual(report["removed"], 1)
+        self.assertEqual(report["release_pending"], 0)
+        self.assertEqual(fs.health()["release_pending"], 0)
+        self.assertFalse(_phys_resident(fake))
+        self.assertIn((keys[0], True, -704), fake.codes)
+
     def test_optimizer_ack_forces_only_durable_samples(self):
         class ForceAwareFake(_FakeMooncakeStore):
             def __init__(self):

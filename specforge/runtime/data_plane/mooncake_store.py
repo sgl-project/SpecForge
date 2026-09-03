@@ -80,6 +80,10 @@ from specforge.runtime.data_plane.feature_store import (
 logger = logging.getLogger(__name__)
 
 # Defaults for MooncakeDistributedStore.setup(); override via ``setup_kwargs``.
+#: Mooncake ``ErrorCode`` values the store reasons about explicitly.
+MOONCAKE_OBJECT_NOT_FOUND = -704  # remove()/get() on an already-freed key
+MOONCAKE_OBJECT_HAS_LEASE = -706  # remove() during a live read lease
+
 _MOONCAKE_SETUP_DEFAULTS = {
     "global_segment_size": 1 << 30,  # 1 GiB per-node segment
     "local_buffer_size": 1 << 30,
@@ -396,13 +400,18 @@ class MooncakeFeatureStore(FeatureStore):
             )
 
     def _store_remove(self, key: str, *, force: bool = False) -> bool:
-        """Best-effort physical free. Returns True on confirmed removal.
+        """Best-effort physical free. Returns True once the key is gone.
 
         Recent Mooncake bindings expose ``remove(key, force=True)`` so a
         lifecycle authority can reclaim an object after all application-level
         leases have closed without waiting for Mooncake's (potentially
         minutes-long) KV lease TTL.  Older bindings only accept ``key``; keep
         those usable and let their normal bounded retry behavior apply.
+
+        ``OBJECT_NOT_FOUND`` is a completed removal, not a failure: a sample's
+        tensors are freed one key at a time, and a retry after a partial free
+        (some keys removed, others still under a read lease) must not keep the
+        sample pending until the bounded drain probes the absent keys.
         """
         try:
             if force:
@@ -414,7 +423,7 @@ class MooncakeFeatureStore(FeatureStore):
                 rc = self._store.remove(key)
         except Exception:  # pragma: no cover - transient RPC failure
             return False
-        return rc is None or int(rc) == 0
+        return rc is None or int(rc) in (0, MOONCAKE_OBJECT_NOT_FOUND)
 
     # -- write -------------------------------------------------------------
     def put(
