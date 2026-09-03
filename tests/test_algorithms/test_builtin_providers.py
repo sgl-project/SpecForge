@@ -26,6 +26,41 @@ BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
+    def test_dpard_resume_contract_records_objective_and_smoothing(self):
+        from specforge.algorithms.dspark.providers import resume_contract
+
+        draft = SimpleNamespace(
+            config=SimpleNamespace(num_hidden_layers=3), target_layer_ids=[1, 17, 33]
+        )
+        model = SimpleNamespace(
+            block_size=16,
+            mask_token_id=1,
+            attention_backend="sdpa",
+            num_anchors=512,
+            loss_decay_gamma=7.0,
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=1.0,
+            loss_type="dpard",
+            dpard_alpha=0.5,
+        )
+        first = resume_contract(None, draft, model)
+        self.assertEqual(first["dspark_loss_type"], "dpard")
+        self.assertEqual(first["dpard_alpha"], 0.5)
+        self.assertEqual(first["dpard_actor_reduction"], "sequence_batch_mean")
+        model.dpard_alpha = 0.75
+        self.assertNotEqual(first, resume_contract(None, draft, model))
+        model.loss_type = "dspark"
+        self.assertNotIn("dspark_loss_type", resume_contract(None, draft, model))
+
+    def test_dpard_step_options_detect_disabling_on_resume(self):
+        step = builtin_algorithm_registry().resolve("dspark").providers.step
+        config = SimpleNamespace(training=SimpleNamespace(loss_type="dflash"))
+        original = step.options(config)
+        self.assertEqual(original, {})
+        config.training.loss_type = "dpard"
+        self.assertNotEqual(original, step.options(config))
+
     def setUp(self):
         self.registry = builtin_algorithm_registry()
 

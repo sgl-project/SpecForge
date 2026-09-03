@@ -76,6 +76,61 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_dpard_offline_example(self):
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parents[2]
+        cfg = load_config(
+            str(
+                repo
+                / "examples/configs/offline/colocated/qwen3-4b-dspark-dpard-offline.yaml"
+            )
+        )
+        self.assertEqual(cfg.mode, "offline")
+        self.assertEqual(cfg.deployment.mode, "local_colocated")
+        from specforge.training.model_loading import resolve_draft_config
+
+        cfg.model.draft_model_config = str(repo / cfg.model.draft_model_config)
+        provider = (
+            builtin_algorithm_registry().resolve("dspark").providers.model.draft_config
+        )
+        draft = resolve_draft_config(cfg, provider=provider)
+        self.assertEqual(draft.block_size, 16)
+        self.assertEqual(draft.num_hidden_layers, 3)
+        self.assertEqual(draft.layer_types, ["full_attention"] * 3)
+        self.assertEqual(draft.dflash_config["target_layer_ids"], [1, 17, 33])
+        self.assertEqual(cfg.training.loss_type, "dpard")
+        self.assertEqual(cfg.training.num_anchors, 512)
+        self.assertIsNone(cfg.training.max_steps)
+        self.assertEqual(cfg.training.num_epochs, 6)
+        self.assertEqual(cfg.training.loss_decay_gamma, 7.0)
+
+    def test_dpard_requires_dspark_and_replaces_ce_l1(self):
+        from specforge.config.schema import TrainingConfig
+
+        options = dict(
+            strategy="dspark",
+            loss_type="dpard",
+            dpard_alpha=0.5,
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.0,
+        )
+        cfg = TrainingConfig(**options)
+        self.assertEqual(cfg.loss_type, "dpard")
+        self.assertEqual(cfg.dpard_alpha, 0.5)
+        for override in [
+            {"strategy": "dflash"},
+            {"dspark_ce_loss_alpha": 0.1},
+            {"dspark_l1_loss_alpha": 0.9},
+            {"dpard_alpha": 0.0},
+            {"dpard_alpha": 1.0},
+            {"dpard_alpha": float("nan")},
+            {"lk_loss_type": "tv"},
+            {"dspark_dpard": True},
+        ]:
+            with self.subTest(override=override), self.assertRaises(ValidationError):
+                TrainingConfig(**{**options, **override})
+
     def test_liger_kernel_flag_is_typed_and_defaults_off(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertFalse(default.model.use_liger_kernel)
