@@ -62,6 +62,22 @@ class AutoDraftModel(AutoModelForCausalLMBase):
                 config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
             model_cls = cls._model_cls_from_config(config)
             kwargs = {**kwargs, "config": config}
+            state_dict = _native_state_dict_for(config, pretrained_model_name_or_path)
+            if state_dict is not None:
+                # HF from_pretrained assigns tensors by key and refuses an
+                # explicit state_dict alongside a path, so build the module and
+                # load the converted state ourselves.
+                torch_dtype = kwargs.pop("torch_dtype", kwargs.pop("dtype", None))
+                model = model_cls._from_config(config, torch_dtype=torch_dtype)
+                result = model.load_state_dict(state_dict, strict=False)
+                missing = [k for k in result.missing_keys if "embed_tokens" not in k]
+                if missing or result.unexpected_keys:
+                    raise ValueError(
+                        f"{pretrained_model_name_or_path!r} does not match "
+                        f"{model_cls.__name__}: missing {missing[:5]}, "
+                        f"unexpected {list(result.unexpected_keys)[:5]}"
+                    )
+                return model.eval()
             model = model_cls.from_pretrained(
                 pretrained_model_name_or_path, *model_args, **kwargs
             )
@@ -69,6 +85,36 @@ class AutoDraftModel(AutoModelForCausalLMBase):
             modeling_utils.logger.warning = original_warn
 
         return model
+
+
+def _native_state_dict_for(config, pretrained_model_name_or_path):
+    """Checkpoint files use the official parameter naming; modules may use a
+    native layout (MoE experts). HF ``from_pretrained`` assigns tensors by key
+    and cannot regroup them, so read the files and convert at this boundary.
+    Returns ``None`` when no conversion is needed (dense drafts)."""
+    from specforge.modeling.draft.moe import (
+        from_checkpoint_state_dict,
+        is_moe_config,
+    )
+
+    if not is_moe_config(config):
+        return None
+    import glob
+
+    from safetensors.torch import load_file
+
+    path = str(pretrained_model_name_or_path)
+    if not os.path.isdir(path):
+        from huggingface_hub import snapshot_download
+
+        path = snapshot_download(path, allow_patterns=["*.safetensors", "*.json"])
+    files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+    if not files:
+        raise FileNotFoundError(f"no safetensors weights under {path!r}")
+    state = {}
+    for file in files:
+        state.update(load_file(file))
+    return from_checkpoint_state_dict(state)
 
 
 class AutoDraftModelConfig:
