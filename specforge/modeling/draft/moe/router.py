@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Callable, Type
+from typing import Callable, Optional, Type
 
 import torch
 from torch import nn
@@ -29,12 +29,15 @@ class RoutingResult:
     ``weights`` are the final combine weights (normalized and scaled as the
     recipe dictates) in fp32; ``indices`` the chosen experts; ``counts`` the
     per-expert token counts on device (no host sync), which dispatch and
-    balancing both consume.
+    balancing both consume. ``scores`` are the full pre-selection affinities
+    (differentiable, fp32) for balance policies that need a gradient signal,
+    e.g. an auxiliary balance loss; routers may leave it ``None``.
     """
 
     weights: torch.Tensor  # [T, k] fp32
     indices: torch.Tensor  # [T, k] long
     counts: torch.Tensor  # [E] long
+    scores: Optional[torch.Tensor] = None  # [T, E] fp32, differentiable
 
     @property
     def topk(self) -> int:

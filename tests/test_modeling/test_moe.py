@@ -63,8 +63,9 @@ class _StubBalance(BalanceController):
     def adjust_selection_scores(self, scores):
         return scores + self.bias
 
-    def observe(self, counts):
-        self.observed.append(counts.detach().clone())
+    def observe(self, routing):
+        self.observed.append(routing.counts.detach().clone())
+        self.saw_scores = routing.scores is not None
 
     def apply_pending_update(self):
         self.applied += 1
@@ -97,7 +98,9 @@ class _StubRouter(Router):
         counts = torch.zeros(
             self.n_experts, dtype=torch.long, device=x.device
         ).scatter_add_(0, indices.flatten(), torch.ones_like(indices.flatten()))
-        return RoutingResult(weights=weights, indices=indices, counts=counts)
+        return RoutingResult(
+            weights=weights, indices=indices, counts=counts, scores=scores
+        )
 
 
 class _StubExperts(RoutedExperts):
@@ -301,6 +304,7 @@ class TestMoELayerComposition(unittest.TestCase):
         self.assertEqual(len(layer.balance.observed), 1)
         self.assertEqual(int(layer.balance.observed[0].sum()), 5 * 2)
         self.assertTrue(torch.equal(layer.last_counts, layer.balance.observed[0]))
+        self.assertTrue(layer.balance.saw_scores)
         layer.eval()
         layer(x)
         self.assertEqual(len(layer.balance.observed), 1)
