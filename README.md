@@ -52,6 +52,7 @@ There are no method-specific Python training entry points.
 | **[DFlash2](https://inco.ai/blog/dflash2/)** | DFlash with grouped dynamic convolution and top-k path selection | [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810)|
 | **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) | — |
 | **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Online external](./examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) | — |
+| MTP | Native Multi-Token Prediction draft head (e.g. Qwen3.5) | Online managed-local (Ascend) | — |
 
 See the [training guide](./docs/basic_usage/training.md) for the supported
 method/topology matrix and the
