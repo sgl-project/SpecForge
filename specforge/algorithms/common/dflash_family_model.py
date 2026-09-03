@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from specforge.core import fused_loss
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
@@ -1038,6 +1039,25 @@ class OnlineDominoModel(OnlineDFlashModel):
         return loss, accuracy, metrics
 
 
+def _fused_dspark_loss_available(tensor: torch.Tensor) -> bool:
+    """True when the fused DSpark TV loss can run for ``tensor``.
+
+    The fused kernel needs a CUDA or Ascend NPU accelerator and an importable
+    Triton (triton-ascend on NPU). A live tensor's device type already proves
+    the accelerator runtime is bound (``torch.npu`` is bound by importing
+    ``torch_npu`` before any NPU tensor can exist), so only the Triton import
+    needs probing here.
+    """
+    if tensor.device.type not in ("cuda", "npu"):
+        return False
+    try:
+        import triton
+        import triton.language  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(triton, "jit")
+
+
 class OnlineDSparkModel(OnlineDFlashModel):
     """DSpark online training wrapper over DFlash block-parallel components."""
 
@@ -1078,6 +1098,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        self._use_fused_dspark_loss = (
+            os.environ.get("SPECFORGE_DSPARK_FUSED_LOSS", "0") == "1"
+        )
 
     def _build_dspark_labels_and_mask(
         self,
@@ -1186,8 +1209,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         tau_den = zero
         accept_probability = None
 
-        draft_probabilities = None
         teacher_ids = None
+        target_logits = None
         if aligned_target_hidden is not None:
             with torch.no_grad():
                 target_logits = self.lm_head(
@@ -1197,13 +1220,30 @@ class OnlineDSparkModel(OnlineDFlashModel):
                         hidden_size,
                     )
                 ).reshape_as(draft_logits)
-                target_probabilities = torch.softmax(target_logits.float(), dim=-1)
                 teacher_ids = target_logits.argmax(dim=-1)
-            draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
-            l1_per_token = (
-                (draft_probabilities - target_probabilities).abs().sum(dim=-1)
-            )
-            accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+            if self._use_fused_dspark_loss and _fused_dspark_loss_available(
+                draft_logits
+            ):
+                # Fused TV: l1 = 2 * tv and accept = 1 - tv for normalized
+                # softmax pairs; no [B, T, V] probability tensor materialized.
+                tv_per_token = fused_loss.fused_tv_loss(
+                    draft_logits.reshape(
+                        batch_size, num_blocks * block_size, vocab_size
+                    ),
+                    target_logits.reshape(
+                        batch_size, num_blocks * block_size, vocab_size
+                    ),
+                ).reshape_as(target_ids)
+                l1_per_token = 2.0 * tv_per_token
+                accept_probability = (1.0 - tv_per_token).clamp(0.0, 1.0)
+            else:
+                with torch.no_grad():
+                    target_probabilities = torch.softmax(target_logits.float(), dim=-1)
+                draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
+                l1_per_token = (
+                    (draft_probabilities - target_probabilities).abs().sum(dim=-1)
+                )
+                accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
 
@@ -1236,15 +1276,25 @@ class OnlineDSparkModel(OnlineDFlashModel):
             correct_position_num = correct.sum(dim=(0, 1))
             position_den = eval_mask.float().sum(dim=(0, 1))
             if aligned_target_hidden is not None:
-                assert draft_probabilities is not None and teacher_ids is not None
+                assert teacher_ids is not None and target_logits is not None
                 teacher_agreement_num = (
                     (predicted_ids == teacher_ids).float() * eval_mask
                 ).sum()
+                # Top-1 softmax probability without materializing probabilities:
+                # p_max = exp(max_logit - logsumexp(logits)), in fp32.
                 teacher_top1_num = (
-                    target_probabilities.max(dim=-1).values * eval_mask
+                    torch.exp(
+                        target_logits.max(dim=-1).values
+                        - target_logits.float().logsumexp(dim=-1)
+                    )
+                    * eval_mask
                 ).sum()
                 draft_top1_num = (
-                    draft_probabilities.max(dim=-1).values * eval_mask
+                    torch.exp(
+                        draft_logits.max(dim=-1).values
+                        - draft_logits.float().logsumexp(dim=-1)
+                    )
+                    * eval_mask
                 ).sum()
                 valid_blocks = eval_mask.any(dim=-1).float()
                 accepted_expectation = (
