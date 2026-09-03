@@ -565,6 +565,7 @@ class TrainingConfig(StrictConfigModel):
     loss_type: Literal[
         "dflash",
         "dpace",
+        "dpard",
         "dpace-cumulative-confidence-only",
         "dpace-continuation-value-only",
     ] = "dflash"
@@ -583,6 +584,7 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+    dpard_alpha: float = Field(default=0.5, gt=0.0, lt=1.0)
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8
@@ -611,6 +613,13 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.loss_type == "dpard":
+            if self.strategy != "dspark":
+                raise ValueError("training.loss_type=dpard requires strategy=dspark")
+            if self.dspark_ce_loss_alpha != 0 or self.dspark_l1_loss_alpha != 0:
+                raise ValueError("D-PARD replaces CE/L1; set both loss alphas to zero")
+            if self.lk_loss_type is not None:
+                raise ValueError("D-PARD cannot be combined with LK loss")
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:

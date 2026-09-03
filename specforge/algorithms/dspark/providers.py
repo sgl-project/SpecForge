@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from functools import partial
 
-from specforge.algorithms.common.defaults import (
-    empty_options,
-    no_missing_checkpoint_keys,
-)
+from specforge.algorithms.common.defaults import no_missing_checkpoint_keys
 from specforge.algorithms.common.hidden_states_data import (
     DSPARK_NORMALIZER_ID,
     build_dspark_collator,
@@ -47,10 +44,15 @@ def build_step(wrapped_model, *, target_head=None, **_options):
     return DSparkTrainStrategy(wrapped_model)
 
 
+def step_options(config):
+    # Keep legacy options unchanged, but detect disabling D-PARD on resume.
+    return {"loss_type": "dpard"} if config.training.loss_type == "dpard" else {}
+
+
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
-    return {
+    contract = {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -66,6 +68,15 @@ def resume_contract(_config, draft_model, training_model):
             training_model.dspark_confidence_head_alpha
         ),
     }
+    if getattr(training_model, "loss_type", "dspark") == "dpard":
+        contract.update(
+            dspark_loss_type="dpard",
+            dpard_alpha=float(training_model.dpace_alpha),
+            dpard_actor_reduction="valid_position_mean",
+            dpard_confidence_weighting="cumulative_reach",
+            dpard_confidence_reduction="valid_block_mean",
+        )
+    return contract
 
 
 def build_draft(config, draft_config):
@@ -149,7 +160,7 @@ def algorithm_providers() -> AlgorithmProviders:
         algorithm_name=ALGORITHM_NAME,
         step=StepProvider(
             build=build_step,
-            options=empty_options,
+            options=step_options,
             resume_contract=resume_contract,
             allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
             uses_external_target_head=False,

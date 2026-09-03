@@ -326,6 +326,188 @@ def _naive_dflash_loss(neg_log_q, binary_mask, gamma):
 
 
 class TestDFlashLosses(unittest.TestCase):
+    def test_dpard_b16_matches_continuation_actor_and_cumulative_confidence(self):
+        torch.manual_seed(42)
+        logits = torch.randn(2, 2, 16, 11, dtype=torch.double, requires_grad=True)
+        target_logits = torch.randn_like(logits, requires_grad=True)
+        conf = torch.randn(2, 2, 16, dtype=torch.double, requires_grad=True)
+        mask = torch.ones(2, 2, 16, dtype=torch.bool)
+        mask[0, 1, 9:] = False
+        mask[1, 1] = False
+        model = _make_dspark_model(
+            logits,
+            torch.zeros(2, 2, dtype=torch.long),
+            torch.ones(2, 2, dtype=torch.bool),
+            draft_model=_FixedDSparkDraft(4, conf),
+            lm_head=_DualFixedHead(logits, target_logits),
+            loss_type="dpard",
+            dpard_alpha=0.25,
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.0,
+            objective_chunk_blocks=0,
+        )
+        with patch.object(
+            torch, "softmax", side_effect=AssertionError("duplicate softmax")
+        ):
+            loss, metrics = model._compute_dspark_loss(
+                output_hidden=torch.zeros(2, 32, 4, dtype=torch.double),
+                target_ids=torch.zeros(2, 2, 16, dtype=torch.long),
+                eval_mask=mask,
+                prev_token_ids=torch.zeros(2, 2, 16, dtype=torch.long),
+                safe_label_indices=torch.ones(2, 2, 16, dtype=torch.long),
+                target_last_hidden_states=torch.zeros(2, 2, 4, dtype=torch.double),
+            )
+        logp, logq = (
+            target_logits.float().log_softmax(-1),
+            logits.float().log_softmax(-1),
+        )
+        actor = -2.0 * torch.logsumexp((logp + logq) / 2, dim=-1)
+        with torch.no_grad():
+            acceptance = torch.minimum(logp.exp(), logq.exp()).sum(-1)
+            credit = torch.zeros_like(acceptance)
+            for b in range(2):
+                for block in range(2):
+                    prefix = 1.0
+                    for end in range(int(mask[b, block].sum())):
+                        prefix *= 0.25 + 0.75 * acceptance[b, block, end]
+                        credit[b, block, : end + 1] += prefix
+            masked_acceptance = torch.where(
+                mask, acceptance, torch.ones_like(acceptance)
+            )
+            reach = torch.ones_like(acceptance)
+            reach[..., 1:] = torch.cumprod(masked_acceptance[..., :-1], dim=-1)
+            confidence_weights = reach * mask
+        bce = F.binary_cross_entropy_with_logits(
+            conf.float(), acceptance, reduction="none"
+        )
+        valid_positions = mask.float().sum()
+        valid_blocks = mask.any(dim=-1).float().sum()
+        want = (actor * credit).sum() / valid_positions + (
+            bce * confidence_weights
+        ).sum() / valid_blocks
+        torch.testing.assert_close(loss.float(), want, atol=1e-6, rtol=1e-6)
+        grad, conf_grad, target_grad = torch.autograd.grad(
+            loss, (logits, conf, target_logits), allow_unused=True
+        )
+        tilted = ((logp + logq) / 2).softmax(-1)
+        expected_grad = (logq.exp() - tilted) * credit.unsqueeze(-1) / valid_positions
+        torch.testing.assert_close(grad.float(), expected_grad, atol=1e-6, rtol=1e-5)
+        expected_conf_grad = (
+            (conf.float().sigmoid() - acceptance) * confidence_weights / valid_blocks
+        )
+        torch.testing.assert_close(conf_grad.float(), expected_conf_grad)
+        num, den = metrics["ratio_metrics"]["dpard_loss"]
+        torch.testing.assert_close(
+            num / den,
+            (actor.detach() * credit).sum() / valid_positions,
+            check_dtype=False,
+        )
+        confidence_num, confidence_den = metrics["ratio_metrics"]["confidence_loss"]
+        torch.testing.assert_close(
+            confidence_num / confidence_den,
+            (bce.detach() * confidence_weights).sum() / valid_blocks,
+            check_dtype=False,
+        )
+        self.assertIsNone(target_grad)
+
+    def test_dpard_pools_valid_position_and_confidence_denominators(self):
+        import torch.distributed as dist
+
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=nn.Linear(4, self.logits.shape[-1], bias=False).double(),
+            loss_type="dpard",
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.0,
+        )
+        inputs = dict(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=torch.randn_like(self.hidden_states),
+        )
+        _, _, metrics = model(**inputs)
+        actor_num, actor_valid_positions = metrics["ratio_metrics"]["dpard_loss"]
+        conf_num, conf_den = metrics["ratio_metrics"]["confidence_loss"]
+        other_rank = iter([7.0, 3.0])
+        with (
+            patch.object(dist, "is_available", return_value=True),
+            patch.object(dist, "is_initialized", return_value=True),
+            patch.object(dist, "get_world_size", return_value=2),
+            patch.object(
+                dist, "all_reduce", side_effect=lambda t, **kw: t.add_(next(other_rank))
+            ),
+        ):
+            loss, _, _ = model(**inputs)
+        expected = 2 * (
+            actor_num / (actor_valid_positions + 3) + conf_num / (conf_den + 7)
+        )
+        torch.testing.assert_close(loss, expected, check_dtype=False)
+
+    def test_dpard_chunking_matches_full_loss_and_gradient(self):
+        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
+        options = dict(
+            loss_type="dpard",
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.0,
+        )
+        full = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=head,
+            objective_chunk_blocks=0,
+            **options,
+        )
+        chunked = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=copy.deepcopy(head),
+            objective_chunk_blocks=1,
+            **options,
+        )
+        chunked.load_state_dict(full.state_dict())
+        inputs = dict(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=torch.randn_like(self.hidden_states),
+        )
+        loss, _, metrics = full(**inputs)
+        chunk_loss, _, chunk_metrics = chunked(**inputs)
+        torch.testing.assert_close(loss, chunk_loss)
+        for name, values in metrics["ratio_metrics"].items():
+            for actual, expected in zip(chunk_metrics["ratio_metrics"][name], values):
+                torch.testing.assert_close(actual, expected)
+        loss.backward()
+        chunk_loss.backward()
+        torch.testing.assert_close(
+            full.draft_model.signal.grad, chunked.draft_model.signal.grad
+        )
+
+    def test_dpard_requires_teacher_without_confidence(self):
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            loss_type="dpard",
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "target_last_hidden_states"):
+            model(
+                input_ids=self.input_ids,
+                hidden_states=self.hidden_states,
+                loss_mask=self.loss_mask,
+            )
+
     def setUp(self):
         (
             self.logits,
