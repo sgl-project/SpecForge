@@ -147,9 +147,10 @@ class _FakeBackend(TrainingBackend):
 
 
 class _FakeDFlashModel(nn.Module):
-    def __init__(self):
+    def __init__(self, lk_target="hard_label"):
         super().__init__()
         self.w = nn.Parameter(torch.ones(1))
+        self.lk_target = lk_target
         self.max_valid_anchors = None
         self.received_selector_loss_alpha = None
         self.target_last_hidden_states = None
@@ -224,6 +225,49 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
             ctx=StepContext(collect_detailed_metrics=False),
         )
         self.assertIsNone(model.target_last_hidden_states)
+
+    def test_dflash_strategy_always_forwards_teacher_hidden_for_full_vocab_lk(self):
+        model = _FakeDFlashModel(lk_target="target_distribution")
+        strategy = DFlashTrainStrategy(model)
+        teacher_hidden = torch.randn(1, 4, 8)
+        batch = TrainBatch(
+            sample_ids=["s0"],
+            strategy="dflash",
+            tensors={
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "hidden_states": torch.randn(1, 4, 8),
+                "target_last_hidden_states": teacher_hidden,
+                "loss_mask": torch.ones(1, 4, dtype=torch.long),
+            },
+            metadata={},
+        )
+
+        strategy.forward_loss(
+            batch,
+            ctx=StepContext(collect_detailed_metrics=False),
+        )
+
+        self.assertIs(model.target_last_hidden_states, teacher_hidden)
+
+    def test_dflash_strategy_requires_teacher_hidden_for_full_vocab_lk(self):
+        model = _FakeDFlashModel(lk_target="target_distribution")
+        strategy = DFlashTrainStrategy(model)
+        batch = TrainBatch(
+            sample_ids=["s0"],
+            strategy="dflash",
+            tensors={
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "hidden_states": torch.randn(1, 4, 8),
+                "loss_mask": torch.ones(1, 4, dtype=torch.long),
+            },
+            metadata={},
+        )
+
+        with self.assertRaisesRegex(ValueError, "target_last_hidden_states"):
+            strategy.forward_loss(
+                batch,
+                ctx=StepContext(collect_detailed_metrics=False),
+            )
 
     def test_dflash_validate_batch_rejects_missing(self):
         strat = DFlashTrainStrategy(_FakeDFlashModel())

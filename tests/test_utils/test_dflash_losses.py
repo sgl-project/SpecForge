@@ -392,6 +392,83 @@ class TestDFlashLosses(unittest.TestCase):
         want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=None)
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
+    def test_dpace_full_vocabulary_lk_matches_angelspec_per_token_lambda(self):
+        torch.manual_seed(456)
+        target_logits = torch.randn_like(self.logits)
+        alpha = 0.5
+        eta = 3.0
+        model = _make_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            lm_head=_DualFixedHead(self.logits, target_logits).double(),
+            loss_type="dpace",
+            dpace_alpha=alpha,
+            lk_loss_type="lambda",
+            lk_target="target_distribution",
+            kl_scale=1.0,
+            kl_decay=eta,
+        )
+
+        got, _accuracy, metrics = model(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=torch.zeros_like(self.hidden_states),
+            collect_detailed_metrics=False,
+        )
+
+        draft_log_probs = torch.log_softmax(self.logits.float(), dim=-1)
+        draft_probs = draft_log_probs.exp()
+        teacher_log_probs = torch.log_softmax(target_logits.float(), dim=-1)
+        teacher_probs = teacher_log_probs.exp()
+        tv = 0.5 * (teacher_probs - draft_probs).abs().sum(dim=-1)
+        acceptance = 1.0 - tv
+        kl = (teacher_probs * (teacher_log_probs - draft_log_probs)).sum(dim=-1)
+        lk_weight = torch.exp(-eta * acceptance)
+        lk = lk_weight * kl + (1.0 - lk_weight) * tv
+        dpace_weight = _naive_dpace_weight(
+            self.q,
+            self.binary_mask,
+            alpha,
+            "dpace",
+        )
+        effective_weight = dpace_weight * self.binary_mask
+        want = (lk * effective_weight).sum() / effective_weight.sum()
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-6)
+
+        acceptance_num, acceptance_den = metrics["ratio_metrics"]["expected_acceptance"]
+        torch.testing.assert_close(
+            acceptance_num / acceptance_den,
+            (acceptance * effective_weight).sum() / effective_weight.sum(),
+            rtol=0,
+            atol=1e-6,
+        )
+        weight_num, weight_den = metrics["ratio_metrics"]["objective/lk_kl_weight"]
+        torch.testing.assert_close(
+            weight_num / weight_den,
+            (lk_weight * effective_weight).sum() / effective_weight.sum(),
+            rtol=0,
+            atol=1e-6,
+        )
+
+    def test_full_vocabulary_lk_requires_target_hidden_states(self):
+        model = _make_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            lk_loss_type="lambda",
+            lk_target="target_distribution",
+        )
+
+        with self.assertRaisesRegex(ValueError, "target_last_hidden_states"):
+            model(
+                input_ids=self.input_ids,
+                hidden_states=self.hidden_states,
+                loss_mask=self.loss_mask,
+                collect_detailed_metrics=False,
+            )
+
     def test_dflash_exposes_additive_loss_and_accuracy_terms(self):
         head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
         model = _make_model(
@@ -603,6 +680,61 @@ class TestDFlashLosses(unittest.TestCase):
                     rtol=1e-6,
                     atol=1e-7,
                 )
+
+    def test_full_vocabulary_lk_chunking_matches_loss_and_gradient(self):
+        torch.manual_seed(78)
+        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
+        full = _make_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=head,
+            loss_type="dpace",
+            lk_loss_type="lambda",
+            lk_target="target_distribution",
+            kl_decay=3.0,
+            objective_chunk_blocks=0,
+        )
+        chunked = _make_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=copy.deepcopy(head),
+            loss_type="dpace",
+            lk_loss_type="lambda",
+            lk_target="target_distribution",
+            kl_decay=3.0,
+            objective_chunk_blocks=1,
+        )
+        chunked.load_state_dict(full.state_dict())
+        target_hidden = torch.randn_like(self.hidden_states)
+
+        full_loss, _full_accuracy, _full_metrics = full(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=target_hidden,
+            collect_detailed_metrics=False,
+        )
+        chunked_loss, _chunked_accuracy, _chunked_metrics = chunked(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=target_hidden,
+            collect_detailed_metrics=False,
+        )
+
+        torch.testing.assert_close(chunked_loss, full_loss, rtol=1e-6, atol=1e-8)
+        full_loss.backward()
+        chunked_loss.backward()
+        torch.testing.assert_close(
+            chunked.draft_model.signal.grad,
+            full.draft_model.signal.grad,
+            rtol=1e-6,
+            atol=1e-7,
+        )
 
     def test_invalid_loss_type_rejected(self):
         with self.assertRaisesRegex(ValueError, "loss_type"):

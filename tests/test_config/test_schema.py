@@ -370,6 +370,35 @@ class ConfigSchemaTest(unittest.TestCase):
         config = Config.model_validate(payload)
 
         self.assertEqual(config.training.lk_loss_type, "tv")
+        self.assertEqual(config.training.dflash_lk_target, "hard_label")
+
+    def test_full_vocabulary_dflash_lk_is_an_online_opt_in(self):
+        payload = _online_payload("dflash")
+        payload["training"].update(
+            {
+                "lk_loss_type": "lambda",
+                "dflash_lk_target": "target_distribution",
+            }
+        )
+
+        config = Config.model_validate(payload)
+
+        self.assertEqual(config.training.dflash_lk_target, "target_distribution")
+
+        missing_loss = copy.deepcopy(payload)
+        missing_loss["training"]["lk_loss_type"] = None
+        with self.assertRaisesRegex(ValidationError, "lk_loss_type"):
+            Config.model_validate(missing_loss)
+
+        wrong_strategy = copy.deepcopy(payload)
+        wrong_strategy["training"]["strategy"] = "eagle3"
+        with self.assertRaisesRegex(ValidationError, "strategy=dflash"):
+            Config.model_validate(wrong_strategy)
+
+        offline = copy.deepcopy(MINIMAL)
+        offline["training"] = payload["training"]
+        with self.assertRaisesRegex(ValidationError, "online DFlash capture"):
+            Config.model_validate(offline)
 
     def test_unknown_fields_and_unsupported_modes_fail_early(self):
         with self.assertRaises(ValidationError):

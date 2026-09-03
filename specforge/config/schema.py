@@ -547,7 +547,8 @@ class TrainingConfig(StrictConfigModel):
     sp_ring_size: int = Field(default=1, gt=0)
     dist_timeout: int = Field(default=10, gt=0)
     #: Acceptance-aware token objective. DFlash-family hard targets make
-    #: ``alpha`` equivalent to CE; ``lambda`` mixes CE and TV.
+    #: ``alpha`` equivalent to CE; ``lambda`` mixes CE and TV. DFlash can opt
+    #: into the captured full-vocabulary target distribution below.
     lk_loss_type: Optional[Literal["lambda", "alpha", "tv"]] = None
     kl_scale: float = 1.0
     kl_decay: float = 1.0
@@ -569,6 +570,10 @@ class TrainingConfig(StrictConfigModel):
         "dpace-continuation-value-only",
     ] = "dflash"
     dpace_alpha: float = 0.5
+    #: DFlash LK supervision source. Full-vocabulary teacher supervision is an
+    #: online-only opt-in because offline DFlash features do not store the
+    #: target model's final hidden state.
+    dflash_lk_target: Literal["hard_label", "target_distribution"] = "hard_label"
     #: Weight of the top-k path-selector objective for DFlash2 drafts.
     dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
     #: Fraction of optimizer steps that train only the DFlash2 base objective.
@@ -735,6 +740,24 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+
+        if self.training.dflash_lk_target == "target_distribution":
+            if self.training.strategy != "dflash":
+                raise ValueError(
+                    "training.dflash_lk_target=target_distribution requires "
+                    "training.strategy=dflash"
+                )
+            if self.training.lk_loss_type is None:
+                raise ValueError(
+                    "training.lk_loss_type is required when "
+                    "training.dflash_lk_target=target_distribution"
+                )
+            if mode != "online":
+                raise ValueError(
+                    "training.dflash_lk_target=target_distribution requires "
+                    "online DFlash capture; offline DFlash features do not "
+                    "contain target_last_hidden_states"
+                )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
