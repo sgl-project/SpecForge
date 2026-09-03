@@ -46,7 +46,7 @@ class MoELayer(nn.Module):
         routing: RoutingResult = self.gate(x)
         if self.training:
             self.last_counts = routing.counts.detach()
-            self.balance.observe(routing.counts)
+            self.balance.observe(routing)
         y = self.experts(x, routing)
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
