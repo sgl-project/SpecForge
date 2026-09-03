@@ -185,6 +185,7 @@ should make their training strategy and topology explicit.
 | `model.use_liger_kernel` | `false` | Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash training. Requires the `specforge[liger]` extra. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
+| `model.target_head_path` | `null` | Optional trainer-only checkpoint for the `embedding_key` / `lm_head_key` tensors when `target_model_path` is a quantized export whose packed head the trainer cannot load; SGLang keeps serving `target_model_path`. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
 | `model.load_target_embedding` | `true` | Copy the frozen target embedding into a fresh draft when supported. |
 | `model.aux_hidden_state_layer_ids` | `null` | Optional EAGLE3/P-EAGLE capture override containing exactly three non-negative layer IDs. Other strategies derive layers from the draft config. |
