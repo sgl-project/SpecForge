@@ -82,4 +82,6 @@ class TopKRouter(Router):
         counts = torch.zeros(
             self.n_experts, dtype=torch.long, device=x.device
         ).scatter_add_(0, flat, torch.ones_like(flat))
-        return RoutingResult(weights=weights, indices=indices, counts=counts)
+        return RoutingResult(
+            weights=weights, indices=indices, counts=counts, scores=scores
+        )

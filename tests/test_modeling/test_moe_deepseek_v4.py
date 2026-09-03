@@ -202,6 +202,35 @@ class TestNoAuxTC(unittest.TestCase):
         self.assertTrue((routing.indices == 3).any(dim=-1).all())
         self.assertTrue(torch.allclose(routing.weights.sum(-1), torch.full((4,), 1.5)))
 
+    def test_aux_balance_loss_is_differentiable_and_uniform_at_balance(self):
+        layer = _layer(dflash_config={"moe_aux_loss_coeff": 0.5}).train()
+        x = torch.randn(64, 32)
+        layer(x)
+        aux = layer.aux_loss()
+        self.assertIsNotNone(aux)
+        self.assertTrue(aux.requires_grad)
+        aux.backward()
+        self.assertIsNotNone(layer.gate.weight.grad)
+        self.assertGreater(float(layer.gate.weight.grad.abs().sum()), 0.0)
+        # perfectly uniform routing and affinities give exactly coeff * 1
+        routing = layer.gate(x)
+        n_experts = layer.cfg.n_routed_experts
+        uniform_scores = torch.full((64, n_experts), 0.25, requires_grad=True)
+        counts = torch.full((n_experts,), 64 * routing.topk // n_experts)
+        layer.balance.observe(
+            type(routing)(routing.weights, routing.indices, counts, uniform_scores)
+        )
+        self.assertAlmostEqual(float(layer.balance.aux_loss()), 0.5, places=5)
+        self.assertIn("aux_loss", layer.balance.metrics())
+        # disabled by default, and never built without a gradient signal
+        layer = _layer().train()
+        layer(torch.randn(8, 32))
+        self.assertIsNone(layer.aux_loss())
+        with torch.no_grad():
+            aux_layer = _layer(dflash_config={"moe_aux_loss_coeff": 0.5}).train()
+            aux_layer(torch.randn(8, 32))
+        self.assertIsNone(aux_layer.aux_loss())
+
     def test_metrics_include_bias_and_global_load(self):
         layer = _layer().train()
         layer(torch.randn(6, 32))
