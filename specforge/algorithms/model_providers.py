@@ -273,7 +273,10 @@ def build_eagle3_model(
         kl_decay=cfg.training.kl_decay,
     ).to(device=_device(), dtype=_torch_dtype(cfg))
     needs_target_head = cfg.mode == "offline" or (
-        cfg.deployment.mode == "disaggregated" and cfg.training.role == "consumer"
+        cfg.mode == "online"
+        and (
+            cfg.deployment.mode == "local_colocated" or cfg.training.role == "consumer"
+        )
     )
     target_head = None
     if needs_target_head:
@@ -313,10 +316,8 @@ def build_peagle_model(
     # same frozen target head used by offline EAGLE3; no target model is loaded
     # in the trainer process.
     target_head = None
-    if (
-        cfg.mode == "online"
-        and cfg.deployment.mode == "disaggregated"
-        and cfg.training.role == "consumer"
+    if cfg.mode == "online" and (
+        cfg.deployment.mode == "local_colocated" or cfg.training.role == "consumer"
     ):
         from specforge.modeling.target.target_head import TargetHead
 

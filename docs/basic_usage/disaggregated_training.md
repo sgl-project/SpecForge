@@ -16,8 +16,9 @@ trainer.
 | Online disaggregated, external | Send prompts to existing capture endpoints and publish streaming refs | Mooncake | User or scheduler owns Mooncake and SGLang |
 | Online disaggregated, managed-local | Send prompts to endpoints started from the same run config | Mooncake | SpecForge owns local Mooncake and SGLang |
 
-Online training always uses the producer/consumer topology; there is currently
-no colocated online target-inference path. `external` describes ownership, not
+This page covers the producer/consumer topology; [colocated online
+training](colocated_training.md) runs target capture in the trainer process
+instead. `external` describes ownership, not
 distance—a loopback service started by the user is still external. Conversely,
 `managed-local` still uses distinct producer and consumer roles even though one
 supervisor owns the local process tree.

@@ -1,0 +1,51 @@
+# Qwen3-8B DSpark, online colocated — tuned baseline for one 8xH200 node.
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-dspark.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  sglang_attention_backend: fa3
+  sglang_mem_fraction_static: 0.4
+  sglang_context_length: 4103
+  sglang_disable_radix_cache: true
+  sglang_max_running_requests: 1
+  sglang_max_total_tokens: 8192
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_train.jsonl
+  max_length: 4096
+  chat_template: qwen
+  build_dataset_num_proc: 32
+  dataloader_num_workers: 0
+  cache_dir: ./cache
+
+training:
+  strategy: dspark
+  num_epochs: 1
+  max_steps: 10000
+  batch_size: 1
+  accumulation_steps: 5
+  fsdp_sharding: SHARD_GRAD_OP
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  save_interval: 1000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+run_id: qwen3-8b-dspark-colocated
+output_dir: ./outputs/qwen3-8b-dspark-colocated
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

@@ -68,6 +68,13 @@ def _config(*, mode="local_colocated", nproc=1, nnodes=1):
     return Config.model_validate(raw)
 
 
+def _online_colocated_config(*, nproc=1, nnodes=1):
+    raw = _config(mode="local_colocated", nproc=nproc, nnodes=nnodes).model_dump()
+    raw["model"]["target_backend"] = "sglang"
+    raw["data"] = {"prompts_path": "prompts.jsonl"}
+    return Config.model_validate(raw)
+
+
 def _offline_disaggregated_config(*, backend="mooncake", producer_segment_size=None):
     raw = _config(mode="disaggregated").model_dump()
     raw["data"] = {"hidden_states_path": "features"}
@@ -199,6 +206,49 @@ class _FakeProcess:
 
 
 class LaunchPlanTest(unittest.TestCase):
+    def test_online_colocated_self_launches_one_torchrun_worker_per_gpu(self):
+        plan = build_launch_plan(
+            _online_colocated_config(nproc=4),
+            config_path="run.yaml",
+            worker_prefix=("specforge",),
+            torchrun_prefix=("torchrun",),
+            env={},
+        )
+
+        self.assertEqual((plan.kind, plan.role), ("command", "all"))
+        self.assertEqual(
+            plan.commands[0].argv,
+            (
+                "torchrun",
+                "--standalone",
+                "--nproc_per_node",
+                "4",
+                "specforge",
+                "train",
+                "--config",
+                "run.yaml",
+                "--role",
+                "all",
+            ),
+        )
+
+    def test_online_colocated_torchrun_child_becomes_all_role_worker(self):
+        distributed = {
+            "RANK": "2",
+            "WORLD_SIZE": "4",
+            "LOCAL_RANK": "2",
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": "29500",
+        }
+        plan = build_launch_plan(
+            _online_colocated_config(nproc=4),
+            config_path="run.yaml",
+            env=distributed,
+        )
+
+        self.assertEqual((plan.kind, plan.role), ("worker", "all"))
+        self.assertEqual(plan.commands, ())
+
     def test_local_multi_rank_self_launches_torchrun(self):
         plan = build_launch_plan(
             _config(nproc=4),

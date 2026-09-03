@@ -1,6 +1,13 @@
 # Online colocated recipes
 
-This directory is reserved so the catalog keeps the same mode/topology axes for
-online and offline recipes. All supported online recipes
-use separate producer and consumer roles under `../disaggregated/`, regardless
-of whether one supervisor starts both roles.
+Every trainer rank loads one SGLang target shard next to its FSDP draft shard
+and captures hidden states in process; no producer role, feature transport, or
+second GPU pool is involved. `training.tp_size` is the target-TP island width,
+and the trainer world size must be divisible by it.
+
+| Recipe | Target | Topology |
+| --- | --- | --- |
+| [`qwen3-8b-dspark-colocated.yaml`](qwen3-8b-dspark-colocated.yaml) | Qwen3-8B | 8 islands of TP1 on one 8xH200 node |
+
+See [Colocated online training](../../../../docs/basic_usage/colocated_training.md)
+for memory sizing and scaling guidance.

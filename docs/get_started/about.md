@@ -6,8 +6,8 @@ Speculative decoding is an important and powerful technique for speeding up infe
 
 - regularly maintained by the SGLang team: the code is runnable out-of-the-box
 - directly compatible with SGLang: no additional porting effort is required
-- able to provide online disaggregated training and both colocated and disaggregated
-  offline training through one runtime, including consumer DP, offline USP,
+- able to provide colocated and disaggregated training, both online and
+  offline, through one runtime, including consumer DP, offline USP,
   evaluation, checkpoint selection, and CUDA/ROCm/Ascend portability
 
 ## ✅ SGLang-ready

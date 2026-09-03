@@ -139,37 +139,32 @@ def _validate_training_topology(
             "receives its own data shard"
         )
     if mode is FeatureMode.STREAMING:
-        if deployment_mode != "disaggregated":
-            raise ValueError(
-                "online training requires deployment.mode=disaggregated; "
-                "colocated online training is no longer supported"
-            )
         if cfg.model.target_backend != "sglang":
             raise ValueError(
-                "online training uses an external SGLang capture server and "
+                "online training uses SGLang target capture and "
                 "requires model.target_backend=sglang"
-            )
-        deployment = cfg.deployment.disaggregated
-        if deployment is None or deployment.backend != "mooncake":
-            raise ValueError(
-                "online disaggregated training requires "
-                "deployment.disaggregated.backend=mooncake"
             )
         if cfg.model.shard_target_output:
             raise ValueError(
-                "model.shard_target_output is unavailable with external server "
-                "capture"
+                "model.shard_target_output is unavailable with SGLang capture"
             )
-        if (
-            cfg.training.tp_size != 1
-            or cfg.training.sp_ulysses_size != 1
-            or cfg.training.sp_ring_size != 1
-        ):
-            raise ValueError(
-                "the disaggregated online consumer uses every trainer rank for "
-                "data parallelism; configure target TP on the external server and "
-                "keep training.tp_size/sp sizes at 1"
-            )
+        if deployment_mode == "disaggregated":
+            deployment = cfg.deployment.disaggregated
+            if deployment is None or deployment.backend != "mooncake":
+                raise ValueError(
+                    "online disaggregated training requires "
+                    "deployment.disaggregated.backend=mooncake"
+                )
+            if (
+                cfg.training.tp_size != 1
+                or cfg.training.sp_ulysses_size != 1
+                or cfg.training.sp_ring_size != 1
+            ):
+                raise ValueError(
+                    "the disaggregated online consumer uses every trainer rank "
+                    "for data parallelism; configure target TP on the external "
+                    "server and keep training.tp_size/sp sizes at 1"
+                )
 
     if cfg.training.attention_backend == "usp" and mode is not FeatureMode.OFFLINE:
         raise ValueError("USP attention currently requires offline features")
