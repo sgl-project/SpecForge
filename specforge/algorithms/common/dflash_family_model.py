@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
+from specforge.core.lk_loss import compute_lk_loss_per_token
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
@@ -33,6 +34,7 @@ _VALID_LOSS_TYPES = {
 }
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
 _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
+_VALID_DFLASH_LK_TARGETS = {"hard_label", "target_distribution"}
 
 
 class SelectorTerms(NamedTuple):
@@ -66,6 +68,9 @@ class DFlashObjectiveTerms(NamedTuple):
 
     ce_loss_num: torch.Tensor
     tv_loss_num: torch.Tensor
+    distribution_lk_loss_num: torch.Tensor
+    distribution_acceptance_num: torch.Tensor
+    distribution_kl_weight_num: torch.Tensor
     loss_den: torch.Tensor
     target_probability_num: torch.Tensor
     correct_num: torch.Tensor
@@ -310,6 +315,7 @@ class OnlineDFlashModel(nn.Module):
         selector_ramp_ratio: float = 0.0,
         selector_stop_gradient: bool = False,
         lk_loss_type: Optional[str] = None,
+        lk_target: str = "hard_label",
         kl_scale: float = 1.0,
         kl_decay: float = 1.0,
         metric_top_k: int = 16,
@@ -335,6 +341,15 @@ class OnlineDFlashModel(nn.Module):
             raise ValueError(
                 "lk_loss_type must be one of None, 'alpha', 'lambda', or 'tv'"
             )
+        if lk_target not in _VALID_DFLASH_LK_TARGETS:
+            raise ValueError(
+                "lk_target must be 'hard_label' or 'target_distribution', "
+                f"got {lk_target!r}"
+            )
+        if lk_target == "target_distribution" and lk_loss_type is None:
+            raise ValueError(
+                "lk_loss_type is required when lk_target='target_distribution'"
+            )
 
         self.draft_model = draft_model
         self.lm_head = target_lm_head
@@ -352,6 +367,7 @@ class OnlineDFlashModel(nn.Module):
         self.selector_ramp_ratio = float(selector_ramp_ratio)
         self.selector_stop_gradient = bool(selector_stop_gradient)
         self.lk_loss_type = lk_loss_type
+        self.lk_target = lk_target
         self.kl_scale = float(kl_scale)
         self.kl_decay = float(kl_decay)
         # Candidate-set width for top-K diagnostics on drafts without a selector.
@@ -699,6 +715,7 @@ class OnlineDFlashModel(nn.Module):
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
+        aligned_target_hidden: Optional[torch.Tensor] = None,
     ) -> DFlashObjectiveTerms:
         """Return a flat tuple of additive objective and metric tensors."""
 
@@ -751,6 +768,42 @@ class OnlineDFlashModel(nn.Module):
             tv_loss_num = ce_loss_num.new_zeros(())
         target_probability_num = (target_probability.detach() * weight_mask).sum()
 
+        distribution_lk_loss_num = ce_loss_num.new_zeros(())
+        distribution_acceptance_num = ce_loss_num.new_zeros(())
+        distribution_kl_weight_num = ce_loss_num.new_zeros(())
+        if self.lk_target == "target_distribution":
+            if aligned_target_hidden is None:
+                raise ValueError(
+                    "full-vocabulary DFlash LK loss requires "
+                    "target_last_hidden_states from online capture"
+                )
+            with torch.no_grad():
+                teacher_logits = self.lm_head(
+                    aligned_target_hidden.reshape(
+                        batch_size,
+                        num_blocks * block_size,
+                        hidden_size,
+                    )
+                ).reshape_as(objective_logits)
+                teacher_probs = torch.softmax(teacher_logits.float(), dim=-1)
+            lk_per_token, acceptance_per_token, kl_weight_per_token = (
+                compute_lk_loss_per_token(
+                    logits=objective_logits,
+                    target_probs=teacher_probs,
+                    lk_loss_type=self.lk_loss_type,
+                    kl_scale=self.kl_scale,
+                    kl_decay=self.kl_decay,
+                )
+            )
+            distribution_lk_loss_num = (lk_per_token * loss_weights).sum()
+            distribution_acceptance_num = (
+                acceptance_per_token.detach() * loss_weights
+            ).sum()
+            if kl_weight_per_token is not None:
+                distribution_kl_weight_num = (
+                    kl_weight_per_token.detach() * loss_weights
+                ).sum()
+
         selector_terms = SelectorTerms.zeros(ce_loss_num)
         if self._selector_objective_enabled:
             selector_terms = self._selector_chunk_terms(
@@ -772,6 +825,9 @@ class OnlineDFlashModel(nn.Module):
         return DFlashObjectiveTerms(
             ce_loss_num=ce_loss_num,
             tv_loss_num=tv_loss_num,
+            distribution_lk_loss_num=distribution_lk_loss_num,
+            distribution_acceptance_num=distribution_acceptance_num,
+            distribution_kl_weight_num=distribution_kl_weight_num,
             loss_den=loss_den,
             target_probability_num=target_probability_num,
             correct_num=correct_num,
@@ -1170,10 +1226,14 @@ class OnlineDFlashModel(nn.Module):
         self,
         ce_num: torch.Tensor,
         tv_num: torch.Tensor,
+        distribution_lk_num: torch.Tensor,
         probability_num: torch.Tensor,
         probability_den: torch.Tensor,
     ) -> torch.Tensor:
-        """Compose a hard-target CE/TV/LK numerator after chunk reduction."""
+        """Compose the configured hard-target or full-vocabulary objective."""
+
+        if self.lk_target == "target_distribution":
+            return distribution_lk_num
 
         if self.lk_loss_type is None or self.lk_loss_type == "alpha":
             # With a one-hot target distribution, LK-alpha is exactly NLL/CE.
@@ -1203,6 +1263,14 @@ class OnlineDFlashModel(nn.Module):
             )
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+        if (
+            self.lk_target == "target_distribution"
+            and target_last_hidden_states is None
+        ):
+            raise ValueError(
+                "full-vocabulary DFlash LK loss requires "
+                "target_last_hidden_states from online capture"
+            )
 
         anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
             input_ids=input_ids,
@@ -1254,12 +1322,16 @@ class OnlineDFlashModel(nn.Module):
                 target_last_hidden_states,
                 safe_label_indices,
             )
-            if target_last_hidden_states is not None and collect_detailed_metrics
+            if target_last_hidden_states is not None
+            and (collect_detailed_metrics or self.lk_target == "target_distribution")
             else None
         )
         (
             ce_loss_num,
             tv_loss_num,
+            distribution_lk_loss_num,
+            distribution_acceptance_num,
+            distribution_kl_weight_num,
             loss_den,
             target_probability_num,
             correct_num,
@@ -1275,12 +1347,18 @@ class OnlineDFlashModel(nn.Module):
             target_ids,
             weight_mask,
             predecessor_ids,
+            (
+                aligned_target_hidden
+                if self.lk_target == "target_distribution"
+                else None
+            ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
         token_loss_num = self._compose_token_objective(
             ce_loss_num,
             tv_loss_num,
+            distribution_lk_loss_num,
             target_probability_num,
             accuracy_denom,
         )
@@ -1309,20 +1387,37 @@ class OnlineDFlashModel(nn.Module):
                 accuracy_denom.detach(),
             ),
             "expected_acceptance": (
-                target_probability_num.detach(),
-                accuracy_denom.detach(),
+                (
+                    distribution_acceptance_num
+                    if self.lk_target == "target_distribution"
+                    else target_probability_num
+                ).detach(),
+                (
+                    loss_denominator
+                    if self.lk_target == "target_distribution"
+                    else accuracy_denom
+                ).detach(),
             ),
             "lk_loss" if self.lk_loss_type is not None else "ce_loss": (
                 token_loss_num.detach(),
                 loss_denominator.detach(),
             ),
         }
-        lk_kl_weight = self._lk_kl_weight(target_probability_num, accuracy_denom)
-        if lk_kl_weight is not None:
-            ratio_metrics["objective/lk_kl_weight"] = (
-                (lk_kl_weight * accuracy_denom).detach(),
-                accuracy_denom.detach(),
-            )
+        if self.lk_loss_type == "lambda":
+            if self.lk_target == "target_distribution":
+                ratio_metrics["objective/lk_kl_weight"] = (
+                    distribution_kl_weight_num.detach(),
+                    loss_denominator.detach(),
+                )
+            else:
+                lk_kl_weight = self._lk_kl_weight(
+                    target_probability_num,
+                    accuracy_denom,
+                )
+                ratio_metrics["objective/lk_kl_weight"] = (
+                    (lk_kl_weight * accuracy_denom).detach(),
+                    accuracy_denom.detach(),
+                )
         candidate_selector = getattr(self.draft_model, "candidate_selector", None)
         if collect_detailed_metrics:
             (

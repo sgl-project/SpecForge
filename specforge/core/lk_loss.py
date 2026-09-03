@@ -99,3 +99,50 @@ def compute_lk_loss(
         kl_weight = kl_scale * torch.exp(-kl_decay * acc_det)
         return kl_weight * kl_loss + (1 - kl_weight) * (1 - acceptance_rate)
     raise ValueError(f"Unknown lk loss type: {lk_loss_type}")
+
+
+def compute_lk_loss_per_token(
+    *,
+    logits: torch.Tensor,
+    target_probs: torch.Tensor,
+    lk_loss_type: str,
+    kl_scale: float,
+    kl_decay: float,
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Return full-vocabulary LK loss and acceptance for each token.
+
+    ``target_probs`` is the frozen teacher distribution and ``logits`` is the
+    trainable draft distribution. LK-lambda uses a separate, detached mixing
+    coefficient at every token, as in AngelSpec, rather than a coefficient
+    derived from an acceptance rate averaged over the batch.
+
+    The third return value is the per-token KL coefficient for LK-lambda and
+    ``None`` for the alpha and TV objectives.
+    """
+
+    if logits.shape != target_probs.shape:
+        raise ValueError(
+            "logits and target_probs must have the same shape, "
+            f"got {logits.shape} and {target_probs.shape}"
+        )
+    draft_log_probs = F.log_softmax(logits.to(torch.float32), dim=-1)
+    draft_probs = draft_log_probs.exp()
+    teacher_probs = target_probs.detach().to(torch.float32)
+    tv_loss = 0.5 * (teacher_probs - draft_probs).abs().sum(dim=-1)
+    acceptance = (1.0 - tv_loss).clamp(0.0, 1.0)
+
+    if lk_loss_type == "alpha":
+        return -torch.log(acceptance.clamp_min(eps)), acceptance, None
+    if lk_loss_type == "tv":
+        return tv_loss, acceptance, None
+    if lk_loss_type == "lambda":
+        kl_loss = F.kl_div(
+            draft_log_probs,
+            teacher_probs,
+            reduction="none",
+        ).sum(dim=-1)
+        kl_weight = kl_scale * torch.exp(-kl_decay * acceptance.detach())
+        loss = kl_weight * kl_loss + (1.0 - kl_weight) * tv_loss
+        return loss, acceptance, kl_weight
+    raise ValueError(f"Unknown lk loss type: {lk_loss_type}")
