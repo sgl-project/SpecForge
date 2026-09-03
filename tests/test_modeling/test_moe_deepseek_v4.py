@@ -352,6 +352,64 @@ class TestWarmStart(unittest.TestCase):
             apply_warm_start(_layer(n_routed_experts=4), plan, source)
 
 
+class TestServingExport(unittest.TestCase):
+    def test_serving_fields_carry_the_resolved_recipe(self):
+        fields = resolve_moe_config(_json()).serving_fields()
+        self.assertEqual(fields["topk_method"], "noaux_tc")
+        self.assertEqual(fields["scoring_func"], "sqrtsoftplus")
+        self.assertEqual(fields["routed_scaling_factor"], 1.5)
+        self.assertEqual(fields["swiglu_limit"], 10.0)
+        self.assertEqual((fields["n_group"], fields["topk_group"]), (1, 1))
+        # a disabled clamp is omitted rather than exported as a clamp at 0
+        self.assertNotIn(
+            "swiglu_limit", resolve_moe_config(_json(swiglu_limit=0)).serving_fields()
+        )
+
+    def test_hf_export_reloads_and_carries_serving_config(self):
+        import os
+        import tempfile
+
+        from specforge.export import export_to_hf
+        from specforge.modeling.auto import AutoDraftModel
+
+        torch.manual_seed(1)
+        config = _dflash_config()
+        model = DFlashDraftModel(config).to(torch.bfloat16)
+        for layer in iter_moe_layers(model):
+            layer.balance.bias.uniform_(-1.0, 1.0)
+        workdir = tempfile.mkdtemp(prefix="moe_export_")
+        config_path = os.path.join(workdir, "draft.json")
+        config.save_pretrained(workdir)
+        os.replace(os.path.join(workdir, "config.json"), config_path)
+        ckpt_dir = os.path.join(workdir, "run-step1")
+        os.makedirs(ckpt_dir)
+        torch.save(
+            {
+                "draft_state_dict": to_checkpoint_state_dict(model.state_dict()),
+                "strategy": "dflash",
+                "global_step": 1,
+            },
+            os.path.join(ckpt_dir, "training_state.pt"),
+        )
+        out = export_to_hf(ckpt_dir, config_path, os.path.join(workdir, "hf"))
+        exported = json.loads((Path(out) / "config.json").read_text())
+        self.assertEqual(exported["topk_method"], "noaux_tc")
+        self.assertEqual(exported["scoring_func"], "sqrtsoftplus")
+        self.assertEqual(exported["n_routed_experts"], 8)
+        from safetensors import safe_open
+
+        with safe_open(os.path.join(out, "model.safetensors"), "pt") as f:
+            keys = set(f.keys())
+        self.assertIn("layers.0.mlp.experts.0.w1.weight", keys)
+        self.assertIn("layers.0.mlp.gate.bias", keys)
+        # HF from_pretrained assigns tensors by key; SpecForge's loader must
+        # convert the official naming back into the stacked module layout.
+        reloaded = AutoDraftModel.from_pretrained(out, torch_dtype=torch.bfloat16)
+        fresh = reloaded.state_dict()
+        for key, value in model.state_dict().items():
+            self.assertTrue(torch.equal(value.float(), fresh[key].float()), key)
+
+
 class TestDFlashIntegration(unittest.TestCase):
     def _forward(self, model):
         return model(
