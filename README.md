@@ -19,9 +19,9 @@ We have seen many open-source projects for speculative decoding, but most of the
 
 - regularly maintained by the SpecForge team: the code is runnable out-of-the-box
 - directly compatible with SGLang: no additional porting effort is required
-- able to run online disaggregated training and both colocated and
-  disaggregated offline training through one runtime, including the supported
-  data, tensor, and sequence parallel topologies
+- able to run colocated and disaggregated training, both online and offline,
+  through one runtime, including the supported data, tensor, and sequence
+  parallel topologies
 
 
 Check out [**our documentation**](https://docs.sglang.io/SpecForge/) to get started.

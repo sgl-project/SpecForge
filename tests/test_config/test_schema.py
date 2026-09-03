@@ -140,9 +140,7 @@ class ConfigSchemaTest(unittest.TestCase):
         payload["model"]["shard_target_output"] = True
         cfg = Config.model_validate(payload)
         self.assertTrue(cfg.model.shard_target_output)
-        with self.assertRaisesRegex(
-            ValueError, "unavailable with external server capture"
-        ):
+        with self.assertRaisesRegex(ValueError, "unavailable with SGLang capture"):
             resolve_run(cfg)
 
     def test_sglang_expert_parallelism_must_fit_target_tensor_parallelism(self):
