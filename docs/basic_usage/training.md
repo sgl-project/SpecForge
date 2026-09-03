@@ -215,31 +215,37 @@ from updating the unary logits and draft hidden states. The selector parameters
 still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
 gradient path. The option defaults to `false`, preserving coupled training.
 
-External tracking reports DFlash2 diagnostics on optimizer steps that reach
-`training.log_interval`. Aggregates live under `train/dflash2/*`; the same
-families are broken down per predicted block position under their own
-`position_1/*` through `position_<block_size-1>/*` sections (the verified
-anchor is omitted), so each position renders as one dashboard group:
+External tracking reports DFlash-family diagnostics on optimizer steps that
+reach `training.log_interval`. Aggregates live under `train/dflash/*` for every
+DFlash-family draft and under `train/dflash2/selector/*` for drafts with a
+candidate selector. The same families are broken down per predicted block
+position under their own `position_1/*` through `position_<block_size-1>/*`
+sections (the verified anchor is omitted), so each position renders as one
+dashboard group:
 
-- `hard_label/*`: unary top-1 accuracy, top-K recall and probability mass,
-  gold-token probability, selector loss, selector conditional accuracy (uniform
-  over covered slots, so comparable across loss types), and the realized greedy
-  serving path's per-slot accuracy. Three aggregate-only per-block
-  accepted-length proxies apply `1 + sum_k prod_{j<=k} a_j` over the supervised
-  slots with `a_j` being coverage by the unary top-K
-  (`unary_topK_oracle_accepted_length`), a serving-path hit
-  (`selector_serving_accepted_length`), or the gold-token probability
-  (`expected_accepted_length`, the smooth D-PACE surrogate). All three are
-  teacher-forced on the real prefix and anchor.
+- `dflash/hard_label/*`: unary top-1 accuracy, top-K recall and probability
+  mass, and gold-token probability. K is the selector's `selector_top_k` when
+  present, otherwise the model's `metric_top_k` (default 16). Two aggregate-only
+  per-block accepted-length proxies apply `1 + sum_k prod_{j<=k} a_j` over the
+  supervised slots with `a_j` being coverage by the unary top-K
+  (`unary_topK_oracle_accepted_length`) or the gold-token probability
+  (`expected_accepted_length`, the smooth D-PACE surrogate).
 - `position_<k>/objective/loss_weight_share`: the fraction of the effective
   objective weight each block position receives under the configured
   fixed-decay or D-PACE weighting.
 - `train/objective/lk_kl_weight`: the CE weight of the `lambda` LK objective.
-- `teacher/*` (online capture only): full-vocabulary expected acceptance, unary
-  top-1 agreement, unary top-K teacher mass, and serving-path agreement against
-  the frozen target head, plus the aggregate `expected_accepted_length` that
-  chains the per-slot expected acceptance, the sampling-regime counterpart of
-  the hard-label surrogate.
+- `dflash/teacher/*` (online capture only): full-vocabulary expected
+  acceptance, unary top-1 agreement, and unary top-K teacher mass against the
+  frozen target head, plus the aggregate `expected_accepted_length` that chains
+  the per-slot expected acceptance, the sampling-regime counterpart of the
+  hard-label surrogate.
+- `dflash2/selector/*` (DFlash2 only): selector loss, conditional accuracy
+  (uniform over covered slots, so comparable across loss types), the realized
+  greedy serving path's per-slot accuracy, its per-block
+  `serving_accepted_length`, and, with online capture, its agreement with the
+  target argmax (`teacher_serving_agreement`).
+
+All accepted-length proxies are teacher-forced on the real prefix and anchor.
 
 The exported computation and parameter names match the public SGLang DFlash2
 contract, including optional `output_multiplier` and

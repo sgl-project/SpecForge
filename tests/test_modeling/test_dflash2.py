@@ -397,23 +397,23 @@ class CandidateSelectorTest(unittest.TestCase):
         expected_keys = {
             "lk_loss",
             "expected_acceptance",
-            "dflash2/hard_label/unary_top1_accuracy",
-            "dflash2/hard_label/selector_conditional_accuracy",
-            "dflash2/hard_label/unary_top2_oracle_accepted_length",
-            "dflash2/hard_label/selector_serving_accepted_length",
+            "dflash/hard_label/unary_top1_accuracy",
+            "dflash/hard_label/unary_top2_oracle_accepted_length",
+            "dflash2/selector/conditional_accuracy",
+            "dflash2/selector/serving_accepted_length",
             "position_1/hard_label/unary_top1_accuracy",
             "position_2/hard_label/unary_top1_accuracy",
             "position_1/hard_label/unary_top2_recall",
             "position_2/hard_label/unary_top2_recall",
-            "position_1/hard_label/selector_loss",
             "position_1/hard_label/unary_top2_mass",
-            "position_2/hard_label/selector_conditional_accuracy",
+            "position_1/selector/loss",
+            "position_2/selector/conditional_accuracy",
+            "position_2/selector/teacher_serving_agreement",
             "position_1/objective/loss_weight_share",
             "position_1/teacher/expected_acceptance",
             "position_2/teacher/expected_acceptance",
             "position_1/teacher/unary_top1_agreement",
             "position_2/teacher/unary_top2_mass",
-            "position_2/teacher/selector_serving_agreement",
         }
         self.assertTrue(expected_keys.issubset(ratios))
         self.assertFalse(any(key.startswith("position_0/") for key in ratios))
@@ -433,11 +433,9 @@ class CandidateSelectorTest(unittest.TestCase):
         # Position 1 is covered and served correctly, position 2 is uncovered:
         # both accepted-length walks credit the anchor plus one slot.
         self.assertEqual(
-            ratio("dflash2/hard_label/unary_top2_oracle_accepted_length"), 2.0
+            ratio("dflash/hard_label/unary_top2_oracle_accepted_length"), 2.0
         )
-        self.assertEqual(
-            ratio("dflash2/hard_label/selector_serving_accepted_length"), 2.0
-        )
+        self.assertEqual(ratio("dflash2/selector/serving_accepted_length"), 2.0)
         # Uniform dflash weights split the objective evenly over both slots.
         self.assertEqual(ratio("position_1/objective/loss_weight_share"), 0.5)
         self.assertEqual(ratio("position_2/objective/loss_weight_share"), 0.5)
@@ -449,7 +447,7 @@ class CandidateSelectorTest(unittest.TestCase):
             -1, torch.tensor([[1], [3]])
         ).squeeze(-1)
         self.assertAlmostEqual(
-            ratio("dflash2/hard_label/expected_accepted_length"),
+            ratio("dflash/hard_label/expected_accepted_length"),
             float(1.0 + gold_probability.cumprod(dim=-1).sum()),
             places=5,
         )
@@ -457,9 +455,68 @@ class CandidateSelectorTest(unittest.TestCase):
             draft_probabilities - teacher_probabilities
         ).abs().sum(dim=-1)
         self.assertAlmostEqual(
-            ratio("dflash2/teacher/expected_accepted_length"),
+            ratio("dflash/teacher/expected_accepted_length"),
             float(1.0 + acceptance.cumprod(dim=-1).sum()),
             places=5,
+        )
+
+    def test_plain_dflash_draft_reports_family_metrics_without_selector_keys(self):
+        # A DFlash draft has neither a candidate selector nor a unary transform.
+        model = OnlineDFlashModel(
+            draft_model=nn.Module(),
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(4, 4),
+            mask_token_id=3,
+            block_size=3,
+            attention_backend="eager",
+            metric_top_k=2,
+        )
+        output_hidden = torch.tensor(
+            [
+                [
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 4.0, 1.0, 0.0],
+                    [0.0, 3.0, 4.0, 2.0],
+                ]
+            ]
+        )
+        target_hidden = torch.tensor(
+            [[[0.0, 5.0, 0.0, 0.0], [0.0, 0.0, 0.0, 5.0], [0.0, 0.0, 0.0, 0.0]]]
+        )
+        model._forward_draft_blocks = lambda **_kwargs: (
+            torch.tensor([[0]]),
+            torch.tensor([[True]]),
+            output_hidden,
+        )
+
+        _loss, _accuracy, metrics = model(
+            input_ids=torch.tensor([[0, 1, 3]]),
+            hidden_states=torch.zeros(1, 3, 4),
+            loss_mask=torch.ones(1, 3),
+            target_last_hidden_states=target_hidden,
+        )
+
+        ratios = metrics["ratio_metrics"]
+
+        def ratio(name):
+            numerator, denominator = ratios[name]
+            return float(numerator / denominator)
+
+        self.assertIn("ce_loss", ratios)
+        self.assertEqual(ratio("dflash/hard_label/unary_top1_accuracy"), 0.5)
+        self.assertEqual(ratio("position_1/hard_label/unary_top1_accuracy"), 1.0)
+        self.assertEqual(ratio("position_2/hard_label/unary_top2_recall"), 0.0)
+        self.assertEqual(
+            ratio("dflash/hard_label/unary_top2_oracle_accepted_length"), 2.0
+        )
+        self.assertEqual(ratio("position_1/objective/loss_weight_share"), 0.5)
+        self.assertEqual(ratio("position_1/teacher/unary_top1_agreement"), 1.0)
+        self.assertIn("dflash/teacher/expected_accepted_length", ratios)
+        self.assertFalse(
+            any(
+                key.startswith("dflash2/") or "/selector/" in key or "selector_" in key
+                for key in ratios
+            )
         )
 
     def test_metric_chunk_reports_accepted_lengths_and_unweighted_selector_terms(
@@ -517,7 +574,7 @@ class CandidateSelectorTest(unittest.TestCase):
         weights = torch.tensor([[[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]])
         predecessors = torch.tensor([[[4, 4, 2], [4, 4, 1]]])
 
-        terms = model._dflash2_metric_chunk_terms(
+        terms = model._dflash_metric_chunk_terms(
             hidden, target_ids, weights, predecessors
         )
 
@@ -653,10 +710,10 @@ class CandidateSelectorTest(unittest.TestCase):
             any(
                 name.startswith(
                     (
-                        "dflash2/teacher/",
-                        "dflash2/hard_label/unary_",
-                        "dflash2/hard_label/expected_acceptance",
-                        "dflash2/hard_label/selector_serving_",
+                        "dflash/",
+                        "position_",
+                        "dflash2/selector/serving_",
+                        "dflash2/selector/conditional_",
                     )
                 )
                 for name in metrics["ratio_metrics"]
