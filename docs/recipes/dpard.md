@@ -12,9 +12,9 @@ s_t = alpha + (1 - alpha) a_t
 W_t = stop_gradient(sum_{k=t}^D product_{i=1}^k s_i)
 ```
 
-The actor applies the detached `W_t` weights to `R_t`.
-The confidence head predicts `a_t`. Its BCE is weighted by the detached
-cumulative reach `product_{i<t} a_i` and averaged over valid blocks.
+The actor applies the detached `W_t` weights to `R_t`. The confidence head
+predicts `a_t`, with BCE weighted by detached cumulative reach
+`product_{i<t} a_i`. Both terms are averaged over valid blocks.
 
 ## Offline training
 

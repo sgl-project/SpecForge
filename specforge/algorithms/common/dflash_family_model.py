@@ -1897,7 +1897,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dpard_credit_position_num = ce_num.new_zeros(block_size)
         l1_num = zero
         confidence_num = zero
-        dpard_confidence_den = zero
         confidence_error_num = zero
         teacher_agreement_num = zero
         teacher_top1_num = zero
@@ -1972,7 +1971,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
                             masked_acceptance[..., :-1], dim=-1
                         )
                     confidence_weights = reach * eval_mask
-                    dpard_confidence_den = eval_mask.any(dim=-1).float().sum()
             confidence_per_token = F.binary_cross_entropy_with_logits(
                 confidence_pred.float(),
                 accept_probability.detach(),
@@ -2027,7 +2025,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             tau_den,
             dpard_loss_num,
             dpard_credit_position_num,
-            dpard_confidence_den,
         )
 
     def _compute_dspark_loss(
@@ -2099,12 +2096,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
             tau_den,
             dpard_loss_num,
             dpard_credit_position_num,
-            dpard_confidence_den,
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
-        global_dpard_position_den = eval_den.detach().clone()
-        global_dpard_confidence_den = dpard_confidence_den.detach().clone()
+        global_dpard_block_den = tau_den.detach().clone()
         world_size = 1
         import torch.distributed as dist
 
@@ -2112,26 +2107,17 @@ class OnlineDSparkModel(OnlineDFlashModel):
             world_size = dist.get_world_size()
             if world_size > 1:
                 if self.loss_type == "dpard":
-                    if self.dspark_confidence_head_alpha > 0:
-                        dist.all_reduce(
-                            global_dpard_confidence_den, op=dist.ReduceOp.SUM
-                        )
-                    dist.all_reduce(global_dpard_position_den, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(global_dpard_block_den, op=dist.ReduceOp.SUM)
                 else:
                     dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
         if self.loss_type == "dpard":
-            if float(global_dpard_position_den) <= 0:
-                raise ValueError("D-PARD actor has no valid position")
-            loss = world_size * dpard_loss_num / global_dpard_position_den
-            if self.dspark_confidence_head_alpha > 0:
-                if float(global_dpard_confidence_den) <= 0:
-                    raise ValueError("D-PARD confidence has no valid block")
-                loss = loss + (
-                    world_size
-                    * self.dspark_confidence_head_alpha
-                    * confidence_num
-                    / global_dpard_confidence_den
-                )
+            if float(global_dpard_block_den) <= 0:
+                raise ValueError("D-PARD objective has no valid block")
+            loss = (
+                world_size
+                * (dpard_loss_num + self.dspark_confidence_head_alpha * confidence_num)
+                / global_dpard_block_den
+            )
         else:
             if float(global_loss_den) <= 0:
                 raise ValueError("DSpark objective has no supervised target tokens")
@@ -2146,7 +2132,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             )
 
         confidence_den = (
-            dpard_confidence_den if self.loss_type == "dpard" else local_loss_den
+            tau_den if self.loss_type == "dpard" else local_loss_den
         ).detach()
         ratio_metrics = {
             "acc": (correct_num, eval_den),
@@ -2163,7 +2149,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if self.loss_type == "dpard":
             ratio_metrics["dpard_loss"] = (
                 dpard_loss_num.detach(),
-                eval_den.detach(),
+                tau_den.detach(),
             )
             ratio_metrics["dpard_credit_position"] = (
                 dpard_credit_position_num,

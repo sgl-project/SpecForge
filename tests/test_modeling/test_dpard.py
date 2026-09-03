@@ -81,5 +81,6 @@ class TestDPardModel(unittest.TestCase):
             self.assertTrue((count >= 0).all())
             num, den = metrics["ratio_metrics"]["dpard_loss"]
             self.assertGreater(float(den), 0.0)
-            torch.testing.assert_close(den, count.sum())
+            _, confidence_den = metrics["ratio_metrics"]["confidence_loss"]
+            torch.testing.assert_close(den, confidence_den)
             self.assertTrue(torch.isfinite(num))
