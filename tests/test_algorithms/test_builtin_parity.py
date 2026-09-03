@@ -87,7 +87,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
         expected = {
             "dflash": (
                 "hidden_states",
-                None,
+                "target_last_hidden_states",
                 (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
                 None,
             ),
@@ -214,6 +214,38 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 self.assertTrue(
                     torch.all(batch["target_last_hidden_states"][0, 2:] == 0)
                 )
+
+    def test_dflash_collator_preserves_optional_teacher_hidden_states(self):
+        short = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "loss_mask": torch.ones(1, 2, dtype=torch.long),
+            "hidden_states": torch.ones(1, 2, 4),
+            "target_last_hidden_states": torch.ones(1, 2, 3),
+        }
+        long = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "loss_mask": torch.ones(1, 3, dtype=torch.long),
+            "hidden_states": torch.ones(1, 3, 4),
+            "target_last_hidden_states": torch.ones(1, 3, 3),
+        }
+        collate = (
+            self.registry.resolve("dflash")
+            .providers.server_streaming_for("text")
+            .build_collator()
+        )
+
+        batch = collate([short, long])
+
+        self.assertEqual((2, 3, 3), tuple(batch["target_last_hidden_states"].shape))
+        self.assertTrue(torch.all(batch["target_last_hidden_states"][0, 2:] == 0))
+
+        without_teacher = {
+            key: value
+            for key, value in short.items()
+            if key != "target_last_hidden_states"
+        }
+        with self.assertRaisesRegex(KeyError, "target_last_hidden_states"):
+            collate([without_teacher, long])
 
     def test_dspark_offline_contract_and_normalizer_preserve_target_hidden(self):
         registration = self.registry.resolve("dspark")

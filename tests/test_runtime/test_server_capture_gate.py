@@ -417,8 +417,17 @@ class TestServerCaptureGate(unittest.TestCase):
         (ref,) = adapter.produce_refs(self._tasks(rows), capture=contract)
         self.assertIsInstance(ref, SampleRef, f"expected a ref, got: {ref}")
         out, handle = store.get(ref)
-        self.assertEqual(sorted(out), ["hidden_states", "input_ids", "loss_mask"])
+        self.assertEqual(
+            sorted(out),
+            [
+                "hidden_states",
+                "input_ids",
+                "loss_mask",
+                "target_last_hidden_states",
+            ],
+        )
         self.assertEqual(out["hidden_states"].shape, (1, 5, len(AUX_LAYER_IDS) * H))
+        self.assertEqual(out["target_last_hidden_states"].shape, (1, 5, H))
         aux_ref, _ = self._hf_reference(rows)
         torch.testing.assert_close(
             out["hidden_states"].float(), aux_ref[0].float(), rtol=TOL, atol=TOL

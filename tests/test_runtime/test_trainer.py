@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -41,6 +42,7 @@ class FakeStrategy(DraftTrainStrategy):
     def __init__(self):
         self.model = TinyModel()
         self.last_ctx = None
+        self.contexts = []
 
     def trainable_module(self):
         return self.model
@@ -48,6 +50,7 @@ class FakeStrategy(DraftTrainStrategy):
     def forward_loss(self, batch: TrainBatch, ctx=None) -> StepOutput:
         self.validate_batch(batch)
         self.last_ctx = ctx  # capture what fit() threads in (StepContext regression)
+        self.contexts.append(ctx)
         loss = (self.model.w * batch.tensors["x"].sum()).abs()
         return StepOutput(loss=loss, metrics={"accuracy": torch.tensor(0.5)})
 
@@ -410,13 +413,36 @@ class TestTrainerCore(unittest.TestCase):
         self.assertAlmostEqual(result.metrics["acc"], 4 / 6)
         self.assertAlmostEqual(result.metrics["ploss_0"], 2.0)
         self.assertAlmostEqual(result.metrics["ploss_1"], 4.0)
+        self.assertAlmostEqual(result.metrics["kl_loss_0"], 2.0)
+        self.assertAlmostEqual(result.metrics["kl_loss_1"], 4.0)
+        self.assertAlmostEqual(result.metrics["kl_loss"], 4.0)
         self.assertAlmostEqual(result.metrics["loss"], 4.0)
         self.assertAlmostEqual(result.metrics["acceptance_rate_0"], 0.25)
         self.assertAlmostEqual(result.metrics["acceptance_rate_1"], 0.75)
         self.assertAlmostEqual(result.metrics["acceptance_rate"], 0.5)
+        self.assertAlmostEqual(result.metrics["expected_acceptance_0"], 0.25)
+        self.assertAlmostEqual(result.metrics["expected_acceptance_1"], 0.75)
+        self.assertAlmostEqual(result.metrics["expected_acceptance"], 0.5)
         self.assertNotIn("acces", result.metrics)
         self.assertNotIn("acceptance_rates", result.metrics)
         self.assertNotIn("plosses", result.metrics)
+
+    def test_eagle_lk_objective_is_named_explicitly(self):
+        strategy = FakeStrategy()
+        strategy.ploss_decay = 0.5
+        strategy.eagle3_model = SimpleNamespace(lk_loss_type="alpha")
+        core = TrainerCore(
+            strategy,
+            FakeBackend(strategy.model),
+            accumulation_steps=1,
+        )
+
+        result = core._result(self._eagle_output(), grad_norm=None, stepped=False)
+
+        self.assertAlmostEqual(result.metrics["lk_loss_0"], 2.0)
+        self.assertAlmostEqual(result.metrics["lk_loss_1"], 4.0)
+        self.assertAlmostEqual(result.metrics["lk_loss"], 4.0)
+        self.assertNotIn("kl_loss", result.metrics)
 
     def test_eagle_metrics_sum_counts_across_data_parallel_ranks(self):
         strat = FakeStrategy()
@@ -511,6 +537,10 @@ class TestTrainerController(unittest.TestCase):
             self.assertGreaterEqual(metrics[name], 0.0)
         self.assertGreater(metrics["perf/optimizer_steps_per_hour"], 0.0)
         self.assertGreater(metrics["perf/global_samples_per_second"], 0.0)
+        self.assertEqual(
+            [ctx.collect_detailed_metrics for ctx in strat.contexts],
+            [False, True],
+        )
 
     def test_progress_bar_tracks_optimizer_steps_on_rank_zero(self):
         strat = FakeStrategy()

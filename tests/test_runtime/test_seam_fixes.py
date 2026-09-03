@@ -20,7 +20,7 @@ from specforge.training.backend import (
     TrainingBackend,
 )
 from specforge.training.controller import TrainerController, TrainerCore
-from specforge.training.strategies.base import DFlashTrainStrategy
+from specforge.training.strategies.base import DFlashTrainStrategy, StepContext
 
 
 def _ref(i):
@@ -152,6 +152,7 @@ class _FakeDFlashModel(nn.Module):
         self.w = nn.Parameter(torch.ones(1))
         self.max_valid_anchors = None
         self.received_selector_loss_alpha = None
+        self.target_last_hidden_states = None
 
     def forward(
         self,
@@ -160,10 +161,13 @@ class _FakeDFlashModel(nn.Module):
         loss_mask,
         max_valid_anchors=None,
         selector_loss_alpha=None,
+        target_last_hidden_states=None,
+        collect_detailed_metrics=True,
     ):
         # mirrors OnlineDFlashModel's (loss, accuracy, metrics) contract
         self.max_valid_anchors = max_valid_anchors
         self.received_selector_loss_alpha = selector_loss_alpha
+        self.target_last_hidden_states = target_last_hidden_states
         loss = (self.w * hidden_states.float().sum()).abs()
         acc = torch.tensor(0.5)
         return loss, acc, {"accuracy_denom": loss_mask.sum()}
@@ -194,6 +198,32 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
         out = strat.forward_loss(batch)
         self.assertAlmostEqual(float(out.metrics["accuracy"]), 0.5)
         self.assertEqual(float(out.metrics["accuracy_denom"]), 4.0)
+
+    def test_dflash_strategy_forwards_teacher_hidden_only_for_detailed_metrics(self):
+        model = _FakeDFlashModel()
+        strategy = DFlashTrainStrategy(model)
+        teacher_hidden = torch.randn(1, 4, 8)
+        batch = TrainBatch(
+            sample_ids=["s0"],
+            strategy="dflash",
+            tensors={
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "hidden_states": torch.randn(1, 4, 8),
+                "target_last_hidden_states": teacher_hidden,
+                "loss_mask": torch.ones(1, 4, dtype=torch.long),
+            },
+            metadata={},
+        )
+
+        strategy.forward_loss(batch)
+        self.assertIs(model.target_last_hidden_states, teacher_hidden)
+
+        model.target_last_hidden_states = None
+        strategy.forward_loss(
+            batch,
+            ctx=StepContext(collect_detailed_metrics=False),
+        )
+        self.assertIsNone(model.target_last_hidden_states)
 
     def test_dflash_validate_batch_rejects_missing(self):
         strat = DFlashTrainStrategy(_FakeDFlashModel())

@@ -272,6 +272,7 @@ def _reduce_eagle3_metrics(
     process_group: Any,
     ploss_decay: float,
     reduce: bool,
+    objective_metric_name: Optional[str] = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """Reduce EAGLE3's per-position training telemetry as numerators/counts.
 
@@ -355,6 +356,8 @@ def _reduce_eagle3_metrics(
     for index in range(length):
         result[f"acc_{index}"] = reduced_acc[index]
         result[f"ploss_{index}"] = reduced_ploss[index]
+        if objective_metric_name is not None:
+            result[f"{objective_metric_name}_{index}"] = reduced_ploss[index]
 
     result["acc"] = packed[0].sum().div(packed[1].sum().clamp_min(1e-6))
     weights = torch.tensor(
@@ -363,12 +366,16 @@ def _reduce_eagle3_metrics(
         device=reduced_ploss.device,
     )
     result["loss"] = (reduced_ploss * weights).sum()
+    if objective_metric_name is not None:
+        result[objective_metric_name] = result["loss"]
 
     if acceptance_rates is not None:
         reduced_acceptance = packed[4] / packed[5].clamp_min(1e-6)
         for index in range(length):
             result[f"acceptance_rate_{index}"] = reduced_acceptance[index]
+            result[f"expected_acceptance_{index}"] = reduced_acceptance[index]
         result["acceptance_rate"] = reduced_acceptance.mean()
+        result["expected_acceptance"] = result["acceptance_rate"]
     return result
 
 
@@ -481,12 +488,22 @@ class TrainerCore:
         )
         parallel_config = getattr(self.backend, "parallel_config", None)
         process_group = getattr(parallel_config, "fsdp_process_group", None)
+        eagle3_model = getattr(self.strategy, "eagle3_model", None)
+        if eagle3_model is not None and not hasattr(eagle3_model, "lk_loss_type"):
+            eagle3_model = getattr(eagle3_model, "module", eagle3_model)
+        objective_metric_name = (
+            "lk_loss"
+            if eagle3_model is not None
+            and getattr(eagle3_model, "lk_loss_type", None) is not None
+            else "kl_loss"
+        )
         structured = _reduce_eagle3_metrics(
             out.metrics,
             device=metric_device,
             process_group=process_group,
             ploss_decay=float(getattr(self.strategy, "ploss_decay", 1.0)),
             reduce=stepped,
+            objective_metric_name=objective_metric_name,
         )
         # Structured EAGLE3 metrics are already globally reduced.  Remaining
         # scalar diagnostics are DP-averaged in a single collective at optimizer
@@ -743,7 +760,12 @@ class TrainerController:
                 result = self.core.train_step(
                     batch,
                     ctx=StepContext(
-                        global_step=self.global_step, total_steps=self.total_steps
+                        global_step=self.global_step,
+                        total_steps=self.total_steps,
+                        collect_detailed_metrics=(
+                            self.logger is not None
+                            and (self.global_step + 1) % max(1, self.log_interval) == 0
+                        ),
                     ),
                 )
                 perf_train_compute_s += time.perf_counter() - train_compute_started
