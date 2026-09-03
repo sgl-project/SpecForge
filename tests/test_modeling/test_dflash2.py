@@ -397,41 +397,39 @@ class CandidateSelectorTest(unittest.TestCase):
         expected_keys = {
             "lk_loss",
             "expected_acceptance",
-            "dflash2/hard_label/unary_top1_accuracy/position_1",
-            "dflash2/hard_label/unary_top1_accuracy/position_2",
-            "dflash2/hard_label/unary_top2_recall/position_1",
-            "dflash2/hard_label/unary_top2_recall/position_2",
-            "dflash2/hard_label/selector_loss/position_1",
-            "dflash2/hard_label/unary_top2_mass/position_1",
+            "dflash2/hard_label/unary_top1_accuracy",
             "dflash2/hard_label/selector_conditional_accuracy",
-            "dflash2/hard_label/selector_conditional_accuracy/position_2",
             "dflash2/hard_label/unary_top2_oracle_accepted_length",
             "dflash2/hard_label/selector_serving_accepted_length",
-            "dflash2/objective/loss_weight_share/position_1",
-            "dflash2/teacher/expected_acceptance/position_1",
-            "dflash2/teacher/expected_acceptance/position_2",
-            "dflash2/teacher/unary_top1_agreement/position_1",
-            "dflash2/teacher/unary_top2_mass/position_2",
-            "dflash2/teacher/selector_serving_agreement/position_2",
+            "position_1/hard_label/unary_top1_accuracy",
+            "position_2/hard_label/unary_top1_accuracy",
+            "position_1/hard_label/unary_top2_recall",
+            "position_2/hard_label/unary_top2_recall",
+            "position_1/hard_label/selector_loss",
+            "position_1/hard_label/unary_top2_mass",
+            "position_2/hard_label/selector_conditional_accuracy",
+            "position_1/objective/loss_weight_share",
+            "position_1/teacher/expected_acceptance",
+            "position_2/teacher/expected_acceptance",
+            "position_1/teacher/unary_top1_agreement",
+            "position_2/teacher/unary_top2_mass",
+            "position_2/teacher/selector_serving_agreement",
         }
         self.assertTrue(expected_keys.issubset(ratios))
-        self.assertFalse(any(key.endswith("position_0") for key in ratios))
+        self.assertFalse(any(key.startswith("position_0/") for key in ratios))
+        self.assertFalse(any("/position_" in key for key in ratios))
         self.assertNotIn("objective/lk_kl_weight", ratios)
 
         def ratio(name):
             numerator, denominator = ratios[name]
             return float(numerator / denominator)
 
-        self.assertEqual(
-            ratio("dflash2/hard_label/unary_top1_accuracy/position_1"), 1.0
-        )
-        self.assertEqual(
-            ratio("dflash2/hard_label/unary_top1_accuracy/position_2"), 0.0
-        )
-        self.assertEqual(ratio("dflash2/hard_label/unary_top2_recall/position_1"), 1.0)
-        self.assertEqual(ratio("dflash2/hard_label/unary_top2_recall/position_2"), 0.0)
-        self.assertEqual(ratio("dflash2/teacher/unary_top1_agreement/position_1"), 1.0)
-        self.assertEqual(ratio("dflash2/teacher/unary_top1_agreement/position_2"), 0.0)
+        self.assertEqual(ratio("position_1/hard_label/unary_top1_accuracy"), 1.0)
+        self.assertEqual(ratio("position_2/hard_label/unary_top1_accuracy"), 0.0)
+        self.assertEqual(ratio("position_1/hard_label/unary_top2_recall"), 1.0)
+        self.assertEqual(ratio("position_2/hard_label/unary_top2_recall"), 0.0)
+        self.assertEqual(ratio("position_1/teacher/unary_top1_agreement"), 1.0)
+        self.assertEqual(ratio("position_2/teacher/unary_top1_agreement"), 0.0)
         # Position 1 is covered and served correctly, position 2 is uncovered:
         # both accepted-length walks credit the anchor plus one slot.
         self.assertEqual(
@@ -441,8 +439,8 @@ class CandidateSelectorTest(unittest.TestCase):
             ratio("dflash2/hard_label/selector_serving_accepted_length"), 2.0
         )
         # Uniform dflash weights split the objective evenly over both slots.
-        self.assertEqual(ratio("dflash2/objective/loss_weight_share/position_1"), 0.5)
-        self.assertEqual(ratio("dflash2/objective/loss_weight_share/position_2"), 0.5)
+        self.assertEqual(ratio("position_1/objective/loss_weight_share"), 0.5)
+        self.assertEqual(ratio("position_2/objective/loss_weight_share"), 0.5)
 
     def test_metric_chunk_reports_accepted_lengths_and_unweighted_selector_terms(
         self,

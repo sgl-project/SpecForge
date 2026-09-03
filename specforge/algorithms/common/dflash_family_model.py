@@ -483,10 +483,15 @@ class OnlineDFlashModel(nn.Module):
         numerators: torch.Tensor,
         denominators: torch.Tensor,
     ) -> None:
-        """Add one explicitly named ratio per predicted block position."""
+        """Add one ratio per predicted block position.
 
+        Per-position keys live under their own ``position_<k>/`` tracker
+        section so each block position renders as one dashboard group.
+        """
+
+        family = name.removeprefix("dflash2/")
         for position in range(1, numerators.numel()):
-            metrics[f"{name}/position_{position}"] = (
+            metrics[f"position_{position}/{family}"] = (
                 numerators[position].detach(),
                 denominators[position].detach(),
             )

@@ -54,10 +54,14 @@ def scalar_metrics(metrics: Mapping[str, Any]) -> Dict[str, float]:
 
 
 def training_metric_names(metrics: Mapping[str, float]) -> Dict[str, float]:
-    """Prefix plain strategy metrics with ``train/``; ``eval/`` and ``perf/``
-    keys already carry their namespace."""
+    """Prefix plain strategy metrics with ``train/``; ``eval/``, ``perf/`` and
+    per-position ``position_<k>/`` keys already carry their section."""
     return {
-        key if key.startswith(("train/", "eval/", "perf/")) else f"train/{key}": value
+        (
+            key
+            if key.startswith(("train/", "eval/", "perf/", "position_"))
+            else f"train/{key}"
+        ): value
         for key, value in metrics.items()
     }
 

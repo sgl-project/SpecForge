@@ -135,12 +135,14 @@ class TrackingLoggerTest(unittest.TestCase):
                     "loss": 1.0,
                     "eval/loss": 2.0,
                     "perf/optimizer_step_time_s": 3.0,
+                    "position_1/hard_label/unary_top1_accuracy": 0.5,
                 }
             ),
             {
                 "train/loss": 1.0,
                 "eval/loss": 2.0,
                 "perf/optimizer_step_time_s": 3.0,
+                "position_1/hard_label/unary_top1_accuracy": 0.5,
             },
         )
 
