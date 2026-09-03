@@ -272,7 +272,7 @@ def _compute_model_resume_provenance(
         "_name_or_path",
         None,
     )
-    return {
+    provenance = {
         MODEL_SOURCE_IDENTITY_FORMAT_FIELD: MODEL_SOURCE_IDENTITY_FORMAT,
         "target_model": model_source_identity(cfg.model.target_model_path),
         "target_revision": getattr(target_config, "_commit_hash", None),
@@ -290,6 +290,12 @@ def _compute_model_resume_provenance(
         "input_modality": cfg.model.input_modality,
         "torch_dtype": cfg.model.torch_dtype,
     }
+    target_head_path = getattr(cfg.model, "target_head_path", None)
+    if target_head_path:
+        # Recorded only when configured so checkpoints written before this
+        # field existed keep comparing equal on resume.
+        provenance["target_head"] = model_source_identity(target_head_path)
+    return provenance
 
 
 def model_resume_provenance(

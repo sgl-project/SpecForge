@@ -73,6 +73,12 @@ model:
   lm_head_key: lm_head.weight
 ```
 
+`model.target_head_path` is an optional trainer-only checkpoint for the
+`embedding_key` / `lm_head_key` tensors. Set it when `target_model_path` is a
+quantized export (for example NVFP4) whose packed `lm_head` the trainer cannot
+load: SGLang keeps serving the quantized target while the trainer reads the
+full-width BF16 head from the unquantized checkpoint or a head-only export.
+
 Every online run uses `model.target_backend: sglang`. Add target-model support
 to the SGLang capture server instead of adding an HF/custom target loader to
 the trainer. Target TP/EP and model-specific inference stay on that server;
