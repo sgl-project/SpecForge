@@ -155,6 +155,36 @@ Before rerunning, clear stale control state:
 - If the capture producer dies with `ACL_ERROR_RT_CONTEXT_NULL` (107002), the
   installed SpecForge predates the NPU transport bind — upgrade past #722.
 
+### Training DFlash 2 drafts
+
+DFlash 2 reuses the DFlash strategy and capture path end to end, so the
+external-server setup above carries over unchanged — including the
+`--spec-capture-aux-layer-ids 1 8 15 22 29` flags, which match
+`configs/qwen3.5-4b-dflash2.json`. Use the checked-in
+[`qwen3.5-4b-dflash2-online-npu.yaml`](../../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-online-npu.yaml)
+recipe:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=1,2,3,4,5,6,7,8 \
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-online-npu.yaml
+```
+
+Notes specific to DFlash 2 on Ascend:
+
+- **`attention_backend: sdpa` is mandatory** (already set in the recipe). The
+  schema default `flex_attention` is rejected at the first training forward
+  with `flex_attention is not available on this device; use sdpa/eager`.
+- **`sdpa` and `eager` share the explicit boolean-mask path**; both implement
+  the same block-local draft visibility, and the grouped convolutions operate
+  inside each proposal block independently of the attention mask. The checked-in
+  4B draft uses `full_attention` layers only, so no sliding-window mask is
+  involved.
+- **Selector knobs keep their defaults** (`dflash2_selector_loss_alpha: 1.0`,
+  zero warmup/ramp). The selector and convolutions are stock torch ops and need
+  no NPU-specific settings.
+- **Serving the export** still requires an SGLang build with DFlash 2 support
+  (SGLang PR #35371); training-side capture is unchanged.
+
 ---
 
 ## 4. Managed-local full stack (one command)
