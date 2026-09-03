@@ -16,6 +16,7 @@ dependencies = [
     "datasets",
     "tqdm",
     "accelerate",
+    "click>=8.0",
     "huggingface-hub",
     "numpy",
     "openai-harmony",
