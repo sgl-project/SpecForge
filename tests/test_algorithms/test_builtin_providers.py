@@ -47,7 +47,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         first = resume_contract(None, draft, model)
         self.assertEqual(first["dspark_loss_type"], "dpard")
         self.assertEqual(first["dpard_alpha"], 0.5)
-        self.assertEqual(first["dpard_actor_reduction"], "valid_position_mean")
+        self.assertEqual(first["dpard_actor_reduction"], "valid_block_mean")
         self.assertEqual(first["dpard_confidence_weighting"], "cumulative_reach")
         self.assertEqual(first["dpard_confidence_reduction"], "valid_block_mean")
         model.dpace_alpha = 0.75

@@ -380,9 +380,8 @@ class TestDFlashLosses(unittest.TestCase):
         bce = F.binary_cross_entropy_with_logits(
             conf.float(), acceptance, reduction="none"
         )
-        valid_positions = mask.float().sum()
         valid_blocks = mask.any(dim=-1).float().sum()
-        want = (actor * credit).sum() / valid_positions + (
+        want = (actor * credit).sum() / valid_blocks + (
             bce * confidence_weights
         ).sum() / valid_blocks
         torch.testing.assert_close(loss.float(), want, atol=1e-6, rtol=1e-6)
@@ -390,7 +389,7 @@ class TestDFlashLosses(unittest.TestCase):
             loss, (logits, conf, target_logits), allow_unused=True
         )
         tilted = ((logp + logq) / 2).softmax(-1)
-        expected_grad = (logq.exp() - tilted) * credit.unsqueeze(-1) / valid_positions
+        expected_grad = (logq.exp() - tilted) * credit.unsqueeze(-1) / valid_blocks
         torch.testing.assert_close(grad.float(), expected_grad, atol=1e-6, rtol=1e-5)
         expected_conf_grad = (
             (conf.float().sigmoid() - acceptance) * confidence_weights / valid_blocks
@@ -399,7 +398,7 @@ class TestDFlashLosses(unittest.TestCase):
         num, den = metrics["ratio_metrics"]["dpard_loss"]
         torch.testing.assert_close(
             num / den,
-            (actor.detach() * credit).sum() / valid_positions,
+            (actor.detach() * credit).sum() / valid_blocks,
             check_dtype=False,
         )
         confidence_num, confidence_den = metrics["ratio_metrics"]["confidence_loss"]
@@ -410,7 +409,7 @@ class TestDFlashLosses(unittest.TestCase):
         )
         self.assertIsNone(target_grad)
 
-    def test_dpard_pools_valid_position_and_confidence_denominators(self):
+    def test_dpard_pools_shared_valid_block_denominator(self):
         import torch.distributed as dist
 
         model = _make_dspark_model(
@@ -430,21 +429,17 @@ class TestDFlashLosses(unittest.TestCase):
             target_last_hidden_states=torch.randn_like(self.hidden_states),
         )
         _, _, metrics = model(**inputs)
-        actor_num, actor_valid_positions = metrics["ratio_metrics"]["dpard_loss"]
+        actor_num, actor_valid_blocks = metrics["ratio_metrics"]["dpard_loss"]
         conf_num, conf_den = metrics["ratio_metrics"]["confidence_loss"]
-        other_rank = iter([7.0, 3.0])
+        torch.testing.assert_close(actor_valid_blocks, conf_den)
         with (
             patch.object(dist, "is_available", return_value=True),
             patch.object(dist, "is_initialized", return_value=True),
             patch.object(dist, "get_world_size", return_value=2),
-            patch.object(
-                dist, "all_reduce", side_effect=lambda t, **kw: t.add_(next(other_rank))
-            ),
+            patch.object(dist, "all_reduce", side_effect=lambda t, **kw: t.add_(7.0)),
         ):
             loss, _, _ = model(**inputs)
-        expected = 2 * (
-            actor_num / (actor_valid_positions + 3) + conf_num / (conf_den + 7)
-        )
+        expected = 2 * (actor_num + conf_num) / (conf_den + 7)
         torch.testing.assert_close(loss, expected, check_dtype=False)
 
     def test_dpard_chunking_matches_full_loss_and_gradient(self):

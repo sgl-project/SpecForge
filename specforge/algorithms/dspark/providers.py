@@ -72,7 +72,7 @@ def resume_contract(_config, draft_model, training_model):
         contract.update(
             dspark_loss_type="dpard",
             dpard_alpha=float(training_model.dpace_alpha),
-            dpard_actor_reduction="valid_position_mean",
+            dpard_actor_reduction="valid_block_mean",
             dpard_confidence_weighting="cumulative_reach",
             dpard_confidence_reduction="valid_block_mean",
         )
