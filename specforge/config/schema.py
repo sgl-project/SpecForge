@@ -551,8 +551,9 @@ class TrainingConfig(StrictConfigModel):
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
     dist_timeout: int = Field(default=10, gt=0)
-    #: EAGLE3 objective.
-    lk_loss_type: Optional[Literal["lambda", "alpha"]] = None
+    #: Acceptance-aware token objective. DFlash-family hard targets make
+    #: ``alpha`` equivalent to CE; ``lambda`` mixes CE and TV.
+    lk_loss_type: Optional[Literal["lambda", "alpha", "tv"]] = None
     kl_scale: float = 1.0
     kl_decay: float = 1.0
     #: Compute the teacher target_p, draft logits and loss only at supervised
@@ -573,6 +574,15 @@ class TrainingConfig(StrictConfigModel):
         "dpace-continuation-value-only",
     ] = "dflash"
     dpace_alpha: float = 0.5
+    #: Weight of the top-k path-selector objective for DFlash2 drafts.
+    dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
+    #: Fraction of optimizer steps that train only the DFlash2 base objective.
+    dflash2_selector_warmup_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    #: Fraction of optimizer steps used to ramp the selector weight to its target.
+    dflash2_selector_ramp_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    #: Stop selector gradients at the unary/backbone boundary while preserving
+    #: the primary DFlash/D-PACE/LK gradient path.
+    dflash2_selector_stop_gradient: bool = False
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1

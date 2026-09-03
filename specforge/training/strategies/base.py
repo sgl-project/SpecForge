@@ -467,22 +467,50 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.dflash_model.parameters()).device
 
+    def _selector_loss_alpha(self, ctx: Optional[StepContext]) -> float:
+        target = float(getattr(self.dflash_model, "selector_loss_alpha", 0.0))
+        if target <= 0 or ctx is None or not ctx.total_steps:
+            return target
+
+        total_steps = int(ctx.total_steps)
+        warmup_steps = int(
+            total_steps
+            * float(getattr(self.dflash_model, "selector_warmup_ratio", 0.0))
+        )
+        if ctx.global_step < warmup_steps:
+            return 0.0
+
+        ramp_steps = int(
+            total_steps * float(getattr(self.dflash_model, "selector_ramp_ratio", 0.0))
+        )
+        if ramp_steps <= 0:
+            return target
+        ramp_progress = min(
+            max((ctx.global_step - warmup_steps + 1) / ramp_steps, 0.0),
+            1.0,
+        )
+        return target * ramp_progress
+
     def forward_loss(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepOutput:
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
+        selector_loss_alpha = self._selector_loss_alpha(ctx)
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
         loss, accuracy, model_metrics = self.dflash_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
             max_valid_anchors=max_valid_anchors,
+            selector_loss_alpha=selector_loss_alpha,
         )
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:
             metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
+        if "selector_loss_alpha" in model_metrics:
+            metrics["selector_loss_alpha"] = model_metrics["selector_loss_alpha"]
         return StepOutput(
             loss=loss,
             metrics=metrics,

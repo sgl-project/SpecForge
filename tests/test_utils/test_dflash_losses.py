@@ -367,6 +367,31 @@ class TestDFlashLosses(unittest.TestCase):
         want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=gamma)
         torch.testing.assert_close(got, want, rtol=0, atol=1e-8)
 
+    def test_dflash_tv_objective_matches_hard_target_total_variation(self):
+        got = self._forward_loss(lk_loss_type="tv")
+        want = ((1.0 - self.q) * self.binary_mask).sum() / self.binary_mask.sum()
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
+
+    def test_dflash_lk_lambda_mixes_ce_and_tv(self):
+        kl_scale = 1.0
+        kl_decay = 1.0
+        got = self._forward_loss(
+            lk_loss_type="lambda",
+            kl_scale=kl_scale,
+            kl_decay=kl_decay,
+        )
+        ce = (self.neg_log_q * self.binary_mask).sum() / self.binary_mask.sum()
+        tv = ((1.0 - self.q) * self.binary_mask).sum() / self.binary_mask.sum()
+        acceptance = (self.q * self.binary_mask).sum() / self.binary_mask.sum()
+        lk_weight = kl_scale * torch.exp(-kl_decay * acceptance)
+        want = lk_weight * ce + (1.0 - lk_weight) * tv
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
+
+    def test_dflash_lk_alpha_equals_ce_for_hard_targets(self):
+        got = self._forward_loss(lk_loss_type="alpha")
+        want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=None)
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
+
     def test_dflash_exposes_additive_loss_and_accuracy_terms(self):
         head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
         model = _make_model(
@@ -414,9 +439,20 @@ class TestDFlashLosses(unittest.TestCase):
         alpha = 0.5
         got = self._forward_loss(loss_type="dpace", dpace_alpha=alpha)
         weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
-        want = (self.neg_log_q * weight * self.binary_mask).sum() / float(
-            self.input_ids.shape[0]
+        effective_weight = weight * self.binary_mask
+        want = (self.neg_log_q * effective_weight).sum() / effective_weight.sum()
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
+
+    def test_dpace_tv_uses_dynamic_position_weights(self):
+        alpha = 0.5
+        got = self._forward_loss(
+            loss_type="dpace",
+            dpace_alpha=alpha,
+            lk_loss_type="tv",
         )
+        weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
+        effective_weight = weight * self.binary_mask
+        want = ((1.0 - self.q) * effective_weight).sum() / effective_weight.sum()
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
     def test_cumulative_confidence_ablation_matches_naive_reference(self):
@@ -430,9 +466,8 @@ class TestDFlashLosses(unittest.TestCase):
             alpha,
             "dpace-cumulative-confidence-only",
         )
-        want = (self.neg_log_q * weight * self.binary_mask).sum() / float(
-            self.input_ids.shape[0]
-        )
+        effective_weight = weight * self.binary_mask
+        want = (self.neg_log_q * effective_weight).sum() / effective_weight.sum()
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
     def test_continuation_value_ablation_matches_naive_reference(self):
@@ -446,12 +481,11 @@ class TestDFlashLosses(unittest.TestCase):
             alpha,
             "dpace-continuation-value-only",
         )
-        want = (self.neg_log_q * weight * self.binary_mask).sum() / float(
-            self.input_ids.shape[0]
-        )
+        effective_weight = weight * self.binary_mask
+        want = (self.neg_log_q * effective_weight).sum() / effective_weight.sum()
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
-    def test_dpace_loss_reduces_by_batch_size(self):
+    def test_dpace_loss_reduces_by_effective_token_weight(self):
         alpha = 0.5
         model = _make_model(
             self.logits,
@@ -466,16 +500,34 @@ class TestDFlashLosses(unittest.TestCase):
             loss_mask=self.loss_mask,
         )
         weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
-        weighted_sum = (self.neg_log_q * weight * self.binary_mask).sum()
-        token_count_loss = weighted_sum / ((weight * self.binary_mask).sum() + 1e-6)
-        batch_loss = weighted_sum / float(self.input_ids.shape[0])
-        torch.testing.assert_close(got, batch_loss, rtol=0, atol=1e-10)
+        effective_weight = weight * self.binary_mask
+        weighted_sum = (self.neg_log_q * effective_weight).sum()
+        effective_weight_sum = effective_weight.sum()
+        token_loss = weighted_sum / effective_weight_sum
+        torch.testing.assert_close(got, token_loss, rtol=0, atol=1e-10)
         torch.testing.assert_close(metrics["loss_terms"][0], weighted_sum)
-        torch.testing.assert_close(
-            metrics["loss_terms"][1],
-            got.new_tensor(float(self.input_ids.shape[0])),
+        torch.testing.assert_close(metrics["loss_terms"][1], effective_weight_sum)
+
+    def test_dpace_zero_effective_weight_has_finite_local_loss(self):
+        logits = torch.zeros_like(self.logits)
+        logits.scatter_(-1, self.targets.unsqueeze(-1), -1000.0)
+        model = _make_model(
+            logits,
+            self.anchors,
+            self.keep_mask,
+            loss_type="dpace",
+            dpace_alpha=0.0,
         )
-        self.assertFalse(torch.allclose(got, token_count_loss))
+
+        loss, _accuracy, metrics = model(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(loss.item(), 0.0)
+        self.assertEqual(metrics["loss_terms"][1].item(), 0.0)
 
     def test_alpha_changes_dpace_loss(self):
         low_alpha = self._forward_loss(loss_type="dpace", dpace_alpha=0.1)

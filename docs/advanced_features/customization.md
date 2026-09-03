@@ -57,7 +57,7 @@ strategy-specific set:
 | --- | --- |
 | EAGLE3 | `sdpa`, `flex_attention`, `fa`, offline `usp` |
 | P-EAGLE | `flex_attention` |
-| DFlash, Domino, DSpark | `eager`, `sdpa`, `flex_attention` |
+| DFlash, DFlash2, Domino, DSpark | `eager`, `sdpa`, `flex_attention` |
 
 ## Target models
 
@@ -84,6 +84,49 @@ EAGLE3 offline sequence parallelism is selected with
 `training.sp_ring_size`. Evaluation, compact-teacher projection, and experiment
 tracking are also config features rather than custom launchers; see the
 [training guide](../basic_usage/training.md) for their validated combinations.
+
+## DFlash-family attention modes
+
+DFlash-family draft models select their attention parameterization with
+`dflash_config.attention_mode`: `gqa` (the default), `mha`, or `mla`. The mode
+swaps only the attention projections inside the shared decoder layer; the
+`DFlashDraftModel`, `DFlash2DraftModel`, `DominoDraftModel`, and
+`DSparkDraftModel` architectures, target-context injection, per-layer
+full/sliding masks, objectives, capture contract, and
+`eager`/`sdpa`/`flex_attention` backend selection are identical across modes.
+Multi-head Latent Attention is therefore a draft JSON change, not a new
+architecture:
+
+```json
+{
+  "architectures": ["DSparkDraftModel"],
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "q_lora_rank": 1536,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 128,
+  "dflash_config": {
+    "projector_type": "dspark",
+    "attention_mode": "mla"
+  }
+}
+```
+
+MLA dimensions and behavior use the standard top-level Hugging Face fields:
+`q_lora_rank` (`null` selects a direct query projection), `kv_lora_rank`, the
+head dims (`qk_nope_head_dim` may be zero; `qk_rope_head_dim` must be even),
+and `rope_interleave` for the rotation convention (omitted means interleaved,
+the DeepSeek default; `false` selects NeoX-style half rotation). Omitting
+`attention_mode` preserves the existing GQA path; `"mha"` requires equal
+query/KV head counts.
+
+MLA is a training-side mode: checkpoints train, evaluate through
+`spec_generate`, and export through `--to hf`. SGLang serving of DFlash-family
+drafts currently implements the GQA/MHA layout only, so plan benchmarks
+accordingly. DFlash2 otherwise follows the same mode selection; its convolution
+and selector do not change the attention projection contract.
 
 ## Draft architectures
 

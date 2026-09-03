@@ -10,12 +10,15 @@
 
 from __future__ import annotations
 
+import logging
 from array import array
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -30,6 +33,17 @@ from specforge.distributed import get_tp_group
 
 from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
+
+logger = logging.getLogger(__name__)
+
+# SGLang capture hooks tried in order for each capture method. K3-class targets
+# expose a native DSpark hook; dense targets serve the same auxiliary
+# hidden-state layout through the DFlash hook, so DSpark falls back to it.
+_CAPTURE_LAYER_HOOKS = {
+    "eagle3": ("set_eagle3_layers_to_capture",),
+    "dflash": ("set_dflash_layers_to_capture",),
+    "dspark": ("set_dspark_layers_to_capture", "set_dflash_layers_to_capture"),
+}
 
 
 class OfflineSGLangCaptureBackend:
@@ -61,18 +75,50 @@ class OfflineSGLangCaptureBackend:
         )
 
         tp_rank = dist.get_rank(get_tp_group())
-        moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+        attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
+            compute_dp_attention_world_info(
+                server_args.enable_dp_attention,
+                tp_rank,
+                server_args.tp_size,
+                server_args.dp_size,
+                server_args.attn_cp_size,
+            )
+        )
+        attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+        moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
+        moe_ep_rank = (
+            tp_rank
+            % (server_args.tp_size // server_args.moe_dp_size)
+            // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
+        )
+        gpu_id = torch.cuda.current_device()
+        parallel_state = ParallelState(
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            pp_rank=0,
+            pp_size=1,
+            dp_rank=0,
+            dp_size=server_args.dp_size,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=attn_tp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=server_args.attn_cp_size,
+            attn_dcp_rank=tp_rank % server_args.dcp_size,
+            attn_dcp_size=server_args.dcp_size,
+            attn_dp_rank=attn_dp_rank,
+            attn_dp_size=attn_dp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
+            moe_dp_rank=moe_dp_rank,
+            moe_dp_size=server_args.moe_dp_size,
+            gpu_id=gpu_id,
+        )
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=torch.cuda.current_device(),
-            tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
-            pp_rank=0,
-            pp_size=1,
+            gpu_id=gpu_id,
+            ps=parallel_state,
             server_args=server_args,
             nccl_port=None,
             is_draft_worker=False,
@@ -94,28 +140,35 @@ class OfflineSGLangCaptureBackend:
     ) -> None:
         """Set auxiliary layers through the strategy's SGLang capture API."""
 
-        setter_name = {
-            "eagle3": "set_eagle3_layers_to_capture",
-            "dflash": "set_dflash_layers_to_capture",
-            "dspark": "set_dspark_layers_to_capture",
-        }.get(capture_method)
-        if setter_name is None:
+        setter_names = _CAPTURE_LAYER_HOOKS.get(capture_method)
+        if setter_names is None:
             raise ValueError(
                 "offline SGLang capture method must be 'eagle3', 'dflash', or "
                 "'dspark', "
                 f"got {capture_method!r}"
             )
-        setter = getattr(self.model_runner.model, setter_name, None)
-        if not callable(setter):
-            raise RuntimeError(
-                f"target model does not expose SGLang capture hook {setter_name!r}"
-            )
-        setter(layer_ids)
+        for setter_name in setter_names:
+            setter = getattr(self.model_runner.model, setter_name, None)
+            if not callable(setter):
+                continue
+            if setter_name != setter_names[0]:
+                logger.info(
+                    "capture method %r resolved through compatibility hook %s",
+                    capture_method,
+                    setter_name,
+                )
+            setter(layer_ids)
+            return
+        raise RuntimeError(
+            "target model does not expose a compatible SGLang capture hook; "
+            f"tried {setter_names!r}"
+        )
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch) -> None:
         if require_mlp_sync(self.model_runner.server_args):
             prepare_mlp_sync_batch_raw(
                 batch,
+                model_runner=self.model_runner,
                 dp_size=self.model_runner.server_args.dp_size,
                 attn_tp_size=1,
                 attn_cp_size=getattr(self.model_runner.server_args, "attn_cp_size", 1),
@@ -154,7 +207,12 @@ class OfflineSGLangCaptureBackend:
             )
             batch.prefill_input_ids_cpu = None
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         output = self.model_runner.forward(forward_batch)
         return output.logits_output if hasattr(output, "logits_output") else output
@@ -164,37 +222,33 @@ class OfflineSGLangCaptureBackend:
         self.model_runner.token_to_kv_pool_allocator.clear()
 
     @torch.no_grad()
-    def capture_eagle3(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-    ):
-        """Capture per-request auxiliary and final hidden states without logits."""
+    def capture_rows(self, input_ids: list[list[int]]):
+        """Capture variable-length request rows in one packed prefill.
 
+        Returns ``(aux_rows, last_rows)``: per-row auxiliary and final hidden
+        states split from the packed forward, so callers never build padded
+        tensors. The KV/request pools are cleared after every call.
+        """
+
+        if not input_ids:
+            return (), ()
+        if any(not row for row in input_ids):
+            raise ValueError("SGLang capture rows must contain at least one token")
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs: list[Req] = []
-        data = []
-        input_rows = torch.split(input_ids, 1, dim=0)
-        attention_rows = torch.split(attention_mask, 1, dim=0)
-        loss_rows = torch.split(loss_mask, 1, dim=0)
-
-        for idx, (input_row, attention_row, loss_row) in enumerate(
-            zip(input_rows, attention_rows, loss_rows)
-        ):
+        for idx, input_row in enumerate(input_ids):
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=input_row.view(-1).tolist(),
+                origin_input_ids=list(input_row),
                 sampling_params=sampling_params,
             )
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.fill_len = len(req.full_untruncated_fill_ids)
-            req.extend_input_len = req.fill_len - len(req.prefix_indices)
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
             req.logprob_start_len = len(req.origin_input_ids) - 1
             reqs.append(req)
-            data.append((input_row, attention_row, loss_row))
 
         input_lens = [len(req.origin_input_ids) for req in reqs]
         try:
@@ -203,14 +257,38 @@ class OfflineSGLangCaptureBackend:
             last_hidden_states = getattr(output, "last_hidden_states", None)
             if aux_hidden_states is None or last_hidden_states is None:
                 raise RuntimeError(
-                    "SGLang did not return the hidden states required for "
-                    "offline feature preparation"
+                    "SGLang did not return the hidden states required for capture"
                 )
             aux_rows = torch.split(aux_hidden_states, input_lens, dim=0)
             last_rows = torch.split(last_hidden_states, input_lens, dim=0)
         finally:
             self._clear_pools()
+        return aux_rows, last_rows
 
+    @torch.no_grad()
+    def capture_eagle3(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ):
+        """Capture per-request auxiliary and final hidden states without logits.
+
+        Padded rows are captured as given (padding positions included), which
+        keeps offline feature preparation byte-identical.
+        """
+
+        data = list(
+            zip(
+                torch.split(input_ids, 1, dim=0),
+                torch.split(attention_mask, 1, dim=0),
+                torch.split(loss_mask, 1, dim=0),
+            )
+        )
+        aux_rows, last_rows = self.capture_rows(
+            [input_row.view(-1).tolist() for input_row, _, _ in data]
+        )
         return data, aux_rows, last_rows
 
     def capture(

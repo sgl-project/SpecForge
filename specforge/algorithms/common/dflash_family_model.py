@@ -2,7 +2,7 @@
 """DFlash-family training models and shared masking helpers."""
 
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,49 @@ _VALID_LOSS_TYPES = {
     "dpace-continuation-value-only",
 }
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
+_VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
+
+
+class SelectorTerms(NamedTuple):
+    """Additive selector objective and metric terms for one objective chunk."""
+
+    ce_num: torch.Tensor
+    probability_num: torch.Tensor
+    correct_num: torch.Tensor
+    weight_den: torch.Tensor
+    covered_num: torch.Tensor
+
+    @classmethod
+    def zeros(cls, reference: torch.Tensor) -> "SelectorTerms":
+        return cls(
+            reference.new_zeros(()),
+            reference.new_zeros(()),
+            reference.new_zeros(()),
+            reference.new_zeros(()),
+            reference.new_zeros(()),
+        )
+
+
+class DFlashObjectiveTerms(NamedTuple):
+    """Additive terms for ``OnlineDFlashModel``'s block objective.
+
+    This tuple covers the standard DFlash and D-PACE loss variants, including
+    the optional DFlash2 selector terms. It is not shared with Domino or DSpark;
+    those models define separate objective reductions. The fields stay flat and
+    tensor-only to satisfy ``checkpointed_chunk_reduce``'s chunk-function contract.
+    """
+
+    ce_loss_num: torch.Tensor
+    tv_loss_num: torch.Tensor
+    loss_den: torch.Tensor
+    target_probability_num: torch.Tensor
+    correct_num: torch.Tensor
+    accuracy_den: torch.Tensor
+    selector_ce_num: torch.Tensor
+    selector_probability_num: torch.Tensor
+    selector_correct_num: torch.Tensor
+    selector_weight_den: torch.Tensor
+    selector_covered_num: torch.Tensor
 
 
 def compute_accept_len(
@@ -166,6 +209,13 @@ class OnlineDFlashModel(nn.Module):
         objective_chunk_blocks: int = 128,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
+        selector_loss_alpha: float = 1.0,
+        selector_warmup_ratio: float = 0.0,
+        selector_ramp_ratio: float = 0.0,
+        selector_stop_gradient: bool = False,
+        lk_loss_type: Optional[str] = None,
+        kl_scale: float = 1.0,
+        kl_decay: float = 1.0,
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -176,6 +226,16 @@ class OnlineDFlashModel(nn.Module):
             raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
         if objective_chunk_blocks < 0:
             raise ValueError("objective_chunk_blocks must be >= 0")
+        if selector_loss_alpha < 0:
+            raise ValueError("selector_loss_alpha must be >= 0")
+        if not 0.0 <= selector_warmup_ratio <= 1.0:
+            raise ValueError("selector_warmup_ratio must be in [0, 1]")
+        if not 0.0 <= selector_ramp_ratio <= 1.0:
+            raise ValueError("selector_ramp_ratio must be in [0, 1]")
+        if lk_loss_type not in _VALID_LK_LOSS_TYPES:
+            raise ValueError(
+                "lk_loss_type must be one of None, 'alpha', 'lambda', or 'tv'"
+            )
 
         self.draft_model = draft_model
         self.lm_head = target_lm_head
@@ -188,6 +248,27 @@ class OnlineDFlashModel(nn.Module):
         self.objective_chunk_blocks = int(objective_chunk_blocks)
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        self.selector_loss_alpha = float(selector_loss_alpha)
+        self.selector_warmup_ratio = float(selector_warmup_ratio)
+        self.selector_ramp_ratio = float(selector_ramp_ratio)
+        self.selector_stop_gradient = bool(selector_stop_gradient)
+        self.lk_loss_type = lk_loss_type
+        self.kl_scale = float(kl_scale)
+        self.kl_decay = float(kl_decay)
+
+        candidate_selector = getattr(self.draft_model, "candidate_selector", None)
+        self._selector_objective_enabled = (
+            candidate_selector is not None and self.selector_loss_alpha > 0
+        )
+        if (
+            candidate_selector is not None
+            and not self._selector_objective_enabled
+            and isinstance(candidate_selector, nn.Module)
+        ):
+            # A zero configured weight statically disables selector training.
+            # Freezing keeps those parameters out of BF16Optimizer and prevents
+            # DDP(find_unused_parameters=False) from waiting for their gradients.
+            candidate_selector.requires_grad_(False)
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -385,26 +466,104 @@ class OnlineDFlashModel(nn.Module):
         )
         return anchor_positions, block_keep_mask, output_hidden
 
+    def _selector_chunk_terms(
+        self,
+        candidate_selector: nn.Module,
+        objective_logits: torch.Tensor,
+        hidden: torch.Tensor,
+        target_ids: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        loss_weights: torch.Tensor,
+        weight_mask: torch.Tensor,
+    ) -> SelectorTerms:
+        """Return additive selector terms for one enabled objective chunk.
+
+        The caller gates this helper only on the model-static selector
+        configuration, never on the per-step effective selector alpha. During
+        warmup the zero-scaled CE term must remain in the autograd graph so DDP
+        with ``find_unused_parameters=False`` observes every selector parameter.
+        The caller flattens these fields into ``DFlashObjectiveTerms`` to preserve
+        ``checkpointed_chunk_reduce``'s flat tuple contract.
+        """
+
+        if self.selector_stop_gradient:
+            # Isolate only the selector objective. The caller still uses the
+            # original tensors for the primary DFlash/D-PACE/LK objective.
+            objective_logits = objective_logits.detach()
+            hidden = hidden.detach()
+
+        # Match serving exactly: train only against the strict unary top-k.
+        # Candidate misses are a backbone/recall failure, not a selector
+        # classification example, so they carry no selector gradient.
+        unary_logits, candidate_ids = objective_logits.topk(
+            candidate_selector.top_k,
+            dim=-1,
+        )
+        target_matches = candidate_ids.eq(target_ids.unsqueeze(-1))
+        target_is_candidate = target_matches.any(dim=-1)
+        target_candidate_index = target_matches.long().argmax(dim=-1)
+        selector_logits = candidate_selector.score_candidates(
+            candidate_ids=candidate_ids,
+            unary_logits=unary_logits,
+            hidden_states=hidden,
+            predecessor_ids=predecessor_ids,
+        )
+        selector_ce = F.cross_entropy(
+            selector_logits.float().reshape(-1, selector_logits.shape[-1]),
+            target_candidate_index.reshape(-1),
+            reduction="none",
+        ).reshape_as(target_ids)
+        selector_probability = torch.exp(-selector_ce)
+        selector_loss_weights = loss_weights * target_is_candidate.float()
+        selector_metric_mask = weight_mask * target_is_candidate.float()
+        ce_num = (selector_ce * selector_loss_weights).sum()
+        probability_num = (selector_probability.detach() * selector_metric_mask).sum()
+        weight_den = selector_loss_weights.sum()
+        covered_num = selector_metric_mask.sum()
+        with torch.no_grad():
+            selected_ids = candidate_ids.gather(
+                -1,
+                selector_logits.argmax(dim=-1, keepdim=True),
+            ).squeeze(-1)
+            correct_num = (
+                (selected_ids == target_ids).float() * selector_loss_weights
+            ).sum()
+        return SelectorTerms(
+            ce_num=ce_num,
+            probability_num=probability_num,
+            correct_num=correct_num,
+            weight_den=weight_den,
+            covered_num=covered_num,
+        )
+
     def _dflash_objective_chunk_terms(
         self,
         hidden: torch.Tensor,
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, ...]:
-        """Return additive DFlash/D-PACE loss and accuracy terms."""
+        predecessor_ids: torch.Tensor,
+    ) -> DFlashObjectiveTerms:
+        """Return a flat tuple of additive objective and metric tensors."""
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         logits = self.lm_head(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
+        candidate_selector = getattr(self.draft_model, "candidate_selector", None)
+        objective_logits = (
+            self.draft_model.transform_unary_logits(logits)
+            if candidate_selector is not None
+            else logits
+        )
         neg_log_q = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
+            objective_logits.reshape(-1, objective_logits.shape[-1]),
             target_ids.reshape(-1),
             reduction="none",
         ).reshape_as(target_ids)
 
+        target_probability = torch.exp(-neg_log_q)
+        loss_weights = weight_mask
         if self.loss_type == "dflash":
-            loss_weights = weight_mask
             if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
                 positions = torch.arange(
                     self.block_size,
@@ -414,29 +573,78 @@ class OnlineDFlashModel(nn.Module):
                     -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
                 )
                 loss_weights = loss_weights * decay_weights
-            loss_num = (neg_log_q * loss_weights).sum()
             loss_den = loss_weights.sum()
         elif self.loss_type in _DPACE_LOSS_TYPES:
             with torch.no_grad():
-                target_probability = torch.exp(-neg_log_q)
                 dpace_weights = self._dpace_weight(
-                    target_probability,
+                    target_probability.detach(),
                     weight_mask,
                     weight_mask > 0,
                     self.loss_type,
                 )
-            loss_num = (neg_log_q * weight_mask * dpace_weights).sum()
-            loss_den = loss_num.new_zeros(())
+            loss_weights = weight_mask * dpace_weights
+            loss_den = loss_weights.sum()
         else:  # defensive: __init__ validates the configured loss type.
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
+        ce_loss_num = (neg_log_q * loss_weights).sum()
+        if self.lk_loss_type in {"lambda", "tv"}:
+            tv_loss_num = ((1.0 - target_probability) * loss_weights).sum()
+        else:
+            tv_loss_num = ce_loss_num.new_zeros(())
+        target_probability_num = (target_probability.detach() * weight_mask).sum()
+
+        selector_terms = SelectorTerms.zeros(ce_loss_num)
+        if self._selector_objective_enabled:
+            selector_terms = self._selector_chunk_terms(
+                candidate_selector=candidate_selector,
+                objective_logits=objective_logits,
+                hidden=hidden,
+                target_ids=target_ids,
+                predecessor_ids=predecessor_ids,
+                loss_weights=loss_weights,
+                weight_mask=weight_mask,
+            )
+
         with torch.no_grad():
-            predicted_ids = logits.argmax(dim=-1)
+            predicted_ids = objective_logits.argmax(dim=-1)
             correct_num = (
                 ((predicted_ids == target_ids) & (weight_mask > 0.5)).sum().float()
             )
             accuracy_den = weight_mask.sum()
-        return loss_num, loss_den, correct_num, accuracy_den
+        return DFlashObjectiveTerms(
+            ce_loss_num=ce_loss_num,
+            tv_loss_num=tv_loss_num,
+            loss_den=loss_den,
+            target_probability_num=target_probability_num,
+            correct_num=correct_num,
+            accuracy_den=accuracy_den,
+            selector_ce_num=selector_terms.ce_num,
+            selector_probability_num=selector_terms.probability_num,
+            selector_correct_num=selector_terms.correct_num,
+            selector_weight_den=selector_terms.weight_den,
+            selector_covered_num=selector_terms.covered_num,
+        )
+
+    def _compose_token_objective(
+        self,
+        ce_num: torch.Tensor,
+        tv_num: torch.Tensor,
+        probability_num: torch.Tensor,
+        probability_den: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compose a hard-target CE/TV/LK numerator after chunk reduction."""
+
+        if self.lk_loss_type is None or self.lk_loss_type == "alpha":
+            # With a one-hot target distribution, LK-alpha is exactly NLL/CE.
+            return ce_num
+        if self.lk_loss_type == "tv":
+            return tv_num
+        if self.lk_loss_type == "lambda":
+            acceptance = probability_num / probability_den.clamp_min(1.0)
+            kl_weight = self.kl_scale * torch.exp(-self.kl_decay * acceptance.detach())
+            return kl_weight * ce_num + (1.0 - kl_weight) * tv_num
+        raise ValueError(f"unknown lk_loss_type {self.lk_loss_type!r}")
 
     def forward(
         self,
@@ -444,6 +652,7 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        selector_loss_alpha: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) - same shape as Domino's forward.
@@ -473,6 +682,10 @@ class OnlineDFlashModel(nn.Module):
             2,
             safe_label_indices,
         )
+        predecessor_ids = torch.cat(
+            [target_ids[:, :, :1], target_ids[:, :, :-1]],
+            dim=-1,
+        )
 
         # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
         weight_mask = (
@@ -496,25 +709,88 @@ class OnlineDFlashModel(nn.Module):
             self.block_size,
             -1,
         )
-        loss_num, loss_den, correct_num, accuracy_denom = checkpointed_chunk_reduce(
+        (
+            ce_loss_num,
+            tv_loss_num,
+            loss_den,
+            target_probability_num,
+            correct_num,
+            accuracy_denom,
+            selector_ce_num,
+            selector_probability_num,
+            selector_correct_num,
+            selector_weight_den,
+            selector_covered_num,
+        ) = checkpointed_chunk_reduce(
             self._dflash_objective_chunk_terms,
             hidden_4d,
             target_ids,
             weight_mask,
+            predecessor_ids,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
+        loss_num = self._compose_token_objective(
+            ce_loss_num,
+            tv_loss_num,
+            target_probability_num,
+            accuracy_denom,
+        )
+        effective_selector_alpha = (
+            self.selector_loss_alpha
+            if selector_loss_alpha is None
+            else float(selector_loss_alpha)
+        )
+        if effective_selector_alpha < 0:
+            raise ValueError("selector_loss_alpha must be >= 0")
+        selector_loss_num = loss_num.new_zeros(())
+        has_selector_objective = self._selector_objective_enabled
+        if has_selector_objective:
+            # The selector is a categorical distribution over the serving
+            # top-k. Keep its proper, calibrated CE independent of the base
+            # model's optional LK/TV composition.
+            selector_loss_num = selector_ce_num
+            loss_num = loss_num + effective_selector_alpha * selector_loss_num
+
+        loss_denominator = loss_den
         ratio_metrics = {
             "acc": (correct_num.detach(), accuracy_denom.detach()),
+            "target_probability": (
+                target_probability_num.detach(),
+                accuracy_denom.detach(),
+            ),
         }
+        if has_selector_objective:
+            ratio_metrics.update(
+                {
+                    "selector_loss": (
+                        selector_loss_num.detach(),
+                        selector_weight_den.detach(),
+                    ),
+                    "selector_accuracy": (
+                        selector_correct_num.detach(),
+                        selector_weight_den.detach(),
+                    ),
+                    "selector_coverage": (
+                        selector_covered_num.detach(),
+                        accuracy_denom.detach(),
+                    ),
+                    "selector_target_probability": (
+                        selector_probability_num.detach(),
+                        selector_covered_num.detach(),
+                    ),
+                }
+            )
         metrics: Dict[str, object] = {
             "accuracy_denom": accuracy_denom.detach(),
             "ratio_metrics": ratio_metrics,
         }
-        loss_denominator = (
-            loss_den if self.loss_type == "dflash" else loss_num.new_tensor(float(bsz))
-        )
-        loss = loss_num / loss_denominator
+        if has_selector_objective:
+            metrics["selector_loss_alpha"] = effective_selector_alpha
+        # Reduce all chunks before flooring the denominator so the result does
+        # not depend on how many chunks happen to contain no effective weight.
+        denominator_floor = torch.finfo(loss_denominator.dtype).tiny
+        loss = loss_num / loss_denominator.clamp_min(denominator_floor)
         metrics["loss_terms"] = (loss_num, loss_denominator.detach())
         accuracy = correct_num / accuracy_denom
         return loss, accuracy, metrics

@@ -141,8 +141,9 @@ deployment:
 It may be omitted for EAGLE3, P-EAGLE, and DFlash. In that case SpecForge
 derives a registered draft config from the target config. The defaults preserve
 the former trainers: one EAGLE3 layer, four P-EAGLE layers, and one DFlash layer
-with block size 16. Typed overrides are available when creating a different
-fresh architecture:
+with block size 16. This DFlash default selects `DFlashDraftModel`; DFlash2
+always requires an explicit draft config or pretrained config source. Typed
+overrides are available when creating a different fresh architecture:
 
 ```yaml
 model:
@@ -151,8 +152,9 @@ model:
   draft_block_size: 8         # DFlash only
 ```
 
-For DFlash, configure the attention layout in the referenced draft JSON. Each
-entry corresponds to one draft layer; sliding layers share one positive window:
+For DFlash-family drafts, including DFlash2, configure the attention layout in
+the referenced draft JSON. Each entry corresponds to one draft layer; sliding
+layers share one positive window:
 
 ```json
 {
@@ -175,6 +177,63 @@ Use `"full_attention"` for every entry, `"use_sliding_window": false`, and
 mixed layout must be edited explicitly in the draft JSON.
 
 The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
+
+### DFlash2
+
+DFlash2 is a draft-architecture variant of DFlash, not a separate capture
+strategy. Keep `training.strategy: dflash` and select it with a draft config
+whose architecture is `DFlash2DraftModel`. The target server still captures
+the same selected hidden states with `--spec-capture-method dflash`.
+
+The DFlash2 config additionally defines `conv_kernel_size` and
+`conv_group_size` for the local convolution, plus `selector_rank` and
+`selector_top_k` for candidate-path selection. The base draft head uses the
+configured CE/LK/TV objective. The selector always uses categorical CE over the
+target head's strict unary top-k, exactly as it will be used during inference.
+If the gold token is outside that candidate set, the token contributes no
+selector loss; `selector_coverage` reports how often the gold token is present.
+Both objectives receive the configured fixed-decay or D-PACE position weight,
+and their combined numerator is normalized by the sum of valid effective token
+weights rather than by batch or anchor count.
+
+Set `training.dflash2_selector_loss_alpha` to scale the selector objective.
+`training.dflash2_selector_warmup_ratio` keeps that scale at zero for an initial
+fraction of optimizer steps, and `training.dflash2_selector_ramp_ratio` then
+ramps it linearly to the configured value. Both schedule ratios default to
+zero. A configured alpha of zero disables selector training and freezes its
+parameters; a positive alpha keeps the selector in the optimizer and autograd
+graph even while its effective warmup weight is zero. The convolution starts
+from an identity kernel with a zero-initialized dynamic projection, and the
+selector starts as a unary no-op, so both additions initially preserve the
+corresponding DFlash computation.
+
+Set `training.dflash2_selector_stop_gradient: true` to keep the selector CE
+from updating the unary logits and draft hidden states. The selector parameters
+still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
+gradient path. The option defaults to `false`, preserving coupled training.
+
+The exported computation and parameter names match the public SGLang DFlash2
+contract, including optional `output_multiplier` and
+`final_logit_softcapping` transforms from `dflash_config`.
+
+The checked-in Qwen3.6-27B recipe owns a two-GPU local stack: one configured
+GPU runs the target capture server and another runs the trainer. Update its
+model/data paths and `cuda_visible_devices` lists for the local host.
+
+```bash
+specforge train \
+  -c examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml \
+  model.target_model_path=/path/to/Qwen3.6-27B
+```
+
+Export the result with `specforge export --to hf`. Serving requires an SGLang
+version that includes DFlash2 support (SGLang PR #35371); the serving algorithm
+name remains `DFLASH`, and the exported `DFlash2DraftModel` config enables the
+new path automatically.
+
+See the dedicated [DFlash2 guide](../concepts/DFlash2.md) for the complete
+model-field constraints, offline feature workflow, selector schedule, and
+serving compatibility boundary.
 
 Domino and DSpark need their projector/head metadata, so they require an
 explicit draft config (or a pretrained warm-start source that contains
@@ -224,6 +283,7 @@ The checked-in examples are the canonical starting points:
 | DFlash | Online disaggregated, external | [`qwen3-8b-dflash-online.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-dflash-online.yaml) |
 | DFlash | Online disaggregated, managed-local | [`qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](../../examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
 | DFlash | Offline colocated | [`qwen3-8b-dflash-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml) |
+| DFlash2 | Online disaggregated, managed-local | [`qwen3.6-27b-dflash2-disaggregated.yaml`](../../examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml) |
 | Domino | Online disaggregated, external | [`qwen3-8b-domino-online.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) |
 | Domino | Online disaggregated, managed-local | [`qwen3-8b-domino-multiserver-disaggregated.yaml`](../../examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
 | Domino | Offline colocated | [`qwen3-8b-domino-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) |
@@ -256,7 +316,7 @@ The unified runtime supports text training in these combinations:
 | Strategy | Online disaggregated | Offline colocated | Offline disaggregated |
 | --- | --- | --- | --- |
 | EAGLE3 | Yes, consumer DP | Yes, DP + USP | Yes, consumer DP |
-| DFlash | Yes, consumer DP | Yes, DP | Yes, consumer DP |
+| DFlash/DFlash2 | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | Domino | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | DSpark | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | MTP | Yes, consumer DP | Yes, DP | Yes, consumer DP |
@@ -271,11 +331,12 @@ assembly. In particular:
   features through `data.eval_hidden_states_path`;
 - attention backends are strategy-specific: EAGLE3 accepts `sdpa`,
   `flex_attention`, `fa`, or offline `usp`; P-EAGLE requires
-  `flex_attention`; DFlash, Domino, and DSpark accept `eager`, `sdpa`, or
-  `flex_attention`; MTP accepts `eager` or `sdpa`;
+  `flex_attention`; DFlash, DFlash2, Domino, and DSpark accept
+  `eager`, `sdpa`, or `flex_attention`; MTP accepts `eager` or `sdpa`;
 - P-EAGLE requires `training.batch_size=1` and reuses EAGLE3's server capture
   schema;
-- offline feature training supports EAGLE3, DFlash, Domino, DSpark, and MTP;
+- offline feature training supports EAGLE3, DFlash, DFlash2, Domino,
+  DSpark, and MTP;
 - every online run is disaggregated and uses `model.target_backend=sglang`;
   finite runs may omit both step fields so the producer can publish the exact
   optimizer horizon derived from the prepared prompt plan;
@@ -482,8 +543,8 @@ specforge export --to sglang \
 ```
 
 `--to sglang` currently implements the EAGLE3 serving-key contract. Use
-`--to hf` for DFlash, Domino, DSpark, and P-EAGLE model directories. For an
-EAGLE-family self-contained Hugging Face directory, provide the target model as
+`--to hf` for DFlash, DFlash2, Domino, DSpark, and P-EAGLE model directories.
+For an EAGLE-family self-contained Hugging Face directory, provide the target model as
 the source of the frozen embedding when it is absent from the runtime
 checkpoint:
 

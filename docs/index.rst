@@ -17,6 +17,7 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
    concepts/speculative_decoding.md
    concepts/EAGLE3.md
+   concepts/DFlash2.md
 
 
 .. toctree::
