@@ -103,17 +103,50 @@ class OnlineMTPModelTest(unittest.TestCase):
         self.assertIsNotNone(draft.mtp.fc.weight.grad)
         self.assertTrue(torch.isfinite(draft.mtp.fc.weight.grad).all())
 
+    def test_chunked_objective_matches_unchunked(self):
+        config = _tiny_config()
+        torch.manual_seed(0)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+        # ragged supervision so chunk boundaries cross masked/unmasked rows
+        loss_mask[0, 5:9] = 0.0
+
+        results = {}
+        for chunk_size in (0, 4):
+            torch.manual_seed(0)
+            draft = Qwen3_5MTPDraftModel(config)
+            model = OnlineMTPModel(draft, objective_chunk_size=chunk_size)
+            loss, corrects, denoms = model(
+                input_ids=input_ids,
+                hidden_states=hidden_states.clone(),
+                loss_mask=loss_mask,
+            )
+            loss.backward()
+            results[chunk_size] = (
+                loss.item(),
+                corrects[0],
+                denoms[0],
+                draft.mtp.fc.weight.grad.clone(),
+            )
+
+        full, chunked = results[0], results[4]
+        self.assertAlmostEqual(full[0], chunked[0], places=6)
+        self.assertTrue(torch.equal(full[1], chunked[1]))
+        self.assertTrue(torch.equal(full[2], chunked[2]))
+        self.assertTrue(torch.allclose(full[3], chunked[3], atol=1e-6))
+
+    def test_objective_chunk_size_rejects_negative(self):
+        with self.assertRaisesRegex(ValueError, "objective_chunk_size"):
+            OnlineMTPModel(
+                Qwen3_5MTPDraftModel(_tiny_config()), objective_chunk_size=-1
+            )
+
     def test_shift_for_next_token_matches_serving_alignment(self):
         model = OnlineMTPModel(Qwen3_5MTPDraftModel(_tiny_config()))
-        logits = torch.zeros(1, 5, 7)
         input_ids = torch.tensor([[10, 11, 12, 13, 14]])
         loss_mask = torch.ones(1, 5)
 
-        shift_logits, shift_labels, shift_mask = model._shift_for_next_token(
-            logits, input_ids, loss_mask
-        )
+        shift_labels, shift_mask = model._shift_for_next_token(input_ids, loss_mask)
 
-        self.assertEqual((1, 4, 7), shift_logits.shape)
         # labels are x_2..x_T padded with one ignore index
         self.assertEqual([12, 13, 14, -100], shift_labels[0].tolist())
         # the padded position is masked out
@@ -125,8 +158,9 @@ class OnlineMTPModelTest(unittest.TestCase):
                 super().__init__()
                 self.config = SimpleNamespace(pad_token_id=0)
                 self.position_ids = None
+                self.mtp = SimpleNamespace(lm_head=torch.nn.Linear(8, 32, bias=False))
 
-            def forward(
+            def forward_hidden(
                 self,
                 input_ids,
                 hidden_states,
@@ -134,10 +168,12 @@ class OnlineMTPModelTest(unittest.TestCase):
                 position_ids=None,
             ):
                 self.position_ids = position_ids.detach().clone()
-                logits = torch.zeros(
-                    input_ids.shape[0], input_ids.shape[1], 32, requires_grad=True
+                return torch.zeros(
+                    input_ids.shape[0],
+                    input_ids.shape[1],
+                    8,
+                    requires_grad=True,
                 )
-                return SimpleNamespace(logits=logits)
 
         draft = _RecordingDraft()
         model = OnlineMTPModel(draft)

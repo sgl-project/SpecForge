@@ -424,6 +424,21 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
     def set_output_embeddings(self, value):
         self.mtp.lm_head = value
 
+    def forward_hidden(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        inputs_embeds = self.embed_tokens(input_ids)
+        return self.mtp(
+            inputs_embeds=inputs_embeds,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -432,14 +447,13 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        inputs_embeds = self.embed_tokens(input_ids)
-        hidden_states = self.mtp(
-            inputs_embeds=inputs_embeds,
+        draft_hidden = self.forward_hidden(
+            input_ids=input_ids,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
         )
-        logits = self.mtp.lm_head(hidden_states)
+        logits = self.mtp.lm_head(draft_hidden)
         return CausalLMOutputWithPast(logits=logits)
 
     @torch.inference_mode()
