@@ -2071,8 +2071,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
-        sequence_count = output_hidden.new_tensor(float(batch_size))
-        global_sequence_count = sequence_count.clone()
+        dpard_weight_mass = dpard_credit_position_num.sum()
+        global_dpard_weight_mass = dpard_weight_mass.detach().clone()
         world_size = 1
         import torch.distributed as dist
 
@@ -2081,12 +2081,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
             if world_size > 1:
                 dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
                 if self.loss_type == "dpard":
-                    dist.all_reduce(global_sequence_count, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(global_dpard_weight_mass, op=dist.ReduceOp.SUM)
         if float(global_loss_den) <= 0:
             raise ValueError("DSpark objective has no supervised target tokens")
         if self.loss_type == "dpard":
             loss = world_size * (
-                dpard_loss_num / global_sequence_count
+                dpard_loss_num / global_dpard_weight_mass
                 + self.dspark_confidence_head_alpha * confidence_num / global_loss_den
             )
         else:
@@ -2118,7 +2118,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if self.loss_type == "dpard":
             ratio_metrics["dpard_loss"] = (
                 dpard_loss_num.detach(),
-                sequence_count,
+                dpard_weight_mass,
             )
             ratio_metrics["dpard_credit_position"] = (
                 dpard_credit_position_num,

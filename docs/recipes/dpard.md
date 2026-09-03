@@ -12,8 +12,8 @@ s_t = alpha + (1 - alpha) a_t
 W_t = stop_gradient(sum_{k=t}^D product_{i=1}^k s_i)
 ```
 
-The actor is `sum_t W_t R_t / global_sequence_count`.
-It has no calibration, valid-position, or weight-mass denominator.
+The actor is `sum_t W_t R_t / sum_t W_t`, matching D-PACE's reduction.
+It has no calibration or valid-position denominator.
 The confidence head remains trainable with the existing static gamma weights,
 exact-overlap target, and static-weight-mass normalization.
 

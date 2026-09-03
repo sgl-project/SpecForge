@@ -388,13 +388,16 @@ class TestDFlashLosses(unittest.TestCase):
         bce = F.binary_cross_entropy_with_logits(
             conf.float(), acceptance, reduction="none"
         )
-        want = (actor * credit).sum() / 2 + (bce * static).sum() / static.sum()
+        dpard_weight_mass = credit.sum()
+        want = (actor * credit).sum() / dpard_weight_mass + (
+            bce * static
+        ).sum() / static.sum()
         torch.testing.assert_close(loss.float(), want, atol=1e-6, rtol=1e-6)
         grad, conf_grad, target_grad = torch.autograd.grad(
             loss, (logits, conf, target_logits), allow_unused=True
         )
         tilted = ((logp + logq) / 2).softmax(-1)
-        expected_grad = (logq.exp() - tilted) * credit.unsqueeze(-1) / 2
+        expected_grad = (logq.exp() - tilted) * credit.unsqueeze(-1) / dpard_weight_mass
         torch.testing.assert_close(grad.float(), expected_grad, atol=1e-6, rtol=1e-5)
         expected_conf_grad = (
             (conf.float().sigmoid() - acceptance) * static / static.sum()
@@ -403,7 +406,7 @@ class TestDFlashLosses(unittest.TestCase):
         num, den = metrics["ratio_metrics"]["dpard_loss"]
         torch.testing.assert_close(
             num / den,
-            (actor.detach() * credit).sum() / 2,
+            (actor.detach() * credit).sum() / dpard_weight_mass,
             check_dtype=False,
         )
         self.assertIsNone(target_grad)
@@ -429,7 +432,7 @@ class TestDFlashLosses(unittest.TestCase):
             target_last_hidden_states=torch.randn_like(self.hidden_states),
         )
         _, _, metrics = model(**inputs)
-        actor_num, sequence_count = metrics["ratio_metrics"]["dpard_loss"]
+        actor_num, dpard_weight_mass = metrics["ratio_metrics"]["dpard_loss"]
         conf_num, conf_den = metrics["ratio_metrics"]["confidence_loss"]
         other_rank = iter([7.0, 3.0])
         with (
@@ -441,9 +444,7 @@ class TestDFlashLosses(unittest.TestCase):
             ),
         ):
             loss, _, _ = model(**inputs)
-        expected = 2 * (
-            actor_num / (sequence_count + 3) + conf_num / (conf_den + 7)
-        )
+        expected = 2 * (actor_num / (dpard_weight_mass + 3) + conf_num / (conf_den + 7))
         torch.testing.assert_close(loss, expected, check_dtype=False)
 
     def test_dpard_chunking_matches_full_loss_and_gradient(self):

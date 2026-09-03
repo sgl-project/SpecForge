@@ -81,5 +81,6 @@ class TestDPardModel(unittest.TestCase):
             self.assertTrue((credit >= 0).all())
             self.assertTrue((count >= 0).all())
             num, den = metrics["ratio_metrics"]["dpard_loss"]
-            self.assertEqual(float(den), 2.0)
+            self.assertGreater(float(den), 0.0)
+            torch.testing.assert_close(den, credit.sum())
             self.assertTrue(torch.isfinite(num))

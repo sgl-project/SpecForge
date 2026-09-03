@@ -72,7 +72,7 @@ def resume_contract(_config, draft_model, training_model):
         contract.update(
             dspark_loss_type="dpard",
             dpard_alpha=float(training_model.dpard_alpha),
-            dpard_actor_reduction="sequence_batch_mean",
+            dpard_actor_reduction="weight_mass_mean",
         )
     return contract
 

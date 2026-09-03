@@ -47,7 +47,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         first = resume_contract(None, draft, model)
         self.assertEqual(first["dspark_loss_type"], "dpard")
         self.assertEqual(first["dpard_alpha"], 0.5)
-        self.assertEqual(first["dpard_actor_reduction"], "sequence_batch_mean")
+        self.assertEqual(first["dpard_actor_reduction"], "weight_mass_mean")
         model.dpard_alpha = 0.75
         self.assertNotEqual(first, resume_contract(None, draft, model))
         model.loss_type = "dspark"
