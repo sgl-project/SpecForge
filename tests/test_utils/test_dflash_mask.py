@@ -12,6 +12,7 @@ from specforge.algorithms.common.dflash_family_model import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
+from specforge.utils import get_device_type
 
 
 def _reference_dflash_mask(
@@ -79,7 +80,7 @@ class TestDFlashMask(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(42)
-        self.device = torch.device("cuda")
+        self.device = torch.device(get_device_type())
 
     def _compare_masks(
         self,
