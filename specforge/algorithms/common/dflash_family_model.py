@@ -104,6 +104,55 @@ class DFlashMetricTerms(NamedTuple):
     serving_accepted_length_num: torch.Tensor
 
 
+class _DFlashUnaryDiagnostics(NamedTuple):
+    """Full-vocabulary unary outputs reused by all DFlash2 diagnostics."""
+
+    probabilities: torch.Tensor
+    hard_label_probability: torch.Tensor
+    predicted_ids: torch.Tensor
+    topk_logits: torch.Tensor
+    candidate_ids: torch.Tensor
+    target_is_candidate: torch.Tensor
+    target_candidate_index: torch.Tensor
+
+
+class _DFlashSelectorDiagnostics(NamedTuple):
+    """Teacher-forced selector outputs and their effective metric masks."""
+
+    cross_entropy: torch.Tensor
+    loss_weights: torch.Tensor
+    selected_ids: torch.Tensor
+    covered_mask: torch.Tensor
+
+
+class _DFlashServingDiagnostics(NamedTuple):
+    """Greedy serving path plus additive per-block acceptance statistics."""
+
+    selected_ids: torch.Tensor
+    correct_num: torch.Tensor
+    block_den: torch.Tensor
+    oracle_accepted_length_num: torch.Tensor
+    accepted_length_num: torch.Tensor
+
+
+class _DFlashTeacherTerms(NamedTuple):
+    """Additive target-distribution diagnostics for one metric chunk."""
+
+    expected_acceptance_num: torch.Tensor
+    unary_top1_agreement_num: torch.Tensor
+    unary_topk_mass_num: torch.Tensor
+    selector_serving_agreement_num: torch.Tensor
+
+    @classmethod
+    def zeros(cls, position_den: torch.Tensor) -> "_DFlashTeacherTerms":
+        return cls(
+            position_den.new_zeros(position_den.shape),
+            position_den.new_zeros(position_den.shape),
+            position_den.new_zeros(position_den.shape),
+            position_den.new_zeros(position_den.shape),
+        )
+
+
 def compute_accept_len(
     pred_ids_4d: torch.Tensor,
     target_ids_4d: torch.Tensor,
@@ -714,8 +763,58 @@ class OnlineDFlashModel(nn.Module):
     ) -> DFlashMetricTerms:
         """Return additive serving and teacher diagnostics for one block chunk."""
 
-        batch_size, num_blocks, block_size, hidden_size = hidden.shape
         candidate_selector = self.draft_model.candidate_selector
+        unary = self._dflash2_unary_diagnostics(
+            hidden,
+            target_ids,
+        )
+        loss_weights = self._dflash2_metric_loss_weights(
+            unary.hard_label_probability,
+            weight_mask,
+        )
+        selector = self._dflash2_selector_diagnostics(
+            candidate_selector=candidate_selector,
+            unary=unary,
+            hidden=hidden,
+            predecessor_ids=predecessor_ids,
+            loss_weights=loss_weights,
+            weight_mask=weight_mask,
+        )
+        position_den = weight_mask.sum(dim=(0, 1))
+        serving = self._dflash2_serving_diagnostics(
+            candidate_selector=candidate_selector,
+            unary=unary,
+            hidden=hidden,
+            target_ids=target_ids,
+            weight_mask=weight_mask,
+            position_den=position_den,
+        )
+        teacher = self._dflash2_teacher_terms(
+            unary=unary,
+            serving_ids=serving.selected_ids,
+            aligned_target_hidden=aligned_target_hidden,
+            weight_mask=weight_mask,
+            position_den=position_den,
+        )
+        return self._reduce_dflash2_metric_terms(
+            unary=unary,
+            selector=selector,
+            serving=serving,
+            teacher=teacher,
+            target_ids=target_ids,
+            weight_mask=weight_mask,
+            loss_weights=loss_weights,
+            position_den=position_den,
+        )
+
+    def _dflash2_unary_diagnostics(
+        self,
+        hidden: torch.Tensor,
+        target_ids: torch.Tensor,
+    ) -> _DFlashUnaryDiagnostics:
+        """Project draft states once and derive the strict unary top-k view."""
+
+        batch_size, num_blocks, block_size, hidden_size = hidden.shape
         logits = self.lm_head(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
@@ -724,166 +823,243 @@ class OnlineDFlashModel(nn.Module):
         hard_label_probability = probabilities.gather(
             -1, target_ids.unsqueeze(-1)
         ).squeeze(-1)
-        predicted_ids = objective_logits.argmax(dim=-1)
-        unary_topk, candidate_ids = objective_logits.topk(
-            candidate_selector.top_k,
+        topk_logits, candidate_ids = objective_logits.topk(
+            self.draft_model.candidate_selector.top_k,
             dim=-1,
         )
         target_matches = candidate_ids.eq(target_ids.unsqueeze(-1))
-        target_is_candidate = target_matches.any(dim=-1)
-
-        loss_weights = weight_mask
-        if self.loss_type == "dflash":
-            if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-                positions = torch.arange(block_size, device=hidden.device).view(
-                    1, 1, -1
-                )
-                decay_weights = torch.exp(
-                    -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
-                )
-                loss_weights = loss_weights * decay_weights
-        else:
-            dpace_weights = self._dpace_weight(
-                hard_label_probability,
-                weight_mask,
-                weight_mask > 0,
-                self.loss_type,
-            )
-            loss_weights = weight_mask * dpace_weights
-
-        target_candidate_index = target_matches.long().argmax(dim=-1)
-        selector_logits = candidate_selector.score_candidates(
+        return _DFlashUnaryDiagnostics(
+            probabilities=probabilities,
+            hard_label_probability=hard_label_probability,
+            predicted_ids=objective_logits.argmax(dim=-1),
+            topk_logits=topk_logits,
             candidate_ids=candidate_ids,
-            unary_logits=unary_topk,
+            target_is_candidate=target_matches.any(dim=-1),
+            target_candidate_index=target_matches.long().argmax(dim=-1),
+        )
+
+    def _dflash2_metric_loss_weights(
+        self,
+        hard_label_probability: torch.Tensor,
+        weight_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reconstruct effective objective weights for position-share metrics."""
+
+        if self.loss_type == "dflash":
+            if self.loss_decay_gamma is None or self.loss_decay_gamma <= 0:
+                return weight_mask
+            positions = torch.arange(
+                weight_mask.shape[-1],
+                device=weight_mask.device,
+            ).view(1, 1, -1)
+            decay_weights = torch.exp(
+                -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
+            )
+            return weight_mask * decay_weights
+
+        dpace_weights = self._dpace_weight(
+            hard_label_probability,
+            weight_mask,
+            weight_mask > 0,
+            self.loss_type,
+        )
+        return weight_mask * dpace_weights
+
+    @staticmethod
+    def _dflash2_selector_diagnostics(
+        *,
+        candidate_selector: nn.Module,
+        unary: _DFlashUnaryDiagnostics,
+        hidden: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        loss_weights: torch.Tensor,
+        weight_mask: torch.Tensor,
+    ) -> _DFlashSelectorDiagnostics:
+        """Evaluate the selector with ground-truth predecessor tokens."""
+
+        selector_logits = candidate_selector.score_candidates(
+            candidate_ids=unary.candidate_ids,
+            unary_logits=unary.topk_logits,
             hidden_states=hidden,
             predecessor_ids=predecessor_ids,
         )
         selector_ce = F.cross_entropy(
             selector_logits.float().reshape(-1, selector_logits.shape[-1]),
-            target_candidate_index.reshape(-1),
+            unary.target_candidate_index.reshape(-1),
             reduction="none",
-        ).reshape_as(target_ids)
-        selector_loss_weights = loss_weights * target_is_candidate.float()
-        selector_teacher_forced_ids = candidate_ids.gather(
-            -1,
-            selector_logits.argmax(dim=-1, keepdim=True),
-        ).squeeze(-1)
+        ).reshape_as(unary.target_candidate_index)
+        target_is_candidate = unary.target_is_candidate.float()
+        return _DFlashSelectorDiagnostics(
+            cross_entropy=selector_ce,
+            loss_weights=loss_weights * target_is_candidate,
+            selected_ids=unary.candidate_ids.gather(
+                -1,
+                selector_logits.argmax(dim=-1, keepdim=True),
+            ).squeeze(-1),
+            covered_mask=weight_mask * target_is_candidate,
+        )
 
-        covered_mask = weight_mask * target_is_candidate.float()
-        position_den = weight_mask.sum(dim=(0, 1))
-        selector_serving_correct_num = position_den.new_zeros(block_size)
-        block_den = position_den.new_zeros(())
-        oracle_accepted_length_num = position_den.new_zeros(())
-        serving_accepted_length_num = position_den.new_zeros(())
-        teacher_selector_serving_agreement_num = position_den.new_zeros(block_size)
-        teacher_expected_acceptance_num = position_den.new_zeros(block_size)
-        teacher_unary_top1_agreement_num = position_den.new_zeros(block_size)
-        teacher_unary_topk_mass_num = position_den.new_zeros(block_size)
-        teacher_probabilities = None
-        teacher_ids = None
-        if aligned_target_hidden is not None:
-            teacher_logits = self.lm_head(
-                aligned_target_hidden.reshape(
-                    batch_size,
-                    num_blocks * block_size,
-                    hidden_size,
-                )
-            ).reshape_as(objective_logits)
-            teacher_probabilities = torch.softmax(teacher_logits.float(), dim=-1)
-            teacher_ids = teacher_logits.argmax(dim=-1)
-            expected_acceptance = (
-                1.0 - 0.5 * (probabilities - teacher_probabilities).abs().sum(dim=-1)
-            ).clamp(0.0, 1.0)
-            teacher_expected_acceptance_num = (expected_acceptance * weight_mask).sum(
-                dim=(0, 1)
+    @staticmethod
+    def _dflash2_serving_diagnostics(
+        *,
+        candidate_selector: nn.Module,
+        unary: _DFlashUnaryDiagnostics,
+        hidden: torch.Tensor,
+        target_ids: torch.Tensor,
+        weight_mask: torch.Tensor,
+        position_den: torch.Tensor,
+    ) -> _DFlashServingDiagnostics:
+        """Walk the greedy selector path and reduce prefix-acceptance metrics."""
+
+        batch_size, num_blocks, block_size, hidden_size = hidden.shape
+        if block_size <= 1:
+            zero = position_den.new_zeros(())
+            return _DFlashServingDiagnostics(
+                selected_ids=target_ids.new_empty(batch_size, num_blocks, 0),
+                correct_num=position_den.new_zeros(position_den.shape),
+                block_den=zero,
+                oracle_accepted_length_num=zero.clone(),
+                accepted_length_num=zero.clone(),
             )
-            teacher_unary_top1_agreement_num = (
-                (predicted_ids == teacher_ids).float() * weight_mask
-            ).sum(dim=(0, 1))
-            teacher_unary_topk_mass_num = (
-                teacher_probabilities.gather(-1, candidate_ids).sum(dim=-1)
-                * weight_mask
-            ).sum(dim=(0, 1))
 
+        serving_ids = candidate_selector.greedy_path(
+            candidate_ids=unary.candidate_ids[:, :, 1:].reshape(
+                batch_size * num_blocks,
+                block_size - 1,
+                candidate_selector.top_k,
+            ),
+            unary_logits=unary.topk_logits[:, :, 1:].reshape(
+                batch_size * num_blocks,
+                block_size - 1,
+                candidate_selector.top_k,
+            ),
+            hidden_states=hidden[:, :, 1:].reshape(
+                batch_size * num_blocks,
+                block_size - 1,
+                hidden_size,
+            ),
+            anchor_token_ids=target_ids[:, :, 0].reshape(-1),
+        ).reshape(batch_size, num_blocks, block_size - 1)
+        serving_hit = serving_ids == target_ids[:, :, 1:]
+        correct_num = torch.cat(
+            (
+                position_den.new_zeros(1),
+                (serving_hit.float() * weight_mask[:, :, 1:]).sum(dim=(0, 1)),
+            )
+        )
+
+        # A block accepts its anchor, then only its leading run of supervised hits.
+        supervised = weight_mask[:, :, 1:] > 0.5
+        block_valid = supervised.any(dim=-1).float()
+        oracle_alive = supervised & unary.target_is_candidate[:, :, 1:]
+        serving_alive = supervised & serving_hit
+        return _DFlashServingDiagnostics(
+            selected_ids=serving_ids,
+            correct_num=correct_num,
+            block_den=block_valid.sum(),
+            oracle_accepted_length_num=(
+                (1.0 + oracle_alive.float().cumprod(dim=-1).sum(dim=-1)) * block_valid
+            ).sum(),
+            accepted_length_num=(
+                (1.0 + serving_alive.float().cumprod(dim=-1).sum(dim=-1)) * block_valid
+            ).sum(),
+        )
+
+    def _dflash2_teacher_terms(
+        self,
+        *,
+        unary: _DFlashUnaryDiagnostics,
+        serving_ids: torch.Tensor,
+        aligned_target_hidden: Optional[torch.Tensor],
+        weight_mask: torch.Tensor,
+        position_den: torch.Tensor,
+    ) -> _DFlashTeacherTerms:
+        """Compare unary and serving predictions with the frozen target head."""
+
+        if aligned_target_hidden is None:
+            return _DFlashTeacherTerms.zeros(position_den)
+
+        batch_size, num_blocks, block_size, hidden_size = aligned_target_hidden.shape
+        teacher_logits = self.lm_head(
+            aligned_target_hidden.reshape(
+                batch_size,
+                num_blocks * block_size,
+                hidden_size,
+            )
+        ).reshape_as(unary.probabilities)
+        teacher_probabilities = torch.softmax(teacher_logits.float(), dim=-1)
+        teacher_ids = teacher_logits.argmax(dim=-1)
+        expected_acceptance = (
+            1.0 - 0.5 * (unary.probabilities - teacher_probabilities).abs().sum(dim=-1)
+        ).clamp(0.0, 1.0)
+
+        selector_serving_agreement_num = position_den.new_zeros(position_den.shape)
         if block_size > 1:
-            serving_ids = candidate_selector.greedy_path(
-                candidate_ids=candidate_ids[:, :, 1:].reshape(
-                    batch_size * num_blocks,
-                    block_size - 1,
-                    candidate_selector.top_k,
-                ),
-                unary_logits=unary_topk[:, :, 1:].reshape(
-                    batch_size * num_blocks,
-                    block_size - 1,
-                    candidate_selector.top_k,
-                ),
-                hidden_states=hidden[:, :, 1:].reshape(
-                    batch_size * num_blocks,
-                    block_size - 1,
-                    hidden_size,
-                ),
-                anchor_token_ids=target_ids[:, :, 0].reshape(-1),
-            ).reshape(batch_size, num_blocks, block_size - 1)
-            serving_hit = serving_ids == target_ids[:, :, 1:]
-            selector_serving_correct_num = torch.cat(
+            selector_serving_agreement_num = torch.cat(
                 (
                     position_den.new_zeros(1),
-                    (serving_hit.float() * weight_mask[:, :, 1:]).sum(dim=(0, 1)),
+                    (
+                        (serving_ids == teacher_ids[:, :, 1:]).float()
+                        * weight_mask[:, :, 1:]
+                    ).sum(dim=(0, 1)),
                 )
             )
-            # Accepted length per block: the anchor counts as one token and a
-            # block extends while every earlier slot is supervised and accepted.
-            supervised = weight_mask[:, :, 1:] > 0.5
-            block_valid = supervised.any(dim=-1).float()
-            block_den = block_valid.sum()
-            oracle_alive = (supervised & target_is_candidate[:, :, 1:]).float()
-            serving_alive = (supervised & serving_hit).float()
-            oracle_accepted_length_num = (
-                (1.0 + oracle_alive.cumprod(dim=-1).sum(dim=-1)) * block_valid
-            ).sum()
-            serving_accepted_length_num = (
-                (1.0 + serving_alive.cumprod(dim=-1).sum(dim=-1)) * block_valid
-            ).sum()
-            if teacher_ids is not None:
-                teacher_selector_serving_agreement_num = torch.cat(
-                    (
-                        position_den.new_zeros(1),
-                        (
-                            (serving_ids == teacher_ids[:, :, 1:]).float()
-                            * weight_mask[:, :, 1:]
-                        ).sum(dim=(0, 1)),
-                    )
-                )
+        return _DFlashTeacherTerms(
+            expected_acceptance_num=(expected_acceptance * weight_mask).sum(dim=(0, 1)),
+            unary_top1_agreement_num=(
+                (unary.predicted_ids == teacher_ids).float() * weight_mask
+            ).sum(dim=(0, 1)),
+            unary_topk_mass_num=(
+                teacher_probabilities.gather(-1, unary.candidate_ids).sum(dim=-1)
+                * weight_mask
+            ).sum(dim=(0, 1)),
+            selector_serving_agreement_num=selector_serving_agreement_num,
+        )
+
+    @staticmethod
+    def _reduce_dflash2_metric_terms(
+        *,
+        unary: _DFlashUnaryDiagnostics,
+        selector: _DFlashSelectorDiagnostics,
+        serving: _DFlashServingDiagnostics,
+        teacher: _DFlashTeacherTerms,
+        target_ids: torch.Tensor,
+        weight_mask: torch.Tensor,
+        loss_weights: torch.Tensor,
+        position_den: torch.Tensor,
+    ) -> DFlashMetricTerms:
+        """Reduce per-token diagnostics into the flat chunk-reducer contract."""
 
         return DFlashMetricTerms(
-            hard_label_probability_num=(hard_label_probability * weight_mask).sum(
+            hard_label_probability_num=(unary.hard_label_probability * weight_mask).sum(
                 dim=(0, 1)
             ),
-            unary_correct_num=((predicted_ids == target_ids).float() * weight_mask).sum(
-                dim=(0, 1)
-            ),
+            unary_correct_num=(
+                (unary.predicted_ids == target_ids).float() * weight_mask
+            ).sum(dim=(0, 1)),
             position_den=position_den,
-            unary_topk_recall_num=covered_mask.sum(dim=(0, 1)),
+            unary_topk_recall_num=selector.covered_mask.sum(dim=(0, 1)),
             unary_topk_mass_num=(
-                probabilities.gather(-1, candidate_ids).sum(dim=-1) * weight_mask
+                unary.probabilities.gather(-1, unary.candidate_ids).sum(dim=-1)
+                * weight_mask
             ).sum(dim=(0, 1)),
-            selector_ce_num=(selector_ce * selector_loss_weights).sum(dim=(0, 1)),
-            selector_weight_den=selector_loss_weights.sum(dim=(0, 1)),
-            selector_conditional_correct_num=(
-                (selector_teacher_forced_ids == target_ids).float() * covered_mask
-            ).sum(dim=(0, 1)),
-            selector_covered_den=covered_mask.sum(dim=(0, 1)),
-            selector_serving_correct_num=selector_serving_correct_num,
-            loss_weight_num=loss_weights.sum(dim=(0, 1)),
-            teacher_expected_acceptance_num=teacher_expected_acceptance_num,
-            teacher_unary_top1_agreement_num=teacher_unary_top1_agreement_num,
-            teacher_unary_topk_mass_num=teacher_unary_topk_mass_num,
-            teacher_selector_serving_agreement_num=(
-                teacher_selector_serving_agreement_num
+            selector_ce_num=(selector.cross_entropy * selector.loss_weights).sum(
+                dim=(0, 1)
             ),
-            block_den=block_den,
-            oracle_accepted_length_num=oracle_accepted_length_num,
-            serving_accepted_length_num=serving_accepted_length_num,
+            selector_weight_den=selector.loss_weights.sum(dim=(0, 1)),
+            selector_conditional_correct_num=(
+                (selector.selected_ids == target_ids).float() * selector.covered_mask
+            ).sum(dim=(0, 1)),
+            selector_covered_den=selector.covered_mask.sum(dim=(0, 1)),
+            selector_serving_correct_num=serving.correct_num,
+            loss_weight_num=loss_weights.sum(dim=(0, 1)),
+            teacher_expected_acceptance_num=teacher.expected_acceptance_num,
+            teacher_unary_top1_agreement_num=teacher.unary_top1_agreement_num,
+            teacher_unary_topk_mass_num=teacher.unary_topk_mass_num,
+            teacher_selector_serving_agreement_num=teacher.selector_serving_agreement_num,
+            block_den=serving.block_den,
+            oracle_accepted_length_num=serving.oracle_accepted_length_num,
+            serving_accepted_length_num=serving.accepted_length_num,
         )
 
     def _lk_kl_weight(

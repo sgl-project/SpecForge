@@ -527,6 +527,13 @@ class CandidateSelectorTest(unittest.TestCase):
         self.assertGreater(
             terms.loss_weight_num[1].item(), terms.loss_weight_num[2].item()
         )
+        for teacher_term in (
+            terms.teacher_expected_acceptance_num,
+            terms.teacher_unary_top1_agreement_num,
+            terms.teacher_unary_topk_mass_num,
+            terms.teacher_selector_serving_agreement_num,
+        ):
+            torch.testing.assert_close(teacher_term, torch.zeros(3))
 
     def test_lambda_objective_reports_its_kl_weight(self):
         class Draft(nn.Module):
