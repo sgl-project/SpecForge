@@ -16,5 +16,7 @@ As SpecForge is built by the SGLang team, draft models trained with SpecForge
 can be exported for [SGLang](https://github.com/sgl-project/sglang) serving.
 Runtime checkpoints retain training state, so materialize a serving directory
 with the shared `specforge export` command. SGLang and Hugging Face export
-targets use the same checkpoint surface; there are no method-specific
-conversion scripts.
+targets use the same checkpoint surface for most methods. MTP is the
+exception: merge the trained head back into the target with
+`scripts/merge_mtp_to_base.py` rather than `specforge export` alone (see
+[Export a trained draft](../basic_usage/training.md#export-a-trained-draft)).
