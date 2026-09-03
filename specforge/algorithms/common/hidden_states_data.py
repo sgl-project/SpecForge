@@ -153,52 +153,35 @@ def build_dspark_offline_normalizer(max_len, **_topology):
     return partial(normalize_dspark_offline_sample, max_len=max_len)
 
 
-def build_collator():
+def _padded_collator(required_keys, optional_keys=()):
+    """Build a collator that zero-pads every listed key along the sequence axis."""
+
+    sequence_axes = {key: 1 for key in (*required_keys, *optional_keys)}
+
     def collate(features):
-        required_keys = ["input_ids", "loss_mask", "hidden_states"]
-        teacher_feature_presence = [
-            "target_last_hidden_states" in feature for feature in features
-        ]
-        if any(teacher_feature_presence) and not all(teacher_feature_presence):
-            raise KeyError(
-                "target_last_hidden_states must be present in every DFlash sample "
-                "or omitted from every sample"
-            )
-        if all(teacher_feature_presence):
-            required_keys.append("target_last_hidden_states")
         return pad_and_concatenate_features(
             features,
-            sequence_axes={
-                "input_ids": 1,
-                "loss_mask": 1,
-                "hidden_states": 1,
-                "target_last_hidden_states": 1,
-            },
+            sequence_axes=sequence_axes,
             required_keys=required_keys,
+            optional_keys=optional_keys,
         )
 
     return collate
+
+
+def build_collator():
+    # The target's final hidden state rides along when the capture layout
+    # carries it; offline v1 DFlash and Domino batches omit it.
+    return _padded_collator(
+        ("input_ids", "loss_mask", "hidden_states"),
+        optional_keys=("target_last_hidden_states",),
+    )
 
 
 def build_dspark_collator():
-    def collate(features):
-        return pad_and_concatenate_features(
-            features,
-            sequence_axes={
-                "input_ids": 1,
-                "loss_mask": 1,
-                "hidden_states": 1,
-                "target_last_hidden_states": 1,
-            },
-            required_keys=(
-                "input_ids",
-                "loss_mask",
-                "hidden_states",
-                "target_last_hidden_states",
-            ),
-        )
-
-    return collate
+    return _padded_collator(
+        ("input_ids", "loss_mask", "hidden_states", "target_last_hidden_states")
+    )
 
 
 def normalize_mtp_offline_sample(raw, max_len: int):
@@ -262,22 +245,7 @@ def build_mtp_offline_normalizer(max_len, **_topology):
 
 
 def build_mtp_collator():
-    def collate(features):
-        return pad_and_concatenate_features(
-            features,
-            sequence_axes={
-                "input_ids": 1,
-                "loss_mask": 1,
-                "target_last_hidden_states": 1,
-            },
-            required_keys=(
-                "input_ids",
-                "loss_mask",
-                "target_last_hidden_states",
-            ),
-        )
-
-    return collate
+    return _padded_collator(("input_ids", "loss_mask", "target_last_hidden_states"))
 
 
 __all__ = [
