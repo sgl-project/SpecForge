@@ -56,7 +56,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 03, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -687,7 +687,10 @@ mixed layout must be edited explicitly in the draft JSON.</p>
 <p>DFlash2 is a draft-architecture variant of DFlash, not a separate capture
 strategy. Keep <code class="docutils literal notranslate"><span class="pre">training.strategy:</span> <span class="pre">dflash</span></code> and select it with a draft config
 whose architecture is <code class="docutils literal notranslate"><span class="pre">DFlash2DraftModel</span></code>. The target server still captures
-the same selected hidden states with <code class="docutils literal notranslate"><span class="pre">--spec-capture-method</span> <span class="pre">dflash</span></code>.</p>
+the same selected hidden states with <code class="docutils literal notranslate"><span class="pre">--spec-capture-method</span> <span class="pre">dflash</span></code>. Online
+capture also retains the target’s final hidden state for teacher-alignment
+telemetry; existing offline DFlash datasets remain compatible and omit only
+the teacher-only metrics.</p>
 <p>The DFlash2 config additionally defines <code class="docutils literal notranslate"><span class="pre">conv_kernel_size</span></code> and
 <code class="docutils literal notranslate"><span class="pre">conv_group_size</span></code> for the local convolution, plus <code class="docutils literal notranslate"><span class="pre">selector_rank</span></code> and
 <code class="docutils literal notranslate"><span class="pre">selector_top_k</span></code> for candidate-path selection. The base draft head uses the
@@ -712,6 +715,37 @@ corresponding DFlash computation.</p>
 from updating the unary logits and draft hidden states. The selector parameters
 still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
 gradient path. The option defaults to <code class="docutils literal notranslate"><span class="pre">false</span></code>, preserving coupled training.</p>
+<p>External tracking reports DFlash-family diagnostics on optimizer steps that
+reach <code class="docutils literal notranslate"><span class="pre">training.log_interval</span></code>. Aggregates live under <code class="docutils literal notranslate"><span class="pre">train/dflash/*</span></code> for every
+DFlash-family draft and under <code class="docutils literal notranslate"><span class="pre">train/dflash2/selector/*</span></code> for drafts with a
+candidate selector. The same families are broken down per predicted block
+position under their own <code class="docutils literal notranslate"><span class="pre">position_1/*</span></code> through <code class="docutils literal notranslate"><span class="pre">position_&lt;block_size-1&gt;/*</span></code>
+sections (the verified anchor is omitted), so each position renders as one
+dashboard group:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">dflash/hard_label/*</span></code>: unary top-1 accuracy, top-K recall and probability
+mass, and gold-token probability. K is the selector’s <code class="docutils literal notranslate"><span class="pre">selector_top_k</span></code> when
+present, otherwise the model’s <code class="docutils literal notranslate"><span class="pre">metric_top_k</span></code> (default 16). Two aggregate-only
+per-block accepted-length proxies apply <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">+</span> <span class="pre">sum_k</span> <span class="pre">prod_{j&lt;=k}</span> <span class="pre">a_j</span></code> over the
+supervised slots with <code class="docutils literal notranslate"><span class="pre">a_j</span></code> being coverage by the unary top-K
+(<code class="docutils literal notranslate"><span class="pre">unary_topK_oracle_accepted_length</span></code>) or the gold-token probability
+(<code class="docutils literal notranslate"><span class="pre">expected_accepted_length</span></code>, the smooth D-PACE surrogate).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">position_&lt;k&gt;/objective/loss_weight_share</span></code>: the fraction of the effective
+objective weight each block position receives under the configured
+fixed-decay or D-PACE weighting.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">train/objective/lk_kl_weight</span></code>: the CE weight of the <code class="docutils literal notranslate"><span class="pre">lambda</span></code> LK objective.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dflash/teacher/*</span></code> (online capture only): full-vocabulary expected
+acceptance, unary top-1 agreement, and unary top-K teacher mass against the
+frozen target head, plus the aggregate <code class="docutils literal notranslate"><span class="pre">expected_accepted_length</span></code> that chains
+the per-slot expected acceptance, the sampling-regime counterpart of the
+hard-label surrogate.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dflash2/selector/*</span></code> (DFlash2 only): selector loss, conditional accuracy
+(uniform over covered slots, so comparable across loss types), the realized
+greedy serving path’s per-slot accuracy, its per-block
+<code class="docutils literal notranslate"><span class="pre">serving_accepted_length</span></code>, and, with online capture, its agreement with the
+target argmax (<code class="docutils literal notranslate"><span class="pre">teacher_serving_agreement</span></code>).</p></li>
+</ul>
+<p>All accepted-length proxies are teacher-forced on the real prefix and anchor.</p>
 <p>The exported computation and parameter names match the public SGLang DFlash2
 contract, including optional <code class="docutils literal notranslate"><span class="pre">output_multiplier</span></code> and
 <code class="docutils literal notranslate"><span class="pre">final_logit_softcapping</span></code> transforms from <code class="docutils literal notranslate"><span class="pre">dflash_config</span></code>.</p>
@@ -1043,8 +1077,11 @@ backend with the top-level <code class="docutils literal notranslate"><span clas
 <p>Accepted values are <code class="docutils literal notranslate"><span class="pre">none</span></code>, <code class="docutils literal notranslate"><span class="pre">wandb</span></code>, <code class="docutils literal notranslate"><span class="pre">tensorboard</span></code>, <code class="docutils literal notranslate"><span class="pre">swanlab</span></code>, and <code class="docutils literal notranslate"><span class="pre">mlflow</span></code>.
 W&amp;B, SwanLab, and MLflow have matching project/run fields in the typed schema;
 TensorBoard writes beneath <code class="docutils literal notranslate"><span class="pre">output_dir/runs</span></code>, and SwanLab writes beneath
-<code class="docutils literal notranslate"><span class="pre">output_dir/swanlog</span></code>. Trainer and evaluator metrics use <code class="docutils literal notranslate"><span class="pre">train/*</span></code> and <code class="docutils literal notranslate"><span class="pre">eval/*</span></code>
-names consistently.</p>
+<code class="docutils literal notranslate"><span class="pre">output_dir/swanlog</span></code>. Optimization and evaluator metrics use <code class="docutils literal notranslate"><span class="pre">train/*</span></code> and
+<code class="docutils literal notranslate"><span class="pre">eval/*</span></code>; throughput and timing counters use the top-level <code class="docutils literal notranslate"><span class="pre">perf/*</span></code> namespace.
+Historical <code class="docutils literal notranslate"><span class="pre">ploss*</span></code>, <code class="docutils literal notranslate"><span class="pre">acceptance_rate*</span></code>, and <code class="docutils literal notranslate"><span class="pre">target_probability</span></code> names remain
+available alongside explicit <code class="docutils literal notranslate"><span class="pre">kl_loss*</span></code> or <code class="docutils literal notranslate"><span class="pre">lk_loss*</span></code>, <code class="docutils literal notranslate"><span class="pre">ce_loss</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">expected_acceptance*</span></code> names.</p>
 </section>
 <section id="cuda-rocm-and-ascend-npu">
 <h2>CUDA, ROCm, and Ascend NPU<a class="headerlink" href="#cuda-rocm-and-ascend-npu" title="Link to this heading">#</a></h2>
@@ -1292,7 +1329,7 @@ By SpecForge Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 01, 2026.
+  Last updated on Sep 03, 2026.
   <br/>
 </p>
   </div>
