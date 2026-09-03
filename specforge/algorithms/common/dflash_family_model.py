@@ -459,9 +459,9 @@ class OnlineDFlashModel(nn.Module):
     ) -> torch.Tensor:
         """Compute detached D-PACE position weights.
 
-        ``prob`` is the draft probability on the target token at each draft
-        position. Invalid positions are treated as multiplicative no-ops inside
-        prefix products and excluded from suffix sums; the caller still
+        ``prob`` holds per-position reach probabilities. Invalid positions are
+        multiplicative no-ops in prefix products and excluded from suffix sums;
+        the caller still
         multiplies the returned weights by ``binary_mask`` before reduction.
         """
         smooth = (1.0 - self.dpace_alpha) * prob + self.dpace_alpha
@@ -1754,7 +1754,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
         objective_chunk_blocks: int = 128,
+        loss_type: str = "dflash",
+        dpard_alpha: float = 0.5,
     ):
+        if loss_type not in {"dflash", "dpard"}:
+            raise ValueError("DSpark loss_type must be 'dflash' or 'dpard'")
         super().__init__(
             draft_model=draft_model,
             target_lm_head=target_lm_head,
@@ -1766,6 +1770,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_decay_gamma=loss_decay_gamma,
             objective_chunk_blocks=objective_chunk_blocks,
             loss_type="dflash",
+            dpace_alpha=dpard_alpha,
         )
         if dspark_ce_loss_alpha < 0:
             raise ValueError("dspark_ce_loss_alpha must be >= 0")
@@ -1773,10 +1778,16 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError("dspark_l1_loss_alpha must be >= 0")
         if dspark_confidence_head_alpha < 0:
             raise ValueError("dspark_confidence_head_alpha must be >= 0")
-        self.loss_type = "dspark"
+        self.loss_type = "dpard" if loss_type == "dpard" else "dspark"
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        if loss_type == "dpard" and (
+            dspark_ce_loss_alpha != 0 or dspark_l1_loss_alpha != 0
+        ):
+            raise ValueError("D-PARD replaces CE/L1; set both loss alphas to zero")
+        if not 0.0 < dpard_alpha < 1.0:
+            raise ValueError("dpard_alpha must be in (0, 1)")
 
     def _build_dspark_labels_and_mask(
         self,
@@ -1867,14 +1878,23 @@ class OnlineDSparkModel(OnlineDFlashModel):
             hidden_states=hidden,
         )
         vocab_size = draft_logits.shape[-1]
-        cross_entropy = F.cross_entropy(
-            draft_logits.reshape(-1, vocab_size),
-            target_ids.reshape(-1),
-            reduction="none",
-        ).reshape_as(target_ids)
+        log_q = None
+        if self.loss_type == "dpard":
+            log_q = F.log_softmax(draft_logits.float(), dim=-1)
+            cross_entropy = (
+                -log_q.detach().gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+            )
+        else:
+            cross_entropy = F.cross_entropy(
+                draft_logits.reshape(-1, vocab_size),
+                target_ids.reshape(-1),
+                reduction="none",
+            ).reshape_as(target_ids)
         ce_num = (cross_entropy * loss_weights).sum()
 
         zero = ce_num.new_zeros(())
+        dpard_loss_num = zero
+        dpard_credit_position_num = ce_num.new_zeros(block_size)
         l1_num = zero
         confidence_num = zero
         confidence_error_num = zero
@@ -1886,6 +1906,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         accept_probability = None
 
         draft_probabilities = None
+        log_p = None
         teacher_ids = None
         if aligned_target_hidden is not None:
             with torch.no_grad():
@@ -1896,15 +1917,36 @@ class OnlineDSparkModel(OnlineDFlashModel):
                         hidden_size,
                     )
                 ).reshape_as(draft_logits)
-                target_probabilities = torch.softmax(target_logits.float(), dim=-1)
+                if self.loss_type == "dpard":
+                    log_p = F.log_softmax(target_logits.float(), dim=-1)
+                    target_probabilities = log_p.exp()
+                else:
+                    target_probabilities = torch.softmax(target_logits.float(), dim=-1)
                 teacher_ids = target_logits.argmax(dim=-1)
-            draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
+            draft_probabilities = (
+                log_q.detach().exp()
+                if log_q is not None
+                else torch.softmax(draft_logits.float(), dim=-1)
+            )
             l1_per_token = (
                 (draft_probabilities - target_probabilities).abs().sum(dim=-1)
             )
             accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
+
+            if self.loss_type == "dpard":
+                assert log_q is not None and log_p is not None
+                renyi = -2.0 * torch.logsumexp(0.5 * (log_p + log_q), dim=-1)
+                with torch.no_grad():
+                    credit = (
+                        self._dpace_weight(
+                            accept_probability, eval_mask.float(), eval_mask, "dpace"
+                        )
+                        * eval_mask
+                    )
+                dpard_loss_num = (renyi * credit).sum()
+                dpard_credit_position_num = credit.sum(dim=(0, 1))
 
         confidence_pred = self.draft_model.predict_confidence(
             hidden,
@@ -1915,15 +1957,29 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 raise ValueError(
                     "DSpark confidence loss requires target_last_hidden_states"
                 )
+            confidence_weights = loss_weights
+            if self.loss_type == "dpard":
+                with torch.no_grad():
+                    masked_acceptance = torch.where(
+                        eval_mask,
+                        accept_probability.detach(),
+                        torch.ones_like(accept_probability),
+                    )
+                    reach = torch.ones_like(masked_acceptance)
+                    if block_size > 1:
+                        reach[..., 1:] = torch.cumprod(
+                            masked_acceptance[..., :-1], dim=-1
+                        )
+                    confidence_weights = reach * eval_mask
             confidence_per_token = F.binary_cross_entropy_with_logits(
                 confidence_pred.float(),
                 accept_probability.detach(),
                 reduction="none",
             )
-            confidence_num = (confidence_per_token * loss_weights).sum()
+            confidence_num = (confidence_per_token * confidence_weights).sum()
             confidence_error_num = (
                 (confidence_pred.float().sigmoid() - accept_probability).abs()
-                * loss_weights
+                * confidence_weights
             ).sum()
 
         with torch.no_grad():
@@ -1967,6 +2023,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_top1_num,
             tau_num,
             tau_den,
+            dpard_loss_num,
+            dpard_credit_position_num,
         )
 
     def _compute_dspark_loss(
@@ -1990,15 +2048,19 @@ class OnlineDSparkModel(OnlineDFlashModel):
         )
         loss_weights = self._dspark_loss_weight_mask(eval_mask)
         local_loss_den = loss_weights.sum()
-        need_target = self.dspark_l1_loss_alpha > 0 or (
-            self.dspark_confidence_head_alpha > 0
-            and getattr(self.draft_model, "confidence_head", None) is not None
+        need_target = (
+            self.loss_type == "dpard"
+            or self.dspark_l1_loss_alpha > 0
+            or (
+                self.dspark_confidence_head_alpha > 0
+                and getattr(self.draft_model, "confidence_head", None) is not None
+            )
         )
         aligned_target_hidden = None
         if need_target:
             if target_last_hidden_states is None:
                 raise ValueError(
-                    "DSpark L1/confidence loss requires target_last_hidden_states"
+                    "DSpark distribution/confidence loss requires target_last_hidden_states"
                 )
             aligned_target_hidden = self._aligned_target_hidden(
                 target_last_hidden_states,
@@ -2032,43 +2094,67 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_top1_num,
             tau_num,
             tau_den,
+            dpard_loss_num,
+            dpard_credit_position_num,
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
+        global_dpard_block_den = tau_den.detach().clone()
         world_size = 1
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
             world_size = dist.get_world_size()
             if world_size > 1:
-                dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
-        if float(global_loss_den) <= 0:
-            raise ValueError("DSpark objective has no supervised target tokens")
-        loss = (
-            world_size
-            * (
-                self.dspark_ce_loss_alpha * ce_num
-                + self.dspark_l1_loss_alpha * l1_num
-                + self.dspark_confidence_head_alpha * confidence_num
+                if self.loss_type == "dpard":
+                    dist.all_reduce(global_dpard_block_den, op=dist.ReduceOp.SUM)
+                else:
+                    dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
+        if self.loss_type == "dpard":
+            if float(global_dpard_block_den) <= 0:
+                raise ValueError("D-PARD objective has no valid block")
+            loss = (
+                world_size
+                * (dpard_loss_num + self.dspark_confidence_head_alpha * confidence_num)
+                / global_dpard_block_den
             )
-            / global_loss_den
-        )
+        else:
+            if float(global_loss_den) <= 0:
+                raise ValueError("DSpark objective has no supervised target tokens")
+            loss = (
+                world_size
+                * (
+                    self.dspark_ce_loss_alpha * ce_num
+                    + self.dspark_l1_loss_alpha * l1_num
+                    + self.dspark_confidence_head_alpha * confidence_num
+                )
+                / global_loss_den
+            )
 
+        confidence_den = (
+            tau_den if self.loss_type == "dpard" else local_loss_den
+        ).detach()
         ratio_metrics = {
             "acc": (correct_num, eval_den),
             "ce_loss": (ce_num.detach(), local_loss_den.detach()),
             "l1_loss": (l1_num.detach(), local_loss_den.detach()),
-            "confidence_loss": (
-                confidence_num.detach(),
-                local_loss_den.detach(),
-            ),
+            "confidence_loss": (confidence_num.detach(), confidence_den),
             "confidence_abs_error": (
                 confidence_error_num.detach(),
-                local_loss_den.detach(),
+                confidence_den,
             ),
             "ce_position": (ce_position_num, position_den),
             "accuracy_position": (correct_position_num, position_den),
         }
+        if self.loss_type == "dpard":
+            ratio_metrics["dpard_loss"] = (
+                dpard_loss_num.detach(),
+                tau_den.detach(),
+            )
+            ratio_metrics["dpard_credit_position"] = (
+                dpard_credit_position_num,
+                position_den,
+            )
         if aligned_target_hidden is not None:
             ratio_metrics.update(
                 {
