@@ -1196,7 +1196,8 @@ class OnlineDFlashModel(nn.Module):
         collect_detailed_metrics: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
-        (loss, accuracy, metrics) — same shape as Domino's forward."""
+        (loss, accuracy, metrics) - same shape as Domino's forward.
+        """
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
