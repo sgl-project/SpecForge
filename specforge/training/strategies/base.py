@@ -717,7 +717,11 @@ class DominoTrainStrategy(DraftTrainStrategy):
             "lambda_base",
             float(lambda_base),
         )
-        return StepOutput(loss=loss, metrics=metrics)
+        return StepOutput(
+            loss=loss,
+            metrics=metrics,
+            loss_terms=model_metrics.get("loss_terms"),
+        )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Everything trainable lives under draft_model.; the target

@@ -1733,6 +1733,13 @@ class OnlineDominoModel(OnlineDFlashModel):
             "lambda_base": float(lambda_base),
             "accuracy_denom": accuracy_denom.detach(),
         }
+        # Hand the trainer raw numerator/denominator so gradients are
+        # normalized by the globally reduced token count instead of a
+        # mean of per-rank ratios.
+        metrics["loss_terms"] = (
+            (1.0 - lambda_base) * final_num + lambda_base * base_num,
+            loss_den.detach(),
+        )
 
         return loss, accuracy, metrics
 

@@ -110,6 +110,67 @@ class TestDominoDraftModel(unittest.TestCase):
                 0.0,
             )
 
+    def test_loss_terms_carry_blended_numerator_and_token_count(self):
+        from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
+
+        torch.manual_seed(11)
+        hidden_size, vocab_size, block_size = 4, 7, 4
+        draft = _bare_domino(
+            hidden_size=hidden_size,
+            gru_hidden_size=3,
+            embedding_size=2,
+            vocab_size=vocab_size,
+            block_size=block_size,
+        )
+        model = OnlineDominoModel(
+            draft_model=draft,
+            target_lm_head=nn.Linear(hidden_size, vocab_size, bias=False),
+            target_embed_tokens=nn.Embedding(vocab_size, hidden_size),
+            mask_token_id=0,
+            block_size=block_size,
+            attention_backend="sdpa",
+            num_anchors=1,
+            shift_label=False,
+        )
+        fixed_hidden = torch.randn(1, block_size, hidden_size)
+
+        def fixed_draft_blocks(
+            self,
+            input_ids,
+            hidden_states,
+            loss_mask,
+            max_valid_anchors=None,
+        ):
+            del hidden_states, loss_mask, max_valid_anchors
+            return (
+                torch.zeros(1, 1, dtype=torch.long, device=input_ids.device),
+                torch.ones(1, 1, dtype=torch.bool, device=input_ids.device),
+                fixed_hidden.to(input_ids.device),
+            )
+
+        model._forward_draft_blocks = MethodType(fixed_draft_blocks, model)
+        for lambda_base in (0.0, 0.4):
+            with self.subTest(lambda_base=lambda_base):
+                loss, _accuracy, metrics = model(
+                    input_ids=torch.tensor([[1, 2, 3, 4]]),
+                    hidden_states=torch.zeros(1, block_size, hidden_size),
+                    loss_mask=torch.ones(1, block_size),
+                    lambda_base=lambda_base,
+                )
+                numerator, denominator = metrics["loss_terms"]
+                self.assertEqual(numerator.numel(), 1)
+                self.assertEqual(denominator.numel(), 1)
+                self.assertTrue(numerator.requires_grad)
+                self.assertFalse(denominator.requires_grad)
+                self.assertGreater(denominator.item(), 0.0)
+                self.assertTrue(
+                    torch.isclose(
+                        numerator / denominator,
+                        loss.detach(),
+                        atol=1e-5,
+                    )
+                )
+
     def test_chunked_objective_matches_full_loss_metrics_and_gradients(self):
         from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
 
