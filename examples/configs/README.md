@@ -324,6 +324,8 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection. |
 | `deployment.disaggregated.producer_segment_size` | `null` | Positive allocation owned by an offline Mooncake producer. Online capture is server-owned and forces client segments to zero. |
 | `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. |
+| `deployment.disaggregated.receive_buffers` | `pageable` | Consumer receive buffers for feature reads: `pageable` (fresh host tensor per feature), `pinned` (pooled page-locked host buffers, side-stream device copy), or `cuda` (pooled device buffers written directly by an RDMA/NVLink transport). |
+| `deployment.disaggregated.receive_pool_bytes` | `8589934592` | Upper bound of the pooled receive buffers per consumer rank (`pinned`/`cuda`). |
 | `deployment.disaggregated.idle_timeout_s` | `null` | Positive consumer idle timeout. |
 | `deployment.disaggregated.peer_wait_timeout_s` | `null` | Optional positive producer/consumer peer-completion timeout. Unset is unbounded; expiration fails the attempt. |
 | `deployment.disaggregated.producer_hold_s` | `null` | Optional positive offline producer retention timeout. Unset is unbounded; expiration fails the attempt. |

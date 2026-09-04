@@ -431,6 +431,15 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: zero for both SpecForge roles.
     producer_segment_size: Optional[int] = Field(default=None, gt=0)
     client_buffer_size: int = Field(default=256 << 20, gt=0)
+    #: Consumer receive buffers for Mooncake ``get_into``: ``pageable`` allocates
+    #: a fresh host tensor per feature (registered and unregistered around each
+    #: read, then copied to the device on the training stream); ``pinned`` keeps
+    #: a bounded pool of page-locked, once-registered host buffers and copies to
+    #: the device on a side stream; ``cuda`` keeps the pool on the trainer device
+    #: so an RDMA / NVLink transport writes features into GPU memory directly.
+    receive_buffers: Literal["pageable", "pinned", "cuda"] = "pageable"
+    #: Upper bound of the pooled receive buffers per consumer rank.
+    receive_pool_bytes: int = Field(default=8 << 30, gt=0)
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
     producer_hold_s: Optional[float] = Field(default=None, gt=0)
@@ -445,6 +454,17 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     def _validate_store(self):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
+        if self.receive_buffers == "cuda":
+            protocol = self.mooncake_protocol
+            if self.managed_local is not None:
+                protocol = self.managed_local.mooncake.protocol
+            if protocol != "rdma":
+                raise ValueError(
+                    "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
+                    "Mooncake transport (mooncake_protocol or "
+                    "managed_local.mooncake.protocol = rdma); the TCP transport "
+                    "cannot write into device memory"
+                )
         if self.consumer_state_dir is not None and (
             not self.consumer_state_dir
             or self.consumer_state_dir.strip() != self.consumer_state_dir

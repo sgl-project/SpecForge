@@ -106,6 +106,21 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Config.model_validate(payload)
 
+    def test_cuda_receive_buffers_require_an_rdma_transport(self):
+        payload = _online_payload()
+        payload["deployment"] = copy.deepcopy(ONLINE_DEPLOYMENT)
+        payload["deployment"]["disaggregated"]["receive_buffers"] = "cuda"
+        with self.assertRaisesRegex(ValidationError, "RDMA"):
+            Config.model_validate(payload)
+        payload["deployment"]["disaggregated"]["mooncake_protocol"] = "rdma"
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.deployment.disaggregated.receive_buffers, "cuda")
+        payload["deployment"]["disaggregated"]["receive_buffers"] = "pinned"
+        payload["deployment"]["disaggregated"].pop("mooncake_protocol")
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.deployment.disaggregated.receive_buffers, "pinned")
+        self.assertEqual(cfg.deployment.disaggregated.receive_pool_bytes, 8 << 30)
+
     def test_fsdp_sharding_is_typed(self):
         payload = copy.deepcopy(MINIMAL)
         payload["training"] = {"fsdp_sharding": "NO_SHARD"}

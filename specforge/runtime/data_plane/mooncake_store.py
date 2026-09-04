@@ -226,6 +226,151 @@ def _nbytes(t: torch.Tensor) -> int:
     return t.numel() * t.element_size()
 
 
+RECEIVE_BUFFER_KINDS = ("pageable", "pinned", "cuda")
+DEFAULT_RECEIVE_POOL_BYTES = 8 << 30
+
+
+class _PoolSlot:
+    __slots__ = ("storage", "capacity", "registered", "quarantined")
+
+    def __init__(self, storage: torch.Tensor, registered: bool) -> None:
+        self.storage = storage  # flat uint8 buffer
+        self.capacity = storage.numel()
+        self.registered = registered
+        self.quarantined = False
+
+
+class ReceiveBufferPool:
+    """Reusable, once-registered receive buffers for ``get_into``.
+
+    The default consumer path allocates a fresh pageable tensor per feature,
+    registers it with the transfer engine, fetches, unregisters, and later pays
+    a pageable host-to-device copy. On a 277 MB sample that path measured
+    ~0.19 s of receive plus ~0.09 s of copy, and the copy runs on the training
+    stream. This pool keeps a bounded set of buffers that are registered once:
+
+    * ``pinned``: page-locked host slots; the fetched bytes are copied to the
+      trainer device on a side stream (54 GB/s instead of 3 GB/s pageable) and
+      the slot is recycled as soon as that copy has completed.
+    * ``cuda``: slots live on the trainer device and the transfer engine writes
+      into them directly (GPUDirect RDMA / NVLink); the caller receives a clone
+      so the slot can be recycled immediately.
+
+    Slots are recycled by size (first fit); the pool grows on demand up to
+    ``max_bytes`` and hands out one-off buffers beyond that so a burst can
+    never deadlock a fetch. A slot whose transfer failed is quarantined
+    because a timed-out transfer may still write into it later.
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        *,
+        kind: str,
+        max_bytes: int = DEFAULT_RECEIVE_POOL_BYTES,
+    ) -> None:
+        if kind not in RECEIVE_BUFFER_KINDS:
+            raise ValueError(
+                f"receive buffer kind {kind!r} not in {RECEIVE_BUFFER_KINDS}"
+            )
+        self.kind = kind
+        self.max_bytes = int(max_bytes)
+        self._store = store
+        self._lock = threading.Lock()
+        self._free: List[_PoolSlot] = []
+        self._allocated_bytes = 0
+        self._streams = threading.local()
+        self.stats = {"hits": 0, "grown": 0, "overflow": 0, "quarantined": 0}
+
+    def _device_for(self, device) -> torch.device:
+        if self.kind == "cuda":
+            target = torch.device(device)
+            if target.type == "cpu":
+                raise ValueError(
+                    "receive_buffers=cuda needs a device-side consumer; the loader "
+                    "asked for CPU tensors"
+                )
+            return target
+        return torch.device("cpu")
+
+    def _new_slot(self, nbytes: int, device: torch.device) -> _PoolSlot:
+        if self.kind == "cuda":
+            storage = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        else:
+            pin = torch.cuda.is_available()
+            storage = torch.empty(nbytes, dtype=torch.uint8, pin_memory=pin)
+        registered = False
+        try:
+            self._store.register_buffer(storage.data_ptr(), nbytes)
+            registered = True
+        except Exception:  # pragma: no cover - some builds auto-register
+            pass
+        return _PoolSlot(storage, registered)
+
+    def acquire(self, nbytes: int, device) -> Tuple[Optional[_PoolSlot], bool]:
+        """Return ``(slot, pooled)``; ``pooled`` False means a one-off buffer."""
+        target = self._device_for(device)
+        with self._lock:
+            best = None
+            for slot in self._free:
+                if (
+                    slot.capacity >= nbytes
+                    and slot.storage.device == target
+                    and (best is None or slot.capacity < best.capacity)
+                ):
+                    best = slot
+            if best is not None:
+                self._free.remove(best)
+                self.stats["hits"] += 1
+                return best, True
+            if self._allocated_bytes + nbytes > self.max_bytes:
+                self.stats["overflow"] += 1
+                pooled = False
+            else:
+                self._allocated_bytes += nbytes
+                self.stats["grown"] += 1
+                pooled = True
+        slot = self._new_slot(nbytes, target)
+        if not pooled:
+            slot.registered = slot.registered  # one-off: unregistered on release
+        return slot, pooled
+
+    def release(
+        self, slot: _PoolSlot, pooled: bool, *, quarantine: bool = False
+    ) -> None:
+        if quarantine:
+            with self._lock:
+                self.stats["quarantined"] += 1
+                slot.quarantined = True
+            return  # never reused: a late transfer may still write into it
+        if not pooled:
+            if slot.registered:
+                try:
+                    self._store.unregister_buffer(slot.storage.data_ptr())
+                except Exception:  # pragma: no cover
+                    pass
+            return
+        with self._lock:
+            self._free.append(slot)
+
+    def copy_stream(self, device: torch.device):
+        """Per-thread side stream for pinned host -> device copies."""
+        stream = getattr(self._streams, "stream", None)
+        if stream is None or stream.device != device:
+            stream = torch.cuda.Stream(device=device)
+            self._streams.stream = stream
+        return stream
+
+    def health(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "receive_buffers": self.kind,
+                "receive_pool_bytes": self._allocated_bytes,
+                "receive_pool_free_slots": len(self._free),
+                **{f"receive_pool_{k}": v for k, v in self.stats.items()},
+            }
+
+
 class MooncakeFeatureStore(FeatureStore):
     """A disaggregated :class:`FeatureStore` backed by the Mooncake store.
 
@@ -260,6 +405,8 @@ class MooncakeFeatureStore(FeatureStore):
         replica_num: int = 1,
         hard_pin: bool = True,
         clock: Callable[[], float] = time.monotonic,
+        receive_buffers: str = "pageable",
+        receive_pool_bytes: int = DEFAULT_RECEIVE_POOL_BYTES,
     ) -> None:
         self.auth = auth or AuthPolicy()
         self._credential = credential
@@ -279,6 +426,16 @@ class MooncakeFeatureStore(FeatureStore):
         # Buffers of failed get_into attempts, never reused or freed: a
         # timed-out transfer can still write into them after the call returns.
         self._quarantined_buffers: List[torch.Tensor] = []
+        if receive_buffers not in RECEIVE_BUFFER_KINDS:
+            raise ValueError(
+                f"receive_buffers={receive_buffers!r} not in {RECEIVE_BUFFER_KINDS}"
+            )
+        self.receive_buffers = receive_buffers
+        self._receive_pool: Optional[ReceiveBufferPool] = (
+            ReceiveBufferPool(store, kind=receive_buffers, max_bytes=receive_pool_bytes)
+            if receive_buffers != "pageable"
+            else None
+        )
         put_config.replica_num = replica_num
         # Prefer true hard pinning when the installed Mooncake supports it.
         # Older ROCm builds expose only `with_soft_pin`; that is a best-effort
@@ -373,22 +530,67 @@ class MooncakeFeatureStore(FeatureStore):
         if rc is not None and int(rc) < 0:
             raise RuntimeError(f"mooncake put_from failed (status {rc}) for {key}")
 
-    def _fetch_tensor(self, key: str, spec) -> torch.Tensor:
-        """Allocate and fetch, retrying transient transfer failures
-        (TRANSFER_FAIL/-800) into a fresh buffer each attempt."""
+    def _fetch_tensor(self, key: str, spec, device="cpu") -> torch.Tensor:
+        """Fetch one feature, retrying transient transfer failures
+        (TRANSFER_FAIL/-800) into a fresh buffer each attempt.
+
+        Returns a tensor the caller owns: pageable host memory on the default
+        path, or a tensor already on ``device`` when a receive pool is active.
+        """
         for attempt in range(3):
-            dst = _alloc_from_spec(spec)
             try:
-                self._store_get_tensor(key, dst)
-                return dst
+                return self._fetch_tensor_once(key, spec, device)
             except KeyError as exc:
-                self._quarantined_buffers.append(dst)
                 delay = 2.0 * 2**attempt
                 logger.warning("%s; retry %d/3 in %.0fs", exc, attempt + 1, delay)
                 time.sleep(delay)
-        dst = _alloc_from_spec(spec)
-        self._store_get_tensor(key, dst)
-        return dst
+        return self._fetch_tensor_once(key, spec, device)
+
+    def _fetch_tensor_once(self, key: str, spec, device) -> torch.Tensor:
+        pool = self._receive_pool
+        if pool is None:
+            dst = _alloc_from_spec(spec)
+            try:
+                self._store_get_tensor(key, dst)
+            except KeyError:
+                self._quarantined_buffers.append(dst)
+                raise
+            return dst
+        dtype = _TORCH_DTYPES.get(spec.dtype)
+        if dtype is None:
+            raise KeyError(f"unsupported feature dtype {spec.dtype!r} for Mooncake get")
+        shape = tuple(int(d) for d in spec.shape)
+        nbytes = torch.empty(0, dtype=dtype).element_size() * int(
+            torch.Size(shape).numel()
+        )
+        slot, pooled = pool.acquire(max(nbytes, 1), device)
+        try:
+            rc = self._store.get_into(key, slot.storage.data_ptr(), nbytes)
+        except Exception:
+            pool.release(slot, pooled, quarantine=True)
+            raise
+        if rc is None or int(rc) < 0 or int(rc) != nbytes:
+            pool.release(slot, pooled, quarantine=True)
+            if rc is None or int(rc) < 0:
+                raise KeyError(f"mooncake get_into failed (status {rc}) for {key}")
+            raise KeyError(
+                f"mooncake get_into short read for {key}: got {rc} of {nbytes} bytes"
+            )
+        view = slot.storage[:nbytes].view(dtype).view(shape)
+        target = torch.device(device)
+        try:
+            if pool.kind == "cuda" or target.type == "cpu":
+                # device slot -> device clone (tens of microseconds), or a host
+                # clone when the loader wants CPU tensors
+                out = view.clone()
+            else:
+                stream = pool.copy_stream(target)
+                with torch.cuda.stream(stream):
+                    out = view.to(target, non_blocking=True)
+                stream.synchronize()
+        finally:
+            pool.release(slot, pooled)
+        return out
 
     def _store_get_tensor(self, key: str, out: torch.Tensor) -> None:
         """Zero-copy fetch into a pre-allocated tensor. Raises KeyError if absent.
@@ -639,9 +841,12 @@ class MooncakeFeatureStore(FeatureStore):
                     f"refusing use-after-free"
                 )
         wanted = names or list(sample_ref.feature_keys.keys())
-        out, gen = self._get_tensors(sample_ref, wanted)
+        out, gen = self._get_tensors(sample_ref, wanted, device)
         if str(device) != "cpu":
-            out = {k: v.to(device) for k, v in out.items()}
+            target = torch.device(device)
+            out = {
+                k: (v if v.device == target else v.to(target)) for k, v in out.items()
+            }
         with self._lock:
             self._counter += 1
             # Consumer-side cache: a process that only get()s a sample (never
@@ -659,7 +864,7 @@ class MooncakeFeatureStore(FeatureStore):
         return out, handle
 
     def _get_tensors(
-        self, ref: SampleRef, wanted: List[str]
+        self, ref: SampleRef, wanted: List[str], device="cpu"
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         """Read each feature straight into a spec-allocated tensor."""
         sid = ref.sample_id
@@ -679,8 +884,8 @@ class MooncakeFeatureStore(FeatureStore):
                     f"sample {sid} gen {gen} feature {n!r} not available "
                     f"(freed, stale, or never written)"
                 )
-            # fresh alloc per attempt -> clone-on-fetch for free (B5)
-            out[n] = self._fetch_tensor(key, spec)
+            # fresh alloc (or a pooled slot copied out) -> clone-on-fetch for free (B5)
+            out[n] = self._fetch_tensor(key, spec, device)
         return out, gen
 
     # -- lifetime ----------------------------------------------------------
@@ -825,6 +1030,7 @@ class MooncakeFeatureStore(FeatureStore):
             "release_pending": len(remaining),
             "remaining_ids": remaining,
             "attempts": 1 if pending else 0,
+            **(self._receive_pool.health() if self._receive_pool else {}),
         }
 
     def drain_pending_removals(

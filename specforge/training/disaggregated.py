@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
@@ -146,12 +146,20 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     ):
         if os.environ.get(env_name):
             setup_kwargs[key] = int(os.environ[env_name])
+    receive_kwargs: Dict[str, Any] = {}
+    if os.environ.get("DISAGG_RECEIVE_BUFFERS"):
+        receive_kwargs["receive_buffers"] = os.environ["DISAGG_RECEIVE_BUFFERS"]
+    if os.environ.get("DISAGG_RECEIVE_POOL_BYTES"):
+        receive_kwargs["receive_pool_bytes"] = int(
+            os.environ["DISAGG_RECEIVE_POOL_BYTES"]
+        )
     return MooncakeFeatureStore(
         store_id=os.environ.get("DISAGG_STORE_ID", cfg.run_id),
         setup_kwargs=setup_kwargs,
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
+        **receive_kwargs,
     )
 
 

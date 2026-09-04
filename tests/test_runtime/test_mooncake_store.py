@@ -29,7 +29,7 @@ from specforge.runtime.data_plane.feature_store import (
     drain_feature_store_removals,
     drain_feature_store_sample_removals,
 )
-from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore, _nbytes
 
 
 class _FakeMooncakeStore:
@@ -425,6 +425,118 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(fs.health()["release_pending"], 0)
         self.assertFalse(_phys_resident(fake))
         self.assertIn((keys[0], True, -704), fake.codes)
+
+    def test_pinned_receive_pool_reuses_registered_slots(self):
+        """Pooled receive buffers: registered once, recycled by size, bytes intact."""
+
+        class CountingFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.registered = 0
+                self.unregistered = 0
+
+            def register_buffer(self, ptr, size):
+                self.registered += 1
+                return 0
+
+            def unregister_buffer(self, ptr):
+                self.unregistered += 1
+                return 0
+
+        fake = CountingFake()
+        producer = MooncakeFeatureStore(store=fake, store_id="run0")
+        consumer = MooncakeFeatureStore(
+            store=fake, store_id="run0", receive_buffers="pinned"
+        )
+        tensors = _tensors()
+        refs = [
+            producer.put(tensors, sample_id=f"s{i}", metadata=_meta()) for i in range(3)
+        ]
+        registered_after_puts = fake.registered
+        for ref in refs:
+            got, handle = consumer.get(ref)
+            for name, expected in tensors.items():
+                self.assertTrue(torch.equal(got[name], expected), name)
+                # the caller owns a copy, never a view of the pooled slot
+                self.assertFalse(
+                    got[name].is_pinned() if torch.cuda.is_available() else False
+                )
+            consumer.release(handle)
+        health = consumer.health()
+        # one slot per distinct size, registered once, then reused for the next samples
+        self.assertEqual(
+            health["receive_pool_grown"], len({_nbytes(t) for t in tensors.values()})
+        )
+        self.assertEqual(
+            health["receive_pool_hits"],
+            3 * len(tensors) - health["receive_pool_grown"],
+        )
+        self.assertEqual(
+            fake.registered - registered_after_puts, health["receive_pool_grown"]
+        )
+        self.assertEqual(
+            health["receive_pool_free_slots"], health["receive_pool_grown"]
+        )
+        self.assertEqual(health["receive_buffers"], "pinned")
+
+    def test_receive_pool_budget_overflows_to_one_off_buffers(self):
+        fake = _FakeMooncakeStore()
+        producer = MooncakeFeatureStore(store=fake, store_id="run0")
+        consumer = MooncakeFeatureStore(
+            store=fake, store_id="run0", receive_buffers="pinned", receive_pool_bytes=1
+        )
+        ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
+        got, handle = consumer.get(ref)
+        self.assertTrue(torch.equal(got["hidden_state"], _tensors()["hidden_state"]))
+        consumer.release(handle)
+        health = consumer.health()
+        self.assertEqual(health["receive_pool_grown"], 0)
+        self.assertEqual(health["receive_pool_overflow"], len(_tensors()))
+        self.assertEqual(health["receive_pool_free_slots"], 0)
+
+    def test_receive_pool_quarantines_a_failed_transfer(self):
+        class FailingFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.fail_next = 0
+
+            def get_into(self, key, ptr, size):
+                if self.fail_next:
+                    self.fail_next -= 1
+                    return -800
+                return super().get_into(key, ptr, size)
+
+        fake = FailingFake()
+        producer = MooncakeFeatureStore(store=fake, store_id="run0")
+        consumer = MooncakeFeatureStore(
+            store=fake, store_id="run0", receive_buffers="pinned"
+        )
+        ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
+        fake.fail_next = 1
+        with mock.patch("specforge.runtime.data_plane.mooncake_store.time.sleep"):
+            got, handle = consumer.get(ref)
+        self.assertTrue(torch.equal(got["hidden_state"], _tensors()["hidden_state"]))
+        consumer.release(handle)
+        health = consumer.health()
+        self.assertEqual(health["receive_pool_quarantined"], 1)
+        # the quarantined slot was replaced by a fresh one, never handed out again
+        self.assertEqual(
+            health["receive_pool_free_slots"], health["receive_pool_grown"] - 1
+        )
+
+    def test_cuda_receive_pool_rejects_cpu_consumers(self):
+        fake = _FakeMooncakeStore()
+        producer = MooncakeFeatureStore(store=fake, store_id="run0")
+        consumer = MooncakeFeatureStore(
+            store=fake, store_id="run0", receive_buffers="cuda"
+        )
+        ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
+        with self.assertRaisesRegex(ValueError, "device-side consumer"):
+            consumer.get(ref)
+
+    def test_unknown_receive_buffer_kind_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "receive_buffers"):
+            _store(receive_buffers="mmap")
 
     def test_optimizer_ack_forces_only_durable_samples(self):
         class ForceAwareFake(_FakeMooncakeStore):
