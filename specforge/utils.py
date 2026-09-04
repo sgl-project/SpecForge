@@ -151,6 +151,8 @@ def get_device_type() -> str:
         return "cuda"
     if hasattr(torch, "npu") and torch.npu.is_available():
         return "npu"
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        return "musa"
     return "cpu"
 
 
@@ -162,6 +164,8 @@ def get_local_device() -> torch.device:
         return torch.device("cuda", local_rank)
     if device_type == "npu":
         return torch.device("npu", local_rank)
+    if device_type == "musa":
+        return torch.device("musa", local_rank)
     return torch.device("cpu")
 
 
