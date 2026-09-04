@@ -36,7 +36,7 @@ Launch the sglang server:
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3.6-27B \
   --mem-fraction-static 0.7 \
-  --tp 1 \
+  --tp-size 1 \
   --host 0.0.0.0 \
   --port 30000 \
   --dtype bfloat16 \
