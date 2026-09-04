@@ -439,6 +439,61 @@ class TestServingExport(unittest.TestCase):
             self.assertTrue(torch.equal(value.float(), fresh[key].float()), key)
 
 
+class TestDeepseekV4TargetDequant(unittest.TestCase):
+    def test_fp4_and_fp8_dequant_conventions(self):
+        from specforge.modeling.draft.moe.deepseek_v4_target import (
+            FP4_TABLE,
+            dequant_fp4_packed,
+            dequant_fp8_block,
+            dequantize_ffn_tensors,
+        )
+
+        # one row of 32 fp4 values: nibbles 0..15 twice; low nibble = even index
+        codes = torch.arange(16, dtype=torch.uint8)
+        packed = (
+            (codes | (codes << 4)).repeat(2).view(1, 32).to(torch.int8)
+        )  # 64 values
+        scale = torch.tensor([[2.0, 0.5]], dtype=torch.float32)  # two groups of 32
+        out = dequant_fp4_packed(packed, scale)
+        self.assertEqual(tuple(out.shape), (1, 64))
+        expected = FP4_TABLE[codes.long()].repeat_interleave(2).repeat(2)
+        expected[:32] *= 2.0
+        expected[32:] *= 0.5
+        self.assertTrue(torch.equal(out.float()[0], expected))
+        w8 = torch.full((128, 256), 1.0).to(torch.float8_e4m3fn)
+        s8 = torch.tensor([[1.0, 4.0]])
+        d8 = dequant_fp8_block(w8, s8).float()
+        self.assertTrue((d8[:, :128] == 1.0).all() and (d8[:, 128:] == 4.0).all())
+        raw = {
+            "layers.3.ffn.gate.weight": torch.randn(4, 8),
+            "layers.3.ffn.gate.bias": torch.randn(4),
+            "layers.3.ffn.experts.0.w1.weight": packed.repeat(2, 1),
+            "layers.3.ffn.experts.0.w1.scale": scale.repeat(2, 1),
+            "layers.3.ffn.shared_experts.w1.weight": w8,
+            "layers.3.ffn.shared_experts.w1.scale": s8,
+        }
+        rel = dequantize_ffn_tensors(raw, "layers.3.ffn.")
+        self.assertEqual(
+            set(rel),
+            {
+                "gate.weight",
+                "gate.bias",
+                "experts.0.w1.weight",
+                "shared_experts.w1.weight",
+            },
+        )
+        self.assertEqual(rel["gate.bias"].dtype, torch.float32)
+        self.assertEqual(rel["experts.0.w1.weight"].dtype, torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "hash-routed"):
+            dequantize_ffn_tensors(
+                {
+                    "layers.1.ffn.gate.tid2eid": torch.zeros(4),
+                    "layers.1.ffn.gate.weight": torch.zeros(4, 8),
+                },
+                "layers.1.ffn.",
+            )
+
+
 class TestDFlashIntegration(unittest.TestCase):
     def _forward(self, model):
         return model(
