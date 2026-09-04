@@ -699,12 +699,18 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        anchor_positions: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        attention_kwargs = dict(kwargs)
+        if getattr(self.self_attn, "uses_anchor_positions", False):
+            # Only recurrent layers need to know where each proposal block
+            # starts; dense attention learns that from the mask.
+            attention_kwargs["anchor_positions"] = anchor_positions
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -715,7 +721,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **kwargs,
+            **attention_kwargs,
         )[0]
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -793,6 +799,9 @@ def normalize_draft_head_checkpoint_keys(
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
+    # The DFlash-family trainer passes per-block anchors only to drafts that
+    # declare it; recurrent layers consume them, dense layers ignore them.
+    accepts_anchor_positions = True
 
     def __init__(
         self,
@@ -906,6 +915,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        anchor_positions: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
@@ -925,9 +935,18 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                anchor_positions=anchor_positions,
                 **kwargs,
             )
         return self.norm(hidden_states)
+
+    def reset_recurrent_state(self) -> None:
+        """Drop per-request state that recurrent attention keeps across steps."""
+
+        for layer in self.layers:
+            reset = getattr(layer.self_attn, "reset_state", None)
+            if reset is not None:
+                reset()
 
     @torch.inference_mode()
     def spec_generate(
@@ -941,6 +960,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         return_dict: bool = False,
     ) -> torch.LongTensor | DFlashGenerationOutput:
         self.eval()
+        self.reset_recurrent_state()
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 

@@ -367,6 +367,11 @@ class OnlineDFlashModel(nn.Module):
             # empty for DFlash's sparse BlockMask.  Keep the general Triton
             # Flex Attention kernel for every DFlash-family batch.
             draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
+        if getattr(self.draft_model, "accepts_anchor_positions", False):
+            # Recurrent draft layers (context-scanning KDA) need the anchor of
+            # every proposal block; dense drafts recover it from the mask and
+            # legacy draft modules may not accept the keyword at all.
+            draft_kwargs["anchor_positions"] = anchor_positions
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
