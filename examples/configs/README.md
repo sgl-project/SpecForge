@@ -1,7 +1,9 @@
 # Unified training recipe catalog
 
 Every draft model JSON under `configs/` has at least one typed YAML recipe in
-this catalog. Choose a recipe by answering three separate questions:
+this catalog, except future/unsupported VLM draft configs
+(`qwen2-5-vl-7b-eagle3.json` and `qwen2.5-vl-32b-eagle3.json`; see the VLM note
+below). Choose a recipe by answering three separate questions:
 
 1. **When are target features produced?** `online` captures them during the
    run; `offline` reads feature files prepared earlier.
