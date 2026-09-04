@@ -369,19 +369,26 @@ def _device_visibility_env_var() -> str:
     """Visible-devices env var for the active accelerator.
 
     Kept torch-free for supervisor processes: ``torch_npu`` is detected by
-    module availability, after explicit env markers.
+    module availability, after explicit env markers. Intel XPU uses
+    ``ZE_AFFINITY_MASK`` (Level Zero affinity).
     """
     forced = os.environ.get("SPECFORGE_DEVICE")
     if forced == "npu":
         return "ASCEND_RT_VISIBLE_DEVICES"
     if forced == "cuda":
         return "CUDA_VISIBLE_DEVICES"
+    if forced == "xpu":
+        return "ZE_AFFINITY_MASK"
     if os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
         "ASCEND_VISIBLE_DEVICES"
     ):
         return "ASCEND_RT_VISIBLE_DEVICES"
     if os.environ.get("CUDA_VISIBLE_DEVICES"):
         return "CUDA_VISIBLE_DEVICES"
+    if os.environ.get("ZE_AFFINITY_MASK") or os.environ.get(
+        "ONEAPI_DEVICE_SELECTOR"
+    ):
+        return "ZE_AFFINITY_MASK"
     if importlib.util.find_spec("torch_npu") is not None:
         return "ASCEND_RT_VISIBLE_DEVICES"
     return "CUDA_VISIBLE_DEVICES"
@@ -392,8 +399,11 @@ def _hidden_devices_env_value(device_visibility_env: str) -> Optional[str]:
 
     The Ascend driver rejects an empty ``ASCEND_RT_VISIBLE_DEVICES``, so
     there the variable must be unset (``None``) instead of emptied.
+    CUDA and Intel XPU (``ZE_AFFINITY_MASK``) accept an empty value.
     """
-    return "" if device_visibility_env == "CUDA_VISIBLE_DEVICES" else None
+    if device_visibility_env in ("CUDA_VISIBLE_DEVICES", "ZE_AFFINITY_MASK"):
+        return ""
+    return None
 
 
 def _sglang_argv(

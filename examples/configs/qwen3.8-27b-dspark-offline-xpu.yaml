@@ -1,0 +1,45 @@
+# Qwen3.8-27B DSpark draft, offline training (features captured to disk) on
+# Intel Arc Pro B70 (XPU). Trainer runs the 1.36B drafter only; the 27B
+# target is used solely by scripts/prepare_hidden_states.py during capture.
+#
+# NOTE(xpu): attention_backend must be sdpa (or eager) — flex_attention is
+# CUDA/Inductor-only and is not available on the XPU backend.
+model:
+  target_model_path: "/home/ryan/models/qwen3.8-27b-fp8"
+  draft_model_config: "configs/qwen3.8-27b-dspark.json"
+  target_backend: "sglang"
+  trust_remote_code: true
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+data:
+  hidden_states_path: "./cache/hidden_states/qwen3.8-27b-dspark"
+  max_length: 2048
+  chat_template: "qwen3.5"
+  cache_dir: "./cache"
+training:
+  strategy: "dspark"
+  num_epochs: 10
+  max_steps: 10000
+  batch_size: 1
+  accumulation_steps: 512
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: "sdpa"
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  save_interval: 16
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.8-27b-dspark-offline-xpu"
+output_dir: "./outputs/qwen3.8-27b-dspark-offline-xpu"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
