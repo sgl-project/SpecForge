@@ -24,6 +24,10 @@ from .router import RoutingResult
 
 
 class RoutedExperts(nn.Module, abc.ABC):
+    #: The training backend keeps a fully frozen instance replicated (outside
+    #: FSDP sharding): no weight all-gathers or gradient reduce-scatters.
+    fsdp_replicate_when_frozen = True
+
     def __init__(self, cfg: MoEConfig, hidden_size: int) -> None:
         super().__init__()
         self.cfg = cfg

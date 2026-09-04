@@ -49,6 +49,7 @@ TRAINING_KEYS = {
     "moe_bias_update_rate": "bias_update_rate",
     "moe_aux_loss_coeff": "aux_loss_coeff",
     "moe_dispatch": "dispatch",
+    "moe_freeze_experts": "freeze_experts",
 }
 
 
@@ -80,6 +81,11 @@ class MoEConfig:
     bias_update_rate: float = 0.0
     aux_loss_coeff: float = 0.0
     dispatch: str = "sorted_loop"
+    #: Keep the routed experts fixed (e.g. warm-started from the target) and
+    #: train only the router, shared expert and the rest of the draft. Frozen
+    #: experts are replicated by the FSDP backend instead of sharded, which
+    #: removes the per-micro-batch weight all-gathers that dominate large MoEs.
+    freeze_experts: bool = False
 
     def __post_init__(self) -> None:
         if self.n_routed_experts <= 0:

@@ -30,6 +30,8 @@ class MoELayer(nn.Module):
         balance = build_balance_controller(cfg, cfg.n_routed_experts)
         self.gate = build_router(cfg, hidden_size, balance)
         self.experts = build_routed_experts(cfg, hidden_size)
+        if cfg.freeze_experts:
+            self.experts.requires_grad_(False)
         self.shared_experts: Optional[nn.Module] = (
             build_shared_expert(cfg, hidden_size) if cfg.n_shared_experts else None
         )

@@ -451,6 +451,37 @@ class TestServingExport(unittest.TestCase):
             )
 
 
+class TestFrozenExperts(unittest.TestCase):
+    def test_freeze_experts_trains_router_and_shared_only(self):
+        layer = _layer(dflash_config={"moe_freeze_experts": True}).train()
+        self.assertFalse(any(p.requires_grad for p in layer.experts.parameters()))
+        self.assertTrue(layer.gate.weight.requires_grad)
+        self.assertTrue(all(p.requires_grad for p in layer.shared_experts.parameters()))
+        y = layer(torch.randn(6, 32, requires_grad=True))
+        y.float().sum().backward()
+        self.assertIsNotNone(layer.gate.weight.grad)
+        self.assertIsNone(layer.experts.w1.grad)
+
+    def test_backend_replicates_frozen_experts(self):
+        from specforge.training.backend import FSDPTrainingBackend
+
+        config = _dflash_config()
+        config.dflash_config = {**config.dflash_config, "moe_freeze_experts": True}
+        model = DFlashDraftModel(config)
+        ignored = FSDPTrainingBackend._frozen_target_modules(model)
+        self.assertEqual([type(m).__name__ for m in ignored], ["GroupedExperts"] * 2)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for m in ignored for p in m.parameters())
+        self.assertGreater(frozen, trainable)
+        # trained experts stay sharded
+        self.assertEqual(
+            FSDPTrainingBackend._frozen_target_modules(
+                DFlashDraftModel(_dflash_config())
+            ),
+            (),
+        )
+
+
 class TestDeepseekV4TargetDequant(unittest.TestCase):
     def test_fp4_and_fp8_dequant_conventions(self):
         from specforge.modeling.draft.moe.deepseek_v4_target import (
