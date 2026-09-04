@@ -288,7 +288,7 @@ class ReceiveBufferPool:
             if target.type == "cpu":
                 raise ValueError(
                     "receive_buffers=cuda needs a device-side consumer; the loader "
-                    "asked for CPU tensors"
+                    "asked for CPU tensors (request the rank's CUDA device instead)"
                 )
             return target
         return torch.device("cpu")
@@ -529,6 +529,23 @@ class MooncakeFeatureStore(FeatureStore):
                 pass
         if rc is not None and int(rc) < 0:
             raise RuntimeError(f"mooncake put_from failed (status {rc}) for {key}")
+
+    def consumer_device(self) -> Optional[torch.device]:
+        """Device the loader should request features on; ``None`` means host.
+
+        ``receive_buffers="cuda"`` lands hidden states straight in device
+        memory (GPU-direct RDMA), so the consumer's loader has to ask for
+        tensors on this rank's CUDA device instead of the default host tensors.
+        """
+        if self.receive_buffers != "cuda":
+            return None
+        # Mirror init_distributed: the launcher's LOCAL_RANK names this rank's
+        # device even before the process group has selected it.
+        local_rank = os.environ.get("LOCAL_RANK")
+        index = (
+            int(local_rank) if local_rank is not None else torch.cuda.current_device()
+        )
+        return torch.device("cuda", index)
 
     def _fetch_tensor(self, key: str, spec, device="cpu") -> torch.Tensor:
         """Fetch one feature, retrying transient transfer failures

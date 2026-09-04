@@ -10,6 +10,7 @@ end-to-end test against ``mooncake`` is gated below on the package import.
 
 import ctypes
 import importlib.util
+import os
 import unittest
 from inspect import signature
 from unittest import mock
@@ -535,6 +536,24 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
         with self.assertRaisesRegex(ValueError, "device-side consumer"):
             consumer.get(ref)
+
+    def test_consumer_device_follows_the_receive_buffer_kind(self):
+        fake = _FakeMooncakeStore()
+        self.assertIsNone(
+            MooncakeFeatureStore(store=fake, store_id="run0").consumer_device()
+        )
+        self.assertIsNone(
+            MooncakeFeatureStore(
+                store=fake, store_id="run0", receive_buffers="pinned"
+            ).consumer_device()
+        )
+        cuda = MooncakeFeatureStore(store=fake, store_id="run0", receive_buffers="cuda")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LOCAL_RANK", None)
+            with mock.patch.object(torch.cuda, "current_device", return_value=3):
+                self.assertEqual(cuda.consumer_device(), torch.device("cuda", 3))
+        with mock.patch.dict(os.environ, {"LOCAL_RANK": "2"}):
+            self.assertEqual(cuda.consumer_device(), torch.device("cuda", 2))
 
     def test_unknown_receive_buffer_kind_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "receive_buffers"):
