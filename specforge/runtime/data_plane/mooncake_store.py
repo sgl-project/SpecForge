@@ -272,6 +272,9 @@ class MooncakeFeatureStore(FeatureStore):
             put_config = _InjectedReplicateConfig()
         _require_store_api(store)
         self._store = store
+        # Buffers of failed get_into attempts, never reused or freed: a
+        # timed-out transfer can still write into them after the call returns.
+        self._quarantined_buffers: List[torch.Tensor] = []
         put_config.replica_num = replica_num
         # Prefer true hard pinning when the installed Mooncake supports it.
         # Older ROCm builds expose only `with_soft_pin`; that is a best-effort
@@ -365,6 +368,23 @@ class MooncakeFeatureStore(FeatureStore):
                 pass
         if rc is not None and int(rc) < 0:
             raise RuntimeError(f"mooncake put_from failed (status {rc}) for {key}")
+
+    def _fetch_tensor(self, key: str, spec) -> torch.Tensor:
+        """Allocate and fetch, retrying transient transfer failures
+        (TRANSFER_FAIL/-800) into a fresh buffer each attempt."""
+        for attempt in range(3):
+            dst = _alloc_from_spec(spec)
+            try:
+                self._store_get_tensor(key, dst)
+                return dst
+            except KeyError as exc:
+                self._quarantined_buffers.append(dst)
+                delay = 2.0 * 2**attempt
+                logger.warning("%s; retry %d/3 in %.0fs", exc, attempt + 1, delay)
+                time.sleep(delay)
+        dst = _alloc_from_spec(spec)
+        self._store_get_tensor(key, dst)
+        return dst
 
     def _store_get_tensor(self, key: str, out: torch.Tensor) -> None:
         """Zero-copy fetch into a pre-allocated tensor. Raises KeyError if absent.
@@ -650,8 +670,8 @@ class MooncakeFeatureStore(FeatureStore):
                     f"sample {sid} gen {gen} feature {n!r} not available "
                     f"(freed, stale, or never written)"
                 )
-            out[n] = _alloc_from_spec(spec)  # fresh -> clone-on-fetch for free (B5)
-            self._store_get_tensor(key, out[n])
+            # fresh alloc per attempt -> clone-on-fetch for free (B5)
+            out[n] = self._fetch_tensor(key, spec)
         return out, gen
 
     # -- lifetime ----------------------------------------------------------

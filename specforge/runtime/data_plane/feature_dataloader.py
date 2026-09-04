@@ -21,6 +21,7 @@ import queue as queue_module
 import threading
 import time
 from collections import OrderedDict
+from concurrent import futures
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -54,8 +55,23 @@ class _QueuePrefetchState:
         self.thread: Optional[threading.Thread] = None
         self.outstanding: "OrderedDict[str, _OutstandingRef]" = OrderedDict()
         self.outstanding_lock = threading.Lock()
+        self.fetches: set = set()
+        self.fetches_lock = threading.Lock()
         self.shutdown_lock = threading.Lock()
         self.shutdown_complete = False
+
+    def track_fetch(self, future: Any) -> None:
+        with self.fetches_lock:
+            self.fetches.add(future)
+        future.add_done_callback(self._untrack_fetch)
+
+    def _untrack_fetch(self, future: Any) -> None:
+        with self.fetches_lock:
+            self.fetches.discard(future)
+
+    def live_fetches(self) -> List[Any]:
+        with self.fetches_lock:
+            return list(self.fetches)
 
     def track(self, refs: List[SampleRef]) -> None:
         with self.outstanding_lock:
@@ -141,6 +157,38 @@ class FeatureDataLoader:
         self._lifecycle_lock = threading.Lock()
         self._prefetch_state: Optional[_QueuePrefetchState] = None
         self._queue_closed = False
+        self._perf_lock = threading.Lock()
+        self._perf = {
+            "wait_producer_s": 0.0,
+            "wait_fetch_s": 0.0,
+            "fetch_s": 0.0,
+            "fetch_bytes": 0.0,
+            "fetch_batches": 0.0,
+        }
+
+    def _perf_add(self, **deltas: float) -> None:
+        with self._perf_lock:
+            for name, delta in deltas.items():
+                self._perf[name] += delta
+
+    def perf_counters_snapshot(self, reset: bool = False) -> Dict[str, float]:
+        """Return loader counters accumulated since the last reset."""
+        with self._perf_lock:
+            snapshot = dict(self._perf)
+            if reset:
+                for name in self._perf:
+                    self._perf[name] = 0.0
+        return snapshot
+
+    def _timed_make_batch(self, refs: List[SampleRef]) -> TrainBatch:
+        started = time.perf_counter()
+        batch = self._make_batch(refs)
+        self._perf_add(
+            fetch_s=time.perf_counter() - started,
+            fetch_bytes=float(sum(int(ref.estimated_bytes or 0) for ref in refs)),
+            fetch_batches=1.0,
+        )
+        return batch
 
     def _maybe_gc(self) -> None:
         if self.gc_interval_s is None:
@@ -333,23 +381,23 @@ class FeatureDataLoader:
         with self._lifecycle_lock:
             if self._queue_closed:
                 return
-        # LOADER_PREFETCH=N (>0) materializes up to N batches ahead on a
-        # background thread so the training step never pays fetch latency
-        # inline. Ack still happens on the consuming thread AFTER the trainer
-        # has taken the batch (same in-flight semantics as the sync path).
         depth = self.num_workers or int(os.environ.get("LOADER_PREFETCH", "0"))
         if depth > 0:
             yield from self._iter_queue_prefetch(depth)
             return
         while True:
+            wait_started = time.perf_counter()
             refs = self.queue.get(self.batch_size, timeout_s=0.0)
+            self._perf_add(wait_producer_s=time.perf_counter() - wait_started)
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
                 self._settle_incomplete_queue_batch(refs)
                 return
             try:
-                batch = self._make_batch(refs)
+                fetch_started = time.perf_counter()
+                batch = self._timed_make_batch(refs)
+                self._perf_add(wait_fetch_s=time.perf_counter() - fetch_started)
             except Exception as exc:
                 self.queue.fail(refs, reason=f"materialize:{exc}", retryable=False)
                 raise
@@ -379,6 +427,14 @@ class FeatureDataLoader:
                 )
             return self.queue.get(self.batch_size, timeout_s=_PREFETCH_POLL_S)
 
+        # The buffer carries FUTURES, so up to `depth` batches materialize
+        # concurrently while the worker goes back to leasing; the consuming
+        # thread resolves them in submission order. Lease/ack semantics are
+        # unchanged.
+        pool = futures.ThreadPoolExecutor(
+            max_workers=depth, thread_name_prefix="loader-fetch"
+        )
+
         def _worker() -> None:
             try:
                 while not state.stop.is_set():
@@ -397,20 +453,17 @@ class FeatureDataLoader:
                             state.mark_yielded_or_failed(refs)
                         put_interruptibly(eos)
                         return
-                    try:
-                        batch = self._make_batch(refs)
-                    except Exception as exc:
-                        self.queue.fail(
-                            refs, reason=f"materialize:{exc}", retryable=False
-                        )
-                        state.mark_yielded_or_failed(refs)
-                        put_interruptibly(exc)
-                        return
-                    state.mark_materialized(refs)
-                    if not put_interruptibly((batch, refs)):
+                    future = pool.submit(self._timed_make_batch, refs)
+                    state.track_fetch(future)
+                    if not put_interruptibly((future, refs)):
                         return
             except BaseException as exc:  # loud failure, never a silent hang
                 put_interruptibly(exc)
+            finally:
+                # Never block worker shutdown on in-flight fetches; refs of
+                # unemitted batches stay tracked and are settled by
+                # _shutdown_prefetch like any other never-yielded lease.
+                pool.shutdown(wait=False, cancel_futures=True)
 
         worker = threading.Thread(
             target=_worker,
@@ -430,15 +483,37 @@ class FeatureDataLoader:
 
         try:
             while not state.stop.is_set():
+                # An empty buffer means the worker is still leasing refs:
+                # producer-bound wait. Time spent resolving an already
+                # submitted future is transfer-bound wait.
+                wait_started = time.perf_counter()
                 try:
                     item = state.buffer.get(timeout=_PREFETCH_POLL_S)
                 except queue_module.Empty:
+                    self._perf_add(wait_producer_s=time.perf_counter() - wait_started)
                     continue
                 if item is eos:
                     return
                 if isinstance(item, BaseException):
                     raise item
-                batch, refs = item
+                future, refs = item
+                fetch_started = time.perf_counter()
+                while not state.stop.is_set():
+                    try:
+                        batch = future.result(timeout=_PREFETCH_POLL_S)
+                        break
+                    except futures.TimeoutError:
+                        continue
+                    except Exception as exc:
+                        self.queue.fail(
+                            refs, reason=f"materialize:{exc}", retryable=False
+                        )
+                        state.mark_yielded_or_failed(refs)
+                        raise
+                else:
+                    return
+                self._perf_add(wait_fetch_s=time.perf_counter() - fetch_started)
+                state.mark_materialized(refs)
                 # From this point the trainer owns the refs. In deferred-ack
                 # mode its optimizer-boundary transaction decides their
                 # outcome; loader shutdown must touch only batches that were
@@ -466,6 +541,14 @@ class FeatureDataLoader:
                         f"{_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend get/materialize "
                         f"is still blocked, outstanding_refs={outstanding_ids}"
                     )
+            live = state.live_fetches()
+            if live and futures.wait(live, timeout=_PREFETCH_JOIN_TIMEOUT_S).not_done:
+                outstanding_ids = state.outstanding_ids()
+                raise RuntimeError(
+                    "FeatureDataLoader prefetch fetch did not stop within "
+                    f"{_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend get/materialize "
+                    f"is still blocked, outstanding_refs={outstanding_ids}"
+                )
 
             outstanding = state.outstanding_entries()
             retryable: List[SampleRef] = []
