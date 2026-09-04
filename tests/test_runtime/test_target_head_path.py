@@ -66,9 +66,7 @@ class TargetHeadPathTest(unittest.TestCase):
 
     def test_dflash_family_head_reads_the_configured_head_checkpoint(self):
         from_pretrained = self._build(_cfg(target_head_path="/models/target-bf16-head"))
-        self.assertEqual(
-            from_pretrained.call_args.args, ("/models/target-bf16-head",)
-        )
+        self.assertEqual(from_pretrained.call_args.args, ("/models/target-bf16-head",))
         self.assertEqual(
             from_pretrained.call_args.kwargs["lm_head_key"], "lm_head.weight"
         )
