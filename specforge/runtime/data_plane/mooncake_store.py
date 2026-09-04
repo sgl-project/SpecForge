@@ -1030,7 +1030,6 @@ class MooncakeFeatureStore(FeatureStore):
             "release_pending": len(remaining),
             "remaining_ids": remaining,
             "attempts": 1 if pending else 0,
-            **(self._receive_pool.health() if self._receive_pool else {}),
         }
 
     def drain_pending_removals(
@@ -1196,7 +1195,7 @@ class MooncakeFeatureStore(FeatureStore):
             # NOTE: resident_bytes is an in-process accounting sum, not a live
             # Mooncake pool-usage query (the Python API exposes only per-key
             # get_size). A cross-node pool-usage signal is a follow-up.
-            return {
+            result = {
                 "store_id": self.store_id,
                 "backend": "mooncake",
                 "resident_samples": len(self._generation),
@@ -1211,6 +1210,9 @@ class MooncakeFeatureStore(FeatureStore):
                 "force_freed_total": self._stats["force_freed"],
                 "hard_pin": bool(getattr(self._put_config, "with_hard_pin", False)),
             }
+            if self._receive_pool is not None:
+                result.update(self._receive_pool.health())
+            return result
 
 
 __all__ = ["MooncakeFeatureStore"]

@@ -463,13 +463,15 @@ class TestMooncakeFeatureStore(unittest.TestCase):
                 )
             consumer.release(handle)
         health = consumer.health()
-        # one slot per distinct size, registered once, then reused for the next samples
-        self.assertEqual(
+        # slots are recycled by first fit as soon as the caller's copy exists, so a
+        # handful of registered slots serve every fetch of every sample
+        acquires = 3 * len(tensors)
+        self.assertGreaterEqual(health["receive_pool_grown"], 1)
+        self.assertLessEqual(
             health["receive_pool_grown"], len({_nbytes(t) for t in tensors.values()})
         )
         self.assertEqual(
-            health["receive_pool_hits"],
-            3 * len(tensors) - health["receive_pool_grown"],
+            health["receive_pool_hits"], acquires - health["receive_pool_grown"]
         )
         self.assertEqual(
             fake.registered - registered_after_puts, health["receive_pool_grown"]
