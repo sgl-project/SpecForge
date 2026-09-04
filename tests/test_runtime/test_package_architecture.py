@@ -715,6 +715,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "glm-5.2-dspark.json",
                 "inkling-dspark.json",
                 "kimi-k3-dspark.json",
+                "qwen3-4b-dspark-kda-scan.json",
                 "qwen3-4b-dspark-kda.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
@@ -732,7 +733,7 @@ class TestPackageArchitecture(unittest.TestCase):
                     payload["num_attention_heads"] % payload["num_key_value_heads"],
                     0,
                 )
-                if name == "qwen3-4b-dspark-kda.json":
+                if name in ("qwen3-4b-dspark-kda.json", "qwen3-4b-dspark-kda-scan.json"):
                     self.assertEqual(
                         payload["dflash_config"]["attention_modes"],
                         ["kda", "kda", "gqa", "kda", "kda"],
@@ -740,6 +741,11 @@ class TestPackageArchitecture(unittest.TestCase):
                     self.assertEqual(payload["linear_attn_config"]["backend"], "fla")
                     self.assertEqual(payload["linear_attn_config"]["head_dim"], 128)
                     self.assertEqual(payload["linear_attn_config"]["num_heads"], 16)
+                    expected_state = "scan" if name.endswith("-scan.json") else "reset"
+                    self.assertEqual(
+                        payload["linear_attn_config"].get("context_state", "reset"),
+                        expected_state,
+                    )
                 else:
                     self.assertEqual(payload["dflash_config"]["attention_mode"], "gqa")
 
