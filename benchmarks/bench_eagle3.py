@@ -26,7 +26,7 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 4 \
     --mem-fraction-static 0.75 \
     --cuda-graph-max-bs 1 \
-    --tp 1 \
+    --tp-size 1 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 30000 \
