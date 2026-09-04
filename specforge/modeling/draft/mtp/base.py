@@ -58,6 +58,20 @@ class MTPDraftModel(nn.Module):
         """
         raise NotImplementedError
 
+    def forward_hidden(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the draft backbone and return pre-``lm_head`` hidden states.
+
+        Memory-bounded training loops consume this and apply ``mtp.lm_head``
+        in chunks, so full-vocab logits never materialize at once.
+        """
+        raise NotImplementedError
+
     def share_target_embeddings(
         self,
         embed_weight: torch.Tensor,
