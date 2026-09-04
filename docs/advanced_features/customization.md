@@ -58,6 +58,7 @@ strategy-specific set:
 | EAGLE3 | `sdpa`, `flex_attention`, `fa`, offline `usp` |
 | P-EAGLE | `flex_attention` |
 | DFlash, DFlash2, Domino, DSpark | `eager`, `sdpa`, `flex_attention` |
+| MTP | `eager`, `sdpa` |
 
 ## Target models
 
