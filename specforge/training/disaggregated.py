@@ -149,6 +149,14 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     receive_kwargs: Dict[str, Any] = {}
     if os.environ.get("DISAGG_RECEIVE_BUFFERS"):
         receive_kwargs["receive_buffers"] = os.environ["DISAGG_RECEIVE_BUFFERS"]
+        if (
+            receive_kwargs["receive_buffers"] == "cuda"
+            and setup_kwargs["protocol"] != "rdma"
+        ):
+            raise ValueError(
+                "DISAGG_RECEIVE_BUFFERS=cuda needs MOONCAKE_PROTOCOL=rdma; the "
+                f"{setup_kwargs['protocol']!r} transport cannot write into device memory"
+            )
     if os.environ.get("DISAGG_RECEIVE_POOL_BYTES"):
         receive_kwargs["receive_pool_bytes"] = int(
             os.environ["DISAGG_RECEIVE_POOL_BYTES"]

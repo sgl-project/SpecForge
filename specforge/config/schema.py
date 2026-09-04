@@ -455,10 +455,14 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
         if self.receive_buffers == "cuda":
+            # A worker role config carries the transport only through the
+            # MOONCAKE_PROTOCOL environment (managed_local is stripped), so the
+            # typed check applies when a protocol is spelled out here; the store
+            # factory re-checks the effective protocol at construction.
             protocol = self.mooncake_protocol
             if self.managed_local is not None:
                 protocol = self.managed_local.mooncake.protocol
-            if protocol != "rdma":
+            if protocol is not None and protocol != "rdma":
                 raise ValueError(
                     "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
                     "Mooncake transport (mooncake_protocol or "
