@@ -314,9 +314,7 @@ uses the intended `target_layer_ids`. Its convolution, selector, and selector
 loss schedule are draft/trainer concerns and do not add tensors to the offline
 record.
 
-D-PACE uses `training.strategy: dflash` and the DFlash feature schema. DTA also
-uses `--strategy dflash`, but feature preparation must receive its DTA draft
-config so the captured layer contract matches the training run.
+D-PACE uses `training.strategy: dflash` and the DFlash feature schema.
 
 For preformatted input, add `--is-preformatted` to the same command and keep
 `--chat-template` aligned with the template already applied to the text:

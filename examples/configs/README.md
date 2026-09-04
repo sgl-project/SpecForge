@@ -564,6 +564,3 @@ Migration notes:
 - The old Qwen3.5-35B offline shell had its training command commented out. The
   YAML records that intended offline trainer configuration after feature
   preparation.
-- Qwen3-8B DTA still shares the DFlash trainer, as before. Its specialized
-  behavior is encoded by the draft JSON (`training_mode: vp_drafter`); there is
-  no second DTA training entry.
