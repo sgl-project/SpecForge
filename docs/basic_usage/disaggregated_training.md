@@ -352,7 +352,7 @@ node-local deployment values.
 The online producer sends prompts to the URLs in
 `deployment.disaggregated.server_urls`. Start a patched SGLang server separately
 with the model, capture method, and auxiliary layer ids matching the draft
-config. DFlash, DFlash2, and Domino use the DFlash capture contract, DSpark
+config. DFlash, DFlash2, Domino, and MTP use the DFlash capture contract, DSpark
 uses its dedicated K3 capture contract, and EAGLE3 and P-EAGLE use the EAGLE3
 capture contract. Capture rejects chunked prefill and
 gives every request attempt a unique radix-cache namespace so cached prefixes
