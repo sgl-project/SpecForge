@@ -184,11 +184,21 @@ class FSDPTrainingBackend(TrainingBackend):
         all-gather them before every optimizer window without saving optimizer
         memory, which is the wrong trade-off for the current trainer recipes.
         """
+        candidates = [
+            module
+            for name in ("lm_head", "embed_tokens")
+            if isinstance(module := getattr(model, name, None), nn.Module)
+        ]
+        # Submodules that opt in (e.g. frozen MoE experts warm-started from the
+        # target) are replicated as well: sharding tens of GB of frozen weights
+        # would re-gather them on every micro-batch for no optimizer savings.
+        candidates += [
+            module
+            for module in model.modules()
+            if getattr(module, "fsdp_replicate_when_frozen", False)
+        ]
         modules = []
-        for name in ("lm_head", "embed_tokens"):
-            module = getattr(model, name, None)
-            if not isinstance(module, nn.Module):
-                continue
+        for module in candidates:
             parameters = tuple(module.parameters())
             if parameters and not any(
                 parameter.requires_grad for parameter in parameters
