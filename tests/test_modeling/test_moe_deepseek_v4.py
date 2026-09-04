@@ -437,6 +437,18 @@ class TestServingExport(unittest.TestCase):
         fresh = reloaded.state_dict()
         for key, value in model.state_dict().items():
             self.assertTrue(torch.equal(value.float(), fresh[key].float()), key)
+        # the trainer's weights-only warm start reads the same directory
+        from specforge.training.model_loading import warm_start_draft_model
+
+        target = DFlashDraftModel(_dflash_config()).to(torch.bfloat16)
+        report = warm_start_draft_model(
+            target, out, draft_config=config, strategy="dflash"
+        )
+        self.assertEqual(report.checkpoint_format, "pretrained")
+        for key, value in model.state_dict().items():
+            self.assertTrue(
+                torch.equal(value.float(), target.state_dict()[key].float()), key
+            )
 
 
 class TestDeepseekV4TargetDequant(unittest.TestCase):

@@ -62,14 +62,16 @@ class AutoDraftModel(AutoModelForCausalLMBase):
                 config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
             model_cls = cls._model_cls_from_config(config)
             kwargs = {**kwargs, "config": config}
-            state_dict = _native_state_dict_for(config, pretrained_model_name_or_path)
+            state_dict = load_native_state_dict(config, pretrained_model_name_or_path)
             if state_dict is not None:
                 # HF from_pretrained assigns tensors by key and refuses an
                 # explicit state_dict alongside a path, so build the module and
                 # load the converted state ourselves.
                 torch_dtype = kwargs.pop("torch_dtype", kwargs.pop("dtype", None))
+                output_loading_info = bool(kwargs.pop("output_loading_info", False))
                 model = model_cls._from_config(config, torch_dtype=torch_dtype)
                 result = model.load_state_dict(state_dict, strict=False)
+                del state_dict
                 missing = [k for k in result.missing_keys if "embed_tokens" not in k]
                 if missing or result.unexpected_keys:
                     raise ValueError(
@@ -77,7 +79,15 @@ class AutoDraftModel(AutoModelForCausalLMBase):
                         f"{model_cls.__name__}: missing {missing[:5]}, "
                         f"unexpected {list(result.unexpected_keys)[:5]}"
                     )
-                return model.eval()
+                model.eval()
+                if output_loading_info:
+                    return model, {
+                        "missing_keys": list(result.missing_keys),
+                        "unexpected_keys": list(result.unexpected_keys),
+                        "mismatched_keys": [],
+                        "error_msgs": [],
+                    }
+                return model
             model = model_cls.from_pretrained(
                 pretrained_model_name_or_path, *model_args, **kwargs
             )
@@ -87,11 +97,13 @@ class AutoDraftModel(AutoModelForCausalLMBase):
         return model
 
 
-def _native_state_dict_for(config, pretrained_model_name_or_path):
+def load_native_state_dict(config, pretrained_model_name_or_path):
     """Checkpoint files use the official parameter naming; modules may use a
     native layout (MoE experts). HF ``from_pretrained`` assigns tensors by key
-    and cannot regroup them, so read the files and convert at this boundary.
-    Returns ``None`` when no conversion is needed (dense drafts)."""
+    and cannot regroup them, so read the files (memory-mapped) and convert at
+    this boundary. Returns ``None`` when no conversion is needed (dense
+    drafts). Callers that only need the tensors (warm start) use this directly
+    instead of materializing a second model."""
     from specforge.modeling.draft.moe import (
         from_checkpoint_state_dict,
         is_moe_config,
@@ -101,7 +113,7 @@ def _native_state_dict_for(config, pretrained_model_name_or_path):
         return None
     import glob
 
-    from safetensors.torch import load_file
+    from safetensors import safe_open
 
     path = str(pretrained_model_name_or_path)
     if not os.path.isdir(path):
@@ -113,7 +125,10 @@ def _native_state_dict_for(config, pretrained_model_name_or_path):
         raise FileNotFoundError(f"no safetensors weights under {path!r}")
     state = {}
     for file in files:
-        state.update(load_file(file))
+        # mmap-backed views: only the regrouped tensors are materialized.
+        with safe_open(file, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                state[key] = handle.get_tensor(key)
     return from_checkpoint_state_dict(state)
 
 
