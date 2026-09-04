@@ -54,10 +54,21 @@ state_dict.py  to/from_checkpoint_state_dict: module layout <-> official names.
 init.py        WarmStartPlan: which target experts seed which draft experts.
 ```
 
-Implementations (a target-family preset, its score function, controller,
-experts backend, shared expert, converter) live in their own module and
-register into these registries at import time. This package holds contracts
-and composition only.
+Implementations register into these registries at import time (imported at
+the bottom of `__init__.py`):
+
+```
+topk_router.py     "topk" router; score functions softmax / sigmoid / sqrtsoftplus;
+                   optional group-limited selection (DeepSeek top-2 group scores).
+noaux_tc.py        "noaux_tc" controller: fp32 selection bias + sign controller on
+                   all-reduced loads; converter gate.balance.bias <-> gate.bias.
+grouped_experts.py "grouped" experts: stacked [E, out, in] w1/w2/w3, sorted-segment
+                   loop or torch._grouped_mm dispatch; converter experts.w1 <->
+                   experts.{i}.w1.weight.
+swiglu_shared.py   "swiglu" ungated shared expert (shared_experts.w1/w2/w3).
+presets.py         "deepseek_v4": sqrtsoftplus + noaux_tc + renorm x1.5 + one
+                   ungated shared expert + SwiGLU clamp 10.
+```
 
 ## Contracts that matter
 

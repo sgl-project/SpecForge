@@ -49,6 +49,7 @@ TRAINING_KEYS = {
     "moe_bias_update_rate": "bias_update_rate",
     "moe_aux_loss_coeff": "aux_loss_coeff",
     "moe_dispatch": "dispatch",
+    "moe_freeze_experts": "freeze_experts",
 }
 
 
@@ -80,6 +81,11 @@ class MoEConfig:
     bias_update_rate: float = 0.0
     aux_loss_coeff: float = 0.0
     dispatch: str = "sorted_loop"
+    #: Keep the routed experts fixed (e.g. warm-started from the target) and
+    #: train only the router, shared expert and the rest of the draft. Frozen
+    #: experts are replicated by the FSDP backend instead of sharded, which
+    #: removes the per-micro-batch weight all-gathers that dominate large MoEs.
+    freeze_experts: bool = False
 
     def __post_init__(self) -> None:
         if self.n_routed_experts <= 0:
@@ -124,6 +130,30 @@ class MoEConfig:
 
     def as_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
+
+    def serving_fields(self) -> Dict[str, Any]:
+        """The resolved recipe in the DeepSeek HF config vocabulary.
+
+        Exports write these to ``config.json`` so a serving engine reads the
+        complete routing recipe without knowing SpecForge presets. Only the
+        keys a DeepSeek-style MoE reads; ``swiglu_limit`` is omitted when the
+        clamp is off (a serving engine treats 0 as a clamp at 0).
+        """
+        out: Dict[str, Any] = {
+            "n_routed_experts": self.n_routed_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
+            "moe_intermediate_size": self.moe_intermediate_size,
+            "n_shared_experts": self.n_shared_experts,
+            "scoring_func": self.scoring_func,
+            "norm_topk_prob": self.norm_topk_prob,
+            "routed_scaling_factor": self.routed_scaling_factor,
+            "n_group": self.n_group,
+            "topk_group": self.topk_group,
+            "topk_method": "noaux_tc" if self.balance == "noaux_tc" else "greedy",
+        }
+        if self.swiglu_limit > 0:
+            out["swiglu_limit"] = self.swiglu_limit
+        return out
 
 
 #: preset name -> architecture defaults (a subset of ARCHITECTURE_KEYS).

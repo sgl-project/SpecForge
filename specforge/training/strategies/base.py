@@ -62,6 +62,17 @@ def _moe_metrics(model_wrapper: nn.Module) -> Dict[str, Any]:
     return collect_moe_metrics(draft_model)
 
 
+def _with_moe_aux_loss(model_wrapper: nn.Module, loss: torch.Tensor) -> torch.Tensor:
+    """Add the MoE balance policies' auxiliary loss (if any) for this forward."""
+    from specforge.modeling.draft.moe import collect_moe_aux_loss
+
+    draft_model = getattr(model_wrapper, "draft_model", None)
+    if draft_model is None:
+        return loss
+    aux = collect_moe_aux_loss(draft_model)
+    return loss if aux is None else loss + aux.to(loss.dtype)
+
+
 def linear_lambda_base(
     global_step: int,
     total_steps: int,
@@ -523,7 +534,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             metrics["selector_loss_alpha"] = model_metrics["selector_loss_alpha"]
         metrics.update(_moe_metrics(self.dflash_model))
         return StepOutput(
-            loss=loss,
+            loss=_with_moe_aux_loss(self.dflash_model, loss),
             metrics=metrics,
             ratio_metrics=model_metrics.get("ratio_metrics", {}),
             loss_terms=model_metrics.get("loss_terms"),
@@ -590,7 +601,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
                 metrics[name] = model_metrics[name]
         metrics.update(_moe_metrics(self.dspark_model))
         return StepOutput(
-            loss=loss,
+            loss=_with_moe_aux_loss(self.dspark_model, loss),
             metrics=metrics,
             ratio_metrics=ratio_metrics,
         )

@@ -379,7 +379,15 @@ def _load_pretrained_draft_state(
     cache_dir: Optional[str],
     trust_remote_code: bool,
 ) -> Dict[str, Any]:
-    from specforge.modeling.auto import AutoDraftModel
+    from specforge.modeling.auto import AutoDraftModel, load_native_state_dict
+
+    # Drafts with a native module layout (MoE experts): read and regroup the
+    # files directly. Building a full second model per rank doubled the CPU
+    # footprint (~65 GB each for a 256-expert drafter) and OOM-killed 8-rank
+    # trainers during warm start.
+    native = load_native_state_dict(draft_config, source)
+    if native is not None:
+        return {key: value.detach().cpu() for key, value in native.items()}
 
     loaded, loading_info = AutoDraftModel.from_pretrained(
         source,
@@ -398,6 +406,25 @@ def _load_pretrained_draft_state(
     return state
 
 
+def _rank_staggered(fn):
+    """Run ``fn`` on one distributed rank at a time (all ranks call this)."""
+    try:
+        import torch.distributed as dist
+
+        active = dist.is_available() and dist.is_initialized()
+    except ImportError:  # pragma: no cover
+        active = False
+    if not active or dist.get_world_size() == 1:
+        return fn()
+    rank, world = dist.get_rank(), dist.get_world_size()
+    result = None
+    for turn in range(world):
+        if turn == rank:
+            result = fn()
+        dist.barrier()
+    return result
+
+
 def warm_start_draft_model(
     model: Any,
     source: str,
@@ -411,30 +438,43 @@ def warm_start_draft_model(
     """Load only draft weights, never optimizer/counters/RNG training state."""
 
     runtime_state = _runtime_state_file(source)
-    if runtime_state is not None:
-        checkpoint_format: Literal["specforge", "pretrained"] = "specforge"
-        state = _load_specforge_draft_state(runtime_state, expected_strategy=strategy)
-    else:
-        checkpoint_format = "pretrained"
-        state = _load_pretrained_draft_state(
-            source,
-            draft_config=draft_config,
-            cache_dir=cache_dir,
-            trust_remote_code=trust_remote_code,
-        )
+    checkpoint_format: Literal["specforge", "pretrained"] = (
+        "specforge" if runtime_state is not None else "pretrained"
+    )
 
-    if not state:
-        raise ValueError(f"warm-start checkpoint {source!r} contains no draft weights")
-    try:
-        # Files use the official naming; modules may use a native MoE layout.
-        from specforge.modeling.draft.moe import from_checkpoint_state_dict
+    def _load() -> Tuple[Dict[str, Any], Any]:
+        if runtime_state is not None:
+            state = _load_specforge_draft_state(
+                runtime_state, expected_strategy=strategy
+            )
+        else:
+            state = _load_pretrained_draft_state(
+                source,
+                draft_config=draft_config,
+                cache_dir=cache_dir,
+                trust_remote_code=trust_remote_code,
+            )
+        if not state:
+            raise ValueError(
+                f"warm-start checkpoint {source!r} contains no draft weights"
+            )
+        try:
+            # Files use the official naming; modules may use a native MoE layout.
+            from specforge.modeling.draft.moe import from_checkpoint_state_dict
 
-        result = model.load_state_dict(from_checkpoint_state_dict(state), strict=False)
-    except RuntimeError as exc:
-        raise ValueError(
-            f"warm-start checkpoint {source!r} has incompatible draft tensor "
-            f"shapes: {exc}"
-        ) from exc
+            result = model.load_state_dict(
+                from_checkpoint_state_dict(state), strict=False
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                f"warm-start checkpoint {source!r} has incompatible draft tensor "
+                f"shapes: {exc}"
+            ) from exc
+        return state, result
+
+    # Every rank loads the full draft state; for large drafts the transient
+    # host memory of N simultaneous loads can exceed the node, so take turns.
+    state, result = _rank_staggered(_load)
     loaded_keys = len(state) - len(result.unexpected_keys)
     if result.unexpected_keys or loaded_keys == 0:
         raise ValueError(

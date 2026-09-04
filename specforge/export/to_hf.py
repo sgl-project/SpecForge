@@ -31,7 +31,7 @@ from specforge.export.checkpoint_io import (
     materialize_draft,
     resolve_training_state,
 )
-from specforge.modeling.draft.moe import to_checkpoint_state_dict
+from specforge.modeling.draft.moe import resolve_moe_config, to_checkpoint_state_dict
 
 
 def _load_embedding_tensor(source: str, key: str) -> torch.Tensor:
@@ -89,6 +89,12 @@ def export_to_hf(
         state, draft_config_path, vocab_mapping_path=vocab_mapping_path
     )
     full_state = dict(to_checkpoint_state_dict(model.state_dict()))
+    moe_cfg = resolve_moe_config(model.config)
+    if moe_cfg is not None:
+        # Serving engines read the routing recipe from config.json; the draft
+        # JSON only names a preset, so materialize the resolved fields.
+        for key, value in moe_cfg.serving_fields().items():
+            setattr(model.config, key, value)
     owns_embedding = hasattr(model, "embed_tokens")
     if owns_embedding and "embed_tokens.weight" not in state["draft_state_dict"]:
         if not embedding_source:
