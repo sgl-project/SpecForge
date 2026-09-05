@@ -555,6 +555,25 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LOCAL_RANK": "2"}):
             self.assertEqual(cuda.consumer_device(), torch.device("cuda", 2))
 
+    def test_failed_slot_registration_is_reported_not_swallowed(self):
+        class RegisterFails(_FakeMooncakeStore):
+            def register_buffer(self, ptr, nbytes):
+                return -1
+
+        fake = RegisterFails()
+        producer = MooncakeFeatureStore(store=fake, store_id="run0")
+        consumer = MooncakeFeatureStore(
+            store=fake, store_id="run0", receive_buffers="pinned"
+        )
+        ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
+        with self.assertLogs(
+            "specforge.runtime.data_plane.mooncake_store", level="WARNING"
+        ) as logs:
+            out, _ = consumer.get(ref)
+        self.assertTrue(any("register_buffer" in line for line in logs.output))
+        for name, expected in _tensors().items():
+            self.assertTrue(torch.equal(out[name].cpu(), expected))
+
     def test_unknown_receive_buffer_kind_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "receive_buffers"):
             _store(receive_buffers="mmap")

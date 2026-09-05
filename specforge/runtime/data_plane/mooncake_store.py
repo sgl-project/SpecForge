@@ -301,10 +301,21 @@ class ReceiveBufferPool:
             storage = torch.empty(nbytes, dtype=torch.uint8, pin_memory=pin)
         registered = False
         try:
-            self._store.register_buffer(storage.data_ptr(), nbytes)
+            rc = self._store.register_buffer(storage.data_ptr(), nbytes)
+        except Exception as exc:  # pragma: no cover - some builds auto-register
+            rc = exc
+        if rc is None or (isinstance(rc, int) and rc == 0):
             registered = True
-        except Exception:  # pragma: no cover - some builds auto-register
-            pass
+        else:
+            # An unregistered device slot makes Mooncake fall back to a temp
+            # staging buffer per get (or fail outright), so make it visible.
+            logger.warning(
+                "receive pool: register_buffer(%s bytes, %s) failed (%s); "
+                "the transfer engine will stage this slot",
+                nbytes,
+                storage.device,
+                rc,
+            )
         return _PoolSlot(storage, registered)
 
     def acquire(self, nbytes: int, device) -> Tuple[Optional[_PoolSlot], bool]:
