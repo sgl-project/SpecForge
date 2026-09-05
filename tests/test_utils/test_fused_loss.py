@@ -13,6 +13,11 @@ gracefully, while the device-cap and eager legs still run on CPU. The
 151936-wide leg also exercises the smaller NPU BLOCK_SIZE cap
 (MAX_FUSED_SIZE_NPU = 4096), which forces the tighter multi-block streaming
 loop.
+
+The label-ids CE variant (fused_ce_label_loss / ce_label_loss) takes
+ground-truth [B, T] ids instead of a [B, T, V] target distribution; its legs
+mix in -100 ignore positions and assert those give exactly zero loss and
+all-zero gradient rows.
 """
 
 import math
@@ -102,6 +107,31 @@ def _assert_fused_matches_eager(
     torch.testing.assert_close(lf.grad.float(), le.grad.float(), **grad_tol)
 
 
+def _assert_fused_ce_label_matches_eager(logits, labels, loss_tol, grad_tol):
+    """ce_label twin of ``_assert_fused_matches_eager`` with ignore-position checks."""
+    le = logits.detach().clone().requires_grad_(True)
+    lf = logits.detach().clone().requires_grad_(True)
+    out_e = fused_loss.ce_label_loss(le, labels)
+    out_f = fused_loss.fused_ce_label_loss(lf, labels)
+    assert out_f.dtype == torch.float32  # like the eager fp32 softmax (#788)
+    torch.testing.assert_close(out_f, out_e.float(), **loss_tol)
+
+    go = torch.randn_like(out_e, dtype=torch.float32)
+    go[:, ::3] = 0.0  # rows taking the go == 0 early-out
+    (out_e.float() * go).sum().backward()
+    (out_f * go).sum().backward()
+    assert le.grad is not None
+    assert lf.grad is not None
+    torch.testing.assert_close(lf.grad.float(), le.grad.float(), **grad_tol)
+
+    # Ignored (-100) positions: exactly zero loss and an all-zero gradient row,
+    # on both the go == 0 and the sentinel early-out paths.
+    ignored = labels == -100
+    assert ignored.any(), "test must exercise ignored positions"
+    assert (out_f[ignored] == 0.0).all()
+    assert (lf.grad[ignored] == 0.0).all()
+
+
 class TestFusedLoss(unittest.TestCase):
     @requires_fused
     def test_fused_matches_eager(self):
@@ -174,6 +204,65 @@ class TestFusedLoss(unittest.TestCase):
                 compiled(logits, targets).backward()
                 assert logits.grad is not None
                 assert torch.isfinite(logits.grad).all()
+
+    @requires_fused
+    def test_fused_ce_label_matches_eager(self):
+        """Fused label-ids CE == eager (value + gradient) in the three regimes.
+
+        Labels mix valid ids (including the 0 and V-1 boundaries) with -100
+        ignore positions; the ignored positions must give exactly zero loss
+        and all-zero gradient rows.
+        """
+        # fp32, with saturated +-30 point-mass rows
+        torch.manual_seed(0)
+        logits = torch.randn(1, 32, 512, device=DEVICE) * 3
+        logits[0, -2:] = -30.0
+        logits[0, -2, 0] = 30.0
+        logits[0, -1, 7] = 30.0
+        labels = torch.randint(0, 512, (1, 32), device=DEVICE)
+        labels[:, ::5] = -100  # every 5th position ignored
+        labels[0, 1] = 0
+        labels[0, 2] = 511  # boundary ids
+        _assert_fused_ce_label_matches_eager(logits, labels, LOSS_TOL, GRAD_TOL)
+
+        # bf16, the training dtype; bounded by eager's own bf16 rounding (as ce)
+        torch.manual_seed(1)
+        logits = (torch.randn(1, 64, 512, device=DEVICE) * 3).bfloat16()
+        labels = torch.randint(0, 512, (1, 64), device=DEVICE)
+        labels[:, ::5] = -100
+        _assert_fused_ce_label_matches_eager(
+            logits, labels, CE_BF16_LOSS_TOL, CE_BF16_GRAD_TOL
+        )
+
+        # Qwen3's 151936 vocab exceeds MAX_FUSED_SIZE (and MAX_FUSED_SIZE_NPU):
+        # multi-block streaming plus a non-power-of-2 masked tail, with an
+        # ignored row and the V-1 boundary id.
+        torch.manual_seed(2)
+        logits = torch.randn(1, 3, 151936, device=DEVICE) * 3
+        labels = torch.tensor([[12345, -100, 151935]], device=DEVICE)
+        _assert_fused_ce_label_matches_eager(logits, labels, LOSS_TOL, GRAD_TOL)
+
+    @requires_fused
+    def test_fused_ce_label_compiles_fullgraph(self):
+        """torch.compile(fullgraph=True) must trace the label-ids CE loss.
+
+        Same guard as test_compiles_fullgraph for the distribution losses: the
+        OP selector crosses the autograd.Function boundary as a plain int.
+        """
+        logits = torch.randn(1, 8, 512, device=DEVICE, requires_grad=True)
+        labels = torch.randint(0, 512, (1, 8), device=DEVICE)
+        labels[0, ::4] = -100  # ignored rows take the sentinel early-out
+
+        # Eager warmup first: the lazy Triton assembly in _require_triton() is
+        # not Dynamo-traceable, so it must happen before the compiled region.
+        fused_loss.fused_ce_label_loss(logits.detach(), labels)
+
+        compiled = torch.compile(
+            lambda a, b: fused_loss.fused_ce_label_loss(a, b).sum(), fullgraph=True
+        )
+        compiled(logits, labels).backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
 
     def test_calculate_settings_respects_device_cap(self):
         """`_calculate_settings` picks the right BLOCK_SIZE for each device without
@@ -270,6 +359,37 @@ class TestFusedLoss(unittest.TestCase):
             reduction="none",
         ).reshape(1, 8)
         torch.testing.assert_close(ce, ref)
+
+    def test_eager_ce_label_loss_matches_cross_entropy(self):
+        """ce_label_loss is F.cross_entropy(ignore_index=-100) pointwise (CPU).
+
+        ce_label_loss has no targets argument, so it cannot join
+        test_eager_implementation_supports_differentiable_targets; this covers
+        it directly, including the ignored-position semantics.
+        """
+        torch.manual_seed(5)
+        logits = torch.randn(2, 7, 193, requires_grad=True)  # odd sizes
+        labels = torch.randint(0, 193, (2, 7))
+        labels[0, ::3] = -100  # ignored positions
+        labels[1, 0] = 0
+        labels[1, -1] = 192  # boundary ids
+
+        out = fused_loss.ce_label_loss(logits, labels)
+        ref = torch.nn.functional.cross_entropy(
+            logits.detach().reshape(-1, 193),
+            labels.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).reshape(2, 7)
+        torch.testing.assert_close(out, ref)
+
+        ignored = labels == -100
+        assert ignored.any()
+        assert (out[ignored] == 0.0).all()
+
+        out.sum().backward()
+        assert logits.grad is not None
+        assert (logits.grad[ignored] == 0.0).all()
 
 
 if __name__ == "__main__":
