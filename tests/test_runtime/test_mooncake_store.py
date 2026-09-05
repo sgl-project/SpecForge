@@ -570,7 +570,9 @@ class TestMooncakeFeatureStore(unittest.TestCase):
             "specforge.runtime.data_plane.mooncake_store", level="WARNING"
         ) as logs:
             out, _ = consumer.get(ref)
-        self.assertTrue(any("register_buffer" in line for line in logs.output))
+        # reported once, then the pool stops registering
+        self.assertEqual(sum("register_buffer" in line for line in logs.output), 1)
+        self.assertTrue(consumer._receive_pool._registration_disabled)
         for name, expected in _tensors().items():
             self.assertTrue(torch.equal(out[name].cpu(), expected))
 

@@ -252,9 +252,12 @@ class ReceiveBufferPool:
     * ``pinned``: page-locked host slots; the fetched bytes are copied to the
       trainer device on a side stream (54 GB/s instead of 3 GB/s pageable) and
       the slot is recycled as soon as that copy has completed.
-    * ``cuda``: slots live on the trainer device and the transfer engine writes
-      into them directly (GPUDirect RDMA / NVLink); the caller receives a clone
-      so the slot can be recycled immediately.
+    * ``cuda``: slots live on the trainer device; the caller receives a clone
+      so the slot can be recycled immediately. Whether the transfer engine
+      writes into the slot directly (GPUDirect RDMA) or stages through its own
+      pinned client buffer and copies is up to the Mooncake build: 0.3.x
+      stages device-destination reads, so size ``client_buffer_size`` for the
+      concurrent fetches and the copy still stays off the training stream.
 
     Slots are recycled by size (first fit); the pool grows on demand up to
     ``max_bytes`` and hands out one-off buffers beyond that so a burst can
@@ -277,6 +280,7 @@ class ReceiveBufferPool:
         self.max_bytes = int(max_bytes)
         self._store = store
         self._lock = threading.Lock()
+        self._registration_disabled = False
         self._free: List[_PoolSlot] = []
         self._allocated_bytes = 0
         self._streams = threading.local()
@@ -300,22 +304,28 @@ class ReceiveBufferPool:
             pin = torch.cuda.is_available()
             storage = torch.empty(nbytes, dtype=torch.uint8, pin_memory=pin)
         registered = False
-        try:
-            rc = self._store.register_buffer(storage.data_ptr(), nbytes)
-        except Exception as exc:  # pragma: no cover - some builds auto-register
-            rc = exc
-        if rc is None or (isinstance(rc, int) and rc == 0):
-            registered = True
-        else:
-            # An unregistered device slot makes Mooncake fall back to a temp
-            # staging buffer per get (or fail outright), so make it visible.
-            logger.warning(
-                "receive pool: register_buffer(%s bytes, %s) failed (%s); "
-                "the transfer engine will stage this slot",
-                nbytes,
-                storage.device,
-                rc,
-            )
+        if not self._registration_disabled:
+            try:
+                rc = self._store.register_buffer(storage.data_ptr(), nbytes)
+            except Exception as exc:  # pragma: no cover - some builds auto-register
+                rc = exc
+            if rc is None or (isinstance(rc, int) and rc == 0):
+                registered = True
+            else:
+                # Mooncake rejects registrations that overlap an earlier one
+                # (small slots carved from a shared allocator block) and, on
+                # 0.3.x, stages device-destination reads through its client
+                # buffer whether or not the slot is registered. Say so once and
+                # stop paying for further attempts.
+                self._registration_disabled = True
+                logger.warning(
+                    "receive pool: register_buffer(%s bytes, %s) failed (%s); "
+                    "leaving the remaining slots unregistered, the transfer "
+                    "engine stages into them",
+                    nbytes,
+                    storage.device,
+                    rc,
+                )
         return _PoolSlot(storage, registered)
 
     def acquire(self, nbytes: int, device) -> Tuple[Optional[_PoolSlot], bool]:
