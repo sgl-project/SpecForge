@@ -6,6 +6,8 @@ and losses/eager.py), derived in turn from specforge/core/loss.py
 (Unsloth / Liger-Kernel lineage).
 Changes for SpecForge: lazy Triton import so the module loads on hosts
 without Triton; eager reference co-located in the same module.
+The label-ids CE variant (``_OP_CE_LABEL``, ``fused_ce_label_loss`` /
+``ce_label_loss``) is a SpecForge addition with no upstream counterpart.
 
 Upstream kernel documentation (speculators losses/fused.py):
 
@@ -20,11 +22,13 @@ instead of kernel branches.
 Per-row gradients (dp = softmax(logits), draft; tp = softmax(targets),
 treated as constant), L the row loss:
 
-    kl_div  dp - tp
-    rkl     dp * (log dp - log tp - L)
-    jsd     0.5 * dp * (log(dp / mix) - KL(dp || mix)),  mix = (dp + tp) / 2
-    ce      dp - onehot(argmax tp)
-    tv      -dp * (1[dp <= tp] - s_s),  s_s = sum of dp where dp <= tp
+    kl_div   dp - tp
+    rkl      dp * (log dp - log tp - L)
+    jsd      0.5 * dp * (log(dp / mix) - KL(dp || mix)),  mix = (dp + tp) / 2
+    ce       dp - onehot(argmax tp)
+    ce_label dp - onehot(label id); reads one int32 label per row instead of
+             the [T, V] targets (SpecForge addition)
+    tv       -dp * (1[dp <= tp] - s_s),  s_s = sum of dp where dp <= tp
 """
 
 # Triton kernels idiomatically use uppercase constexpr/dim names (B, T, V,
@@ -42,6 +46,7 @@ __all__ = [
     "fused_reverse_kl_div_loss",
     "fused_js_div_loss",
     "fused_ce_loss",
+    "fused_ce_label_loss",
     "fused_tv_loss",
     "fused_nla_loss",
     "fused_lk_hybrid_loss",
@@ -50,6 +55,7 @@ __all__ = [
     "reverse_kl_div_loss",
     "js_div_loss",
     "ce_loss",
+    "ce_label_loss",
     "tv_loss",
     "neg_log_acceptance_loss",
     "lk_hybrid_loss",
@@ -76,10 +82,15 @@ _OP_RKL = 1
 _OP_JSD = 2
 _OP_CE = 3
 _OP_TV = 4
+# SpecForge addition: CE against ground-truth label ids (one int32 per row)
+# instead of a [T, V] target distribution -- the MTP/DFlash-style path where
+# no teacher distribution exists.
+_OP_CE_LABEL = 5
 
 # stats [_N_STATS, n_rows]: [0]/[1] draft row max / sum-exp, [2]/[3] same for
 # targets (unused by ce), [4] per-OP -- kl_div/rkl: row loss L | jsd:
-# KL(dp||mix) | tv: s_s | ce: argmax as float32 (exact: vocab < 2**24).
+# KL(dp||mix) | tv: s_s | ce: argmax as float32 (exact: vocab < 2**24) |
+# ce_label: label id as float32, or the -1 sentinel for ignored rows.
 _N_STATS = 5
 
 _NLA_EPS = 1e-5
@@ -156,7 +167,10 @@ def loss_forward_kernel(  # noqa: C901 -- constexpr OP branches, pruned per inst
     """
     pid = tl.program_id(0).to(tl.int64)
     logits_ptr += pid * n_cols
-    targets_ptr += pid * n_cols
+    # targets_ptr is NOT offset here: its layout depends on OP. The
+    # distribution ops carry [n_rows, n_cols] target logits (advanced by
+    # pid * n_cols inside their branches); ce_label carries one int32 label
+    # per row (indexed by pid directly).
 
     m_d, z_d = _online_stats(logits_ptr, n_cols, BLOCK_SIZE)
     lse_d = m_d + tl.log(z_d)
@@ -165,6 +179,7 @@ def loss_forward_kernel(  # noqa: C901 -- constexpr OP branches, pruned per inst
 
     if OP == _OP_CE:
         # Only the target argmax is needed; no target softmax stats.
+        targets_ptr += pid * n_cols
         best_val = float("-inf")
         best_idx = 0
         for i in range(0, n_cols, BLOCK_SIZE):
@@ -183,7 +198,22 @@ def loss_forward_kernel(  # noqa: C901 -- constexpr OP branches, pruned per inst
         tl.store(loss_ptr + pid, lse_d - logit_at_target)
         # mypy reads traced Triton code as Python and types best_idx as int
         tl.store(stats_ptr + 4 * stats_row + pid, best_idx.to(tl.float32))  # type: ignore[attr-defined]
+    elif OP == _OP_CE_LABEL:
+        # Ground-truth label ids: one int32 per row, no [n_rows, n_cols]
+        # targets to scan. Labels outside [0, n_cols) -- e.g. the -100 ignore
+        # index -- give loss 0 and the -1 sentinel in stats[4], which the
+        # backward kernel maps to an all-zero gradient row.
+        label = tl.load(targets_ptr + pid).to(tl.int32)
+        in_range = (label >= 0) & (label < n_cols)
+        safe_label = tl.where(in_range, label, 0)
+        logit_at_label = tl.load(logits_ptr + safe_label).cast(tl.float32)
+        tl.store(loss_ptr + pid, tl.where(in_range, lse_d - logit_at_label, 0.0))
+        tl.store(
+            stats_ptr + 4 * stats_row + pid,
+            tl.where(in_range, label, -1).to(tl.float32),
+        )
     else:
+        targets_ptr += pid * n_cols
         m_t, z_t = _online_stats(targets_ptr, n_cols, BLOCK_SIZE)
         lse_t = m_t + tl.log(z_t)
         tl.store(stats_ptr + 2 * stats_row + pid, m_t)
@@ -241,7 +271,12 @@ def loss_backward_kernel(
     grad_in_ptr += pid * n_cols
 
     go = tl.load(grad_out_ptr + pid).cast(tl.float32)
-    if go == 0.0:
+    zero_row = go == 0.0
+    if OP == _OP_CE_LABEL:
+        # Ignored positions carry the -1 sentinel in stats[4]; their gradient
+        # is the all-zero row (same as a zero upstream gradient).
+        zero_row = zero_row | (tl.load(stats_ptr + 4 * stats_row + pid) < 0.0)
+    if zero_row:
         for i in range(0, n_cols, BLOCK_SIZE):
             offsets = i + tl.arange(0, BLOCK_SIZE)
             mask = offsets < n_cols
@@ -252,14 +287,16 @@ def loss_backward_kernel(
     z_d = tl.load(stats_ptr + 1 * stats_row + pid)
     lse_d = m_d + tl.log(z_d)
     extra = tl.load(stats_ptr + 4 * stats_row + pid)
-    if OP != _OP_CE:
-        # CE passes None for targets_ptr.
+    if OP == _OP_CE or OP == _OP_CE_LABEL:  # noqa: PLR1714, SIM109
+        # Both CE variants pass None for targets_ptr; the target index
+        # (argmax for CE, label id for ce_label) travels via stats[4].
+        # Ignored ce_label rows already took the early-out above.
+        target_idx = extra.to(tl.int32)
+    else:
         targets_ptr += pid * n_cols
         m_t = tl.load(stats_ptr + 2 * stats_row + pid)
         z_t = tl.load(stats_ptr + 3 * stats_row + pid)
         lse_t = m_t + tl.log(z_t)
-    else:
-        target_idx = extra.to(tl.int32)
 
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
@@ -267,7 +304,7 @@ def loss_backward_kernel(
         x = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
         ldp = x - lse_d
         dp = tl.exp(ldp)
-        if OP == _OP_CE:
+        if OP == _OP_CE or OP == _OP_CE_LABEL:  # noqa: PLR1714, SIM109
             grad = dp - (offsets == target_idx).to(tl.float32)
         else:
             y = tl.load(targets_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
@@ -315,6 +352,7 @@ def _require_triton():
     module_globals["_OP_JSD"] = tl.constexpr(_OP_JSD)
     module_globals["_OP_CE"] = tl.constexpr(_OP_CE)
     module_globals["_OP_TV"] = tl.constexpr(_OP_TV)
+    module_globals["_OP_CE_LABEL"] = tl.constexpr(_OP_CE_LABEL)
     module_globals["_online_stats"] = triton.jit(_online_stats)
     module_globals["_log_mix"] = triton.jit(_log_mix)
     module_globals["loss_forward_kernel"] = triton.jit(loss_forward_kernel)
@@ -333,7 +371,11 @@ class _FusedLoss(torch.autograd.Function):
     def forward(ctx, logits, targets, op):
         B, T, V = logits.shape
         logits_flat = logits.contiguous().view(B * T, V)
-        targets_flat = targets.contiguous().view(B * T, V)
+        if op == _OP_CE_LABEL.value:
+            # Label ids are one int32 per row, not a [B * T, V] distribution.
+            targets_flat = targets.contiguous().view(-1)
+        else:
+            targets_flat = targets.contiguous().view(B * T, V)
         loss = torch.empty(B * T, device=logits.device, dtype=torch.float32)
         stats = torch.empty(_N_STATS, B * T, device=logits.device, dtype=torch.float32)
         BLOCK_SIZE, num_warps = _calculate_settings(V, logits_flat.device)
@@ -348,9 +390,12 @@ class _FusedLoss(torch.autograd.Function):
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
-        # CE backward only needs the target argmax cached in stats.
+        # CE backward only needs the target index cached in stats (argmax for
+        # CE, label id for ce_label); both CE variants pass None for targets.
         ctx.save_for_backward(
-            logits_flat, None if op == _OP_CE.value else targets_flat, stats
+            logits_flat,
+            None if op in (_OP_CE.value, _OP_CE_LABEL.value) else targets_flat,
+            stats,
         )
         ctx.op = op
         ctx.shape = (B, T, V)
@@ -400,6 +445,29 @@ def fused_ce_loss(logits, targets):
     """Per-position CE vs argmax(targets) ``[1, T]``; fused twin of ``ce_loss``."""
     _require_triton()
     return _FusedLoss.apply(logits, targets, _OP_CE.value)
+
+
+def fused_ce_label_loss(logits, labels):
+    """Per-position CE vs ground-truth label ids; fused twin of ``ce_label_loss``.
+
+    Args:
+        logits: Draft model logits, shape ``[batch, seq_len, vocab]``.
+        labels: Ground-truth token ids, shape ``[batch, seq_len]`` (cast to
+            int32 internally). Follows ``F.cross_entropy`` ``ignore_index=-100``
+            semantics: any label outside ``[0, vocab)`` -- e.g. -100 padding in
+            MTP/DFlash targets -- is treated as an ignore position by the
+            kernel (loss 0, all-zero gradient row) rather than validated.
+
+    Returns:
+        Per-position cross-entropy, shape ``[batch, seq_len]``, fp32.
+    """
+    if labels.shape != logits.shape[:2]:
+        raise ValueError(
+            f"labels shape {tuple(labels.shape)} must match logits.shape[:2] "
+            f"{tuple(logits.shape[:2])}"
+        )
+    _require_triton()
+    return _FusedLoss.apply(logits, labels.to(torch.int32), _OP_CE_LABEL.value)
 
 
 def fused_tv_loss(logits, targets):
@@ -537,6 +605,37 @@ def ce_loss(
     elementwise_loss = torch.nn.functional.cross_entropy(
         logits.reshape(-1, draft_vocab_size),
         target_ids.reshape(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).reshape(batch_size, seq_len)
+
+    return elementwise_loss  # noqa: RET504
+
+
+def ce_label_loss(
+    logits: torch.Tensor,  # shape: [batch_size, seq_len, vocab_size]
+    labels: torch.Tensor,  # shape: [batch_size, seq_len], ground-truth token ids
+):
+    """Compute per-position cross-entropy against ground-truth label ids.
+
+    Unlike ``ce_loss`` -- which derives hard labels from the argmax of the
+    target logits -- this takes integer labels directly: the MTP/DFlash-style
+    ground-truth CE path, where no teacher distribution exists.
+
+    Args:
+        logits: Draft model logits.
+        labels: Ground-truth token ids; positions labeled -100 are ignored
+            (loss 0, no gradient), matching
+            ``F.cross_entropy(ignore_index=-100)``.
+
+    Returns:
+        Per-position cross-entropy loss with shape [batch_size, seq_len].
+    """
+    batch_size, seq_len, vocab_size = logits.shape
+
+    elementwise_loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, vocab_size),
+        labels.reshape(-1),
         reduction="none",
         ignore_index=-100,
     ).reshape(batch_size, seq_len)
