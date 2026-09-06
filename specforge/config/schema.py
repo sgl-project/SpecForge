@@ -328,10 +328,7 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
-    #: Publish captured tensors straight from device memory
-    #: (``SGLANG_SPEC_CAPTURE_GPU_PUT=1`` on the server). Needs a transport that
-    #: can read device memory, so the stack validator requires ``mooncake.protocol``
-    #: ``rdma``.
+    #: Publish device snapshots through RDMA; CUDA memory must be registerable.
     gpu_put: bool = False
 
     @model_validator(mode="after")

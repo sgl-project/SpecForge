@@ -390,6 +390,12 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
 | `deployment.disaggregated.managed_local.capture_servers[].startup_timeout_s` | `1800` | Positive server readiness timeout. |
 
+GPU publication retains a device snapshot until the asynchronous store write completes.
+Use RDMA-registerable CUDA allocations; with PyTorch, set
+`PYTORCH_ALLOC_CONF=expandable_segments:False` for capture servers if VMM allocations
+cannot be registered by the installed Mooncake/driver combination. Registration
+failures are reported before publishing refs.
+
 Managed-local is only for a fresh, single-node, online Mooncake run. It derives
 server URLs and Mooncake endpoints, so do not combine it with explicit external
 endpoints, `store_root`, or `producer_segment_size`. It does not support resume,

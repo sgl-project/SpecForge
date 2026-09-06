@@ -1,18 +1,20 @@
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index 2487072b63..12040ba6e6 100644
+index 2487072b63..1a7d91a329 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
-@@ -102,6 +102,9 @@ class LogitsProcessorOutput:
+@@ -102,6 +102,11 @@ class LogitsProcessorOutput:
      # Used by speculative decoding (EAGLE)
      # The last hidden layers
      hidden_states: Optional[torch.Tensor] = None
 +    # Spec-training capture: under FULL+aux, `hidden_states` is the aux
 +    # concatenation, so the post-norm last hidden is exposed here separately.
 +    last_hidden_states: Optional[torch.Tensor] = None
++    spec_capture_aux_gpu: Optional[torch.Tensor] = None
++    spec_capture_last_hidden_gpu: Optional[torch.Tensor] = None
  
      ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
      # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
-@@ -391,6 +394,30 @@ class LogitsProcessor(nn.Module):
+@@ -391,6 +396,30 @@ class LogitsProcessor(nn.Module):
              sample_indices,
              logits_metadata,
          )
@@ -43,7 +45,7 @@ index 2487072b63..12040ba6e6 100644
          del hidden_states
  
          if not logits_metadata.extend_return_logprob:
-@@ -404,6 +431,7 @@ class LogitsProcessor(nn.Module):
+@@ -404,6 +433,7 @@ class LogitsProcessor(nn.Module):
              return LogitsProcessorOutput(
                  next_token_logits=sampled_logits,
                  hidden_states=hidden_states_to_store,
@@ -151,7 +153,7 @@ index 3ff2a29f3f..ad8ef20dc9 100755
          # Extra key for caller-defined request classification.
          if lora_id is not None:
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 7dc5be833f..94b7671688 100644
+index 7dc5be833f..5dc9c81946 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -655,6 +655,19 @@ class Scheduler(
@@ -182,21 +184,31 @@ index 7dc5be833f..94b7671688 100644
              )
              req.tokenizer = self.tokenizer
  
-@@ -3578,6 +3592,13 @@ class Scheduler(
+@@ -3578,6 +3592,23 @@ class Scheduler(
          # GenerationBatchResult.extra_keep_alive_refs after forward returns.
          self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
  
 +    def _should_copy_hidden_states_to_cpu(self, batch: ScheduleBatch) -> bool:
-+        """Avoid redundant multi-GiB capture D2H on non-writer TP ranks."""
++        from sglang.srt.spec_capture_sink import gpu_put_enabled
++
 +        return batch.return_hidden_states and (
-+            self.ps.attn_tp_rank == 0
++            (self.ps.attn_tp_rank == 0 and not gpu_put_enabled())
 +            or any(req.spec_capture is None for req in batch.reqs)
++        )
++
++    def _should_capture_hidden_states_on_device(self, batch: ScheduleBatch) -> bool:
++        from sglang.srt.spec_capture_sink import gpu_put_enabled
++
++        return (
++            self.ps.attn_tp_rank == 0
++            and gpu_put_enabled()
++            and any(req.spec_capture is not None for req in batch.reqs)
 +        )
 +
      @contextmanager
      def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
          """Make SB transactional across one forward (overlap and non-overlap).
-@@ -3726,7 +3747,9 @@ class Scheduler(
+@@ -3726,7 +3757,16 @@ class Scheduler(
                                  # overlaps.
                                  batch_result.copy_to_cpu(
                                      return_logprob=batch.return_logprob,
@@ -204,10 +216,17 @@ index 7dc5be833f..94b7671688 100644
 +                                    return_hidden_states=self._should_copy_hidden_states_to_cpu(
 +                                        batch
 +                                    ),
++                                    capture_stream=(
++                                        self.forward_stream
++                                        if self._should_capture_hidden_states_on_device(
++                                            batch
++                                        )
++                                        else None
++                                    ),
                                  )
                              else:
                                  # Result D2H on copy_stream overlaps the next forward
-@@ -3736,7 +3759,9 @@ class Scheduler(
+@@ -3736,7 +3776,16 @@ class Scheduler(
                                  with self.copy_stream_ctx:
                                      batch_result.copy_to_cpu(
                                          return_logprob=batch.return_logprob,
@@ -215,32 +234,45 @@ index 7dc5be833f..94b7671688 100644
 +                                        return_hidden_states=self._should_copy_hidden_states_to_cpu(
 +                                            batch
 +                                        ),
++                                        capture_stream=(
++                                            self.forward_stream
++                                            if self._should_capture_hidden_states_on_device(
++                                                batch
++                                            )
++                                            else None
++                                        ),
                                      )
                          else:
                              batch_result.future_indices = future_indices
-@@ -3775,7 +3800,9 @@ class Scheduler(
+@@ -3775,7 +3824,12 @@ class Scheduler(
                  batch_result.copy_done = self.device_module.Event()
                  batch_result.copy_to_cpu(
                      return_logprob=batch.return_logprob,
 -                    return_hidden_states=batch.return_hidden_states,
-+                    return_hidden_states=self._should_copy_hidden_states_to_cpu(
-+                        batch
++                    return_hidden_states=self._should_copy_hidden_states_to_cpu(batch),
++                    capture_stream=(
++                        self.forward_stream
++                        if self._should_capture_hidden_states_on_device(batch)
++                        else None
 +                    ),
                  )
              else:
                  kwargs = (
-@@ -3905,7 +3932,9 @@ class Scheduler(
+@@ -3905,7 +3959,12 @@ class Scheduler(
          with self.copy_stream_ctx:
              batch_result.copy_to_cpu(
                  return_logprob=cur_batch.return_logprob,
 -                return_hidden_states=cur_batch.return_hidden_states,
-+                return_hidden_states=self._should_copy_hidden_states_to_cpu(
-+                    cur_batch
++                return_hidden_states=self._should_copy_hidden_states_to_cpu(cur_batch),
++                capture_stream=(
++                    self.forward_stream
++                    if self._should_capture_hidden_states_on_device(cur_batch)
++                    else None
 +                ),
              )
  
          # Release the closure and large GPU tensors that are no longer needed.
-@@ -3924,6 +3953,11 @@ class Scheduler(
+@@ -3924,6 +3983,11 @@ class Scheduler(
          batch: ScheduleBatch,
          result: Union[GenerationBatchResult, EmbeddingBatchResult],
      ):
@@ -252,7 +284,7 @@ index 7dc5be833f..94b7671688 100644
          # Flush async trace ops here: in overlap mode this CPU work runs while
          # the next batch's GPU forward is in flight, giving free overlap.
          flush_trace_batch(batch.reqs)
-@@ -4043,6 +4077,15 @@ class Scheduler(
+@@ -4043,6 +4107,15 @@ class Scheduler(
          # Flush any health-check signal deferred while the engine was busy.
          self.maybe_send_health_check_signal()
  
@@ -268,7 +300,7 @@ index 7dc5be833f..94b7671688 100644
          if not self.is_fully_idle():
              return
  
-@@ -4093,6 +4136,7 @@ class Scheduler(
+@@ -4093,6 +4166,7 @@ class Scheduler(
              and not self.dllm_manager.any_staging_reqs()
              and (self.last_batch is None or self.last_batch.is_empty())
              and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -277,7 +309,7 @@ index 7dc5be833f..94b7671688 100644
          )
  
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 024781c37e..d5208452b7 100644
+index 024781c37e..31defd0da1 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -1,7 +1,9 @@
@@ -398,7 +430,7 @@ index 024781c37e..d5208452b7 100644
  
          can_run_cuda_graph = result.can_run_cuda_graph
          self.metrics_reporter.report_prefill_stats(
-@@ -496,6 +531,184 @@ class SchedulerBatchResultProcessor:
+@@ -496,6 +531,192 @@ class SchedulerBatchResultProcessor:
                      f"Placeholder zeros would be appended to output_ids."
                  )
  
@@ -410,42 +442,50 @@ index 024781c37e..d5208452b7 100644
 +        hidden_state_offset: int,
 +        extend_input_len: int,
 +    ) -> int:
-+        """Accumulate captured rows as CPU tensors for the Mooncake sink.
++        """Retain per-request views of the completed batch capture."""
++        from sglang.srt.spec_capture_sink import gpu_put_enabled
 +
-+        Same offset arithmetic as ``_append_prefill_hidden_states`` but keeps
-+        tensor slices (aux concat in ``hidden_states``, post-norm last in
-+        ``last_hidden_states``) rather than the JSON-able response payload.
-+        """
 +        start = hidden_state_offset
 +        end = start + extend_input_len
-+        # Only attention-TP rank 0 owns the Mooncake sink.  Copying these very
-+        # large tensors to host on every TP rank creates identical D2H
-+        # transfers whose results are immediately discarded on TP > 1.
 +        if self.output_streamer.ps.attn_tp_rank != 0:
 +            return end
-+        # Materialize each scheduler result on host once, rather than issuing
-+        # one synchronous D2H transfer per request.  In overlap mode the writer
-+        # rank has already copied both tensors asynchronously on copy_stream;
-+        # ``.cpu()`` is then a no-op.  The fallback keeps non-overlap correct.
++        gpu_put = gpu_put_enabled()
 +        features = dict(req.spec_capture.get("features") or {})
-+        aux_cpu = getattr(logits_output, "_spec_capture_aux_cpu", None)
-+        if "aux" in features and aux_cpu is None:
-+            aux_cpu = logits_output.hidden_states.cpu()
-+            logits_output._spec_capture_aux_cpu = aux_cpu
-+        last_hidden_cpu = getattr(
-+            logits_output, "_spec_capture_last_hidden_cpu", None
-+        )
-+        if (
-+            "last_hidden" in features
-+            and logits_output.last_hidden_states is not None
-+            and last_hidden_cpu is None
++        for artifact, source_name, gpu_name, cpu_name, chunks in (
++            (
++                "aux",
++                "hidden_states",
++                "spec_capture_aux_gpu",
++                "_spec_capture_aux_cpu",
++                req.spec_capture_aux,
++            ),
++            (
++                "last_hidden",
++                "last_hidden_states",
++                "spec_capture_last_hidden_gpu",
++                "_spec_capture_last_hidden_cpu",
++                req.spec_capture_last_hidden,
++            ),
 +        ):
-+            last_hidden_cpu = logits_output.last_hidden_states.cpu()
-+            logits_output._spec_capture_last_hidden_cpu = last_hidden_cpu
-+        if "aux" in features and aux_cpu is not None:
-+            req.spec_capture_aux.append(aux_cpu[start:end])
-+        if "last_hidden" in features and last_hidden_cpu is not None:
-+            req.spec_capture_last_hidden.append(last_hidden_cpu[start:end])
++            if artifact not in features:
++                continue
++            cache_name = gpu_name if gpu_put else cpu_name
++            captured = getattr(logits_output, cache_name, None)
++            if captured is None:
++                source = getattr(logits_output, source_name)
++                if source is None:
++                    continue
++                if gpu_put:
++                    if not source.is_cuda:
++                        raise RuntimeError(
++                            "GPU capture reached the sink after CPU staging"
++                        )
++                    # Non-overlap execution does not create the copy_to_cpu snapshot.
++                    captured = source.detach().clone()
++                else:
++                    captured = source.cpu()
++                setattr(logits_output, cache_name, captured)
++            chunks.append(captured[start:end])
 +        return end
 +
 +    def _sink_spec_capture(self, req: Req):
@@ -651,17 +691,37 @@ index 41c9cd212e..b01fd9e64b 100644
                  val = recv_obj.routed_experts[i]
                  if val is not None:
 diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
-index 69d00c9af9..6620ef83d7 100644
+index 69d00c9af9..3b4f7956f5 100644
 --- a/python/sglang/srt/managers/utils.py
 +++ b/python/sglang/srt/managers/utils.py
-@@ -120,6 +120,16 @@ class GenerationBatchResult:
+@@ -115,11 +115,35 @@ class GenerationBatchResult:
+         return isinstance(self.next_token_ids, torch.Tensor)
+ 
+     @torch.profiler.record_function("copy_result_to_cpu")
+-    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
++    def copy_to_cpu(
++        self,
++        return_logprob: bool,
++        return_hidden_states: bool = True,
++        capture_stream: Optional[torch.cuda.Stream] = None,
++    ):
+         """Copy tensors to CPU in overlap scheduling.
          Only the tensors which are needed for processing results are copied,
          e.g., next_token_ids, logits outputs
          """
-+        if (
-+            return_hidden_states
-+            and self.logits_output.last_hidden_states is not None
-+        ):
++        if capture_stream is not None:
++            for source_name, snapshot_name in (
++                ("hidden_states", "spec_capture_aux_gpu"),
++                ("last_hidden_states", "spec_capture_last_hidden_gpu"),
++            ):
++                source = getattr(self.logits_output, source_name)
++                if source is not None:
++                    # Snapshot before a later forward can overwrite graph outputs.
++                    setattr(self.logits_output, snapshot_name, source.detach().clone())
++                    source.record_stream(torch.cuda.current_stream(source.device))
++            # A graph replay may overwrite its outputs despite record_stream.
++            capture_stream.wait_stream(torch.cuda.current_stream())
++        if return_hidden_states and self.logits_output.last_hidden_states is not None:
 +            # Spec-capture's post-norm last hidden rides the same async D2H
 +            # as the aux hidden states (the field exists only when the
 +            # spec-capture patch is applied).
@@ -754,10 +814,10 @@ index 5c4f3ff44a..c40bcc6c42 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000000..7c8b6d2463
+index 0000000000..91bf321f5d
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,408 @@
+@@ -0,0 +1,442 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -820,6 +880,15 @@ index 0000000000..7c8b6d2463
 +
 +_ARTIFACT_AUX = "aux"
 +_ARTIFACT_LAST_HIDDEN = "last_hidden"
++
++
++def gpu_put_enabled() -> bool:
++    enabled = os.environ.get("SGLANG_SPEC_CAPTURE_GPU_PUT", "0") == "1"
++    if enabled and os.environ.get("MOONCAKE_PROTOCOL", "tcp") != "rdma":
++        raise ValueError(
++            "SGLANG_SPEC_CAPTURE_GPU_PUT=1 requires MOONCAKE_PROTOCOL=rdma"
++        )
++    return enabled
 +
 +
 +class SpecCaptureSink:
@@ -917,7 +986,23 @@ index 0000000000..7c8b6d2463
 +        ],
 +    ) -> Future[List[Dict[str, Any]]]:
 +        """Queue one scheduler batch without blocking the scheduler thread."""
-+        return self._executor.submit(self.put_samples, samples)
++        devices = {
++            tensor.device
++            for _, aux, last_hidden in samples
++            for tensor in (aux, last_hidden)
++            if tensor is not None and tensor.is_cuda
++        }
++        ready = []
++        for device in devices:
++            event = torch.cuda.Event()
++            event.record(torch.cuda.current_stream(device))
++            ready.append(event)
++        return self._executor.submit(self._put_ready_samples, samples, ready)
++
++    def _put_ready_samples(self, samples, ready):
++        for event in ready:
++            event.synchronize()
++        return self.put_samples(samples)
 +
 +    def put_samples(
 +        self,
@@ -941,11 +1026,7 @@ index 0000000000..7c8b6d2463
 +
 +        store = self._connect()
 +        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
-+        # SGLANG_SPEC_CAPTURE_GPU_PUT=1 keeps captured tensors on the device and
-+        # lets an RDMA/NVLink-capable transfer engine read them from there, so
-+        # the per-sample D2H copy and its host staging leave the capture path.
-+        # A TCP transport cannot read device memory: leave it off there.
-+        gpu_put = os.environ.get("SGLANG_SPEC_CAPTURE_GPU_PUT", "0") == "1"
++        gpu_put = gpu_put_enabled()
 +        started = time.perf_counter()
 +        keys: List[str] = []
 +        tensors: List[torch.Tensor] = []
@@ -964,12 +1045,7 @@ index 0000000000..7c8b6d2463
 +            tensor: torch.Tensor,
 +        ) -> None:
 +            if gpu_put and tensor.is_cuda:
-+                # Device-resident put: the transfer engine reads the captured
-+                # tensor where it lives instead of a pageable host copy; a
-+                # contiguous view pins a stable address for the synchronous put.
 +                tensor = tensor.detach().contiguous()
-+                if tensor.data_ptr() == 0 or not tensor.is_contiguous():
-+                    tensor = tensor.clone()
 +            else:
 +                tensor = tensor.detach().to("cpu").contiguous()
 +            key = self._tkey(store_id, sample_id, gen, name)
@@ -1055,20 +1131,36 @@ index 0000000000..7c8b6d2463
 +                }
 +            )
 +
-+        if gpu_put and any(t.is_cuda for t in tensors):
-+            # every device tensor must be complete before the engine reads it
-+            torch.cuda.synchronize()
++        for device in {t.device for t in tensors if t.is_cuda}:
++            # Complete any contiguous copies made by this writer thread.
++            torch.cuda.current_stream(device).synchronize()
 +        materialize_ms = (time.perf_counter() - started) * 1000.0
 +        self._remove_many_quiet(replace_keys)
-+        registered: List[torch.Tensor] = []
++        registered: List[int] = []
++        seen_storage = set()
 +        register_started = time.perf_counter()
 +        try:
 +            for tensor, nbytes in zip(tensors, sizes):
++                storage = tensor.untyped_storage()
++                ptr = storage.data_ptr()
++                if ptr in seen_storage or nbytes == 0:
++                    continue
++                seen_storage.add(ptr)
 +                try:
-+                    store.register_buffer(tensor.data_ptr(), nbytes)
-+                    registered.append(tensor)
++                    # Per-request slices can share one batch allocation.
++                    rc = store.register_buffer(ptr, storage.nbytes())
 +                except Exception:
-+                    pass  # TCP and some Mooncake builds auto-register
++                    if tensor.is_cuda:
++                        raise
++                else:
++                    if rc is None or int(rc) == 0:
++                        registered.append(ptr)
++                    elif tensor.is_cuda:
++                        raise RuntimeError(
++                            f"GPU capture buffer registration failed ({rc}); "
++                            "use RDMA-registerable CUDA memory and disable "
++                            "PyTorch expandable_segments for this server"
++                        )
 +            register_ms = (time.perf_counter() - register_started) * 1000.0
 +            put_started = time.perf_counter()
 +            batch_put = getattr(store, "batch_put_from", None)
@@ -1089,9 +1181,9 @@ index 0000000000..7c8b6d2463
 +            self._remove_many_quiet(keys)
 +            raise
 +        finally:
-+            for tensor in registered:
++            for ptr in registered:
 +                try:
-+                    store.unregister_buffer(tensor.data_ptr())
++                    store.unregister_buffer(ptr)
 +                except Exception:
 +                    pass
 +
@@ -1119,7 +1211,7 @@ index 0000000000..7c8b6d2463
 +            logger.info(
 +                "[spec-capture-timing] batch_sink samples=%d objects=%d "
 +                "bytes=%d materialize_ms=%.3f register_ms=%.3f put_ms=%.3f "
-+                "total_ms=%.3f",
++                "total_ms=%.3f gpu_payload_bytes=%d host_payload_bytes=%d",
 +                len(samples),
 +                len(keys),
 +                sum(sizes),
@@ -1127,6 +1219,8 @@ index 0000000000..7c8b6d2463
 +                register_ms,
 +                put_ms,
 +                (time.perf_counter() - started) * 1000.0,
++                sum(size for tensor, size in zip(tensors, sizes) if tensor.is_cuda),
++                sum(size for tensor, size in zip(tensors, sizes) if not tensor.is_cuda),
 +            )
 +        return results
 +
