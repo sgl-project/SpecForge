@@ -10,7 +10,7 @@ from safetensors import safe_open
 
 from specforge.modeling.target.target_utils import (
     load_target_config,
-    target_text_config,
+    target_hidden_size,
     target_vocab_size,
 )
 from specforge.utils import get_local_device, padding
@@ -29,8 +29,7 @@ class TargetHead(nn.Module):
             trust_remote_code=trust_remote_code,
             cache_dir=cache_dir,
         )
-        text_config = target_text_config(self.config)
-        self.hidden_size = int(text_config.hidden_size)
+        self.hidden_size = target_hidden_size(self.config)
         self.vocab_size = target_vocab_size(self.config)
 
         self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
