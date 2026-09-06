@@ -431,9 +431,9 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: read, then copied to the device on the training stream); ``pinned`` keeps
     #: a bounded pool of page-locked, once-registered host buffers and copies to
     #: the device on a side stream; ``cuda`` keeps the pool on the trainer device
-    #: so an RDMA / NVLink transport writes features into GPU memory directly.
+    #: for device reads (Mooncake 0.3.x stages these through its client buffer).
     receive_buffers: Literal["pageable", "pinned", "cuda"] = "pageable"
-    #: Upper bound of the pooled receive buffers per consumer rank.
+    #: Retained receive-pool budget per rank; excludes output copies and overflow.
     receive_pool_bytes: int = Field(default=8 << 30, gt=0)
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)

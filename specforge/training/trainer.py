@@ -144,9 +144,7 @@ class Trainer:
                 "refs_for_epoch must be callable and accompany a refs source"
             )
         trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
-        # GPU-direct receive pools land features on this rank's CUDA device, so
-        # the loader has to request device tensors; the strategy's own
-        # ``.to(device)`` then becomes a no-op. Host stores keep the CPU path.
+        # Pooled reads finish their device copies before yielding to the trainer.
         consumer_device = getattr(store, "consumer_device", None)
         loader_device = consumer_device() if callable(consumer_device) else None
         if not isinstance(loader_device, torch.device):

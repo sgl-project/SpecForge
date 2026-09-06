@@ -9,9 +9,11 @@ end-to-end test against ``mooncake`` is gated below on the package import.
 """
 
 import ctypes
+import gc
 import importlib.util
 import os
 import unittest
+import weakref
 from inspect import signature
 from unittest import mock
 
@@ -30,7 +32,11 @@ from specforge.runtime.data_plane.feature_store import (
     drain_feature_store_removals,
     drain_feature_store_sample_removals,
 )
-from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore, _nbytes
+from specforge.runtime.data_plane.mooncake_store import (
+    MooncakeFeatureStore,
+    ReceiveBufferPool,
+    _nbytes,
+)
 
 
 class _FakeMooncakeStore:
@@ -495,11 +501,12 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertIsNone(
             MooncakeFeatureStore(store=fake, store_id="run0").consumer_device()
         )
-        self.assertIsNone(
-            MooncakeFeatureStore(
-                store=fake, store_id="run0", receive_buffers="pinned"
-            ).consumer_device()
-        )
+        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+            self.assertIsNone(
+                MooncakeFeatureStore(
+                    store=fake, store_id="run0", receive_buffers="pinned"
+                ).consumer_device()
+            )
         cuda = MooncakeFeatureStore(store=fake, store_id="run0", receive_buffers="cuda")
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LOCAL_RANK", None)
@@ -508,7 +515,7 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LOCAL_RANK": "2"}):
             self.assertEqual(cuda.consumer_device(), torch.device("cuda", 2))
 
-    def test_failed_slot_registration_is_reported_not_swallowed(self):
+    def test_host_registration_failure_does_not_disable_future_registration(self):
         class RegisterFails(_FakeMooncakeStore):
             def register_buffer(self, ptr, nbytes):
                 return -1
@@ -519,15 +526,80 @@ class TestMooncakeFeatureStore(unittest.TestCase):
             store=fake, store_id="run0", receive_buffers="pinned"
         )
         ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
-        with self.assertLogs(
-            "specforge.runtime.data_plane.mooncake_store", level="WARNING"
-        ) as logs:
+        with self.assertRaisesRegex(RuntimeError, "registration failed"):
+            consumer.get(ref)
+        pool = consumer._receive_pool
+        self.assertFalse(pool._registration_disabled)
+        self.assertEqual(pool.health()["receive_pool_bytes"], 0)
+        with mock.patch.object(fake, "register_buffer", return_value=0):
             out, _ = consumer.get(ref)
-        # reported once, then the pool stops registering
-        self.assertEqual(sum("register_buffer" in line for line in logs.output), 1)
-        self.assertTrue(consumer._receive_pool._registration_disabled)
         for name, expected in _tensors().items():
             self.assertTrue(torch.equal(out[name].cpu(), expected))
+
+    def test_quarantined_storage_survives_collection_and_late_writes(self):
+        for budget in (1, 4096):
+            with self.subTest(budget=budget):
+                pool = ReceiveBufferPool(
+                    _FakeMooncakeStore(), kind="pinned", max_bytes=budget
+                )
+                slot, pooled = pool.acquire(128, "cpu")
+                storage = weakref.ref(slot.storage)
+                ptr = slot.storage.data_ptr()
+                pool.release(slot, pooled, quarantine=True)
+                del slot
+                gc.collect()
+                self.assertIsNotNone(storage(), "late DMA must not target freed memory")
+                next_slot, _ = pool.acquire(128, "cpu")
+                next_slot.storage.zero_()
+                ctypes.memset(ptr, 1, 128)
+                self.assertTrue(
+                    torch.equal(next_slot.storage, torch.zeros(128, dtype=torch.uint8))
+                )
+                self.assertEqual(pool.health()["receive_pool_quarantined_bytes"], 128)
+
+    def test_transient_get_failures_retry_into_fresh_buffers(self):
+        for kind in ("pageable", "pinned"):
+            for status in (-703, -707, -800):
+                with self.subTest(kind=kind, status=status):
+                    fake = _FakeMooncakeStore()
+                    consumer = MooncakeFeatureStore(store=fake, receive_buffers=kind)
+                    ref = consumer.put(_tensors(), sample_id="s0", metadata=_meta())
+                    original = fake.get_into
+                    pointers = []
+
+                    def fail_once(key, ptr, size):
+                        pointers.append(ptr)
+                        return (
+                            status if len(pointers) == 1 else original(key, ptr, size)
+                        )
+
+                    with mock.patch.object(fake, "get_into", side_effect=fail_once):
+                        with mock.patch(
+                            "specforge.runtime.data_plane.mooncake_store.time.sleep"
+                        ):
+                            tensors, _ = consumer.get(ref)
+                    self.assertNotEqual(pointers[0], pointers[1])
+                    self.assertTrue(
+                        torch.equal(tensors["hidden_state"], _tensors()["hidden_state"])
+                    )
+
+    def test_nontransient_get_failures_are_not_retried(self):
+        for kind in ("pageable", "pinned"):
+            for status in (-200, -600, 1):
+                with self.subTest(kind=kind, status=status):
+                    fake = _FakeMooncakeStore()
+                    consumer = MooncakeFeatureStore(store=fake, receive_buffers=kind)
+                    ref = consumer.put(_tensors(), sample_id="s0", metadata=_meta())
+                    with mock.patch.object(
+                        fake, "get_into", return_value=status
+                    ) as get:
+                        with mock.patch(
+                            "specforge.runtime.data_plane.mooncake_store.time.sleep"
+                        ) as sleep:
+                            with self.assertRaises(KeyError):
+                                consumer.get(ref)
+                    self.assertEqual(get.call_count, 1)
+                    sleep.assert_not_called()
 
     def test_unknown_receive_buffer_kind_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "receive_buffers"):
