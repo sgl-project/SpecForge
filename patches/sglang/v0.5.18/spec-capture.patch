@@ -757,7 +757,7 @@ new file mode 100644
 index 0000000000..7c8b6d2463
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,408 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -785,7 +785,8 @@ index 0000000000..7c8b6d2463
 +"aux_layer_ids", "features": {name: {"shape", "dtype"}}}``.
 +
 +Mooncake connection uses the standard ``MOONCAKE_*`` env vars (see
-+``MooncakeFeatureStore``).
++``MooncakeFeatureStore``). ``SGLANG_SPEC_CAPTURE_GPU_PUT=1`` publishes the
++captured tensors from device memory (RDMA/NVLink transports only).
 +"""
 +
 +from __future__ import annotations
@@ -940,6 +941,11 @@ index 0000000000..7c8b6d2463
 +
 +        store = self._connect()
 +        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
++        # SGLANG_SPEC_CAPTURE_GPU_PUT=1 keeps captured tensors on the device and
++        # lets an RDMA/NVLink-capable transfer engine read them from there, so
++        # the per-sample D2H copy and its host staging leave the capture path.
++        # A TCP transport cannot read device memory: leave it off there.
++        gpu_put = os.environ.get("SGLANG_SPEC_CAPTURE_GPU_PUT", "0") == "1"
 +        started = time.perf_counter()
 +        keys: List[str] = []
 +        tensors: List[torch.Tensor] = []
@@ -957,7 +963,15 @@ index 0000000000..7c8b6d2463
 +            name: str,
 +            tensor: torch.Tensor,
 +        ) -> None:
-+            tensor = tensor.detach().to("cpu").contiguous()
++            if gpu_put and tensor.is_cuda:
++                # Device-resident put: the transfer engine reads the captured
++                # tensor where it lives instead of a pageable host copy; a
++                # contiguous view pins a stable address for the synchronous put.
++                tensor = tensor.detach().contiguous()
++                if tensor.data_ptr() == 0 or not tensor.is_contiguous():
++                    tensor = tensor.clone()
++            else:
++                tensor = tensor.detach().to("cpu").contiguous()
 +            key = self._tkey(store_id, sample_id, gen, name)
 +            keys.append(key)
 +            tensors.append(tensor)
@@ -1041,6 +1055,9 @@ index 0000000000..7c8b6d2463
 +                }
 +            )
 +
++        if gpu_put and any(t.is_cuda for t in tensors):
++            # every device tensor must be complete before the engine reads it
++            torch.cuda.synchronize()
 +        materialize_ms = (time.perf_counter() - started) * 1000.0
 +        self._remove_many_quiet(replace_keys)
 +        registered: List[torch.Tensor] = []
