@@ -693,12 +693,26 @@ class OnlineDFlashModel(nn.Module):
             covered_num=covered_num,
         )
 
+    @staticmethod
+    def _sequence_anchor_scale(weight_mask: torch.Tensor) -> torch.Tensor:
+        """Return 1 / valid-anchor-count for every anchor in each sequence."""
+
+        valid_anchor_counts = (weight_mask > 0).any(dim=-1).sum(dim=1, keepdim=True)
+        return (
+            valid_anchor_counts.to(weight_mask.dtype)
+            .clamp_min(1.0)
+            .reciprocal()
+            .unsqueeze(-1)
+            .expand(-1, weight_mask.shape[1], -1)
+        )
+
     def _dflash_objective_chunk_terms(
         self,
         hidden: torch.Tensor,
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
+        sequence_anchor_scale: Optional[torch.Tensor] = None,
     ) -> DFlashObjectiveTerms:
         """Return a flat tuple of additive objective and metric tensors."""
 
@@ -740,7 +754,18 @@ class OnlineDFlashModel(nn.Module):
                     self.loss_type,
                 )
             loss_weights = weight_mask * dpace_weights
-            loss_den = loss_weights.sum()
+            valid_anchors = (weight_mask > 0).any(dim=-1)
+            if sequence_anchor_scale is None:
+                sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
+            loss_weights = loss_weights * sequence_anchor_scale
+            # Each valid anchor contributes 1 / A_b to the denominator, so
+            # reducing all chunks yields the number of valid sequences. This
+            # preserves D-PACE's total credit mass while balancing sequences
+            # with different numbers of sampled anchors.
+            loss_den = (
+                valid_anchors.to(weight_mask.dtype)
+                * sequence_anchor_scale.squeeze(-1)
+            ).sum()
         else:  # defensive: __init__ validates the configured loss type.
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
@@ -806,6 +831,7 @@ class OnlineDFlashModel(nn.Module):
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
         aligned_target_hidden: Optional[torch.Tensor] = None,
+        sequence_anchor_scale: Optional[torch.Tensor] = None,
     ) -> DFlashMetricTerms:
         """Return additive unary, selector, and teacher diagnostics for one chunk.
 
@@ -823,6 +849,7 @@ class OnlineDFlashModel(nn.Module):
         loss_weights = self._dflash_metric_loss_weights(
             unary.hard_label_probability,
             weight_mask,
+            sequence_anchor_scale,
         )
         selector = None
         if candidate_selector is not None:
@@ -899,6 +926,7 @@ class OnlineDFlashModel(nn.Module):
         self,
         hard_label_probability: torch.Tensor,
         weight_mask: torch.Tensor,
+        sequence_anchor_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Reconstruct effective objective weights for position-share metrics."""
 
@@ -920,7 +948,9 @@ class OnlineDFlashModel(nn.Module):
             weight_mask > 0,
             self.loss_type,
         )
-        return weight_mask * dpace_weights
+        if sequence_anchor_scale is None:
+            sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
+        return weight_mask * dpace_weights * sequence_anchor_scale
 
     @staticmethod
     def _dflash2_selector_diagnostics(
@@ -1257,6 +1287,9 @@ class OnlineDFlashModel(nn.Module):
             if target_last_hidden_states is not None and collect_detailed_metrics
             else None
         )
+        sequence_anchor_scale = None
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
         (
             ce_loss_num,
             tv_loss_num,
@@ -1275,6 +1308,7 @@ class OnlineDFlashModel(nn.Module):
             target_ids,
             weight_mask,
             predecessor_ids,
+            sequence_anchor_scale,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
@@ -1353,6 +1387,7 @@ class OnlineDFlashModel(nn.Module):
                 weight_mask,
                 predecessor_ids,
                 aligned_target_hidden,
+                sequence_anchor_scale,
                 chunk_size=self.objective_chunk_blocks,
                 dim=1,
             )
