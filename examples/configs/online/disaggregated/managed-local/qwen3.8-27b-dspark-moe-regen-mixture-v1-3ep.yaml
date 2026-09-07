@@ -96,10 +96,10 @@ runtime:
   producer_concurrency: 8
   # Up to ~0.42 GiB of aux features per 8k sample (5 layers x 5120 x bf16,
   # ~0.18 GiB at the corpus mean of 3.6k tokens). The high watermark must be
-  # at least the global optimizer quantum (512); 1.5 quanta in flight keeps
+  # at least the global optimizer quantum (512) and so must the low watermark; 1.5 quanta in flight keeps
   # the trainer fed while halving the host footprint of the 6-epoch run.
   in_flight_high_watermark: 768
-  in_flight_low_watermark: 384
+  in_flight_low_watermark: 512
   # 300 / 200 GiB resident bounds and a 380 GiB hard cap, inside the 400 GiB
   # of Mooncake segments below (768 x 0.42 GiB worst case = 322 GiB).
   resident_high_watermark_bytes: 322122547200
