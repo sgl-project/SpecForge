@@ -65,9 +65,19 @@ noaux_tc.py        "noaux_tc" controller: fp32 selection bias + sign controller 
 grouped_experts.py "grouped" experts: stacked [E, out, in] w1/w2/w3, sorted-segment
                    loop or torch._grouped_mm dispatch; converter experts.w1 <->
                    experts.{i}.w1.weight.
-swiglu_shared.py   "swiglu" ungated shared expert (shared_experts.w1/w2/w3).
+aux_loss.py        "aux_loss" controller: no selection bias; Switch-Transformer
+                   balance loss coeff * E * sum_e f_e P_e (== transformers'
+                   load_balancing_loss_func), load-fraction metrics.
+swiglu_shared.py   "swiglu" shared expert (shared_experts.w1/w2/w3), optionally
+                   gated per token by sigmoid(shared_experts.gate(x)) when
+                   shared_expert_gate == "sigmoid".
+qwen_layout.py     converter to/from the Qwen family's file naming
+                   (experts.{i}.{gate,up,down}_proj, shared_expert.*,
+                   shared_expert_gate.weight) for layers with a shared gate.
 presets.py         "deepseek_v4": sqrtsoftplus + noaux_tc + renorm x1.5 + one
                    ungated shared expert + SwiGLU clamp 10.
+                   "qwen3_5_moe": softmax + aux_loss + renorm x1.0 + one
+                   sigmoid-gated shared expert, no clamp (Qwen3.5/3.8 MoE).
 ```
 
 ## Contracts that matter
@@ -76,7 +86,13 @@ presets.py         "deepseek_v4": sqrtsoftplus + noaux_tc + renorm x1.5 + one
 `experts`, `shared_experts` (the DeepSeek-family names SGLang loads). A
 component whose native parameter layout differs from the official file naming
 registers a `state_dict` converter pair; both directions are idempotent and
-no-ops on dense models.
+no-ops on dense models. Family naming is a converter too: a layer carrying the
+Qwen per-token shared-expert gate is written in Qwen naming
+(`experts.{i}.{gate,up,down}_proj.weight`, `shared_expert.*`,
+`shared_expert_gate.weight`, what SGLang's `Qwen2MoeSparseMoeBlock` loads),
+and Qwen naming is always accepted on read. An ablation that removes the
+shared expert from a Qwen-preset draft therefore falls back to the DeepSeek
+per-expert names in its files.
 
 **Naming is converted at the boundary, not in `state_dict()`.** FSDP's
 full-state-dict hooks index the gathered dict by the module's own parameter
@@ -97,9 +113,13 @@ differently and raise `CheckpointError`.
 controller metrics; the DFlash/DSpark strategies add them to `StepOutput.metrics`,
 and the trainer DP-averages and logs them like any other scalar.
 
-**Aux losses are collected, not yet consumed.** `collect_moe_aux_loss` sums
-scaled layer losses; wiring it into an objective is done with the first preset
-whose balancing policy emits one (aux-loss-free policies do not).
+**Aux losses ride the objective.** `collect_moe_aux_loss` sums the layers'
+already-scaled losses and the DFlash/DSpark strategies add the sum to the
+step loss (`_with_moe_aux_loss`). `aux_loss` (Qwen) emits
+`moe_aux_loss_coeff * E * sum_e f_e P_e` with `f_e` the per-expert share of
+(token, slot) assignments summed over slots, exactly transformers'
+`load_balancing_loss_func` (uniform routing gives `coeff * k`); `noaux_tc`
+optionally emits DeepSeek-V3's complementary loss, which divides by `k`.
 
 ## Extension points
 

@@ -25,3 +25,24 @@ register_moe_preset(
     shared_expert="swiglu",
     shared_expert_gate="none",
 )
+
+# Qwen3.5/3.8 MoE (``qwen3_5_moe_text``, e.g. Qwen3.8-2.4T-A95B): softmax
+# scores, plain top-k with the top-k probabilities renormalized to sum 1 and
+# no scaling, no selection bias; balancing is the Switch-Transformer auxiliary
+# load-balancing loss (transformers' ``load_balancing_loss_func``). One SwiGLU
+# shared expert of ``shared_expert_intermediate_size`` width, gated per token
+# by ``sigmoid(shared_expert_gate(x))``; no SwiGLU clamp. Checkpoints use the
+# Qwen naming SGLang's ``Qwen2MoeSparseMoeBlock`` loads (see qwen_layout.py).
+register_moe_preset(
+    "qwen3_5_moe",
+    scoring_func="softmax",
+    norm_topk_prob=True,
+    routed_scaling_factor=1.0,
+    n_shared_experts=1,
+    swiglu_limit=0.0,
+    router="topk",
+    balance="aux_loss",
+    experts_backend="grouped",
+    shared_expert="swiglu",
+    shared_expert_gate="sigmoid",
+)

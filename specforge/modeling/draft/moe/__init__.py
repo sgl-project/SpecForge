@@ -26,8 +26,9 @@ Modules:
 - :mod:`.init`        warm-start plans from a target model's experts
 
 Implementations register into the registries from their own modules
-(:mod:`.topk_router`, :mod:`.noaux_tc`, :mod:`.grouped_experts`,
-:mod:`.swiglu_shared`) and presets in :mod:`.presets`; the modules above
+(:mod:`.topk_router`, :mod:`.noaux_tc`, :mod:`.aux_loss`,
+:mod:`.grouped_experts`, :mod:`.swiglu_shared`, :mod:`.qwen_layout`) and
+presets in :mod:`.presets`; the modules above
 define contracts and hold no routing math themselves.
 """
 
@@ -35,6 +36,8 @@ define contracts and hold no routing math themselves.
 from . import (  # noqa: E402,F401  isort: skip
     grouped_experts,
     noaux_tc,
+    aux_loss,
+    qwen_layout,
     presets,
     swiglu_shared,
     topk_router,

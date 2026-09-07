@@ -69,6 +69,25 @@ def plan_warm_start(
 
 _EXPERT_WEIGHTS = ("w1", "w2", "w3")
 
+#: Official per-expert weight names by family: DeepSeek ``w{1,2,3}`` first,
+#: then the Qwen ``{gate,down,up}_proj`` aliases (see qwen_layout.py).
+_EXPERT_ALIASES = {
+    "w1": ("w1", "gate_proj"),
+    "w2": ("w2", "down_proj"),
+    "w3": ("w3", "up_proj"),
+}
+_SHARED_PREFIXES = ("shared_experts", "shared_expert")
+_SHARED_GATE_KEYS = ("shared_experts.gate.weight", "shared_expert_gate.weight")
+
+
+def _lookup(source: Mapping[str, torch.Tensor], *candidates: str) -> torch.Tensor:
+    for key in candidates:
+        if key in source:
+            return source[key]
+    raise KeyError(
+        f"warm-start source has none of {list(candidates)}; keys: {sorted(source)[:8]}..."
+    )
+
 
 def apply_warm_start(
     layer: MoELayer, plan: WarmStartPlan, source: Mapping[str, torch.Tensor]
@@ -76,8 +95,11 @@ def apply_warm_start(
     """Seed ``layer`` from one target MoE layer.
 
     ``source`` holds the target layer's tensors in official naming, relative
-    to the layer: ``experts.{j}.w{1,2,3}.weight``, ``gate.weight`` ``[E_t, H]``,
-    optionally ``gate.bias`` ``[E_t]`` and ``shared_experts.w{1,2,3}.weight``.
+    to the layer, in either family layout: DeepSeek
+    (``experts.{j}.w{1,2,3}.weight``, ``gate.weight`` ``[E_t, H]``, optionally
+    ``gate.bias`` ``[E_t]`` and ``shared_experts.w{1,2,3}.weight``) or Qwen
+    (``experts.{j}.{gate,up,down}_proj.weight``,
+    ``shared_expert.{gate,up,down}_proj.weight``, ``shared_expert_gate.weight``).
     Returns the (module-native) keys that were loaded.
     """
     if plan.n_draft_experts != layer.cfg.n_routed_experts:
@@ -88,7 +110,9 @@ def apply_warm_start(
     official = {}
     for i, j in enumerate(plan.target_expert_ids):
         for w in _EXPERT_WEIGHTS:
-            official[f"experts.{i}.{w}.weight"] = source[f"experts.{j}.{w}.weight"]
+            official[f"experts.{i}.{w}.weight"] = _lookup(
+                source, *(f"experts.{j}.{alias}.weight" for alias in _EXPERT_ALIASES[w])
+            )
     if plan.copy_gate_rows:
         rows = torch.as_tensor(plan.target_expert_ids, dtype=torch.long)
         official["gate.weight"] = source["gate.weight"][rows]
@@ -96,9 +120,16 @@ def apply_warm_start(
             official["gate.bias"] = source["gate.bias"][rows]
     if plan.copy_shared_expert and layer.shared_experts is not None:
         for w in _EXPERT_WEIGHTS:
-            official[f"shared_experts.{w}.weight"] = source[
-                f"shared_experts.{w}.weight"
-            ]
+            official[f"shared_experts.{w}.weight"] = _lookup(
+                source,
+                *(
+                    f"{prefix}.{alias}.weight"
+                    for prefix in _SHARED_PREFIXES
+                    for alias in _EXPERT_ALIASES[w]
+                ),
+            )
+        if getattr(layer.shared_experts, "gated", False):
+            official["shared_experts.gate.weight"] = _lookup(source, *_SHARED_GATE_KEYS)
     native = from_checkpoint_state_dict(official)
     result = layer.load_state_dict(native, strict=False)
     if result.unexpected_keys:

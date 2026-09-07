@@ -152,17 +152,26 @@ Top-level keys override the preset (for ablations: `scoring_func`,
 `norm_topk_prob`, `routed_scaling_factor`, `balance`, `shared_expert_gate`,
 `swiglu_limit`, ...). Training-only knobs live under `dflash_config` with an
 `moe_` prefix and never change the checkpoint. Checkpoints, warm starts and
-exports keep the official per-expert naming (`experts.{i}.w{1,2,3}.weight`),
+exports keep the target family's official per-expert naming (DeepSeek
+`experts.{i}.w{1,2,3}.weight`, Qwen `experts.{i}.{gate,up,down}_proj.weight`),
 so an exported drafter loads into SGLang unchanged. Dense drafts are
 unaffected: with no `n_routed_experts` the kernel provider's MLP is used as-is.
 
 `deepseek_v4` is the checked-in preset (DeepSeek-V4 routing:
 `sqrtsoftplus` scores, aux-loss-free `noaux_tc` balancing, combine weights
 renormalized and scaled by 1.5, one ungated shared expert, SwiGLU clamp 10);
-`configs/deepseek-v4-flash-dspark-moe.json` uses it. A new target family is a
-preset registration plus whichever components it needs (score function,
-balance controller, experts backend, shared expert); each registers by name
-from its own module.
+`configs/deepseek-v4-flash-dspark-moe.json` uses it. `qwen3_5_moe` is the
+Qwen3.5/3.8 MoE recipe (`qwen3_5_moe_text` targets such as Qwen3.8-2.4T-A95B:
+softmax scores, top-k probabilities renormalized to sum 1, no scaling, one
+SwiGLU shared expert gated per token by `sigmoid(shared_expert_gate(x))`, and
+the Switch-Transformer auxiliary load-balancing loss scaled by
+`dflash_config.moe_aux_loss_coeff`); `configs/qwen3.8-27b-dspark-moe.json`
+uses it with 512 experts of width 512, 10 active. Its checkpoints use the
+Qwen naming SGLang's `Qwen2MoeSparseMoeBlock` loads
+(`experts.{i}.{gate,up,down}_proj.weight`, `shared_expert.*`,
+`shared_expert_gate.weight`). A new target family is a preset registration
+plus whichever components it needs (score function, balance controller,
+experts backend, shared expert); each registers by name from its own module.
 
 ## Draft architectures
 
