@@ -95,6 +95,40 @@ class TestClipGradNormSingleProcess(unittest.TestCase):
             )
         )
 
+    def test_cpu_offload_reuses_host_buffers_over_steps(self):
+        torch.manual_seed(5)
+        resident_model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8, bias=False), torch.nn.Linear(8, 4, bias=True)
+        )
+        torch.manual_seed(5)
+        offload_model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8, bias=False), torch.nn.Linear(8, 4, bias=True)
+        )
+        resident = BF16Optimizer(resident_model, lr=1e-2, max_grad_norm=0.5)
+        offload = BF16Optimizer(
+            offload_model, lr=1e-2, max_grad_norm=0.5, offload_master=True
+        )
+        self.assertIsNotNone(offload._master_grad_buffers)
+        buffers = [t.data_ptr() for t in offload._master_grad_buffers]
+        staging = [t.data_ptr() for t in offload._staging_buffers]
+        for step in range(3):
+            torch.manual_seed(100 + step)
+            grads = [torch.randn_like(p) for p in resident_model.parameters()]
+            for model in (resident_model, offload_model):
+                for p, g in zip(model.parameters(), grads):
+                    # a parameter without a gradient this step is skipped
+                    p.grad = None if (step == 1 and p.dim() == 1) else g.clone()
+            torch.testing.assert_close(offload.step(), resident.step())
+            for a, b in zip(offload_model.parameters(), resident_model.parameters()):
+                torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-4)
+            self.assertTrue(all(p.grad is None for p in offload_model.parameters()))
+        # the pinned host buffers are persistent (no per-step allocation)
+        self.assertEqual([t.data_ptr() for t in offload._master_grad_buffers], buffers)
+        self.assertEqual([t.data_ptr() for t in offload._staging_buffers], staging)
+        # fused CPU AdamW is in use on the host masters
+        self.assertTrue(offload.optimizer.defaults.get("fused"))
+        self.assertFalse(bool(resident.optimizer.defaults.get("fused")))
+
     def test_resume_allows_cpu_offload_mode_change(self):
         model, resident = _make_optimizer(seed=3, offload_master=False)
         for param in model.parameters():
