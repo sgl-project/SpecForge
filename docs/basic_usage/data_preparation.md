@@ -288,7 +288,7 @@ Use these strategy/model pairs for the checked-in offline colocated recipes:
 | DSpark | `Qwen/Qwen3-4B` | `configs/qwen3-4b-dspark.json` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
 
 `--strategy` defaults to `eagle3` for compatibility. Pass it explicitly in
-reproducible jobs. `--draft-model-config` is required for Domino and DSpark;
+reproducible jobs. `--draft-model-config` is required for Domino, DSpark, and MTP;
 passing the same explicit config used by training is recommended for every
 strategy. Capture layers come from the resolved draft config. EAGLE3 retains
 target-derived defaults for legacy configs that do not define

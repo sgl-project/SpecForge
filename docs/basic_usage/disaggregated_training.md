@@ -434,7 +434,7 @@ deployment:
 ```
 
 Both paths must be visible at the same location from producer and consumer
-nodes. The producer ingests existing EAGLE3, DFlash/DFlash2, Domino, or DSpark
+nodes. The producer ingests existing EAGLE3, DFlash/DFlash2, Domino, DSpark, or MTP
 features and publishes a fixed manifest. Offline epochs remain re-iterable.
 
 Set `backend: mooncake` instead, omit `store_root`, and provide the Mooncake
