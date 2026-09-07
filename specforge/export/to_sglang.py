@@ -29,6 +29,7 @@ from specforge.export.checkpoint_io import (
     resolve_training_state,
 )
 from specforge.modeling.draft.moe import to_checkpoint_state_dict
+from specforge.modeling.draft.moe.topk_router import fold_router_centering
 
 #: per-architecture trainer-key -> serving-key renames ({} = identity).
 WEIGHT_MAPS: Dict[str, Dict[str, str]] = {
@@ -85,7 +86,9 @@ def export_to_sglang(
     # embeddings exactly as the trainer-side checkpoint filter does.
     full = {
         k: v
-        for k, v in to_checkpoint_state_dict(model.state_dict()).items()
+        for k, v in fold_router_centering(
+            to_checkpoint_state_dict(model.state_dict())
+        ).items()
         if "embed" not in k.lower()
     }
     model.save_pretrained(output_dir, state_dict=_serving_state(full, weight_map))

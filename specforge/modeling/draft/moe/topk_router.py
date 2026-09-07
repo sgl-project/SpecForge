@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Dict, Optional
 
 import torch
@@ -218,3 +219,28 @@ class TopKRouter(Router):
         if self.input_mean is not None:
             out["input_mean_norm"] = self.input_mean.norm()
         return out
+
+
+_INPUT_MEAN_KEY = re.compile(r"^(?P<base>(?:.*\.)?)gate\.input_mean$")
+
+
+def fold_router_centering(state: dict) -> dict:
+    """Export-time fold of EMA router centering into a gate bias.
+
+    ``W (x - mu) = W x - W mu``: the checkpoint's ``gate.input_mean`` (and its
+    step counter) become ``gate.bias = -W @ mu`` so a serving engine that
+    reads a router bias reproduces the trained routing without knowing about
+    centering. No-op on dicts without the buffer.
+    """
+    out = dict(state)
+    for key in list(state):
+        m = _INPUT_MEAN_KEY.match(key)
+        if m is None:
+            continue
+        base = m["base"]
+        weight = state[f"{base}gate.weight"]
+        mean = out.pop(key)
+        out.pop(f"{base}gate.input_mean_steps", None)
+        bias = -(weight.float() @ mean.float())
+        out[f"{base}gate.bias"] = bias.to(weight.dtype)
+    return out

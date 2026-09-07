@@ -34,7 +34,11 @@ from specforge.modeling.draft.moe.aux_loss import AuxLossController, load_balanc
 from specforge.modeling.draft.moe.grouped_experts import GroupedExperts, swiglu_clamped
 from specforge.modeling.draft.moe.qwen_layout import from_qwen_layout, to_qwen_layout
 from specforge.modeling.draft.moe.swiglu_shared import SwiGLUSharedExpert
-from specforge.modeling.draft.moe.topk_router import TopKRouter, routing_diagnostics
+from specforge.modeling.draft.moe.topk_router import (
+    TopKRouter,
+    fold_router_centering,
+    routing_diagnostics,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HIDDEN = 32
@@ -768,6 +772,28 @@ class TestRouterRegularizers(unittest.TestCase):
         # bf16 casts keep the statistics fp32
         layer.to(torch.bfloat16)
         self.assertEqual(layer.gate.input_mean.dtype, torch.float32)
+
+    def test_export_fold_turns_centering_into_a_gate_bias(self):
+        x = self._collapsed_inputs()
+        layer = _layer(dflash_config={"moe_router_center": "ema"}).train()
+        layer(x)
+        layer.apply_pending_balance_update()
+        layer.eval()
+        state = to_checkpoint_state_dict(layer.state_dict())
+        folded = fold_router_centering(state)
+        self.assertNotIn("gate.input_mean", folded)
+        self.assertNotIn("gate.input_mean_steps", folded)
+        self.assertIn("gate.bias", folded)
+        self.assertEqual(folded["gate.bias"].shape, (8,))
+        # W (x - mu) == W x + bias for every token
+        logits_centered = (x - layer.gate.input_mean) @ layer.gate.weight.t()
+        logits_folded = x @ folded["gate.weight"].t() + folded["gate.bias"]
+        self.assertTrue(torch.allclose(logits_centered, logits_folded, atol=1e-4))
+        # nested prefixes and dense dicts
+        nested = {f"layers.3.mlp.{k}": v for k, v in state.items()}
+        self.assertIn("layers.3.mlp.gate.bias", fold_router_centering(nested))
+        plain = {"gate.weight": torch.zeros(8, HIDDEN)}
+        self.assertEqual(fold_router_centering(plain), plain)
 
     def test_dspark_model_applies_router_updates_before_routing(self):
         config = _draft_config("DSparkDraftModel")

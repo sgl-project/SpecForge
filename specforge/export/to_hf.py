@@ -32,6 +32,7 @@ from specforge.export.checkpoint_io import (
     resolve_training_state,
 )
 from specforge.modeling.draft.moe import resolve_moe_config, to_checkpoint_state_dict
+from specforge.modeling.draft.moe.topk_router import fold_router_centering
 
 
 def _load_embedding_tensor(source: str, key: str) -> torch.Tensor:
@@ -88,7 +89,9 @@ def export_to_hf(
     model = materialize_draft(
         state, draft_config_path, vocab_mapping_path=vocab_mapping_path
     )
-    full_state = dict(to_checkpoint_state_dict(model.state_dict()))
+    full_state = fold_router_centering(
+        dict(to_checkpoint_state_dict(model.state_dict()))
+    )
     moe_cfg = resolve_moe_config(model.config)
     if moe_cfg is not None:
         # Serving engines read the routing recipe from config.json; the draft
