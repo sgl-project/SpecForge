@@ -18,17 +18,20 @@ multi-rank workers and recognizes an existing torchrun worker environment
 without nesting another launcher.
 
 Model/data assembly lives in :mod:`specforge.training.assembly`; this module is
-deliberately limited to command parsing and distributed process lifecycle.
+deliberately limited to click command definitions and distributed process
+lifecycle.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import signal
 import socket
 from contextlib import contextmanager
-from typing import Iterator, List, Optional
+from types import SimpleNamespace
+from typing import Iterator, Optional, Sequence
+
+import click
 
 from specforge.config import Config, load_config
 
@@ -170,137 +173,191 @@ def _config_for_role(cfg: Config, role: str) -> Config:
     return Config.model_validate(raw)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="specforge")
-    sub = parser.add_subparsers(dest="command", required=True)
-    train = sub.add_parser("train", help="train a draft model from a typed config")
-    train.add_argument("-c", "--config", required=True, help="YAML or JSON run config")
-    train.add_argument(
-        "--role",
-        choices=("auto", "all", "producer", "consumer", "both"),
-        default="auto",
-        help=(
-            "launch selection (default: offline local all or online/disaggregated "
-            "producer+consumer)"
-        ),
-    )
-    train.add_argument(
-        "--node-rank",
-        type=int,
-        default=None,
-        help="node-local rank for an explicit multi-node trainer launch",
-    )
-    train.add_argument(
-        "--plan",
-        action="store_true",
-        help="print the resolved process plan without starting workers",
-    )
-    train.add_argument(
-        "overrides",
-        nargs="*",
-        help="dotted overrides, e.g. training.learning_rate=1e-4",
-    )
-    export = sub.add_parser(
-        "export", help="materialize a runtime checkpoint as a model directory"
-    )
-    export.add_argument("--to", choices=("hf", "sglang"), required=True)
-    export.add_argument("--checkpoint", required=True)
-    export.add_argument("--draft-config", required=True)
-    export.add_argument("--output-dir", required=True)
-    export.add_argument("--vocab-mapping", default=None)
-    export.add_argument(
-        "--embedding-source",
-        default=None,
-        help="target model path supplying a frozen embedding for HF export",
-    )
-    export.add_argument("--embedding-key", default="model.embed_tokens.weight")
-    benchmark = sub.add_parser(
-        "benchmark",
-        help="benchmark a running SGLang server",
-        description=(
-            "Measure throughput and optional speculative-decoding telemetry from "
-            "a running SGLang server."
-        ),
-    )
-    benchmark.add_argument("--model", required=True)
-    benchmark.add_argument(
-        "--dataset",
-        choices=("gsm8k", "math500", "humaneval", "mbpp", "mt-bench"),
-        required=True,
-    )
-    benchmark.add_argument("--max-new-tokens", type=int, default=2048)
-    benchmark.add_argument("--temperature", type=float, default=0.0)
-    benchmark.add_argument("--top-p", type=float, default=1.0)
-    benchmark.add_argument("--top-k", type=int, default=1)
-    benchmark.add_argument("--max-samples", type=int)
-    benchmark.add_argument("--num-prompts", type=int, default=1024)
-    benchmark.add_argument("--concurrency", type=int, default=1)
-    benchmark.add_argument("--base-url", default="http://127.0.0.1:30000")
-    benchmark.add_argument("--timeout-seconds", type=int, default=3600)
-    benchmark.add_argument("--enable-thinking", action="store_true")
-    benchmark.add_argument("--trust-remote-code", action="store_true")
-    benchmark.add_argument("--output-json")
-    args = parser.parse_args(argv)
+_CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
-    if args.command == "train":
-        cfg = load_config(args.config, args.overrides)
-        from specforge.application import bind_run, resolve_run
-        from specforge.launch_plan import build_launch_plan, run_commands
 
-        resolved = resolve_run(cfg)
-        plan = build_launch_plan(
-            resolved.config,
-            algorithm=resolved.algorithm,
-            config_path=args.config,
-            overrides=args.overrides,
-            requested_role=args.role,
-            node_rank=args.node_rank,
-        )
-        if args.plan:
-            print(plan.render())
-            return 0
-        if plan.kind == "worker":
-            for key, value in plan.worker_env.items():
-                if value is None:
-                    # CommandSpec.env contract: None unsets the variable.
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-            role_config = _config_for_role(resolved.config, plan.role)
-            try:
-                with _worker_signal_unwind():
-                    _train(bind_run(role_config, resolved.algorithm))
-            except _WorkerTermination as received:
-                return 128 + received.signum
-            return 0
-        return run_commands(plan)
-    if args.command == "benchmark":
-        from specforge.benchmarks.sglang import run
+@click.group(context_settings=_CONTEXT_SETTINGS)
+def cli() -> None:
+    """SpecForge: speculative decoding training framework."""
 
-        return run(args)
-    if args.to == "hf":
+
+@cli.command(short_help="train a draft model from a typed config")
+@click.option(
+    "-c",
+    "--config",
+    "config_path",
+    required=True,
+    metavar="PATH",
+    help="YAML or JSON run config.",
+)
+@click.option(
+    "--role",
+    type=click.Choice(("auto", "all", "producer", "consumer", "both")),
+    default="auto",
+    show_default=True,
+    help=(
+        "Launch selection: offline local 'all' or online/disaggregated "
+        "producer+consumer when 'auto'."
+    ),
+)
+@click.option(
+    "--node-rank",
+    type=int,
+    default=None,
+    help="Node-local rank for an explicit multi-node trainer launch.",
+)
+@click.option(
+    "--plan",
+    is_flag=True,
+    help="Print the resolved process plan without starting workers.",
+)
+@click.argument("overrides", nargs=-1)
+def train(
+    config_path: str,
+    role: str,
+    node_rank: Optional[int],
+    plan: bool,
+    overrides: Sequence[str],
+) -> int:
+    """Train a draft model from a typed run config.
+
+    OVERRIDES are dotted ``section.field=value`` assignments applied on top of
+    the config file, e.g. ``training.learning_rate=1e-4``.
+    """
+    overrides = list(overrides)
+    cfg = load_config(config_path, overrides)
+    from specforge.application import bind_run, resolve_run
+    from specforge.launch_plan import build_launch_plan, run_commands
+
+    resolved = resolve_run(cfg)
+    launch = build_launch_plan(
+        resolved.config,
+        algorithm=resolved.algorithm,
+        config_path=config_path,
+        overrides=overrides,
+        requested_role=role,
+        node_rank=node_rank,
+    )
+    if plan:
+        print(launch.render())
+        return 0
+    if launch.kind == "worker":
+        for key, value in launch.worker_env.items():
+            if value is None:
+                # CommandSpec.env contract: None unsets the variable.
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        role_config = _config_for_role(resolved.config, launch.role)
+        try:
+            with _worker_signal_unwind():
+                _train(bind_run(role_config, resolved.algorithm))
+        except _WorkerTermination as received:
+            return 128 + received.signum
+        return 0
+    return run_commands(launch)
+
+
+@cli.command(short_help="materialize a runtime checkpoint as a model directory")
+@click.option(
+    "--to",
+    "target",
+    type=click.Choice(("hf", "sglang")),
+    required=True,
+    help="Export layout.",
+)
+@click.option("--checkpoint", required=True, metavar="PATH")
+@click.option("--draft-config", required=True, metavar="PATH")
+@click.option("--output-dir", required=True, metavar="PATH")
+@click.option("--vocab-mapping", default=None, metavar="PATH")
+@click.option(
+    "--embedding-source",
+    default=None,
+    metavar="PATH",
+    help="Target model path supplying a frozen embedding for HF export.",
+)
+@click.option(
+    "--embedding-key",
+    default="model.embed_tokens.weight",
+    show_default=True,
+)
+@click.pass_context
+def export(
+    ctx: click.Context,
+    target: str,
+    checkpoint: str,
+    draft_config: str,
+    output_dir: str,
+    vocab_mapping: Optional[str],
+    embedding_source: Optional[str],
+    embedding_key: str,
+) -> int:
+    """Materialize a runtime checkpoint as a model directory."""
+    if target == "hf":
         from specforge.export.to_hf import export_to_hf
 
         export_to_hf(
-            args.checkpoint,
-            args.draft_config,
-            args.output_dir,
-            vocab_mapping_path=args.vocab_mapping,
-            embedding_source=args.embedding_source,
-            embedding_key=args.embedding_key,
+            checkpoint,
+            draft_config,
+            output_dir,
+            vocab_mapping_path=vocab_mapping,
+            embedding_source=embedding_source,
+            embedding_key=embedding_key,
         )
-    else:
-        if args.embedding_source is not None:
-            parser.error("--embedding-source is only valid with --to hf")
-        from specforge.export.to_sglang import export_to_sglang
+        return 0
+    if embedding_source is not None:
+        raise click.UsageError("--embedding-source is only valid with --to hf", ctx)
+    from specforge.export.to_sglang import export_to_sglang
 
-        export_to_sglang(
-            args.checkpoint,
-            args.draft_config,
-            args.output_dir,
-            vocab_mapping_path=args.vocab_mapping,
-        )
+    export_to_sglang(
+        checkpoint,
+        draft_config,
+        output_dir,
+        vocab_mapping_path=vocab_mapping,
+    )
     return 0
+
+
+@cli.command(short_help="benchmark a running SGLang server")
+@click.option("--model", required=True, help="Tokenizer/model id for prompt rendering.")
+@click.option(
+    "--dataset",
+    type=click.Choice(("gsm8k", "math500", "humaneval", "mbpp", "mt-bench")),
+    required=True,
+)
+@click.option("--max-new-tokens", type=int, default=2048, show_default=True)
+@click.option("--temperature", type=float, default=0.0, show_default=True)
+@click.option("--top-p", type=float, default=1.0, show_default=True)
+@click.option("--top-k", type=int, default=1, show_default=True)
+@click.option("--max-samples", type=int, default=None)
+@click.option("--num-prompts", type=int, default=1024, show_default=True)
+@click.option("--concurrency", type=int, default=1, show_default=True)
+@click.option("--base-url", default="http://127.0.0.1:30000", show_default=True)
+@click.option("--timeout-seconds", type=int, default=3600, show_default=True)
+@click.option("--enable-thinking", is_flag=True)
+@click.option("--trust-remote-code", is_flag=True)
+@click.option("--output-json", default=None, metavar="PATH")
+def benchmark(**options) -> int:
+    """Measure throughput and optional speculative-decoding telemetry from a
+    running SGLang server."""
+    from specforge.benchmarks.sglang import run
+
+    return run(SimpleNamespace(**options))
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run the ``specforge`` CLI and return its exit status.
+
+    Unlike click's standalone mode this never calls ``sys.exit`` itself, so the
+    console-script and ``python -m`` entries own process exit while embedded
+    callers and tests receive the status as a plain integer.
+    """
+    try:
+        status = cli.main(args=argv, prog_name="specforge", standalone_mode=False)
+    except click.ClickException as error:
+        error.show()
+        return error.exit_code
+    return int(status or 0)
 
 
 if __name__ == "__main__":

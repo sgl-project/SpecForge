@@ -44,12 +44,13 @@ class StepOutput:
 
 @dataclass(frozen=True)
 class StepContext:
-    """Training-schedule state passed into ``forward_loss`` for objectives that
-    depend on where in training we are (e.g. Domino's decaying ``lambda_base``);
-    most strategies ignore it."""
+    """Training-schedule state passed into ``forward_loss``.
+
+    ``collect_detailed_metrics`` gates expensive diagnostics to log steps."""
 
     global_step: int = 0
     total_steps: Optional[int] = None
+    collect_detailed_metrics: bool = True
 
 
 def linear_lambda_base(
@@ -499,13 +500,24 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         device = self._device()
         selector_loss_alpha = self._selector_loss_alpha(ctx)
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
-        loss, accuracy, model_metrics = self.dflash_model(
-            input_ids=t["input_ids"].to(device, non_blocking=True),
-            hidden_states=t["hidden_states"].to(device, non_blocking=True),
-            loss_mask=t["loss_mask"].to(device, non_blocking=True),
-            max_valid_anchors=max_valid_anchors,
-            selector_loss_alpha=selector_loss_alpha,
+        collect_detailed_metrics = (
+            ctx.collect_detailed_metrics if ctx is not None else True
         )
+        model_inputs = {
+            "input_ids": t["input_ids"].to(device, non_blocking=True),
+            "hidden_states": t["hidden_states"].to(device, non_blocking=True),
+            "loss_mask": t["loss_mask"].to(device, non_blocking=True),
+            "max_valid_anchors": max_valid_anchors,
+            "selector_loss_alpha": selector_loss_alpha,
+        }
+        if ctx is not None:
+            model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
+        target_last_hidden_states = t.get("target_last_hidden_states")
+        if target_last_hidden_states is not None and collect_detailed_metrics:
+            model_inputs["target_last_hidden_states"] = target_last_hidden_states.to(
+                device, non_blocking=True
+            )
+        loss, accuracy, model_metrics = self.dflash_model(**model_inputs)
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:
             metrics["accuracy_denom"] = model_metrics["accuracy_denom"]

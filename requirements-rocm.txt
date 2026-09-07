@@ -11,6 +11,7 @@ wandb
 psutil
 numpy
 accelerate
+click>=8.0
 pydantic
 pyyaml
 requests

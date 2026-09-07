@@ -75,20 +75,31 @@ if ! command -v git > /dev/null; then
     exit 1
 fi
 
+# git apply must treat $SGL_PARENT as a plain directory. When site-packages
+# lives inside a git checkout (a repo-local .venv is the documented install,
+# and a source tree is itself a repository) git resolves patch paths against
+# that repository's top level and silently SKIPS every file outside the
+# current subdirectory, exiting 0 without touching anything. Stop repository
+# discovery at $SGL_PARENT so paths always resolve relative to it.
+git_apply() {
+    GIT_CEILING_DIRECTORIES="$(dirname "$SGL_PARENT")" \
+        git -C "$SGL_PARENT" apply "$@"
+}
+
 check_apply() {
-    git -C "$SGL_PARENT" apply --check -p2 "$1" 2> /dev/null
+    git_apply --check -p2 "$1" 2> /dev/null
 }
 
 check_reverse() {
-    git -C "$SGL_PARENT" apply --reverse --check -p2 "$1" 2> /dev/null
+    git_apply --reverse --check -p2 "$1" 2> /dev/null
 }
 
 apply_exact() {
-    git -C "$SGL_PARENT" apply -p2 "$1"
+    git_apply -p2 "$1"
 }
 
 reverse_exact() {
-    git -C "$SGL_PARENT" apply --reverse -p2 "$1"
+    git_apply --reverse -p2 "$1"
 }
 
 fail_unknown_state() {

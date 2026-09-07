@@ -66,6 +66,32 @@ class ApplySglangSpecCapturePatchTest(unittest.TestCase):
         self.record.write_text(old_patch, encoding="utf-8")
         return old_patch
 
+    def test_patches_site_packages_nested_inside_a_git_repository(self) -> None:
+        # A repo-local .venv is the documented install layout. git apply run
+        # from a subdirectory of a repository resolves paths against the repo
+        # top level and silently skips everything else, so the unfixed script
+        # reported success while leaving sglang untouched.
+        subprocess.run(
+            ["git", "init", "-q", self.temp_dir.name], check=True, capture_output=True
+        )
+        self.example.write_text("new base\n", encoding="utf-8")
+
+        result = self.run_script()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("applied at", result.stdout)
+        self.assertEqual(self.example.read_text(encoding="utf-8"), "new patched\n")
+        self.assertEqual(self.sink.read_text(encoding="utf-8"), "new sink\n")
+
+        again = self.run_script()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("already applied", again.stdout)
+
+        reversed_ = self.run_script("--reverse")
+        self.assertEqual(reversed_.returncode, 0, reversed_.stderr)
+        self.assertEqual(self.example.read_text(encoding="utf-8"), "new base\n")
+        self.assertFalse(self.sink.exists())
+
     def test_recovers_files_left_by_pip_upgrade_and_is_idempotent(self) -> None:
         self.seed_cached_upgrade()
 

@@ -1,6 +1,8 @@
 # coding=utf-8
 """CPU-only lifecycle gates for the single public SpecForge entry point."""
 
+import contextlib
+import io
 import os
 import signal
 import sys
@@ -375,6 +377,47 @@ class TestCliLifecycle(unittest.TestCase):
             )
         self.assertEqual(calls[0][0], ("checkpoint", "draft.json", "exported"))
         self.assertEqual(calls[0][1]["embedding_source"], "target")
+
+    def test_sglang_export_rejects_embedding_source_as_usage_error(self):
+        module = types.ModuleType("specforge.export.to_sglang")
+        module.export_to_sglang = mock.Mock()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(sys.modules, {"specforge.export.to_sglang": module}),
+            contextlib.redirect_stderr(stderr),
+        ):
+            status = main(
+                [
+                    "export",
+                    "--to",
+                    "sglang",
+                    "--checkpoint",
+                    "checkpoint",
+                    "--draft-config",
+                    "draft.json",
+                    "--output-dir",
+                    "exported",
+                    "--embedding-source",
+                    "target",
+                ]
+            )
+        self.assertEqual(status, 2)
+        self.assertIn(
+            "--embedding-source is only valid with --to hf", stderr.getvalue()
+        )
+        module.export_to_sglang.assert_not_called()
+
+    def test_main_returns_usage_status_instead_of_exiting(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(main(["train"]), 2)
+        self.assertIn("--config", stderr.getvalue())
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(main(["-h"]), 0)
+        for command in ("train", "export", "benchmark"):
+            self.assertIn(command, stdout.getvalue())
 
 
 if __name__ == "__main__":
