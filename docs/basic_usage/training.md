@@ -270,11 +270,13 @@ See the dedicated [DFlash2 guide](../concepts/DFlash2.md) for the complete
 model-field constraints, offline feature workflow, selector schedule, and
 serving compatibility boundary.
 
-Domino and DSpark need their projector/head metadata, so they require an
-explicit draft config (or a pretrained warm-start source that contains
-`config.json`). The old Domino parser exposed an optional config flag, but its
-no-config branch immediately failed because those required projector fields
-had no defaults; the unified schema rejects that unusable combination early.
+Domino, DSpark, and MTP require an explicit draft config (or a pretrained
+warm-start source that contains `config.json`). Domino and DSpark need their
+projector/head metadata; MTP selects the Qwen3.5 native MTP draft architecture
+(`Qwen3_5MTPDraftModel`) and has no automatic target-derived draft defaults.
+The old Domino parser exposed an optional config flag, but its no-config branch
+immediately failed because those required projector fields had no defaults; the
+unified schema rejects that unusable combination early.
 
 There are two deliberately separate checkpoint operations:
 
