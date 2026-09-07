@@ -486,6 +486,7 @@ For deeper lifecycle and recovery semantics, see the
 | DFlash | consumer DP | DP | consumer DP |
 | Domino | consumer DP | DP | consumer DP |
 | DSpark | consumer DP | DP | consumer DP |
+| MTP | consumer DP | DP | consumer DP |
 | P-EAGLE | consumer DP, batch size 1 | No | No |
 
 `qwen3-8b-dpace-online.yaml` is the D-PACE recipe. It deliberately uses the
