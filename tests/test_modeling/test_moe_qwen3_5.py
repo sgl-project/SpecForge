@@ -34,7 +34,7 @@ from specforge.modeling.draft.moe.aux_loss import AuxLossController, load_balanc
 from specforge.modeling.draft.moe.grouped_experts import GroupedExperts, swiglu_clamped
 from specforge.modeling.draft.moe.qwen_layout import from_qwen_layout, to_qwen_layout
 from specforge.modeling.draft.moe.swiglu_shared import SwiGLUSharedExpert
-from specforge.modeling.draft.moe.topk_router import TopKRouter
+from specforge.modeling.draft.moe.topk_router import TopKRouter, routing_diagnostics
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HIDDEN = 32
@@ -151,7 +151,7 @@ class TestPresetAndConfig(unittest.TestCase):
         )
         self.assertEqual(cfg.n_shared_experts, 1)
         self.assertEqual(cfg.shared_expert_intermediate_size, 2048)
-        self.assertEqual(cfg.aux_loss_coeff, 0.01)
+        self.assertEqual(cfg.aux_loss_coeff, 0.001)
         self.assertEqual(cfg.dispatch, "grouped_mm")
         self.assertEqual(cfg.bias_update_rate, 0.0)
         # the dense Qwen3.8-27B DSpark geometry is preserved
@@ -561,6 +561,227 @@ class TestDSparkIntegration(unittest.TestCase):
         official = to_checkpoint_state_dict(model.state_dict())
         self.assertIn("layers.4.mlp.experts.511.gate_proj.weight", official)
         self.assertIn("layers.4.mlp.shared_expert_gate.weight", official)
+
+
+class TestRouterRegularizers(unittest.TestCase):
+    """Knobs for from-scratch drafters whose router inputs share a dominant
+    token-independent component (every token picks the same top-k)."""
+
+    @staticmethod
+    def _collapsed_inputs(tokens=64, common_scale=200.0, seed=3):
+        torch.manual_seed(seed)
+        common = torch.randn(HIDDEN)
+        return common_scale * common + torch.randn(tokens, HIDDEN)
+
+    def test_config_knobs_and_validation(self):
+        cfg = resolve_moe_config(
+            _json(
+                dflash_config={
+                    "moe_router_noise_std": 0.5,
+                    "moe_router_z_loss_coeff": 1e-3,
+                    "moe_router_init_std": 0.1,
+                    "moe_router_center": "ema",
+                    "moe_router_center_momentum": 0.9,
+                }
+            )
+        )
+        self.assertEqual(
+            (
+                cfg.router_noise_std,
+                cfg.router_z_loss_coeff,
+                cfg.router_init_std,
+                cfg.router_center,
+                cfg.router_center_momentum,
+            ),
+            (0.5, 1e-3, 0.1, "ema", 0.9),
+        )
+        defaults = resolve_moe_config(_json())
+        self.assertEqual(defaults.router_noise_std, 0.0)
+        self.assertEqual(defaults.router_center, "none")
+        for bad in (
+            {"moe_router_noise_std": -1},
+            {"moe_router_z_loss_coeff": -1},
+            {"moe_router_init_std": -1},
+            {"moe_router_center": "batch"},
+            {"moe_router_center_momentum": 1.0},
+        ):
+            with self.assertRaises(ValueError):
+                resolve_moe_config(_json(dflash_config=bad))
+
+    def test_diagnostics_detect_collapse_and_diversity(self):
+        x = self._collapsed_inputs()
+        layer = _layer().train()
+        layer(x)
+        m = layer.metrics()
+        for key in (
+            "router_input_cos",
+            "logit_common_frac",
+            "logit_common_std",
+            "logit_token_std",
+            "route_entropy_frac",
+            "top1_mode_frac",
+        ):
+            self.assertIn(key, m)
+        # a dominant common direction: near-parallel inputs, common logits
+        self.assertGreater(float(m["router_input_cos"]), 0.9)
+        self.assertGreater(float(m["logit_common_frac"]), 0.9)
+        self.assertGreater(float(m["logit_common_std"]), float(m["logit_token_std"]))
+        self.assertAlmostEqual(float(m["top1_mode_frac"]), 1.0, places=6)
+        # every token picks the same k: entropy log(k)/log(E)
+        import math
+
+        self.assertAlmostEqual(
+            float(m["route_entropy_frac"]), math.log(3) / math.log(8), places=4
+        )
+        self.assertAlmostEqual(float(m["experts_unused_frac"]), 5 / 8, places=6)
+        # diverse inputs: low cosine, common fraction small, entropy high
+        layer(torch.randn(64, HIDDEN))
+        m = layer.metrics()
+        self.assertLess(float(m["router_input_cos"]), 0.2)
+        self.assertLess(float(m["logit_common_frac"]), 0.3)
+        self.assertGreater(float(m["route_entropy_frac"]), 0.9)
+        # eval forwards neither compute nor clear diagnostics
+        layer.eval()
+        layer(torch.randn(4, HIDDEN))
+        self.assertIn("router_input_cos", layer.metrics())
+
+    def test_diagnostics_are_exact_on_a_toy_case(self):
+        x = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        logits = torch.tensor([[1.0, 3.0, 2.0], [1.0, 3.0, 2.0]])
+        indices = torch.tensor([[1], [1]])
+        counts = torch.tensor([0, 2, 0])
+        d = routing_diagnostics(x, logits, indices, counts)
+        self.assertAlmostEqual(float(d["router_input_cos"]), 0.0, places=6)
+        self.assertAlmostEqual(float(d["logit_common_frac"]), 1.0, places=6)
+        self.assertAlmostEqual(float(d["logit_token_std"]), 0.0, places=6)
+        self.assertAlmostEqual(float(d["route_entropy_frac"]), 0.0, places=6)
+        self.assertAlmostEqual(float(d["top1_mode_frac"]), 1.0, places=6)
+
+    def test_per_layer_metrics_are_reported(self):
+        model = DSparkDraftModel(_draft_config("DSparkDraftModel")).train()
+        TestDSparkIntegration._forward(self, model)
+        metrics = collect_moe_metrics(model)
+        for i in range(2):
+            self.assertIn(f"moe/layer{i}/experts_unused_frac", metrics)
+            self.assertIn(f"moe/layer{i}/logit_common_frac", metrics)
+        self.assertIn("moe/router_input_cos", metrics)
+
+    def test_noise_is_training_only_and_diversifies_collapsed_routing(self):
+        x = self._collapsed_inputs()
+        plain = _layer().train()
+        plain(x)
+        self.assertAlmostEqual(float(plain.metrics()["experts_unused_frac"]), 5 / 8)
+        noisy = _layer(dflash_config={"moe_router_noise_std": 50.0}).train()
+        noisy.load_state_dict(plain.state_dict())
+        torch.manual_seed(0)
+        noisy(x)
+        self.assertLess(float(noisy.metrics()["experts_unused_frac"]), 0.2)
+        # combine weights come from the jittered scores in training ...
+        torch.manual_seed(0)
+        y_train = noisy(x)
+        torch.manual_seed(1)
+        self.assertFalse(torch.allclose(y_train, noisy(x)))
+        # ... and the eval forward is deterministic and equals the plain router
+        noisy.eval()
+        plain.eval()
+        self.assertTrue(torch.allclose(noisy(x), plain(x)))
+
+    def test_z_loss_is_added_to_the_layer_aux_loss(self):
+        layer = _layer(
+            dflash_config={"moe_aux_loss_coeff": 0.0, "moe_router_z_loss_coeff": 0.1}
+        ).train()
+        x = torch.randn(16, HIDDEN)
+        layer(x)
+        z = layer.aux_loss()
+        self.assertIsNotNone(z)
+        logits = x @ layer.gate.weight.detach().t()
+        ref = 0.1 * torch.logsumexp(logits, -1).square().mean()
+        self.assertAlmostEqual(float(z), float(ref), places=5)
+        self.assertIn("z_loss", layer.metrics())
+        z.backward()
+        self.assertIsNotNone(layer.gate.weight.grad)
+        # with the balance loss on, both terms are summed
+        both = _layer(
+            dflash_config={"moe_aux_loss_coeff": 0.5, "moe_router_z_loss_coeff": 0.1}
+        ).train()
+        both(x)
+        self.assertGreater(float(both.aux_loss()), float(both.balance.aux_loss()))
+        # off in eval / without the coefficient
+        layer.eval()
+        layer(x)
+        self.assertIsNone(layer.aux_loss())
+        self.assertIsNone(_layer().train().gate.aux_loss())
+
+    def test_router_init_std_overrides_the_model_default(self):
+        torch.manual_seed(0)
+        layer = MoELayer(
+            resolve_moe_config(_json(dflash_config={"moe_router_init_std": 1.0})),
+            HIDDEN,
+        )
+        layer.reset_parameters(std=0.02)
+        self.assertGreater(float(layer.gate.weight.std()), 0.5)
+        layer = MoELayer(resolve_moe_config(_json()), HIDDEN)
+        layer.reset_parameters(std=0.02)
+        self.assertLess(float(layer.gate.weight.std()), 0.05)
+
+    def test_ema_centering_removes_the_common_mode(self):
+        x = self._collapsed_inputs()
+        layer = _layer(dflash_config={"moe_router_center": "ema"}).train()
+        self.assertIn("input_mean", dict(layer.gate.named_buffers()))
+        self.assertEqual(layer.gate.input_mean.dtype, torch.float32)
+        # first forward: mean is still zero -> collapsed like the plain router
+        layer(x)
+        self.assertAlmostEqual(float(layer.metrics()["experts_unused_frac"]), 5 / 8)
+        self.assertTrue(torch.equal(layer.gate.input_mean, torch.zeros(HIDDEN)))
+        # the update happens outside the forward (deferred, like a balance bias)
+        layer.apply_pending_balance_update()
+        self.assertTrue(torch.allclose(layer.gate.input_mean, x.mean(0)))
+        self.assertEqual(int(layer.gate.input_mean_steps), 1)
+        layer(x)
+        m = layer.metrics()
+        self.assertLess(float(m["experts_unused_frac"]), 0.2)
+        self.assertLess(float(m["logit_common_frac"]), 0.3)
+        self.assertGreater(float(m["input_mean_norm"]), 0.0)
+        # second update is an EMA step
+        layer.apply_pending_balance_update()
+        self.assertTrue(torch.allclose(layer.gate.input_mean, x.mean(0), atol=1e-5))
+        y = self._collapsed_inputs(seed=4)
+        layer(y)
+        layer.apply_pending_balance_update()
+        expected = 0.99 * x.mean(0) + 0.01 * y.mean(0)
+        self.assertTrue(torch.allclose(layer.gate.input_mean, expected, atol=1e-4))
+        # eval uses the same centering; no pending state is created
+        layer.eval()
+        layer(x)
+        self.assertIsNone(layer.gate._pending_input_mean)
+        # the buffer round-trips through the checkpoint boundary
+        state = to_checkpoint_state_dict(layer.state_dict())
+        self.assertIn("gate.input_mean", state)
+        fresh = _layer(dflash_config={"moe_router_center": "ema"})
+        fresh.load_state_dict(from_checkpoint_state_dict(state))
+        self.assertTrue(torch.equal(fresh.gate.input_mean, layer.gate.input_mean))
+        # the plain router has no such buffer and a no-op update
+        plain = _layer().train()
+        plain(x)
+        plain.apply_pending_balance_update()
+        self.assertNotIn("input_mean", dict(plain.gate.named_buffers()))
+        # bf16 casts keep the statistics fp32
+        layer.to(torch.bfloat16)
+        self.assertEqual(layer.gate.input_mean.dtype, torch.float32)
+
+    def test_dspark_model_applies_router_updates_before_routing(self):
+        config = _draft_config("DSparkDraftModel")
+        config.dflash_config["moe_router_center"] = "ema"
+        model = DSparkDraftModel(config).train()
+        gates = [layer.gate for layer in iter_moe_layers(model)]
+        TestDSparkIntegration._forward(self, model)
+        for gate in gates:
+            self.assertIsNotNone(gate._pending_input_mean)
+            self.assertEqual(int(gate.input_mean_steps), 0)
+        TestDSparkIntegration._forward(self, model)
+        for gate in gates:
+            self.assertEqual(int(gate.input_mean_steps), 1)
+            self.assertGreater(float(gate.input_mean.norm()), 0.0)
 
 
 if __name__ == "__main__":

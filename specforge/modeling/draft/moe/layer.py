@@ -57,9 +57,15 @@ class MoELayer(nn.Module):
     # -- model-level hooks (see hooks.py) ---------------------------------
     def apply_pending_balance_update(self) -> None:
         self.balance.apply_pending_update()
+        self.gate.apply_pending_update()
 
     def aux_loss(self) -> Optional[torch.Tensor]:
-        return self.balance.aux_loss()
+        """Balance loss plus any router regularizer (z-loss), already scaled."""
+        total = self.balance.aux_loss()
+        router_loss = self.gate.aux_loss()
+        if router_loss is not None:
+            total = router_loss if total is None else total + router_loss
+        return total
 
     def metrics(self) -> Dict[str, MetricValue]:
         out: Dict[str, MetricValue] = {}
@@ -71,6 +77,7 @@ class MoELayer(nn.Module):
             out["load_min_ratio"] = load.min() / mean
             out["experts_unused_frac"] = (load == 0).float().mean()
         out.update(self.balance.metrics())
+        out.update(self.gate.metrics())
         return out
 
     def reset_parameters(self, std: float) -> None:

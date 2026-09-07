@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Callable, Optional, Type
+from typing import Callable, Dict, Optional, Type
 
 import torch
 from torch import nn
 
 from ._registry import Registry
-from .balance import BalanceController
+from .balance import BalanceController, MetricValue
 from .config import MoEConfig
 
 
@@ -78,6 +78,19 @@ class Router(nn.Module, abc.ABC):
     @abc.abstractmethod
     def reset_parameters(self, std: float) -> None:
         """Initialize the gate weights (called from the model's ``_init_weights``)."""
+
+    # -- optional training-time state, same timing rules as BalanceController --
+    def apply_pending_update(self) -> None:
+        """Consume state stashed by the forward; called by the model outside
+        checkpoint regions (may run collectives)."""
+
+    def aux_loss(self) -> Optional[torch.Tensor]:
+        """Router-side regularizer for the last forward (e.g. z-loss), or ``None``."""
+        return None
+
+    def metrics(self) -> Dict[str, MetricValue]:
+        """Scalar routing diagnostics of the last training forward."""
+        return {}
 
 
 ROUTERS: Registry[Type[Router]] = Registry("MoE router")

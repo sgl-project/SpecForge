@@ -45,19 +45,35 @@ def collect_moe_aux_loss(module: nn.Module) -> Optional[torch.Tensor]:
     return total
 
 
+#: Metrics also reported per layer (``moe/layer{i}/...``): routing collapse
+#: and its cause differ by depth, which the layer average hides.
+PER_LAYER_METRICS = (
+    "experts_unused_frac",
+    "router_input_cos",
+    "logit_common_frac",
+    "logit_token_std",
+)
+
+
 def collect_moe_metrics(
     module: nn.Module, prefix: str = "moe/"
 ) -> Dict[str, MetricValue]:
-    """Layer-averaged scalar diagnostics; ``{}`` for dense models."""
+    """Layer-averaged scalar diagnostics (plus :data:`PER_LAYER_METRICS` per
+    layer); ``{}`` for dense models."""
     sums: Dict[str, MetricValue] = {}
+    per_layer: Dict[str, MetricValue] = {}
     n = 0
-    for layer in iter_moe_layers(module):
+    for index, layer in enumerate(iter_moe_layers(module)):
         n += 1
         for key, value in layer.metrics().items():
             sums[key] = value if key not in sums else sums[key] + value
+            if key in PER_LAYER_METRICS:
+                per_layer[f"{prefix}layer{index}/{key}"] = value
     if n == 0:
         return {}
-    return {
+    out = {
         f"{prefix}{key}": (value / n if isinstance(value, torch.Tensor) else value / n)
         for key, value in sums.items()
     }
+    out.update(per_layer)
+    return out

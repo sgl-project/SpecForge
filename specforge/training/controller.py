@@ -172,6 +172,27 @@ def _dp_mean_scalars(
     return {name: packed[index] for index, name in enumerate(names)}
 
 
+def _device_memory_metrics() -> Dict[str, float]:
+    """Rank-local CUDA allocator stats for the logging rank (``perf/mem_*``).
+
+    ``mem_alloc_retries`` counts cudaMalloc retries after a cache flush: a
+    non-zero, growing value means the caching allocator is thrashing, which
+    shows up as step time, not as an error.
+    """
+    if not torch.cuda.is_available():
+        return {}
+    try:
+        stats = torch.cuda.memory_stats()
+    except (RuntimeError, AssertionError):
+        return {}
+    gib = float(2**30)
+    return {
+        "perf/mem_peak_alloc_gib": stats.get("allocated_bytes.all.peak", 0) / gib,
+        "perf/mem_reserved_gib": stats.get("reserved_bytes.all.current", 0) / gib,
+        "perf/mem_alloc_retries": float(stats.get("num_alloc_retries", 0)),
+    }
+
+
 def _reduce_ratio_metrics(
     values: Dict[str, Any],
     *,
@@ -772,6 +793,7 @@ class TrainerController:
                         time.perf_counter() - perf_window_started,
                         1e-12,
                     )
+                    log_metrics.update(_device_memory_metrics())
                     parallel = getattr(self.core.backend, "parallel_config", None)
                     world_size = int(getattr(parallel, "world_size", 1))
                     tp_size = int(getattr(parallel, "tp_size", 1))

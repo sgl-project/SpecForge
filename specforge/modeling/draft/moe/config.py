@@ -50,7 +50,14 @@ TRAINING_KEYS = {
     "moe_aux_loss_coeff": "aux_loss_coeff",
     "moe_dispatch": "dispatch",
     "moe_freeze_experts": "freeze_experts",
+    "moe_router_noise_std": "router_noise_std",
+    "moe_router_z_loss_coeff": "router_z_loss_coeff",
+    "moe_router_init_std": "router_init_std",
+    "moe_router_center": "router_center",
+    "moe_router_center_momentum": "router_center_momentum",
 }
+
+ROUTER_CENTER_MODES = ("none", "ema")
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,24 @@ class MoEConfig:
     #: experts are replicated by the FSDP backend instead of sharded, which
     #: removes the per-micro-batch weight all-gathers that dominate large MoEs.
     freeze_experts: bool = False
+    #: Router regularizers for from-scratch drafters whose early router inputs
+    #: share a dominant token-independent component (DFlash-family draft
+    #: positions are mask-token embeddings plus near-uniform attention over
+    #: the target features), which makes every token pick the same top-k.
+    #: ``router_noise_std``: Gaussian jitter added to the gate logits in
+    #: training only. ``router_z_loss_coeff``: ST-MoE router z-loss
+    #: ``coeff * mean_t logsumexp_e(logits)^2``. ``router_init_std``: gate
+    #: weight init std (0 = the draft's ``initializer_range``).
+    #: ``router_center``: ``"ema"`` subtracts an EMA (momentum
+    #: ``router_center_momentum``, updated outside the forward like a balance
+    #: bias) of the cross-token mean router input before the gate projection;
+    #: the mean is a checkpoint buffer (``gate.input_mean``), so a servable
+    #: export needs ``gate.bias = -W @ input_mean``.
+    router_noise_std: float = 0.0
+    router_z_loss_coeff: float = 0.0
+    router_init_std: float = 0.0
+    router_center: str = "none"
+    router_center_momentum: float = 0.99
 
     def __post_init__(self) -> None:
         if self.n_routed_experts <= 0:
@@ -122,6 +147,21 @@ class MoEConfig:
             raise ValueError("swiglu_limit must be >= 0 (0 disables the clamp)")
         if self.bias_update_rate < 0 or self.aux_loss_coeff < 0:
             raise ValueError("bias_update_rate and aux_loss_coeff must be >= 0")
+        if (
+            self.router_noise_std < 0
+            or self.router_z_loss_coeff < 0
+            or self.router_init_std < 0
+        ):
+            raise ValueError(
+                "router_noise_std, router_z_loss_coeff and router_init_std must be >= 0"
+            )
+        if self.router_center not in ROUTER_CENTER_MODES:
+            raise ValueError(
+                f"unknown router_center {self.router_center!r}; "
+                f"choose from {ROUTER_CENTER_MODES}"
+            )
+        if not 0 <= self.router_center_momentum < 1:
+            raise ValueError("router_center_momentum must be in [0, 1)")
 
     @property
     def group_limited(self) -> bool:
