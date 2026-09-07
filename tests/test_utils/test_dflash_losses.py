@@ -565,9 +565,7 @@ class TestDFlashLosses(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(loss.item(), 0.0)
-        valid_sequences = (
-            (self.binary_mask > 0).any(dim=-1).any(dim=-1).sum().item()
-        )
+        valid_sequences = (self.binary_mask > 0).any(dim=-1).any(dim=-1).sum().item()
         self.assertEqual(metrics["loss_terms"][1].item(), valid_sequences)
 
     def test_alpha_changes_dpace_loss(self):

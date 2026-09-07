@@ -763,8 +763,7 @@ class OnlineDFlashModel(nn.Module):
             # preserves D-PACE's total credit mass while balancing sequences
             # with different numbers of sampled anchors.
             loss_den = (
-                valid_anchors.to(weight_mask.dtype)
-                * sequence_anchor_scale.squeeze(-1)
+                valid_anchors.to(weight_mask.dtype) * sequence_anchor_scale.squeeze(-1)
             ).sum()
         else:  # defensive: __init__ validates the configured loss type.
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
