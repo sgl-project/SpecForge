@@ -125,15 +125,22 @@ class TopKRouter(Router):
         self.init_std = float(cfg.router_init_std)
         self.center = cfg.router_center
         self.center_momentum = float(cfg.router_center_momentum)
+        self.normalize = bool(cfg.router_normalize)
         if self.center in ("ema", "batch"):
             self.register_buffer(
                 "input_mean", torch.zeros(hidden_size, dtype=torch.float32)
             )
             self.register_buffer("input_mean_steps", torch.zeros((), dtype=torch.long))
+            self.register_buffer(
+                "input_rms",
+                torch.ones((), dtype=torch.float32) if self.normalize else None,
+            )
         else:
             self.input_mean = None
             self.input_mean_steps = None
+            self.input_rms = None
         self._pending_input_mean: Optional[torch.Tensor] = None
+        self._pending_input_rms: Optional[torch.Tensor] = None
         self._lag_logit_std: Optional[torch.Tensor] = None
         self._z_loss: Optional[torch.Tensor] = None
         self._diagnostics: Dict[str, torch.Tensor] = {}
@@ -143,6 +150,8 @@ class TopKRouter(Router):
         # Keep the centering statistics fp32 through module-wide dtype casts.
         if module.input_mean is not None and module.input_mean.dtype != torch.float32:
             module.input_mean.data = module.input_mean.data.float()
+        if module.input_rms is not None and module.input_rms.dtype != torch.float32:
+            module.input_rms.data = module.input_rms.data.float()
         return module
 
     def reset_parameters(self, std: float) -> None:
@@ -158,22 +167,32 @@ class TopKRouter(Router):
         self._z_loss = None
         self._pending_input_mean = None
         self._lag_logit_std = None
+        self._pending_input_rms = None
         if self.input_mean is not None:
             if self.training:
                 batch_mean = x32.mean(dim=0)
                 # Stash only; the EMA moves in apply_pending_update.
                 self._pending_input_mean = batch_mean.detach()
-                with torch.no_grad():
-                    # Common-mode logit error eval routing would see from the
-                    # EMA lag, on the scale of logit_token_std.
-                    lag = F.linear(batch_mean.detach() - self.input_mean, self.weight.float())
-                    self._lag_logit_std = lag.std()
                 if self.center == "batch":
                     x32 = x32 - batch_mean
                 else:
                     x32 = x32 - self.input_mean
+                if self.normalize:
+                    batch_rms = x32.square().mean().sqrt().clamp_min(1e-6)
+                    self._pending_input_rms = batch_rms.detach()
+                    scale = batch_rms if self.center == "batch" else self.input_rms
+                    x32 = x32 / scale
+                with torch.no_grad():
+                    # Common-mode logit error eval routing would see from the
+                    # EMA lag, on the scale of logit_token_std.
+                    lag = batch_mean.detach() - self.input_mean
+                    if self.normalize:
+                        lag = lag / scale.detach()
+                    self._lag_logit_std = F.linear(lag, self.weight.float()).std()
             else:
                 x32 = x32 - self.input_mean
+                if self.normalize:
+                    x32 = x32 / self.input_rms
         logits = F.linear(x32, self.weight.float())
         if self.training:
             if self.z_loss_coeff > 0 and logits.requires_grad:
@@ -208,19 +227,32 @@ class TopKRouter(Router):
         import torch.distributed as dist
 
         batch_mean = self._pending_input_mean
+        batch_rms = self._pending_input_rms
         self._pending_input_mean = None
+        self._pending_input_rms = None
         if batch_mean is None or self.input_mean is None:
             return
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(batch_mean)
             batch_mean = batch_mean / dist.get_world_size()
+            if batch_rms is not None:
+                dist.all_reduce(batch_rms)
+                batch_rms = batch_rms / dist.get_world_size()
         with torch.no_grad():
-            if int(self.input_mean_steps) == 0:
+            first = int(self.input_mean_steps) == 0
+            if first:
                 self.input_mean.copy_(batch_mean)
             else:
                 self.input_mean.mul_(self.center_momentum).add_(
                     batch_mean, alpha=1.0 - self.center_momentum
                 )
+            if batch_rms is not None and self.input_rms is not None:
+                if first:
+                    self.input_rms.copy_(batch_rms)
+                else:
+                    self.input_rms.mul_(self.center_momentum).add_(
+                        batch_rms, alpha=1.0 - self.center_momentum
+                    )
             self.input_mean_steps += 1
 
     def aux_loss(self) -> Optional[torch.Tensor]:
@@ -232,6 +264,8 @@ class TopKRouter(Router):
             out["z_loss"] = self._z_loss.detach()
         if self.input_mean is not None:
             out["input_mean_norm"] = self.input_mean.norm()
+        if self.input_rms is not None:
+            out["input_rms"] = self.input_rms
         if self._lag_logit_std is not None:
             out["logit_lag_std"] = self._lag_logit_std
         return out
@@ -241,12 +275,14 @@ _INPUT_MEAN_KEY = re.compile(r"^(?P<base>(?:.*\.)?)gate\.input_mean$")
 
 
 def fold_router_centering(state: dict) -> dict:
-    """Export-time fold of EMA router centering into a gate bias.
+    """Export-time fold of router centering/normalization into the gate.
 
-    ``W (x - mu) = W x - W mu``: the checkpoint's ``gate.input_mean`` (and its
-    step counter) become ``gate.bias = -W @ mu`` so a serving engine that
-    reads a router bias reproduces the trained routing without knowing about
-    centering. No-op on dicts without the buffer.
+    ``W (x - mu) / s = (W / s) x - (W / s) mu``: the checkpoint's
+    ``gate.input_mean`` / ``gate.input_rms`` EMA buffers (and the step
+    counter) become ``gate.weight = W / s`` and ``gate.bias = -(W / s) @ mu``
+    so a serving engine that reads a router bias reproduces the trained
+    routing without knowing about centering. No-op on dicts without the
+    buffers.
     """
     out = dict(state)
     for key in list(state):
@@ -254,9 +290,12 @@ def fold_router_centering(state: dict) -> dict:
         if m is None:
             continue
         base = m["base"]
-        weight = state[f"{base}gate.weight"]
-        mean = out.pop(key)
+        weight = state[f"{base}gate.weight"].float()
+        mean = out.pop(key).float()
         out.pop(f"{base}gate.input_mean_steps", None)
-        bias = -(weight.float() @ mean.float())
-        out[f"{base}gate.bias"] = bias.to(weight.dtype)
+        rms = out.pop(f"{base}gate.input_rms", None)
+        if rms is not None:
+            weight = weight / rms.float()
+            out[f"{base}gate.weight"] = weight.to(state[f"{base}gate.weight"].dtype)
+        out[f"{base}gate.bias"] = (-(weight @ mean)).to(state[f"{base}gate.weight"].dtype)
     return out

@@ -55,6 +55,7 @@ TRAINING_KEYS = {
     "moe_router_init_std": "router_init_std",
     "moe_router_center": "router_center",
     "moe_router_center_momentum": "router_center_momentum",
+    "moe_router_normalize": "router_normalize",
 }
 
 ROUTER_CENTER_MODES = ("none", "ema", "batch")
@@ -114,6 +115,15 @@ class MoEConfig:
     router_init_std: float = 0.0
     router_center: str = "none"
     router_center_momentum: float = 0.99
+    #: With centering on, also divide the centered router input by its global
+    #: RMS (over all tokens and dims of the micro-batch in ``"batch"`` mode,
+    #: the EMA buffer ``gate.input_rms`` in ``"ema"`` mode and in eval). Keeps
+    #: the gate-logit scale independent of how small the token-specific part
+    #: of the hidden states is (it shrinks ~4x while a from-scratch drafter
+    #: learns the marginal), so softmax scores stay informative and the
+    #: balance loss keeps leverage. Top-k selection is invariant to the scale;
+    #: the exporters fold it as ``W / rms`` and ``bias = -(W / rms) @ mean``.
+    router_normalize: bool = False
 
     def __post_init__(self) -> None:
         if self.n_routed_experts <= 0:
@@ -165,6 +175,8 @@ class MoEConfig:
             )
         if not 0 <= self.router_center_momentum < 1:
             raise ValueError("router_center_momentum must be in [0, 1)")
+        if self.router_normalize and self.router_center == "none":
+            raise ValueError("router_normalize requires router_center 'ema' or 'batch'")
 
     @property
     def group_limited(self) -> bool:

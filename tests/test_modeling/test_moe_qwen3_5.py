@@ -801,6 +801,50 @@ class TestRouterRegularizers(unittest.TestCase):
         plain(x)
         self.assertNotIn("logit_lag_std", plain.metrics())
 
+    def test_normalize_keeps_logit_scale_and_folds_at_export(self):
+        with self.assertRaises(ValueError):
+            resolve_moe_config(_json(dflash_config={"moe_router_normalize": True}))
+        knobs = {"moe_router_center": "batch", "moe_router_normalize": True}
+        layer = _layer(dflash_config=knobs).train()
+        self.assertIn("input_rms", dict(layer.gate.named_buffers()))
+        x = self._collapsed_inputs()
+        layer(x)
+        std_full = float(layer.metrics()["logit_token_std"])
+        # shrinking the token-specific part 10x leaves the logit scale intact
+        common = x.mean(0, keepdim=True)
+        x_small = common + 0.1 * (x - common)
+        layer(x_small)
+        m = layer.metrics()
+        self.assertAlmostEqual(float(m["logit_token_std"]), std_full, delta=0.05 * std_full)
+        # ... while the plain batch-centered router's logits shrink with it
+        plain = _layer(dflash_config={"moe_router_center": "batch"}).train()
+        plain.load_state_dict(layer.state_dict(), strict=False)
+        plain(x)
+        s1 = float(plain.metrics()["logit_token_std"])
+        plain(x_small)
+        self.assertLess(float(plain.metrics()["logit_token_std"]), 0.2 * s1)
+        # EMA statistics move only in the deferred update
+        self.assertEqual(float(layer.gate.input_rms), 1.0)
+        layer.apply_pending_balance_update()
+        centered = x_small - x_small.mean(0)
+        self.assertAlmostEqual(
+            float(layer.gate.input_rms), float(centered.square().mean().sqrt()), places=5
+        )
+        self.assertIn("input_rms", layer.metrics())
+        # eval: EMA mean and rms; export fold reproduces the eval logits exactly
+        layer.eval()
+        state = to_checkpoint_state_dict(layer.state_dict())
+        folded = fold_router_centering(state)
+        self.assertNotIn("gate.input_rms", folded)
+        eval_logits = (
+            (x - layer.gate.input_mean) / layer.gate.input_rms
+        ) @ layer.gate.weight.t()
+        folded_logits = x @ folded["gate.weight"].t() + folded["gate.bias"]
+        torch.testing.assert_close(eval_logits, folded_logits, rtol=1e-4, atol=1e-3)
+        # bf16 casts keep the statistics fp32
+        layer.to(torch.bfloat16)
+        self.assertEqual(layer.gate.input_rms.dtype, torch.float32)
+
     def test_export_fold_turns_centering_into_a_gate_bias(self):
         x = self._collapsed_inputs()
         layer = _layer(dflash_config={"moe_router_center": "ema"}).train()
