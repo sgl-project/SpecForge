@@ -1,0 +1,138 @@
+# Exp F: B3 config with 2-sample micro-batches (4 x 4 x 2 = 32 per step): halves the per-sample FSDP all-gathers; profiles one step.
+# Smoke test for the Qwen3.8-27B DSpark MoE recipe (1,140-row slice, 1 epoch,
+# 4 x 8 microbatches per step) to check memory/throughput of the ~20B MoE drafter
+# on node .103 before the 3-epoch run.
+model:
+  # NVFP4 body (matches the regen backend) with the source BF16 lm_head so the
+  # trainer can load the frozen target head/embedding directly.
+  target_model_path: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
+  draft_model_config: /personal/SpecForge-qwen38-moe/configs/qwen3.8-27b-dspark-moe-exp-b3-batchnorm.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  load_target_embedding: true
+  torch_dtype: bfloat16
+  # Same id as the official Qwen3.5/3.6/3.8 drafters. In the Qwen3.8 tokenizer
+  # this is <|audio_start|>, which never occurs in text-only training data.
+  mask_token_id: 248070
+  # Hybrid GDN targets on Blackwell accept only triton, trtllm_mha or fa4.
+  sglang_attention_backend: triton
+  # Capture servers own their GPUs here (the official colocated run shared each
+  # GPU with a trainer rank and used 0.30).
+  sglang_mem_fraction_static: 0.85
+  sglang_disable_radix_cache: true
+  # max_length + 7 headroom, as in the official run.
+  sglang_context_length: 8199
+  # Bound per-server concurrency and KV pool like the official run; capture
+  # was ~4x faster than the trainer needed, so this costs no throughput and
+  # caps host-side sink buffers.
+  sglang_max_running_requests: 2
+  sglang_max_total_tokens: 32768
+
+data:
+  # Same JSONL as the 6-epoch run; the tokenized shards in cache_dir are keyed
+  # by content hash + max_length + template and are reused as-is.
+  train_data_path: /personal/SpecForge-qwen38/cache/dataset/qwen38_regen_mixture_v1_smoke.jsonl
+  max_length: 8192
+  chat_template: qwen3.5
+  cache_dir: /personal/SpecForge-qwen38/cache/qwen3.8-27b-regen-mixture-v1
+  build_dataset_num_proc: 64
+  # Concurrent feature fetches per trainer rank (one Mooncake read each). The
+  # trainer is compute-bound at ~61 s/step, so 8 (official value) is plenty.
+  dataloader_num_workers: 8
+
+training:
+  strategy: dspark
+  num_epochs: 1
+  # 4 ranks x 128 microbatches -> global batch 512 (7,437 optimizer steps).
+  batch_size: 2
+  accumulation_steps: 4
+  # ~20B-parameter MoE drafter: shard everything and keep Adam state on the host.
+  fsdp_sharding: FULL_SHARD
+  optimizer_cpu_offload: true
+  learning_rate: 0.0005
+  lr_scheduler: constant
+  # ~297 warmup steps of 7,437 (official run and every sibling DSpark recipe).
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 100000
+  max_steps: 12
+  max_checkpoints: 3
+  log_interval: 1
+  # Minutes. The 6-epoch run used 60 and sat in a dead allreduce for an hour
+  # after the producer was killed.
+  dist_timeout: 15
+  seed: 42
+  prompt_seed: 42
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-qwen38-ablation
+  wandb_name: qwen3.8-27b-dspark-moe-exp-f-bs2-b200-dp4
+  wandb_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-exp-f-bs2/wandb
+
+runtime:
+  producer_lease: 8
+  # 4 capture servers x 2 running requests.
+  producer_concurrency: 8
+  # Up to ~0.42 GiB of aux features per 8k sample (5 layers x 5120 x bf16,
+  # ~0.18 GiB at the corpus mean of 3.6k tokens). The high watermark must be
+  # at least the global optimizer quantum (512); 1.5 quanta in flight keeps
+  # the trainer fed while halving the host footprint of the 6-epoch run.
+  in_flight_high_watermark: 64
+  in_flight_low_watermark: 32
+  # 300 / 200 GiB resident bounds and a 380 GiB hard cap, inside the 400 GiB
+  # of Mooncake segments below (768 x 0.42 GiB worst case = 322 GiB).
+  resident_high_watermark_bytes: 322122547200
+  resident_low_watermark_bytes: 214748364800
+  feature_store_max_resident_bytes: 408021893120
+
+run_id: qwen3.8-27b-dspark-moe-exp-f-bs2
+output_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-exp-f-bs2
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-exp-f-bs2/control
+    consumer_state_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-exp-f-bs2/consumer-state
+    backend: mooncake
+    client_buffer_size: 1073741824
+    managed_local:
+      trainer_cuda_visible_devices: ["4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        # Each capture server mounts this much host memory (4 x 100 GiB). The
+        # segment pages get touched over the run, so the scheduler RSS grows
+        # to this size: 400 GiB total keeps NUMA node 0 (685 GB) safe.
+        global_segment_size_bytes: 107374182400
+        local_buffer_size_bytes: 1073741824
+        # Multi-hundred-MB feature objects need a long lease (5 min).
+        default_kv_lease_ttl_ms: 300000
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+        - port: 30001
+          cuda_visible_devices: ["1"]
+          tp_size: 1
+        - port: 30002
+          cuda_visible_devices: ["2"]
+          tp_size: 1
+        - port: 30003
+          cuda_visible_devices: ["3"]
+          tp_size: 1
+profiling:
+  enabled: true
+  start_step: 3
+  num_steps: 1
