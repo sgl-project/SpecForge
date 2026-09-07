@@ -174,7 +174,7 @@ should make their training strategy and topology explicit.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `model.target_model_path` | required | Local target directory or Hugging Face repository ID. |
-| `model.draft_model_config` | `null` | Draft JSON, model directory containing `config.json`, or Hugging Face repository. EAGLE3, P-EAGLE, and DFlash may omit it and derive a fresh config; Domino and DSpark require one. |
+| `model.draft_model_config` | `null` | Draft JSON, model directory containing `config.json`, or Hugging Face repository. EAGLE3, P-EAGLE, and DFlash may omit it and derive a fresh config; Domino, DSpark, and MTP require one. |
 | `model.draft_checkpoint_path` | `null` | Weights-only warm start for a new run. Do not combine it with `training.resume_from`. |
 | `model.draft_num_hidden_layers` | `null` | Positive fresh-architecture override where the strategy permits it. EAGLE3 remains one layer; P-EAGLE and DFlash may override their generated defaults. |
 | `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
