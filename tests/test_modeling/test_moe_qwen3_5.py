@@ -606,7 +606,7 @@ class TestRouterRegularizers(unittest.TestCase):
             {"moe_router_noise_std": -1},
             {"moe_router_z_loss_coeff": -1},
             {"moe_router_init_std": -1},
-            {"moe_router_center": "batch"},
+            {"moe_router_center": "running"},
             {"moe_router_center_momentum": 1.0},
         ):
             with self.assertRaises(ValueError):
@@ -772,6 +772,34 @@ class TestRouterRegularizers(unittest.TestCase):
         # bf16 casts keep the statistics fp32
         layer.to(torch.bfloat16)
         self.assertEqual(layer.gate.input_mean.dtype, torch.float32)
+
+    def test_batch_centering_removes_the_common_mode_from_the_first_forward(self):
+        x = self._collapsed_inputs()
+        layer = _layer(dflash_config={"moe_router_center": "batch"}).train()
+        layer(x)
+        m = layer.metrics()
+        # exact: the token-mean logit vector carries (almost) no energy
+        self.assertLess(float(m["logit_common_frac"]), 0.05)
+        self.assertLess(float(m["experts_unused_frac"]), 0.2)
+        # the EMA lags (still zero) -> a large eval-time logit error is reported
+        self.assertIn("logit_lag_std", m)
+        self.assertGreater(float(m["logit_lag_std"]), float(m["logit_token_std"]))
+        layer.apply_pending_balance_update()
+        self.assertTrue(torch.allclose(layer.gate.input_mean, x.mean(0)))
+        layer(x)
+        self.assertLess(float(layer.metrics()["logit_lag_std"]), 1e-3)
+        # gradient reaches the gate weight through the centered logits
+        layer(x).float().square().mean().backward()
+        self.assertIsNotNone(layer.gate.weight.grad)
+        # eval uses the EMA buffer, like "ema" mode
+        layer.eval()
+        ema = _layer(dflash_config={"moe_router_center": "ema"}).eval()
+        ema.load_state_dict(layer.state_dict())
+        self.assertTrue(torch.allclose(layer(x), ema(x)))
+        # the plain and ema routers report no lag metric
+        plain = _layer().train()
+        plain(x)
+        self.assertNotIn("logit_lag_std", plain.metrics())
 
     def test_export_fold_turns_centering_into_a_gate_bias(self):
         x = self._collapsed_inputs()

@@ -108,9 +108,10 @@ class TopKRouter(Router):
     with the raw scores (optionally renormalized, then scaled).
 
     Training-only regularizers (``MoEConfig.router_*``): Gaussian logit jitter,
-    the ST-MoE z-loss, and EMA input centering (``gate.input_mean`` buffer,
-    updated from :meth:`apply_pending_update` so a checkpoint recompute routes
-    identically). Diagnostics from the last training forward are in
+    the ST-MoE z-loss, and input centering: ``"ema"`` subtracts the
+    ``gate.input_mean`` EMA buffer (updated from :meth:`apply_pending_update`
+    so a checkpoint recompute routes identically); ``"batch"`` subtracts the
+    exact micro-batch mean in training and the EMA in eval. Diagnostics from the last training forward are in
     :meth:`metrics` (see :func:`routing_diagnostics`)."""
 
     def __init__(
@@ -124,7 +125,7 @@ class TopKRouter(Router):
         self.init_std = float(cfg.router_init_std)
         self.center = cfg.router_center
         self.center_momentum = float(cfg.router_center_momentum)
-        if self.center == "ema":
+        if self.center in ("ema", "batch"):
             self.register_buffer(
                 "input_mean", torch.zeros(hidden_size, dtype=torch.float32)
             )
@@ -133,6 +134,7 @@ class TopKRouter(Router):
             self.input_mean = None
             self.input_mean_steps = None
         self._pending_input_mean: Optional[torch.Tensor] = None
+        self._lag_logit_std: Optional[torch.Tensor] = None
         self._z_loss: Optional[torch.Tensor] = None
         self._diagnostics: Dict[str, torch.Tensor] = {}
 
@@ -155,11 +157,23 @@ class TopKRouter(Router):
         # into the next forward (or an eval forward).
         self._z_loss = None
         self._pending_input_mean = None
+        self._lag_logit_std = None
         if self.input_mean is not None:
             if self.training:
+                batch_mean = x32.mean(dim=0)
                 # Stash only; the EMA moves in apply_pending_update.
-                self._pending_input_mean = x32.detach().mean(dim=0)
-            x32 = x32 - self.input_mean
+                self._pending_input_mean = batch_mean.detach()
+                with torch.no_grad():
+                    # Common-mode logit error eval routing would see from the
+                    # EMA lag, on the scale of logit_token_std.
+                    lag = F.linear(batch_mean.detach() - self.input_mean, self.weight.float())
+                    self._lag_logit_std = lag.std()
+                if self.center == "batch":
+                    x32 = x32 - batch_mean
+                else:
+                    x32 = x32 - self.input_mean
+            else:
+                x32 = x32 - self.input_mean
         logits = F.linear(x32, self.weight.float())
         if self.training:
             if self.z_loss_coeff > 0 and logits.requires_grad:
@@ -218,6 +232,8 @@ class TopKRouter(Router):
             out["z_loss"] = self._z_loss.detach()
         if self.input_mean is not None:
             out["input_mean_norm"] = self.input_mean.norm()
+        if self._lag_logit_std is not None:
+            out["logit_lag_std"] = self._lag_logit_std
         return out
 
 

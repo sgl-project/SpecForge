@@ -57,7 +57,7 @@ TRAINING_KEYS = {
     "moe_router_center_momentum": "router_center_momentum",
 }
 
-ROUTER_CENTER_MODES = ("none", "ema")
+ROUTER_CENTER_MODES = ("none", "ema", "batch")
 
 
 @dataclass(frozen=True)
@@ -101,11 +101,14 @@ class MoEConfig:
     #: training only. ``router_z_loss_coeff``: ST-MoE router z-loss
     #: ``coeff * mean_t logsumexp_e(logits)^2``. ``router_init_std``: gate
     #: weight init std (0 = the draft's ``initializer_range``).
-    #: ``router_center``: ``"ema"`` subtracts an EMA (momentum
+    #: ``router_center``: subtract the cross-token mean router input before
+    #: the gate projection. ``"ema"`` uses an EMA (momentum
     #: ``router_center_momentum``, updated outside the forward like a balance
-    #: bias) of the cross-token mean router input before the gate projection;
-    #: the mean is a checkpoint buffer (``gate.input_mean``), so a servable
-    #: export needs ``gate.bias = -W @ input_mean``.
+    #: bias) in both modes; ``"batch"`` uses the exact mean of the current
+    #: micro-batch in training (BatchNorm semantics: no common mode can
+    #: survive, however fast the hidden states drift) and the EMA in eval.
+    #: The mean is a checkpoint buffer (``gate.input_mean``) that the
+    #: exporters fold into ``gate.bias = -W @ input_mean``.
     router_noise_std: float = 0.0
     router_z_loss_coeff: float = 0.0
     router_init_std: float = 0.0
