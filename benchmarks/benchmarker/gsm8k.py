@@ -16,19 +16,20 @@ INVALID = -9999999
 
 
 def get_one_example(lines: List[Dict], i: int, include_answer: bool) -> str:
-    """Format a single example."""
+    """Format a single example as plain text (legacy concat helper)."""
     ret = "Question: " + lines[i]["question"] + "\nAnswer:"
     if include_answer:
         ret += " " + lines[i]["answer"]
     return ret
 
 
-def get_few_shot_examples(lines: List[Dict], k: int) -> str:
-    """Get few-shot examples as a string."""
-    ret = ""
+def get_few_shot_messages(lines: List[Dict], k: int) -> List[Dict[str, str]]:
+    """Few-shot as a list of conversation turns suitable for chat templates."""
+    msgs: List[Dict[str, str]] = []
     for i in range(k):
-        ret += get_one_example(lines, i, True) + "\n\n"
-    return ret
+        msgs.append({"role": "user", "content": lines[i]["question"]})
+        msgs.append({"role": "assistant", "content": lines[i]["answer"]})
+    return msgs
 
 
 def get_answer_value(answer_str: str) -> int:
@@ -57,21 +58,19 @@ class GSM8KBenchmarker(Benchmarker):
         data_path = download_and_cache_file(url)
         lines = list(read_jsonl(data_path))
 
-        # Construct prompts
-        few_shot_examples = get_few_shot_examples(lines, 5)
+        # Few-shot examples as proper conversation turns (the first 5 records
+        # become alternating user/assistant messages prepended to each query).
+        self.few_shot_messages = get_few_shot_messages(lines, 5)
+        # Skip the few-shot records when iterating actual queries.
+        eval_lines = lines[5:]
 
         questions = []
         labels = []
-        for i in range((len(lines))):
+        for i in range(len(eval_lines)):
             if self.num_samples is not None and i >= self.num_samples:
                 break
-
-            question_text = get_one_example(lines, i, False)
-            questions.append({"question": question_text})
-            labels.append(get_answer_value(lines[i]["answer"]))
-
-        # Store few_shot_examples for use in create_sgl_function
-        self.few_shot_examples = few_shot_examples
+            questions.append({"question": eval_lines[i]["question"]})
+            labels.append(get_answer_value(eval_lines[i]["answer"]))
 
         assert all(l != INVALID for l in labels), "Some labels are invalid"
         return questions, labels
@@ -90,9 +89,9 @@ class GSM8KBenchmarker(Benchmarker):
         return correct / len(labels) if len(labels) > 0 else 0.0
 
     def create_sgl_function(self):
-        """Create SGL function for GSM8K with few-shot examples."""
+        """Create SGL function for GSM8K with few-shot examples as message turns."""
         return create_few_shot_sgl_function(
-            few_shot_examples=self.few_shot_examples,
+            few_shot_messages=self.few_shot_messages,
             function_name="few_shot_gsm8k",
             answer_key="answer",
             stop=["Question", "Assistant:", "<|separator|>"],
