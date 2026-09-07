@@ -194,7 +194,7 @@ The DFlash2 config additionally defines `conv_kernel_size` and
 configured CE/LK/TV objective. The selector always uses categorical CE over the
 target head's strict unary top-k, exactly as it will be used during inference.
 If the gold token is outside that candidate set, the token contributes no
-selector loss; `selector_coverage` reports how often the gold token is present.
+selector loss; `dflash/hard_label/unary_topK_recall` reports how often the gold token is present.
 Both objectives receive the configured fixed-decay or D-PACE position weight,
 and their combined numerator is normalized by the sum of valid effective token
 weights rather than by batch or anchor count.
@@ -216,36 +216,126 @@ still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
 gradient path. The option defaults to `false`, preserving coupled training.
 
 External tracking reports DFlash-family diagnostics on optimizer steps that
-reach `training.log_interval`. Aggregates live under `train/dflash/*` for every
-DFlash-family draft and under `train/dflash2/selector/*` for drafts with a
-candidate selector. The same families are broken down per predicted block
-position under their own `position_1/*` through `position_<block_size-1>/*`
-sections (the verified anchor is omitted), so each position renders as one
-dashboard group:
+reach `training.log_interval`. Aggregates live under `train/dflash/*` and
+`train/dflash2/selector/*`. Per-position metrics live under `position_1/*`
+through `position_<block_size-1>/*`, without the `train/` or algorithm prefix.
+Position 0 is the verified anchor and is omitted from token rates. K is the
+selector's `selector_top_k`, or `metric_top_k` (default 16) for plain DFlash.
 
-- `dflash/hard_label/*`: unary top-1 accuracy, top-K recall and probability
-  mass, and gold-token probability. K is the selector's `selector_top_k` when
-  present, otherwise the model's `metric_top_k` (default 16). Two aggregate-only
-  per-block accepted-length proxies apply `1 + sum_k prod_{j<=k} a_j` over the
-  supervised slots with `a_j` being coverage by the unary top-K
-  (`unary_topK_oracle_accepted_length`) or the gold-token probability
-  (`expected_accepted_length`, the smooth D-PACE surrogate).
-- `position_<k>/objective/loss_weight_share`: the fraction of the effective
-  objective weight each block position receives under the configured
-  fixed-decay or D-PACE weighting.
-- `train/objective/lk_kl_weight`: the CE weight of the `lambda` LK objective.
-- `dflash/teacher/*` (online capture only): full-vocabulary expected
-  acceptance, unary top-1 agreement, and unary top-K teacher mass against the
-  frozen target head, plus the aggregate `expected_accepted_length` that chains
-  the per-slot expected acceptance, the sampling-regime counterpart of the
-  hard-label surrogate.
-- `dflash2/selector/*` (DFlash2 only): selector loss, conditional accuracy
-  (uniform over covered slots, so comparable across loss types), the realized
-  greedy serving path's per-slot accuracy, its per-block
-  `serving_accepted_length`, and, with online capture, its agreement with the
-  target argmax (`teacher_serving_agreement`).
+### Reading the acceptance metrics
 
-All accepted-length proxies are teacher-forced on the real prefix and anchor.
+The following metrics compare predictions to **recorded hard labels on fixed
+training blocks**. The greedy selector conditions on its own preceding choices
+within each block; the block still starts from the recorded prefix and anchor.
+These are training diagnostics, not measured serving acceptance at the eval
+sampling temperature, top-p, or top-K.
+
+| Metric | Population and meaning |
+| --- | --- |
+| `dflash/hard_label/unary_top1_accuracy` | Unary argmax matches, over all supervised slots; a marginal rate. |
+| `dflash/hard_label/unary_topK_recall` | Gold token is in the strict unary top-K, over all supervised slots. |
+| `dflash/hard_label/unary_probability`, `unary_topK_mass` | Full-softmax gold probability and mass assigned to the candidate set. |
+| `dflash2/selector/teacher_forced_covered_accuracy` | Selector argmax accuracy given a gold predecessor and gold in top-K; uniform over covered slots. |
+| `dflash2/selector/self_conditioned_marginal_accuracy` | Greedy selector matches over all supervised slots, including slots after an earlier error. |
+| `dflash2/selector/greedy_prefix_acceptance` | Accepted / reached slots on the greedy selector prefix. A slot is reached only when all earlier slots matched and the current slot is supervised. |
+| `position_<j>/selector/greedy_prefix_survival` | Fraction of valid blocks whose selector prefix matches through position j. |
+| `dflash2/selector/greedy_accepted_length` | Mean `1 + number of leading matches`, including the anchor. |
+
+Unary greedy and top-K oracle paths have their own `*_prefix_acceptance`,
+`*_prefix_survival`, and `*_accepted_length` under `dflash/hard_label/`, with
+stems `unary_greedy` and `unary_topK_oracle`. Each path uses its own reached
+population. The oracle assumes the recorded gold token is always selected when
+it is in top-K; it is a candidate-coverage bound on these blocks, not a serving
+performance ceiling.
+
+For each path, `position_<j>/*` also logs `*_reached_count`,
+`*_accepted_count`, and `*_first_failure_count`. Counts are summed across metric
+chunks, gradient-accumulation microbatches, and data-parallel ranks before
+forming any rate. They describe the optimizer window being logged, not all
+steps since the last log. Aggregate prefix rates use total accepted / total
+reached, rather than averaging per-position percentages.
+
+To separate candidate misses from selector ranking errors on the **same
+selector-reached prefixes**, use:
+
+- `dflash2/selector/greedy_prefix_unary_top1_accuracy` and
+  `greedy_prefix_topK_recall`: unary accuracy and candidate recall on that population.
+- `greedy_prefix_covered_accuracy`: selector matches / covered reached slots.
+- `greedy_prefix_coverage_miss_rate`: uncovered reached slots / reached slots.
+- `greedy_prefix_ranking_error_rate`: covered but incorrect slots / reached slots.
+
+The last two rates plus `greedy_prefix_acceptance` sum to one whenever there
+are observations. Their per-position counts are `greedy_covered_count`,
+`greedy_coverage_miss_count`, and `greedy_ranking_error_count` in the selector
+section. A ratio with zero denominator logs zero by the trainer's existing
+convention; **ignore it when the corresponding reached or covered count is
+zero**, rather than treating it as measured 0% accuracy.
+
+Chains stop at the first unsupervised slot. Padding, masked tails, and internal
+mask gaps are not model failures. `dflash/hard_label/block_count` counts blocks
+with at least one supervised prediction; per-position `hard_label/supervised_count`
+and `hard_label/valid_prefix_count` expose the raw mask and contiguous supervised
+prefix populations. `dflash/hard_label/supervised_prefix_length` is the mean
+maximum observable chain length including the anchor. This distinguishes a
+short supervision window from a short accepted prefix.
+
+For each path, length is exactly `1 + sum_j survival_j` (when block count is
+positive). With fully supervised blocks, survival is also the cumulative product
+of the conditional prefix rates. With masked tails, inspect the counts as well.
+Plot length and survival over optimizer steps first, then prefix acceptance and
+the coverage/ranking split at early versus late positions. Marginal accuracy
+alone cannot identify where the acceptance chain breaks.
+
+### Probability and objective diagnostics
+
+- `dflash/hard_label/unary_gold_probability_chain_length` is the smooth D-PACE
+  surrogate `1 + sum_j prod_{i<=j} q_i(gold_i)` on recorded labels.
+- `dflash/teacher/unary_distribution_overlap` is `1 - TV(q_unary, p_teacher)`
+  over the full-vocabulary softmax distributions, when target final hidden
+  states are available. `unary_overlap_chain_length` chains these overlaps
+  along the recorded blocks. Neither includes the final selector distribution
+  or eval sampling filters. Unary top-1 teacher agreement and top-K teacher
+  mass remain in this family.
+- `dflash2/selector/self_conditioned_teacher_argmax_agreement` compares the
+  greedy selector to the target argmax at recorded prefixes.
+- `dflash2/selector/loss` is the weighted selector CE. Its gold probability is
+  `teacher_forced_covered_gold_probability`, uniform over covered slots.
+  `dflash2/objective/weighted_covered_accuracy` uses the selector loss weights;
+  use the uniform accuracy metrics above for comparisons across objectives.
+- `position_<j>/objective/loss_weight_share` reports the effective fixed-decay
+  or D-PACE objective weight per position. `train/objective/lk_kl_weight` is the
+  CE weight of the `lambda` LK objective.
+
+### Dashboard migration and checkpoint alignment
+
+The following old DFlash metric names are no longer emitted. Update existing
+panels; historical W&B rows are not renamed or deleted. Per-position variants
+follow the same changes.
+
+| Old name | Replacement |
+| --- | --- |
+| `expected_acceptance`, `dflash/hard_label/expected_acceptance` | `target_probability` or `dflash/hard_label/unary_probability` (duplicate aliases removed) |
+| `dflash/hard_label/expected_accepted_length` | `dflash/hard_label/unary_gold_probability_chain_length` |
+| `dflash/teacher/expected_acceptance` | `dflash/teacher/unary_distribution_overlap` |
+| `dflash/teacher/expected_accepted_length` | `dflash/teacher/unary_overlap_chain_length` |
+| `dflash2/selector/serving_accuracy` | `dflash2/selector/self_conditioned_marginal_accuracy` |
+| `dflash2/selector/conditional_accuracy` | `dflash2/selector/teacher_forced_covered_accuracy` |
+| `dflash2/selector/serving_accepted_length` | `dflash2/selector/greedy_accepted_length` |
+| `dflash2/selector/teacher_serving_agreement` | `dflash2/selector/self_conditioned_teacher_argmax_agreement` |
+| `selector_loss` | `dflash2/selector/loss` (duplicate removed) |
+| `selector_coverage` | `dflash/hard_label/unary_topK_recall` (duplicate removed) |
+| `selector_accuracy` | `dflash2/objective/weighted_covered_accuracy` |
+| `selector_target_probability` | `dflash2/selector/teacher_forced_covered_gold_probability` |
+
+The generic `acc` and `target_probability` remain available for lightweight
+logging and evaluation consumers. EAGLE3 and DSpark metric names are unchanged.
+Every tracker row now includes `train/optimizer_step`, supplied by the same
+controller counter used for checkpoints. Join external eval results by run ID
+and checkpoint optimizer step, not by a tracker's internal row index. An eval
+comparison must also record its dataset, target/draft revisions, block size,
+sampling settings, and whether acceptance length is proposal-weighted or a
+mean of per-request lengths; the training proxies above do not replace those
+measurements.
 
 The exported computation and parameter names match the public SGLang DFlash2
 contract, including optional `output_multiplier` and
