@@ -170,7 +170,18 @@ class _FakeDFlashModel(nn.Module):
         self.target_last_hidden_states = target_last_hidden_states
         loss = (self.w * hidden_states.float().sum()).abs()
         acc = torch.tensor(0.5)
-        return loss, acc, {"accuracy_denom": loss_mask.sum()}
+        return (
+            loss,
+            acc,
+            {
+                "accuracy_denom": loss_mask.sum(),
+                "sum_metrics": (
+                    {"dflash/hard_label/block_count": torch.tensor(2.0)}
+                    if collect_detailed_metrics
+                    else {}
+                ),
+            },
+        )
 
 
 class TestDFlashSharesLifecycle(unittest.TestCase):
@@ -195,9 +206,11 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
         self.assertEqual(model.max_valid_anchors, 3)
         self.assertEqual(model.received_selector_loss_alpha, 0.0)
         self.assertAlmostEqual(rep.metrics["acc"], 0.5)
+        self.assertEqual(rep.metrics["dflash/hard_label/block_count"], 2)
         out = strat.forward_loss(batch)
         self.assertAlmostEqual(float(out.metrics["accuracy"]), 0.5)
         self.assertEqual(float(out.metrics["accuracy_denom"]), 4.0)
+        self.assertEqual(out.sum_metrics["dflash/hard_label/block_count"], 2)
 
     def test_dflash_strategy_forwards_teacher_hidden_only_for_detailed_metrics(self):
         model = _FakeDFlashModel()
@@ -219,11 +232,12 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
         self.assertIs(model.target_last_hidden_states, teacher_hidden)
 
         model.target_last_hidden_states = None
-        strategy.forward_loss(
+        out = strategy.forward_loss(
             batch,
             ctx=StepContext(collect_detailed_metrics=False),
         )
         self.assertIsNone(model.target_last_hidden_states)
+        self.assertEqual(out.sum_metrics, {})
 
     def test_dflash_validate_batch_rejects_missing(self):
         strat = DFlashTrainStrategy(_FakeDFlashModel())
