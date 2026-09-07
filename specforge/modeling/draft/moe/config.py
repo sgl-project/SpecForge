@@ -58,7 +58,7 @@ TRAINING_KEYS = {
     "moe_router_normalize": "router_normalize",
 }
 
-ROUTER_CENTER_MODES = ("none", "ema", "batch")
+ROUTER_CENTER_MODES = ("none", "ema", "batch", "sample")
 
 
 @dataclass(frozen=True)
@@ -107,7 +107,10 @@ class MoEConfig:
     #: ``router_center_momentum``, updated outside the forward like a balance
     #: bias) in both modes; ``"batch"`` uses the exact mean of the current
     #: micro-batch in training (BatchNorm semantics: no common mode can
-    #: survive, however fast the hidden states drift) and the EMA in eval.
+    #: survive, however fast the hidden states drift) and the EMA in eval;
+    #: ``"sample"`` centers each sample of a multi-sample micro-batch on its
+    #: own token mean (a sample-level common mode would otherwise route by
+    #: sample instead of by token) and also uses the EMA in eval.
     #: The mean is a checkpoint buffer (``gate.input_mean``) that the
     #: exporters fold into ``gate.bias = -W @ input_mean``.
     router_noise_std: float = 0.0
@@ -176,7 +179,9 @@ class MoEConfig:
         if not 0 <= self.router_center_momentum < 1:
             raise ValueError("router_center_momentum must be in [0, 1)")
         if self.router_normalize and self.router_center == "none":
-            raise ValueError("router_normalize requires router_center 'ema' or 'batch'")
+            raise ValueError(
+                "router_normalize requires router_center 'ema', 'batch' or 'sample'"
+            )
 
     @property
     def group_limited(self) -> bool:

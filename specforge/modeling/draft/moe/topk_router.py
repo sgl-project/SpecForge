@@ -114,6 +114,8 @@ class TopKRouter(Router):
     exact micro-batch mean in training and the EMA in eval. Diagnostics from the last training forward are in
     :meth:`metrics` (see :func:`routing_diagnostics`)."""
 
+    accepts_tokens_per_sample = True
+
     def __init__(
         self, cfg: MoEConfig, hidden_size: int, balance: BalanceController
     ) -> None:
@@ -126,7 +128,7 @@ class TopKRouter(Router):
         self.center = cfg.router_center
         self.center_momentum = float(cfg.router_center_momentum)
         self.normalize = bool(cfg.router_normalize)
-        if self.center in ("ema", "batch"):
+        if self.center != "none":
             self.register_buffer(
                 "input_mean", torch.zeros(hidden_size, dtype=torch.float32)
             )
@@ -159,7 +161,9 @@ class TopKRouter(Router):
             self.weight, mean=0.0, std=self.init_std if self.init_std > 0 else std
         )
 
-    def forward(self, x: torch.Tensor) -> RoutingResult:
+    def forward(
+        self, x: torch.Tensor, tokens_per_sample: Optional[int] = None
+    ) -> RoutingResult:
         # Routing math in fp32 regardless of the model dtype.
         x32 = x.float()
         # Overwrite, never accumulate: stale training state must not survive
@@ -175,12 +179,21 @@ class TopKRouter(Router):
                 self._pending_input_mean = batch_mean.detach()
                 if self.center == "batch":
                     x32 = x32 - batch_mean
+                elif self.center == "sample":
+                    n = tokens_per_sample or x32.shape[0]
+                    if x32.shape[0] % n:
+                        raise ValueError(
+                            f"{x32.shape[0]} router tokens are not a multiple of "
+                            f"tokens_per_sample={n}"
+                        )
+                    grouped = x32.view(-1, n, x32.shape[-1])
+                    x32 = (grouped - grouped.mean(dim=1, keepdim=True)).view_as(x32)
                 else:
                     x32 = x32 - self.input_mean
                 if self.normalize:
                     batch_rms = x32.square().mean().sqrt().clamp_min(1e-6)
                     self._pending_input_rms = batch_rms.detach()
-                    scale = batch_rms if self.center == "batch" else self.input_rms
+                    scale = batch_rms if self.center != "ema" else self.input_rms
                     x32 = x32 / scale
                 with torch.no_grad():
                     # Common-mode logit error eval routing would see from the

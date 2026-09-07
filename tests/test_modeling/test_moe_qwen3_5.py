@@ -801,6 +801,45 @@ class TestRouterRegularizers(unittest.TestCase):
         plain(x)
         self.assertNotIn("logit_lag_std", plain.metrics())
 
+    def test_sample_centering_removes_each_samples_common_mode(self):
+        torch.manual_seed(11)
+        # two samples of 32 tokens, each with its own dominant common direction
+        a = 200.0 * torch.randn(HIDDEN) + torch.randn(32, HIDDEN)
+        b = 200.0 * torch.randn(HIDDEN) + torch.randn(32, HIDDEN)
+        x = torch.stack([a, b])  # [B=2, N=32, H]
+        batch = _layer(dflash_config={"moe_router_center": "batch"}).train()
+        sample = _layer(dflash_config={"moe_router_center": "sample"}).train()
+        sample.load_state_dict(batch.state_dict())
+        batch(x)
+        sample(x)
+        # per-micro-batch centering leaves the sample-level mode: tokens of one
+        # sample all agree -> two blocks of k experts
+        self.assertGreater(float(batch.metrics()["top1_mode_frac"]), 0.45)
+        self.assertLessEqual(float(batch.metrics()["experts_unused_frac"]), 1 - 3 / 8)
+        # per-sample centering routes by token within each sample
+        m = sample.metrics()
+        self.assertLess(float(m["top1_mode_frac"]), 0.4)
+        self.assertLess(float(m["experts_unused_frac"]), 0.2)
+        # a 2-D input (no batch dim) degrades to one sample == batch centering
+        flat = _layer(dflash_config={"moe_router_center": "sample"}).train()
+        flat.load_state_dict(batch.state_dict())
+        flat(a)
+        batch(a)
+        self.assertTrue(torch.equal(flat.last_counts, batch.last_counts))
+        # eval uses the EMA buffer like the other modes, and the export folds
+        sample.apply_pending_balance_update()
+        self.assertTrue(
+            torch.allclose(sample.gate.input_mean, x.reshape(-1, HIDDEN).mean(0))
+        )
+        sample.eval()
+        self.assertIn(
+            "gate.bias",
+            fold_router_centering(to_checkpoint_state_dict(sample.state_dict())),
+        )
+        sample.train()
+        with self.assertRaises(ValueError):
+            sample.gate(a, tokens_per_sample=7)
+
     def test_normalize_keeps_logit_scale_and_folds_at_export(self):
         with self.assertRaises(ValueError):
             resolve_moe_config(_json(dflash_config={"moe_router_normalize": True}))

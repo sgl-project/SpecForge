@@ -59,7 +59,14 @@ def get_score_function(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
 
 
 class Router(nn.Module, abc.ABC):
-    """Base router. Subclasses implement :meth:`forward` and :meth:`reset_parameters`."""
+    """Base router. Subclasses implement :meth:`forward` and :meth:`reset_parameters`.
+
+    A router that sets ``accepts_tokens_per_sample`` is called with
+    ``tokens_per_sample=<int>`` when the layer input carried a leading batch
+    dimension (the flat ``[T, hidden]`` batch is ``B`` samples of that many
+    tokens each, in order)."""
+
+    accepts_tokens_per_sample = False
 
     def __init__(
         self, cfg: MoEConfig, hidden_size: int, balance: BalanceController

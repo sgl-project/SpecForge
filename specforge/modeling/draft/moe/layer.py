@@ -45,7 +45,10 @@ class MoELayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.hidden_size)
-        routing: RoutingResult = self.gate(x)
+        if self.gate.accepts_tokens_per_sample and len(shape) >= 3:
+            routing: RoutingResult = self.gate(x, tokens_per_sample=int(shape[-2]))
+        else:
+            routing = self.gate(x)
         if self.training:
             self.last_counts = routing.counts.detach()
             self.balance.observe(routing)
