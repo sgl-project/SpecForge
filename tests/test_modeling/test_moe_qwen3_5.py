@@ -171,6 +171,23 @@ class TestPresetAndConfig(unittest.TestCase):
             payload["dflash_config"]["target_layer_ids"], [5, 19, 33, 47, 61]
         )
 
+    def test_v2_draft_config_routes_on_sample_centered_inputs(self):
+        payload = json.loads(
+            (REPO_ROOT / "configs" / "qwen3.8-27b-dspark-moe-v2.json").read_text()
+        )
+        cfg = resolve_moe_config(payload)
+        self.assertEqual(cfg.router_center, "sample")
+        self.assertEqual(cfg.router_center_momentum, 0.99)
+        self.assertFalse(cfg.router_normalize)
+        self.assertEqual(cfg.router_noise_std, 0.0)
+        self.assertEqual(cfg.aux_loss_coeff, 0.001)
+        # geometry unchanged from v1
+        base = json.loads(
+            (REPO_ROOT / "configs" / "qwen3.8-27b-dspark-moe.json").read_text()
+        )
+        for key in ("n_routed_experts", "num_experts_per_tok", "moe_intermediate_size"):
+            self.assertEqual(payload[key], base[key])
+
     def test_serving_fields_are_greedy_softmax(self):
         fields = resolve_moe_config(_json()).serving_fields()
         self.assertEqual(fields["topk_method"], "greedy")
