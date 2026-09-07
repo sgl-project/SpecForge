@@ -88,6 +88,9 @@ class TrackerLogger:
         if self._closed:
             raise RuntimeError("cannot log after TrackerLogger.close()")
         values = training_metric_names(scalar_metrics(metrics))
+        # Use the controller's optimizer step as an explicit join key for
+        # checkpoint/eval comparisons, independent of a tracker's row counter.
+        values["train/optimizer_step"] = float(step)
         if self.console_logger is not None:
             self.console_logger(values, step)
         self.tracker.log(values, step=step)

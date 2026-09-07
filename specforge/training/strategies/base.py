@@ -40,6 +40,9 @@ class StepOutput:
     metrics: Dict[str, Any]
     ratio_metrics: Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
     loss_terms: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Additive telemetry (for example reached/accepted counts), summed across
+    # the optimizer window and data-parallel ranks, never averaged.
+    sum_metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -528,6 +531,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             metrics=metrics,
             ratio_metrics=model_metrics.get("ratio_metrics", {}),
             loss_terms=model_metrics.get("loss_terms"),
+            sum_metrics=model_metrics.get("sum_metrics", {}),
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
