@@ -1,0 +1,84 @@
+# Production MoE run, resumed from the v2 step-1000 checkpoint at batch_size 4 x accumulation 16
+# (non-managed disaggregated; launch with outputs/launch/launch-moe-disagg-manual-on-103.sh).
+model:
+  target_model_path: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
+  draft_model_config: /personal/SpecForge-qwen38-moe/configs/qwen3.8-27b-dspark-moe-v2.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  load_target_embedding: true
+  torch_dtype: bfloat16
+  mask_token_id: 248070
+  sglang_attention_backend: triton
+  sglang_mem_fraction_static: 0.85
+  sglang_disable_radix_cache: true
+  sglang_context_length: 8199
+  sglang_max_running_requests: 2
+  sglang_max_total_tokens: 32768
+data:
+  train_data_path: /personal/SpecForge-qwen38/cache/dataset/qwen38_regen_mixture_v1_train.jsonl
+  max_length: 8192
+  chat_template: qwen3.5
+  cache_dir: /personal/SpecForge-qwen38/cache/qwen3.8-27b-regen-mixture-v1
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 8
+training:
+  strategy: dspark
+  num_epochs: 3
+  batch_size: 4
+  accumulation_steps: 16
+  fsdp_sharding: FULL_SHARD
+  optimizer_cpu_offload: true
+  learning_rate: 0.0005
+  lr_scheduler: constant
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 500
+  max_checkpoints: 3
+  log_interval: 10
+  dist_timeout: 15
+  seed: 42
+  prompt_seed: 42
+  resume_from: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-3ep-v2/qwen3.8-27b-dspark-moe-regen-mixture-v1-3ep-v2-step1000
+tracking:
+  report_to: wandb
+  wandb_project: specforge-qwen38-ablation
+  wandb_name: qwen3.8-27b-dspark-moe-regen-mixture-v1-3ep-v3-resume-b200-dp4
+  wandb_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-3ep-v2/wandb
+runtime:
+  producer_lease: 8
+  producer_concurrency: 8
+  in_flight_high_watermark: 768
+  in_flight_low_watermark: 512
+  resident_high_watermark_bytes: 322122547200
+  resident_low_watermark_bytes: 214748364800
+  feature_store_max_resident_bytes: 408021893120
+run_id: qwen3.8-27b-dspark-moe-regen-mixture-v1-3ep-v3-resume
+output_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-3ep-v2
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-3ep-v3-resume/control
+    consumer_state_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-3ep-v2/consumer-state
+    backend: mooncake
+    client_buffer_size: 1073741824
+    server_urls:
+    - http://127.0.0.1:30000
+    - http://127.0.0.1:30001
+    - http://127.0.0.1:30002
+    - http://127.0.0.1:30003
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_local_hostname: 127.0.0.1
+    mooncake_protocol: tcp
