@@ -49,7 +49,7 @@ topology remains in YAML. The complete
 environment contract is in the [disaggregated training
 guide](../docs/basic_usage/disaggregated_training.md).
 
-Offline feature training supports EAGLE3, DFlash, Domino, and DSpark, including
+Offline feature training supports EAGLE3, DFlash, DFlash2, Domino, DSpark, and MTP, including
 local and disaggregated consumers. Optional config sections provide
 offline evaluation with `<run_id>-best` selection, compact teacher
 projection for offline text EAGLE3, and W&B, TensorBoard, SwanLab, or MLflow
