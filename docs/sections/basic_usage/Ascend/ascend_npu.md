@@ -161,7 +161,7 @@ DFlash 2 reuses the DFlash strategy and capture path end to end, so the
 external-server setup above carries over unchanged — including the
 `--spec-capture-aux-layer-ids 1 8 15 22 29` flags, which match
 `configs/qwen3.5-4b-dflash2.json`. Use the checked-in
-[`qwen3.5-4b-dflash2-online-npu.yaml`](../../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-online-npu.yaml)
+[`qwen3.5-4b-dflash2-online-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-online-npu.yaml)
 recipe:
 
 ```bash
