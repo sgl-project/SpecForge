@@ -82,6 +82,7 @@ import { data as recipes } from '../recipes.data'
 .rx-tag[data-method='DFlash'], .rx-tag[data-method='DFlash2'] { background: #7c3aed; }
 .rx-tag[data-method='DSpark'] { background: #d97706; }
 .rx-tag[data-method='Domino'] { background: #059669; }
+.rx-tag[data-method='P-EAGLE'] { background: #4f46e5; }
 
 .rx-title {
   font-size: 17px;
