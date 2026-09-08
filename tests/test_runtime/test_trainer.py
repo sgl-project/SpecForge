@@ -497,6 +497,31 @@ class TestTrainerCore(unittest.TestCase):
 
 
 class TestTrainerController(unittest.TestCase):
+    def test_failed_optimizer_step_does_not_advance_or_ack(self):
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        backend.step = mock.Mock(
+            side_effect=FloatingPointError("non-finite global grad norm")
+        )
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        acknowledged = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=1,
+                num_epochs=1,
+                ack_fn=lambda ids, step: acknowledged.append((list(ids), step)),
+            )
+            with self.assertRaisesRegex(
+                FloatingPointError, "non-finite global grad norm"
+            ):
+                ctrl.fit([_batch()])
+
+        self.assertEqual(ctrl.global_step, 0)
+        self.assertEqual(acknowledged, [])
+
     def test_training_log_reports_pipeline_throughput_breakdown(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
@@ -541,6 +566,39 @@ class TestTrainerController(unittest.TestCase):
             [ctx.collect_detailed_metrics for ctx in strat.contexts],
             [False, True],
         )
+
+    def test_loader_fetch_seconds_metric_is_per_sample(self):
+        class PerfData(list):
+            def perf_counters_snapshot(self, reset=False):
+                self.reset_requested = reset
+                return {
+                    "wait_producer_s": 0.0,
+                    "wait_fetch_s": 0.0,
+                    "fetch_s": 8.0,
+                    "fetch_bytes": 1 << 30,
+                    "fetch_batches": 2.0,
+                    "fetch_samples": 4.0,
+                }
+
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        data = PerfData([_batch()])
+        logged = []
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                max_steps=1,
+                num_epochs=1,
+                log_interval=1,
+                logger=lambda metrics, step: logged.append((dict(metrics), step)),
+            )
+            self.assertEqual(ctrl.fit(data), 1)
+
+        self.assertTrue(data.reset_requested)
+        self.assertEqual(logged[0][0]["perf/fetch_seconds_per_sample"], 2.0)
 
     def test_progress_bar_tracks_optimizer_steps_on_rank_zero(self):
         strat = FakeStrategy()
