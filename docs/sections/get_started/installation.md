@@ -2,43 +2,86 @@
 
 ## Installation
 
-To install this project, you can simply run the following command.
+SpecForge needs Python 3.10 or newer. The recommended installer is
+[uv](https://docs.astral.sh/uv/): the `cuda` extra routes `torch` and
+`sglang-kernel` to CUDA-specific wheel indexes through `[tool.uv.sources]` in
+`pyproject.toml`, and uv is what honours those pins. pip works too; it takes
+every wheel from PyPI, where the pinned `torch` and `sglang-kernel` releases
+are CUDA 13 builds anyway.
 
-- **Install from source (recommended)**
+### Quick install
 
-```bash
-# git clone the source code
-git clone https://github.com/sgl-project/SpecForge.git
-cd SpecForge
+Pick your hardware, the SpecForge version, your installer and any optional
+extras. The command updates as you go.
 
-# create a new virtual environment
-uv venv -p 3.11 --seed
-source .venv/bin/activate
+<InstallSelector />
 
-# install specforge
-uv pip install -e .
-```
+The selector covers the supported combinations. The sections below explain
+what the generated command does on each accelerator and what to watch out for.
 
-- **Install from PyPI**
+### Extras reference
 
-```bash
-pip install specforge
-```
+| Hardware | Extra | What it pins |
+| --- | --- | --- |
+| NVIDIA GPU (CUDA 13 driver) | `cuda` | `torch==2.13.0` (cu130), `sglang-kernel==0.4.6.post1` (cu130), `mooncake-transfer-engine-cuda13` |
+| AMD Instinct GPU (ROCm) | none, install with `--no-deps` | ROCm PyTorch and SGLang come from the SGLang ROCm container |
+| Ascend NPU | none, install with `--no-deps` | PyTorch and `torch_npu` come from the vendor stack |
 
-## Accelerator-specific environments
+Every install shares the same `sglang==0.5.18` base dependency and the same
+`specforge train` entry point; only the compiled wheels differ. Optional
+extras that stack on top:
+
+| Extra | Adds |
+| --- | --- |
+| `fa` | `flash-attn` (built from source; install `torch` first and build with `--no-build-isolation`) |
+| `liger` | `liger-kernel`, enables `model.use_liger_kernel` for DFlash training |
+| `dev` | `pre-commit` for contributors |
+
+Combine extras with a comma, for example `".[cuda,liger]"`.
 
 ### NVIDIA CUDA
 
-The standard installation above uses the platform selected by PyTorch. Install
-a CUDA build compatible with the host driver, then run every recipe through
-the same `specforge train` entry.
+The canonical source install is:
+
+```bash
+git clone https://github.com/sgl-project/SpecForge.git
+cd SpecForge
+
+uv venv -p 3.11 --seed
+source .venv/bin/activate
+
+uv pip install --prerelease=allow -e ".[cuda]"
+```
+
+`--prerelease=allow` (`--pre` for pip) is required because SGLang 0.5.18 pins
+a pre-release `cuda-tile` wheel.
+
+> **CUDA 12 is not supported.** SGLang 0.5.18 is a CUDA 13 build (it requires
+> `cuda-python>=13` and `flashinfer_python[cu13]`) and publishes no CUDA 12
+> wheel, so the `cuda` extra targets CUDA 13 only.
+
+FlashAttention is not installed through the `fa` extra in the same command:
+it builds from source and needs `torch` to be importable first. Install it as
+a second step on top of the environment above:
+
+```bash
+uv pip install ninja packaging
+MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
+```
+
+The published `specforge` release on PyPI predates the hardware extras, so
+`pip install "specforge[cuda]"` only works once a release that includes them
+is published. Until then, install from source.
 
 ### AMD ROCm
 
-On ROCm, install SpecForge into an environment that already provides a ROCm
-PyTorch and a ROCm SGLang (an official SGLang ROCm release container is the
-recommended base), and install the package **without dependencies** so pip does
-not pull CUDA wheels over the working ROCm stack:
+The base `sglang==0.5.18` dependency is a CUDA build that drags CUDA
+`sglang-kernel` and FlashInfer wheels along with it, so do not resolve
+dependencies on ROCm. Instead, install SpecForge into an environment that
+already provides a ROCm PyTorch and a ROCm SGLang (an official SGLang ROCm
+release container is the recommended base), and install the package
+**without dependencies** so pip does not pull CUDA wheels over the working
+ROCm stack:
 
 ```bash
 # Inside the ROCm SGLang container
@@ -46,6 +89,9 @@ git clone https://github.com/sgl-project/SpecForge.git /workspace/SpecForge
 cd /workspace/SpecForge
 python -m pip install -e . --no-deps
 ```
+
+If a later step reports a missing lightweight dependency (for example
+`accelerate`), install just that package, also with `--no-deps`.
 
 For the complete container setup and an end-to-end walkthrough covering
 installation, data preparation, offline colocated training, online
@@ -55,12 +101,22 @@ forms on AMD Instinct GPUs, follow the
 
 ### Ascend NPU
 
-Install the vendor-matched PyTorch and `torch_npu` packages first, then install
-SpecForge. The checked-in
+You need an Ascend host with the driver, CANN, and a `torch_npu`-enabled
+PyTorch already installed, plus SGLang 0.5.18 with NPU support. Then install
+SpecForge without touching that stack:
+
+```bash
+git clone https://github.com/sgl-project/SpecForge.git
+cd SpecForge
+python -m pip install -e . --no-deps
+```
+
+The checked-in
 [`qwen3.5-4b-dflash-online-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml)
 and
 [`qwen3.5-4b-domino-online-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-domino-online-npu.yaml)
 recipes use external SGLang server capture with SDPA consumers. Install a
 compatible SGLang/Mooncake service first. The unified launcher detects the NPU
 device, self-launches the process count recorded in YAML, and selects HCCL; see
-the [training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu).
+the [training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu) and
+the [Ascend NPU Tutorial](../basic_usage/Ascend/ascend_npu.md).

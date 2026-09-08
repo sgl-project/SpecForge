@@ -490,11 +490,11 @@ available alongside explicit `kl_loss*` or `lk_loss*`, `ce_loss`, and
 
 ## CUDA, ROCm, and Ascend NPU
 
-CUDA and ROCm runs use the same YAML and entry point. For ROCm, install the
-checked-in environment before installing SpecForge:
+CUDA and ROCm runs use the same YAML and entry point. For ROCm, install
+SpecForge with `--no-deps` inside an SGLang ROCm container, as described in the
+[installation guide](../get_started/installation.md#amd-rocm):
 
 ```bash
-python -m pip install -r requirements-rocm.txt
 python -m pip install -e . --no-deps
 ```
 

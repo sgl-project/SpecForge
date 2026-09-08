@@ -55,11 +55,13 @@ the `sharegpt` preset.
 When training speculative decoding draft models for a specific target model, instead of using the original dataset, we can regenerate the assistant responses using the target model to better align the draft model with the target model's output distribution. This will improve the acceptance rate of the draft model and the overall performance of the speculative decoding. According to the [EAGLE1 paper](https://arxiv.org/pdf/2401.15077), the EAGLE method is not very sensitive to the dataset quality, which means the performance is still good even if you use the original dataset. However, if you are looking for optimal performance in the production environment, it is recommended to regenerate the dataset using the target model.
 
 The regeneration utility uses the OpenAI-compatible client to call SGLang's
-HTTP API. Install it in the source-checkout environment before running the
-repository script:
+HTTP API. The `openai` package is part of SpecForge's base dependencies, so a
+normal install from the [installation guide](../get_started/installation.md)
+already provides it. If you installed with `--no-deps` (ROCm or Ascend NPU),
+add it separately:
 
 ```bash
-pip install -e '.[data]'
+pip install openai
 ```
 
 We can follow the following steps to regenerate the dataset. In the example below, we will use `meta-llama/Llama-3.1-8B-Instruct` as an example, you can replace it with your own target model.
