@@ -314,6 +314,8 @@ def _disaggregated_env(
         values["DISAGG_STORE_ROOT"] = deployment.store_root
     if deployment.backend == "mooncake":
         values["DISAGG_CLIENT_BUFFER_SIZE"] = str(deployment.client_buffer_size)
+        values["DISAGG_RECEIVE_BUFFERS"] = deployment.receive_buffers
+        values["DISAGG_RECEIVE_POOL_BYTES"] = str(deployment.receive_pool_bytes)
 
     optional_values = {
         "MOONCAKE_METADATA_SERVER": deployment.mooncake_metadata_server,

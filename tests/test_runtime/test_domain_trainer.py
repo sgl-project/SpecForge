@@ -34,6 +34,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         tp_size=1,
         sp_ulysses_size=1,
         sp_ring_size=1,
+        store="STORE",
     ):
         import specforge.training.trainer as tr
 
@@ -134,7 +135,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 algorithm_name=algorithm.name,
                 make_step_strategy=algorithm.providers.step.build,
                 controller=dfc,
-                store="STORE",
+                store=store,
                 ref_source=ref_source,
                 model=model,
                 target_head="HEAD",
@@ -160,6 +161,20 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 sp_ring_size=sp_ring_size,
             )
         return trainer, cap, dfc_calls, model
+
+    def test_pinned_receive_requests_device_tensors_from_the_loader(self):
+        import torch
+
+        from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+        from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
+
+        store = MooncakeFeatureStore(
+            store=_FakeMooncakeStore(), receive_buffers="pinned"
+        )
+        with mock.patch.object(torch.cuda, "is_available", return_value=True):
+            with mock.patch.dict("os.environ", {"LOCAL_RANK": "2"}):
+                _, captured, _, _ = self._build({"refs": list(range(6))}, store=store)
+        self.assertEqual(captured["loader_kw"]["device"], torch.device("cuda", 2))
 
     def test_offline_wiring_matches_assemble_trainer(self):
         try:
