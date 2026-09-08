@@ -485,6 +485,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-start-mooncake-and-the-capture-server">Step 1: Start Mooncake and the capture server</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-launch-training">Step 2: Launch training</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#success-criteria">Success criteria</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#training-dflash-2-drafts">Training DFlash 2 drafts</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#managed-local-full-stack-one-command">4. Managed-local full stack (one command)</a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -644,6 +645,35 @@ specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w">
 installed SpecForge predates the NPU transport bind — upgrade past #722.</p></li>
 </ul>
 </section>
+<section id="training-dflash-2-drafts">
+<h3>Training DFlash 2 drafts<a class="headerlink" href="#training-dflash-2-drafts" title="Link to this heading">#</a></h3>
+<p>DFlash 2 reuses the DFlash strategy and capture path end to end, so the
+external-server setup above carries over unchanged — including the
+<code class="docutils literal notranslate"><span class="pre">--spec-capture-aux-layer-ids</span> <span class="pre">1</span> <span class="pre">8</span> <span class="pre">15</span> <span class="pre">22</span> <span class="pre">29</span></code> flags, which match
+<code class="docutils literal notranslate"><span class="pre">configs/qwen3.5-4b-dflash2.json</span></code>. Use the checked-in
+<a class="reference download internal" download="" href="../../_downloads/fb7ead5876f42f303f86ffe91d51e012/qwen3.5-4b-dflash2-online-npu.yaml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">qwen3.5-4b-dflash2-online-npu.yaml</span></code></span></a>
+recipe:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ASCEND_RT_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">1</span>,2,3,4,5,6,7,8<span class="w"> </span><span class="se">\</span>
+specforge<span class="w"> </span>train<span class="w"> </span>-c<span class="w"> </span>examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-online-npu.yaml
+</pre></div>
+</div>
+<p>Notes specific to DFlash 2 on Ascend:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">attention_backend:</span> <span class="pre">sdpa</span></code> is mandatory</strong> (already set in the recipe). The
+schema default <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code> is rejected at the first training forward
+with <code class="docutils literal notranslate"><span class="pre">flex_attention</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">available</span> <span class="pre">on</span> <span class="pre">this</span> <span class="pre">device;</span> <span class="pre">use</span> <span class="pre">sdpa/eager</span></code>.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">sdpa</span></code> and <code class="docutils literal notranslate"><span class="pre">eager</span></code> share the explicit boolean-mask path</strong>; both implement
+the same block-local draft visibility, and the grouped convolutions operate
+inside each proposal block independently of the attention mask. The checked-in
+4B draft uses <code class="docutils literal notranslate"><span class="pre">full_attention</span></code> layers only, so no sliding-window mask is
+involved.</p></li>
+<li><p><strong>Selector knobs keep their defaults</strong> (<code class="docutils literal notranslate"><span class="pre">dflash2_selector_loss_alpha:</span> <span class="pre">1.0</span></code>,
+zero warmup/ramp). The selector and convolutions are stock torch ops and need
+no NPU-specific settings.</p></li>
+<li><p><strong>Serving the export</strong> still requires an SGLang build with DFlash 2 support
+(SGLang PR #35371); training-side capture is unchanged.</p></li>
+</ul>
+</section>
 </section>
 <hr class="docutils" />
 <section id="managed-local-full-stack-one-command">
@@ -801,6 +831,7 @@ a tuned performance benchmark.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-start-mooncake-and-the-capture-server">Step 1: Start Mooncake and the capture server</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-launch-training">Step 2: Launch training</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#success-criteria">Success criteria</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#training-dflash-2-drafts">Training DFlash 2 drafts</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#managed-local-full-stack-one-command">4. Managed-local full stack (one command)</a><ul class="pst-show_toc_level nav section-nav flex-column">
