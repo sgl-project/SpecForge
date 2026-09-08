@@ -325,6 +325,7 @@ The checked-in examples are the canonical starting points:
 | DSpark | Online disaggregated, external | [`qwen3-4b-dspark-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) |
 | DSpark | Offline colocated | [`qwen3-4b-dspark-offline.yaml`](../../examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) |
 | DFlash (Ascend) | Online disaggregated, external | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml) |
+| DFlash2 (Ascend) | Online disaggregated, external | [`qwen3.5-4b-dflash2-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-online-npu.yaml) |
 | MTP (Ascend) | Online disaggregated, managed-local | [`qwen3.5-4b-mtp-disaggregated-npu.yaml`](../../examples/configs/online/disaggregated/managed-local/qwen3.5-4b-mtp-disaggregated-npu.yaml) |
 
 ## Online and offline data
