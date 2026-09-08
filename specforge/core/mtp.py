@@ -19,8 +19,9 @@ class OnlineMTPModel(nn.Module):
     Online MTP training wrapper.
 
     Architecture-agnostic: any registered MTP draft module exposing
-    ``forward(input_ids, hidden_states, attention_mask, position_ids)`` and a
-    ``config`` with ``pad_token_id`` can be plugged in (see
+    ``forward_hidden(input_ids, hidden_states, attention_mask, position_ids)``,
+    a position-wise ``mtp.lm_head``, and a ``config`` with ``pad_token_id`` can
+    be plugged in (see
     ``specforge/modeling/draft/mtp/``).
 
     Args:
@@ -30,7 +31,9 @@ class OnlineMTPModel(nn.Module):
         objective_chunk_size: Token positions per lm_head+CE chunk.  Bounds the
             full-vocab logits to one chunk at a time (with activation
             checkpointing), instead of materializing [batch*seq, vocab] twice.
-            0 disables chunking.
+            0 disables chunking. Configured by ``training.mtp_objective_chunk_size``
+            in YAML. This bounds objective intermediates only; backbone
+            activations, attention, weights, and optimizer state are unchanged.
     """
 
     def __init__(

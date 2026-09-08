@@ -8,6 +8,8 @@ on:
 
 - ``embed_tokens`` plus a trainable ``mtp`` module with an ``lm_head``
 - ``forward(input_ids, hidden_states, ...)`` -> object exposing ``logits``
+- ``forward_hidden(input_ids, hidden_states, ...)`` -> pre-head hidden states
+  of shape [batch, seq, hidden], consumed by the chunked training objective
 - the native checkpoint key prefix (``mtp.*``) used for native-head init and
   export round-trips
 - sharing/freezing the target checkpoint's embedding (and optional lm_head)
@@ -67,8 +69,11 @@ class MTPDraftModel(nn.Module):
     ) -> torch.Tensor:
         """Run the draft backbone and return pre-``lm_head`` hidden states.
 
-        Memory-bounded training loops consume this and apply ``mtp.lm_head``
-        in chunks, so full-vocab logits never materialize at once.
+        Returns [batch, seq, hidden] without projecting to the vocabulary.
+        ``mtp.lm_head`` must apply independently to each token position and
+        accept flattened [positions, hidden] inputs. The training wrapper
+        optionally checkpoints head/CE chunks; the backbone still processes
+        the complete sequence.
         """
         raise NotImplementedError
 
