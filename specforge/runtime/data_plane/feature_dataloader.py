@@ -55,35 +55,50 @@ class _QueuePrefetchState:
         self.thread: Optional[threading.Thread] = None
         self.outstanding: "OrderedDict[str, _OutstandingRef]" = OrderedDict()
         self.outstanding_lock = threading.Lock()
-        self.fetches: set = set()
+        self.fetches: Dict[Any, List[SampleRef]] = {}
         self.fetches_lock = threading.Lock()
         self.shutdown_lock = threading.Lock()
         self.shutdown_complete = False
 
-    def track_fetch(self, future: Any) -> None:
+    def track_fetch(self, future: Any, refs: List[SampleRef]) -> None:
         with self.fetches_lock:
-            self.fetches.add(future)
-        future.add_done_callback(self._untrack_fetch)
+            self.fetches[future] = list(refs)
 
-    def _untrack_fetch(self, future: Any) -> None:
+    def claim_for_yield(self, future: Any) -> Optional[List[SampleRef]]:
+        """Transfer a completed fetch and its refs to the consumer."""
         with self.fetches_lock:
-            self.fetches.discard(future)
+            refs = self.fetches.pop(future, None)
+            if refs is None:
+                return None
+            with self.outstanding_lock:
+                for ref in refs:
+                    self.outstanding.pop(ref.sample_id, None)
+            return refs
 
-    def live_fetches(self) -> List[Any]:
+    def settle_unyielded_fetch(
+        self, future: Any, *, materialized: bool
+    ) -> Optional[List[SampleRef]]:
+        """Stop tracking a fetch while leaving its refs for close settlement."""
         with self.fetches_lock:
-            return list(self.fetches)
+            refs = self.fetches.pop(future, None)
+            if refs is None:
+                return None
+            if materialized:
+                with self.outstanding_lock:
+                    for ref in refs:
+                        entry = self.outstanding.get(ref.sample_id)
+                        if entry is not None:
+                            entry.materialized = True
+            return refs
+
+    def live_fetches(self) -> Dict[Any, List[SampleRef]]:
+        with self.fetches_lock:
+            return dict(self.fetches)
 
     def track(self, refs: List[SampleRef]) -> None:
         with self.outstanding_lock:
             for ref in refs:
                 self.outstanding[ref.sample_id] = _OutstandingRef(ref)
-
-    def mark_materialized(self, refs: List[SampleRef]) -> None:
-        with self.outstanding_lock:
-            for ref in refs:
-                entry = self.outstanding.get(ref.sample_id)
-                if entry is not None:
-                    entry.materialized = True
 
     def mark_yielded_or_failed(self, refs: List[SampleRef]) -> None:
         with self.outstanding_lock:
@@ -164,6 +179,7 @@ class FeatureDataLoader:
             "fetch_s": 0.0,
             "fetch_bytes": 0.0,
             "fetch_batches": 0.0,
+            "fetch_samples": 0.0,
         }
 
     def _perf_add(self, **deltas: float) -> None:
@@ -187,6 +203,7 @@ class FeatureDataLoader:
             fetch_s=time.perf_counter() - started,
             fetch_bytes=float(sum(int(ref.estimated_bytes or 0) for ref in refs)),
             fetch_batches=1.0,
+            fetch_samples=float(len(refs)),
         )
         return batch
 
@@ -454,7 +471,7 @@ class FeatureDataLoader:
                         put_interruptibly(eos)
                         return
                     future = pool.submit(self._timed_make_batch, refs)
-                    state.track_fetch(future)
+                    state.track_fetch(future, refs)
                     if not put_interruptibly((future, refs)):
                         return
             except BaseException as exc:  # loud failure, never a silent hang
@@ -505,20 +522,26 @@ class FeatureDataLoader:
                     except futures.TimeoutError:
                         continue
                     except Exception as exc:
-                        self.queue.fail(
-                            refs, reason=f"materialize:{exc}", retryable=False
+                        failed_refs = state.settle_unyielded_fetch(
+                            future, materialized=True
                         )
-                        state.mark_yielded_or_failed(refs)
+                        if failed_refs is not None:
+                            self.queue.fail(
+                                failed_refs,
+                                reason=f"materialize:{exc}",
+                                retryable=False,
+                            )
+                            state.mark_yielded_or_failed(failed_refs)
                         raise
                 else:
                     return
                 self._perf_add(wait_fetch_s=time.perf_counter() - fetch_started)
-                state.mark_materialized(refs)
                 # From this point the trainer owns the refs. In deferred-ack
                 # mode its optimizer-boundary transaction decides their
                 # outcome; loader shutdown must touch only batches that were
                 # materialized ahead but never yielded.
-                state.mark_yielded_or_failed(refs)
+                if state.claim_for_yield(future) is None:
+                    return
                 yield batch
                 if self.ack:
                     self.queue.ack(refs)
@@ -542,13 +565,36 @@ class FeatureDataLoader:
                         f"is still blocked, outstanding_refs={outstanding_ids}"
                     )
             live = state.live_fetches()
-            if live and futures.wait(live, timeout=_PREFETCH_JOIN_TIMEOUT_S).not_done:
+            if (
+                live
+                and futures.wait(list(live), timeout=_PREFETCH_JOIN_TIMEOUT_S).not_done
+            ):
                 outstanding_ids = state.outstanding_ids()
                 raise RuntimeError(
                     "FeatureDataLoader prefetch fetch did not stop within "
                     f"{_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend get/materialize "
                     f"is still blocked, outstanding_refs={outstanding_ids}"
                 )
+
+            # A completed future has already called _make_batch. Record that
+            # before classifying its unyielded refs; otherwise close could
+            # requeue data already released by a consume-once store. Failed
+            # materializations retain the old terminal-failure behavior.
+            for future in live:
+                if future.cancelled():
+                    state.settle_unyielded_fetch(future, materialized=False)
+                    continue
+                exc = future.exception()
+                fetched_refs = state.settle_unyielded_fetch(
+                    future, materialized=exc is None
+                )
+                if exc is not None and fetched_refs is not None:
+                    self.queue.fail(
+                        fetched_refs,
+                        reason=f"materialize:{exc}",
+                        retryable=False,
+                    )
+                    state.mark_yielded_or_failed(fetched_refs)
 
             outstanding = state.outstanding_entries()
             retryable: List[SampleRef] = []
