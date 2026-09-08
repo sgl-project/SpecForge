@@ -44,7 +44,7 @@ draft models against the baseline without speculative decoding.
 ## Usage
 
 Launch an SGLang server with a target model and its SpecBundle draft. Add
-`--tp`, `--ep` and `--mem-fraction-static` when you run into memory limits.
+`--tp-size`, `--ep` and `--mem-fraction-static` when you run into memory limits.
 
 ::: code-group
 
