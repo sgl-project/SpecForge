@@ -323,7 +323,7 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection. |
 | `deployment.disaggregated.producer_segment_size` | `null` | Positive allocation owned by an offline Mooncake producer. Online capture is server-owned and forces client segments to zero. |
 | `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. For `receive_buffers: cuda`, size for the largest concurrently fetched tensors; an 8k-token Qwen3.8-27B feature can exceed this default. Use e.g. `2147483648` and increase with fetch concurrency. |
-| `deployment.disaggregated.receive_buffers` | `pageable` | Consumer receive buffers for feature reads: `pageable` (fresh host tensor per feature), `pinned` (pooled page-locked host buffers, side-stream device copy), or `cuda` (pooled device buffers; Mooncake 0.3.x stages RDMA reads through its client buffer). |
+| `deployment.disaggregated.receive_buffers` | `pinned` | Consumer receive buffers for feature reads: `pinned` (pooled page-locked host buffers, side-stream device copy), `pageable` (fresh host tensor per feature), or `cuda` (pooled device buffers; Mooncake 0.3.x stages RDMA reads through its client buffer). |
 | `deployment.disaggregated.receive_pool_bytes` | `8589934592` | Retained receive-pool budget per rank (`pinned`/`cuda`), excluding output copies and concurrent overflow. Failed-transfer buffers remain quarantined for the store lifetime. |
 | `deployment.disaggregated.idle_timeout_s` | `null` | Positive consumer idle timeout. |
 | `deployment.disaggregated.peer_wait_timeout_s` | `null` | Optional positive producer/consumer peer-completion timeout. Unset is unbounded; expiration fails the attempt. |
@@ -386,11 +386,21 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.mooncake.default_kv_lease_ttl_ms` | `500` | Master key-lease TTL (ms) forwarded to `mooncake_master --default_kv_lease_ttl`. Kept below the consumer's teardown drain window so managed_local shuts down cleanly; set `null` to inherit Mooncake's stock default. |
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
-| `deployment.disaggregated.managed_local.capture_servers[].gpu_put` | `false` | Publish captured tensors from device memory (`SGLANG_SPEC_CAPTURE_GPU_PUT=1`); requires `mooncake.protocol: rdma`. |
+| `deployment.disaggregated.managed_local.capture_servers[].gpu_put` | `null` | Automatically publish from CUDA memory when the capture worker uses RDMA. Set `false` to use host publication or `true` to require GPU publication; `true` requires `mooncake.protocol: rdma`. |
 | `deployment.disaggregated.managed_local.capture_servers[].tp_size` | `1` | Target-model tensor parallelism for this server. |
 | `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `null` | Optional SGLang static-memory override in `(0, 1]`; otherwise inherit `model.sglang_mem_fraction_static`. |
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
 | `deployment.disaggregated.managed_local.capture_servers[].startup_timeout_s` | `1800` | Positive server readiness timeout. |
+
+Disaggregated Mooncake trainers use pinned receive pools without additional settings.
+With loader prefetch enabled, H2D runs in the loader before the batch reaches training.
+Select `receive_buffers: pageable` to restore fresh host receives. The 8 GiB receive-pool
+budget is allocated lazily per rank and excludes returned tensors and overflow buffers.
+
+Patched CUDA capture servers use GPU publication automatically when
+`MOONCAKE_PROTOCOL=rdma`; TCP and non-CUDA workers use host publication. External
+servers can set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` to disable it or `1` to explicitly
+enable it. Managed-local `gpu_put: false` also disables an inherited enable flag.
 
 GPU publication retains a device snapshot until the asynchronous store write completes.
 Use RDMA-registerable CUDA allocations; with PyTorch, set
