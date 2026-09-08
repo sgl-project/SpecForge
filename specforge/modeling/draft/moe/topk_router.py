@@ -296,6 +296,14 @@ def fold_router_centering(state: dict) -> dict:
     so a serving engine that reads a router bias reproduces the trained
     routing without knowing about centering. No-op on dicts without the
     buffers.
+
+    The bias is written in fp32: it is the common-mode logit ``W @ mu`` the
+    centering removes, typically large next to the token-specific logit
+    spread, so a bf16 rounding of it (~0.4% relative) could flip top-k
+    choices. The router computes its logits in fp32 in training and in the
+    SGLang draft model (``Qwen3MoeDSparkModel``), which loads the bias into an
+    fp32 parameter; the weight keeps the checkpoint dtype (lossless without
+    ``input_rms``).
     """
     out = dict(state)
     for key in list(state):
@@ -310,5 +318,5 @@ def fold_router_centering(state: dict) -> dict:
         if rms is not None:
             weight = weight / rms.float()
             out[f"{base}gate.weight"] = weight.to(state[f"{base}gate.weight"].dtype)
-        out[f"{base}gate.bias"] = (-(weight @ mean)).to(state[f"{base}gate.weight"].dtype)
+        out[f"{base}gate.bias"] = -(weight @ mean)
     return out

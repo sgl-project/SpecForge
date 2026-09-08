@@ -923,6 +923,48 @@ class TestRouterRegularizers(unittest.TestCase):
         plain = {"gate.weight": torch.zeros(8, HIDDEN)}
         self.assertEqual(fold_router_centering(plain), plain)
 
+    def test_hf_export_folds_centering_and_drops_the_raw_buffers(self):
+        # The checkpoint's draft_state_dict carries gate.input_mean(+steps) and
+        # the unfolded gate.weight; the export must ship only the folded
+        # gate.weight/gate.bias (fp32 bias), never the raw centering buffers.
+        from safetensors import safe_open
+
+        from specforge.export.to_hf import export_to_hf
+
+        config = _draft_config("DSparkDraftModel")
+        config.dflash_config["moe_router_center"] = "ema"
+        model = DSparkDraftModel(config).train()
+        layers = list(iter_moe_layers(model))
+        for layer in layers:
+            layer.gate.input_mean.normal_()
+            layer.gate.input_mean_steps.fill_(3)
+        state = to_checkpoint_state_dict(model.state_dict())
+        self.assertIn("layers.0.mlp.gate.input_mean", state)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, "draft.json")
+            config.to_json_file(cfg_path)
+            ckpt = os.path.join(tmp, "run-step1")
+            os.makedirs(ckpt)
+            torch.save(
+                {"draft_state_dict": state, "strategy": "dspark"},
+                os.path.join(ckpt, "training_state.pt"),
+            )
+            out = export_to_hf(ckpt, cfg_path, os.path.join(tmp, "hf"))
+            with safe_open(os.path.join(out, "model.safetensors"), "pt") as f:
+                keys = set(f.keys())
+                self.assertFalse([k for k in keys if "input_mean" in k], keys)
+                self.assertFalse([k for k in keys if "input_rms" in k], keys)
+                for i, layer in enumerate(layers):
+                    bias = f.get_tensor(f"layers.{i}.mlp.gate.bias")
+                    self.assertEqual(bias.dtype, torch.float32)
+                    expected = -(layer.gate.weight.float() @ layer.gate.input_mean)
+                    torch.testing.assert_close(bias, expected, rtol=1e-5, atol=1e-5)
+            with open(os.path.join(out, "config.json"), encoding="utf-8") as f:
+                exported = json.load(f)
+            self.assertEqual(exported["n_routed_experts"], 8)
+            self.assertEqual(exported["scoring_func"], "softmax")
+            self.assertTrue(exported["norm_topk_prob"])
+
     def test_dspark_model_applies_router_updates_before_routing(self):
         config = _draft_config("DSparkDraftModel")
         config.dflash_config["moe_router_center"] = "ema"

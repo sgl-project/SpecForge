@@ -178,6 +178,87 @@ class TestNormalizeDFlashExport(unittest.TestCase):
             )
             self.assertEqual(json.loads(path.read_text()), normalized)
 
+    def _dspark_moe_export_config(self, **overrides):
+        config = {
+            "architectures": ["DSparkDraftModel"],
+            "auto_map": {"AutoModel": "dspark.DSparkDraftModel"},
+            "block_size": 7,
+            "model_type": "qwen3",
+            "dflash_config": {
+                "projector_type": "dspark",
+                "markov_rank": 256,
+                "markov_head_type": "vanilla",
+                "enable_confidence_head": True,
+                "confidence_head_with_markov": True,
+                "moe_router_center": "sample",
+                "target_layer_ids": [5, 19, 33, 47, 61],
+            },
+            # what specforge.export.to_hf writes for the qwen3_5_moe preset
+            "moe_preset": "qwen3_5_moe",
+            "n_routed_experts": 512,
+            "num_experts_per_tok": 10,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 2048,
+            "n_shared_experts": 1,
+            "scoring_func": "softmax",
+            "norm_topk_prob": True,
+            "routed_scaling_factor": 1.0,
+            "n_group": 1,
+            "topk_group": 1,
+            "topk_method": "greedy",
+        }
+        config.update(overrides)
+        return config
+
+    def test_normalizes_dspark_moe_for_sglang(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(self._dspark_moe_export_config()), encoding="utf-8"
+            )
+
+            normalized = self.module.normalize_export(str(path), 7)
+
+            self.assertEqual(normalized["architectures"], ["Qwen3MoeDSparkModel"])
+            self.assertNotIn("auto_map", normalized)
+            self.assertEqual(normalized["markov_rank"], 256)
+            # Qwen alias next to the DeepSeek-vocabulary field the exporter wrote
+            self.assertEqual(normalized["num_experts"], 512)
+            self.assertEqual(normalized["n_routed_experts"], 512)
+            self.assertEqual(normalized["n_shared_experts"], 1)
+            self.assertTrue(normalized["norm_topk_prob"])
+            # centered router => the folded gate.bias is mandatory at load
+            self.assertTrue(normalized["moe_router_bias"])
+            self.assertEqual(json.loads(path.read_text()), normalized)
+
+    def test_dspark_moe_without_centering_has_optional_router_bias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            config = self._dspark_moe_export_config()
+            del config["dflash_config"]["moe_router_center"]
+            path.write_text(json.dumps(config), encoding="utf-8")
+            normalized = self.module.normalize_export(str(path), 7)
+            self.assertFalse(normalized["moe_router_bias"])
+
+    def test_rejects_dspark_moe_recipes_the_sglang_model_cannot_serve(self):
+        for overrides in (
+            {"scoring_func": "sigmoid"},
+            {"topk_method": "noaux_tc"},
+            {"n_group": 8, "topk_group": 4},
+            {"n_shared_experts": 2},
+            {"num_experts_per_tok": 600},
+            {"n_shared_experts": 1, "shared_expert_intermediate_size": 0},
+            {"num_experts": 256},
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "config.json"
+                path.write_text(
+                    json.dumps(self._dspark_moe_export_config(**overrides)),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError, msg=str(overrides)):
+                    self.module.normalize_export(str(path), 7)
+
     def test_preserves_dflash2_architecture_and_nested_block_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

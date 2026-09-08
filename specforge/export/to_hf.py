@@ -89,9 +89,7 @@ def export_to_hf(
     model = materialize_draft(
         state, draft_config_path, vocab_mapping_path=vocab_mapping_path
     )
-    full_state = fold_router_centering(
-        dict(to_checkpoint_state_dict(model.state_dict()))
-    )
+    full_state = dict(to_checkpoint_state_dict(model.state_dict()))
     moe_cfg = resolve_moe_config(model.config)
     if moe_cfg is not None:
         # Serving engines read the routing recipe from config.json; the draft
@@ -123,6 +121,10 @@ def export_to_hf(
             embedding_source, embedding_key
         )
     full_state.update(state["draft_state_dict"])  # trained keys win
+    # Fold AFTER the trained keys land: the checkpoint carries the raw router
+    # centering buffers (gate.input_mean, ...) and the unfolded gate.weight,
+    # which would otherwise overwrite the fold and leak into the export.
+    full_state = fold_router_centering(full_state)
     model.save_pretrained(output_dir, state_dict=full_state)
     apply_legacy_rope_scaling(output_dir)
     return output_dir
