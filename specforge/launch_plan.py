@@ -396,29 +396,43 @@ def _hidden_devices_env_value(device_visibility_env: str) -> Optional[str]:
     return "" if device_visibility_env == "CUDA_VISIBLE_DEVICES" else None
 
 
+def resolve_sglang_engine_args(
+    model: ModelConfig,
+    *,
+    overrides: Optional[Mapping[str, object]] = None,
+) -> dict[str, object]:
+    """Resolve every ``sglang_*`` field on *model* into SGLang engine arguments.
+
+    Keys drop the ``sglang_`` prefix and match ``ServerArgs`` field names
+    (``sglang_context_length`` -> ``context_length``), so the result can be
+    rendered as CLI flags for an external server or passed as keyword arguments
+    to an in-process engine. *overrides* are keyed by the original field name
+    and win over the config value; ``None`` values are omitted.
+    """
+    resolved = overrides or {}
+    args: dict[str, object] = {}
+    for name in ModelConfig.model_fields:
+        if not name.startswith("sglang_"):
+            continue
+        value = resolved[name] if name in resolved else getattr(model, name)
+        if value is not None:
+            args[name.removeprefix("sglang_")] = value
+    return args
+
+
 def _sglang_argv(
     model: ModelConfig,
     *,
     overrides: Optional[Mapping[str, object]] = None,
 ) -> list[str]:
-    """Derive SGLang CLI args from all ``sglang_*`` fields on *model*.
-
-    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``.
-    Fields whose values require non-trivial resolution (server-level overrides,
-    fallback computations) are passed via *overrides* keyed by the original
-    field name; every other ``sglang_*`` field is read directly from *model*.
-    """
-    resolved = overrides or {}
+    """Render ``resolve_sglang_engine_args`` as CLI flags (``foo_bar`` -> ``--foo-bar``)."""
     argv: list[str] = []
-    for name in ModelConfig.model_fields:
-        if not name.startswith("sglang_"):
-            continue
-        value = resolved[name] if name in resolved else getattr(model, name)
-        flag = "--" + name.removeprefix("sglang_").replace("_", "-")
+    for name, value in resolve_sglang_engine_args(model, overrides=overrides).items():
+        flag = "--" + name.replace("_", "-")
         if isinstance(value, bool):
             if value:
                 argv.append(flag)
-        elif value is not None:
+        else:
             argv.extend((flag, str(value)))
     return argv
 
@@ -696,16 +710,16 @@ def build_launch_plan(
     torchrun_prefix: Optional[Sequence[str]] = None,
 ) -> LaunchPlan:
     """Resolve one validated config into a side-effect-free process plan."""
-    if cfg.mode == "online":
-        if cfg.deployment.mode != "disaggregated":
-            raise ValueError(
-                "online launch planning requires disaggregated producer/consumer "
-                "mode; colocated online training is no longer supported"
-            )
-        if cfg.model.target_backend != "sglang":
-            raise ValueError(
-                "online launch planning requires an external SGLang capture server"
-            )
+    if cfg.mode == "online" and cfg.model.target_backend != "sglang":
+        capture_location = (
+            "an in-process"
+            if cfg.deployment.mode == "local_colocated"
+            else "an external"
+        )
+        raise ValueError(
+            f"online launch planning requires {capture_location} SGLang "
+            "capture backend"
+        )
     base_env = os.environ if env is None else env
     distributed = _distributed_state(base_env)
     deployment = cfg.deployment.disaggregated
@@ -1223,5 +1237,6 @@ __all__ = [
     "ReadinessSpec",
     "ServiceSpec",
     "build_launch_plan",
+    "resolve_sglang_engine_args",
     "run_commands",
 ]

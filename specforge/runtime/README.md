@@ -17,9 +17,10 @@ The runtime has three responsibilities:
 All trainer-bearing launchers converge on the same
 `Trainer -> FeatureDataLoader -> TrainerController -> TrainerCore` lifecycle.
 Offline refs remain a fixed list and never enter an online queue or ledger.
-Online capture always runs in an external patched SGLang server and uses
+Online disaggregated capture runs in an external patched SGLang server and uses
 `RefDistributor -> per-rank InboxChannel -> StreamingRefQueue`, including for a
-single consumer rank. There is no colocated target-model or local-rollout path.
+single consumer rank. Colocated online runs instead use a bounded pull-through
+`LocalRolloutStream`; target tensors stay in the rank-private feature store.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the supported topology matrix and
 cross-plane flow, [control_plane/DESIGN.md](control_plane/DESIGN.md) for ledger

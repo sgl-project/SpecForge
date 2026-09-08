@@ -79,8 +79,8 @@ class OfflineVocabMappingTest(unittest.TestCase):
                 _install_dataset_vocab_mapping(
                     cfg,
                     bundle,
-                    counts=counts,
                     dataset_identity=prompt_key,
+                    count_tokens=lambda: counts,
                 )
                 self.assertEqual(_prompt_cache_key(cfg), prompt_key)
 

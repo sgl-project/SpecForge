@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 
 import sympy
 import torch
@@ -60,3 +61,31 @@ def patch_inductor_cutedsl_lowerings() -> bool:
 
 
 __all__ = ["patch_inductor_cutedsl_lowerings"]
+
+
+_INDUCTOR_GEMM_BACKENDS = "TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS"
+
+
+def configure_flex_attention_inductor(attention_backend: str) -> bool:
+    """Pin TorchInductor's GEMM autotune candidates to ``ATEN,TRITON``.
+
+    Colocated capture feeds raw variable-length sequences into the compiled
+    FlexAttention draft forward. The colocated validation run hit
+    ``NoValidChoicesError`` (the autotuner found no valid candidate) on some of
+    those shapes, and did not once ``TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS``
+    was set to ``ATEN,TRITON``. torch 2.11's default already lists ``ATEN``, so
+    the effective change is dropping ``CPP`` from the candidate set; the exact
+    mechanism has not been isolated. An explicit operator setting of the
+    variable stays authoritative. Returns ``True`` when this call installed the
+    default.
+    """
+    if attention_backend != "flex_attention" or _INDUCTOR_GEMM_BACKENDS in os.environ:
+        return False
+    os.environ[_INDUCTOR_GEMM_BACKENDS] = "ATEN,TRITON"
+    # torch._inductor.config reads the variable once at import; it may already
+    # be imported (Transformers, Accelerate, an in-process SGLang engine), so
+    # update the live value as well.
+    from torch._inductor import config as inductor_config
+
+    inductor_config.max_autotune_gemm_backends = "ATEN,TRITON"
+    return True

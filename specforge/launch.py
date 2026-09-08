@@ -29,6 +29,7 @@ from specforge.runtime.data_plane import (
     LocalFeatureStore,
     drain_feature_store_removals,
 )
+from specforge.training.prompt_plan import iter_epoch_online_prompt_batches
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ def _assemble_trainer(
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     dataloader_num_workers: int = 0,
+    clone_on_fetch: bool = True,
     profiling_options=None,
     fit_context=None,
     on_fit_success: Optional[Callable[[int], None]] = None,
@@ -145,6 +147,7 @@ def _assemble_trainer(
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         dataloader_num_workers=dataloader_num_workers,
+        clone_on_fetch=clone_on_fetch,
         profiling_options=profiling_options,
         fit_context=fit_context,
         on_fit_success=on_fit_success,
@@ -400,65 +403,6 @@ def _publish_refs_with_cleanup(
                 f"{cleanup_errors}"
             ) from publish_exc
         raise
-
-
-def _epoch_online_prompts(
-    prompts,
-    epoch: int,
-    prompt_epochs: int,
-    *,
-    seed: int = 0,
-):
-    """Build one deterministic, epoch-specific online prompt plan."""
-    return [
-        _epoch_online_prompt(prompts[index], index, epoch, prompt_epochs)
-        for index in _epoch_prompt_indices(prompts, epoch, seed=seed)
-    ]
-
-
-def _epoch_prompt_indices(prompts, epoch: int, *, seed: int = 0):
-    """Return the legacy deterministic shuffle without materializing payloads."""
-    import random
-
-    indices = list(range(len(prompts)))
-    random.Random(int(seed) + int(epoch)).shuffle(indices)
-    return indices
-
-
-def _epoch_online_prompt(prompt, index: int, epoch: int, prompt_epochs: int):
-    """Apply epoch identity while preserving the single-epoch prompt shape."""
-    if prompt_epochs == 1:
-        return prompt
-
-    item = dict(prompt)
-    metadata = dict(prompt.get("metadata") or {})
-    if "task_id" in prompt:
-        metadata.setdefault("base_task_id", str(prompt["task_id"]))
-    metadata["prompt_index"] = index
-    metadata["epoch"] = epoch
-    metadata["prompt_epochs"] = prompt_epochs
-    item["metadata"] = metadata
-    # The online feature store is consume-once and commit dedups by
-    # sample_id, so every epoch pass must mint distinct task/sample ids.
-    item["task_id"] = f"epoch{epoch:04d}-prompt{index:012d}"
-    return item
-
-
-def _iter_epoch_online_prompt_batches(
-    prompts,
-    epoch: int,
-    prompt_epochs: int,
-    *,
-    seed: int = 0,
-    batch_size: int = 4096,
-):
-    """Yield a shuffled epoch while bounding expanded token-list residency."""
-    indices = _epoch_prompt_indices(prompts, epoch, seed=seed)
-    for start in range(0, len(indices), batch_size):
-        yield [
-            _epoch_online_prompt(prompts[index], index, epoch, prompt_epochs)
-            for index in indices[start : start + batch_size]
-        ]
 
 
 def _assemble_server_rollout_workers(
@@ -784,8 +728,182 @@ def build_disagg_offline_runtime(
 
 
 # ---------------------------------------------------------------------------
-# Online disaggregated producer/consumer.  Capture is always delegated to an
-# externally managed SGLang server source.
+# Online colocated runtime.
+# ---------------------------------------------------------------------------
+
+
+def _assemble_local_rollout_worker(
+    *,
+    algorithm: AlgorithmRegistration,
+    modality: str,
+    controller: DataFlowController,
+    store: FeatureStore,
+    feature_source,
+    batch_partition,
+    run_id: str,
+    target_hidden_size: int,
+    target_vocab_size: Optional[int],
+    draft_vocab_size: Optional[int],
+    target_repr: Optional[str],
+    aux_hidden_state_layer_ids,
+    vocab_map_version: Optional[str],
+):
+    """Build the one synchronous worker owned by a colocated trainer rank."""
+    from specforge.inference.capture import CaptureConfig
+    from specforge.inference.rollout_worker import RolloutWorker
+
+    contract = algorithm.spec.feature_contract("streaming", modality)
+    capture_config = CaptureConfig.from_strategy(
+        required_features=contract.required_tensors,
+        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids or ()),
+        target_repr=target_repr,
+        target_hidden_size=target_hidden_size,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        vocab_map_version=vocab_map_version,
+    )
+    return RolloutWorker(
+        controller,
+        store,
+        feature_source,
+        capture_config,
+        run_id=run_id,
+        worker_id="colocated-rollout",
+        strategy=algorithm.name,
+        batch_partition=batch_partition,
+        feature_source_returns_local_batch=bool(
+            getattr(feature_source, "returns_local_batch", False)
+        ),
+    )
+
+
+def build_colocated_online_runtime(
+    *,
+    algorithm: AlgorithmRegistration,
+    modality: str = "text",
+    prompts,
+    feature_source,
+    draft_model,
+    target_head,
+    optimizer_factory,
+    run_id: str,
+    output_dir: str,
+    target_hidden_size: int,
+    target_vocab_size: Optional[int] = None,
+    draft_vocab_size: Optional[int] = None,
+    target_repr: Optional[str] = None,
+    aux_hidden_state_layer_ids=None,
+    vocab_map_version: Optional[str] = None,
+    batch_size: int = 1,
+    accumulation_steps: int = 1,
+    max_steps: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    save_interval: int = 0,
+    eval_interval: int = 0,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    logger=None,
+    log_interval: int = 50,
+    resume_from: Optional[str] = None,
+    resume_state: Optional[dict] = None,
+    dataset_size: Optional[int] = None,
+    checkpoint_extra: Optional[dict] = None,
+    max_checkpoints: int = 0,
+    strategy_kwargs: Optional[Mapping[str, Any]] = None,
+    dataloader_num_workers: int = 0,
+    profiling_options=None,
+):
+    """Assemble bounded in-process target capture and FSDP draft training.
+
+    ``prompts`` is this rank's lazy prompt stream, already sharded to its
+    target-DP island and aligned to ``tp_size * batch_size`` (see
+    ``specforge.training.prompt_plan``). Every target-TP peer captures the same
+    TP-wide batch through ``feature_source`` and trains its contiguous slice.
+    """
+    if sp_ulysses_size != 1 or sp_ring_size != 1:
+        raise NotImplementedError(
+            "colocated target TP does not yet compose with draft sequence parallelism"
+        )
+    from specforge.inference.batch_partition import TargetBatchPartition
+    from specforge.runtime.data_plane import LocalRolloutStream
+
+    batch_partition = TargetBatchPartition.from_distributed(tp_size)
+    configure_partition = getattr(feature_source, "set_batch_partition", None)
+    if callable(configure_partition):
+        configure_partition(batch_partition)
+    provider = algorithm.providers.server_streaming_for(modality)
+    controller = DataFlowController(run_id, metadata_store=NoOpMetadataStore())
+    store = LocalFeatureStore(run_id)
+    worker = _assemble_local_rollout_worker(
+        algorithm=algorithm,
+        modality=modality,
+        controller=controller,
+        store=store,
+        feature_source=feature_source,
+        batch_partition=batch_partition,
+        run_id=run_id,
+        target_hidden_size=target_hidden_size,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+        target_repr=target_repr,
+        aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
+        vocab_map_version=vocab_map_version,
+    )
+    rollout_stream = LocalRolloutStream(
+        controller=controller,
+        worker=worker,
+        feature_store=store,
+        prompts=prompts,
+        local_batch_size=batch_size,
+        target_batch_size=batch_partition.target_batch_size(batch_size),
+    )
+    return _assemble_trainer(
+        algorithm=algorithm,
+        controller=controller,
+        store=store,
+        ref_source={"queue": rollout_stream, "prepositioned": resume_from is not None},
+        model=draft_model,
+        target_head=(
+            target_head if algorithm.providers.step.uses_external_target_head else None
+        ),
+        optimizer_factory=optimizer_factory,
+        run_id=run_id,
+        output_dir=output_dir,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        # The stream already spans every prompt epoch.
+        num_epochs=1,
+        max_steps=max_steps,
+        total_steps=total_steps,
+        save_interval=save_interval,
+        eval_interval=eval_interval,
+        logger=logger,
+        log_interval=log_interval,
+        collate_fn=provider.build_collator(),
+        strategy_kwargs=strategy_kwargs,
+        per_sample_transform=None,
+        durable_ack=False,
+        resume_from=resume_from,
+        resume_state=resume_state,
+        dataset_size=dataset_size,
+        checkpoint_extra=checkpoint_extra,
+        max_checkpoints=max_checkpoints,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+        dataloader_num_workers=dataloader_num_workers,
+        # The rank-private in-memory store hands out tensors this trainer alone
+        # consumes once; the defensive loader clone would only double the peak.
+        clone_on_fetch=False,
+        profiling_options=profiling_options,
+        fit_context=rollout_stream,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Online disaggregated producer/consumer.  Capture is delegated to an external
+# SGLang server source.
 # ---------------------------------------------------------------------------
 
 
@@ -1347,7 +1465,7 @@ def build_disagg_online_producer(
             for epoch in range(prompt_epochs):
                 if should_stop is not None and should_stop():
                     break
-                epoch_batches = _iter_epoch_online_prompt_batches(
+                epoch_batches = iter_epoch_online_prompt_batches(
                     prompts,
                     epoch,
                     prompt_epochs,
@@ -1801,6 +1919,7 @@ def build_disagg_online_consumer(
 __all__ = [
     "build_offline_runtime",
     "build_disagg_offline_runtime",
+    "build_colocated_online_runtime",
     "build_disagg_online_producer",
     "build_disagg_online_consumer",
 ]

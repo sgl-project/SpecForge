@@ -16,8 +16,8 @@
 
 The application resolves one immutable algorithm registration and passes it
 through every builder.  This module never resolves an algorithm name and never
-constructs an in-process online target engine; online capture comes exclusively
-from an external SGLang server through the disaggregated runtime.
+constructs algorithm-specific target policy.  Topology-specific assembly lives
+in :mod:`specforge.training.colocated` and :mod:`specforge.training.disaggregated`.
 
 Heavy model/data dependencies stay lazy so importing :mod:`specforge.training`
 does not load Transformers, datasets, or a target backend.
@@ -401,8 +401,8 @@ def _prepare_prompts(
         raise ValueError("prompt preparation requires a non-empty data path")
     if cache_key is None:
         cache_key = (
-            cfg.data.cache_key
-            if path is None and cfg.data.cache_key is not None
+            _training_prompt_cache_key(cfg, tokenizer)
+            if path is None
             else _prompt_cache_key(cfg, tokenizer=tokenizer, path=source_path)
         )
     min_loss_tokens = algorithm.providers.model.minimum_loss_tokens(cfg, draft_config)
@@ -422,14 +422,106 @@ def _prepare_prompts(
     )
 
 
+def _training_prompt_cache_key(cfg: Config, tokenizer) -> str:
+    """Cache namespace of the configured training prompt source."""
+    return cfg.data.cache_key or _prompt_cache_key(cfg, tokenizer=tokenizer)
+
+
+def _prepare_prompts_coordinated(
+    cfg: Config,
+    tokenizer,
+    *,
+    algorithm: AlgorithmRegistration,
+    draft_config,
+) -> Sequence[dict]:
+    """Prepare the training prompts once per cache, then read them on every rank.
+
+    For runs where every rank prepares the same prompt source. Tokenization
+    spawns ``data.build_dataset_num_proc`` workers, so letting all ranks start
+    it independently causes a process storm and races on the Arrow cache.
+
+    Protocol: global rank zero prepares and publishes a ``<cache_key>.ready``
+    sentinel next to the cache. On node-local cache paths, local rank zero of
+    every node that still cannot see the sentinel prepares that node's copy.
+    Every other rank then takes the cache-hit path. Failures propagate to all
+    ranks through the coordination collective, which must complete within
+    ``training.dist_timeout``; pre-build the cache or raise the timeout for very
+    large raw datasets. Without a cache directory or an initialized process
+    group every rank prepares on its own.
+    """
+    import torch.distributed as dist
+
+    ready_file = (
+        os.path.join(
+            cfg.data.cache_dir, f"{_training_prompt_cache_key(cfg, tokenizer)}.ready"
+        )
+        if cfg.data.cache_dir
+        else None
+    )
+
+    def prepare(*, mark_ready: bool = False) -> Sequence[dict]:
+        prompts = _prepare_prompts(
+            cfg, tokenizer, algorithm=algorithm, draft_config=draft_config
+        )
+        if mark_ready and ready_file is not None:
+            os.makedirs(cfg.data.cache_dir, exist_ok=True)
+            temporary = f"{ready_file}.{os.getpid()}.tmp"
+            with open(temporary, "w", encoding="utf-8") as stream:
+                stream.write("ready\n")
+            os.replace(temporary, ready_file)
+        return prompts
+
+    if (
+        ready_file is None
+        or not dist.is_available()
+        or not dist.is_initialized()
+        or dist.get_world_size() == 1
+    ):
+        return prepare()
+
+    def prepare_collectively(should_prepare: bool) -> Optional[Sequence[dict]]:
+        prompts = None
+        error = None
+        if should_prepare:
+            try:
+                prompts = prepare(mark_ready=True)
+            except BaseException as exc:
+                error = f"rank {dist.get_rank()}: {type(exc).__name__}: {exc}"
+        errors = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, error)
+        failures = [item for item in errors if item is not None]
+        if failures:
+            raise RuntimeError(
+                "coordinated prompt-cache preparation failed: " + "; ".join(failures)
+            )
+        return prompts
+
+    prompts = prepare_collectively(dist.get_rank() == 0)
+    # On a shared filesystem rank zero's cache is now visible everywhere. On
+    # node-local storage, exactly one process per missing node repeats the
+    # same deterministic build.
+    node_prompts = prepare_collectively(
+        prompts is None
+        and int(os.environ.get("LOCAL_RANK", "0")) == 0
+        and not os.path.isfile(ready_file)
+    )
+    if prompts is None:
+        prompts = node_prompts
+    return prompts if prompts is not None else prepare()
+
+
 def _install_dataset_vocab_mapping(
     cfg: Config,
     bundle: ModelBundle,
     *,
-    counts: Counter,
     dataset_identity: str,
+    count_tokens: Callable[[], Counter],
 ) -> None:
-    """Build, cache, and install one deterministic EAGLE vocabulary map."""
+    """Install one deterministic EAGLE vocabulary map, building it on a cache miss.
+
+    ``count_tokens`` runs only when no cached map exists for this dataset
+    identity and vocabulary pair, so a cache hit never re-reads the corpus.
+    """
     if (
         cfg.model.vocab_mapping_path
         or bundle.draft_vocab_size == bundle.target_vocab_size
@@ -454,7 +546,7 @@ def _install_dataset_vocab_mapping(
     from specforge.data.preprocessing import process_token_dict_to_mappings
 
     d2t, t2d = process_token_dict_to_mappings(
-        counts,
+        count_tokens(),
         bundle.draft_vocab_size,
         bundle.target_vocab_size,
     )
@@ -503,16 +595,15 @@ def _ensure_offline_vocab_mapping(
         },
         sort_keys=True,
     )
-    counts = count_effective_feature_tokens(
-        cfg.data.hidden_states_path,
-        max_length=cfg.data.max_length,
-        target_vocab_size=bundle.target_vocab_size,
-    )
     _install_dataset_vocab_mapping(
         cfg,
         bundle,
-        counts=counts,
         dataset_identity=identity,
+        count_tokens=lambda: count_effective_feature_tokens(
+            cfg.data.hidden_states_path,
+            max_length=cfg.data.max_length,
+            target_vocab_size=bundle.target_vocab_size,
+        ),
     )
 
 
@@ -574,70 +665,28 @@ def _common_launch_kwargs(
     )
 
 
-def build_training_run(
-    cfg: Config,
-    *,
-    algorithm: AlgorithmRegistration,
-) -> TrainingRun:
-    """Assemble one validated run from an already-resolved algorithm.
-
-    Offline training may run in one process or with a disaggregated feature
-    source.  Online training is always disaggregated and captures through
-    external SGLang servers; colocated online execution is intentionally absent.
-    """
-
-    if algorithm.name != cfg.training.strategy:
-        raise ValueError(
-            "resolved algorithm does not match training.strategy: "
-            f"{algorithm.name!r} != {cfg.training.strategy!r}"
-        )
-
-    t = cfg.training
-    if t.role != "producer":
-        import torch.distributed as dist
-
-        cfg.validate_world_size(dist.get_world_size() if dist.is_initialized() else 1)
-
-    if cfg.mode == "online" and cfg.deployment.mode != "disaggregated":
-        raise ValueError(
-            "online training is server-only and requires "
-            "deployment.mode='disaggregated'"
-        )
-
-    if cfg.deployment.mode == "disaggregated":
-        from specforge.training.disaggregated import build_disaggregated_run
-
-        run_logger = _configured_logger(cfg)
-        try:
-            return build_disaggregated_run(
-                cfg,
-                algorithm=algorithm,
-                build_model_bundle=lambda run_cfg: build_model_bundle(
-                    run_cfg, algorithm=algorithm
-                ),
-                prepare_prompts=lambda run_cfg, tokenizer, **kwargs: _prepare_prompts(
-                    run_cfg,
-                    tokenizer,
-                    algorithm=algorithm,
-                    **kwargs,
-                ),
-                optimizer_factory=_optimizer_factory,
-                logger=run_logger,
-            )
-        except BaseException:
-            _close_configured_logger(run_logger)
-            raise
-
-    if cfg.mode != "offline":
-        raise ValueError("colocated execution supports offline training only")
-
-    bundle = build_model_bundle(cfg, algorithm=algorithm)
-    from specforge.launch import build_offline_runtime
-
-    _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
+def _with_run_logger(cfg: Config, build: Callable[[Any], Any]):
+    """Create this rank's metric logger for *build*; close it if assembly fails."""
     run_logger = _configured_logger(cfg)
     try:
-        trainer = build_offline_runtime(
+        return build(run_logger)
+    except BaseException:
+        _close_configured_logger(run_logger)
+        raise
+
+
+def _build_offline_colocated_run(
+    cfg: Config, *, algorithm: AlgorithmRegistration
+) -> TrainingRun:
+    """Assemble local offline training over precomputed feature files."""
+    from specforge.launch import build_offline_runtime
+
+    t = cfg.training
+    bundle = build_model_bundle(cfg, algorithm=algorithm)
+    _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
+    trainer = _with_run_logger(
+        cfg,
+        lambda run_logger: build_offline_runtime(
             hidden_states_path=cfg.data.hidden_states_path,
             eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
             draft_model=bundle.model,
@@ -648,17 +697,77 @@ def build_training_run(
             use_usp_preprocess=(t.attention_backend == "usp"),
             seed=t.seed,
             resume_from=t.resume_from,
-            **_common_launch_kwargs(
+            **_common_launch_kwargs(cfg, bundle, algorithm, logger=run_logger),
+        ),
+    )
+    return TrainingRun(trainer=trainer)
+
+
+def build_training_run(
+    cfg: Config,
+    *,
+    algorithm: AlgorithmRegistration,
+) -> TrainingRun:
+    """Assemble one validated run from an already-resolved algorithm.
+
+    Dispatch is by topology only: disaggregated runs (offline or online) are
+    assembled by :mod:`specforge.training.disaggregated`, colocated online runs
+    by :mod:`specforge.training.colocated`, and colocated offline runs here over
+    precomputed feature files.
+    """
+
+    if algorithm.name != cfg.training.strategy:
+        raise ValueError(
+            "resolved algorithm does not match training.strategy: "
+            f"{algorithm.name!r} != {cfg.training.strategy!r}"
+        )
+
+    if cfg.training.role != "producer":
+        import torch.distributed as dist
+
+        cfg.validate_world_size(dist.get_world_size() if dist.is_initialized() else 1)
+
+    def bundle_for(run_cfg: Config) -> ModelBundle:
+        return build_model_bundle(run_cfg, algorithm=algorithm)
+
+    def prompts_for(run_cfg: Config, tokenizer, **kwargs) -> Sequence[dict]:
+        return _prepare_prompts(run_cfg, tokenizer, algorithm=algorithm, **kwargs)
+
+    if cfg.deployment.mode == "disaggregated":
+        from specforge.training.disaggregated import build_disaggregated_run
+
+        return _with_run_logger(
+            cfg,
+            lambda run_logger: build_disaggregated_run(
                 cfg,
-                bundle,
-                algorithm,
+                algorithm=algorithm,
+                build_model_bundle=bundle_for,
+                prepare_prompts=prompts_for,
+                optimizer_factory=_optimizer_factory,
                 logger=run_logger,
             ),
         )
-    except BaseException:
-        _close_configured_logger(run_logger)
-        raise
-    return TrainingRun(trainer=trainer)
+
+    if cfg.mode == "online":
+        from specforge.training.colocated import build_colocated_run
+
+        def coordinated_prompts_for(run_cfg: Config, tokenizer, **kwargs):
+            return _prepare_prompts_coordinated(
+                run_cfg, tokenizer, algorithm=algorithm, **kwargs
+            )
+
+        return _with_run_logger(
+            cfg,
+            lambda run_logger: build_colocated_run(
+                cfg,
+                algorithm=algorithm,
+                build_model_bundle=bundle_for,
+                prepare_prompts=coordinated_prompts_for,
+                logger=run_logger,
+            ),
+        )
+
+    return _build_offline_colocated_run(cfg, algorithm=algorithm)
 
 
 __all__ = [

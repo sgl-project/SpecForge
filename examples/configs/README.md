@@ -30,7 +30,7 @@ examples/configs/
 | --- | --- | --- | --- |
 | `offline/colocated` | Precomputed `.ckpt` files | Trainer only | Not applicable |
 | `offline/disaggregated` | Precomputed files ingested into `shared_dir` or Mooncake | Producer + consumer | Storage is configured separately; there is no `external`/`managed-local` subdivision |
-| `online/colocated` | — | — | Reserved; the current runtime does not support online colocated training |
+| `online/colocated` | Live in-process SGLang capture | Trainer only (role `all`) | SpecForge owns the in-process SGLang target shard |
 | `online/disaggregated/external` | Live SGLang capture | Producer + consumer | User or scheduler starts Mooncake and SGLang |
 | `online/disaggregated/managed-local` | Live SGLang capture | Producer + consumer | SpecForge starts local Mooncake and SGLang from `managed_local` |
 
@@ -145,6 +145,7 @@ assume the command runs from the repository root.
 
 | Workflow | Canonical starting point |
 | --- | --- |
+| DSpark online, colocated | [`online/colocated/qwen3-8b-dspark-colocated.yaml`](online/colocated/qwen3-8b-dspark-colocated.yaml) |
 | EAGLE3 offline, colocated | [`offline/colocated/qwen3-8b-eagle3-offline.yaml`](offline/colocated/qwen3-8b-eagle3-offline.yaml) |
 | DFlash offline, colocated | [`offline/colocated/qwen3-8b-dflash-offline.yaml`](offline/colocated/qwen3-8b-dflash-offline.yaml) |
 | Domino offline, colocated | [`offline/colocated/qwen3-8b-domino-offline.yaml`](offline/colocated/qwen3-8b-domino-offline.yaml) |

@@ -31,9 +31,10 @@ from specforge.inference.adapters.server_capture import (
     ServerCaptureSchema,
     SGLangServerCaptureAdapter,
 )
-from specforge.launch import _epoch_online_prompts, build_disagg_online_producer
+from specforge.launch import build_disagg_online_producer
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+from specforge.training.prompt_plan import epoch_online_prompts
 from tests.test_runtime.test_server_capture import (
     AUX_LAYERS,
     HIDDEN,
@@ -628,12 +629,12 @@ class TestMultiServerProducer(unittest.TestCase):
     def test_prompt_epoch_order_is_seeded_and_reconstruction_stable(self):
         prompts = _prompts(12)
 
-        single_epoch = _epoch_online_prompts(prompts, 0, 1, seed=42)
-        rebuilt_single_epoch = _epoch_online_prompts(prompts, 0, 1, seed=42)
-        other_seed = _epoch_online_prompts(prompts, 0, 1, seed=43)
-        epoch_zero = _epoch_online_prompts(prompts, 0, 3, seed=42)
-        epoch_one = _epoch_online_prompts(prompts, 1, 3, seed=42)
-        rebuilt_epoch_one = _epoch_online_prompts(prompts, 1, 3, seed=42)
+        single_epoch = epoch_online_prompts(prompts, 0, 1, seed=42)
+        rebuilt_single_epoch = epoch_online_prompts(prompts, 0, 1, seed=42)
+        other_seed = epoch_online_prompts(prompts, 0, 1, seed=43)
+        epoch_zero = epoch_online_prompts(prompts, 0, 3, seed=42)
+        epoch_one = epoch_online_prompts(prompts, 1, 3, seed=42)
+        rebuilt_epoch_one = epoch_online_prompts(prompts, 1, 3, seed=42)
 
         self.assertEqual(single_epoch, rebuilt_single_epoch)
         self.assertNotEqual(

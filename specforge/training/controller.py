@@ -602,6 +602,7 @@ class TrainerController:
         checkpoint_manager: Optional[Any] = None,
         checkpoint_extra: Optional[Dict[str, Any]] = None,
         profiling_options=None,
+        runtime_metrics_provider: Optional[Callable[[], Dict[str, Any]]] = None,
     ) -> None:
         if (start_batch == 0) != (start_samples == 0):
             raise ValueError(
@@ -628,6 +629,9 @@ class TrainerController:
         self.total_steps = total_steps if total_steps is not None else max_steps
         self.num_epochs = num_epochs
         self.logger = logger
+        # Optional zero-argument callable (e.g. LocalRolloutStream.perf_metrics)
+        # merged into perf/* at each log interval.
+        self.runtime_metrics_provider = runtime_metrics_provider
         # ack_fn(sample_ids, global_step) records the durable ack transaction at
         # the optimizer-step boundary; None = the loader acks (simple runs).
         self.ack_fn = ack_fn
@@ -768,6 +772,10 @@ class TrainerController:
                         ),
                     ),
                 )
+                # Release this microbatch before the loader produces the next
+                # one: a source that materializes on demand must never see two
+                # long-context batches resident at once.
+                del batch
                 perf_train_compute_s += time.perf_counter() - train_compute_started
                 # grad accumulated but optimizer has not stepped yet; everything
                 # keyed on optimizer steps fires only at the boundary.
@@ -796,9 +804,11 @@ class TrainerController:
                     )
                     parallel = getattr(self.core.backend, "parallel_config", None)
                     world_size = int(getattr(parallel, "world_size", 1))
-                    tp_size = int(getattr(parallel, "tp_size", 1))
                     sp_size = int(getattr(parallel, "sp_size", 1))
-                    data_parallel_size = max(1, world_size // (tp_size * sp_size))
+                    # Ranks are sample-parallel for draft training unless draft
+                    # sequence parallelism shards one logical sample across
+                    # ranks; target tensor parallelism never duplicates samples.
+                    sample_parallel_size = max(1, world_size // sp_size)
                     log_metrics.update(
                         {
                             "perf/optimizer_steps_per_hour": (
@@ -818,11 +828,39 @@ class TrainerController:
                             ),
                             "perf/global_samples_per_second": (
                                 perf_window_samples
-                                * data_parallel_size
+                                * sample_parallel_size
                                 / perf_elapsed_s
                             ),
                         }
                     )
+                    if self.runtime_metrics_provider is not None:
+                        runtime_metrics = self.runtime_metrics_provider()
+                        log_metrics.update(
+                            {
+                                f"perf/{name}": float(value)
+                                for name, value in runtime_metrics.items()
+                            }
+                        )
+                    try:
+                        model_device = next(module.parameters()).device
+                        device_module = getattr(torch, model_device.type, None)
+                        if device_module is not None and model_device.type != "cpu":
+                            log_metrics.update(
+                                {
+                                    "perf/accelerator_peak_allocated_gib": (
+                                        device_module.max_memory_allocated(model_device)
+                                        / float(1 << 30)
+                                    ),
+                                    "perf/accelerator_peak_reserved_gib": (
+                                        device_module.max_memory_reserved(model_device)
+                                        / float(1 << 30)
+                                    ),
+                                }
+                            )
+                    except (AttributeError, RuntimeError, StopIteration):
+                        # CPU-only strategies and mocked accelerators have no
+                        # peak-memory counters; logging must never fail a step.
+                        pass
                     self.logger(log_metrics, self.global_step)
                     perf_window_started = time.perf_counter()
                     perf_window_steps = 0

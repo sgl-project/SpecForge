@@ -30,6 +30,8 @@ REMOVED_MODULE_FILES = (
     "specforge/inference/adapters/dflash.py",
     "specforge/inference/adapters/eagle3.py",
     "specforge/inference/adapters/policy.py",
+    # Superseded, not retired for good: colocated online returned as the
+    # bounded pull-through runtime/data_plane/colocated_rollout_stream.py.
     "specforge/runtime/data_plane/local_rollout_stream.py",
     "specforge/inference/target_engine/capture_policy.py",
     "specforge/inference/target_engine/dflash_target_model.py",
@@ -245,6 +247,7 @@ LEGACY_API_NAMES = {
 }
 
 CANONICAL_LAUNCH_EXPORTS = {
+    "build_colocated_online_runtime",
     "build_disagg_offline_runtime",
     "build_disagg_online_consumer",
     "build_disagg_online_producer",

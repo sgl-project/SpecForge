@@ -24,6 +24,7 @@ from typing import Callable, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.training.prompt_plan import online_prompt_seed
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
 _ONLINE_SCHEDULE_SUFFIX = ".schedule.json"
@@ -201,12 +202,6 @@ def _consumer_database_path(cfg: Config) -> Optional[str]:
     return os.path.join(state_dir, "consumer.sqlite")
 
 
-def _online_prompt_seed(cfg: Config) -> int:
-    """Resolve prompt ordering independently while preserving old configs."""
-    configured = getattr(cfg.training, "prompt_seed", None)
-    return cfg.training.seed if configured is None else configured
-
-
 def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
     """Resolve and validate producer ref watermarks before prompt preparation.
 
@@ -275,7 +270,7 @@ def _online_schedule_payload(cfg: Config, *, num_prompts: int) -> dict:
         "total_steps": total_steps,
         "num_prompts": num_prompts,
         "prompt_epochs": cfg.training.num_epochs,
-        "prompt_seed": _online_prompt_seed(cfg),
+        "prompt_seed": online_prompt_seed(cfg),
         "dp_size": dp_size,
         "batch_size": cfg.training.batch_size,
         "accumulation_steps": cfg.training.accumulation_steps,
@@ -302,7 +297,7 @@ def _read_online_total_steps(cfg: Config, channel_path: str) -> int:
     expected = {
         "version": 1,
         "prompt_epochs": cfg.training.num_epochs,
-        "prompt_seed": _online_prompt_seed(cfg),
+        "prompt_seed": online_prompt_seed(cfg),
         "dp_size": trainer.nnodes * trainer.nproc_per_node,
         "batch_size": cfg.training.batch_size,
         "accumulation_steps": cfg.training.accumulation_steps,
@@ -670,7 +665,7 @@ def _build_online(
             target_repr=target_repr,
             aux_hidden_state_layer_ids=layers,
             prompt_epochs=cfg.training.num_epochs,
-            prompt_seed=_online_prompt_seed(cfg),
+            prompt_seed=online_prompt_seed(cfg),
             lease=cfg.runtime.producer_lease,
             in_flight_high_watermark=in_flight_high_watermark,
             in_flight_low_watermark=in_flight_low_watermark,

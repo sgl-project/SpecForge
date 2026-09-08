@@ -34,7 +34,7 @@ examples/configs/
 │   ├── colocated/
 │   └── disaggregated/
 └── online/
-    ├── colocated/                 # reserved; currently unsupported
+    ├── colocated/                 # in-process SGLang capture, role "all"
     └── disaggregated/
         ├── external/
         └── managed-local/
@@ -62,10 +62,12 @@ When it is greater than one, the CLI starts torch distributed itself:
 specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3-online.yaml
 ```
 
-Online target inference never runs in the trainer. A patched SGLang server owns
-target parallelism and publishes captured features through Mooncake; every
-consumer rank is data parallel. Offline runs shard fixed feature references
-across trainer ranks and may additionally use EAGLE3 USP. See
+Online target inference either runs locally in each trainer process
+([colocated online training](colocated_training.md)) or on a patched external
+SGLang server that publishes through Mooncake. Colocated target TP is
+configured with `training.tp_size`; disaggregated consumers remain fully data
+parallel. Offline runs shard fixed feature references across trainer ranks and
+may additionally use EAGLE3 USP. See
 [Parallel topologies](#parallel-topologies) for the exact constraints.
 
 Paths in a config are resolved from the current working directory. The example
@@ -348,14 +350,14 @@ launching it.
 
 The unified runtime supports text training in these combinations:
 
-| Strategy | Online disaggregated | Offline colocated | Offline disaggregated |
-| --- | --- | --- | --- |
-| EAGLE3 | Yes, consumer DP | Yes, DP + USP | Yes, consumer DP |
-| DFlash/DFlash2 | Yes, consumer DP | Yes, DP | Yes, consumer DP |
-| Domino | Yes, consumer DP | Yes, DP | Yes, consumer DP |
-| DSpark | Yes, consumer DP | Yes, DP | Yes, consumer DP |
-| MTP | Yes, consumer DP | Yes, DP | Yes, consumer DP |
-| P-EAGLE | Yes, consumer DP, batch size 1 | No | No |
+| Strategy | Online colocated | Online disaggregated | Offline colocated | Offline disaggregated |
+| --- | --- | --- | --- | --- |
+| EAGLE3 | Yes, target TP/islands | Yes, consumer DP | Yes, DP + USP | Yes, consumer DP |
+| DFlash/DFlash2 | Yes, target TP/islands | Yes, consumer DP | Yes, DP | Yes, consumer DP |
+| Domino | Yes, target TP/islands | Yes, consumer DP | Yes, DP | Yes, consumer DP |
+| DSpark | Yes, target TP/islands | Yes, consumer DP | Yes, DP | Yes, consumer DP |
+| MTP | Yes, target TP/islands | Yes, consumer DP | Yes, DP | Yes, consumer DP |
+| P-EAGLE | Yes, batch size 1 | Yes, consumer DP, batch size 1 | No | No |
 
 Unsupported combinations fail explicitly during config validation or run
 assembly. In particular:
@@ -372,9 +374,10 @@ assembly. In particular:
   schema;
 - offline feature training supports EAGLE3, DFlash, DFlash2, Domino,
   DSpark, and MTP;
-- every online run is disaggregated and uses `model.target_backend=sglang`;
-  finite runs may omit both step fields so the producer can publish the exact
-  optimizer horizon derived from the prepared prompt plan;
+- every online run uses `model.target_backend=sglang`; disaggregated finite
+  runs may omit both step fields so the producer can publish the exact
+  optimizer horizon, while colocated runs derive it locally from the prompt
+  plan;
 - EAGLE3 offline colocated runs derive and cache a deterministic vocabulary mapping
   from the feature corpus when `model.vocab_mapping_path` is empty. EAGLE3
   disaggregated runs require an explicit shared mapping so producer and
@@ -393,9 +396,12 @@ publishes the exact schedule horizon and the consumer trains to EOF.
 
 The launcher creates every process group from the typed run config:
 
-- Online target TP/EP belongs to each external SGLang capture server, not the
-  trainer. Online consumers keep `training.tp_size` and both SP sizes at 1;
-  every trainer rank receives a disjoint feature stream.
+- Colocated online runs use `training.tp_size` as the target-island width.
+  Target-DP islands receive disjoint prompt streams; TP peers capture the same
+  TP-wide batch and train disjoint local slices.
+- Disaggregated online target TP/EP belongs to each external SGLang capture
+  server. Consumers keep `training.tp_size` and both SP sizes at 1; every
+  trainer rank receives a disjoint feature stream.
 - Offline consumers also keep `training.tp_size` at 1. Without USP, every
   trainer rank receives a disjoint reference shard and participates as data
   parallelism.
@@ -404,16 +410,18 @@ The launcher creates every process group from the typed run config:
   greater than one, USP currently uses `training.batch_size: 1`, and SP peers
   share one sequence while draft-DP groups receive disjoint references.
 
-The world size must be divisible by
-`training.sp_ulysses_size * training.sp_ring_size`. Use a shared `output_dir`
-for multi-rank checkpoints.
+The world size must be divisible by both `training.tp_size` and
+`training.sp_ulysses_size * training.sp_ring_size`. See
+[Colocated online training](colocated_training.md) for memory sizing and
+scaling guidance. Use a shared `output_dir` for multi-rank checkpoints.
 
 ## Loader and profiling controls
 
 `data.dataloader_num_workers` controls ordered background feature
 materialization. If omitted, the former trainer defaults are retained:
 EAGLE3/P-EAGLE use four workers and DFlash-family strategies use eight. Set it
-to zero for fully synchronous loading.
+to zero for fully synchronous loading. Colocated online capture stays
+synchronous regardless, keeping all CUDA work on the trainer thread.
 
 Enable a bounded, per-rank PyTorch trace without a separate profiler entry:
 
