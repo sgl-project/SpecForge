@@ -176,6 +176,7 @@ def reference_kda(
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
 ):
     """Differentiable KDA recurrence used as the correctness oracle.
 
@@ -192,7 +193,8 @@ def reference_kda(
                 "variable-length KDA expects a flattened batch of size 1, "
                 f"got {q.shape[0]}"
             )
-        bounds = [int(bound) for bound in cu_seqlens.tolist()]
+        source = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+        bounds = [int(bound) for bound in source.tolist()]
         outputs, final_states = [], []
         for index, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
             state = None if initial_state is None else initial_state[index : index + 1]
@@ -323,6 +325,7 @@ def _fla_kda_varlen(
     output_final_state: bool,
     cu_seqlens: torch.Tensor,
     kernel_kwargs: dict,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
 ):
     """One variable-length FLA launch over flattened context segments.
 
@@ -350,12 +353,14 @@ def _fla_kda_varlen(
         padded_sequences *= 2
         extra_sequences = padded_sequences - num_sequences
         padded_total = _round_up(total + extra_sequences, _FLA_CHUNK_SIZE)
+    bounds_cpu = cu_seqlens_cpu
     if extra_sequences:
         dummy_ends = total + torch.arange(
             1, extra_sequences + 1, device=bounds.device, dtype=torch.long
         )
         dummy_ends[-1] = padded_total
         bounds = torch.cat((bounds, dummy_ends))
+        bounds_cpu = None  # padded on device only; FLA falls back to the device copy
     state = initial_state
     if state is not None and extra_sequences:
         state = _pad_batch_to(state, padded_sequences)
@@ -368,6 +373,7 @@ def _fla_kda_varlen(
         initial_state=state,
         output_final_state=output_final_state,
         cu_seqlens=bounds,
+        **({"cu_seqlens_cpu": bounds_cpu} if bounds_cpu is not None else {}),
         **kernel_kwargs,
     )
     output = output[:, :total]
@@ -389,6 +395,7 @@ def fla_kda(
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
 ):
     """Run FLA KDA while respecting the CUDA grid-z launch limit.
 
@@ -409,6 +416,7 @@ def fla_kda(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             kernel_kwargs=kernel_kwargs,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
 
     max_blocks_per_launch = max(1, _CUDA_MAX_GRID_DIM_Z // int(q.shape[2]))
@@ -559,7 +567,7 @@ def _scan_row_states(
     return stacked[inverse]
 
 
-def scan_kda_context_states(
+def scan_kda_context_states_rowwise(
     kda_fn: Callable,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -572,7 +580,13 @@ def scan_kda_context_states(
     *,
     group_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Recurrent state after the context positions strictly before each anchor.
+    """Row-by-row reference of :func:`scan_kda_context_states` (one launch chain per row).
+
+    Kept as the exactness oracle for the batched implementation; it issues
+    ``rows * (num_groups + group)`` launches with per-launch gathers and a
+    host sync per row, which is what made the scan launch-bound in training.
+
+    Recurrent state after the context positions strictly before each anchor.
 
     ``k``/``v`` are the convolved context projections ``[B, S, H, D]``,
     ``raw_gate`` ``[B, S, H, D]`` and ``beta`` ``[B, S, H]`` the context gates,
@@ -607,6 +621,329 @@ def scan_kda_context_states(
             )
         )
     return torch.stack(rows, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# Batched context scan: one launch chain for all rows, host-side layout
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ScanLaunch:
+    """One variable-length KDA launch of the two-level scan, fully described on the host."""
+
+    length: int  # padded token count (multiple of _FLA_CHUNK_SIZE)
+    real: int  # real sequences; the rest are one-token dummies feeding the zero slot
+    cu_seqlens_cpu: torch.Tensor  # [padded_sequences + 1], CPU long
+    cu_seqlens: torch.Tensor  # same, on the compute device
+    state_in: torch.Tensor  # [padded_sequences] pool slots feeding initial states
+    out_slots: torch.Tensor  # [real] pool slots receiving the final states
+
+
+@dataclass
+class ScanLayout:
+    """Host-precomputed launch plan of the two-level anchor scan for one micro-batch.
+
+    Built once per forward from ``anchor_positions`` (one device->host copy) and
+    shared by every context-scanning KDA layer, so the layers themselves issue
+    no host syncs and no per-launch index arithmetic. Parameter-free, hence
+    safe to build outside the FSDP units.
+    """
+
+    batch_size: int
+    context_len: int
+    num_anchors: int
+    group: int
+    num_slots: int
+    level1: list
+    level2: list
+    index1: torch.Tensor  # device long: token gather for all level-1 launches (concatenated)
+    index2: torch.Tensor  # device long: token gather for all level-2 launches (concatenated)
+    gin_slots: torch.Tensor  # device long: level-1 group-input slots ...
+    cur_slots: torch.Tensor  # ... copied into these running slots before level 2
+    anchor_gather: torch.Tensor  # device long [batch * num_anchors] -> row of the collected finals
+    total_finals: int
+
+
+def _pad_launch(
+    sequences: list, zero_index: int
+) -> tuple[list, list, int, int]:
+    """Pad real (start, end, token_base) sequences to FLA's launch buckets.
+
+    Returns ``(token_index_list, cu_seqlens_list, padded_sequences, padded_total)``
+    using the same policy as :func:`_fla_kda_varlen`: a power-of-two sequence
+    count via one-token dummy sequences and a chunk-aligned token count, the
+    last dummy absorbing the remainder. Dummy tokens gather the zero row.
+    """
+
+    lengths = [end - start for start, end, _ in sequences]
+    total = sum(lengths)
+    num_sequences = len(sequences)
+    padded_sequences = 1 << max(num_sequences - 1, 0).bit_length()
+    extra = padded_sequences - num_sequences
+    padded_total = _round_up(total + extra, _FLA_CHUNK_SIZE)
+    if padded_total > total and extra == 0:
+        padded_sequences *= 2
+        extra = padded_sequences - num_sequences
+        padded_total = _round_up(total + extra, _FLA_CHUNK_SIZE)
+    index: list[int] = []
+    for start, end, base in sequences:
+        index.extend(range(base + start, base + end))
+    index.extend([zero_index] * (padded_total - total))
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    for j in range(extra):
+        cu.append(total + j + 1 if j < extra - 1 else padded_total)
+    if extra == 0:
+        assert padded_total == total
+    return index, cu, padded_sequences, padded_total
+
+
+def build_scan_layout(
+    anchor_positions: torch.Tensor,
+    context_len: int,
+    device: torch.device,
+    *,
+    group_size: Optional[int] = None,
+) -> ScanLayout:
+    """Plan the two-level anchor scan for ``anchor_positions`` ``[B, N]``.
+
+    Rows are cut at their unique sorted anchors into segments; ``group``
+    consecutive segments form a group. Level 1 chains the group spans of every
+    row in ``max_groups`` launches (one launch per group index, all rows
+    together); level 2 advances the in-group offsets of every group of every
+    row in ``group`` launches. Exactly the launches of the row-wise scheme,
+    batched across rows, with the launch plan computed here on the host.
+    """
+
+    anchors = anchor_positions.detach().to("cpu", torch.long).clamp(0, int(context_len))
+    batch_size, num_anchors = anchors.shape
+    rows_unique = [sorted(set(anchors[r].tolist())) for r in range(batch_size)]
+    num_segments = [len(u) for u in rows_unique]
+    max_segments = max(num_segments) if num_segments else 0
+    group = int(group_size) if group_size else max(1, math.isqrt(max(max_segments, 1)))
+    num_groups = [-(-m // group) for m in num_segments]
+    max_groups = max(num_groups) if num_groups else 0
+
+    # Pool slots: 0 = zero state; gin(r, g) for g >= 1; cur(r, g) for all g.
+    next_slot = 1
+    gin: list[list[int]] = []
+    cur: list[list[int]] = []
+    for r in range(batch_size):
+        gin.append([0] + [next_slot + i for i in range(max(num_groups[r] - 1, 0))])
+        next_slot += max(num_groups[r] - 1, 0)
+        cur.append([next_slot + i for i in range(num_groups[r])])
+        next_slot += num_groups[r]
+    num_slots = next_slot
+    zero_index = batch_size * context_len  # the appended zero row of the flattened context
+
+    finals_row: dict = {}  # (row, segment) -> row index in the concatenated finals
+    total_finals = 0
+    level1: list = []
+    index1: list[int] = []
+    for g in range(max_groups):
+        seqs, state_in, out_slots, owners = [], [], [], []
+        for r in range(batch_size):
+            if g >= num_groups[r]:
+                continue
+            bounds = [0] + rows_unique[r]
+            start = bounds[g * group]
+            last = min((g + 1) * group, num_segments[r]) - 1
+            end = bounds[last + 1]
+            if end <= start:
+                continue  # empty group span (only possible for anchor 0 alone)
+            seqs.append((start, end, r * context_len))
+            state_in.append(gin[r][g])
+            out_slots.append(gin[r][g + 1] if g + 1 < num_groups[r] else cur[r][g])
+            owners.append((r, last))
+        if not seqs:
+            continue
+        index, cu, padded_sequences, padded_total = _pad_launch(seqs, zero_index)
+        state_in += [0] * (padded_sequences - len(seqs))
+        for owner in owners:
+            finals_row[owner] = total_finals
+            total_finals += 1
+        index1.extend(index)
+        level1.append(
+            _ScanLaunch(
+                length=padded_total,
+                real=len(seqs),
+                cu_seqlens_cpu=torch.tensor(cu, dtype=torch.long),
+                cu_seqlens=torch.tensor(cu, dtype=torch.long, device=device),
+                state_in=torch.tensor(state_in, dtype=torch.long, device=device),
+                out_slots=torch.tensor(out_slots, dtype=torch.long, device=device),
+            )
+        )
+    # Level-1 launches write the *next* group's input; a group that is the row's
+    # last writes into its own running slot, which level 2 never reads for that
+    # group's last segment, so the value is only collected as a final.
+
+    level2: list = []
+    index2: list[int] = []
+    for offset in range(group):
+        seqs, state_in, out_slots, owners = [], [], [], []
+        for r in range(batch_size):
+            bounds = [0] + rows_unique[r]
+            for g in range(num_groups[r]):
+                segment = g * group + offset
+                last = min((g + 1) * group, num_segments[r]) - 1
+                if segment > last or segment == last:
+                    continue
+                start, end = bounds[segment], bounds[segment + 1]
+                if end <= start:
+                    continue  # anchor 0: state before it is the zero state
+                seqs.append((start, end, r * context_len))
+                state_in.append(cur[r][g])
+                out_slots.append(cur[r][g])
+                owners.append((r, segment))
+        if not seqs:
+            continue
+        index, cu, padded_sequences, padded_total = _pad_launch(seqs, zero_index)
+        state_in += [0] * (padded_sequences - len(seqs))
+        for owner in owners:
+            finals_row[owner] = total_finals
+            total_finals += 1
+        index2.extend(index)
+        level2.append(
+            _ScanLaunch(
+                length=padded_total,
+                real=len(seqs),
+                cu_seqlens_cpu=torch.tensor(cu, dtype=torch.long),
+                cu_seqlens=torch.tensor(cu, dtype=torch.long, device=device),
+                state_in=torch.tensor(state_in, dtype=torch.long, device=device),
+                out_slots=torch.tensor(out_slots, dtype=torch.long, device=device),
+            )
+        )
+
+    # Every anchor maps to the final state of its segment; anchor 0 (an empty
+    # segment) maps to the zero row appended after the collected finals.
+    gather: list[int] = []
+    for r in range(batch_size):
+        position = {anchor: i for i, anchor in enumerate(rows_unique[r])}
+        for anchor in anchors[r].tolist():
+            segment = position[anchor]
+            gather.append(finals_row.get((r, segment), total_finals))
+    gin_slots = [slot for r in range(batch_size) for slot in gin[r]]
+    cur_slots = [slot for r in range(batch_size) for slot in cur[r]]
+    as_index = lambda values: torch.tensor(values, dtype=torch.long, device=device)
+    return ScanLayout(
+        batch_size=batch_size,
+        context_len=int(context_len),
+        num_anchors=num_anchors,
+        group=group,
+        num_slots=num_slots,
+        level1=level1,
+        level2=level2,
+        index1=as_index(index1),
+        index2=as_index(index2),
+        gin_slots=as_index(gin_slots),
+        cur_slots=as_index(cur_slots),
+        anchor_gather=as_index(gather),
+        total_finals=total_finals,
+    )
+
+
+def scan_kda_context_states(
+    kda_fn: Callable,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_gate: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: Optional[float],
+    anchor_positions: torch.Tensor,
+    *,
+    group_size: Optional[int] = None,
+    layout: Optional[ScanLayout] = None,
+) -> torch.Tensor:
+    """Recurrent state after the context positions strictly before each anchor.
+
+    Same contract and the same launches as :func:`scan_kda_context_states_rowwise`
+    (``k``/``v`` ``[B, S, H, D]``, ``raw_gate`` ``[B, S, H, D]``, ``beta``
+    ``[B, S, H]``, ``anchor_positions`` ``[B, N]`` -> fp32 ``[B, N, H, K, V]``),
+    but all rows share one launch chain, token gathers are one ``index_select``
+    plus ``split`` per level, states live in one pool updated out of place, and
+    the launch plan comes from a :class:`ScanLayout` built once on the host.
+    """
+
+    batch_size, context_len = k.shape[:2]
+    if anchor_positions.shape[0] != batch_size:
+        raise ValueError(
+            "anchor_positions must carry one row per context row, got "
+            f"{tuple(anchor_positions.shape)} for {batch_size} rows"
+        )
+    if layout is None:
+        layout = build_scan_layout(
+            anchor_positions, context_len, k.device, group_size=group_size
+        )
+    elif (layout.batch_size, layout.context_len, layout.num_anchors) != (
+        batch_size,
+        int(context_len),
+        int(anchor_positions.shape[1]),
+    ):
+        raise ValueError(
+            "scan layout does not match the context/anchor shapes: "
+            f"layout=({layout.batch_size}, {layout.context_len}, {layout.num_anchors}) "
+            f"vs ({batch_size}, {context_len}, {anchor_positions.shape[1]})"
+        )
+    num_heads, key_dim = k.shape[2], k.shape[3]
+    value_dim = v.shape[3]
+
+    def flatten(tensor: torch.Tensor) -> torch.Tensor:
+        flat = tensor.reshape(batch_size * context_len, *tensor.shape[2:])
+        return torch.cat((flat, flat.new_zeros((1, *flat.shape[1:]))), dim=0)
+
+    k_flat, v_flat, g_flat, b_flat = (flatten(t) for t in (k, v, raw_gate, beta))
+    pool = k.new_zeros(
+        (layout.num_slots, num_heads, key_dim, value_dim), dtype=torch.float32
+    )
+    max_length = max(
+        [launch.length for launch in layout.level1 + layout.level2] or [0]
+    )
+    # The recurrent state does not depend on queries; one zero buffer serves
+    # every launch as a view.
+    zero_q = k.new_zeros((1, max_length, num_heads, key_dim))
+    finals: list[torch.Tensor] = []
+    for level, index, launches in (
+        (1, layout.index1, layout.level1),
+        (2, layout.index2, layout.level2),
+    ):
+        if not launches:
+            continue
+        if level == 2:
+            pool = pool.index_copy(
+                0, layout.cur_slots, pool.index_select(0, layout.gin_slots)
+            )
+        lengths = [launch.length for launch in launches]
+        ks, vs, gs, bs = (
+            torch.split(t.index_select(0, index), lengths, dim=0)
+            for t in (k_flat, v_flat, g_flat, b_flat)
+        )
+        for i, launch in enumerate(launches):
+            initial_state = pool.index_select(0, launch.state_in)
+            _, final_state = kda_fn(
+                zero_q[:, : launch.length],
+                ks[i].unsqueeze(0),
+                vs[i].unsqueeze(0),
+                gs[i].unsqueeze(0),
+                bs[i].unsqueeze(0),
+                A_log,
+                dt_bias,
+                lower_bound,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=launch.cu_seqlens,
+                cu_seqlens_cpu=launch.cu_seqlens_cpu,
+            )
+            real = final_state[: launch.real]
+            pool = pool.index_copy(0, launch.out_slots, real)
+            finals.append(real)
+    zero_row = pool[:1]
+    collected = torch.cat(finals + [zero_row], dim=0)
+    states = collected.index_select(0, layout.anchor_gather)
+    return states.view(batch_size, layout.num_anchors, num_heads, key_dim, value_dim)
 
 
 def _gather_left_rows(
@@ -807,6 +1144,7 @@ class Qwen3DFlashKDAAttention(Qwen3DFlashAttentionBase):
         anchor_positions: Optional[torch.Tensor],
         batch_size: int,
         num_blocks: int,
+        scan_layout: Optional[ScanLayout] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-block initial states and left conv rows for block-parallel use."""
 
@@ -838,6 +1176,7 @@ class Qwen3DFlashKDAAttention(Qwen3DFlashAttentionBase):
             self.dt_bias,
             self.lower_bound,
             anchors,
+            layout=scan_layout if anchor_positions is not None else None,
         )
         left_rows = _gather_left_rows(target_hidden, anchors, window)
         return states, left_rows
@@ -883,6 +1222,7 @@ class Qwen3DFlashKDAAttention(Qwen3DFlashAttentionBase):
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         anchor_positions: Optional[torch.Tensor] = None,
+        scan_layout: Optional[ScanLayout] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Dense/MLA siblings may use the shared cache during SpecForge decode.
@@ -892,7 +1232,7 @@ class Qwen3DFlashKDAAttention(Qwen3DFlashAttentionBase):
 
         blocks, batch_size, query_len = self._independent_blocks(hidden_states)
         if not self.scans_context:
-            del target_hidden, past_key_values, anchor_positions
+            del target_hidden, past_key_values, anchor_positions, scan_layout
             q = self.q_conv1d(self.q_proj(blocks))
             k = self.k_conv1d(self.k_proj(blocks))
             v = self.v_conv1d(self.v_proj(blocks))
@@ -908,7 +1248,7 @@ class Qwen3DFlashKDAAttention(Qwen3DFlashAttentionBase):
             left_rows = tail.unsqueeze(1).expand(-1, num_blocks, -1, -1)
         else:
             states, left_rows = self._anchor_context(
-                target_hidden, anchor_positions, batch_size, num_blocks
+                target_hidden, anchor_positions, batch_size, num_blocks, scan_layout
             )
         initial_state = states.reshape(
             block_count, self.num_heads, self.head_dim, self.head_dim
@@ -925,6 +1265,9 @@ __all__ = [
     "Qwen3DFlashKDAAttention",
     "fla_kda",
     "reference_kda",
+    "ScanLayout",
+    "build_scan_layout",
     "scan_kda_context_states",
+    "scan_kda_context_states_rowwise",
     "validate_dflash_kda_config",
 ]

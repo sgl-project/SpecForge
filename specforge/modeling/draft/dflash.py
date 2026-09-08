@@ -700,6 +700,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
         anchor_positions: Optional[torch.Tensor] = None,
+        scan_layout: Optional[object] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -707,8 +708,10 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         attention_kwargs = dict(kwargs)
         if getattr(self.self_attn, "uses_anchor_positions", False):
             # Only recurrent layers need to know where each proposal block
-            # starts; dense attention learns that from the mask.
+            # starts; dense attention learns that from the mask. The scan
+            # layout is the host-precomputed launch plan shared by all of them.
             attention_kwargs["anchor_positions"] = anchor_positions
+            attention_kwargs["scan_layout"] = scan_layout
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -938,6 +941,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        scan_layout = self._build_scan_layout(
+            target_hidden, anchor_positions, past_key_values
+        )
         for layer_type, layer in zip(self.layer_types, self.layers):
             layer_attention_mask = (
                 attention_mask[layer_type]
@@ -953,9 +959,37 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
                 anchor_positions=anchor_positions,
+                scan_layout=scan_layout,
                 **kwargs,
             )
         return self.norm(hidden_states)
+
+    def _build_scan_layout(
+        self,
+        target_hidden: torch.Tensor,
+        anchor_positions: Optional[torch.Tensor],
+        past_key_values: Optional[Cache],
+    ):
+        """One host-side launch plan for every context-scanning KDA layer.
+
+        Parameter-free, so it may run outside the per-layer FSDP units; the
+        single ``anchor_positions`` device->host copy replaces one sync per
+        (row, layer) inside the layers. Generation keeps its running state and
+        needs no plan.
+        """
+
+        if anchor_positions is None or past_key_values is not None:
+            return None
+        if not any(
+            getattr(getattr(layer, "self_attn", None), "scans_context", False)
+            for layer in self.layers
+        ):
+            return None
+        from .kda import build_scan_layout
+
+        return build_scan_layout(
+            anchor_positions, target_hidden.shape[1], target_hidden.device
+        )
 
     def reset_recurrent_state(self) -> None:
         """Drop per-request state that recurrent attention keeps across steps."""
