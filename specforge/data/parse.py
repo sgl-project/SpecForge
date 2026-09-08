@@ -7,9 +7,16 @@ from typing import Dict, List, Tuple
 import torch
 from transformers import PreTrainedTokenizer
 
+from .encoders.deepseek_v4 import encode_messages as encode_deepseek_v4_messages
 from .template import ChatTemplate
 
-__all__ = ["GeneralParser", "GLMParser", "HarmonyParser", "ThinkingParser"]
+__all__ = [
+    "DeepSeekV4Parser",
+    "GeneralParser",
+    "GLMParser",
+    "HarmonyParser",
+    "ThinkingParser",
+]
 
 
 class Parser(ABC):
@@ -122,6 +129,8 @@ _harmony_encoding = None
 
 class GeneralParser(Parser):
 
+    allow_chat_template_fallback = True
+
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
@@ -134,8 +143,6 @@ class GeneralParser(Parser):
         self.set_assistant_pattern(chat_template)
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
-        if self.chat_template.jinja_chat_template is not None:
-            kwargs.setdefault("chat_template", self.chat_template.jinja_chat_template)
         conversation = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -144,6 +151,10 @@ class GeneralParser(Parser):
             **kwargs,
         )
         return conversation
+
+    @staticmethod
+    def _prepare_system_message(message: dict) -> dict:
+        return {"role": "system", "content": message["content"]}
 
     def set_assistant_pattern(self, chat_template: ChatTemplate):
         if chat_template.assistant_pattern_type == "longcat":
@@ -205,9 +216,7 @@ class GeneralParser(Parser):
                 warnings.warn(
                     f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
                 )
-                messages.append(
-                    {"role": "system", "content": conversation[0]["content"]}
-                )
+                messages.append(self._prepare_system_message(conversation[0]))
                 conversation = conversation[1:]
             else:
                 if self.system_prompt:
@@ -244,6 +253,8 @@ class GeneralParser(Parser):
             try:
                 conversation = self.apply_chat_template(messages, tool=tool, **kwargs)
             except (ValueError, TypeError):
+                if not self.allow_chat_template_fallback:
+                    raise
                 # Fallback rendering for tokenizers without built-in chat_template
                 warnings.warn(
                     "Tokenizer does not have a chat_template, using fallback rendering."
@@ -480,8 +491,6 @@ class ThinkingParser(GeneralParser):
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         """Apply chat template to all messages, handling reasoning_content and tool_calls."""
-        if self.chat_template.jinja_chat_template is not None:
-            kwargs.setdefault("chat_template", self.chat_template.jinja_chat_template)
         # See GeneralParser.apply_chat_template: pass `None` rather than an empty
         # list so templates don't enter tool-use mode when there are no tools.
         conversation = self.tokenizer.apply_chat_template(
@@ -508,6 +517,90 @@ class ThinkingParser(GeneralParser):
             kwargs["enable_thinking"] = True
         return super().parse(
             conversation, max_length, preformatted, train_only_last_turn, tool, **kwargs
+        )
+
+
+class DeepSeekV4Parser(ThinkingParser):
+    """Render DeepSeek-V4 conversations with its official Python encoder."""
+
+    allow_chat_template_fallback = False
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        chat_template: ChatTemplate,
+    ):
+        super().__init__(tokenizer, chat_template)
+        self.standard_keys.update(
+            {
+                "content_blocks",
+                "mask",
+                "response_format",
+                "task",
+                "tools",
+                "wo_eos",
+            }
+        )
+
+    def _sanitize_message(self, message: dict) -> dict:
+        cleaned = {k: v for k, v in message.items() if k in self.standard_keys}
+        tool_calls = cleaned.get("tool_calls")
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except json.JSONDecodeError:
+                warnings.warn(
+                    "Failed to parse tool_calls JSON string, removing tool_calls"
+                )
+                cleaned.pop("tool_calls", None)
+                return cleaned
+
+        if isinstance(tool_calls, list):
+            sanitized_tool_calls = []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                arguments = function.get("arguments", "{}")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                sanitized_tool_calls.append(
+                    {
+                        "id": tool_call.get("id", ""),
+                        "type": tool_call.get("type", "function"),
+                        "function": {
+                            "name": function.get("name", ""),
+                            "arguments": arguments,
+                        },
+                    }
+                )
+            cleaned["tool_calls"] = sanitized_tool_calls
+
+        return cleaned
+
+    def _prepare_system_message(self, message: dict) -> dict:
+        return self._sanitize_message(message)
+
+    def apply_chat_template(self, messages, tool, **kwargs) -> str:
+        messages = [dict(message) for message in messages]
+        if tool:
+            for message in messages:
+                if message["role"] in ("system", "developer"):
+                    message.setdefault("tools", tool)
+                    break
+            else:
+                messages.insert(0, {"role": "system", "content": "", "tools": tool})
+
+        enable_thinking = kwargs.pop("enable_thinking", False)
+        return encode_deepseek_v4_messages(
+            messages,
+            thinking_mode="thinking" if enable_thinking else "chat",
+            context=kwargs.pop("context", None),
+            drop_thinking=kwargs.pop("drop_thinking", True),
+            add_default_bos_token=kwargs.pop("add_default_bos_token", True),
+            reasoning_effort=kwargs.pop("reasoning_effort", None),
         )
 
 

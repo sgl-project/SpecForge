@@ -14,8 +14,6 @@ class ChatTemplate(BaseModel):
         system_prompt(str): The system prompt.
         end_of_turn_token(str): The end token of a turn of conversation.
         ignore_token(List[str]): The list of tokens to ignore when parsing the model output, e.g., for thinking token.
-        jinja_chat_template(str): Jinja template applied instead of the tokenizer's
-            own, for checkpoints that ship no chat template.
     """
 
     assistant_header: Optional[str] = None
@@ -26,7 +24,6 @@ class ChatTemplate(BaseModel):
     assistant_pattern_type: str = "general"
     enable_thinking: bool = False
     ignore_token: Optional[List[str]] = None
-    jinja_chat_template: Optional[str] = None
 
 
 class TemplateRegistry:
@@ -316,58 +313,6 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
-# DeepSeek-V4 ships a Python reference encoder rather than tokenizer Jinja.  The
-# training recipe uses its system/user/assistant ShareGPT subset.  Keep that
-# subset explicit here: chat mode suppresses reasoning, while thinking mode
-# retains reasoning only for the assistant turn after the final user message,
-# matching the reference encoder's default drop_thinking behavior.  Tool and
-# task messages need the reference encoder's DSML preprocessing and therefore
-# fail loudly instead of being rendered incorrectly.
-DEEPSEEK_V4_CHAT_TEMPLATE = r"""
-{%- if tools is defined and tools -%}
-    {{- raise_exception('The DeepSeek-V4 training template does not support tools') -}}
-{%- endif -%}
-{%- set state = namespace(last_user_index=-1) -%}
-{%- for message in messages -%}
-    {%- if message['role'] == 'user' -%}
-        {%- set state.last_user_index = loop.index0 -%}
-    {%- endif -%}
-{%- endfor -%}
-{{- '<｜begin▁of▁sentence｜>' -}}
-{%- for message in messages -%}
-    {%- set role = message['role'] -%}
-    {%- set content = message['content'] | default('', true) -%}
-    {%- if role == 'system' -%}
-        {{- content -}}
-    {%- elif role == 'user' -%}
-        {{- '<｜User｜>' + content -}}
-    {%- elif role == 'assistant' -%}
-        {%- if message['tool_calls'] is defined and message['tool_calls'] -%}
-            {{- raise_exception('The DeepSeek-V4 training template does not support tool calls') -}}
-        {%- endif -%}
-        {{- '<｜Assistant｜>' -}}
-        {%- if (enable_thinking | default(false)) and loop.index0 > state.last_user_index -%}
-            {{- '<think>' -}}
-            {{- message['reasoning_content'] | default('', true) -}}
-        {%- endif -%}
-        {{- '</think>' + content + '<｜end▁of▁sentence｜>' -}}
-    {%- else -%}
-        {{- raise_exception(
-            'The DeepSeek-V4 training template does not support role: ' ~ role
-        ) -}}
-    {%- endif -%}
-{%- endfor -%}
-{%- if add_generation_prompt | default(false) -%}
-    {{- '<｜Assistant｜>' -}}
-    {%- if enable_thinking | default(false) -%}
-        {{- '<think>' -}}
-    {%- else -%}
-        {{- '</think>' -}}
-    {%- endif -%}
-{%- endif -%}
-"""
-
-
 TEMPLATE_REGISTRY.register(
     name="deepseek-v4",
     template=ChatTemplate(
@@ -375,9 +320,8 @@ TEMPLATE_REGISTRY.register(
         user_header="<｜User｜>",
         system_prompt=None,
         end_of_turn_token="<｜end▁of▁sentence｜>",
-        parser_type="thinking",
+        parser_type="deepseek-v4",
         enable_thinking=False,
-        jinja_chat_template=DEEPSEEK_V4_CHAT_TEMPLATE,
     ),
 )
 
