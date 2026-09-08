@@ -7,7 +7,7 @@
 #   every token pick the same 10 experts and the balance loss merely move all
 #   tokens to another 10. Exact centering removes it by construction; the EMA
 #   mean is folded into gate.bias at export.
-# - 4-sample micro-batches (batch_size 4 x accumulation 16 x 4 ranks = 512): halves the
+# - 4-sample micro-batches (batch_size 4 x accumulation 16 x 4 ranks = **256** — NOT 512; accumulation should have been 32. Left as run; one epoch = 4,958 steps): halves the
 #   per-step FSDP all-gather/copy overhead again vs v2 (bs2), which the bs2 profile showed
 #   dominating over math; sglang_max_running_requests stays 2 per capture server.
 #   halves the per-sample FSDP all-gathers (0.25 s vs 0.33 s per sample) for

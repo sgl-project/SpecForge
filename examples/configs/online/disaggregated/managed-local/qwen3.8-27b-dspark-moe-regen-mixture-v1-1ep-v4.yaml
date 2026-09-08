@@ -1,9 +1,7 @@
-# Qwen3.8-27B DSpark MoE drafter, ONE epoch (4,958 steps at global batch 256 — see note below), single node, managed_local:
-# 4 TP1 capture servers (GPUs 0-3) + 4-rank FSDP trainer (GPUs 4-7) with 4-sample micro-batches
-# (batch_size 4 x accumulation 16 x 4 ranks = **256** — NOT 512; accumulation should have been 32. Left as run; one epoch = 4,958 steps). Same drafter/optimizer as v2 (router centering,
-# aux 0.001); bs4 halves the per-step FSDP all-gather/copy overhead that dominated v2's 44 s steps.
-# Chosen over the two-node layout because cross-node Mooncake TCP reads cap at ~0.3 GiB/s per rank.
-# Launch: outputs/launch/launch-moe-3ep-on-103.sh qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3  (any idle node)
+# Qwen3.8-27B DSpark MoE drafter, ONE epoch at global batch **512** (2,479 steps): batch_size 4 x accumulation 32 x 4 ranks.
+# Corrected successor of the -1ep-v3 recipe, which ran at global batch 256 (accumulation 16) by mistake.
+# Otherwise identical (configs/qwen3.8-27b-dspark-moe-v2.json, router centering, aux 0.001, FULL_SHARD + offload).
+# Launch: scripts/launch/launch-moe-managed-local.sh qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v4
 model:
   target_model_path: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
   draft_model_config: /personal/SpecForge-qwen38-moe/configs/qwen3.8-27b-dspark-moe-v2.json
@@ -31,7 +29,7 @@ training:
   strategy: dspark
   num_epochs: 1
   batch_size: 4
-  accumulation_steps: 16
+  accumulation_steps: 32
   fsdp_sharding: FULL_SHARD
   optimizer_cpu_offload: true
   learning_rate: 0.0005
@@ -54,8 +52,8 @@ training:
 tracking:
   report_to: wandb
   wandb_project: specforge-qwen38-ablation
-  wandb_name: qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3-b200-dp4
-  wandb_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3/wandb
+  wandb_name: qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v4-b200-dp4
+  wandb_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v4/wandb
 runtime:
   producer_lease: 8
   producer_concurrency: 8
@@ -64,16 +62,16 @@ runtime:
   resident_high_watermark_bytes: 322122547200
   resident_low_watermark_bytes: 214748364800
   feature_store_max_resident_bytes: 408021893120
-run_id: qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3
-output_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3
+run_id: qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v4
+output_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v4
 deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
     nproc_per_node: 4
   disaggregated:
-    control_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3/control
-    consumer_state_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3/consumer-state
+    control_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v4/control
+    consumer_state_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v4/consumer-state
     backend: mooncake
     client_buffer_size: 1073741824
     managed_local:

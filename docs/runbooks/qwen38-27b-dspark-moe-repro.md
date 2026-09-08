@@ -39,7 +39,7 @@ Self-contained notes for another session. Everything referenced lives on the sha
   `moe_preset: qwen3_5_moe`, `moe_router_center: sample` (momentum 0.99), `moe_aux_loss_coeff: 0.001`, `moe_dispatch: grouped_mm`.
   20.8B total / 1.08B active parameters.
 - Recipe `examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3.yaml`:
-  1 epoch = 2,479 optimizer steps at global batch 512 (4 ranks x batch_size 4 x accumulation 16), lr 5e-4 constant after 4%
+  **1 epoch = 4,958 optimizer steps at global batch 256** (4 ranks x batch_size 4 x accumulation 16 — an error: 512 needs accumulation 32; the corrected recipe is `...-1ep-v4.yaml`), lr 5e-4 constant after 4%
   warmup, FULL_SHARD + `optimizer_cpu_offload`, dist_timeout 15 (minutes), 4 TP1 NVFP4 capture servers on GPUs 0-3 (triton
   attention, 2 running requests, 32k pool, 100 GiB Mooncake segment each) and the 4-rank trainer on GPUs 4-7, in-flight
   768/512, resident caps 300/200/380 GiB. W&B project `specforge-qwen38-ablation`.
@@ -54,8 +54,7 @@ Self-contained notes for another session. Everything referenced lives on the sha
   ```
   Output: `outputs/<run_id>/launch.log` (step lines every 10 steps incl. `train/moe/*` router metrics and `train/perf/*`),
   `control/logs/{capture-server-*,mooncake}.log`, checkpoints `<run_id>-step{500,1000,...}` (272 GB each, 3 kept) and a final one.
-- Expected numbers (2026-09-08, .102): 22-23 s/step, peak 128 GB allocated per rank, data wait ~1 s, `experts_unused_frac` ~0,
-  train/acc 0.55-0.57 at the end of the epoch; ~15.5 h total.
+- Measured (2026-09-08, .102): 22-23 s per 256-sample step (i.e. the same ~0.09 s/sample as the bs2 v2 run at 512 — bs4 bought no per-sample speedup), peak 128 GB allocated per rank, data wait ~1 s, `experts_unused_frac` ~0, train/acc 0.55-0.57 around step 2400 (half the epoch); ~31 h for the full 4,958-step epoch.
 - Managed_local cannot resume (`training.resume_from` is rejected) and a resumed producer would re-capture the trained prefix, so
   treat runs as restart-from-scratch; stop a run only right after a `step N+10` line following a checkpoint (SIGTERM during a save
   leaves `*.pt.tmp` only).
