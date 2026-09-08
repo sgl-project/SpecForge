@@ -47,7 +47,7 @@ specforge train --config examples/configs/online/disaggregated/external/qwen3-8b
 `model.draft_model_config` may name a local JSON file, a local model directory,
 or a Hugging Face repository. Fresh EAGLE3, P-EAGLE, and DFlash runs may omit it
 and derive the draft architecture from the target; see the
-[training guide](../../docs/basic_usage/training.md#draft-configuration-and-model-initialization)
+[training guide](../../docs/sections/basic_usage/training.md#draft-configuration-and-model-initialization)
 for layer/block overrides and the distinction between weights-only
 `model.draft_checkpoint_path` and full `training.resume_from`.
 
@@ -475,8 +475,8 @@ specforge train -c ./my-run.yaml \
 ```
 
 For deeper lifecycle and recovery semantics, see the
-[training guide](../../docs/basic_usage/training.md) and
-[disaggregated training guide](../../docs/basic_usage/disaggregated_training.md).
+[training guide](../../docs/sections/basic_usage/training.md) and
+[disaggregated training guide](../../docs/sections/basic_usage/disaggregated_training.md).
 
 ## Capability matrix
 

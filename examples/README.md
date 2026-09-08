@@ -47,13 +47,13 @@ delegates to `specforge train`. The
 cluster-provided node rank to the same CLI's producer or consumer role. Launch
 topology remains in YAML. The complete
 environment contract is in the [disaggregated training
-guide](../docs/basic_usage/disaggregated_training.md).
+guide](../docs/sections/basic_usage/disaggregated_training.md).
 
 Offline feature training supports EAGLE3, DFlash, Domino, and DSpark, including
 local and disaggregated consumers. Optional config sections provide
 offline evaluation with `<run_id>-best` selection, compact teacher
 projection for offline text EAGLE3, and W&B, TensorBoard, SwanLab, or MLflow
-tracking. See the [training guide](../docs/basic_usage/training.md) for the full
+tracking. See the [training guide](../docs/sections/basic_usage/training.md) for the full
 capability matrix, ROCm installation, and Ascend NPU/HCCL launch example.
 
 Offline colocated and offline disaggregated resume are supported.

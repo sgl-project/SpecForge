@@ -1,0 +1,70 @@
+/* SpecForge brand palette (derived from the logo blues). */
+:root {
+  --sf-blue-1: #2b8fd0;
+  --sf-blue-2: #4fb3e6;
+  --sf-blue-3: #7fd0f2;
+
+  --vp-c-brand-1: #1f7fc0;
+  --vp-c-brand-2: #2b8fd0;
+  --vp-c-brand-3: #4fb3e6;
+  --vp-c-brand-soft: rgba(43, 143, 208, 0.14);
+
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #1f7fc0 20%, #5cc3ef);
+  --vp-home-hero-image-background-image: linear-gradient(-45deg, #2b8fd0 40%, #7fd0f2 60%);
+  --vp-home-hero-image-filter: blur(44px);
+}
+
+.dark {
+  --vp-c-brand-1: #5cc3ef;
+  --vp-c-brand-2: #4fb3e6;
+  --vp-c-brand-3: #2b8fd0;
+  --vp-c-brand-soft: rgba(79, 179, 230, 0.18);
+}
+
+@media (min-width: 640px) {
+  :root { --vp-home-hero-image-filter: blur(56px); }
+}
+@media (min-width: 960px) {
+  :root { --vp-home-hero-image-filter: blur(68px); }
+}
+
+/* Browser surfaces follow the brand: selection, caret, focus rings, scrollbars. */
+::selection {
+  background: var(--vp-c-brand-soft);
+  color: var(--vp-c-text-1);
+}
+input,
+textarea {
+  caret-color: var(--vp-c-brand-1);
+}
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--vp-c-brand-1);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+* {
+  scrollbar-color: var(--vp-c-text-3) transparent;
+  scrollbar-width: thin;
+}
+
+/* Balanced headings and tidy rag in the docs body. */
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3 {
+  text-wrap: balance;
+}
+.vp-doc p,
+.vp-doc li {
+  text-wrap: pretty;
+}
+.vp-doc table {
+  font-variant-numeric: tabular-nums;
+}
+
+/* SpecBundle page: let the model gallery use the full content width. */
+.Layout.sb-page .VPDoc .content,
+.Layout.sb-page .VPDoc:not(.has-sidebar) .content,
+.Layout.sb-page .VPDoc .content-container {
+  max-width: 1152px;
+}

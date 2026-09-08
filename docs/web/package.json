@@ -1,0 +1,22 @@
+{
+  "name": "specforge-docs",
+  "private": true,
+  "version": "1.0.0",
+  "description": "SpecForge documentation site (VitePress)",
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview",
+    "update-specbundle": "python3 scripts/update_specbundle.py"
+  },
+  "devDependencies": {
+    "markdown-it-mathjax3": "^4.3.2",
+    "vitepress": "^1.6.3",
+    "vue": "^3.5.24"
+  },
+  "dependencies": {
+    "echarts": "^6.1.0",
+    "vue-echarts": "^8.3.0"
+  }
+}

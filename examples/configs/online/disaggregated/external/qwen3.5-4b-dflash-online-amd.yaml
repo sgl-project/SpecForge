@@ -2,7 +2,7 @@
 # The producer/consumer stream target features live through Mooncake. Launch the
 # patched capture server with AITER + --disable-radix-cache (Qwen3.5-4B is a hybrid
 # Mamba target); the trainer runs on ROCm unchanged (flex_attention).
-# See docs/basic_usage/AMD/amd_rocm.md, Section 4.
+# See docs/sections/basic_usage/AMD/amd_rocm.md, Section 4.
 model:
   target_model_path: "Qwen/Qwen3.5-4B"
   draft_model_config: "configs/qwen3.5-4b-dflash.json"
