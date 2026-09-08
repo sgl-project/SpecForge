@@ -15,8 +15,10 @@ The flow is the standard disaggregated setup
   with `--spec-capture-method dspark`. The generic DFlash capture is not
   equivalent for V4: the inter-layer residual is the widened mHC tensor, so
   capture must use the model's own `set_dspark_layers_to_capture` hook.
-- **Chat template**: the checkpoint ships no Jinja chat template, so the
-  recipe uses the bundled `deepseek-v4` registry template.
+- **Chat template**: the checkpoint ships a Python reference encoder rather
+  than tokenizer Jinja. The bundled `deepseek-v4` template implements its
+  system/user/assistant ShareGPT subset in non-thinking mode; tool/agent data
+  must be pre-rendered with the reference encoder instead.
 - **B200 MoE**: `--moe-runner-backend flashinfer_mxfp4` (the routed experts
   are fp4; the default MoE path cannot run them), with
   `FLASHINFER_USE_CUDA_NORM=1 FLASHINFER_USE_CUDA_QUANT=1` exported to work
