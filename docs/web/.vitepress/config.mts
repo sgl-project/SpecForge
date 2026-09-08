@@ -39,7 +39,7 @@ const repo = 'https://github.com/sgl-project/SpecForge'
 export default defineConfig({
   title: 'SpecForge',
   description:
-    'SpecForge is the SGLang-native framework for training speculative decoding draft models (EAGLE3, DFlash, DSpark, Domino).',
+    'SpecForge is the SGLang-native framework for training speculative decoding draft models (EAGLE3, P-EAGLE, DFlash, DFlash2, DSpark, Domino, MTP).',
   base: '/SpecForge/',
   lang: 'en-US',
   lastUpdated: true,

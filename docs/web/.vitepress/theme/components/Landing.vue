@@ -88,8 +88,8 @@ const p = (path: string) => withBase(path + '.html')
             <span class="sf-accent">Forge Draft Models</span> for Speculative Decoding
           </h1>
           <p class="sf-sub">
-            SpecForge is the SGLang-native framework for training EAGLE3, DFlash, DSpark and Domino
-            draft models. Train once, export once, serve at speed.
+            SpecForge is the SGLang-native framework for training EAGLE3, P-EAGLE, DFlash, DFlash2,
+            DSpark, Domino and MTP draft models. Train once, export once, serve at speed.
           </p>
           <div class="sf-actions">
             <a class="sf-btn sf-btn-brand" :href="p('/get_started/installation')">Get Started <span aria-hidden="true">→</span></a>
