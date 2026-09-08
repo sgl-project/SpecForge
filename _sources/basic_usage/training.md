@@ -495,7 +495,7 @@ checked-in environment before installing SpecForge:
 
 ```bash
 python -m pip install -r requirements-rocm.txt
-python -m pip install -e .
+python -m pip install -e . --no-deps
 ```
 
 Use a model/backend combination supported by that PyTorch ROCm environment;
