@@ -19,12 +19,12 @@ const features = [
   {
     title: 'SGLang-ready',
     icon: 'M13 3 4 14h6l-1 7 9-11h-6l1-7Z',
-    text: 'Draft models trained with SpecForge export straight into SGLang serving. No porting scripts, no method-specific conversion.',
+    text: 'Draft models trained with SpecForge export straight into SGLang serving. Most methods use specforge export; MTP merges via scripts/merge_mtp_to_base.py.',
   },
   {
     title: 'Every draft family',
     icon: 'M4 6h16M4 12h10M4 18h7M19 15v6m-3-3h6',
-    text: 'EAGLE3, P-EAGLE, DFlash, DFlash2, DSpark and Domino drafts all train through one runtime with shared data, evaluation and export.',
+    text: 'EAGLE3, P-EAGLE, DFlash, DFlash2, DSpark, Domino and MTP drafts all train through one runtime with shared data, evaluation and export.',
   },
   {
     title: 'Any scale, any accelerator',
@@ -40,7 +40,7 @@ const steps = [
   { title: 'Export and serve', text: 'Run <code>specforge export</code> and launch SGLang with the draft for faster decoding.', link: '/get_started/about' },
 ]
 
-const methods = ['EAGLE3', 'P-EAGLE', 'DFlash', 'DFlash2', 'DSpark', 'Domino']
+const methods = ['EAGLE3', 'P-EAGLE', 'DFlash', 'DFlash2', 'DSpark', 'Domino', 'MTP']
 const hardware = ['NVIDIA GPUs', 'AMD GPUs', 'Ascend NPUs']
 const families = ['Llama', 'Qwen', 'Kimi', 'DeepSeek', 'GLM', 'gpt-oss', 'Step', 'Ling', 'Inkling']
 
