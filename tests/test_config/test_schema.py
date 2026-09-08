@@ -325,6 +325,22 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "trainer role"):
             Config.model_validate(producer_payload)
 
+    def test_capture_server_gpu_put_requires_an_rdma_transport(self):
+        payload = _managed_local_payload(ep_size=1)
+        managed = payload["deployment"]["disaggregated"]["managed_local"]
+        managed["capture_servers"][0]["gpu_put"] = True
+        with self.assertRaisesRegex(ValidationError, "rdma"):
+            Config.model_validate(payload)
+        managed["mooncake"] = {"protocol": "rdma", "rdma_devices": "mlx5_0"}
+        cfg = Config.model_validate(payload)
+        server = cfg.deployment.disaggregated.managed_local.capture_servers[0]
+        self.assertTrue(server.gpu_put)
+        managed["capture_servers"][0].pop("gpu_put")
+        cfg = Config.model_validate(payload)
+        self.assertFalse(
+            cfg.deployment.disaggregated.managed_local.capture_servers[0].gpu_put
+        )
+
     def test_unknown_backend_rejected(self):
         bad = {**MINIMAL, "model": {**MINIMAL["model"], "target_backend": "vllm"}}
         with self.assertRaises(ValidationError):
