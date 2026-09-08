@@ -807,7 +807,7 @@ class TrainerController:
                     if callable(perf_snapshot):
                         loader = perf_snapshot(reset=True)
                         steps = max(1, perf_window_steps)
-                        batches = max(1.0, loader["fetch_batches"])
+                        samples = max(1.0, loader["fetch_samples"])
                         log_metrics.update(
                             {
                                 "perf/data_wait_producer_s": (
@@ -817,7 +817,7 @@ class TrainerController:
                                     loader["wait_fetch_s"] / steps
                                 ),
                                 "perf/fetch_seconds_per_sample": (
-                                    loader["fetch_s"] / batches
+                                    loader["fetch_s"] / samples
                                 ),
                                 "perf/fetch_delivered_gib_per_s": (
                                     loader["fetch_bytes"]

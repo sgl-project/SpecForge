@@ -81,6 +81,19 @@ class _FakeMooncakeStore:
         return 0
 
 
+class _ScriptedGetStore(_FakeMooncakeStore):
+    def __init__(self, statuses):
+        super().__init__()
+        self.statuses = list(statuses)
+        self.get_calls = 0
+
+    def get_into(self, key, ptr, size):
+        self.get_calls += 1
+        if self.statuses:
+            return self.statuses.pop(0)
+        return super().get_into(key, ptr, size)
+
+
 def _phys_resident(fake, sid="s0", store_id="run0"):
     """Do any per-tensor objects for the sample remain in the fake?"""
     prefix = f"{store_id}/{sid}/"
@@ -116,6 +129,74 @@ def _store(**kw):
 
 
 class TestMooncakeFeatureStore(unittest.TestCase):
+    def test_get_retries_only_explicit_transient_statuses(self):
+        fake = _ScriptedGetStore([-800, -707])
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        with mock.patch(
+            "specforge.runtime.data_plane.mooncake_store.time.sleep"
+        ) as sleep:
+            out, _ = fs.get(ref, names=["hidden_state"])
+
+        self.assertIn("hidden_state", out)
+        self.assertEqual(fake.get_calls, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2.0, 4.0])
+        health = fs.health()
+        self.assertEqual(health["quarantined_buffers"], 2)
+        self.assertGreater(health["quarantined_bytes"], 0)
+
+    def test_get_does_not_retry_permanent_status(self):
+        fake = _ScriptedGetStore([-704])
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.mooncake_store.time.sleep"
+            ) as sleep,
+            self.assertRaisesRegex(KeyError, "status -704"),
+        ):
+            fs.get(ref, names=["hidden_state"])
+
+        self.assertEqual(fake.get_calls, 1)
+        sleep.assert_not_called()
+        self.assertEqual(fs.health()["quarantined_buffers"], 1)
+
+    def test_get_quarantines_final_failed_attempt(self):
+        fake = _ScriptedGetStore([-800, -800, -800, -800])
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.mooncake_store.time.sleep"
+            ) as sleep,
+            self.assertRaisesRegex(KeyError, "status -800"),
+        ):
+            fs.get(ref, names=["hidden_state"])
+
+        self.assertEqual(fake.get_calls, 4)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list], [2.0, 4.0, 8.0]
+        )
+        self.assertEqual(fs.health()["quarantined_buffers"], 4)
+
+    def test_get_quarantine_is_bounded(self):
+        fake = _ScriptedGetStore([-800])
+        fs = MooncakeFeatureStore(
+            store=fake,
+            store_id="run0",
+            max_quarantined_bytes=0,
+        )
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        with self.assertRaisesRegex(MemoryError, "quarantine exceeded"):
+            fs.get(ref, names=["hidden_state"])
+
+        self.assertEqual(fake.get_calls, 1)
+        self.assertEqual(fs.health()["quarantined_buffers"], 1)
+
     def test_drain_interfaces_share_retry_defaults(self):
         groups = (
             (
