@@ -28,7 +28,7 @@ data:
   chat_template: qwen3.5
   cache_dir: /personal/SpecForge-qwen38/cache/qwen3.8-27b-regen-mixture-v1
   build_dataset_num_proc: 64
-  dataloader_num_workers: 16
+  dataloader_num_workers: 48
 training:
   strategy: dspark
   num_epochs: 1
@@ -61,10 +61,10 @@ tracking:
 runtime:
   producer_lease: 8
   producer_concurrency: 24
-  in_flight_high_watermark: 1024
-  in_flight_low_watermark: 512
-  resident_high_watermark_bytes: 483183820800
-  resident_low_watermark_bytes: 322122547200
+  in_flight_high_watermark: 1536
+  in_flight_low_watermark: 1024
+  resident_high_watermark_bytes: 515396075520
+  resident_low_watermark_bytes: 386547056640
   feature_store_max_resident_bytes: 601295421440
 run_id: qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-2node
 output_dir: /personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-2node

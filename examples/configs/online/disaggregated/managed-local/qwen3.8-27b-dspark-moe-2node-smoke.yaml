@@ -21,7 +21,7 @@ data:
   chat_template: qwen3.5
   cache_dir: /personal/SpecForge-qwen38/cache/qwen3.8-27b-regen-mixture-v1
   build_dataset_num_proc: 64
-  dataloader_num_workers: 16
+  dataloader_num_workers: 48
 training:
   strategy: dspark
   num_epochs: 1
