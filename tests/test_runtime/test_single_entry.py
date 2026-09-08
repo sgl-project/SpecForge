@@ -23,6 +23,7 @@ from specforge.training.assembly import TrainingRun
 from specforge.training.disaggregated import (
     _ONLINE_CONTROL_SUFFIXES,
     _claim_fresh_control_path,
+    _mooncake_store,
     build_disaggregated_run,
 )
 
@@ -104,6 +105,33 @@ class TestTrainingRunLifecycle(unittest.TestCase):
     def test_producer_executor_cannot_take_trainer_hooks(self):
         with self.assertRaisesRegex(ValueError, "hooks belong to trainer-bearing"):
             TrainingRun(execute=lambda: 1, on_finally=lambda: None)
+
+    def test_mooncake_quarantine_budget_comes_from_typed_runtime(self):
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"hidden_states_path": "/features"},
+                "runtime": {"feature_store_max_quarantined_bytes": 1234},
+            }
+        )
+        feature_store = object()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "MOONCAKE_METADATA_SERVER": "http://metadata",
+                    "MOONCAKE_MASTER_SERVER_ADDR": "127.0.0.1:50051",
+                },
+                clear=False,
+            ),
+            mock.patch(
+                "specforge.runtime.data_plane.mooncake_store.MooncakeFeatureStore",
+                return_value=feature_store,
+            ) as constructor,
+        ):
+            self.assertIs(_mooncake_store(cfg), feature_store)
+
+        self.assertEqual(constructor.call_args.kwargs["max_quarantined_bytes"], 1234)
 
     def test_disaggregated_producer_requires_fresh_attempt_path(self):
         import tempfile

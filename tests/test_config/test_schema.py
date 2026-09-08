@@ -578,6 +578,7 @@ class ConfigSchemaTest(unittest.TestCase):
                     "resident_high_watermark_bytes": 4096,
                     "resident_low_watermark_bytes": 2048,
                     "feature_store_max_resident_bytes": 8192,
+                    "feature_store_max_quarantined_bytes": 16384,
                 },
             }
         )
@@ -585,6 +586,11 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertEqual(cfg.profiling.num_steps, 5)
         self.assertEqual(cfg.runtime.producer_concurrency, 3)
         self.assertEqual(cfg.runtime.in_flight_low_watermark, 16)
+        self.assertEqual(cfg.runtime.feature_store_max_quarantined_bytes, 16384)
+        self.assertEqual(
+            Config.model_validate(MINIMAL).runtime.feature_store_max_quarantined_bytes,
+            8 << 30,
+        )
 
         invalid_runtime = (
             {"producer_concurrency": 0},
@@ -601,6 +607,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 "resident_high_watermark_bytes": 10,
                 "feature_store_max_resident_bytes": 9,
             },
+            {"feature_store_max_quarantined_bytes": -1},
         )
         for runtime in invalid_runtime:
             with self.subTest(runtime=runtime), self.assertRaises(ValidationError):

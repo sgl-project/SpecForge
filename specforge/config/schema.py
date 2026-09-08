@@ -204,6 +204,7 @@ class RuntimeConfig(StrictConfigModel):
     resident_high_watermark_bytes: Optional[int] = Field(default=None, gt=0)
     resident_low_watermark_bytes: Optional[int] = Field(default=None, ge=0)
     feature_store_max_resident_bytes: Optional[int] = Field(default=None, gt=0)
+    feature_store_max_quarantined_bytes: int = Field(default=8 << 30, ge=0)
 
     @model_validator(mode="after")
     def _validate_watermarks(self):

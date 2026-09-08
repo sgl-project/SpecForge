@@ -416,6 +416,7 @@ unless tuning throughput or memory pressure.
 | `runtime.resident_high_watermark_bytes` | `null` | Optional byte-level pause threshold. |
 | `runtime.resident_low_watermark_bytes` | `null` | Optional byte-level resume threshold; requires and cannot exceed the resident high watermark. |
 | `runtime.feature_store_max_resident_bytes` | `null` | Optional hard store budget; it cannot be smaller than the resident high watermark. |
+| `runtime.feature_store_max_quarantined_bytes` | `8589934592` | Per-process Mooncake receive-buffer quarantine limit; exceeding it fails loudly. |
 
 ### `tracking`: experiment logging
 
