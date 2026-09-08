@@ -225,6 +225,6 @@ Use `specforge train -c run.yaml --plan` to inspect the resolved role and
 process commands without starting workers. Secret-looking override values and
 URL userinfo are redacted.
 
-See the [disaggregated training guide](../../docs/basic_usage/disaggregated_training.md)
+See the [disaggregated training guide](../../docs/sections/basic_usage/disaggregated_training.md)
 for service prerequisites, recovery rules, and the online/offline data-plane
 contracts.

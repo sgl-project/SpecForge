@@ -1,3 +1,11 @@
+---
+title: Kimi K3 DSpark Disaggregated
+description: Move the four-node colocated Kimi K3 continual run to one TP8 capture node and one four-rank trainer node without changing the draft architecture or training schedule.
+target: moonshotai/Kimi-K3
+method: DSpark
+topology: Disaggregated
+---
+
 # Kimi K3 DSpark disaggregated reproduction
 
 This recipe migrates the prior four-node colocated Kimi K3 continual run
