@@ -814,10 +814,10 @@ index 5c4f3ff44a..c40bcc6c42 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000000..91bf321f5d
+index 0000000..37692fd
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,455 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -845,8 +845,9 @@ index 0000000000..91bf321f5d
 +"aux_layer_ids", "features": {name: {"shape", "dtype"}}}``.
 +
 +Mooncake connection uses the standard ``MOONCAKE_*`` env vars (see
-+``MooncakeFeatureStore``). ``SGLANG_SPEC_CAPTURE_GPU_PUT=1`` publishes the
-+captured tensors from device memory (RDMA/NVLink transports only).
++``MooncakeFeatureStore``). CUDA capture uses device publication on RDMA by
++default. ``SGLANG_SPEC_CAPTURE_GPU_PUT=0`` selects host publication; ``1``
++explicitly enables device publication and requires RDMA.
 +"""
 +
 +from __future__ import annotations
@@ -883,8 +884,16 @@ index 0000000000..91bf321f5d
 +
 +
 +def gpu_put_enabled() -> bool:
-+    enabled = os.environ.get("SGLANG_SPEC_CAPTURE_GPU_PUT", "0") == "1"
-+    if enabled and os.environ.get("MOONCAKE_PROTOCOL", "tcp") != "rdma":
++    protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp")
++    configured = os.environ.get("SGLANG_SPEC_CAPTURE_GPU_PUT")
++    if configured is None:
++        return (
++            protocol == "rdma"
++            and torch.version.cuda is not None
++            and torch.cuda.is_available()
++        )
++    enabled = configured == "1"
++    if enabled and protocol != "rdma":
 +        raise ValueError(
 +            "SGLANG_SPEC_CAPTURE_GPU_PUT=1 requires MOONCAKE_PROTOCOL=rdma"
 +        )
@@ -1253,6 +1262,10 @@ index 0000000000..91bf321f5d
 +    """
 +    global _SINK
 +    if getattr(server_args, "enable_spec_capture", False) and _SINK is None:
++        logger.info(
++            "Spec capture Mooncake publication uses %s tensors",
++            "device" if gpu_put_enabled() else "host",
++        )
 +        _SINK = SpecCaptureSink(
 +            aux_layer_ids=getattr(server_args, "spec_capture_aux_layer_ids", None)
 +        )

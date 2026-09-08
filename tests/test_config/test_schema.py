@@ -337,7 +337,7 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertTrue(server.gpu_put)
         managed["capture_servers"][0].pop("gpu_put")
         cfg = Config.model_validate(payload)
-        self.assertFalse(
+        self.assertIsNone(
             cfg.deployment.disaggregated.managed_local.capture_servers[0].gpu_put
         )
 

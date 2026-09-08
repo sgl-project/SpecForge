@@ -328,8 +328,8 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
-    #: Publish device snapshots through RDMA; CUDA memory must be registerable.
-    gpu_put: bool = False
+    #: None selects CUDA publication on RDMA in the capture worker.
+    gpu_put: Optional[bool] = None
 
     @model_validator(mode="after")
     def _validate_devices(self):
@@ -442,7 +442,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: a bounded pool of page-locked, once-registered host buffers and copies to
     #: the device on a side stream; ``cuda`` keeps the pool on the trainer device
     #: for device reads (Mooncake 0.3.x stages these through its client buffer).
-    receive_buffers: Literal["pageable", "pinned", "cuda"] = "pageable"
+    receive_buffers: Literal["pageable", "pinned", "cuda"] = "pinned"
     #: Retained receive-pool budget per rank; excludes output copies and overflow.
     receive_pool_bytes: int = Field(default=8 << 30, gt=0)
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
