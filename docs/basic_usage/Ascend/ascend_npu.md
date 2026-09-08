@@ -185,6 +185,32 @@ Notes specific to DFlash 2 on Ascend:
 - **Serving the export** still requires an SGLang build with DFlash 2 support
   (SGLang PR #35371); training-side capture is unchanged.
 
+### Training Domino drafts
+
+Domino reuses the same external Mooncake + SGLang capture flow and the DFlash
+capture contract (`--spec-capture-method dflash`), but its auxiliary layer IDs
+differ. Restart the capture server with the Domino
+`--spec-capture-aux-layer-ids` from `configs/qwen3.5-4b-domino.json`:
+`3 11 19 27 31`. A mismatch with the DFlash IDs above produces zero features.
+Use the checked-in
+[`qwen3.5-4b-domino-online-npu.yaml`](../../../examples/configs/online/disaggregated/external/qwen3.5-4b-domino-online-npu.yaml)
+recipe:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=1,2,3,4,5,6,7,8 \
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-domino-online-npu.yaml
+```
+
+Notes specific to Domino on Ascend:
+
+- **`draft_model_config` is required** (already set to
+  `configs/qwen3.5-4b-domino.json` in the recipe). Domino needs projector/head
+  metadata and will not derive a fresh draft config.
+- **`attention_backend: sdpa` is mandatory** (already set in the recipe), for
+  the same Ascend reason as DFlash / DFlash 2.
+- Clear stale control state before reruns:
+  `rm -rf outputs/qwen3.5-4b-domino-npu-online`.
+
 ---
 
 ## 4. Managed-local full stack (one command)
