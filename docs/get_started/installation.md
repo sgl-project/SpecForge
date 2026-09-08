@@ -57,7 +57,8 @@ forms on AMD Instinct GPUs, follow the
 
 Install the vendor-matched PyTorch and `torch_npu` packages first, then install
 SpecForge. The checked-in
-[`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml)
+[`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml),
+[`qwen3.5-4b-dflash2-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-online-npu.yaml),
 and
 [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-domino-online-npu.yaml)
 recipes use external SGLang server capture with SDPA consumers. Install a
