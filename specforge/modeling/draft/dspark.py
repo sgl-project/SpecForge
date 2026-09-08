@@ -343,9 +343,8 @@ class DSparkDraftModel(DFlashDraftModel):
     def _init_draft_head(self, config) -> None:
         dspark_config = resolve_dflash_variant_config(config, "dspark_config")
         self.markov_head = build_markov_head(config, dspark_config)
-        confidence_alpha = float(dspark_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(
-            dspark_config.get("enable_confidence_head", confidence_alpha > 0.0)
+            dspark_config.get("enable_confidence_head", False)
         )
         self.confidence_head_with_markov = bool(
             dspark_config.get("confidence_head_with_markov", False)

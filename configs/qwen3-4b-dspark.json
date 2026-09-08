@@ -18,7 +18,6 @@
   "dspark_config": {
     "markov_rank": 256,
     "markov_head_type": "vanilla",
-    "confidence_head_alpha": 1.0,
     "enable_confidence_head": true,
     "confidence_head_with_markov": true
   },
