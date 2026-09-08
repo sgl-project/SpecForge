@@ -354,7 +354,8 @@ class DFlash2DraftModel(DFlashDraftModel):
             mlp_conv=grouped_conv(),
         )
 
-    def _init_draft_head(self, config: Qwen3Config, dflash_config: dict) -> None:
+    def _init_draft_head(self, config: Qwen3Config) -> None:
+        dflash_config = getattr(config, "dflash_config", {})
         selector_rank = dflash_config.get("selector_rank")
         selector_top_k = dflash_config.get("selector_top_k")
         if not isinstance(selector_rank, int) or isinstance(selector_rank, bool):

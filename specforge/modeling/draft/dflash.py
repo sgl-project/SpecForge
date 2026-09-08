@@ -39,6 +39,15 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
+def resolve_dflash_variant_config(config, variant_config_name: str) -> dict:
+    """Return a variant's config, falling back to the DFlash section."""
+
+    variant_config = getattr(config, variant_config_name, None)
+    if variant_config is not None:
+        return variant_config
+    return getattr(config, "dflash_config", None) or {}
+
+
 def resolve_dflash_attention_layout(
     config: Qwen3Config,
 ) -> tuple[tuple[str, ...], Optional[int]]:
@@ -719,7 +728,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
-        self._init_draft_head(config, dflash_config)
+        self._init_draft_head(config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
 
@@ -733,8 +742,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         return self.decoder_layer_class(config, layer_idx, kernels)
 
-    def _init_draft_head(self, config, dflash_config: dict) -> None:
-        del config, dflash_config
+    def _init_draft_head(self, config) -> None:
+        del config
 
     def apply_logits_head(
         self,

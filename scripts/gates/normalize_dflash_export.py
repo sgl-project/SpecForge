@@ -127,10 +127,17 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
         )
 
     if projector_type == "dspark":
-        _normalize_dspark(config, method_config)
+        dspark_config = config.get("dspark_config")
+        if dspark_config is None:
+            dspark_config = method_config
+        _normalize_dspark(config, dspark_config)
     elif _DFLASH2_ARCHITECTURE in (config.get("architectures") or []):
         _normalize_dflash2(config, method_config)
     else:
+        domino_config = config.get("domino_config")
+        if projector_type == "domino" and domino_config is not None:
+            method_config.update(domino_config)
+            config["dflash_config"] = method_config
         config["architectures"] = ["DFlashDraftModel"]
     config.pop("auto_map", None)
     with path.open("w", encoding="utf-8") as handle:
