@@ -322,6 +322,7 @@ The checked-in examples are the canonical starting points:
 | Domino | Online disaggregated, external | [`qwen3-8b-domino-online.yaml`](../../examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) |
 | Domino | Online disaggregated, managed-local | [`qwen3-8b-domino-multiserver-disaggregated.yaml`](../../examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
 | Domino | Offline colocated | [`qwen3-8b-domino-offline.yaml`](../../examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) |
+| Domino (Ascend) | Online disaggregated, external | [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-domino-online-npu.yaml) |
 | DSpark | Online disaggregated, external | [`qwen3-4b-dspark-disaggregated.yaml`](../../examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) |
 | DSpark | Offline colocated | [`qwen3-4b-dspark-offline.yaml`](../../examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) |
 | DFlash (Ascend) | Online disaggregated, external | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml) |
