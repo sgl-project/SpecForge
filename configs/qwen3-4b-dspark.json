@@ -13,7 +13,9 @@
     "attention_mode": "gqa",
     "mask_token_id": 151669,
     "target_layer_ids": [1, 9, 17, 25, 33],
-    "projector_type": "dspark",
+    "projector_type": "dspark"
+  },
+  "dspark_config": {
     "markov_rank": 256,
     "markov_head_type": "vanilla",
     "confidence_head_alpha": 1.0,
