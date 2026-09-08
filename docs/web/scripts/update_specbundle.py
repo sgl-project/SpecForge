@@ -35,7 +35,10 @@ OUTPUT = Path(__file__).resolve().parents[2] / "data" / "specbundle_models.json"
 METHOD_PATTERNS = [
     ("DSpark", re.compile(r"dspark", re.I)),
     ("Domino", re.compile(r"domino", re.I)),
+    ("DFlash2", re.compile(r"dflash2", re.I)),
     ("DFlash", re.compile(r"dflash", re.I)),
+    ("MTP", re.compile(r"mtp", re.I)),
+    ("P-EAGLE", re.compile(r"p-?eagle|peagle", re.I)),
     ("EAGLE3", re.compile(r"eagle-?3|eagle", re.I)),
 ]
 

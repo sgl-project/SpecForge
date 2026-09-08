@@ -206,7 +206,7 @@ array:
 | `id`                 | Hugging Face repo id of the draft model                                  |
 | `name`               | the part of `id` after the slash                                         |
 | `provider.name`      | Hugging Face account; `fullname` is the display name, `avatar` may be `null` |
-| `method`             | `EAGLE3`, `DFlash`, `DSpark`, `Domino` or `Other`                        |
+| `method`             | `EAGLE3`, `P-EAGLE`, `DFlash`, `DFlash2`, `DSpark`, `Domino`, `MTP` or `Other` |
 | `target`             | Hugging Face id of the model the draft was trained for                   |
 | `dataset`            | regenerated training dataset on Hugging Face, or `null`                  |
 | counters             | `downloads`, `likes`, `numParameters`, `lastModified` may be left at `0` / `null`; the page refreshes them from Hugging Face in the browser |

@@ -35,7 +35,7 @@ interface Model {
 
 type SortKey = 'downloads' | 'likes' | 'recent' | 'name'
 
-const METHOD_ORDER = ['EAGLE3', 'DFlash', 'DSpark', 'Domino', 'Other']
+const METHOD_ORDER = ['EAGLE3', 'P-EAGLE', 'DFlash', 'DFlash2', 'DSpark', 'Domino', 'MTP', 'Other']
 
 const models = ref<Model[]>(snapshot.models as Model[])
 const updated = ref<string>(snapshot.updated)
@@ -53,7 +53,10 @@ function detectMethod(id: string): string {
   const s = id.toLowerCase()
   if (s.includes('dspark')) return 'DSpark'
   if (s.includes('domino')) return 'Domino'
+  if (s.includes('dflash2')) return 'DFlash2'
   if (s.includes('dflash')) return 'DFlash'
+  if (s.includes('mtp')) return 'MTP'
+  if (s.includes('peagle') || s.includes('p-eagle')) return 'P-EAGLE'
   if (s.includes('eagle')) return 'EAGLE3'
   return 'Other'
 }
@@ -528,9 +531,11 @@ function clear() {
   background: var(--vp-c-text-3);
 }
 .mg-method[data-method='EAGLE3'] { background: #1f7fc0; }
-.mg-method[data-method='DFlash'] { background: #7c3aed; }
+.mg-method[data-method='P-EAGLE'] { background: #4f46e5; }
+.mg-method[data-method='DFlash'], .mg-method[data-method='DFlash2'] { background: #7c3aed; }
 .mg-method[data-method='DSpark'] { background: #d97706; }
 .mg-method[data-method='Domino'] { background: #059669; }
+.mg-method[data-method='MTP'] { background: #db2777; }
 
 .mg-title {
   margin: 0;
