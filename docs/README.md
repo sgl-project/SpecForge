@@ -165,7 +165,7 @@ sidebar.
    | `title`       | card title on the Recipes page and the sidebar entry         |
    | `description` | card text                                                    |
    | `target`      | Hugging Face id of the target model, shown on the card       |
-   | `method`      | `EAGLE3`, `DFlash`, `DFlash2`, `DSpark` or `Domino`; colors the tag |
+   | `method`      | `EAGLE3`, `DFlash`, `DFlash2`, `DSpark`, `Domino` or `MTP`; colors the tag |
    | `topology`    | free text such as `Disaggregated` or `Colocated`             |
 
 3. Build or run the dev server. The card and the sidebar entry are generated
