@@ -711,6 +711,7 @@ class TestPackageArchitecture(unittest.TestCase):
         self.assertEqual(
             set(dspark_configs),
             {
+                "deepseek-v4-flash-dspark-moe.json",
                 "deepseek-v4-flash-dspark.json",
                 "glm-5.2-dspark.json",
                 "inkling-dspark.json",
