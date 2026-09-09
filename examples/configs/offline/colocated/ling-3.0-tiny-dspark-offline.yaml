@@ -1,0 +1,38 @@
+model:
+  target_model_path: inclusionAI/Ling-3.0-tiny
+  draft_model_config: configs/ling-3.0-tiny-dspark.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.word_embeddings.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/ling-3.0-tiny-dspark
+  max_length: 4096
+  chat_template: ling-3.0
+  cache_dir: ./cache
+
+training:
+  strategy: dspark
+  num_epochs: 20
+  batch_size: 1
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  # Ling-3.0's 157k vocabulary makes the anchor loss the peak allocation of the
+  # step; 128 anchors keeps it inside a 24GB card. Raise it on larger GPUs.
+  num_anchors: 128
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+run_id: ling-3.0-tiny-dspark-offline
+output_dir: ./outputs/ling-3.0-tiny-dspark-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

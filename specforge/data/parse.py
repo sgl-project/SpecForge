@@ -610,3 +610,18 @@ class GLMParser(GeneralParser):
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         kwargs.setdefault("enable_thinking", False)
         return super().apply_chat_template(messages, tool, **kwargs)
+
+
+class LingParser(ThinkingParser):
+    """Render Ling-3.0 (Bailing V3) conversations with thinking turned off.
+
+    The Bailing V3 template defaults to ``thinking_option = 'on'`` when the
+    caller passes nothing, which renders the system line as ``detailed thinking
+    on`` while the data itself carries empty think blocks. Serving with thinking
+    off renders ``detailed thinking off``, so the draft would be trained on a
+    prefix it never sees. Passing the flag explicitly keeps the two consistent.
+    """
+
+    def apply_chat_template(self, messages, tool, **kwargs) -> str:
+        kwargs.setdefault("enable_thinking", False)
+        return super().apply_chat_template(messages, tool, **kwargs)
