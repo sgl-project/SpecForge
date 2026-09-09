@@ -6,6 +6,8 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from unittest import mock
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
@@ -333,6 +335,93 @@ class TestStreamingRefChannel(unittest.TestCase):
         consumer.publish_consumer_quantum(8, allow_existing=True)
         with self.assertRaisesRegex(ValueError, "changed across resume"):
             consumer.publish_consumer_quantum(16, allow_existing=True)
+
+    def test_consumer_quantum_is_invisible_until_the_write_is_synced(self):
+        consumer = StreamingRefChannel(self.path)
+        producer = StreamingRefChannel(self.path)
+        observations = []
+        real_fdopen = os.fdopen
+        real_fsync = os.fsync
+
+        @contextmanager
+        def poll_before_write(fd, *args, **kwargs):
+            with real_fdopen(fd, *args, **kwargs) as stream:
+                # Interleave the producer after file creation, before the
+                # consumer has written any bytes into its buffered stream.
+                observations.append(producer.consumer_quantum())
+                yield stream
+
+        def poll_before_sync(fd):
+            observations.append(producer.consumer_quantum())
+            return real_fsync(fd)
+
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.streaming_ref_channel.os.fdopen",
+                side_effect=poll_before_write,
+            ),
+            mock.patch(
+                "specforge.runtime.data_plane.streaming_ref_channel.os.fsync",
+                side_effect=poll_before_sync,
+            ),
+        ):
+            consumer.publish_consumer_quantum(32)
+
+        self.assertEqual(observations, [None, None])
+        self.assertEqual(producer.consumer_quantum(), 32)
+
+    def test_failed_consumer_quantum_write_leaves_no_claim(self):
+        consumer = StreamingRefChannel(self.path)
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.streaming_ref_channel.os.fsync",
+                side_effect=OSError("injected quantum fsync failure"),
+            ),
+            self.assertRaisesRegex(OSError, "injected quantum fsync failure"),
+        ):
+            consumer.publish_consumer_quantum(32)
+
+        self.assertIsNone(consumer.consumer_quantum())
+        self.assertEqual(os.listdir(self.dir), [])
+        consumer.publish_consumer_quantum(32)
+        self.assertEqual(consumer.consumer_quantum(), 32)
+
+    def test_concurrent_consumers_cannot_replace_the_winning_quantum(self):
+        ready = threading.Barrier(2)
+
+        def publish(quantum):
+            consumer = StreamingRefChannel(self.path)
+            ready.wait(timeout=5)
+            try:
+                consumer.publish_consumer_quantum(quantum)
+            except ValueError:
+                return None
+            return quantum
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            attempts = [pool.submit(publish, quantum) for quantum in (8, 32)]
+            winners = [
+                quantum
+                for attempt in attempts
+                if (quantum := attempt.result(timeout=5)) is not None
+            ]
+
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(StreamingRefChannel(self.path).consumer_quantum(), winners[0])
+        self.assertEqual(
+            os.listdir(self.dir), [os.path.basename(self.path) + ".consumer_quantum"]
+        )
+
+    def test_consumer_quantum_rejects_corrupt_existing_state(self):
+        consumer = StreamingRefChannel(self.path)
+        for value in ("", "invalid", "0", "-1"):
+            with self.subTest(value=value):
+                with open(self.path + ".consumer_quantum", "w") as stream:
+                    stream.write(value)
+                with self.assertRaisesRegex(RuntimeError, "invalid consumer quantum"):
+                    consumer.consumer_quantum()
+                with self.assertRaisesRegex(RuntimeError, "invalid consumer quantum"):
+                    consumer.publish_consumer_quantum(32, allow_existing=True)
 
     def test_queue_get_does_not_advance_consumed_before_explicit_ack(self):
         producer = StreamingRefChannel(self.path)
