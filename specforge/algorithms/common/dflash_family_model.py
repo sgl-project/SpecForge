@@ -505,10 +505,9 @@ class OnlineDFlashModel(nn.Module):
         anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
 
         flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
-        noise_ids[flat_batch_idx, block_starts] = torch.where(
-            block_keep_mask,
-            anchor_tokens,
-            torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
+        # masked_fill with a scalar avoids a pageable H2D copy per microbatch.
+        noise_ids[flat_batch_idx, block_starts] = anchor_tokens.masked_fill(
+            ~block_keep_mask, self.mask_token_id
         )
 
         return self.embed_tokens(noise_ids)
@@ -1946,6 +1945,13 @@ class OnlineDominoModel(OnlineDFlashModel):
             "lambda_base": float(lambda_base),
             "accuracy_denom": accuracy_denom.detach(),
         }
+        # Hand the trainer raw numerator/denominator so gradients are
+        # normalized by the globally reduced token count instead of a
+        # mean of per-rank ratios.
+        metrics["loss_terms"] = (
+            (1.0 - lambda_base) * final_num + lambda_base * base_num,
+            loss_den.detach(),
+        )
         if collect_detailed_metrics:
             block_valid_mask = walk_valid > 0.5
             metrics["accept_len"] = (accept_num / (accept_den + 1e-6)).detach()
@@ -2327,8 +2333,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
             world_size = dist.get_world_size()
             if world_size > 1:
                 dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
-        if float(global_loss_den) <= 0:
-            raise ValueError("DSpark objective has no supervised target tokens")
+        # Device-side assert: a host-side float() here drains the stream per
+        # microbatch right after a collective, serializing all ranks.
+        torch._assert_async(
+            (global_loss_den > 0).any(),
+            "DSpark objective has no supervised target tokens",
+        )
         loss = (
             world_size
             * (

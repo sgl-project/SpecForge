@@ -80,12 +80,28 @@ from specforge.runtime.data_plane.feature_store import (
 logger = logging.getLogger(__name__)
 
 # Defaults for MooncakeDistributedStore.setup(); override via ``setup_kwargs``.
+#: Mooncake ``ErrorCode`` values the store reasons about explicitly.
+MOONCAKE_OBJECT_NOT_FOUND = -704  # remove()/get() on an already-freed key
+MOONCAKE_OBJECT_HAS_LEASE = -706  # remove() during a live read lease
+
 _MOONCAKE_SETUP_DEFAULTS = {
     "global_segment_size": 1 << 30,  # 1 GiB per-node segment
     "local_buffer_size": 1 << 30,
     "protocol": "tcp",  # bring up on TCP; flip to "rdma" once NICs are verified
     "rdma_devices": "",
 }
+
+_GET_RETRY_DELAYS_S = (2.0, 4.0, 8.0)
+# TRANSFER_FAIL and a lease that expired during transfer are retryable with a
+# fresh get_into call. Object/lifecycle errors and short reads are not.
+_RETRYABLE_GET_STATUSES = frozenset({-800, -707})
+_DEFAULT_MAX_QUARANTINED_BYTES = 8 << 30
+
+
+class _MooncakeGetError(KeyError):
+    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class _InjectedReplicateConfig:
@@ -253,6 +269,7 @@ class MooncakeFeatureStore(FeatureStore):
         max_hold_age_s: Optional[float] = None,
         retain_on_release: bool = False,
         max_release_attempts: int = 3,
+        max_quarantined_bytes: int = _DEFAULT_MAX_QUARANTINED_BYTES,
         replica_num: int = 1,
         hard_pin: bool = True,
         clock: Callable[[], float] = time.monotonic,
@@ -272,6 +289,16 @@ class MooncakeFeatureStore(FeatureStore):
             put_config = _InjectedReplicateConfig()
         _require_store_api(store)
         self._store = store
+        if max_quarantined_bytes < 0:
+            raise ValueError("max_quarantined_bytes must be >= 0")
+        self.max_quarantined_bytes = int(max_quarantined_bytes)
+        # Buffers of failed get_into attempts cannot be reused or freed while a
+        # timed-out transfer may still write into them. Bound that quarantine
+        # and fail loudly instead of turning repeated transport failures into
+        # unbounded host-memory growth.
+        self._quarantined_buffers: List[torch.Tensor] = []
+        self._quarantined_bytes = 0
+        self._quarantine_lock = threading.Lock()
         put_config.replica_num = replica_num
         # Prefer true hard pinning when the installed Mooncake supports it.
         # Older ROCm builds expose only `with_soft_pin`; that is a best-effort
@@ -366,6 +393,44 @@ class MooncakeFeatureStore(FeatureStore):
         if rc is not None and int(rc) < 0:
             raise RuntimeError(f"mooncake put_from failed (status {rc}) for {key}")
 
+    def _quarantine_buffer(self, tensor: torch.Tensor) -> None:
+        size = _nbytes(tensor)
+        with self._quarantine_lock:
+            self._quarantined_buffers.append(tensor)
+            self._quarantined_bytes += size
+            if self._quarantined_bytes > self.max_quarantined_bytes:
+                raise MemoryError(
+                    "Mooncake failed-transfer quarantine exceeded "
+                    f"{self.max_quarantined_bytes} bytes; refusing unbounded "
+                    "host-memory growth because an in-flight transfer may still "
+                    "write into each quarantined buffer"
+                )
+
+    def _fetch_tensor(self, key: str, spec) -> torch.Tensor:
+        """Fetch into a fresh buffer and retry only transient status codes."""
+        attempts = len(_GET_RETRY_DELAYS_S) + 1
+        for attempt in range(attempts):
+            dst = _alloc_from_spec(spec)
+            try:
+                self._store_get_tensor(key, dst)
+                return dst
+            except _MooncakeGetError as exc:
+                # Quarantine the final failed attempt too: propagating its
+                # exception must not free storage that a late transfer can use.
+                self._quarantine_buffer(dst)
+                if exc.status not in _RETRYABLE_GET_STATUSES or attempt + 1 == attempts:
+                    raise
+                delay = _GET_RETRY_DELAYS_S[attempt]
+                logger.warning(
+                    "%s; retry %d/%d in %.0fs",
+                    exc,
+                    attempt + 1,
+                    len(_GET_RETRY_DELAYS_S),
+                    delay,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable Mooncake fetch retry state")
+
     def _store_get_tensor(self, key: str, out: torch.Tensor) -> None:
         """Zero-copy fetch into a pre-allocated tensor. Raises KeyError if absent.
 
@@ -384,25 +449,36 @@ class MooncakeFeatureStore(FeatureStore):
                 self._store.unregister_buffer(out.data_ptr())
             except Exception:  # pragma: no cover
                 pass
-        if rc is None or int(rc) < 0:
-            raise KeyError(f"mooncake get_into failed (status {rc}) for {key}")
+        if rc is None:
+            raise _MooncakeGetError(f"mooncake get_into failed (status {rc}) for {key}")
+        status = int(rc)
+        if status < 0:
+            raise _MooncakeGetError(
+                f"mooncake get_into failed (status {status}) for {key}",
+                status=status,
+            )
         # get_into returns the number of bytes read; a full read returns exactly
         # nb. A short read (0 <= rc < nb) would leave the tail of this freshly
         # allocated buffer as uninitialized garbage. Reject it rather than hand
         # the trainer silently-corrupt data (B5: never serve wrong bytes).
-        if int(rc) != nb:
-            raise KeyError(
-                f"mooncake get_into short read for {key}: got {rc} of {nb} bytes"
+        if status != nb:
+            raise _MooncakeGetError(
+                f"mooncake get_into short read for {key}: got {status} of {nb} bytes"
             )
 
     def _store_remove(self, key: str, *, force: bool = False) -> bool:
-        """Best-effort physical free. Returns True on confirmed removal.
+        """Best-effort physical free. Returns True once the key is gone.
 
         Recent Mooncake bindings expose ``remove(key, force=True)`` so a
         lifecycle authority can reclaim an object after all application-level
         leases have closed without waiting for Mooncake's (potentially
         minutes-long) KV lease TTL.  Older bindings only accept ``key``; keep
         those usable and let their normal bounded retry behavior apply.
+
+        ``OBJECT_NOT_FOUND`` is a completed removal, not a failure: a sample's
+        tensors are freed one key at a time, and a retry after a partial free
+        (some keys removed, others still under a read lease) must not keep the
+        sample pending until the bounded drain probes the absent keys.
         """
         try:
             if force:
@@ -414,7 +490,7 @@ class MooncakeFeatureStore(FeatureStore):
                 rc = self._store.remove(key)
         except Exception:  # pragma: no cover - transient RPC failure
             return False
-        return rc is None or int(rc) == 0
+        return rc is None or int(rc) in (0, MOONCAKE_OBJECT_NOT_FOUND)
 
     # -- write -------------------------------------------------------------
     def put(
@@ -650,8 +726,8 @@ class MooncakeFeatureStore(FeatureStore):
                     f"sample {sid} gen {gen} feature {n!r} not available "
                     f"(freed, stale, or never written)"
                 )
-            out[n] = _alloc_from_spec(spec)  # fresh -> clone-on-fetch for free (B5)
-            self._store_get_tensor(key, out[n])
+            # fresh alloc per attempt -> clone-on-fetch for free (B5)
+            out[n] = self._fetch_tensor(key, spec)
         return out, gen
 
     # -- lifetime ----------------------------------------------------------
@@ -955,6 +1031,9 @@ class MooncakeFeatureStore(FeatureStore):
         }
 
     def health(self) -> Dict[str, Any]:
+        with self._quarantine_lock:
+            quarantined_buffers = len(self._quarantined_buffers)
+            quarantined_bytes = self._quarantined_bytes
         with self._lock:
             now = self._clock()
             ages = [now - t for t in self._put_time.values()]
@@ -975,6 +1054,9 @@ class MooncakeFeatureStore(FeatureStore):
                 "avg_age_s": (sum(ages) / len(ages)) if ages else 0.0,
                 "force_freed_total": self._stats["force_freed"],
                 "hard_pin": bool(getattr(self._put_config, "with_hard_pin", False)),
+                "quarantined_buffers": quarantined_buffers,
+                "quarantined_bytes": quarantined_bytes,
+                "max_quarantined_bytes": self.max_quarantined_bytes,
             }
 
 

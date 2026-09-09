@@ -733,6 +733,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss=loss,
             metrics=metrics,
             ratio_metrics=model_metrics.get("ratio_metrics", {}),
+            loss_terms=model_metrics.get("loss_terms"),
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

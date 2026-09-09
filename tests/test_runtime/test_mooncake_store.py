@@ -81,6 +81,19 @@ class _FakeMooncakeStore:
         return 0
 
 
+class _ScriptedGetStore(_FakeMooncakeStore):
+    def __init__(self, statuses):
+        super().__init__()
+        self.statuses = list(statuses)
+        self.get_calls = 0
+
+    def get_into(self, key, ptr, size):
+        self.get_calls += 1
+        if self.statuses:
+            return self.statuses.pop(0)
+        return super().get_into(key, ptr, size)
+
+
 def _phys_resident(fake, sid="s0", store_id="run0"):
     """Do any per-tensor objects for the sample remain in the fake?"""
     prefix = f"{store_id}/{sid}/"
@@ -116,6 +129,74 @@ def _store(**kw):
 
 
 class TestMooncakeFeatureStore(unittest.TestCase):
+    def test_get_retries_only_explicit_transient_statuses(self):
+        fake = _ScriptedGetStore([-800, -707])
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        with mock.patch(
+            "specforge.runtime.data_plane.mooncake_store.time.sleep"
+        ) as sleep:
+            out, _ = fs.get(ref, names=["hidden_state"])
+
+        self.assertIn("hidden_state", out)
+        self.assertEqual(fake.get_calls, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2.0, 4.0])
+        health = fs.health()
+        self.assertEqual(health["quarantined_buffers"], 2)
+        self.assertGreater(health["quarantined_bytes"], 0)
+
+    def test_get_does_not_retry_permanent_status(self):
+        fake = _ScriptedGetStore([-704])
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.mooncake_store.time.sleep"
+            ) as sleep,
+            self.assertRaisesRegex(KeyError, "status -704"),
+        ):
+            fs.get(ref, names=["hidden_state"])
+
+        self.assertEqual(fake.get_calls, 1)
+        sleep.assert_not_called()
+        self.assertEqual(fs.health()["quarantined_buffers"], 1)
+
+    def test_get_quarantines_final_failed_attempt(self):
+        fake = _ScriptedGetStore([-800, -800, -800, -800])
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.mooncake_store.time.sleep"
+            ) as sleep,
+            self.assertRaisesRegex(KeyError, "status -800"),
+        ):
+            fs.get(ref, names=["hidden_state"])
+
+        self.assertEqual(fake.get_calls, 4)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list], [2.0, 4.0, 8.0]
+        )
+        self.assertEqual(fs.health()["quarantined_buffers"], 4)
+
+    def test_get_quarantine_is_bounded(self):
+        fake = _ScriptedGetStore([-800])
+        fs = MooncakeFeatureStore(
+            store=fake,
+            store_id="run0",
+            max_quarantined_bytes=0,
+        )
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        with self.assertRaisesRegex(MemoryError, "quarantine exceeded"):
+            fs.get(ref, names=["hidden_state"])
+
+        self.assertEqual(fake.get_calls, 1)
+        self.assertEqual(fs.health()["quarantined_buffers"], 1)
+
     def test_drain_interfaces_share_retry_defaults(self):
         groups = (
             (
@@ -378,6 +459,53 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         num_features = len(ref.feature_keys)
         self.assertEqual(fake.force_values[:num_features], [False] * num_features)
         self.assertEqual(fake.force_values[num_features:], [True] * num_features)
+
+    def test_retry_treats_already_removed_keys_as_freed(self):
+        """A partially freed sample must not stay pending until the slow drain.
+
+        The first free removes the keys whose read lease has expired and fails
+        on the still-leased ones (-706). The next forced retry then sees -704
+        (OBJECT_NOT_FOUND) for the keys that are already gone; that is a
+        completed removal, not a failure.
+        """
+
+        class PartialLeaseFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.leased = set()
+                self.codes = []
+
+            def remove(self, key, force=False):
+                self.remove_calls += 1
+                if key not in self._d:
+                    rc = -704
+                elif key in self.leased and not force:
+                    rc = -706
+                else:
+                    self._d.pop(key, None)
+                    rc = 0
+                self.codes.append((key, force, rc))
+                return rc
+
+        fake = PartialLeaseFake()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, handle = fs.get(ref)
+        keys = sorted(fake._d)
+        self.assertGreaterEqual(len(keys), 2)
+        fake.leased.add(keys[-1])  # one tensor still under Mooncake's read lease
+
+        fs.release(handle)
+        self.assertEqual(fs.health()["release_pending"], 1)
+        self.assertEqual(len(fake._d), 1)  # the unleased keys were freed
+
+        report = fs.retry_sample_removals(["s0"])
+
+        self.assertEqual(report["removed"], 1)
+        self.assertEqual(report["release_pending"], 0)
+        self.assertEqual(fs.health()["release_pending"], 0)
+        self.assertFalse(_phys_resident(fake))
+        self.assertIn((keys[0], True, -704), fake.codes)
 
     def test_optimizer_ack_forces_only_durable_samples(self):
         class ForceAwareFake(_FakeMooncakeStore):

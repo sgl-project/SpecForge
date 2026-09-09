@@ -204,6 +204,7 @@ class RuntimeConfig(StrictConfigModel):
     resident_high_watermark_bytes: Optional[int] = Field(default=None, gt=0)
     resident_low_watermark_bytes: Optional[int] = Field(default=None, ge=0)
     feature_store_max_resident_bytes: Optional[int] = Field(default=None, gt=0)
+    feature_store_max_quarantined_bytes: int = Field(default=8 << 30, ge=0)
 
     @model_validator(mode="after")
     def _validate_watermarks(self):
@@ -557,6 +558,8 @@ class TrainingConfig(StrictConfigModel):
     #: prompt-heavy data. Falls back to the full-length path for batch > 1 or when
     #: an lk_loss objective is used.
     trim_loss_positions: bool = False
+    #: MTP token positions per lm_head + CE chunk (0 disables chunking).
+    mtp_objective_chunk_size: int = Field(default=4096, ge=0)
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None

@@ -70,6 +70,9 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+docs/web/node_modules/
+docs/web/.vitepress/cache/
+docs/web/.vitepress/dist/
 
 # PyBuilder
 .pybuilder/
