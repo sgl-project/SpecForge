@@ -208,8 +208,8 @@ class TestHFVocabMappingExport(unittest.TestCase):
         reloaded, info = AutoDraftModel.from_pretrained(
             self.output, torch_dtype=torch.float32, output_loading_info=True
         )
-        self.assertEqual(info["missing_keys"], [])
-        self.assertEqual(info["unexpected_keys"], [])
+        self.assertFalse(info["missing_keys"])
+        self.assertFalse(info["unexpected_keys"])
         self.assertEqual(set(saved), set(self.weights))
         reloaded_weights = reloaded.state_dict()
         for key, original in self.weights.items():
