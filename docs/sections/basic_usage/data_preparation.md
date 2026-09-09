@@ -57,7 +57,7 @@ When training speculative decoding draft models for a specific target model, ins
 The regeneration utility uses the OpenAI-compatible client to call SGLang's
 HTTP API. The `openai` package is part of SpecForge's base dependencies, so a
 normal install from the [installation guide](../get_started/installation.md)
-already provides it. If you installed with `--no-deps` (ROCm or Ascend NPU),
+already provides it. If you installed with `--no-deps` (ROCm),
 add it separately:
 
 ```bash

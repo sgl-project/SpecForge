@@ -129,11 +129,41 @@ const lines = computed<string[]>(() => {
     return out
   }
 
-  // ROCm and NPU: the accelerator stack (torch, SGLang) already exists in the
-  // environment, so install SpecForge without dependencies.
+  if (hw === 'npu') {
+    // The npu extra pins a CPU torch plus torch_npu / triton / triton_ascend.
+    // pip does not read [tool.uv.sources], so it needs the PyTorch CPU index
+    // on the command line; uv only needs it for the PyPI release, which
+    // carries no source routing. The NPU build of SGLang, sgl_kernel_npu and
+    // hccl are not on PyPI and must already be installed from the CANN stack.
+    // No --pre: the torch_npu pre-release is an exact pin, and a global --pre
+    // would pull pre-release builds of unrelated packages. Python 3.11 is the
+    // newest interpreter with triton_ascend wheels.
+    const spec = ['npu', ...extras.value].join(',')
+    const index = '--extra-index-url https://download.pytorch.org/whl/cpu'
+    const pipInstall = useUv ? 'uv pip install' : 'pip install'
+    out.push('# On an Ascend host with CANN, an NPU-enabled SGLang and sgl_kernel_npu installed')
+    if (fromSource) {
+      out.push(
+        `git clone ${REPO}`,
+        'cd SpecForge',
+        useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
+        'source .venv/bin/activate',
+        useUv ? `${pipInstall} -e ".[${spec}]"` : `${pipInstall} -e ".[${spec}]" ${index}`
+      )
+    } else {
+      out.push(
+        useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
+        'source .venv/bin/activate',
+        `${pipInstall} "specforge[${spec}]" ${index}`
+      )
+    }
+    return out
+  }
+
+  // ROCm: the accelerator stack (torch, SGLang) already exists in the
+  // container, so install SpecForge without dependencies.
   const pip = useUv ? 'uv pip install --system' : 'python -m pip install'
-  if (hw === 'rocm') out.push('# Run inside the SGLang ROCm release container')
-  if (hw === 'npu') out.push('# After installing torch, torch_npu and an NPU-enabled SGLang for your CANN release')
+  out.push('# Run inside the SGLang ROCm release container')
   if (fromSource) {
     out.push(`git clone ${REPO}`, 'cd SpecForge', `${pip} -e . --no-deps`)
   } else {
@@ -158,7 +188,7 @@ const note = computed(() => {
       }
     case 'npu':
       return {
-        text: 'Install the vendor-matched PyTorch, torch_npu and a compatible SGLang/Mooncake service first. The launcher detects the NPU and selects HCCL.',
+        text: 'The npu extra pins a CPU PyTorch plus torch_npu, triton and triton_ascend from the PyTorch CPU index and PyPI. The NPU build of SGLang, sgl_kernel_npu and hccl come from your CANN stack and must be installed first. The launcher detects the NPU and selects HCCL.',
         link: '/basic_usage/Ascend/ascend_npu',
         label: 'Ascend NPU tutorial',
       }

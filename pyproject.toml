@@ -29,7 +29,6 @@ dependencies = [
     "yunchang",
     "openai-harmony",
     "openai",
-    "sglang==0.5.18",
 ]
 
 [project.scripts]
@@ -40,6 +39,7 @@ include = ["specforge*"]
 
 [project.optional-dependencies]
 cuda = [
+    "sglang==0.5.18",
     "torch==2.13.0",
     "sglang-kernel==0.4.6.post1",
     "mooncake-transfer-engine-cuda13"
@@ -48,12 +48,12 @@ rocm = [
     "torch==2.13.0+rocm7.2",
 ]
 npu = [
+    # The NPU build of SGLang, sgl_kernel_npu and hccl are not on PyPI; they
+    # come from the CANN / SGLang-NPU stack. See docs/sections/basic_usage/Ascend.
     "torch==2.13.0+cpu",
     "torch_npu==2.13.0rc1",
-    "sgl_kernel_npu==2026.5.1",
-    "hccl==0.1.0",
     "triton==3.5.0",
-    "triton_ascend==3.2.1.dev20260530",
+    "triton_ascend==3.2.0",
 ]
 dev = [
     "pre-commit",
