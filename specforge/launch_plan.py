@@ -994,9 +994,7 @@ def _managed_preflight(plan: LaunchPlan) -> None:
                 ) from exc
 
 
-def _http_ready(
-    readiness: ReadinessSpec, *, timeout_s: Optional[float] = None
-) -> bool:
+def _http_ready(readiness: ReadinessSpec, *, timeout_s: Optional[float] = None) -> bool:
     if timeout_s is None:
         timeout_s = readiness.probe_timeout_s
     try:
