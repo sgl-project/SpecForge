@@ -71,9 +71,11 @@ multi-node trainers. By default rank inboxes stay under the shared
 `inbox_server_url` to a private rank-0 HTTP origin: rank 0 keeps the inbox files
 locally and relays only tensor-free references and consumed counters to remote
 ranks. The producer and consumer rank 0 must still resolve `control_dir` to the
-same path. A fresh attempt requires fresh control and consumer-state
-directories. `store_id` defaults to `run_id` and can be set explicitly when the
-Mooncake deployment requires another namespace.
+same path. For online training, its filesystem must support atomic hard links
+so the consumer can publish a complete optimizer-window contract without
+overwriting another consumer's claim. A fresh attempt requires fresh control
+and consumer-state directories. `store_id` defaults to `run_id` and can be set
+explicitly when the Mooncake deployment requires another namespace.
 
 Long producer/consumer waits are unbounded unless `idle_timeout_s`,
 `peer_wait_timeout_s`, or `producer_hold_s` is explicitly configured. This
@@ -213,6 +215,18 @@ The selector runs only on the consumer; capture servers still use
 `--spec-capture-method dflash` and the auxiliary layer IDs from the draft
 config.
 
+The Qwen3.8-27B DFlash2 recipe fills one 8-GPU node: four TP=1 capture servers
+on GPUs 0-3 and a DP4 trainer on GPUs 4-7, with the Mooncake lease, segment
+sizes and in-flight watermarks measured for its 277-500 MB feature payloads.
+Its [recipe page](../../recipes/qwen3.8-27b-dflash2-disaggregated.md) explains
+how to move servers between the two lists for a different GPU generation and
+records the throughput measured on B300 and H200 nodes:
+
+```bash
+specforge train -c \
+  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml
+```
+
 The launcher starts Mooncake first, waits for its metadata and RPC endpoints,
 starts every configured capture server and waits for every health endpoint,
 then starts the existing producer/consumer plan. A service or role failure
@@ -314,6 +328,14 @@ run root. SQLite/WAL and rank inboxes default to the trainer-local
 `/tmp/specforge/$DISAGG_STORE_ID/consumer-state`. Set
 `DISAGG_CONSUMER_STATE_DIR` or `LOCAL_SCRATCH` to select another node-local
 path. This split-state form currently supports one trainer node only.
+
+The same wrapper starts several capture servers on rank 0 when `SERVER_COUNT`
+is set: server `i` owns the `i`-th group of `SERVER_TP` devices from
+`SERVER_GPUS`, listens on `SERVER_PORT + i`, and every server is handed to the
+producer as `deployment.disaggregated.server_urls`.
+`examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh` uses it for eight
+TP1 Qwen3.8-27B capture servers feeding an eight-rank DFlash2 trainer; see its
+[recipe page](../../recipes/qwen3.8-27b-dflash2-disaggregated.md).
 
 ## External and managed-local services
 

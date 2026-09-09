@@ -48,6 +48,22 @@ class TestClipGradNormSingleProcess(unittest.TestCase):
         expected = torch.full((8, 8), 0.1).norm()
         torch.testing.assert_close(norm, expected)
 
+    def test_non_finite_norm_fails_before_optimizer_or_scheduler_advance(self):
+        model, optimizer = _make_optimizer()
+        model_before = model.weight.detach().clone()
+        scheduler_epoch_before = optimizer.scheduler.last_epoch
+        for param in model.parameters():
+            param.grad = torch.full_like(param, float("inf"))
+
+        with self.assertRaisesRegex(FloatingPointError, "non-finite global grad norm"):
+            optimizer.step()
+
+        torch.testing.assert_close(model.weight, model_before)
+        self.assertEqual(optimizer.scheduler.last_epoch, scheduler_epoch_before)
+        self.assertFalse(optimizer.optimizer.state)
+        self.assertTrue(all(param.grad is None for param in optimizer.model_params))
+        self.assertTrue(all(param.grad is None for param in optimizer.fp32_params))
+
     def test_backend_configures_sharded_and_replicated_optimizers(self):
         class RecordingOptimizer:
             def configure_grad_norm_reduction(self, **kwargs):

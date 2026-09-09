@@ -83,6 +83,16 @@ class _DurableQueue(SampleRefQueue):
         super().fail(refs, reason=reason, retryable=retryable)
 
 
+class _RecordingQueue(SampleRefQueue):
+    def __init__(self):
+        super().__init__()
+        self.failures = []
+
+    def fail(self, refs, reason, retryable):
+        self.failures.append(([ref.sample_id for ref in refs], reason, retryable))
+        super().fail(refs, reason=reason, retryable=retryable)
+
+
 class _CloneFailure:
     def numel(self):
         return 1
@@ -546,6 +556,56 @@ class TestFeatureDataLoader(unittest.TestCase):
         self.assertNotIn(yielded.sample_ids[0], failed_ids)
         self.assertEqual(store.health()["active_leases"], 0)
         self.assertFalse(state.thread.is_alive())
+        self.assertIsNone(loader._prefetch_state)
+
+    def test_prefetch_close_does_not_requeue_materialized_consume_once_refs(self):
+        store = LocalFeatureStore("st")
+        refs = [
+            store.put(
+                {"x": torch.tensor([index])},
+                sample_id=f"s{index}",
+                metadata={"run_id": "run", "target_repr": "hidden_state"},
+            )
+            for index in range(4)
+        ]
+        by_id = {ref.sample_id: ref for ref in refs}
+        queue = _RecordingQueue()
+        queue.put(refs)
+        loader = FeatureDataLoader(
+            store,
+            queue,
+            batch_size=1,
+            ack=False,
+            num_workers=2,
+        )
+
+        iterator = iter(loader)
+        yielded = next(iterator)
+        queue.ack([by_id[yielded.sample_ids[0]]])
+        state = loader._prefetch_state
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            live = state.live_fetches()
+            if queue.in_flight() == 3 and live and all(f.done() for f in live):
+                break
+            time.sleep(0.01)
+        self.assertEqual(queue.in_flight(), 3)
+        self.assertTrue(all(f.done() for f in state.live_fetches()))
+
+        loader.close()
+        iterator.close()
+
+        self.assertEqual(queue.in_flight(), 0)
+        self.assertEqual(queue.depth(), 0)
+        self.assertTrue(queue.failures)
+        self.assertTrue(all(not retryable for _, _, retryable in queue.failures))
+        self.assertTrue(
+            all(
+                "closed_after_materialization" in reason
+                for _, reason, _ in queue.failures
+            )
+        )
+        self.assertEqual(store.health()["active_leases"], 0)
         self.assertIsNone(loader._prefetch_state)
 
     def test_prefetch_close_is_bounded_if_store_get_stalls(self):

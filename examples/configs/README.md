@@ -82,6 +82,22 @@ two-node migration of the 64K Kimi K3 continual run. Its dedicated
 SGLang revision and patch target, preserves the old effective global batch and
 prompt order, and documents the TP8 capture plus four-rank trainer topology.
 
+`deepseek-v4-flash-dspark-disaggregated.yaml` trains a DSpark drafter for
+DeepSeek-V4-Flash-0731 from scratch on ShareGPT, with external capture
+servers. Its
+[runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
+covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
+template (the checkpoint ships no Jinja template).
+
+`qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
+its managed-local sibling `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
+(one node, four capture servers plus a DP4 trainer) train the DFlash2 drafter
+in `configs/qwen3.8-27b-dflash2.json` for Qwen3.8-27B. Their
+[runbook](../../docs/recipes/qwen3.8-27b-dflash2-disaggregated.md) records the
+server/trainer splits, Mooncake lease, in-flight watermarks and throughput
+measured on B300 and H200 nodes, and the two-node launcher that starts eight
+capture servers.
+
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
 intentionally record their GPU allocation and loopback services. External
@@ -152,6 +168,8 @@ assume the command runs from the repository root.
 | EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
 | EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
 | DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+| DFlash 2 online, managed-local stack | [`online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`](online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml) |
+| DFlash 2 online, external services on two nodes | [`online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml`](online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml) |
 | Domino online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
 
 The runtime derives online/offline mode from the selected `data` source and
@@ -283,6 +301,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
+| MTP | `training.mtp_objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
 
 New recipes must not write the loader-only migration fields
 `training.deployment_mode`, `training.server_urls`, or
@@ -409,6 +428,7 @@ unless tuning throughput or memory pressure.
 | `runtime.resident_high_watermark_bytes` | `null` | Optional byte-level pause threshold. |
 | `runtime.resident_low_watermark_bytes` | `null` | Optional byte-level resume threshold; requires and cannot exceed the resident high watermark. |
 | `runtime.feature_store_max_resident_bytes` | `null` | Optional hard store budget; it cannot be smaller than the resident high watermark. |
+| `runtime.feature_store_max_quarantined_bytes` | `8589934592` | Per-process Mooncake receive-buffer quarantine limit; exceeding it fails loudly. |
 
 ### `tracking`: experiment logging
 

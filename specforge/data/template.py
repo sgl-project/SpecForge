@@ -314,6 +314,18 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="deepseek-v4",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        parser_type="deepseek-v4",
+        enable_thinking=False,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="glm-5.2",
     template=ChatTemplate(
         assistant_header="<|assistant|><think>",
