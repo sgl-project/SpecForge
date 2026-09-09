@@ -166,6 +166,7 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
+        max_quarantined_bytes=cfg.runtime.feature_store_max_quarantined_bytes,
         **receive_kwargs,
     )
 

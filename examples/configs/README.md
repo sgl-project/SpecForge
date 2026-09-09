@@ -47,7 +47,7 @@ specforge train --config examples/configs/online/disaggregated/external/qwen3-8b
 `model.draft_model_config` may name a local JSON file, a local model directory,
 or a Hugging Face repository. Fresh EAGLE3, P-EAGLE, and DFlash runs may omit it
 and derive the draft architecture from the target; see the
-[training guide](../../docs/basic_usage/training.md#draft-configuration-and-model-initialization)
+[training guide](../../docs/sections/basic_usage/training.md#draft-configuration-and-model-initialization)
 for layer/block overrides and the distinction between weights-only
 `model.draft_checkpoint_path` and full `training.resume_from`.
 
@@ -81,6 +81,13 @@ two-node migration of the 64K Kimi K3 continual run. Its dedicated
 [runbook](../../docs/recipes/kimi-k3-dspark-disaggregated.md) pins the K3
 SGLang revision and patch target, preserves the old effective global batch and
 prompt order, and documents the TP8 capture plus four-rank trainer topology.
+
+`deepseek-v4-flash-dspark-disaggregated.yaml` trains a DSpark drafter for
+DeepSeek-V4-Flash-0731 from scratch on ShareGPT, with external capture
+servers. Its
+[runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
+covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
+template (the checkpoint ships no Jinja template).
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
@@ -283,6 +290,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
+| MTP | `training.mtp_objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
 
 New recipes must not write the loader-only migration fields
 `training.deployment_mode`, `training.server_urls`, or
@@ -411,6 +419,7 @@ unless tuning throughput or memory pressure.
 | `runtime.resident_high_watermark_bytes` | `null` | Optional byte-level pause threshold. |
 | `runtime.resident_low_watermark_bytes` | `null` | Optional byte-level resume threshold; requires and cannot exceed the resident high watermark. |
 | `runtime.feature_store_max_resident_bytes` | `null` | Optional hard store budget; it cannot be smaller than the resident high watermark. |
+| `runtime.feature_store_max_quarantined_bytes` | `8589934592` | Per-process Mooncake receive-buffer quarantine limit; exceeding it fails loudly. |
 
 ### `tracking`: experiment logging
 
@@ -477,8 +486,8 @@ specforge train -c ./my-run.yaml \
 ```
 
 For deeper lifecycle and recovery semantics, see the
-[training guide](../../docs/basic_usage/training.md) and
-[disaggregated training guide](../../docs/basic_usage/disaggregated_training.md).
+[training guide](../../docs/sections/basic_usage/training.md) and
+[disaggregated training guide](../../docs/sections/basic_usage/disaggregated_training.md).
 
 ## Capability matrix
 

@@ -80,12 +80,28 @@ from specforge.runtime.data_plane.feature_store import (
 logger = logging.getLogger(__name__)
 
 # Defaults for MooncakeDistributedStore.setup(); override via ``setup_kwargs``.
+#: Mooncake ``ErrorCode`` values the store reasons about explicitly.
+MOONCAKE_OBJECT_NOT_FOUND = -704  # remove()/get() on an already-freed key
+MOONCAKE_OBJECT_HAS_LEASE = -706  # remove() during a live read lease
+
 _MOONCAKE_SETUP_DEFAULTS = {
     "global_segment_size": 1 << 30,  # 1 GiB per-node segment
     "local_buffer_size": 1 << 30,
     "protocol": "tcp",  # bring up on TCP; flip to "rdma" once NICs are verified
     "rdma_devices": "",
 }
+
+_GET_RETRY_DELAYS_S = (2.0, 4.0, 8.0)
+# TRANSFER_FAIL and a lease that expired during transfer are retryable with a
+# fresh get_into call. Object/lifecycle errors and short reads are not.
+_RETRYABLE_GET_STATUSES = frozenset({-800, -707})
+_DEFAULT_MAX_QUARANTINED_BYTES = 8 << 30
+
+
+class _MooncakeGetError(KeyError):
+    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class _InjectedReplicateConfig:
@@ -226,28 +242,24 @@ RECEIVE_BUFFER_KINDS = ("pageable", "pinned", "cuda")
 DEFAULT_RECEIVE_POOL_BYTES = 8 << 30
 
 
-class _RetryableGetError(KeyError):
-    """Mooncake reported a transient transfer failure."""
-
-
 def _check_get_result(key: str, rc: Optional[int], nbytes: int) -> None:
-    if rc in (
-        -703,
-        -707,
-        -800,
-    ):  # replica not ready, expired read lease, transfer failure
-        raise _RetryableGetError(f"mooncake get_into failed (status {rc}) for {key}")
-    if rc is None or int(rc) < 0:
+    if rc is None:
+        raise _MooncakeGetError(f"mooncake get_into failed (status {rc}) for {key}")
+    status = int(rc)
+    if status < 0:
         hint = (
             "; increase deployment.disaggregated.client_buffer_size to cover "
             "concurrent device reads"
-            if rc == -200
+            if status == -200
             else ""
         )
-        raise KeyError(f"mooncake get_into failed (status {rc}) for {key}{hint}")
-    if int(rc) != nbytes:
-        raise KeyError(
-            f"mooncake get_into short read for {key}: got {rc} of {nbytes} bytes"
+        raise _MooncakeGetError(
+            f"mooncake get_into failed (status {status}) for {key}{hint}",
+            status=status,
+        )
+    if status != nbytes:
+        raise _MooncakeGetError(
+            f"mooncake get_into short read for {key}: got {status} of {nbytes} bytes"
         )
 
 
@@ -275,18 +287,23 @@ class ReceiveBufferPool:
         *,
         kind: str,
         max_bytes: int = DEFAULT_RECEIVE_POOL_BYTES,
+        max_quarantined_bytes: int = _DEFAULT_MAX_QUARANTINED_BYTES,
     ) -> None:
         if kind not in ("pinned", "cuda"):
             raise ValueError(f"receive pool kind must be pinned or cuda, got {kind!r}")
         if max_bytes <= 0:
             raise ValueError("receive_pool_bytes must be positive")
+        if max_quarantined_bytes < 0:
+            raise ValueError("max_quarantined_bytes must be >= 0")
         self.kind = kind
         self.max_bytes = int(max_bytes)
+        self.max_quarantined_bytes = int(max_quarantined_bytes)
         self._store = store
         self._lock = threading.Lock()
         self._registration_disabled = False
         self._free: List[_PoolSlot] = []
         self._quarantined: List[_PoolSlot] = []
+        self._quarantined_bytes = 0
         self._allocated_bytes = 0
         self._streams = threading.local()
         self.stats = {"hits": 0, "grown": 0, "overflow": 0, "quarantined": 0}
@@ -371,6 +388,14 @@ class ReceiveBufferPool:
                 self.stats["quarantined"] += 1
                 slot.quarantined = True
                 self._quarantined.append(slot)
+                self._quarantined_bytes += slot.capacity
+                if self._quarantined_bytes > self.max_quarantined_bytes:
+                    raise MemoryError(
+                        "Mooncake failed-transfer quarantine exceeded "
+                        f"{self.max_quarantined_bytes} bytes; refusing unbounded "
+                        "receive-pool memory growth because an in-flight transfer "
+                        "may still write into each quarantined buffer"
+                    )
             return
         if not pooled:
             if slot.registered:
@@ -398,9 +423,7 @@ class ReceiveBufferPool:
                 "receive_buffers": self.kind,
                 "receive_pool_bytes": self._allocated_bytes,
                 "receive_pool_free_slots": len(self._free),
-                "receive_pool_quarantined_bytes": sum(
-                    slot.capacity for slot in self._quarantined
-                ),
+                "receive_pool_quarantined_bytes": self._quarantined_bytes,
                 **{f"receive_pool_{k}": v for k, v in self.stats.items()},
             }
 
@@ -436,6 +459,7 @@ class MooncakeFeatureStore(FeatureStore):
         max_hold_age_s: Optional[float] = None,
         retain_on_release: bool = False,
         max_release_attempts: int = 3,
+        max_quarantined_bytes: int = _DEFAULT_MAX_QUARANTINED_BYTES,
         replica_num: int = 1,
         hard_pin: bool = True,
         clock: Callable[[], float] = time.monotonic,
@@ -457,16 +481,27 @@ class MooncakeFeatureStore(FeatureStore):
             put_config = _InjectedReplicateConfig()
         _require_store_api(store)
         self._store = store
-        # Buffers of failed get_into attempts, never reused or freed: a
-        # timed-out transfer can still write into them after the call returns.
+        if max_quarantined_bytes < 0:
+            raise ValueError("max_quarantined_bytes must be >= 0")
+        self.max_quarantined_bytes = int(max_quarantined_bytes)
+        # Failed pageable-buffer reads are retained because a timed-out transfer
+        # may still write into them. Pooled modes maintain the equivalent
+        # quarantine inside ReceiveBufferPool.
         self._quarantined_buffers: List[torch.Tensor] = []
+        self._quarantined_bytes = 0
+        self._quarantine_lock = threading.Lock()
         if receive_buffers not in RECEIVE_BUFFER_KINDS:
             raise ValueError(
                 f"receive_buffers={receive_buffers!r} not in {RECEIVE_BUFFER_KINDS}"
             )
         self.receive_buffers = receive_buffers
         self._receive_pool: Optional[ReceiveBufferPool] = (
-            ReceiveBufferPool(store, kind=receive_buffers, max_bytes=receive_pool_bytes)
+            ReceiveBufferPool(
+                store,
+                kind=receive_buffers,
+                max_bytes=receive_pool_bytes,
+                max_quarantined_bytes=max_quarantined_bytes,
+            )
             if receive_buffers != "pageable"
             else None
         )
@@ -580,14 +615,23 @@ class MooncakeFeatureStore(FeatureStore):
 
     def _fetch_tensor(self, key: str, spec, device="cpu") -> torch.Tensor:
         """Retry transient reads into fresh storage; return caller-owned tensors."""
-        for attempt in range(3):
+        attempts = len(_GET_RETRY_DELAYS_S) + 1
+        for attempt in range(attempts):
             try:
                 return self._fetch_tensor_once(key, spec, device)
-            except _RetryableGetError as exc:
-                delay = 2.0 * 2**attempt
-                logger.warning("%s; retry %d/3 in %.0fs", exc, attempt + 1, delay)
+            except _MooncakeGetError as exc:
+                if exc.status not in _RETRYABLE_GET_STATUSES or attempt + 1 == attempts:
+                    raise
+                delay = _GET_RETRY_DELAYS_S[attempt]
+                logger.warning(
+                    "%s; retry %d/%d in %.0fs",
+                    exc,
+                    attempt + 1,
+                    len(_GET_RETRY_DELAYS_S),
+                    delay,
+                )
                 time.sleep(delay)
-        return self._fetch_tensor_once(key, spec, device)
+        raise AssertionError("unreachable Mooncake fetch retry state")
 
     def _fetch_tensor_once(self, key: str, spec, device) -> torch.Tensor:
         pool = self._receive_pool
@@ -595,8 +639,10 @@ class MooncakeFeatureStore(FeatureStore):
             dst = _alloc_from_spec(spec)
             try:
                 self._store_get_tensor(key, dst)
-            except KeyError:
-                self._quarantined_buffers.append(dst)
+            except _MooncakeGetError:
+                # Quarantine the final failed attempt too: propagating its
+                # exception must not free storage that a late transfer can use.
+                self._quarantine_buffer(dst)
                 raise
             return dst
         dtype = _TORCH_DTYPES.get(spec.dtype)
@@ -634,6 +680,19 @@ class MooncakeFeatureStore(FeatureStore):
             pool.release(slot, pooled)
         return out
 
+    def _quarantine_buffer(self, tensor: torch.Tensor) -> None:
+        size = _nbytes(tensor)
+        with self._quarantine_lock:
+            self._quarantined_buffers.append(tensor)
+            self._quarantined_bytes += size
+            if self._quarantined_bytes > self.max_quarantined_bytes:
+                raise MemoryError(
+                    "Mooncake failed-transfer quarantine exceeded "
+                    f"{self.max_quarantined_bytes} bytes; refusing unbounded "
+                    "host-memory growth because an in-flight transfer may still "
+                    "write into each quarantined buffer"
+                )
+
     def _store_get_tensor(self, key: str, out: torch.Tensor) -> None:
         """Zero-copy fetch into a pre-allocated tensor. Raises KeyError if absent.
 
@@ -655,13 +714,18 @@ class MooncakeFeatureStore(FeatureStore):
         _check_get_result(key, rc, nb)
 
     def _store_remove(self, key: str, *, force: bool = False) -> bool:
-        """Best-effort physical free. Returns True on confirmed removal.
+        """Best-effort physical free. Returns True once the key is gone.
 
         Recent Mooncake bindings expose ``remove(key, force=True)`` so a
         lifecycle authority can reclaim an object after all application-level
         leases have closed without waiting for Mooncake's (potentially
         minutes-long) KV lease TTL.  Older bindings only accept ``key``; keep
         those usable and let their normal bounded retry behavior apply.
+
+        ``OBJECT_NOT_FOUND`` is a completed removal, not a failure: a sample's
+        tensors are freed one key at a time, and a retry after a partial free
+        (some keys removed, others still under a read lease) must not keep the
+        sample pending until the bounded drain probes the absent keys.
         """
         try:
             if force:
@@ -673,7 +737,7 @@ class MooncakeFeatureStore(FeatureStore):
                 rc = self._store.remove(key)
         except Exception:  # pragma: no cover - transient RPC failure
             return False
-        return rc is None or int(rc) == 0
+        return rc is None or int(rc) in (0, MOONCAKE_OBJECT_NOT_FOUND)
 
     # -- write -------------------------------------------------------------
     def put(
@@ -1217,6 +1281,9 @@ class MooncakeFeatureStore(FeatureStore):
         }
 
     def health(self) -> Dict[str, Any]:
+        with self._quarantine_lock:
+            quarantined_buffers = len(self._quarantined_buffers)
+            quarantined_bytes = self._quarantined_bytes
         with self._lock:
             now = self._clock()
             ages = [now - t for t in self._put_time.values()]
@@ -1237,9 +1304,19 @@ class MooncakeFeatureStore(FeatureStore):
                 "avg_age_s": (sum(ages) / len(ages)) if ages else 0.0,
                 "force_freed_total": self._stats["force_freed"],
                 "hard_pin": bool(getattr(self._put_config, "with_hard_pin", False)),
+                "quarantined_buffers": quarantined_buffers,
+                "quarantined_bytes": quarantined_bytes,
+                "max_quarantined_bytes": self.max_quarantined_bytes,
             }
             if self._receive_pool is not None:
-                result.update(self._receive_pool.health())
+                pool_health = self._receive_pool.health()
+                result.update(pool_health)
+                # Keep the backend-wide quarantine metrics introduced on main
+                # meaningful for pooled receive modes as well.
+                result["quarantined_buffers"] = pool_health["receive_pool_quarantined"]
+                result["quarantined_bytes"] = pool_health[
+                    "receive_pool_quarantined_bytes"
+                ]
             return result
 
 

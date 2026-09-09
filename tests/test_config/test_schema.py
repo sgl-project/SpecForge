@@ -354,6 +354,35 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "dspark_objective_chunk_blocks"):
             Config.model_validate(payload)
 
+    def test_mtp_objective_chunk_size_yaml_reaches_model(self):
+        from specforge.algorithms.mtp.providers import build_training_model
+
+        for chunk_size in (None, 0, 17):
+            with self.subTest(chunk_size=chunk_size):
+                payload = _online_payload("mtp")
+                if chunk_size is not None:
+                    payload["training"]["mtp_objective_chunk_size"] = chunk_size
+                path = _write(payload, ".yaml")
+                try:
+                    config = load_config(path)
+                finally:
+                    os.unlink(path)
+                # Construction does not run the draft: this tests YAML ->
+                # validated config -> provider -> objective without weights.
+                parts = build_training_model(config, None, None, None, None)
+                expected = 4096 if chunk_size is None else chunk_size
+                self.assertEqual(config.training.mtp_objective_chunk_size, expected)
+                self.assertEqual(parts.model.objective_chunk_size, expected)
+
+        for invalid in (-1, 1.5):
+            payload = _online_payload("mtp")
+            payload["training"]["mtp_objective_chunk_size"] = invalid
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    ValidationError, "mtp_objective_chunk_size"
+                ):
+                    Config.model_validate(payload)
+
     def test_dflash2_selector_objective_settings_are_bounded(self):
         payload = _online_payload("dflash")
         payload["training"]["dflash2_selector_loss_alpha"] = 0.25
@@ -597,6 +626,7 @@ class ConfigSchemaTest(unittest.TestCase):
                     "resident_high_watermark_bytes": 4096,
                     "resident_low_watermark_bytes": 2048,
                     "feature_store_max_resident_bytes": 8192,
+                    "feature_store_max_quarantined_bytes": 16384,
                 },
             }
         )
@@ -604,6 +634,11 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertEqual(cfg.profiling.num_steps, 5)
         self.assertEqual(cfg.runtime.producer_concurrency, 3)
         self.assertEqual(cfg.runtime.in_flight_low_watermark, 16)
+        self.assertEqual(cfg.runtime.feature_store_max_quarantined_bytes, 16384)
+        self.assertEqual(
+            Config.model_validate(MINIMAL).runtime.feature_store_max_quarantined_bytes,
+            8 << 30,
+        )
 
         invalid_runtime = (
             {"producer_concurrency": 0},
@@ -620,6 +655,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 "resident_high_watermark_bytes": 10,
                 "feature_store_max_resident_bytes": 9,
             },
+            {"feature_store_max_quarantined_bytes": -1},
         )
         for runtime in invalid_runtime:
             with self.subTest(runtime=runtime), self.assertRaises(ValidationError):
