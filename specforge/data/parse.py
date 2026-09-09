@@ -15,6 +15,7 @@ __all__ = [
     "GeneralParser",
     "GLMParser",
     "HarmonyParser",
+    "LingParser",
     "ThinkingParser",
 ]
 

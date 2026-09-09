@@ -111,9 +111,11 @@ class TestLing3LossMask(unittest.TestCase):
         ]
         self.assertEqual(self._spans("ling-3.0", conversation), [])
 
-    def test_thinking_off_is_rendered_as_thinking_off(self):
-        # The Bailing V3 template defaults to 'detailed thinking on'; the ling
-        # parser passes the flag so training and serving share one prefix.
+    def test_thinking_flag_is_passed_explicitly(self):
+        # The Bailing V3 template defaults its thinking option to on, so the
+        # ling parser has to pass the flag: otherwise the draft trains on a
+        # system prefix it never sees when served with thinking off. Compare
+        # renderings rather than pinning the template's wording.
         conversation = [
             {"role": "user", "content": "What is 2+2?"},
             {"role": "assistant", "content": "It is 4."},
@@ -127,8 +129,21 @@ class TestLing3LossMask(unittest.TestCase):
         rendered = self.tokenizer.decode(
             results["input_ids"][0].squeeze(), skip_special_tokens=False
         )
-        self.assertIn("detailed thinking off", rendered)
-        self.assertNotIn("detailed thinking on", rendered)
+        explicit_off = self.tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+            enable_thinking=False,
+        )
+        default_rendering = self.tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )
+        self.assertEqual(rendered, explicit_off)
+        self.assertNotEqual(explicit_off, default_rendering)
 
 
 if __name__ == "__main__":
