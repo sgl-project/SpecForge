@@ -41,6 +41,23 @@ _PREFETCH_JOIN_TIMEOUT_S = float(
 
 
 @dataclass
+class _PreparedBatch:
+    batch: TrainBatch
+    ready: Dict[torch.device, torch.cuda.Event]
+
+    def consume(self) -> TrainBatch:
+        # Futures synchronize Python threads, not CUDA work. Hand off both
+        # execution ordering and allocator lifetime to the consumer's streams.
+        for device, event in self.ready.items():
+            stream = torch.cuda.current_stream(device)
+            stream.wait_event(event)
+            for tensor in self.batch.tensors.values():
+                if tensor.device == device:
+                    tensor.record_stream(stream)
+        return self.batch
+
+
+@dataclass
 class _OutstandingRef:
     ref: SampleRef
     materialized: bool = False
@@ -207,6 +224,16 @@ class FeatureDataLoader:
         )
         return batch
 
+    def _prepare_batch(self, refs: List[SampleRef]) -> _PreparedBatch:
+        batch = self._timed_make_batch(refs)
+        ready = {}
+        for tensor in batch.tensors.values():
+            if tensor.is_cuda and tensor.device not in ready:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(tensor.device))
+                ready[tensor.device] = event
+        return _PreparedBatch(batch, ready)
+
     def _maybe_gc(self) -> None:
         if self.gc_interval_s is None:
             return
@@ -361,14 +388,14 @@ class FeatureDataLoader:
                     chunk = next(chunk_iter)
                 except StopIteration:
                     break
-                pending.append(executor.submit(self._make_batch, chunk))
+                pending.append(executor.submit(self._prepare_batch, chunk))
             while pending:
-                yield pending.popleft().result()
+                yield pending.popleft().result().consume()
                 try:
                     chunk = next(chunk_iter)
                 except StopIteration:
                     continue
-                pending.append(executor.submit(self._make_batch, chunk))
+                pending.append(executor.submit(self._prepare_batch, chunk))
 
     def seek(self, num_batches: int) -> None:
         """Skip the first ``num_batches`` of the NEXT iteration (refs mode; one-shot).
@@ -470,7 +497,7 @@ class FeatureDataLoader:
                             state.mark_yielded_or_failed(refs)
                         put_interruptibly(eos)
                         return
-                    future = pool.submit(self._timed_make_batch, refs)
+                    future = pool.submit(self._prepare_batch, refs)
                     state.track_fetch(future, refs)
                     if not put_interruptibly((future, refs)):
                         return
@@ -517,7 +544,7 @@ class FeatureDataLoader:
                 fetch_started = time.perf_counter()
                 while not state.stop.is_set():
                     try:
-                        batch = future.result(timeout=_PREFETCH_POLL_S)
+                        batch = future.result(timeout=_PREFETCH_POLL_S).consume()
                         break
                     except futures.TimeoutError:
                         continue

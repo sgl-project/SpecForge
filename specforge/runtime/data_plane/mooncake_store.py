@@ -62,6 +62,7 @@ import os
 import threading
 import time
 import uuid
+import weakref
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -273,12 +274,42 @@ class _PoolSlot:
         self.quarantined = False
 
 
+# Last-resort retention when a pool is abandoned with writes still possible.
+# Leaking these buffers is safer than returning DMA targets to the allocator.
+_UNSAFE_RECEIVE_BUFFERS: List[Any] = []
+
+
+def _unregister_slot(store: Any, slot: _PoolSlot) -> None:
+    if slot.registered:
+        rc = store.unregister_buffer(slot.storage.data_ptr())
+        if rc is not None and int(rc) != 0:
+            raise RuntimeError(f"Mooncake receive buffer unregistration failed ({rc})")
+        slot.registered = False
+
+
+def _finalize_receive_pool(store, free, active, quarantined) -> None:
+    unsafe = list(active) + list(quarantined)
+    for slot in free:
+        try:
+            _unregister_slot(store, slot)
+        except Exception:
+            logger.exception("Unable to unregister abandoned Mooncake receive buffer")
+            unsafe.append(slot)
+    if unsafe:
+        _UNSAFE_RECEIVE_BUFFERS.append((store, unsafe))
+        logger.warning(
+            "Retaining %d unsafe receive buffers from an unclosed Mooncake pool; "
+            "close the feature store after stopping its readers",
+            len(unsafe),
+        )
+
+
 class ReceiveBufferPool:
     """Reusable, once-registered receive buffers for ``get_into``.
 
     Retained slots fit within ``max_bytes``; concurrent overflow uses one-off
-    slots. Failed transfers retain their storage until this pool is destroyed,
-    since the transport can still write after returning an error.
+    slots. Failed transfers retain their storage until the transport is stopped,
+    since it can still write after returning an error, even after pool destruction.
     """
 
     def __init__(
@@ -302,7 +333,17 @@ class ReceiveBufferPool:
         self._lock = threading.Lock()
         self._registration_disabled = False
         self._free: List[_PoolSlot] = []
+        self._active: List[_PoolSlot] = []
         self._quarantined: List[_PoolSlot] = []
+        self._closed = False
+        self._finalizer = weakref.finalize(
+            self,
+            _finalize_receive_pool,
+            store,
+            self._free,
+            self._active,
+            self._quarantined,
+        )
         self._quarantined_bytes = 0
         self._allocated_bytes = 0
         self._streams = threading.local()
@@ -358,6 +399,8 @@ class ReceiveBufferPool:
         """Return ``(slot, pooled)``; ``pooled`` False means a one-off buffer."""
         target = self._device_for(device)
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Mooncake receive pool is closed")
             best = None
             for slot in self._free:
                 if (
@@ -368,11 +411,13 @@ class ReceiveBufferPool:
                     best = slot
             if best is not None:
                 self._free.remove(best)
+                self._active.append(best)
                 self.stats["hits"] += 1
                 return best, True
             pooled = self._allocated_bytes + nbytes <= self.max_bytes
             # Serialize registration and account only for successful allocations.
             slot = self._new_slot(nbytes, target)
+            self._active.append(slot)
             if not pooled:
                 self.stats["overflow"] += 1
             else:
@@ -385,6 +430,7 @@ class ReceiveBufferPool:
     ) -> None:
         if quarantine:
             with self._lock:
+                self._active.remove(slot)
                 self.stats["quarantined"] += 1
                 slot.quarantined = True
                 self._quarantined.append(slot)
@@ -397,15 +443,40 @@ class ReceiveBufferPool:
                         "may still write into each quarantined buffer"
                     )
             return
-        if not pooled:
-            if slot.registered:
-                try:
-                    self._store.unregister_buffer(slot.storage.data_ptr())
-                except Exception:  # pragma: no cover
-                    pass
-            return
         with self._lock:
+            self._active.remove(slot)
+            # Keep ownership until unregister succeeds, including overflow.
             self._free.append(slot)
+            if not pooled:
+                try:
+                    _unregister_slot(self._store, slot)
+                except Exception:
+                    # Do not reuse an overflow slot whose registration state
+                    # is now uncertain, or bypass the pool's memory budget.
+                    self._closed = True
+                    raise
+                self._free.remove(slot)
+
+    def close(self, *, transport_stopped: bool = False) -> None:
+        """Seal the pool and release idle registrations; safe to retry.
+
+        Call only after stopping readers. Quarantined storage remains owned
+        unless the backend owner confirms that its transport has been stopped.
+        """
+        with self._lock:
+            self._closed = True
+            if self._active:
+                raise RuntimeError(
+                    "Cannot close Mooncake receive pool with active readers"
+                )
+            for slot in list(self._free):
+                if not transport_stopped:
+                    _unregister_slot(self._store, slot)
+                self._free.remove(slot)
+            if transport_stopped:
+                self._quarantined.clear()
+                self._quarantined_bytes = 0
+            self._allocated_bytes = self._quarantined_bytes
 
     def copy_stream(self, device: torch.device):
         """Per-thread side stream for copies out of receive slots."""
@@ -470,6 +541,8 @@ class MooncakeFeatureStore(FeatureStore):
         self._credential = credential
         self.auth.check(credential)  # attach-time gate (B9)
         self.store_id = store_id or uuid.uuid4().hex[:8]
+        self._owns_store = store is None
+        self._closed = False
         if store is None:
             kw = dict(_MOONCAKE_SETUP_DEFAULTS)
             kw.update(setup_kwargs or {})
@@ -613,8 +686,30 @@ class MooncakeFeatureStore(FeatureStore):
         )
         return torch.device("cuda", index)
 
+    def close(self) -> None:
+        """Release receive memory after loaders and removal drains have stopped.
+
+        An injected/shared backend is never closed here. Its failed-transfer
+        buffers stay quarantined because its owner may still be using transport.
+        """
+        if self._closed:
+            return
+        if self._receive_pool is not None:
+            self._receive_pool.close()
+        if self._owns_store:
+            rc = self._store.close()
+            if rc is not None and int(rc) != 0:
+                raise RuntimeError(f"Mooncake transport close failed ({rc})")
+            if self._receive_pool is not None:
+                self._receive_pool.close(transport_stopped=True)
+            self._quarantined_buffers.clear()
+            self._quarantined_bytes = 0
+        self._closed = True
+
     def _fetch_tensor(self, key: str, spec, device="cpu") -> torch.Tensor:
         """Retry transient reads into fresh storage; return caller-owned tensors."""
+        if self._closed:
+            raise RuntimeError("Mooncake feature store is closed")
         attempts = len(_GET_RETRY_DELAYS_S) + 1
         for attempt in range(attempts):
             try:

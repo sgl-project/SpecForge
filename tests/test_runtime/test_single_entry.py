@@ -24,6 +24,7 @@ from specforge.config import Config
 from specforge.training.assembly import TrainingRun
 from specforge.training.disaggregated import (
     _ONLINE_CONTROL_SUFFIXES,
+    _build_online,
     _claim_fresh_control_path,
     _mooncake_store,
     build_disaggregated_run,
@@ -60,6 +61,60 @@ class _FakeTrainer:
 
 
 class TestTrainingRunLifecycle(unittest.TestCase):
+    def test_online_consumer_closes_its_store_after_fit_on_success_and_failure(self):
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"prompts_path": "prompts.jsonl"},
+                "training": {
+                    "strategy": "dflash", "role": "consumer", "max_steps": 1
+                },
+                "deployment": _disaggregated_deployment(
+                    "/shared/close-test", server_urls=["http://capture:30000"]
+                ),
+            }
+        )
+        for error in (None, RuntimeError("fit failed")):
+            with self.subTest(error=error):
+                events = []
+                store = mock.Mock()
+                store.close.side_effect = lambda: events.append("store.close")
+                trainer = _FakeTrainer(error=error, events=events)
+                bundle = types.SimpleNamespace(
+                    model=object(), target_head=None, strategy_kwargs={}
+                )
+                with (
+                    mock.patch.dict(
+                        os.environ, {"DISAGG_REF_CHANNEL": "/shared/refs"}
+                    ),
+                    mock.patch(
+                        "specforge.runtime.data_plane.streaming_ref_channel."
+                        "StreamingRefChannel"
+                    ),
+                    mock.patch(
+                        "specforge.training.disaggregated._mooncake_store",
+                        return_value=store,
+                    ),
+                    mock.patch(
+                        "specforge.launch.build_disagg_online_consumer",
+                        return_value=trainer,
+                    ),
+                ):
+                    run = _build_online(
+                        cfg,
+                        algorithm=ALGORITHM,
+                        build_model_bundle=lambda _cfg: bundle,
+                        prepare_prompts=mock.Mock(),
+                        optimizer_factory=mock.Mock(),
+                        logger=None,
+                    )
+                    if error is None:
+                        self.assertEqual(run.run(), 3)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "fit failed"):
+                            run.run()
+                self.assertEqual(events, ["fit", "store.close"])
+
     def test_training_run_delegates_to_the_one_trainer_entry(self):
         trainer = _FakeTrainer(fit_step=3)
         self.assertEqual(TrainingRun(trainer=trainer).run(), 3)

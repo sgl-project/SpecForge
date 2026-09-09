@@ -333,6 +333,14 @@ def _disaggregated_env(
             values[name] = str(value)
 
     if deployment.backend == "mooncake":
+        if (
+            deployment.receive_buffers == "cuda"
+            and values.get("MOONCAKE_PROTOCOL", "tcp") != "rdma"
+        ):
+            raise ValueError(
+                "receive_buffers=cuda needs an RDMA Mooncake transport; "
+                "the effective MOONCAKE_PROTOCOL must be rdma"
+            )
         required = ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
         missing = [
             name for name in required if not values.get(name) and not base_env.get(name)

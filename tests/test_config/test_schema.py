@@ -93,13 +93,12 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertIsNone(config.training.max_steps)
         self.assertIsNone(config.training.total_steps)
 
-    def test_cuda_receive_buffers_require_an_rdma_transport(self):
+    def test_external_cuda_transport_is_validated_after_environment_resolution(self):
         payload = _online_payload()
         payload["deployment"] = copy.deepcopy(ONLINE_DEPLOYMENT)
         payload["deployment"]["disaggregated"]["receive_buffers"] = "cuda"
         payload["deployment"]["disaggregated"]["mooncake_protocol"] = "tcp"
-        with self.assertRaisesRegex(ValidationError, "RDMA"):
-            Config.model_validate(payload)
+        Config.model_validate(payload)  # MOONCAKE_PROTOCOL may override TCP.
         payload["deployment"]["disaggregated"]["mooncake_protocol"] = "rdma"
         cfg = Config.model_validate(payload)
         self.assertEqual(cfg.deployment.disaggregated.receive_buffers, "cuda")

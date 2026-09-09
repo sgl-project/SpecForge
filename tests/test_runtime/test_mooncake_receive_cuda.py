@@ -6,7 +6,9 @@ from unittest import mock
 
 import torch
 
+from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore, _meta
 
 
@@ -28,6 +30,59 @@ class _DeviceReads(_FakeMooncakeStore):
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class MooncakeReceiveCudaTest(unittest.TestCase):
+    def test_prefetched_batch_handoff_waits_for_collate_on_consumer_stream(self):
+        # Warm up before injecting a delay; lazy CUDA initialization would hide
+        # the race by taking longer than the worker's pending copy.
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            torch.ones(32, device="cuda").sum().item()
+
+        def delayed_collate(features):
+            source = features[0]["hidden_state"]
+            output = torch.zeros_like(source)
+            torch.cuda.current_stream().synchronize()
+            torch.cuda._sleep(300_000_000)
+            output.copy_(source)
+            return {"hidden_state": output}
+
+        for kind in ("pinned", "cuda"):
+            for mode in ("refs", "queue"):
+                with self.subTest(kind=kind, mode=mode):
+                    backend = (
+                        _DeviceReads() if kind == "cuda" else _FakeMooncakeStore()
+                    )
+                    store = MooncakeFeatureStore(
+                        store=backend, receive_buffers=kind, retain_on_release=True
+                    )
+                    ref = store.put(
+                        {"hidden_state": torch.full((32,), 7.0)},
+                        sample_id="sample",
+                        metadata=_meta(),
+                    )
+                    source = {"refs": [ref]}
+                    if mode == "queue":
+                        queue = SampleRefQueue()
+                        queue.put([ref])
+                        source = {"queue": queue}
+                    loader = FeatureDataLoader(
+                        store,
+                        **source,
+                        device="cuda:0",
+                        num_workers=1,
+                        collate_fn=delayed_collate,
+                    )
+                    iterator = iter(loader)
+                    try:
+                        with torch.cuda.stream(stream):
+                            batch = next(iterator)
+                            self.assertEqual(
+                                batch.tensors["hidden_state"].sum().item(), 224
+                            )
+                    finally:
+                        iterator.close()
+                        loader.close()
+                        store.close()
+
     def test_pinned_and_cuda_outputs_survive_immediate_slot_reuse(self):
         for kind in ("pinned", "cuda"):
             with self.subTest(kind=kind):

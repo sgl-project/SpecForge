@@ -514,10 +514,11 @@ def _build_offline(
     accumulation_steps = cfg.training.accumulation_steps
     if cfg.training.attention_backend == "usp":
         accumulation_steps *= cfg.training.sp_ulysses_size * cfg.training.sp_ring_size
+    store = _offline_store(cfg, retain_on_release=True)
     trainer = build_disagg_offline_runtime(
         algorithm=algorithm,
         modality=cfg.model.input_modality,
-        feature_store=_offline_store(cfg, retain_on_release=True),
+        feature_store=store,
         refs=read_ref_manifest(manifest),
         draft_model=bundle.model,
         target_head=bundle.target_head,
@@ -559,6 +560,7 @@ def _build_offline(
         trainer=trainer,
         on_success=mark_consumed,
         on_failure=mark_consumer_failed,
+        on_finally=getattr(store, "close", None),
     )
 
 
@@ -821,7 +823,7 @@ def _build_online(
         profiling_options=_profiling_options(cfg),
     )
 
-    return TrainingRun(trainer=trainer)
+    return TrainingRun(trainer=trainer, on_finally=store.close)
 
 
 def build_disaggregated_run(

@@ -135,6 +135,139 @@ def _store(**kw):
     return MooncakeFeatureStore(store=_FakeMooncakeStore(), store_id="run0", **kw)
 
 
+class TestReceivePoolLifecycle(unittest.TestCase):
+    def test_close_unregisters_idle_slots_once_and_prevents_reuse(self):
+        backend = _FakeMooncakeStore()
+        pool = ReceiveBufferPool(backend, kind="pinned")
+        slot, pooled = pool.acquire(128, "cpu")
+        storage = weakref.ref(slot.storage)
+        ptr = slot.storage.data_ptr()
+        pool.release(slot, pooled)
+        del slot
+        with mock.patch.object(
+            backend, "unregister_buffer", return_value=0
+        ) as unregister:
+            pool.close()
+            pool.close()
+            unregister.assert_called_once_with(ptr)
+        self.assertIsNone(storage())
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            pool.acquire(128, "cpu")
+
+    def test_gc_unregisters_before_releasing_storage(self):
+        backend = _FakeMooncakeStore()
+        pool = ReceiveBufferPool(backend, kind="pinned")
+        slot, pooled = pool.acquire(128, "cpu")
+        storage = weakref.ref(slot.storage)
+        pool.release(slot, pooled)
+        del slot
+
+        def unregister(_ptr):
+            self.assertIsNotNone(storage())
+            return 0
+
+        with mock.patch.object(
+            backend, "unregister_buffer", side_effect=unregister
+        ) as call:
+            del pool
+            gc.collect()
+            call.assert_called_once()
+        self.assertIsNone(storage())
+
+    def test_close_refuses_active_read_and_can_be_retried(self):
+        backend = _FakeMooncakeStore()
+        pool = ReceiveBufferPool(backend, kind="pinned")
+        slot, pooled = pool.acquire(128, "cpu")
+        with mock.patch.object(
+            backend, "unregister_buffer", return_value=0
+        ) as unregister:
+            with self.assertRaisesRegex(RuntimeError, "active readers"):
+                pool.close()
+            unregister.assert_not_called()
+            pool.release(slot, pooled)
+            pool.close()
+            unregister.assert_called_once()
+
+    def test_unregister_failure_retains_storage_until_successful_retry(self):
+        for budget in (1, 4096):
+            for failure in (-1, RuntimeError("unregister failed")):
+                with self.subTest(budget=budget, failure=failure):
+                    backend = _FakeMooncakeStore()
+                    pool = ReceiveBufferPool(backend, kind="pinned", max_bytes=budget)
+                    slot, pooled = pool.acquire(128, "cpu")
+                    storage = weakref.ref(slot.storage)
+                    with mock.patch.object(
+                        backend, "unregister_buffer", side_effect=[failure, 0]
+                    ):
+                        if pooled:
+                            pool.release(slot, pooled)
+                            with self.assertRaises(RuntimeError):
+                                pool.close()
+                        else:
+                            with self.assertRaises(RuntimeError):
+                                pool.release(slot, pooled)
+                        del slot
+                        gc.collect()
+                        self.assertIsNotNone(storage())
+                        pool.close()
+                    self.assertIsNone(storage())
+
+    def test_quarantine_is_released_only_after_owned_transport_stops(self):
+        backend = _FakeMooncakeStore()
+        with mock.patch(
+            "specforge.runtime.data_plane.mooncake_store._connect_store",
+            return_value=(backend, type("Config", (), {})),
+        ):
+            store = MooncakeFeatureStore(receive_buffers="pinned")
+        pool = store._receive_pool
+        slot, pooled = pool.acquire(128, "cpu")
+        storage = weakref.ref(slot.storage)
+        pool.release(slot, pooled, quarantine=True)
+        del slot
+        pool.close()
+        self.assertIsNotNone(storage())
+
+        def stop():
+            self.assertIsNotNone(storage(), "late writes remain possible until close")
+            return 0
+
+        with mock.patch.object(
+            backend, "close", create=True, return_value=-1
+        ) as close:
+            with self.assertRaisesRegex(RuntimeError, "transport close failed"):
+                store.close()
+            self.assertIsNotNone(storage())
+            close.side_effect = stop
+            store.close()
+            store.close()
+            self.assertEqual(close.call_count, 2)
+        self.assertIsNone(storage())
+
+    def test_injected_backend_is_not_closed(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, receive_buffers="pinned")
+        with mock.patch.object(backend, "close", create=True) as close:
+            store.close()
+            close.assert_not_called()
+
+    def test_abandoned_quarantine_survives_pool_collection(self):
+        backend = _FakeMooncakeStore()
+        pool = ReceiveBufferPool(backend, kind="pinned")
+        slot, pooled = pool.acquire(128, "cpu")
+        storage = weakref.ref(slot.storage)
+        pool.release(slot, pooled, quarantine=True)
+        del slot
+        with mock.patch(
+            "specforge.runtime.data_plane.mooncake_store._UNSAFE_RECEIVE_BUFFERS", []
+        ):
+            del pool
+            gc.collect()
+            self.assertIsNotNone(storage())
+            # The fake has no asynchronous writes; production must retain this
+            # buffer until process exit if its owner abandons the transport.
+        self.assertIsNone(storage())
+
+
 class TestMooncakeFeatureStore(unittest.TestCase):
     def test_get_retries_only_explicit_transient_statuses(self):
         fake = _ScriptedGetStore([-800, -707])
