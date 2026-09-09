@@ -66,9 +66,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
             {
                 "model": {"target_model_path": "t", "draft_model_config": "d"},
                 "data": {"prompts_path": "prompts.jsonl"},
-                "training": {
-                    "strategy": "dflash", "role": "consumer", "max_steps": 1
-                },
+                "training": {"strategy": "dflash", "role": "consumer", "max_steps": 1},
                 "deployment": _disaggregated_deployment(
                     "/shared/close-test", server_urls=["http://capture:30000"]
                 ),
@@ -84,9 +82,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     model=object(), target_head=None, strategy_kwargs={}
                 )
                 with (
-                    mock.patch.dict(
-                        os.environ, {"DISAGG_REF_CHANNEL": "/shared/refs"}
-                    ),
+                    mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": "/shared/refs"}),
                     mock.patch(
                         "specforge.runtime.data_plane.streaming_ref_channel."
                         "StreamingRefChannel"

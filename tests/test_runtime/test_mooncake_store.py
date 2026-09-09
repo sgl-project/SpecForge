@@ -231,9 +231,7 @@ class TestReceivePoolLifecycle(unittest.TestCase):
             self.assertIsNotNone(storage(), "late writes remain possible until close")
             return 0
 
-        with mock.patch.object(
-            backend, "close", create=True, return_value=-1
-        ) as close:
+        with mock.patch.object(backend, "close", create=True, return_value=-1) as close:
             with self.assertRaisesRegex(RuntimeError, "transport close failed"):
                 store.close()
             self.assertIsNotNone(storage())

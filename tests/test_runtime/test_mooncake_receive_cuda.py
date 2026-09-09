@@ -48,9 +48,7 @@ class MooncakeReceiveCudaTest(unittest.TestCase):
         for kind in ("pinned", "cuda"):
             for mode in ("refs", "queue"):
                 with self.subTest(kind=kind, mode=mode):
-                    backend = (
-                        _DeviceReads() if kind == "cuda" else _FakeMooncakeStore()
-                    )
+                    backend = _DeviceReads() if kind == "cuda" else _FakeMooncakeStore()
                     store = MooncakeFeatureStore(
                         store=backend, receive_buffers=kind, retain_on_release=True
                     )
