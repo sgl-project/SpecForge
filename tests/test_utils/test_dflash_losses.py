@@ -62,8 +62,10 @@ with patch.dict(
     _spec.loader.exec_module(_dflash_module)
 OnlineDFlashModel = _dflash_module.OnlineDFlashModel
 OnlineDSparkModel = _dflash_module.OnlineDSparkModel
+compute_accept_len = _dflash_module.compute_accept_len
 compute_visited_mask = _dflash_module.compute_visited_mask
-WALK_METRIC = "dflash/hard_label/walk_accepted_length"
+UNARY_WALK_METRIC = "dflash/hard_label/walk_accepted_length"
+SELECTOR_WALK_METRIC = "dflash2/selector/walk_accepted_length"
 
 
 def _anchor_sampler_subject(num_anchors: int = 8):
@@ -184,6 +186,55 @@ class _LookupHead(nn.Module):
         table = self.table.to(device=hidden_states.device)
         index = slots.unsqueeze(-1).expand(-1, -1, table.shape[-1])
         return torch.gather(table, 1, index)
+
+
+class _PlannedSelector(nn.Module):
+    """Choose candidate 1 for a planned accepted prefix, then candidate 0."""
+
+    top_k = 2
+
+    def __init__(self, accepted, block_size):
+        super().__init__()
+        self.register_buffer("accepted", torch.as_tensor(accepted, dtype=torch.long))
+        self.block_size = block_size
+
+    def score_candidates(
+        self,
+        candidate_ids,
+        unary_logits,
+        hidden_states,
+        predecessor_ids,
+    ):
+        del candidate_ids, hidden_states, predecessor_ids
+        return torch.zeros_like(unary_logits)
+
+    def greedy_path(
+        self,
+        candidate_ids,
+        unary_logits,
+        hidden_states,
+        anchor_token_ids,
+    ):
+        del unary_logits, anchor_token_ids
+        block_indices = hidden_states[:, 0, 0].round().long() // self.block_size
+        accepted = self.accepted.to(hidden_states.device)[block_indices]
+        offsets = torch.arange(candidate_ids.shape[1], device=hidden_states.device)
+        choose_target = offsets.unsqueeze(0) < accepted.unsqueeze(1)
+        return torch.where(
+            choose_target,
+            candidate_ids[:, :, 1],
+            candidate_ids[:, :, 0],
+        )
+
+
+class _SelectorSlotIndexedDraft(_SlotIndexedDraft):
+    def __init__(self, hidden_size, candidate_selector):
+        super().__init__(hidden_size)
+        self.candidate_selector = candidate_selector
+
+    @staticmethod
+    def transform_unary_logits(logits):
+        return logits
 
 
 class _DualFixedHead(nn.Module):
@@ -686,9 +737,7 @@ class TestDFlashLosses(unittest.TestCase):
             anchors,
             keep_mask,
             draft_model=_SlotIndexedDraft(hidden_size=4).double(),
-            lm_head=_LookupHead(
-                logits.reshape(bsz, n_blocks * block_size, vocab_size)
-            ),
+            lm_head=_LookupHead(logits.reshape(bsz, n_blocks * block_size, vocab_size)),
             **kwargs,
         )
         _loss, _accuracy, metrics = model(
@@ -697,6 +746,61 @@ class TestDFlashLosses(unittest.TestCase):
             loss_mask=loss_mask,
         )
         return metrics["ratio_metrics"]
+
+    def _planned_selector_metrics(self, accept_plan, **kwargs):
+        """Run a one-row fixture whose unary and selector paths disagree."""
+
+        n_blocks = len(accept_plan)
+        block_size, vocab_size, seq_len = 4, 11, 20
+        torch.manual_seed(11)
+        input_ids = torch.randint(1, vocab_size, (1, seq_len), dtype=torch.long)
+        anchors = torch.tensor([[0, 2, 5, 8, 11, 14]], dtype=torch.long)
+        keep_mask = torch.ones(1, n_blocks, dtype=torch.bool)
+        loss_mask = torch.ones(1, seq_len, dtype=torch.double)
+        hidden_states = torch.zeros(1, seq_len, 4, dtype=torch.double)
+
+        # Candidate 0 is the unary argmax and always wrong. Candidate 1 is the
+        # target, so the fake selector can realize the independently pinned
+        # serving plan while remaining inside the strict unary top-k.
+        logits = torch.full(
+            (1, n_blocks, block_size, vocab_size),
+            -10.0,
+            dtype=torch.double,
+        )
+        logits[..., 0] = 5.0
+        for block, anchor in enumerate(anchors[0]):
+            for offset in range(1, block_size):
+                target = input_ids[0, anchor + offset]
+                logits[0, block, offset, target] = 4.0
+
+        selector = _PlannedSelector(accept_plan, block_size)
+        model = _make_model(
+            logits,
+            anchors,
+            keep_mask,
+            draft_model=_SelectorSlotIndexedDraft(4, selector).double(),
+            lm_head=_LookupHead(logits.reshape(1, n_blocks * block_size, vocab_size)),
+            selector_loss_alpha=0.0,
+            **kwargs,
+        )
+        _loss, _accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+        )
+        return metrics["ratio_metrics"]
+
+    def test_accept_len_stops_at_the_first_unsupervised_slot(self):
+        target = torch.tensor([[[1, 2, 3]]])
+        predicted = target.clone()
+
+        accepted = compute_accept_len(
+            predicted,
+            target,
+            torch.tensor([[[True, False, True]]]),
+        )
+
+        self.assertEqual(accepted.tolist(), [[1.0]])
 
     def test_visited_mask_walks_greedily_over_consecutive_anchors(self):
         accepted = torch.tensor([[2.0, 0.0, 5.0, 1.0, 0.0, 3.0]])
@@ -732,6 +836,18 @@ class TestDFlashLosses(unittest.TestCase):
 
         self.assertEqual(visited.tolist(), [[True, True, False]])
 
+    def test_visited_mask_supports_empty_and_non_prefix_valid_masks(self):
+        accepted = torch.tensor([[9.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
+        positions = torch.tensor([[0, 0, 0], [1, 3, 8]])
+        valid = torch.tensor([[False, False, False], [True, False, True]])
+
+        visited = compute_visited_mask(accepted, positions, valid)
+
+        self.assertEqual(
+            visited.tolist(),
+            [[False, False, False], [True, False, True]],
+        )
+
     def test_visited_mask_covers_every_anchor_when_nothing_is_accepted(self):
         # Consecutive anchors with an empty accepted prefix advance one anchor
         # per round, so the walk degenerates to the plain per-anchor average.
@@ -748,7 +864,7 @@ class TestDFlashLosses(unittest.TestCase):
         plan = [[3, 0, 2, 1, 0, 3], [1, 2, 0, 3, 1, 0]]
         metrics = self._planned_acceptance_metrics(plan)
 
-        walk_num, walk_den = metrics[WALK_METRIC]
+        walk_num, walk_den = metrics[UNARY_WALK_METRIC]
 
         # A greedy run only restarts at tokens 0,5,8,11,14 (row 0) and
         # 1,3,6,9,15 (row 1) -- 10 of the 12 blocks. Averaging over every block
@@ -768,11 +884,56 @@ class TestDFlashLosses(unittest.TestCase):
                     objective_chunk_blocks=chunk_blocks,
                 )
                 torch.testing.assert_close(
-                    chunked[WALK_METRIC][0], reference[WALK_METRIC][0]
+                    chunked[UNARY_WALK_METRIC][0],
+                    reference[UNARY_WALK_METRIC][0],
                 )
                 torch.testing.assert_close(
-                    chunked[WALK_METRIC][1], reference[WALK_METRIC][1]
+                    chunked[UNARY_WALK_METRIC][1],
+                    reference[UNARY_WALK_METRIC][1],
                 )
+
+    def test_selector_walk_uses_autoregressive_selector_predictions(self):
+        plan = [3, 0, 2, 1, 0, 3]
+        reference = self._planned_selector_metrics(plan)
+
+        # Unary rejects every first token, so it visits all six anchors. The
+        # selector visits anchors 0, 5, 8, 11, and 14 according to its own path.
+        self.assertEqual(float(reference[UNARY_WALK_METRIC][0]), 6.0)
+        self.assertEqual(float(reference[UNARY_WALK_METRIC][1]), 6.0)
+        self.assertEqual(float(reference[SELECTOR_WALK_METRIC][0]), 14.0)
+        self.assertEqual(float(reference[SELECTOR_WALK_METRIC][1]), 5.0)
+
+        for chunk_blocks in (1, 2, 4, 5):
+            with self.subTest(objective_chunk_blocks=chunk_blocks):
+                chunked = self._planned_selector_metrics(
+                    plan,
+                    objective_chunk_blocks=chunk_blocks,
+                )
+                torch.testing.assert_close(
+                    chunked[SELECTOR_WALK_METRIC][0],
+                    reference[SELECTOR_WALK_METRIC][0],
+                )
+                torch.testing.assert_close(
+                    chunked[SELECTOR_WALK_METRIC][1],
+                    reference[SELECTOR_WALK_METRIC][1],
+                )
+
+    def test_walk_collection_is_skipped_without_detailed_metrics(self):
+        model = _make_model(self.logits, self.anchors, self.keep_mask)
+
+        with patch.object(
+            _dflash_module,
+            "compute_accept_len",
+            side_effect=AssertionError("walk collection must stay gated"),
+        ):
+            _loss, _accuracy, metrics = model(
+                input_ids=self.input_ids,
+                hidden_states=self.hidden_states,
+                loss_mask=self.loss_mask,
+                collect_detailed_metrics=False,
+            )
+
+        self.assertNotIn(UNARY_WALK_METRIC, metrics["ratio_metrics"])
 
     def test_invalid_loss_type_rejected(self):
         with self.assertRaisesRegex(ValueError, "loss_type"):

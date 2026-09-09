@@ -71,8 +71,6 @@ class DFlashObjectiveTerms(NamedTuple):
     target_probability_num: torch.Tensor
     correct_num: torch.Tensor
     accuracy_den: torch.Tensor
-    block_accepted: torch.Tensor
-    block_valid: torch.Tensor
     selector_ce_num: torch.Tensor
     selector_probability_num: torch.Tensor
     selector_correct_num: torch.Tensor
@@ -83,8 +81,9 @@ class DFlashObjectiveTerms(NamedTuple):
 class DFlashMetricTerms(NamedTuple):
     """Additive DFlash2 diagnostics for one metric chunk.
 
-    Per-position fields hold one entry per block position; the accepted-length
-    fields and ``block_den`` are per-block scalars.
+    Per-position fields hold one entry per block position. Accepted-length
+    numerators and ``block_den`` are scalars; the final three fields are sparse
+    full-grid tensors that reconstruct sampled-block order across chunks.
     """
 
     hard_label_probability_num: torch.Tensor
@@ -107,6 +106,9 @@ class DFlashMetricTerms(NamedTuple):
     serving_accepted_length_num: torch.Tensor
     expected_accepted_length_num: torch.Tensor
     teacher_expected_accepted_length_num: torch.Tensor
+    unary_block_accepted: torch.Tensor
+    selector_block_accepted: torch.Tensor
+    block_valid: torch.Tensor
 
 
 def _expected_accepted_length_num(
@@ -154,6 +156,8 @@ class _DFlashServingDiagnostics(NamedTuple):
     oracle_accepted_length_num: torch.Tensor
     accepted_length_num: torch.Tensor
     expected_accepted_length_num: torch.Tensor
+    block_accepted: torch.Tensor
+    block_valid: torch.Tensor
 
 
 class _DFlashTeacherTerms(NamedTuple):
@@ -181,10 +185,10 @@ def compute_accept_len(
     target_ids_4d: torch.Tensor,
     valid_mask_4d: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute per-block acceptance length."""
-    correct = (pred_ids_4d == target_ids_4d) | (~valid_mask_4d)
-    accept_prefix = correct.long().cumprod(dim=2) * valid_mask_4d.long()
-    return accept_prefix.sum(dim=2).float()
+    """Compute the leading correct-and-supervised prefix of each block."""
+
+    accepted = (pred_ids_4d == target_ids_4d) & valid_mask_4d
+    return accepted.long().cumprod(dim=-1).sum(dim=-1).float()
 
 
 def compute_visited_mask(
@@ -192,18 +196,20 @@ def compute_visited_mask(
     anchor_positions: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
-    """Mark anchors visited by the greedy serving walk."""
+    """Mark sampled anchors visited by a greedy cross-block serving walk."""
     counts = accepted.detach().to(device="cpu", dtype=torch.long)
     positions = anchor_positions.detach().to(device="cpu", dtype=torch.long)
-    lengths = valid.detach().to(device="cpu", dtype=torch.bool).sum(dim=1)
+    valid = valid.detach().to(device="cpu", dtype=torch.bool)
     visited = torch.zeros_like(counts, dtype=torch.bool)
     for row in range(counts.shape[0]):
-        num_valid = int(lengths[row].item())
-        row_positions = positions[row, :num_valid]
+        valid_indices = valid[row].nonzero(as_tuple=False).flatten()
+        row_positions = positions[row, valid_indices]
+        num_valid = row_positions.numel()
         cursor = 0
         while cursor < num_valid:
-            visited[row, cursor] = True
-            resume_at = row_positions[cursor] + counts[row, cursor] + 1
+            source_index = valid_indices[cursor]
+            visited[row, source_index] = True
+            resume_at = row_positions[cursor] + counts[row, source_index] + 1
             cursor = max(
                 int(torch.searchsorted(row_positions, resume_at).item()),
                 cursor + 1,
@@ -726,9 +732,6 @@ class OnlineDFlashModel(nn.Module):
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
-        block_index: Optional[torch.Tensor] = None,
-        *,
-        total_blocks: Optional[int] = None,
     ) -> DFlashObjectiveTerms:
         """Return a flat tuple of additive objective and metric tensors."""
 
@@ -798,20 +801,6 @@ class OnlineDFlashModel(nn.Module):
             valid_mask = weight_mask > 0.5
             correct_num = ((predicted_ids == target_ids) & valid_mask).sum().float()
             accuracy_den = weight_mask.sum()
-            valid_blocks = valid_mask.any(dim=-1).float()
-            accepted = compute_accept_len(predicted_ids, target_ids, valid_mask)
-            if block_index is None:
-                block_index = torch.arange(
-                    num_blocks, device=hidden.device
-                ).unsqueeze(0)
-            row_width = num_blocks if total_blocks is None else total_blocks
-            scatter_index = block_index.expand(batch_size, -1)
-            block_accepted = accepted.new_zeros(batch_size, row_width).scatter_(
-                1, scatter_index, accepted
-            )
-            block_valid = valid_blocks.new_zeros(batch_size, row_width).scatter_(
-                1, scatter_index, valid_blocks
-            )
         return DFlashObjectiveTerms(
             ce_loss_num=ce_loss_num,
             tv_loss_num=tv_loss_num,
@@ -819,8 +808,6 @@ class OnlineDFlashModel(nn.Module):
             target_probability_num=target_probability_num,
             correct_num=correct_num,
             accuracy_den=accuracy_den,
-            block_accepted=block_accepted,
-            block_valid=block_valid,
             selector_ce_num=selector_terms.ce_num,
             selector_probability_num=selector_terms.probability_num,
             selector_correct_num=selector_terms.correct_num,
@@ -851,6 +838,9 @@ class OnlineDFlashModel(nn.Module):
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
         aligned_target_hidden: Optional[torch.Tensor] = None,
+        block_index: Optional[torch.Tensor] = None,
+        *,
+        total_blocks: Optional[int] = None,
     ) -> DFlashMetricTerms:
         """Return additive unary, selector, and teacher diagnostics for one chunk.
 
@@ -904,6 +894,8 @@ class OnlineDFlashModel(nn.Module):
             weight_mask=weight_mask,
             loss_weights=loss_weights,
             position_den=position_den,
+            block_index=block_index,
+            total_blocks=total_blocks,
         )
 
     def _dflash_unary_diagnostics(
@@ -1016,6 +1008,7 @@ class OnlineDFlashModel(nn.Module):
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         zero = position_den.new_zeros(())
         if block_size <= 1:
+            empty_blocks = position_den.new_zeros((batch_size, num_blocks))
             return _DFlashServingDiagnostics(
                 selected_ids=None,
                 correct_num=position_den.new_zeros(position_den.shape),
@@ -1023,6 +1016,8 @@ class OnlineDFlashModel(nn.Module):
                 oracle_accepted_length_num=zero.clone(),
                 accepted_length_num=zero.clone(),
                 expected_accepted_length_num=zero.clone(),
+                block_accepted=empty_blocks,
+                block_valid=empty_blocks.clone(),
             )
 
         # A block accepts its anchor, then only its leading run of supervised
@@ -1037,6 +1032,7 @@ class OnlineDFlashModel(nn.Module):
             unary.hard_label_probability[:, :, 1:], supervised, block_valid
         )
         if candidate_selector is None:
+            empty_blocks = block_valid.new_zeros(block_valid.shape)
             return _DFlashServingDiagnostics(
                 selected_ids=None,
                 correct_num=position_den.new_zeros(position_den.shape),
@@ -1044,6 +1040,8 @@ class OnlineDFlashModel(nn.Module):
                 oracle_accepted_length_num=oracle_accepted_length_num,
                 accepted_length_num=zero,
                 expected_accepted_length_num=expected_accepted_length_num,
+                block_accepted=empty_blocks,
+                block_valid=block_valid,
             )
 
         serving_ids = candidate_selector.greedy_path(
@@ -1065,6 +1063,11 @@ class OnlineDFlashModel(nn.Module):
             anchor_token_ids=target_ids[:, :, 0].reshape(-1),
         ).reshape(batch_size, num_blocks, block_size - 1)
         serving_hit = serving_ids == target_ids[:, :, 1:]
+        block_accepted = compute_accept_len(
+            serving_ids,
+            target_ids[:, :, 1:],
+            supervised,
+        )
         return _DFlashServingDiagnostics(
             selected_ids=serving_ids,
             correct_num=torch.cat(
@@ -1079,6 +1082,8 @@ class OnlineDFlashModel(nn.Module):
                 serving_hit, supervised, block_valid
             ),
             expected_accepted_length_num=expected_accepted_length_num,
+            block_accepted=block_accepted,
+            block_valid=block_valid,
         )
 
     def _dflash_teacher_terms(
@@ -1152,9 +1157,12 @@ class OnlineDFlashModel(nn.Module):
         weight_mask: torch.Tensor,
         loss_weights: torch.Tensor,
         position_den: torch.Tensor,
+        block_index: Optional[torch.Tensor],
+        total_blocks: Optional[int],
     ) -> DFlashMetricTerms:
         """Reduce per-token diagnostics into the flat chunk-reducer contract."""
 
+        batch_size, num_blocks = target_ids.shape[:2]
         covered_mask = weight_mask * unary.target_is_candidate.float()
         position_zeros = position_den.new_zeros(position_den.shape)
         if selector is None:
@@ -1169,6 +1177,26 @@ class OnlineDFlashModel(nn.Module):
             selector_conditional_correct_num = (
                 (selector.selected_ids == target_ids).float() * selector.covered_mask
             ).sum(dim=(0, 1))
+        supervised = weight_mask[:, :, 1:] > 0.5
+        unary_block_accepted = compute_accept_len(
+            unary.predicted_ids[:, :, 1:],
+            target_ids[:, :, 1:],
+            supervised,
+        )
+        if block_index is None:
+            block_index = torch.arange(num_blocks, device=target_ids.device).unsqueeze(
+                0
+            )
+        row_width = num_blocks if total_blocks is None else total_blocks
+        scatter_index = block_index.expand(batch_size, -1)
+
+        def scatter_blocks(values: torch.Tensor) -> torch.Tensor:
+            return values.new_zeros(batch_size, row_width).scatter_(
+                1,
+                scatter_index,
+                values,
+            )
+
         return DFlashMetricTerms(
             hard_label_probability_num=(unary.hard_label_probability * weight_mask).sum(
                 dim=(0, 1)
@@ -1197,6 +1225,9 @@ class OnlineDFlashModel(nn.Module):
             serving_accepted_length_num=serving.accepted_length_num,
             expected_accepted_length_num=serving.expected_accepted_length_num,
             teacher_expected_accepted_length_num=teacher.expected_accepted_length_num,
+            unary_block_accepted=scatter_blocks(unary_block_accepted),
+            selector_block_accepted=scatter_blocks(serving.block_accepted),
+            block_valid=scatter_blocks(serving.block_valid),
         )
 
     def _lk_kl_weight(
@@ -1309,23 +1340,17 @@ class OnlineDFlashModel(nn.Module):
             target_probability_num,
             correct_num,
             accuracy_denom,
-            block_accepted,
-            block_valid,
             selector_ce_num,
             selector_probability_num,
             selector_correct_num,
             selector_weight_den,
             selector_covered_num,
         ) = checkpointed_chunk_reduce(
-            partial(
-                self._dflash_objective_chunk_terms,
-                total_blocks=anchor_positions.shape[1],
-            ),
+            self._dflash_objective_chunk_terms,
             hidden_4d,
             target_ids,
             weight_mask,
             predecessor_ids,
-            torch.arange(anchor_positions.shape[1], device=device).unsqueeze(0),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
@@ -1376,20 +1401,6 @@ class OnlineDFlashModel(nn.Module):
             )
         candidate_selector = getattr(self.draft_model, "candidate_selector", None)
         if collect_detailed_metrics:
-            with torch.no_grad():
-                block_valid_mask = block_valid > 0.5
-                visited = (
-                    compute_visited_mask(
-                        block_accepted,
-                        anchor_positions,
-                        block_valid_mask,
-                    )
-                    & block_valid_mask
-                )
-                ratio_metrics["dflash/hard_label/walk_accepted_length"] = (
-                    ((block_accepted + 1.0) * visited.float()).sum(),
-                    visited.float().sum(),
-                )
             (
                 hard_label_probability_position_num,
                 unary_correct_position_num,
@@ -1411,16 +1422,46 @@ class OnlineDFlashModel(nn.Module):
                 serving_accepted_length_num,
                 expected_accepted_length_num,
                 teacher_expected_accepted_length_num,
+                unary_block_accepted,
+                selector_block_accepted,
+                detailed_block_valid,
             ) = checkpointed_chunk_reduce(
-                self._dflash_metric_chunk_terms,
+                partial(
+                    self._dflash_metric_chunk_terms,
+                    total_blocks=anchor_positions.shape[1],
+                ),
                 hidden_4d.detach(),
                 target_ids,
                 weight_mask,
                 predecessor_ids,
                 aligned_target_hidden,
+                torch.arange(anchor_positions.shape[1], device=device).unsqueeze(0),
                 chunk_size=self.objective_chunk_blocks,
                 dim=1,
             )
+            with torch.no_grad():
+                block_valid_mask = detailed_block_valid > 0.5
+                unary_visited = compute_visited_mask(
+                    unary_block_accepted,
+                    anchor_positions,
+                    block_valid_mask,
+                )
+                ratio_metrics["dflash/hard_label/walk_accepted_length"] = (
+                    ((unary_block_accepted + 1.0) * unary_visited.float()).sum(),
+                    unary_visited.float().sum(),
+                )
+                if candidate_selector is not None:
+                    selector_visited = compute_visited_mask(
+                        selector_block_accepted,
+                        anchor_positions,
+                        block_valid_mask,
+                    )
+                    ratio_metrics["dflash2/selector/walk_accepted_length"] = (
+                        (
+                            (selector_block_accepted + 1.0) * selector_visited.float()
+                        ).sum(),
+                        selector_visited.float().sum(),
+                    )
             top_k = self._metric_top_k()
             for name, numerators in (
                 (
