@@ -3,11 +3,11 @@
 ## Installation
 
 SpecForge needs Python 3.10 or newer. The recommended installer is
-[uv](https://docs.astral.sh/uv/): the `cuda` extra routes `torch` and
-`sglang-kernel` to CUDA-specific wheel indexes through `[tool.uv.sources]` in
-`pyproject.toml`, and uv is what honours those pins. pip works too; it takes
-every wheel from PyPI, where the pinned `torch` and `sglang-kernel` releases
-are CUDA 13 builds anyway.
+[uv](https://docs.astral.sh/uv/): the hardware extras route `torch` and
+`sglang-kernel` to accelerator-specific wheel indexes through
+`[tool.uv.sources]` in `pyproject.toml`, and uv honours those pins for a
+source install. pip does not read that table, so the pip commands below pass
+the same indexes with `--extra-index-url`.
 
 ### Quick install
 
@@ -44,7 +44,9 @@ Combine extras with a comma, for example `".[cuda,liger]"`.
 
 The canonical source install is:
 
-```bash
+::: code-group
+
+```bash [uv]
 git clone https://github.com/sgl-project/SpecForge.git
 cd SpecForge
 
@@ -54,8 +56,27 @@ source .venv/bin/activate
 uv pip install --prerelease=allow -e ".[cuda]"
 ```
 
+```bash [pip]
+git clone https://github.com/sgl-project/SpecForge.git
+cd SpecForge
+
+python -m venv .venv
+source .venv/bin/activate
+
+pip install --pre -e ".[cuda]" \
+    --extra-index-url https://download.pytorch.org/whl/cu130 \
+    --extra-index-url https://sgl-project.github.io/whl/cu130/
+```
+
+:::
+
 `--prerelease=allow` (`--pre` for pip) is required because SGLang 0.5.18 pins
-a pre-release `cuda-tile` wheel.
+a pre-release `cuda-tile` wheel. The two `--extra-index-url` flags give pip
+the `torch==2.13.0+cu130` and `sglang-kernel==0.4.6.post1+cu130` wheels that
+uv picks up from `[tool.uv.sources]`; use `--extra-index-url`, not
+`--index-url`, because everything else still comes from PyPI. When installing
+the PyPI release with uv, pass the same two flags, since the published package
+carries no source routing.
 
 > **CUDA 12 is not supported.** SGLang 0.5.18 is a CUDA 13 build (it requires
 > `cuda-python>=13` and `flashinfer_python[cu13]`) and publishes no CUDA 12

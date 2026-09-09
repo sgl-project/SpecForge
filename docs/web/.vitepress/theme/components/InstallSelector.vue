@@ -101,8 +101,13 @@ const lines = computed<string[]>(() => {
   if (hw === 'cuda') {
     // The cuda extra pins torch / sglang-kernel to CUDA 13 wheels; pre-releases
     // are allowed because sglang pins a pre-release cuda-tile wheel. flash-attn
-    // is built separately so it can see the installed torch.
+    // is built separately so it can see the installed torch. uv routes torch
+    // and sglang-kernel to the cu130 indexes via [tool.uv.sources] for a
+    // source install; pip does not read that, so it gets both indexes on the
+    // command line (also needed for the PyPI release under either installer).
     const spec = ['cuda', ...extras.value.filter((e) => e !== 'fa')].join(',')
+    const index =
+      '--extra-index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://sgl-project.github.io/whl/cu130/'
     const pipInstall = useUv ? 'uv pip install --prerelease=allow' : 'pip install --pre'
     if (fromSource) {
       out.push(
@@ -110,13 +115,13 @@ const lines = computed<string[]>(() => {
         'cd SpecForge',
         useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
         'source .venv/bin/activate',
-        `${pipInstall} -e ".[${spec}]"`
+        useUv ? `${pipInstall} -e ".[${spec}]"` : `${pipInstall} -e ".[${spec}]" ${index}`
       )
     } else {
       out.push(
         useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
         'source .venv/bin/activate',
-        `${pipInstall} "specforge[${spec}]"`
+        `${pipInstall} "specforge[${spec}]" ${index}`
       )
     }
     if (extras.value.includes('fa')) {
