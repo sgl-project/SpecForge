@@ -89,6 +89,15 @@ servers. Its
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
+`qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
+its managed-local sibling `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
+(one node, four capture servers plus a DP4 trainer) train the DFlash2 drafter
+in `configs/qwen3.8-27b-dflash2.json` for Qwen3.8-27B. Their
+[runbook](../../docs/recipes/qwen3.8-27b-dflash2-disaggregated.md) records the
+server/trainer splits, Mooncake lease, in-flight watermarks and throughput
+measured on B300 and H200 nodes, and the two-node launcher that starts eight
+capture servers.
+
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
 intentionally record their GPU allocation and loopback services. External
@@ -159,6 +168,8 @@ assume the command runs from the repository root.
 | EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
 | EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
 | DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+| DFlash 2 online, managed-local stack | [`online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`](online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml) |
+| DFlash 2 online, external services on two nodes | [`online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml`](online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml) |
 | Domino online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
 
 The runtime derives online/offline mode from the selected `data` source and
