@@ -291,6 +291,8 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
+    #: Budget for one readiness probe, capped by the remaining startup timeout.
+    probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     #: Master key-lease TTL (ms) forwarded to ``mooncake_master
     #: --default_kv_lease_ttl``. The consumer's teardown drain allows about
     #: 19.5s for leases to settle. Keep the managed-local default at 500ms so
@@ -329,6 +331,8 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
+    #: SGLang's generation-based /health waits at least one second internally.
+    probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_devices(self):

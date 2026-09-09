@@ -402,6 +402,7 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.mooncake.global_segment_size_bytes` | `34359738368` | Owned global segment size. |
 | `deployment.disaggregated.managed_local.mooncake.local_buffer_size_bytes` | `1073741824` | Owned local client buffer. |
 | `deployment.disaggregated.managed_local.mooncake.startup_timeout_s` | `60` | Positive Mooncake readiness timeout. |
+| `deployment.disaggregated.managed_local.mooncake.probe_timeout_s` | `5` | Positive, finite budget for one HTTP + TCP readiness probe, capped by the remaining startup timeout. |
 | `deployment.disaggregated.managed_local.mooncake.default_kv_lease_ttl_ms` | `500` | Master key-lease TTL (ms) forwarded to `mooncake_master --default_kv_lease_ttl`. Kept below the consumer's teardown drain window so managed_local shuts down cleanly; set `null` to inherit Mooncake's stock default. |
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
@@ -409,6 +410,13 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `null` | Optional SGLang static-memory override in `(0, 1]`; otherwise inherit `model.sglang_mem_fraction_static`. |
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
 | `deployment.disaggregated.managed_local.capture_servers[].startup_timeout_s` | `1800` | Positive server readiness timeout. |
+| `deployment.disaggregated.managed_local.capture_servers[].probe_timeout_s` | `5` | Positive, finite HTTP health-probe timeout, capped by the remaining startup timeout. SGLang's generation-based `/health` waits at least one second; allow headroom instead of setting this to one second. |
+
+`startup_timeout_s` bounds the overall readiness wait; `probe_timeout_s` controls
+each probe within that window. Increasing only the startup timeout cannot fix
+an HTTP probe timeout that is shorter than the server's healthy response time.
+The default probe budget supports SGLang's generation-based health check without
+disabling health-endpoint generation.
 
 Managed-local is only for a fresh, single-node, online Mooncake run. It derives
 server URLs and Mooncake endpoints, so do not combine it with explicit external
