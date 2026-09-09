@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from transformers import LlamaConfig
 
+from specforge.modeling._mask_utils import prepare_decoder_attention_mask
 from specforge.modeling.draft.llama3_eagle import (
     LlamaAttention,
     LlamaFlashAttention,
@@ -11,7 +12,6 @@ from specforge.modeling.draft.llama3_eagle import (
     _std_flash_attn_varlen_func,
     _std_flash_pad_input,
     _std_flash_unpad_input,
-    prepare_decoder_attention_mask,
 )
 from specforge.utils import padding
 from tests.test_utils.utils import norm_tensor
@@ -111,8 +111,9 @@ class TestFlashAttention(unittest.TestCase):
         )
         decoder_attention_mask = prepare_decoder_attention_mask(
             attention_mask=attention_mask,
-            input_shape=(batch_size, seq_len),
-            inputs_embeds=input_embeds,
+            hidden_states=input_embeds,
+            batch_size=batch_size,
+            seq_length=seq_len,
             past_key_values_length=0,
         )
         hidden_states_list = []
@@ -193,8 +194,9 @@ class TestFlashAttention(unittest.TestCase):
         )
         decoder_attention_mask = prepare_decoder_attention_mask(
             attention_mask=attention_mask,
-            input_shape=(batch_size, seq_len),
-            inputs_embeds=input_embeds,
+            hidden_states=input_embeds,
+            batch_size=batch_size,
+            seq_length=seq_len,
             past_key_values_length=0,
         )
 

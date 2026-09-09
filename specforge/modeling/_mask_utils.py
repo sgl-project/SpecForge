@@ -71,3 +71,39 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(
         inverted_mask.to(torch.bool), torch.finfo(dtype).min
     )
+
+
+def prepare_decoder_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    batch_size: int,
+    seq_length: int,
+    past_key_values_length: int = 0,
+) -> Optional[torch.Tensor]:
+    """
+    Build the additive decoder attention mask of shape `[bsz, 1, tgt_seq_len, src_seq_len]`
+    from a causal mask and an optional `[bsz, seq_len]` padding mask.
+    """
+    # create causal mask
+    # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+    combined_attention_mask = None
+    if seq_length > 1:
+        combined_attention_mask = _make_causal_mask(
+            (batch_size, seq_length),
+            hidden_states.dtype,
+            device=hidden_states.device,
+            past_key_values_length=past_key_values_length,
+        )
+
+    if attention_mask is not None:
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        expanded_attn_mask = _expand_mask(
+            attention_mask, hidden_states.dtype, tgt_len=seq_length
+        ).to(hidden_states.device)
+        combined_attention_mask = (
+            expanded_attn_mask
+            if combined_attention_mask is None
+            else expanded_attn_mask + combined_attention_mask
+        )
+
+    return combined_attention_mask
