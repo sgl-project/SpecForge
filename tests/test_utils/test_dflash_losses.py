@@ -61,11 +61,15 @@ with patch.dict(
 ):
     _spec.loader.exec_module(_dflash_module)
 OnlineDFlashModel = _dflash_module.OnlineDFlashModel
+OnlineDominoModel = _dflash_module.OnlineDominoModel
 OnlineDSparkModel = _dflash_module.OnlineDSparkModel
 compute_accept_len = _dflash_module.compute_accept_len
 compute_visited_mask = _dflash_module.compute_visited_mask
 UNARY_WALK_METRIC = "dflash/hard_label/walk_accepted_length"
 SELECTOR_WALK_METRIC = "dflash2/selector/walk_accepted_length"
+DOMINO_WALK_METRIC = "domino/final/walk_accepted_length"
+DOMINO_BASE_WALK_METRIC = "domino/base/walk_accepted_length"
+DSPARK_WALK_METRIC = "dspark/hard_label/walk_accepted_length"
 
 
 def _anchor_sampler_subject(num_anchors: int = 8):
@@ -237,6 +241,62 @@ class _SelectorSlotIndexedDraft(_SlotIndexedDraft):
         return logits
 
 
+class _FixedDominoDraft(_SlotIndexedDraft):
+    suffix_start = 0
+
+    def __init__(self, hidden_size, vocab_size):
+        super().__init__(hidden_size)
+        self.vocab_size = vocab_size
+        self.serving_calls = 0
+
+    def compute_correction_logits(self, hidden_states, prev_token_embeddings):
+        del prev_token_embeddings
+        return hidden_states.new_zeros(*hidden_states.shape[:-1], self.vocab_size)
+
+    def apply_logits_head(self, base_logits, **kwargs):
+        del kwargs
+        self.serving_calls += 1
+        return base_logits
+
+
+class _PlannedMarkovHead(nn.Module):
+    """Autoregressively choose candidate 1 for a pinned accepted prefix."""
+
+    def __init__(self, accepted, block_size):
+        super().__init__()
+        self.register_buffer("accepted", torch.as_tensor(accepted, dtype=torch.long))
+        self.block_size = block_size
+        self.serving_calls = 0
+
+    def sample_block_tokens(
+        self,
+        base_logits,
+        *,
+        first_prev_token_ids,
+        hidden_states,
+        temperature=0.0,
+    ):
+        del first_prev_token_ids, temperature
+        self.serving_calls += 1
+        block_indices = hidden_states[:, 0, 0].round().long() // self.block_size
+        accepted = self.accepted.to(hidden_states.device)[block_indices]
+        offsets = torch.arange(base_logits.shape[1], device=hidden_states.device)
+        choose_target = offsets.unsqueeze(0) < accepted.unsqueeze(1)
+        candidates = base_logits.topk(2, dim=-1).indices
+        sampled = torch.where(
+            choose_target,
+            candidates[:, :, 1],
+            candidates[:, :, 0],
+        )
+        return sampled, base_logits
+
+
+class _MarkovSlotIndexedDraft(_SlotIndexedDraft):
+    def __init__(self, hidden_size, markov_head):
+        super().__init__(hidden_size)
+        self.markov_head = markov_head
+
+
 class _DualFixedHead(nn.Module):
     def __init__(self, draft_logits: torch.Tensor, target_logits: torch.Tensor):
         super().__init__()
@@ -306,6 +366,37 @@ def _make_dspark_model(
         block_size=block_size,
         attention_backend="sdpa",
         num_anchors=n_blocks,
+        **kwargs,
+    ).double()
+    model._sample_anchor_positions = types.MethodType(
+        _fixed_anchor_sampler(anchors, keep_mask), model
+    )
+    model._create_noise_embed = types.MethodType(_fixed_noise_embed, model)
+    return model
+
+
+def _make_domino_model(
+    logits,
+    anchors,
+    keep_mask,
+    *,
+    shift_label,
+    draft_model=None,
+    lm_head=None,
+    **kwargs,
+):
+    bsz, n_blocks, block_size, vocab_size = logits.shape
+    model = OnlineDominoModel(
+        draft_model=draft_model
+        or _FixedDominoDraft(hidden_size=4, vocab_size=vocab_size),
+        target_lm_head=lm_head
+        or _FixedHead(logits.reshape(bsz, n_blocks * block_size, vocab_size)),
+        target_embed_tokens=nn.Embedding(vocab_size, 4).double(),
+        mask_token_id=0,
+        block_size=block_size,
+        attention_backend="sdpa",
+        num_anchors=n_blocks,
+        shift_label=shift_label,
         **kwargs,
     ).double()
     model._sample_anchor_positions = types.MethodType(
@@ -790,6 +881,105 @@ class TestDFlashLosses(unittest.TestCase):
         )
         return metrics["ratio_metrics"]
 
+    def _planned_domino_metrics(
+        self,
+        accept_plan,
+        *,
+        shift_label,
+        collect_detailed_metrics=True,
+        return_model=False,
+        **kwargs,
+    ):
+        """Run Domino with identical pinned base and corrected predictions."""
+
+        n_blocks = len(accept_plan)
+        block_size, vocab_size, seq_len = 4, 11, 20
+        torch.manual_seed(13)
+        input_ids = torch.randint(1, vocab_size, (1, seq_len), dtype=torch.long)
+        anchors = torch.tensor([[0, 2, 5, 8, 11, 14]], dtype=torch.long)
+        keep_mask = torch.ones(1, n_blocks, dtype=torch.bool)
+        loss_mask = torch.ones(1, seq_len, dtype=torch.double)
+        hidden_states = torch.zeros(1, seq_len, 4, dtype=torch.double)
+        logits = torch.full(
+            (1, n_blocks, block_size, vocab_size),
+            -10.0,
+            dtype=torch.double,
+        )
+        logits[..., 0] = 5.0
+        label_start = 1 if shift_label else 0
+        acceptance_start = 0 if shift_label else 1
+        for block, accepted in enumerate(accept_plan):
+            for step in range(accepted):
+                position = acceptance_start + step
+                target = input_ids[0, anchors[0, block] + label_start + position]
+                logits[0, block, position, target] = 6.0
+
+        model = _make_domino_model(
+            logits,
+            anchors,
+            keep_mask,
+            shift_label=shift_label,
+            draft_model=_FixedDominoDraft(4, vocab_size).double(),
+            lm_head=_LookupHead(logits.reshape(1, -1, vocab_size)),
+            **kwargs,
+        )
+        _loss, _accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+            collect_detailed_metrics=collect_detailed_metrics,
+        )
+        return (metrics, model) if return_model else metrics
+
+    def _planned_dspark_metrics(
+        self,
+        accept_plan,
+        *,
+        collect_detailed_metrics=True,
+        return_model=False,
+        **kwargs,
+    ):
+        """Run DSpark with a pinned hard-label accepted-prefix plan."""
+
+        n_blocks = len(accept_plan)
+        block_size, vocab_size, seq_len = 4, 11, 20
+        torch.manual_seed(17)
+        input_ids = torch.randint(1, vocab_size, (1, seq_len), dtype=torch.long)
+        anchors = torch.tensor([[0, 2, 5, 8, 11, 14]], dtype=torch.long)
+        keep_mask = torch.ones(1, n_blocks, dtype=torch.bool)
+        loss_mask = torch.ones(1, seq_len, dtype=torch.double)
+        hidden_states = torch.zeros(1, seq_len, 4, dtype=torch.double)
+        logits = torch.full(
+            (1, n_blocks, block_size, vocab_size),
+            -10.0,
+            dtype=torch.double,
+        )
+        logits[..., 0] = 6.0
+        for block in range(n_blocks):
+            for position in range(block_size):
+                target = input_ids[0, anchors[0, block] + position + 1]
+                logits[0, block, position, target] = 5.0
+
+        markov_head = _PlannedMarkovHead(accept_plan, block_size)
+        model = _make_dspark_model(
+            logits,
+            anchors,
+            keep_mask,
+            draft_model=_MarkovSlotIndexedDraft(4, markov_head).double(),
+            lm_head=_LookupHead(logits.reshape(1, -1, vocab_size)),
+            dspark_ce_loss_alpha=1.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+            **kwargs,
+        )
+        _loss, _accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+            collect_detailed_metrics=collect_detailed_metrics,
+        )
+        return (metrics, model) if return_model else metrics
+
     def test_accept_len_stops_at_the_first_unsupervised_slot(self):
         target = torch.tensor([[[1, 2, 3]]])
         predicted = target.clone()
@@ -934,6 +1124,99 @@ class TestDFlashLosses(unittest.TestCase):
             )
 
         self.assertNotIn(UNARY_WALK_METRIC, metrics["ratio_metrics"])
+
+    def test_domino_unshifted_anchor_slot_is_not_a_rejection(self):
+        metrics, model = self._planned_domino_metrics(
+            [3, 3, 3, 3, 3, 3],
+            shift_label=False,
+            return_model=True,
+        )
+
+        self.assertAlmostEqual(float(metrics["accept_len"]), 4.0, places=5)
+        self.assertAlmostEqual(float(metrics["base_accept_len"]), 4.0, places=5)
+        self.assertEqual(model.draft_model.serving_calls, 3)
+
+    def test_domino_walk_supports_both_label_layouts_and_chunking(self):
+        plan = [3, 0, 2, 1, 0, 3]
+        for shift_label in (False, True):
+            reference = self._planned_domino_metrics(
+                plan,
+                shift_label=shift_label,
+                objective_chunk_blocks=0,
+            )["ratio_metrics"]
+            for metric_name in (DOMINO_WALK_METRIC, DOMINO_BASE_WALK_METRIC):
+                self.assertEqual(float(reference[metric_name][0]), 14.0)
+                self.assertEqual(float(reference[metric_name][1]), 5.0)
+            for chunk_blocks in (1, 2, 4, 5):
+                with self.subTest(
+                    shift_label=shift_label,
+                    objective_chunk_blocks=chunk_blocks,
+                ):
+                    chunked = self._planned_domino_metrics(
+                        plan,
+                        shift_label=shift_label,
+                        objective_chunk_blocks=chunk_blocks,
+                    )["ratio_metrics"]
+                    for metric_name in (
+                        DOMINO_WALK_METRIC,
+                        DOMINO_BASE_WALK_METRIC,
+                    ):
+                        torch.testing.assert_close(
+                            chunked[metric_name][0], reference[metric_name][0]
+                        )
+                        torch.testing.assert_close(
+                            chunked[metric_name][1], reference[metric_name][1]
+                        )
+
+    def test_domino_acceptance_metrics_are_detailed_only(self):
+        metrics, model = self._planned_domino_metrics(
+            [3, 0, 2, 1, 0, 3],
+            shift_label=False,
+            collect_detailed_metrics=False,
+            return_model=True,
+        )
+
+        self.assertNotIn("accept_len", metrics)
+        self.assertNotIn("base_accept_len", metrics)
+        self.assertNotIn("ratio_metrics", metrics)
+        self.assertEqual(model.draft_model.serving_calls, 0)
+
+    def test_dspark_walk_replays_hard_label_path_and_is_chunk_invariant(self):
+        plan = [3, 0, 2, 1, 0, 3]
+        reference_metrics, model = self._planned_dspark_metrics(
+            plan,
+            objective_chunk_blocks=0,
+            return_model=True,
+        )
+        reference = reference_metrics["ratio_metrics"]
+        self.assertEqual(float(reference[DSPARK_WALK_METRIC][0]), 14.0)
+        self.assertEqual(float(reference[DSPARK_WALK_METRIC][1]), 5.0)
+        self.assertEqual(model.draft_model.markov_head.serving_calls, 1)
+
+        for chunk_blocks in (1, 2, 4, 5):
+            with self.subTest(objective_chunk_blocks=chunk_blocks):
+                chunked = self._planned_dspark_metrics(
+                    plan,
+                    objective_chunk_blocks=chunk_blocks,
+                )["ratio_metrics"]
+                torch.testing.assert_close(
+                    chunked[DSPARK_WALK_METRIC][0],
+                    reference[DSPARK_WALK_METRIC][0],
+                )
+                torch.testing.assert_close(
+                    chunked[DSPARK_WALK_METRIC][1],
+                    reference[DSPARK_WALK_METRIC][1],
+                )
+
+    def test_dspark_walk_collection_is_detailed_only(self):
+        metrics, model = self._planned_dspark_metrics(
+            [3, 0, 2, 1, 0, 3],
+            collect_detailed_metrics=False,
+            return_model=True,
+        )
+
+        self.assertNotIn(DSPARK_WALK_METRIC, metrics["ratio_metrics"])
+        self.assertEqual(model.draft_model.markov_head.serving_calls, 0)
 
     def test_invalid_loss_type_rejected(self):
         with self.assertRaisesRegex(ValueError, "loss_type"):
