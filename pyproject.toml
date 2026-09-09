@@ -47,6 +47,14 @@ cuda = [
 rocm = [
     "torch==2.13.0+rocm7.2",
 ]
+npu = [
+    "torch==2.13.0+cpu",
+    "torch_npu==2.13.0rc1",
+    "sgl_kernel_npu==2026.5.1",
+    "hccl==0.1.0",
+    "triton==3.5.0",
+    "triton_ascend==3.2.1.dev20260530",
+]
 dev = [
     "pre-commit",
 ]
@@ -57,6 +65,7 @@ liger = ["liger-kernel"]
 torch = [
     { index = "pytorch-rocm", extra = "rocm" },
     { index = "pytorch-cu130", extra = "cuda" },
+    { index = "pytorch-cpu", extra = "npu" },
 ]
 sglang-kernel = [
     { index = "sglang-cu130", extra = "cuda" },
@@ -70,6 +79,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [[tool.uv.index]]
