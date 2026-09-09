@@ -32,7 +32,7 @@ from safetensors import safe_open
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
 
-from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
+from specforge.modeling._mask_utils import prepare_decoder_attention_mask
 
 
 class Eagle3DraftModel(PreTrainedModel, ABC):
@@ -70,28 +70,13 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         """
         Prepare the attention mask of the draft model.
         """
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        combined_attention_mask = None
-        if seq_length > 1:
-            combined_attention_mask = _make_causal_mask(
-                (batch_size, seq_length),
-                hidden_states.dtype,
-                device=hidden_states.device,
-                past_key_values_length=past_key_values_length,
-            )
-
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(
-                attention_mask, hidden_states.dtype, tgt_len=seq_length
-            ).to(hidden_states.device)
-            combined_attention_mask = (
-                expanded_attn_mask
-                if combined_attention_mask is None
-                else expanded_attn_mask + combined_attention_mask
-            )
-        return combined_attention_mask
+        return prepare_decoder_attention_mask(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            past_key_values_length=past_key_values_length,
+        )
 
     @abstractmethod
     def backbone(
