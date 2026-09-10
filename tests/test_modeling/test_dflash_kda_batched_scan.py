@@ -45,7 +45,10 @@ def _config() -> Qwen3Config:
     config.draft_vocab_size = 64
     config.layer_types = ["full_attention"] * config.num_hidden_layers
     config.use_sliding_window = False
-    config.dflash_config = {"attention_modes": ["kda", "gqa", "kda"], "mask_token_id": 0}
+    config.dflash_config = {
+        "attention_modes": ["kda", "gqa", "kda"],
+        "mask_token_id": 0,
+    }
     config.linear_attn_config = {
         "head_dim": HEAD_DIM,
         "num_heads": HEADS,
@@ -61,7 +64,9 @@ def _config() -> Qwen3Config:
 def _inputs(batch_size: int, context_len: int, heads: int, dim: int, **kw):
     k = torch.randn(batch_size, context_len, heads, dim, requires_grad=True, **kw)
     v = torch.randn(batch_size, context_len, heads, dim, requires_grad=True, **kw)
-    raw_gate = (torch.randn(batch_size, context_len, heads, dim, **kw) * 0.1).requires_grad_(True)
+    raw_gate = (
+        torch.randn(batch_size, context_len, heads, dim, **kw) * 0.1
+    ).requires_grad_(True)
     beta = torch.randn(batch_size, context_len, heads, requires_grad=True, **kw)
     A_log = torch.rand(heads, **kw).add_(0.5).log_().requires_grad_(True)
     dt_bias = (torch.randn(heads * dim, **kw) * 0.1).requires_grad_(True)
@@ -86,7 +91,15 @@ class TestBatchedScanMatchesRowwise(unittest.TestCase):
         results = []
         for fn in (scan_kda_context_states_rowwise, scan_kda_context_states):
             states = fn(
-                reference_kda, k, v, raw_gate, beta, A_log, dt_bias, -5.0, anchors,
+                reference_kda,
+                k,
+                v,
+                raw_gate,
+                beta,
+                A_log,
+                dt_bias,
+                -5.0,
+                anchors,
                 group_size=group_size,
             )
             grads = (
@@ -122,14 +135,30 @@ class TestBatchedScanMatchesRowwise(unittest.TestCase):
         )
         for _ in range(2):
             actual = scan_kda_context_states(
-                reference_kda, k, v, raw_gate, beta, A_log, dt_bias, -5.0, ANCHORS,
+                reference_kda,
+                k,
+                v,
+                raw_gate,
+                beta,
+                A_log,
+                dt_bias,
+                -5.0,
+                ANCHORS,
                 layout=layout,
             )
             assert_close(actual, expected, rtol=1e-6, atol=1e-6)
         with self.assertRaises(ValueError):
             scan_kda_context_states(
-                reference_kda, k[:2], v[:2], raw_gate[:2], beta[:2], A_log, dt_bias,
-                -5.0, ANCHORS[:2], layout=layout,
+                reference_kda,
+                k[:2],
+                v[:2],
+                raw_gate[:2],
+                beta[:2],
+                A_log,
+                dt_bias,
+                -5.0,
+                ANCHORS[:2],
+                layout=layout,
             )
 
     def test_launch_count_is_two_level(self):
@@ -138,7 +167,9 @@ class TestBatchedScanMatchesRowwise(unittest.TestCase):
         self.assertEqual(layout.group, 8)
         self.assertEqual(len(layout.level1), 8)
         self.assertLessEqual(len(layout.level2), 7)
-        two_rows = build_scan_layout(torch.cat([anchors, anchors - 1]), 200, torch.device("cpu"))
+        two_rows = build_scan_layout(
+            torch.cat([anchors, anchors - 1]), 200, torch.device("cpu")
+        )
         # Batching rows adds no launches.
         self.assertEqual(len(two_rows.level1), len(layout.level1))
         self.assertEqual(len(two_rows.level2), len(layout.level2))
@@ -148,7 +179,9 @@ class TestModelUsesSharedLayout(unittest.TestCase):
     def _model_inputs(self, batch_size, num_blocks, context_len):
         draft_len = num_blocks * BLOCK
         return {
-            "position_ids": torch.arange(context_len + draft_len).expand(batch_size, -1),
+            "position_ids": torch.arange(context_len + draft_len).expand(
+                batch_size, -1
+            ),
             "noise_embedding": torch.randn(batch_size, draft_len, HIDDEN),
             "target_hidden": torch.randn(batch_size, context_len, 3 * HIDDEN),
             "attention_mask": torch.ones(
@@ -176,7 +209,9 @@ class TestModelUsesSharedLayout(unittest.TestCase):
 
     def test_generation_path_builds_no_layout(self):
         model = DFlashDraftModel(_config()).eval()
-        self.assertIsNone(model._build_scan_layout(torch.zeros(1, 4, HIDDEN), None, None))
+        self.assertIsNone(
+            model._build_scan_layout(torch.zeros(1, 4, HIDDEN), None, None)
+        )
 
 
 @unittest.skipUnless(CUDA_AND_FLA, "requires CUDA and fla")
@@ -190,7 +225,9 @@ class TestBatchedScanWithFLA(unittest.TestCase):
         )
         A_log = A_log.detach().float().requires_grad_(True)
         dt_bias = dt_bias.detach().float().requires_grad_(True)
-        anchors = torch.tensor([[0, 37, 37, 130, 200, 64], [5, 199, 12, 12, 100, 3]], device=device)
+        anchors = torch.tensor(
+            [[0, 37, 37, 130, 200, 64], [5, 199, 12, 12, 100, 3]], device=device
+        )
         rowwise = scan_kda_context_states_rowwise(
             fla_kda, k, v, raw_gate, beta, A_log, dt_bias, -5.0, anchors
         )
@@ -200,11 +237,17 @@ class TestBatchedScanWithFLA(unittest.TestCase):
         reference = scan_kda_context_states_rowwise(
             reference_kda, k, v, raw_gate, beta, A_log, dt_bias, -5.0, anchors
         )
-        assert_close(batched, rowwise, rtol=1e-4, atol=1e-4)  # same kernel, same launches
+        assert_close(
+            batched, rowwise, rtol=1e-4, atol=1e-4
+        )  # same kernel, same launches
         assert_close(batched, reference, rtol=4e-2, atol=4e-2)
         weight = torch.randn_like(batched)
-        grads_rowwise = torch.autograd.grad((rowwise * weight).sum(), (k, v, raw_gate, beta))
-        grads_batched = torch.autograd.grad((batched * weight).sum(), (k, v, raw_gate, beta))
+        grads_rowwise = torch.autograd.grad(
+            (rowwise * weight).sum(), (k, v, raw_gate, beta)
+        )
+        grads_batched = torch.autograd.grad(
+            (batched * weight).sum(), (k, v, raw_gate, beta)
+        )
         for got, want in zip(grads_batched, grads_rowwise):
             assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)
 

@@ -657,17 +657,21 @@ class ScanLayout:
     num_slots: int
     level1: list
     level2: list
-    index1: torch.Tensor  # device long: token gather for all level-1 launches (concatenated)
-    index2: torch.Tensor  # device long: token gather for all level-2 launches (concatenated)
+    index1: (
+        torch.Tensor
+    )  # device long: token gather for all level-1 launches (concatenated)
+    index2: (
+        torch.Tensor
+    )  # device long: token gather for all level-2 launches (concatenated)
     gin_slots: torch.Tensor  # device long: level-1 group-input slots ...
     cur_slots: torch.Tensor  # ... copied into these running slots before level 2
-    anchor_gather: torch.Tensor  # device long [batch * num_anchors] -> row of the collected finals
+    anchor_gather: (
+        torch.Tensor
+    )  # device long [batch * num_anchors] -> row of the collected finals
     total_finals: int
 
 
-def _pad_launch(
-    sequences: list, zero_index: int
-) -> tuple[list, list, int, int]:
+def _pad_launch(sequences: list, zero_index: int) -> tuple[list, list, int, int]:
     """Pad real (start, end, token_base) sequences to FLA's launch buckets.
 
     Returns ``(token_index_list, cu_seqlens_list, padded_sequences, padded_total)``
@@ -736,7 +740,9 @@ def build_scan_layout(
         cur.append([next_slot + i for i in range(num_groups[r])])
         next_slot += num_groups[r]
     num_slots = next_slot
-    zero_index = batch_size * context_len  # the appended zero row of the flattened context
+    zero_index = (
+        batch_size * context_len
+    )  # the appended zero row of the flattened context
 
     finals_row: dict = {}  # (row, segment) -> row index in the concatenated finals
     total_finals = 0
@@ -899,9 +905,7 @@ def scan_kda_context_states(
     pool = k.new_zeros(
         (layout.num_slots, num_heads, key_dim, value_dim), dtype=torch.float32
     )
-    max_length = max(
-        [launch.length for launch in layout.level1 + layout.level2] or [0]
-    )
+    max_length = max([launch.length for launch in layout.level1 + layout.level2] or [0])
     # The recurrent state does not depend on queries; one zero buffer serves
     # every launch as a view.
     zero_q = k.new_zeros((1, max_length, num_heads, key_dim))

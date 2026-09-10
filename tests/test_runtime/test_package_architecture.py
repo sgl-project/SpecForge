@@ -733,7 +733,10 @@ class TestPackageArchitecture(unittest.TestCase):
                     payload["num_attention_heads"] % payload["num_key_value_heads"],
                     0,
                 )
-                if name in ("qwen3-4b-dspark-kda.json", "qwen3-4b-dspark-kda-scan.json"):
+                if name in (
+                    "qwen3-4b-dspark-kda.json",
+                    "qwen3-4b-dspark-kda-scan.json",
+                ):
                     self.assertEqual(
                         payload["dflash_config"]["attention_modes"],
                         ["kda", "kda", "gqa", "kda", "kda"],
