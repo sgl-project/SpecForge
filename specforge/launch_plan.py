@@ -545,6 +545,7 @@ def _managed_local_services(
         service_env = {
             **shared_env,
             device_visibility_env: ",".join(server.cuda_visible_devices),
+            **({"SGLANG_SPEC_CAPTURE_GPU_PUT": "1"} if server.gpu_put else {}),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),

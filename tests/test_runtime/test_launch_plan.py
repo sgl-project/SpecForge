@@ -649,6 +649,36 @@ class LaunchPlanTest(unittest.TestCase):
 
         self.assertNotIn("--disable-radix-cache", plan.services[1].command.argv)
 
+    def test_managed_local_gpu_put_renders_only_on_the_opted_in_server(self):
+        servers = [
+            {"port": 30000, "cuda_visible_devices": ["0"], "tp_size": 1},
+            {"port": 30001, "cuda_visible_devices": ["1"], "tp_size": 1},
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            control_dir = os.path.join(root, "attempt")
+            cfg = _managed_config(control_dir, servers=servers)
+            raw = cfg.model_dump()
+            managed = raw["deployment"]["disaggregated"]["managed_local"]
+            # gpu_put is only valid with an RDMA transport (see the schema test)
+            managed["mooncake"].update(protocol="rdma", rdma_devices="mlx5_0")
+            managed["capture_servers"][0]["gpu_put"] = True
+            cfg = Config.model_validate(raw)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                plan = build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env={},
+                )
+        envs = {service.command.label: service.command.env for service in plan.services}
+        self.assertEqual(envs["capture-server-0"]["SGLANG_SPEC_CAPTURE_GPU_PUT"], "1")
+        self.assertNotIn("SGLANG_SPEC_CAPTURE_GPU_PUT", envs["capture-server-1"])
+        self.assertNotIn("SGLANG_SPEC_CAPTURE_GPU_PUT", envs["mooncake"])
+
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [
             {
