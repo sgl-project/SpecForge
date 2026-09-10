@@ -561,8 +561,9 @@ specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dfl
 ```
 
 The unified launcher provides rank/world/rendezvous variables and the runtime
-selects HCCL when `torch_npu` is active. For AMD GPUs, install
-`requirements-rocm.txt`; HF + SDPA is the portable ROCm starting point.
+selects HCCL when `torch_npu` is active. For AMD GPUs, follow the
+[ROCm installation steps](../../docs/get_started/installation.md#amd-rocm);
+HF + SDPA is the portable ROCm starting point.
 
 Offline colocated and offline disaggregated resume are supported.
 Disaggregated online recovery resumes only the consumer against retained

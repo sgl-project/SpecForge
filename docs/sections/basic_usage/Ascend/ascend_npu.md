@@ -10,19 +10,33 @@ A3 (64GB) host.
 
 ## 1. Installation
 
-You need an Ascend host with the driver, CANN, and a `torch_npu`-enabled
-PyTorch already installed, plus SGLang `0.5.18` with NPU support. Then install
-SpecForge without touching that stack:
+You need an Ascend host with the driver and CANN installed, plus the NPU build
+of SGLang `0.5.18`, `sgl_kernel_npu` and `hccl` from that stack; none of those
+are on PyPI. SpecForge's `npu` extra installs the rest: a CPU `torch==2.13.0`
+from the PyTorch index, `torch_npu==2.13.0rc1`, `triton==3.5.0` and
+`triton_ascend==3.2.0`. Use Python 3.11 or older; `triton_ascend` has no
+3.12 wheels.
 
-```bash
+::: code-group
+
+```bash [uv]
 git clone https://github.com/sgl-project/SpecForge.git
 cd SpecForge
-python -m pip install -e . --no-deps
+uv pip install -e ".[npu]"
 ```
 
-`--no-deps` keeps pip from pulling CUDA wheels over the working NPU
-torch/sglang. If a later step reports a missing lightweight dependency, install
-just that package, also with `--no-deps`.
+```bash [pip]
+git clone https://github.com/sgl-project/SpecForge.git
+cd SpecForge
+pip install -e ".[npu]" --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+:::
+
+pip needs `--extra-index-url` because the `+cpu` torch wheel is only on the
+PyTorch index; uv reads that routing from `pyproject.toml`. Do not add `--pre`;
+the `torch_npu` pin resolves without it. SGLang is not a base dependency, so
+the resolve leaves your NPU SGLang untouched.
 
 ### Apply the SGLang capture patches (online runs only)
 

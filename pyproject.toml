@@ -11,7 +11,6 @@ description = "SpecForge: Speculative Decoding Training Framework"
 authors = [{name = "SGLang Team"}]
 urls = {Homepage = "https://github.com/sgl-project/SpecForge"}
 dependencies = [
-    "torch==2.13.0",
     "transformers==5.12.1",
     "datasets",
     "tqdm",
@@ -19,17 +18,17 @@ dependencies = [
     "click>=8.0",
     "huggingface-hub",
     "numpy",
-    "openai-harmony",
     "pydantic",
     "psutil",
     "pyyaml",
     "safetensors",
-    "sglang==0.5.18",
     "requests",
-    "tensorboard",
     "typing-extensions",
+    "tensorboard",
     "wandb",
     "yunchang",
+    "openai-harmony",
+    "openai",
 ]
 
 [project.scripts]
@@ -39,12 +38,59 @@ specforge = "specforge.cli:main"
 include = ["specforge*"]
 
 [project.optional-dependencies]
-data = ["openai"]
+cuda = [
+    "sglang==0.5.18",
+    "torch==2.13.0",
+    "sglang-kernel==0.4.6.post1",
+    "mooncake-transfer-engine-cuda13"
+]
+rocm = [
+    "torch==2.13.0+rocm7.2",
+]
+npu = [
+    # The NPU build of SGLang, sgl_kernel_npu and hccl are not on PyPI; they
+    # come from the CANN / SGLang-NPU stack. See docs/sections/basic_usage/Ascend.
+    "torch==2.13.0+cpu",
+    "torch_npu==2.13.0rc1",
+    "triton==3.5.0",
+    "triton_ascend==3.2.0",
+]
 dev = [
     "pre-commit",
 ]
 fa = ["flash-attn", "ninja", "packaging"]
 liger = ["liger-kernel"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-rocm", extra = "rocm" },
+    { index = "pytorch-cu130", extra = "cuda" },
+    { index = "pytorch-cpu", extra = "npu" },
+]
+sglang-kernel = [
+    { index = "sglang-cu130", extra = "cuda" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "sglang-cu130"
+url = "https://sgl-project.github.io/whl/cu130/"
+explicit = true
+
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
