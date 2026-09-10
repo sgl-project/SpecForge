@@ -199,6 +199,57 @@ class _FakeProcess:
 
 
 class LaunchPlanTest(unittest.TestCase):
+    def test_cuda_receive_buffers_validate_effective_external_protocol(self):
+        for configured, override, valid in (
+            ("tcp", "rdma", True),
+            ("rdma", "tcp", False),
+            ("rdma", None, True),
+            (None, "rdma", True),
+            (None, None, False),
+            ("tcp", None, False),
+        ):
+            with self.subTest(configured=configured, override=override):
+                raw = _config(mode="disaggregated").model_dump()
+                raw["deployment"]["disaggregated"].update(
+                    receive_buffers="cuda", mooncake_protocol=configured
+                )
+                cfg = Config.model_validate(raw)
+                env = {
+                    "MOONCAKE_METADATA_SERVER": "http://metadata:8080",
+                    "MOONCAKE_MASTER_SERVER_ADDR": "master:50051",
+                }
+                if override is not None:
+                    env["MOONCAKE_PROTOCOL"] = override
+                if valid:
+                    plan = build_launch_plan(cfg, config_path="run.yaml", env=env)
+                    for command in plan.commands:
+                        self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "rdma")
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "effective MOONCAKE_PROTOCOL"
+                    ):
+                        build_launch_plan(cfg, config_path="run.yaml", env=env)
+
+    def test_managed_cuda_protocol_is_authoritative(self):
+        raw = _managed_config("/shared/attempt-cuda").model_dump()
+        deployment = raw["deployment"]["disaggregated"]
+        deployment["receive_buffers"] = "cuda"
+        deployment["managed_local"]["mooncake"]["protocol"] = "tcp"
+        with self.assertRaisesRegex(ValidationError, "RDMA"):
+            Config.model_validate(raw)
+        deployment["managed_local"]["mooncake"]["protocol"] = "rdma"
+        with mock.patch(
+            "specforge.training.capture_contract.resolve_server_capture_contract",
+            return_value=CAPTURE_CONTRACT,
+        ):
+            plan = build_launch_plan(
+                Config.model_validate(raw),
+                config_path="run.yaml",
+                env={"MOONCAKE_PROTOCOL": "tcp"},
+            )
+        for command in plan.commands:
+            self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "rdma")
+
     def test_local_multi_rank_self_launches_torchrun(self):
         plan = build_launch_plan(
             _config(nproc=4),

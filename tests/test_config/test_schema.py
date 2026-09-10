@@ -93,6 +93,24 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertIsNone(config.training.max_steps)
         self.assertIsNone(config.training.total_steps)
 
+    def test_external_cuda_transport_is_validated_after_environment_resolution(self):
+        payload = _online_payload()
+        payload["deployment"] = copy.deepcopy(ONLINE_DEPLOYMENT)
+        payload["deployment"]["disaggregated"]["receive_buffers"] = "cuda"
+        payload["deployment"]["disaggregated"]["mooncake_protocol"] = "tcp"
+        Config.model_validate(payload)  # MOONCAKE_PROTOCOL may override TCP.
+        payload["deployment"]["disaggregated"]["mooncake_protocol"] = "rdma"
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.deployment.disaggregated.receive_buffers, "cuda")
+        # a worker role config learns the transport from MOONCAKE_PROTOCOL only;
+        # the store factory re-checks it, so no typed protocol is accepted here
+        payload["deployment"]["disaggregated"].pop("mooncake_protocol")
+        Config.model_validate(payload)
+        payload["deployment"]["disaggregated"]["receive_buffers"] = "pinned"
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.deployment.disaggregated.receive_buffers, "pinned")
+        self.assertEqual(cfg.deployment.disaggregated.receive_pool_bytes, 8 << 30)
+
     def test_fsdp_sharding_is_typed(self):
         payload = copy.deepcopy(MINIMAL)
         payload["training"] = {"fsdp_sharding": "NO_SHARD"}
