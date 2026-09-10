@@ -516,6 +516,9 @@ class MooncakeFeatureStore(FeatureStore):
     ``is_exist``/``remove``/``put_from``/``get_into``) so the contract is
     unit-testable without a running master. An incompatible backend is rejected
     during construction rather than selected as a different transport.
+    An injected backend's owner must ensure its transport supports device reads
+    when selecting ``receive_buffers="cuda"``; setup kwargs apply only to owned
+    connections, whose effective protocol is validated here.
     """
 
     def __init__(
@@ -546,6 +549,11 @@ class MooncakeFeatureStore(FeatureStore):
         if store is None:
             kw = dict(_MOONCAKE_SETUP_DEFAULTS)
             kw.update(setup_kwargs or {})
+            if receive_buffers == "cuda" and kw["protocol"] != "rdma":
+                raise ValueError(
+                    "receive_buffers=cuda needs an RDMA Mooncake transport; "
+                    f"the {kw['protocol']!r} transport cannot write into device memory"
+                )
             store, replicate_config_type = _connect_store(kw)
             put_config = replicate_config_type()
         else:
@@ -674,10 +682,14 @@ class MooncakeFeatureStore(FeatureStore):
 
     def consumer_device(self) -> Optional[torch.device]:
         """Request device tensors so pooled copies run in the loader worker."""
-        if self.receive_buffers == "pageable" or (
-            self.receive_buffers == "pinned" and not torch.cuda.is_available()
-        ):
+        if self.receive_buffers == "pageable":
             return None
+        if self.receive_buffers == "pinned":
+            from specforge.utils import get_device_type
+
+            # Visible CUDA devices do not override an explicit CPU/NPU trainer.
+            if get_device_type() != "cuda" or not torch.cuda.is_available():
+                return None
         # Mirror init_distributed: the launcher's LOCAL_RANK names this rank's
         # device even before the process group has selected it.
         local_rank = os.environ.get("LOCAL_RANK")

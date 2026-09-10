@@ -176,6 +176,24 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 _, captured, _, _ = self._build({"refs": list(range(6))}, store=store)
         self.assertEqual(captured["loader_kw"]["device"], torch.device("cuda", 2))
 
+    def test_pinned_receive_keeps_loader_on_explicit_cpu_device(self):
+        import torch
+
+        from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+        from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
+
+        store = MooncakeFeatureStore(
+            store=_FakeMooncakeStore(), receive_buffers="pinned"
+        )
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.dict(
+                "os.environ", {"SPECFORGE_DEVICE": "cpu", "LOCAL_RANK": "0"}
+            ),
+        ):
+            _, captured, _, _ = self._build({"refs": list(range(6))}, store=store)
+        self.assertEqual(captured["loader_kw"]["device"], "cpu")
+
     def test_offline_wiring_matches_assemble_trainer(self):
         try:
             import torch  # noqa: F401

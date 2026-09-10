@@ -744,6 +744,72 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LOCAL_RANK": "2"}):
             self.assertEqual(cuda.consumer_device(), torch.device("cuda", 2))
 
+    def test_cuda_constructor_rejects_tcp_before_connecting(self):
+        for setup_kwargs in (None, {}, {"protocol": "tcp"}):
+            with (
+                self.subTest(setup_kwargs=setup_kwargs),
+                mock.patch(
+                    "specforge.runtime.data_plane.mooncake_store._connect_store",
+                    return_value=(_FakeMooncakeStore(), type("Config", (), {})),
+                ) as connect,
+            ):
+                with self.assertRaisesRegex(ValueError, "RDMA"):
+                    MooncakeFeatureStore(
+                        receive_buffers="cuda", setup_kwargs=setup_kwargs
+                    )
+                connect.assert_not_called()
+
+    def test_constructor_preserves_supported_receive_transports(self):
+        for kind, protocol in (
+            ("pageable", "tcp"),
+            ("pageable", "rdma"),
+            ("pinned", "tcp"),
+            ("pinned", "rdma"),
+            ("cuda", "rdma"),
+        ):
+            backend = _FakeMooncakeStore()
+            with (
+                self.subTest(kind=kind, protocol=protocol),
+                mock.patch(
+                    "specforge.runtime.data_plane.mooncake_store._connect_store",
+                    return_value=(backend, type("Config", (), {})),
+                ) as connect,
+                mock.patch.object(backend, "close", create=True, return_value=0),
+            ):
+                store = MooncakeFeatureStore(
+                    receive_buffers=kind, setup_kwargs={"protocol": protocol}
+                )
+                try:
+                    self.assertEqual(store.receive_buffers, kind)
+                    self.assertEqual(connect.call_args.args[0]["protocol"], protocol)
+                finally:
+                    store.close()
+
+    def test_pinned_consumer_respects_explicit_non_cuda_device(self):
+        store = _store(receive_buffers="pinned")
+        for device_type in ("cpu", "npu"):
+            with (
+                self.subTest(device_type=device_type),
+                mock.patch.dict(
+                    os.environ,
+                    {"SPECFORGE_DEVICE": device_type, "LOCAL_RANK": "0"},
+                ),
+                mock.patch.object(torch.cuda, "is_available", return_value=True),
+            ):
+                self.assertIsNone(store.consumer_device())
+        store.close()
+
+    def test_pinned_consumer_preserves_explicit_cuda_rank(self):
+        store = _store(receive_buffers="pinned")
+        with (
+            mock.patch.dict(
+                os.environ, {"SPECFORGE_DEVICE": "cuda", "LOCAL_RANK": "2"}
+            ),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+        ):
+            self.assertEqual(store.consumer_device(), torch.device("cuda", 2))
+        store.close()
+
     def test_host_registration_failure_does_not_disable_future_registration(self):
         class RegisterFails(_FakeMooncakeStore):
             def register_buffer(self, ptr, nbytes):
