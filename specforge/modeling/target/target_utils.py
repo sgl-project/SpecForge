@@ -74,6 +74,11 @@ def target_vocab_size(config) -> int:
     )
 
 
+def target_hidden_size(config) -> int:
+    text_config = target_text_config(config)
+    return int(text_config.hidden_size)
+
+
 class TargetEmbeddingsAndHead(nn.Module):
     """
     Efficiently loads only the embedding layer and lm_head from a pretrained model.

@@ -7,8 +7,12 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
-from transformers import AutoConfig
 
+from specforge.modeling.target.target_utils import (
+    load_target_config,
+    target_hidden_size,
+    target_vocab_size,
+)
 from specforge.utils import get_local_device, padding
 
 
@@ -20,13 +24,13 @@ class TargetHead(nn.Module):
         cache_dir: Optional[str] = None,
     ):
         super().__init__()
-        self.config = AutoConfig.from_pretrained(
+        self.config = load_target_config(
             model_path,
             trust_remote_code=trust_remote_code,
             cache_dir=cache_dir,
         )
-        self.hidden_size = self.config.hidden_size
-        self.vocab_size = self.config.vocab_size
+        self.hidden_size = target_hidden_size(self.config)
+        self.vocab_size = target_vocab_size(self.config)
 
         self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
 
