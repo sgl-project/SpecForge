@@ -604,6 +604,20 @@ class CandidateSelectorTest(unittest.TestCase):
             .gather(-1, target_ids[0].unsqueeze(-1))
             .squeeze(-1)
         )
+        expected_loss_weights = (
+            weights
+            * model._dpace_weight(
+                gold_probability.unsqueeze(0),
+                weights,
+                weights > 0,
+                "dpace",
+            )
+            / 2.0
+        )
+        torch.testing.assert_close(
+            terms.loss_weight_num,
+            expected_loss_weights.sum(dim=(0, 1)),
+        )
         torch.testing.assert_close(
             terms.expected_accepted_length_num,
             (1.0 + gold_probability[:, 1:].cumprod(dim=-1).sum(dim=-1)).sum(),
@@ -928,6 +942,41 @@ class CandidateSelectorTest(unittest.TestCase):
             selector_ce * dpace_weight,
         )
         torch.testing.assert_close(dpace_terms.selector_weight_den, dpace_weight)
+        self.assertEqual(dpace_terms.loss_den.item(), 1.0)
+
+        # Sequence-balanced anchor normalization applies the same 1 / A_b
+        # scale to the shared base and selector numerators. The first sequence
+        # has two valid anchors while the second has one.
+        multi_hidden = hidden.expand(2, 2, -1, -1).clone()
+        multi_targets = covered_targets.expand(2, 2, -1).clone()
+        multi_weights = torch.tensor(
+            [
+                [[0.0, 1.0], [0.0, 1.0]],
+                [[0.0, 1.0], [0.0, 0.0]],
+            ]
+        )
+        multi_predecessors = predecessors.expand(2, 2, -1).clone()
+
+        multi_terms = model._dflash_objective_chunk_terms(
+            multi_hidden,
+            multi_targets,
+            multi_weights,
+            multi_predecessors,
+        )
+
+        torch.testing.assert_close(
+            multi_terms.ce_loss_num,
+            2.0 * covered_base_ce * dpace_weight,
+        )
+        torch.testing.assert_close(
+            multi_terms.selector_ce_num,
+            2.0 * selector_ce * dpace_weight,
+        )
+        torch.testing.assert_close(
+            multi_terms.selector_weight_den,
+            2.0 * dpace_weight,
+        )
+        self.assertEqual(multi_terms.loss_den.item(), 2.0)
 
     def test_selector_keeps_ce_when_base_uses_tv(self):
         class Draft(nn.Module):
