@@ -567,6 +567,9 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
+        collect_detailed_metrics = (
+            ctx.collect_detailed_metrics if ctx is not None else True
+        )
         loss, accuracy, model_metrics = self.dspark_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
@@ -575,6 +578,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
                 device, non_blocking=True
             ),
             max_valid_anchors=max_valid_anchors,
+            collect_detailed_metrics=collect_detailed_metrics,
         )
         metrics = {
             "accuracy": accuracy.detach(),
@@ -704,14 +708,22 @@ class DominoTrainStrategy(DraftTrainStrategy):
         device = self._device()
         lambda_base = self._lambda_base(ctx)
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
+        collect_detailed_metrics = (
+            ctx.collect_detailed_metrics if ctx is not None else True
+        )
         loss, accuracy, model_metrics = self.domino_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
             lambda_base=lambda_base,
             max_valid_anchors=max_valid_anchors,
+            collect_detailed_metrics=collect_detailed_metrics,
         )
-        metrics = dict(model_metrics)
+        metrics = {
+            name: value
+            for name, value in model_metrics.items()
+            if name != "ratio_metrics"
+        }
         metrics["accuracy"] = accuracy.detach()
         metrics.setdefault(
             "lambda_base",
@@ -720,6 +732,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
         return StepOutput(
             loss=loss,
             metrics=metrics,
+            ratio_metrics=model_metrics.get("ratio_metrics", {}),
             loss_terms=model_metrics.get("loss_terms"),
         )
 

@@ -61,7 +61,15 @@ with patch.dict(
 ):
     _spec.loader.exec_module(_dflash_module)
 OnlineDFlashModel = _dflash_module.OnlineDFlashModel
+OnlineDominoModel = _dflash_module.OnlineDominoModel
 OnlineDSparkModel = _dflash_module.OnlineDSparkModel
+compute_accept_len = _dflash_module.compute_accept_len
+compute_visited_mask = _dflash_module.compute_visited_mask
+UNARY_WALK_METRIC = "dflash/hard_label/walk_accepted_length"
+SELECTOR_WALK_METRIC = "dflash2/selector/walk_accepted_length"
+DOMINO_WALK_METRIC = "domino/final/walk_accepted_length"
+DOMINO_BASE_WALK_METRIC = "domino/base/walk_accepted_length"
+DSPARK_WALK_METRIC = "dspark/hard_label/walk_accepted_length"
 
 
 def _anchor_sampler_subject(num_anchors: int = 8):
@@ -141,6 +149,154 @@ class _FixedHead(nn.Module):
         return self.fixed_logits.to(device=hidden_states.device)
 
 
+class _SlotIndexedDraft(_FixedDraft):
+    """Emit the global draft-slot index in channel 0.
+
+    ``_FixedHead`` returns the whole batch of logits regardless of its input, so
+    it cannot be used with a chunked objective. Pairing this draft with
+    ``_LookupHead`` gives the same pinned logits while staying correct under any
+    ``objective_chunk_blocks``, because the head resolves each row by its global
+    slot index instead of assuming it was handed the entire sequence.
+    """
+
+    def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
+        del position_ids, target_hidden, attention_mask
+        bsz, draft_len = noise_embedding.shape[:2]
+        slots = torch.arange(
+            draft_len,
+            device=noise_embedding.device,
+            dtype=noise_embedding.dtype,
+        )
+        hidden = torch.zeros(
+            bsz,
+            draft_len,
+            self.hidden_size,
+            dtype=noise_embedding.dtype,
+            device=noise_embedding.device,
+        )
+        hidden[..., 0] = slots.unsqueeze(0)
+        return hidden
+
+
+class _LookupHead(nn.Module):
+    """Return pre-baked logits for the slot index carried in hidden channel 0."""
+
+    def __init__(self, logits: torch.Tensor):
+        super().__init__()
+        self.register_buffer("table", logits)
+
+    def forward(self, hidden_states):
+        slots = hidden_states[..., 0].round().long()
+        table = self.table.to(device=hidden_states.device)
+        index = slots.unsqueeze(-1).expand(-1, -1, table.shape[-1])
+        return torch.gather(table, 1, index)
+
+
+class _PlannedSelector(nn.Module):
+    """Choose candidate 1 for a planned accepted prefix, then candidate 0."""
+
+    top_k = 2
+
+    def __init__(self, accepted, block_size):
+        super().__init__()
+        self.register_buffer("accepted", torch.as_tensor(accepted, dtype=torch.long))
+        self.block_size = block_size
+
+    def score_candidates(
+        self,
+        candidate_ids,
+        unary_logits,
+        hidden_states,
+        predecessor_ids,
+    ):
+        del candidate_ids, hidden_states, predecessor_ids
+        return torch.zeros_like(unary_logits)
+
+    def greedy_path(
+        self,
+        candidate_ids,
+        unary_logits,
+        hidden_states,
+        anchor_token_ids,
+    ):
+        del unary_logits, anchor_token_ids
+        block_indices = hidden_states[:, 0, 0].round().long() // self.block_size
+        accepted = self.accepted.to(hidden_states.device)[block_indices]
+        offsets = torch.arange(candidate_ids.shape[1], device=hidden_states.device)
+        choose_target = offsets.unsqueeze(0) < accepted.unsqueeze(1)
+        return torch.where(
+            choose_target,
+            candidate_ids[:, :, 1],
+            candidate_ids[:, :, 0],
+        )
+
+
+class _SelectorSlotIndexedDraft(_SlotIndexedDraft):
+    def __init__(self, hidden_size, candidate_selector):
+        super().__init__(hidden_size)
+        self.candidate_selector = candidate_selector
+
+    @staticmethod
+    def transform_unary_logits(logits):
+        return logits
+
+
+class _FixedDominoDraft(_SlotIndexedDraft):
+    suffix_start = 0
+
+    def __init__(self, hidden_size, vocab_size):
+        super().__init__(hidden_size)
+        self.vocab_size = vocab_size
+        self.serving_calls = 0
+
+    def compute_correction_logits(self, hidden_states, prev_token_embeddings):
+        del prev_token_embeddings
+        return hidden_states.new_zeros(*hidden_states.shape[:-1], self.vocab_size)
+
+    def apply_logits_head(self, base_logits, **kwargs):
+        del kwargs
+        self.serving_calls += 1
+        return base_logits
+
+
+class _PlannedMarkovHead(nn.Module):
+    """Autoregressively choose candidate 1 for a pinned accepted prefix."""
+
+    def __init__(self, accepted, block_size):
+        super().__init__()
+        self.register_buffer("accepted", torch.as_tensor(accepted, dtype=torch.long))
+        self.block_size = block_size
+        self.serving_calls = 0
+
+    def sample_block_tokens(
+        self,
+        base_logits,
+        *,
+        first_prev_token_ids,
+        hidden_states,
+        temperature=0.0,
+    ):
+        del first_prev_token_ids, temperature
+        self.serving_calls += 1
+        block_indices = hidden_states[:, 0, 0].round().long() // self.block_size
+        accepted = self.accepted.to(hidden_states.device)[block_indices]
+        offsets = torch.arange(base_logits.shape[1], device=hidden_states.device)
+        choose_target = offsets.unsqueeze(0) < accepted.unsqueeze(1)
+        candidates = base_logits.topk(2, dim=-1).indices
+        sampled = torch.where(
+            choose_target,
+            candidates[:, :, 1],
+            candidates[:, :, 0],
+        )
+        return sampled, base_logits
+
+
+class _MarkovSlotIndexedDraft(_SlotIndexedDraft):
+    def __init__(self, hidden_size, markov_head):
+        super().__init__(hidden_size)
+        self.markov_head = markov_head
+
+
 class _DualFixedHead(nn.Module):
     def __init__(self, draft_logits: torch.Tensor, target_logits: torch.Tensor):
         super().__init__()
@@ -210,6 +366,37 @@ def _make_dspark_model(
         block_size=block_size,
         attention_backend="sdpa",
         num_anchors=n_blocks,
+        **kwargs,
+    ).double()
+    model._sample_anchor_positions = types.MethodType(
+        _fixed_anchor_sampler(anchors, keep_mask), model
+    )
+    model._create_noise_embed = types.MethodType(_fixed_noise_embed, model)
+    return model
+
+
+def _make_domino_model(
+    logits,
+    anchors,
+    keep_mask,
+    *,
+    shift_label,
+    draft_model=None,
+    lm_head=None,
+    **kwargs,
+):
+    bsz, n_blocks, block_size, vocab_size = logits.shape
+    model = OnlineDominoModel(
+        draft_model=draft_model
+        or _FixedDominoDraft(hidden_size=4, vocab_size=vocab_size),
+        target_lm_head=lm_head
+        or _FixedHead(logits.reshape(bsz, n_blocks * block_size, vocab_size)),
+        target_embed_tokens=nn.Embedding(vocab_size, 4).double(),
+        mask_token_id=0,
+        block_size=block_size,
+        attention_backend="sdpa",
+        num_anchors=n_blocks,
+        shift_label=shift_label,
         **kwargs,
     ).double()
     model._sample_anchor_positions = types.MethodType(
@@ -603,6 +790,433 @@ class TestDFlashLosses(unittest.TestCase):
                     rtol=1e-6,
                     atol=1e-7,
                 )
+
+    def _planned_acceptance_metrics(self, accept_plan, **kwargs):
+        """Run a forward pass where every block accepts a planned prefix.
+
+        The LM head is pinned so position ``j`` of a block predicts the target
+        token for ``1 <= j <= accepted`` and misses immediately afterwards,
+        which makes the acceptance telemetry exactly predictable.
+        """
+        bsz, n_blocks = len(accept_plan), len(accept_plan[0])
+        block_size, vocab_size, seq_len = 4, 11, 20
+        torch.manual_seed(7)
+        input_ids = torch.randint(1, vocab_size, (bsz, seq_len), dtype=torch.long)
+        anchors = torch.tensor(
+            [[0, 2, 5, 8, 11, 14], [1, 3, 6, 9, 12, 15]],
+            dtype=torch.long,
+        )
+        keep_mask = torch.ones(bsz, n_blocks, dtype=torch.bool)
+        loss_mask = torch.ones(bsz, seq_len, dtype=torch.double)
+        hidden_states = torch.zeros(bsz, seq_len, 4, dtype=torch.double)
+
+        # Token id 0 never appears in input_ids, so an argmax of 0 always misses.
+        logits = torch.full(
+            (bsz, n_blocks, block_size, vocab_size),
+            -10.0,
+            dtype=torch.double,
+        )
+        logits[..., 0] = 0.0
+        for row, plan in enumerate(accept_plan):
+            for block, accepted in enumerate(plan):
+                for offset in range(1, accepted + 1):
+                    target = input_ids[row, anchors[row, block] + offset]
+                    logits[row, block, offset, target] = 5.0
+
+        model = _make_model(
+            logits,
+            anchors,
+            keep_mask,
+            draft_model=_SlotIndexedDraft(hidden_size=4).double(),
+            lm_head=_LookupHead(logits.reshape(bsz, n_blocks * block_size, vocab_size)),
+            **kwargs,
+        )
+        _loss, _accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+        )
+        return metrics["ratio_metrics"]
+
+    def _planned_selector_metrics(self, accept_plan, **kwargs):
+        """Run a one-row fixture whose unary and selector paths disagree."""
+
+        n_blocks = len(accept_plan)
+        block_size, vocab_size, seq_len = 4, 11, 20
+        torch.manual_seed(11)
+        input_ids = torch.randint(1, vocab_size, (1, seq_len), dtype=torch.long)
+        anchors = torch.tensor([[0, 2, 5, 8, 11, 14]], dtype=torch.long)
+        keep_mask = torch.ones(1, n_blocks, dtype=torch.bool)
+        loss_mask = torch.ones(1, seq_len, dtype=torch.double)
+        hidden_states = torch.zeros(1, seq_len, 4, dtype=torch.double)
+
+        # Candidate 0 is the unary argmax and always wrong. Candidate 1 is the
+        # target, so the fake selector can realize the independently pinned
+        # serving plan while remaining inside the strict unary top-k.
+        logits = torch.full(
+            (1, n_blocks, block_size, vocab_size),
+            -10.0,
+            dtype=torch.double,
+        )
+        logits[..., 0] = 5.0
+        for block, anchor in enumerate(anchors[0]):
+            for offset in range(1, block_size):
+                target = input_ids[0, anchor + offset]
+                logits[0, block, offset, target] = 4.0
+
+        selector = _PlannedSelector(accept_plan, block_size)
+        model = _make_model(
+            logits,
+            anchors,
+            keep_mask,
+            draft_model=_SelectorSlotIndexedDraft(4, selector).double(),
+            lm_head=_LookupHead(logits.reshape(1, n_blocks * block_size, vocab_size)),
+            selector_loss_alpha=0.0,
+            **kwargs,
+        )
+        _loss, _accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+        )
+        return metrics["ratio_metrics"]
+
+    def _planned_domino_metrics(
+        self,
+        accept_plan,
+        *,
+        shift_label,
+        collect_detailed_metrics=True,
+        return_model=False,
+        **kwargs,
+    ):
+        """Run Domino with identical pinned base and corrected predictions."""
+
+        n_blocks = len(accept_plan)
+        block_size, vocab_size, seq_len = 4, 11, 20
+        torch.manual_seed(13)
+        input_ids = torch.randint(1, vocab_size, (1, seq_len), dtype=torch.long)
+        anchors = torch.tensor([[0, 2, 5, 8, 11, 14]], dtype=torch.long)
+        keep_mask = torch.ones(1, n_blocks, dtype=torch.bool)
+        loss_mask = torch.ones(1, seq_len, dtype=torch.double)
+        hidden_states = torch.zeros(1, seq_len, 4, dtype=torch.double)
+        logits = torch.full(
+            (1, n_blocks, block_size, vocab_size),
+            -10.0,
+            dtype=torch.double,
+        )
+        logits[..., 0] = 5.0
+        label_start = 1 if shift_label else 0
+        acceptance_start = 0 if shift_label else 1
+        for block, accepted in enumerate(accept_plan):
+            for step in range(accepted):
+                position = acceptance_start + step
+                target = input_ids[0, anchors[0, block] + label_start + position]
+                logits[0, block, position, target] = 6.0
+
+        model = _make_domino_model(
+            logits,
+            anchors,
+            keep_mask,
+            shift_label=shift_label,
+            draft_model=_FixedDominoDraft(4, vocab_size).double(),
+            lm_head=_LookupHead(logits.reshape(1, -1, vocab_size)),
+            **kwargs,
+        )
+        _loss, _accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+            collect_detailed_metrics=collect_detailed_metrics,
+        )
+        return (metrics, model) if return_model else metrics
+
+    def _planned_dspark_metrics(
+        self,
+        accept_plan,
+        *,
+        collect_detailed_metrics=True,
+        return_model=False,
+        **kwargs,
+    ):
+        """Run DSpark with a pinned hard-label accepted-prefix plan."""
+
+        n_blocks = len(accept_plan)
+        block_size, vocab_size, seq_len = 4, 11, 20
+        torch.manual_seed(17)
+        input_ids = torch.randint(1, vocab_size, (1, seq_len), dtype=torch.long)
+        anchors = torch.tensor([[0, 2, 5, 8, 11, 14]], dtype=torch.long)
+        keep_mask = torch.ones(1, n_blocks, dtype=torch.bool)
+        loss_mask = torch.ones(1, seq_len, dtype=torch.double)
+        hidden_states = torch.zeros(1, seq_len, 4, dtype=torch.double)
+        logits = torch.full(
+            (1, n_blocks, block_size, vocab_size),
+            -10.0,
+            dtype=torch.double,
+        )
+        logits[..., 0] = 6.0
+        for block in range(n_blocks):
+            for position in range(block_size):
+                target = input_ids[0, anchors[0, block] + position + 1]
+                logits[0, block, position, target] = 5.0
+
+        markov_head = _PlannedMarkovHead(accept_plan, block_size)
+        model = _make_dspark_model(
+            logits,
+            anchors,
+            keep_mask,
+            draft_model=_MarkovSlotIndexedDraft(4, markov_head).double(),
+            lm_head=_LookupHead(logits.reshape(1, -1, vocab_size)),
+            dspark_ce_loss_alpha=1.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+            **kwargs,
+        )
+        _loss, _accuracy, metrics = model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+            collect_detailed_metrics=collect_detailed_metrics,
+        )
+        return (metrics, model) if return_model else metrics
+
+    def test_accept_len_stops_at_the_first_unsupervised_slot(self):
+        target = torch.tensor([[[1, 2, 3]]])
+        predicted = target.clone()
+
+        accepted = compute_accept_len(
+            predicted,
+            target,
+            torch.tensor([[[True, False, True]]]),
+        )
+
+        self.assertEqual(accepted.tolist(), [[1.0]])
+
+    def test_visited_mask_walks_greedily_over_consecutive_anchors(self):
+        accepted = torch.tensor([[2.0, 0.0, 5.0, 1.0, 0.0, 3.0]])
+        positions = torch.arange(6).unsqueeze(0)
+        valid = torch.ones(1, 6, dtype=torch.bool)
+
+        visited = compute_visited_mask(accepted, positions, valid)
+
+        # Anchor 0 accepts 2 tokens, so serving resumes at token 3; anchor 3
+        # accepts 1 and resumes at 5; anchor 5 runs off the end.
+        self.assertEqual(
+            visited.tolist(),
+            [[True, False, False, True, False, True]],
+        )
+
+    def test_visited_mask_advances_by_token_distance_not_anchor_index(self):
+        # Sparse anchors: accepting 3 tokens at token 0 resumes at token 4,
+        # which is anchor index 3 -- not index 0 + 3 + 1.
+        accepted = torch.tensor([[3.0, 0.0, 0.0, 0.0]])
+        positions = torch.tensor([[0, 1, 2, 10]])
+        valid = torch.ones(1, 4, dtype=torch.bool)
+
+        visited = compute_visited_mask(accepted, positions, valid)
+
+        self.assertEqual(visited.tolist(), [[True, False, False, True]])
+
+    def test_visited_mask_stops_at_the_padded_anchor_slots(self):
+        accepted = torch.tensor([[0.0, 0.0, 7.0]])
+        positions = torch.tensor([[3, 4, 0]])
+        valid = torch.tensor([[True, True, False]])
+
+        visited = compute_visited_mask(accepted, positions, valid)
+
+        self.assertEqual(visited.tolist(), [[True, True, False]])
+
+    def test_visited_mask_supports_empty_and_non_prefix_valid_masks(self):
+        accepted = torch.tensor([[9.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
+        positions = torch.tensor([[0, 0, 0], [1, 3, 8]])
+        valid = torch.tensor([[False, False, False], [True, False, True]])
+
+        visited = compute_visited_mask(accepted, positions, valid)
+
+        self.assertEqual(
+            visited.tolist(),
+            [[False, False, False], [True, False, True]],
+        )
+
+    def test_visited_mask_covers_every_anchor_when_nothing_is_accepted(self):
+        # Consecutive anchors with an empty accepted prefix advance one anchor
+        # per round, so the walk degenerates to the plain per-anchor average.
+        accepted = torch.zeros(1, 5)
+        positions = torch.arange(5).unsqueeze(0)
+        valid = torch.ones(1, 5, dtype=torch.bool)
+
+        visited = compute_visited_mask(accepted, positions, valid)
+
+        self.assertTrue(bool(visited.all()))
+
+    def test_walk_accepted_length_replays_the_greedy_serving_walk(self):
+        # anchors row 0: [0, 2, 5, 8, 11, 14]; row 1: [1, 3, 6, 9, 12, 15]
+        plan = [[3, 0, 2, 1, 0, 3], [1, 2, 0, 3, 1, 0]]
+        metrics = self._planned_acceptance_metrics(plan)
+
+        walk_num, walk_den = metrics[UNARY_WALK_METRIC]
+
+        # A greedy run only restarts at tokens 0,5,8,11,14 (row 0) and
+        # 1,3,6,9,15 (row 1) -- 10 of the 12 blocks. Averaging over every block
+        # instead would give 28/12; the walk gives 25/10.
+        self.assertEqual(float(walk_den), 10.0)
+        self.assertEqual(float(walk_num), 25.0)
+
+    def test_walk_accepted_length_does_not_depend_on_objective_chunking(self):
+        # The walk is sequential, so a per-chunk evaluation would restart it at
+        # every boundary and collapse the metric onto the plain per-block mean.
+        plan = [[3, 0, 2, 1, 0, 3], [1, 2, 0, 3, 1, 0]]
+        reference = self._planned_acceptance_metrics(plan, objective_chunk_blocks=0)
+        for chunk_blocks in (1, 2, 4, 5):
+            with self.subTest(objective_chunk_blocks=chunk_blocks):
+                chunked = self._planned_acceptance_metrics(
+                    plan,
+                    objective_chunk_blocks=chunk_blocks,
+                )
+                torch.testing.assert_close(
+                    chunked[UNARY_WALK_METRIC][0],
+                    reference[UNARY_WALK_METRIC][0],
+                )
+                torch.testing.assert_close(
+                    chunked[UNARY_WALK_METRIC][1],
+                    reference[UNARY_WALK_METRIC][1],
+                )
+
+    def test_selector_walk_uses_autoregressive_selector_predictions(self):
+        plan = [3, 0, 2, 1, 0, 3]
+        reference = self._planned_selector_metrics(plan)
+
+        # Unary rejects every first token, so it visits all six anchors. The
+        # selector visits anchors 0, 5, 8, 11, and 14 according to its own path.
+        self.assertEqual(float(reference[UNARY_WALK_METRIC][0]), 6.0)
+        self.assertEqual(float(reference[UNARY_WALK_METRIC][1]), 6.0)
+        self.assertEqual(float(reference[SELECTOR_WALK_METRIC][0]), 14.0)
+        self.assertEqual(float(reference[SELECTOR_WALK_METRIC][1]), 5.0)
+
+        for chunk_blocks in (1, 2, 4, 5):
+            with self.subTest(objective_chunk_blocks=chunk_blocks):
+                chunked = self._planned_selector_metrics(
+                    plan,
+                    objective_chunk_blocks=chunk_blocks,
+                )
+                torch.testing.assert_close(
+                    chunked[SELECTOR_WALK_METRIC][0],
+                    reference[SELECTOR_WALK_METRIC][0],
+                )
+                torch.testing.assert_close(
+                    chunked[SELECTOR_WALK_METRIC][1],
+                    reference[SELECTOR_WALK_METRIC][1],
+                )
+
+    def test_walk_collection_is_skipped_without_detailed_metrics(self):
+        model = _make_model(self.logits, self.anchors, self.keep_mask)
+
+        with patch.object(
+            _dflash_module,
+            "compute_accept_len",
+            side_effect=AssertionError("walk collection must stay gated"),
+        ):
+            _loss, _accuracy, metrics = model(
+                input_ids=self.input_ids,
+                hidden_states=self.hidden_states,
+                loss_mask=self.loss_mask,
+                collect_detailed_metrics=False,
+            )
+
+        self.assertNotIn(UNARY_WALK_METRIC, metrics["ratio_metrics"])
+
+    def test_domino_unshifted_anchor_slot_is_not_a_rejection(self):
+        metrics, model = self._planned_domino_metrics(
+            [3, 3, 3, 3, 3, 3],
+            shift_label=False,
+            return_model=True,
+        )
+
+        self.assertAlmostEqual(float(metrics["accept_len"]), 4.0, places=5)
+        self.assertAlmostEqual(float(metrics["base_accept_len"]), 4.0, places=5)
+        self.assertEqual(model.draft_model.serving_calls, 3)
+
+    def test_domino_walk_supports_both_label_layouts_and_chunking(self):
+        plan = [3, 0, 2, 1, 0, 3]
+        for shift_label in (False, True):
+            reference = self._planned_domino_metrics(
+                plan,
+                shift_label=shift_label,
+                objective_chunk_blocks=0,
+            )["ratio_metrics"]
+            for metric_name in (DOMINO_WALK_METRIC, DOMINO_BASE_WALK_METRIC):
+                self.assertEqual(float(reference[metric_name][0]), 14.0)
+                self.assertEqual(float(reference[metric_name][1]), 5.0)
+            for chunk_blocks in (1, 2, 4, 5):
+                with self.subTest(
+                    shift_label=shift_label,
+                    objective_chunk_blocks=chunk_blocks,
+                ):
+                    chunked = self._planned_domino_metrics(
+                        plan,
+                        shift_label=shift_label,
+                        objective_chunk_blocks=chunk_blocks,
+                    )["ratio_metrics"]
+                    for metric_name in (
+                        DOMINO_WALK_METRIC,
+                        DOMINO_BASE_WALK_METRIC,
+                    ):
+                        torch.testing.assert_close(
+                            chunked[metric_name][0], reference[metric_name][0]
+                        )
+                        torch.testing.assert_close(
+                            chunked[metric_name][1], reference[metric_name][1]
+                        )
+
+    def test_domino_acceptance_metrics_are_detailed_only(self):
+        metrics, model = self._planned_domino_metrics(
+            [3, 0, 2, 1, 0, 3],
+            shift_label=False,
+            collect_detailed_metrics=False,
+            return_model=True,
+        )
+
+        self.assertNotIn("accept_len", metrics)
+        self.assertNotIn("base_accept_len", metrics)
+        self.assertNotIn("ratio_metrics", metrics)
+        self.assertEqual(model.draft_model.serving_calls, 0)
+
+    def test_dspark_walk_replays_hard_label_path_and_is_chunk_invariant(self):
+        plan = [3, 0, 2, 1, 0, 3]
+        reference_metrics, model = self._planned_dspark_metrics(
+            plan,
+            objective_chunk_blocks=0,
+            return_model=True,
+        )
+        reference = reference_metrics["ratio_metrics"]
+        self.assertEqual(float(reference[DSPARK_WALK_METRIC][0]), 14.0)
+        self.assertEqual(float(reference[DSPARK_WALK_METRIC][1]), 5.0)
+        self.assertEqual(model.draft_model.markov_head.serving_calls, 1)
+
+        for chunk_blocks in (1, 2, 4, 5):
+            with self.subTest(objective_chunk_blocks=chunk_blocks):
+                chunked = self._planned_dspark_metrics(
+                    plan,
+                    objective_chunk_blocks=chunk_blocks,
+                )["ratio_metrics"]
+                torch.testing.assert_close(
+                    chunked[DSPARK_WALK_METRIC][0],
+                    reference[DSPARK_WALK_METRIC][0],
+                )
+                torch.testing.assert_close(
+                    chunked[DSPARK_WALK_METRIC][1],
+                    reference[DSPARK_WALK_METRIC][1],
+                )
+
+    def test_dspark_walk_collection_is_detailed_only(self):
+        metrics, model = self._planned_dspark_metrics(
+            [3, 0, 2, 1, 0, 3],
+            collect_detailed_metrics=False,
+            return_model=True,
+        )
+
+        self.assertNotIn(DSPARK_WALK_METRIC, metrics["ratio_metrics"])
+        self.assertEqual(model.draft_model.markov_head.serving_calls, 0)
 
     def test_invalid_loss_type_rejected(self):
         with self.assertRaisesRegex(ValueError, "loss_type"):

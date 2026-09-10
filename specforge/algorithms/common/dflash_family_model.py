@@ -2,6 +2,7 @@
 """DFlash-family training models and shared masking helpers."""
 
 import os
+from functools import partial
 from typing import Dict, NamedTuple, Optional, Tuple
 
 import torch
@@ -80,8 +81,9 @@ class DFlashObjectiveTerms(NamedTuple):
 class DFlashMetricTerms(NamedTuple):
     """Additive DFlash2 diagnostics for one metric chunk.
 
-    Per-position fields hold one entry per block position; the accepted-length
-    fields and ``block_den`` are per-block scalars.
+    Per-position fields hold one entry per block position. Accepted-length
+    numerators and ``block_den`` are scalars; the final three fields are sparse
+    full-grid tensors that reconstruct sampled-block order across chunks.
     """
 
     hard_label_probability_num: torch.Tensor
@@ -104,6 +106,9 @@ class DFlashMetricTerms(NamedTuple):
     serving_accepted_length_num: torch.Tensor
     expected_accepted_length_num: torch.Tensor
     teacher_expected_accepted_length_num: torch.Tensor
+    unary_block_accepted: torch.Tensor
+    selector_block_accepted: torch.Tensor
+    block_valid: torch.Tensor
 
 
 def _expected_accepted_length_num(
@@ -151,6 +156,8 @@ class _DFlashServingDiagnostics(NamedTuple):
     oracle_accepted_length_num: torch.Tensor
     accepted_length_num: torch.Tensor
     expected_accepted_length_num: torch.Tensor
+    block_accepted: torch.Tensor
+    block_valid: torch.Tensor
 
 
 class _DFlashTeacherTerms(NamedTuple):
@@ -174,14 +181,70 @@ class _DFlashTeacherTerms(NamedTuple):
 
 
 def compute_accept_len(
-    pred_ids_4d: torch.Tensor,
-    target_ids_4d: torch.Tensor,
-    valid_mask_4d: torch.Tensor,
+    pred_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute per-block acceptance length."""
-    correct = (pred_ids_4d == target_ids_4d) | (~valid_mask_4d)
-    accept_prefix = correct.long().cumprod(dim=2) * valid_mask_4d.long()
-    return accept_prefix.sum(dim=2).float()
+    """Compute the leading correct-and-supervised prefix of each block."""
+
+    accepted = (pred_ids == target_ids) & valid_mask
+    return accepted.long().cumprod(dim=-1).sum(dim=-1).float()
+
+
+def compute_visited_mask(
+    accepted: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    """Mark sampled anchors visited by a greedy cross-block serving walk."""
+    counts = accepted.detach().to(device="cpu", dtype=torch.long)
+    positions = anchor_positions.detach().to(device="cpu", dtype=torch.long)
+    valid = valid.detach().to(device="cpu", dtype=torch.bool)
+    visited = torch.zeros_like(counts, dtype=torch.bool)
+    for row in range(counts.shape[0]):
+        valid_indices = valid[row].nonzero(as_tuple=False).flatten()
+        row_positions = positions[row, valid_indices]
+        num_valid = row_positions.numel()
+        cursor = 0
+        while cursor < num_valid:
+            source_index = valid_indices[cursor]
+            visited[row, source_index] = True
+            resume_at = row_positions[cursor] + counts[row, source_index] + 1
+            cursor = max(
+                int(torch.searchsorted(row_positions, resume_at).item()),
+                cursor + 1,
+            )
+    return visited.to(device=accepted.device)
+
+
+def compute_walk_accepted_length_terms(
+    accepted: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    valid: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return additive accepted-length terms over a sampled-anchor walk."""
+
+    visited = compute_visited_mask(accepted, anchor_positions, valid)
+    visited_weight = visited.to(dtype=accepted.dtype)
+    return (
+        ((accepted + 1.0) * visited_weight).sum(),
+        visited_weight.sum(),
+    )
+
+
+def _scatter_block_values(
+    values: torch.Tensor,
+    block_index: torch.Tensor,
+    total_blocks: int,
+) -> torch.Tensor:
+    """Place one objective chunk back into sampled-anchor order."""
+
+    batch_size = values.shape[0]
+    return values.new_zeros(batch_size, total_blocks).scatter_(
+        1,
+        block_index.expand(batch_size, -1),
+        values,
+    )
 
 
 def create_dflash_sdpa_mask(
@@ -764,9 +827,8 @@ class OnlineDFlashModel(nn.Module):
 
         with torch.no_grad():
             predicted_ids = objective_logits.argmax(dim=-1)
-            correct_num = (
-                ((predicted_ids == target_ids) & (weight_mask > 0.5)).sum().float()
-            )
+            valid_mask = weight_mask > 0.5
+            correct_num = ((predicted_ids == target_ids) & valid_mask).sum().float()
             accuracy_den = weight_mask.sum()
         return DFlashObjectiveTerms(
             ce_loss_num=ce_loss_num,
@@ -805,6 +867,9 @@ class OnlineDFlashModel(nn.Module):
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
         aligned_target_hidden: Optional[torch.Tensor] = None,
+        block_index: Optional[torch.Tensor] = None,
+        *,
+        total_blocks: Optional[int] = None,
     ) -> DFlashMetricTerms:
         """Return additive unary, selector, and teacher diagnostics for one chunk.
 
@@ -858,6 +923,8 @@ class OnlineDFlashModel(nn.Module):
             weight_mask=weight_mask,
             loss_weights=loss_weights,
             position_den=position_den,
+            block_index=block_index,
+            total_blocks=total_blocks,
         )
 
     def _dflash_unary_diagnostics(
@@ -970,6 +1037,7 @@ class OnlineDFlashModel(nn.Module):
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         zero = position_den.new_zeros(())
         if block_size <= 1:
+            empty_blocks = position_den.new_zeros((batch_size, num_blocks))
             return _DFlashServingDiagnostics(
                 selected_ids=None,
                 correct_num=position_den.new_zeros(position_den.shape),
@@ -977,6 +1045,8 @@ class OnlineDFlashModel(nn.Module):
                 oracle_accepted_length_num=zero.clone(),
                 accepted_length_num=zero.clone(),
                 expected_accepted_length_num=zero.clone(),
+                block_accepted=empty_blocks,
+                block_valid=empty_blocks.clone(),
             )
 
         # A block accepts its anchor, then only its leading run of supervised
@@ -991,6 +1061,7 @@ class OnlineDFlashModel(nn.Module):
             unary.hard_label_probability[:, :, 1:], supervised, block_valid
         )
         if candidate_selector is None:
+            empty_blocks = block_valid.new_zeros(block_valid.shape)
             return _DFlashServingDiagnostics(
                 selected_ids=None,
                 correct_num=position_den.new_zeros(position_den.shape),
@@ -998,6 +1069,8 @@ class OnlineDFlashModel(nn.Module):
                 oracle_accepted_length_num=oracle_accepted_length_num,
                 accepted_length_num=zero,
                 expected_accepted_length_num=expected_accepted_length_num,
+                block_accepted=empty_blocks,
+                block_valid=block_valid,
             )
 
         serving_ids = candidate_selector.greedy_path(
@@ -1019,6 +1092,11 @@ class OnlineDFlashModel(nn.Module):
             anchor_token_ids=target_ids[:, :, 0].reshape(-1),
         ).reshape(batch_size, num_blocks, block_size - 1)
         serving_hit = serving_ids == target_ids[:, :, 1:]
+        block_accepted = compute_accept_len(
+            serving_ids,
+            target_ids[:, :, 1:],
+            supervised,
+        )
         return _DFlashServingDiagnostics(
             selected_ids=serving_ids,
             correct_num=torch.cat(
@@ -1033,6 +1111,8 @@ class OnlineDFlashModel(nn.Module):
                 serving_hit, supervised, block_valid
             ),
             expected_accepted_length_num=expected_accepted_length_num,
+            block_accepted=block_accepted,
+            block_valid=block_valid,
         )
 
     def _dflash_teacher_terms(
@@ -1106,9 +1186,12 @@ class OnlineDFlashModel(nn.Module):
         weight_mask: torch.Tensor,
         loss_weights: torch.Tensor,
         position_den: torch.Tensor,
+        block_index: Optional[torch.Tensor],
+        total_blocks: Optional[int],
     ) -> DFlashMetricTerms:
         """Reduce per-token diagnostics into the flat chunk-reducer contract."""
 
+        num_blocks = target_ids.shape[1]
         covered_mask = weight_mask * unary.target_is_candidate.float()
         position_zeros = position_den.new_zeros(position_den.shape)
         if selector is None:
@@ -1123,6 +1206,18 @@ class OnlineDFlashModel(nn.Module):
             selector_conditional_correct_num = (
                 (selector.selected_ids == target_ids).float() * selector.covered_mask
             ).sum(dim=(0, 1))
+        supervised = weight_mask[:, :, 1:] > 0.5
+        unary_block_accepted = compute_accept_len(
+            unary.predicted_ids[:, :, 1:],
+            target_ids[:, :, 1:],
+            supervised,
+        )
+        if block_index is None:
+            block_index = torch.arange(num_blocks, device=target_ids.device).unsqueeze(
+                0
+            )
+        row_width = num_blocks if total_blocks is None else total_blocks
+
         return DFlashMetricTerms(
             hard_label_probability_num=(unary.hard_label_probability * weight_mask).sum(
                 dim=(0, 1)
@@ -1151,6 +1246,15 @@ class OnlineDFlashModel(nn.Module):
             serving_accepted_length_num=serving.accepted_length_num,
             expected_accepted_length_num=serving.expected_accepted_length_num,
             teacher_expected_accepted_length_num=teacher.expected_accepted_length_num,
+            unary_block_accepted=_scatter_block_values(
+                unary_block_accepted, block_index, row_width
+            ),
+            selector_block_accepted=_scatter_block_values(
+                serving.block_accepted, block_index, row_width
+            ),
+            block_valid=_scatter_block_values(
+                serving.block_valid, block_index, row_width
+            ),
         )
 
     def _lk_kl_weight(
@@ -1345,16 +1449,40 @@ class OnlineDFlashModel(nn.Module):
                 serving_accepted_length_num,
                 expected_accepted_length_num,
                 teacher_expected_accepted_length_num,
+                unary_block_accepted,
+                selector_block_accepted,
+                detailed_block_valid,
             ) = checkpointed_chunk_reduce(
-                self._dflash_metric_chunk_terms,
+                partial(
+                    self._dflash_metric_chunk_terms,
+                    total_blocks=anchor_positions.shape[1],
+                ),
                 hidden_4d.detach(),
                 target_ids,
                 weight_mask,
                 predecessor_ids,
                 aligned_target_hidden,
+                torch.arange(anchor_positions.shape[1], device=device).unsqueeze(0),
                 chunk_size=self.objective_chunk_blocks,
                 dim=1,
             )
+            with torch.no_grad():
+                block_valid_mask = detailed_block_valid > 0.5
+                ratio_metrics["dflash/hard_label/walk_accepted_length"] = (
+                    compute_walk_accepted_length_terms(
+                        unary_block_accepted,
+                        anchor_positions,
+                        block_valid_mask,
+                    )
+                )
+                if candidate_selector is not None:
+                    ratio_metrics["dflash2/selector/walk_accepted_length"] = (
+                        compute_walk_accepted_length_terms(
+                            selector_block_accepted,
+                            anchor_positions,
+                            block_valid_mask,
+                        )
+                    )
             top_k = self._metric_top_k()
             for name, numerators in (
                 (
@@ -1526,6 +1654,36 @@ class OnlineDominoModel(OnlineDFlashModel):
             os.environ.get("SPECFORGE_DOMINO_TRITON_CE", "1") == "1"
         )
 
+    @torch.no_grad()
+    def _domino_serving_ids(
+        self,
+        base_logits: torch.Tensor,
+        hidden: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Greedily replay Domino's token-conditioned serving head."""
+
+        batch_size, num_blocks, block_size = hidden.shape[:3]
+        completed_ids = torch.full(
+            (batch_size, num_blocks, block_size),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=hidden.device,
+        )
+        completed_ids[:, :, 0] = anchor_token_ids
+        for token_position in range(1, block_size):
+            previous_embeddings = self.embed_tokens(completed_ids)
+            final_logits = self.draft_model.apply_logits_head(
+                base_logits,
+                prev_token_embeddings=previous_embeddings,
+                hidden_states=hidden,
+            )
+            head_position = token_position - 1 if self.shift_label else token_position
+            completed_ids[:, :, token_position] = final_logits[
+                :, :, head_position
+            ].argmax(dim=-1)
+        return completed_ids[:, :, 1:]
+
     def _build_domino_head_inputs(
         self,
         input_ids: torch.Tensor,
@@ -1559,6 +1717,10 @@ class OnlineDominoModel(OnlineDFlashModel):
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
         eval_weight_mask: torch.Tensor,
+        block_index: Optional[torch.Tensor] = None,
+        *,
+        total_blocks: Optional[int] = None,
+        collect_acceptance_metrics: bool = True,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive Domino loss and telemetry terms for one block slice."""
         from specforge.core.domino_loss import domino_weighted_cross_entropy
@@ -1600,17 +1762,54 @@ class OnlineDominoModel(OnlineDFlashModel):
             )
             accuracy_den = eval_weight_mask.sum()
 
-            valid_mask = eval_weight_mask > 0
-            accepted = compute_accept_len(predicted_ids, target_ids, valid_mask)
-            base_accepted = compute_accept_len(
-                base_predicted_ids,
-                target_ids,
-                valid_mask,
-            )
-            valid_blocks = valid_mask.any(dim=-1).float()
-            accept_num = ((accepted + 1.0) * valid_blocks).sum()
-            base_accept_num = ((base_accepted + 1.0) * valid_blocks).sum()
-            accept_den = valid_blocks.sum()
+            accept_num = accuracy_den.new_zeros(())
+            base_accept_num = accuracy_den.new_zeros(())
+            accept_den = accuracy_den.new_zeros(())
+            walk_accepted = accuracy_den.new_zeros(())
+            base_walk_accepted = accuracy_den.new_zeros(())
+            walk_valid = accuracy_den.new_zeros(())
+            if collect_acceptance_metrics:
+                # Both serving layouts propose block_size - 1 tokens. Unshifted
+                # Domino excludes the structural anchor at position 0; shifted
+                # Domino uses head positions [0, block_size - 2] and excludes
+                # its extra training-only target at the final position.
+                acceptance_slice = (
+                    slice(None, -1) if self.shift_label else slice(1, None)
+                )
+                serving_target_ids = target_ids[..., acceptance_slice]
+                valid_mask = eval_weight_mask[..., acceptance_slice] > 0
+                serving_ids = self._domino_serving_ids(
+                    base_logits,
+                    hidden,
+                    prev_ids[:, :, 0],
+                )
+                accepted = compute_accept_len(
+                    serving_ids,
+                    serving_target_ids,
+                    valid_mask,
+                )
+                base_accepted = compute_accept_len(
+                    base_predicted_ids[..., acceptance_slice],
+                    serving_target_ids,
+                    valid_mask,
+                )
+                valid_blocks = valid_mask.any(dim=-1).float()
+                accept_num = ((accepted + 1.0) * valid_blocks).sum()
+                base_accept_num = ((base_accepted + 1.0) * valid_blocks).sum()
+                accept_den = valid_blocks.sum()
+                if block_index is not None:
+                    row_width = (
+                        target_ids.shape[1] if total_blocks is None else total_blocks
+                    )
+                    walk_accepted = _scatter_block_values(
+                        accepted, block_index, row_width
+                    )
+                    base_walk_accepted = _scatter_block_values(
+                        base_accepted, block_index, row_width
+                    )
+                    walk_valid = _scatter_block_values(
+                        valid_blocks, block_index, row_width
+                    )
 
         return (
             final_num,
@@ -1622,6 +1821,9 @@ class OnlineDominoModel(OnlineDFlashModel):
             accept_num,
             base_accept_num,
             accept_den,
+            walk_accepted,
+            base_walk_accepted,
+            walk_valid,
         )
 
     def forward(
@@ -1631,6 +1833,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         loss_mask: torch.Tensor,
         lambda_base: float = 0.0,
         max_valid_anchors: Optional[int] = None,
+        collect_detailed_metrics: bool = True,
     ):
         """Parallel Domino training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -1704,13 +1907,25 @@ class OnlineDominoModel(OnlineDFlashModel):
             accept_num,
             base_accept_num,
             accept_den,
+            walk_accepted,
+            base_walk_accepted,
+            walk_valid,
         ) = checkpointed_chunk_reduce(
-            self._domino_objective_chunk_terms,
+            partial(
+                self._domino_objective_chunk_terms,
+                total_blocks=anchor_positions.shape[1],
+                collect_acceptance_metrics=collect_detailed_metrics,
+            ),
             hidden4d,
             prev_ids,
             target_ids,
             weight_mask,
             eval_weight_mask,
+            (
+                torch.arange(anchor_positions.shape[1], device=device).unsqueeze(0)
+                if collect_detailed_metrics
+                else None
+            ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
@@ -1724,8 +1939,6 @@ class OnlineDominoModel(OnlineDFlashModel):
             "final_loss": final_loss.detach(),
             "base_loss": base_loss.detach(),
             "base_accuracy": (base_correct_num / (accuracy_denom + 1e-6)).detach(),
-            "accept_len": (accept_num / (accept_den + 1e-6)).detach(),
-            "base_accept_len": (base_accept_num / (accept_den + 1e-6)).detach(),
             # Telemetry does not participate in the objective. Keeping this as
             # a host scalar avoids a tiny H2D copy that otherwise synchronizes
             # the whole forward stream once per micro-step.
@@ -1739,6 +1952,28 @@ class OnlineDominoModel(OnlineDFlashModel):
             (1.0 - lambda_base) * final_num + lambda_base * base_num,
             loss_den.detach(),
         )
+        if collect_detailed_metrics:
+            block_valid_mask = walk_valid > 0.5
+            metrics["accept_len"] = (accept_num / (accept_den + 1e-6)).detach()
+            metrics["base_accept_len"] = (
+                base_accept_num / (accept_den + 1e-6)
+            ).detach()
+            metrics["ratio_metrics"] = {
+                "domino/final/walk_accepted_length": (
+                    compute_walk_accepted_length_terms(
+                        walk_accepted,
+                        anchor_positions,
+                        block_valid_mask,
+                    )
+                ),
+                "domino/base/walk_accepted_length": (
+                    compute_walk_accepted_length_terms(
+                        base_walk_accepted,
+                        anchor_positions,
+                        block_valid_mask,
+                    )
+                ),
+            }
 
         return loss, accuracy, metrics
 
@@ -1860,6 +2095,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         loss_weights: torch.Tensor,
         eval_mask: torch.Tensor,
         aligned_target_hidden: Optional[torch.Tensor],
+        block_index: Optional[torch.Tensor] = None,
+        *,
+        total_blocks: Optional[int] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive loss and telemetry numerators for one block slice."""
 
@@ -1889,6 +2127,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         draft_top1_num = zero
         tau_num = zero
         tau_den = zero
+        walk_accepted = zero
+        walk_valid = zero
         accept_probability = None
 
         draft_probabilities = None
@@ -1940,6 +2180,37 @@ class OnlineDSparkModel(OnlineDFlashModel):
             ce_position_num = (cross_entropy.detach() * eval_mask).sum(dim=(0, 1))
             correct_position_num = correct.sum(dim=(0, 1))
             position_den = eval_mask.float().sum(dim=(0, 1))
+            if block_index is not None:
+                # SGLang DSpark emits ``gamma`` draft tokens from all ``gamma``
+                # hidden slots, seeded by the verified bonus/anchor token.  Do
+                # not copy the older local ``spec_generate`` convention that
+                # reserves one block slot for the anchor and emits one fewer
+                # token: online DSpark training and serving both use the full
+                # next-token block here.
+                serving_ids = predicted_ids
+                markov_head = getattr(self.draft_model, "markov_head", None)
+                if markov_head is not None:
+                    serving_ids, _ = markov_head.sample_block_tokens(
+                        base_logits.reshape(
+                            batch_size * num_blocks,
+                            block_size,
+                            vocab_size,
+                        ),
+                        first_prev_token_ids=prev_token_ids[:, :, 0].reshape(-1),
+                        hidden_states=hidden.reshape(
+                            batch_size * num_blocks,
+                            block_size,
+                            hidden_size,
+                        ),
+                    )
+                    serving_ids = serving_ids.reshape_as(target_ids)
+                accepted = compute_accept_len(serving_ids, target_ids, eval_mask)
+                valid_blocks = eval_mask.any(dim=-1).float()
+                row_width = (
+                    target_ids.shape[1] if total_blocks is None else total_blocks
+                )
+                walk_accepted = _scatter_block_values(accepted, block_index, row_width)
+                walk_valid = _scatter_block_values(valid_blocks, block_index, row_width)
             if aligned_target_hidden is not None:
                 assert draft_probabilities is not None and teacher_ids is not None
                 teacher_agreement_num = (
@@ -1973,6 +2244,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_top1_num,
             tau_num,
             tau_den,
+            walk_accepted,
+            walk_valid,
         )
 
     def _compute_dspark_loss(
@@ -1984,6 +2257,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         prev_token_ids: torch.Tensor,
         safe_label_indices: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor],
+        anchor_positions: torch.Tensor,
+        collect_detailed_metrics: bool,
     ) -> Tuple[torch.Tensor, Dict[str, object]]:
         """Token-pooled DSpark objective with bounded vocab-logit memory."""
 
@@ -2012,13 +2287,21 @@ class OnlineDSparkModel(OnlineDFlashModel):
             )
 
         totals = checkpointed_chunk_reduce(
-            self._dspark_objective_chunk_terms,
+            partial(
+                self._dspark_objective_chunk_terms,
+                total_blocks=num_blocks,
+            ),
             hidden_4d,
             prev_token_ids,
             target_ids,
             loss_weights,
             eval_mask,
             aligned_target_hidden,
+            (
+                torch.arange(num_blocks, device=target_ids.device).unsqueeze(0)
+                if collect_detailed_metrics
+                else None
+            ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
@@ -2038,6 +2321,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_top1_num,
             tau_num,
             tau_den,
+            walk_accepted,
+            walk_valid,
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
@@ -2088,6 +2373,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     "tau_probabilistic": (tau_num, tau_den),
                 }
             )
+        if collect_detailed_metrics:
+            ratio_metrics["dspark/hard_label/walk_accepted_length"] = (
+                compute_walk_accepted_length_terms(
+                    walk_accepted,
+                    anchor_positions,
+                    walk_valid > 0.5,
+                )
+            )
         metrics: Dict[str, object] = {
             "ratio_metrics": {
                 name: (numerator.detach(), denominator.detach())
@@ -2105,6 +2398,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
+        collect_detailed_metrics: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -2140,6 +2434,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             prev_token_ids=prev_token_ids,
             safe_label_indices=safe_label_indices,
             target_last_hidden_states=target_last_hidden_states,
+            anchor_positions=anchor_positions,
+            collect_detailed_metrics=collect_detailed_metrics,
         )
         accuracy = metrics.pop("accuracy")
         return loss, accuracy, metrics
