@@ -970,9 +970,14 @@ class Config(StrictConfigModel):
         return cls.model_validate(migrate_legacy_config(raw))
 
 
-def apply_overrides(config: Config, overrides: List[str]) -> Config:
-    """Apply dotted ``section.field=value`` overrides, re-validating the result."""
-    raw = config.model_dump()
+def apply_dotted_overrides(raw: dict, overrides: List[str]) -> dict:
+    """Apply dotted ``section.field=value`` items to a plain config mapping.
+
+    Paths must already exist in ``raw`` so a typo cannot silently create an
+    ignored key.  Values stay strings (the caller's pydantic model coerces
+    scalars on re-validation) unless the target is structured and the value
+    looks like YAML/JSON, in which case it is parsed.
+    """
     for item in overrides:
         if "=" not in item:
             raise ValueError(f"override {item!r} is not of the form path=value")
@@ -995,8 +1000,13 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
                 raise ValueError(
                     f"override {path!r} contains an invalid structured value"
                 ) from exc
-        node[keys[-1]] = value  # pydantic coerces scalars on re-validation
-    return Config.model_validate(raw)
+        node[keys[-1]] = value
+    return raw
+
+
+def apply_overrides(config: Config, overrides: List[str]) -> Config:
+    """Apply dotted ``section.field=value`` overrides, re-validating the result."""
+    return Config.model_validate(apply_dotted_overrides(config.model_dump(), overrides))
 
 
 def load_config(path: str, overrides: Optional[List[str]] = None) -> Config:
@@ -1023,4 +1033,5 @@ __all__ = [
     "migrate_legacy_config",
     "load_config",
     "apply_overrides",
+    "apply_dotted_overrides",
 ]
