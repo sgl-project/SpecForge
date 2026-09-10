@@ -78,7 +78,7 @@ jobs:
           uv pip install wheel setuptools psutil packaging ninja
           uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
           MAX_JOBS=8  uv pip install -v flash-attn --no-build-isolation
-          uv pip install -v . --prerelease=allow
+          uv pip install -v ".[kda]" --prerelease=allow
           # SGLang 0.5.18 installs cubin separately and requires it to match
           # flashinfer-python; replace the 0.6.12 copy in cached venvs.
           uv pip install flashinfer-cubin==0.6.17 --index-url https://flashinfer.ai/whl

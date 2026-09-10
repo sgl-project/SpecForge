@@ -165,6 +165,8 @@ assume the command runs from the repository root.
 | DFlash offline, colocated | [`offline/colocated/qwen3-8b-dflash-offline.yaml`](offline/colocated/qwen3-8b-dflash-offline.yaml) |
 | Domino offline, colocated | [`offline/colocated/qwen3-8b-domino-offline.yaml`](offline/colocated/qwen3-8b-domino-offline.yaml) |
 | DSpark offline, colocated | [`offline/colocated/qwen3-4b-dspark-offline.yaml`](offline/colocated/qwen3-4b-dspark-offline.yaml) |
+| DSpark KDA offline, colocated | [`offline/colocated/qwen3-4b-dspark-kda-offline.yaml`](offline/colocated/qwen3-4b-dspark-kda-offline.yaml) |
+| DSpark KDA (context scan) offline, colocated | [`offline/colocated/qwen3-4b-dspark-kda-scan-offline.yaml`](offline/colocated/qwen3-4b-dspark-kda-scan-offline.yaml) |
 | EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
 | EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
 | DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
@@ -175,6 +177,20 @@ assume the command runs from the repository root.
 The runtime derives online/offline mode from the selected `data` source and
 reads topology from `deployment.mode`; it does not parse the filename or its
 historical suffixes.
+
+The Qwen3-4B KDA recipe is offline-only until SGLang's DFlash serving loader
+supports recurrent KDA draft layers. It uses the same captured target features
+as the GQA recipe and selects a hybrid `4×KDA + 1×GQA` draft stack. Install the
+optional kernel dependency with `pip install -e '.[kda]'` before running it.
+
+`linear_attn_config.context_state` selects where each KDA proposal block's
+recurrent state starts. The default `reset` starts every block from zero, so KDA
+layers only mix the block's own positions and target context enters through the
+GQA layer. `scan` (the `-kda-scan` recipe) first runs the recurrence over the
+target features of the positions before the anchor, so every KDA layer reads
+the context with block-conditioned queries; training resolves one state per
+anchor with a two-level segment scan and SpecForge generation keeps a running
+state per request. Both policies share weights and checkpoint layout.
 
 ### Top-level fields
 

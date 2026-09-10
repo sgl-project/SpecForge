@@ -166,11 +166,19 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        anchor_positions: Optional[torch.Tensor] = None,
+        scan_layout: Optional[object] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
+        attention_kwargs = dict(kwargs)
+        if getattr(self.self_attn, "uses_anchor_positions", False):
+            # Recurrent (context-scanning KDA) layers need each block's anchor
+            # and the shared host-precomputed scan launch plan.
+            attention_kwargs["anchor_positions"] = anchor_positions
+            attention_kwargs["scan_layout"] = scan_layout
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -181,7 +189,7 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **kwargs,
+            **attention_kwargs,
         )[0]
         hidden_states = self.attention_conv.finish(
             hidden_states,
