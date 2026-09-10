@@ -543,16 +543,30 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len,
-            loss_mask,
-            device,
-            max_valid_anchors=max_valid_anchors,
-        )
+        if anchor_positions is None and block_keep_mask is None:
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len,
+                loss_mask,
+                device,
+                max_valid_anchors=max_valid_anchors,
+            )
+        else:
+            if anchor_positions is None or block_keep_mask is None:
+                raise ValueError("Replay requires both anchors and block validity")
+            if (anchor_positions.ndim != 2 or anchor_positions.shape[0] != bsz
+                    or block_keep_mask.shape != anchor_positions.shape
+                    or block_keep_mask.dtype != torch.bool
+                    or anchor_positions.dtype != torch.int64):
+                raise ValueError("Invalid replay anchor shape or dtype")
+            if bool((((anchor_positions < 0) | (anchor_positions >= seq_len))
+                     & block_keep_mask).any()):
+                raise ValueError("Replay anchor outside the captured input")
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
