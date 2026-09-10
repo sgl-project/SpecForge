@@ -90,6 +90,19 @@ def resolve_dflash_attention_layout(
     return layer_types, sliding_window
 
 
+def resolve_dflash_block_size(config: Qwen3Config) -> int:
+    dflash_config = getattr(config, "dflash_config", {}) or {}
+    block_size = getattr(config, "block_size", None)
+    if block_size is None:
+        block_size = dflash_config.get("block_size")
+    if not isinstance(block_size, int) or isinstance(block_size, bool):
+        raise ValueError(
+            "DFlash config must define an integer block_size either at "
+            "config.block_size or config.dflash_config.block_size"
+        )
+    return block_size
+
+
 def resolve_dflash_attention_modes(config: Qwen3Config) -> tuple[str, ...]:
     """Return one normalized attention mode for every draft layer.
 
@@ -826,15 +839,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         )
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         dflash_config = getattr(config, "dflash_config", {}) or {}
-        block_size = getattr(config, "block_size", None)
-        if block_size is None:
-            block_size = dflash_config.get("block_size")
-        if not isinstance(block_size, int) or isinstance(block_size, bool):
-            raise ValueError(
-                "DFlash config must define an integer block_size either at "
-                "config.block_size or config.dflash_config.block_size"
-            )
-        self.block_size = block_size
+        self.block_size = resolve_dflash_block_size(config)
         self.layers = nn.ModuleList(
             [
                 self._build_decoder_layer(config, layer_idx, kernels)

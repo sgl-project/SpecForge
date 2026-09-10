@@ -162,6 +162,22 @@ class TestKDAComposition(unittest.TestCase):
             )
         )
 
+    def test_nested_block_size_matches_top_level_outputs(self):
+        config = _kda_config()
+        model = DFlashDraftModel(config).eval()
+        nested = copy.deepcopy(config)
+        nested.dflash_config["block_size"] = nested.block_size
+        del nested.block_size
+        loaded = DFlashDraftModel(nested).eval()
+        loaded.load_state_dict(model.state_dict())
+        inputs = {
+            "position_ids": torch.arange(7).unsqueeze(0),
+            "noise_embedding": torch.randn(1, 4, 24),
+            "target_hidden": torch.randn(1, 3, 72),
+            "attention_mask": torch.ones(1, 1, 4, 7, dtype=torch.bool),
+        }
+        assert_close(loaded(**inputs), model(**inputs), rtol=0, atol=0)
+
     def test_rejects_ambiguous_or_malformed_layer_modes(self):
         cases = {
             "only one": {"attention_mode": "gqa", "attention_modes": ["gqa"] * 3},

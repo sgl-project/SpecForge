@@ -31,7 +31,7 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen3.modeling_qwen3 import FlashAttentionKwargs, Qwen3Config
 from typing_extensions import Unpack
 
-from .dflash import Qwen3DFlashAttentionBase
+from .dflash import Qwen3DFlashAttentionBase, resolve_dflash_block_size
 from .dflash_kernels import DFlashKernels
 
 _CUDA_MAX_GRID_DIM_Z = 65_535
@@ -77,7 +77,7 @@ class KDAConfig:
             "hidden_size": int(config.hidden_size),
             "head_dim": int(linear_config["head_dim"]),
             "num_heads": int(linear_config["num_heads"]),
-            "block_size": int(config.block_size),
+            "block_size": resolve_dflash_block_size(config),
             "short_conv_kernel_size": int(linear_config["short_conv_kernel_size"]),
         }
         for name, value in dimensions.items():
