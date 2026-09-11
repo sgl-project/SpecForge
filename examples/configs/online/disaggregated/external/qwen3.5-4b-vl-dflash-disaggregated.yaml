@@ -1,0 +1,52 @@
+# Multimodal (image+text) DFlash on Qwen3.5-4B: disaggregated online training
+# against an external patched SGLang capture server. Requires sglang v0.5.14
+# with patches/sglang/v0.5.14/spec-capture.patch and
+# SGLANG_MM_AVOID_RETOKENIZE=1 on the capture server.
+#
+# Data: ShareGPT-style JSONL with an optional top-level "image" field (file
+# path or base64) per record; text-only records are supported in the same run.
+model:
+  target_model_path: Qwen/Qwen3.5-4B
+  draft_model_config: configs/qwen3.5-4b-dflash.json
+  target_backend: sglang
+  trust_remote_code: true
+  input_modality: multimodal
+data:
+  train_data_path: ./cache/dataset/train_vl_regen.jsonl
+  max_length: 4096
+  chat_template: qwen3.5
+  cache_dir: cache
+  build_dataset_num_proc: 32
+training:
+  strategy: dflash
+  num_epochs: 10
+  max_steps: 10000
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  save_interval: 1000
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: none
+run_id: qwen3.5-4b-vl-dflash
+output_dir: outputs/qwen3.5-4b-vl-dflash
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/qwen3.5-4b-vl-dflash/control
+    consumer_state_dir: outputs/qwen3.5-4b-vl-dflash/consumer-state
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp

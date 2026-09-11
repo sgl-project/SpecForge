@@ -169,8 +169,20 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_len = q.size(-2)
-    q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    head_dim = q.shape[-1]
+    if rotary_dim < head_dim:
+        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+        q_rot = (q_rot * cos[..., -q_len:, :]) + (
+            rotate_half(q_rot) * sin[..., -q_len:, :]
+        )
+        k_rot = (k_rot * cos) + (rotate_half(k_rot) * sin)
+        q_embed = torch.cat([q_rot, q_pass], dim=-1)
+        k_embed = torch.cat([k_rot, k_pass], dim=-1)
+    else:
+        q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
+        k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 
