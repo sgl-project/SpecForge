@@ -142,7 +142,8 @@ def get_device_type() -> str:
     1. SPECFORGE_DEVICE environment variable
     2. NVIDIA CUDA (torch.cuda)
     3. Ascend NPU (torch.npu)
-    4. CPU fallback
+    4. Intel XPU (torch.xpu)
+    5. CPU fallback
     """
     dt = os.environ.get("SPECFORGE_DEVICE", None)
     if dt:
@@ -151,6 +152,8 @@ def get_device_type() -> str:
         return "cuda"
     if hasattr(torch, "npu") and torch.npu.is_available():
         return "npu"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
     return "cpu"
 
 
@@ -162,6 +165,8 @@ def get_local_device() -> torch.device:
         return torch.device("cuda", local_rank)
     if device_type == "npu":
         return torch.device("npu", local_rank)
+    if device_type == "xpu":
+        return torch.device("xpu", local_rank)
     return torch.device("cpu")
 
 
