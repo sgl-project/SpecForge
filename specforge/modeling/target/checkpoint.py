@@ -17,7 +17,6 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import torch
 from safetensors import safe_open
 
-
 _CANONICAL_LAYOUTS = (
     ("single", "model.safetensors"),
     ("index", "model.safetensors.index.json"),
@@ -208,9 +207,7 @@ def load_checkpoint_tensors(
                 raise FileNotFoundError(
                     f"Checkpoint index {path} references missing shard {shard_path}"
                 )
-            shard_tensors = _load_tensor_file(
-                shard_path, lambda key: key in shard_keys
-            )
+            shard_tensors = _load_tensor_file(shard_path, lambda key: key in shard_keys)
             missing_from_shard = sorted(shard_keys - shard_tensors.keys())
             if missing_from_shard:
                 raise KeyError(
@@ -272,8 +269,7 @@ def merge_state_into_checkpoint(
     # the selected model-weight representation is written below; copying an
     # alternate representation would leave a stale model in the output.
     weight_files = {
-        os.path.basename(path)
-        for path in _weight_artifact_paths(base_checkpoint_dir)
+        os.path.basename(path) for path in _weight_artifact_paths(base_checkpoint_dir)
     }
     for fname in os.listdir(base_checkpoint_dir):
         src = os.path.join(base_checkpoint_dir, fname)
