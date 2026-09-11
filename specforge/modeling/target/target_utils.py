@@ -1,14 +1,13 @@
-import gc
-import glob
 import json
 import os
 from typing import Optional
 
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download, snapshot_download
-from safetensors import safe_open
+from huggingface_hub import hf_hub_download
 from transformers import AutoConfig
+
+from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
 
 class _RawConfigShim:
@@ -123,23 +122,17 @@ class TargetEmbeddingsAndHead(nn.Module):
         if lm_head_key is None:
             lm_head_key = "lm_head.weight"
 
-        # 2. Resolve Model Path
-        local_model_path = model_path
-        if not os.path.exists(local_model_path):
-            try:
-                local_model_path = snapshot_download(
-                    repo_id=model_path,
-                    cache_dir=cache_dir,
-                    allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model"],
-                )
-            except Exception as e:
-                print(f"Warning: Snapshot download failed or path check failed: {e}")
-
-        # 3. Handle Weight Tying
+        # 2. Handle Weight Tying
         tie_weights = getattr(config, "tie_word_embeddings", False)
 
-        # 4. Load Weights
-        instance._load_weights(local_model_path, embed_key, lm_head_key, tie_weights)
+        # 3. Load Weights
+        instance._load_weights(
+            model_path,
+            embed_key,
+            lm_head_key,
+            tie_weights,
+            cache_dir=cache_dir,
+        )
 
         text_config = target_text_config(config)
         mup_multiplier = getattr(
@@ -156,67 +149,46 @@ class TargetEmbeddingsAndHead(nn.Module):
             instance.lm_head.weight.data.div_(float(mup_multiplier))
             instance.lm_head_mup_folded = float(mup_multiplier)
 
-        # 5. Move to Device & Freeze
+        # 4. Move to Device & Freeze
         instance.to(device=device, dtype=dtype)
         instance.eval()
         instance.requires_grad_(False)
 
         return instance
 
+    @torch.no_grad()
     def _load_weights(
-        self, model_path: str, embed_key: str, lm_head_key: str, tie_weights: bool
+        self,
+        model_path: str,
+        embed_key: str,
+        lm_head_key: str,
+        tie_weights: bool,
+        cache_dir: Optional[str] = None,
     ) -> set[str]:
-        index_files = glob.glob(os.path.join(model_path, "*.index.json"))
-        weight_map = {}
-        files_to_load = {}
-        required_keys = [embed_key]
+        destinations = [(embed_key, self.embed_tokens.weight)]
         if not tie_weights:
-            required_keys.append(lm_head_key)
+            destinations.append((lm_head_key, self.lm_head.weight))
+        required_keys = [key for key, _destination in destinations]
 
-        if index_files:
-            with open(index_files[0], "r") as f:
-                index = json.load(f)
-            weight_map = index.get("weight_map", {})
-
-            missing_from_index = sorted(set(required_keys) - weight_map.keys())
-            if missing_from_index:
-                raise ValueError(
-                    "Required target weight keys are missing from the checkpoint "
-                    f"index: {missing_from_index}"
-                )
-            for key in required_keys:
-                files_to_load[key] = weight_map[key]
-        else:
-            safetensors = glob.glob(os.path.join(model_path, "*.safetensors"))
-            bins = glob.glob(os.path.join(model_path, "*.bin"))
-            target_file = safetensors[0] if safetensors else (bins[0] if bins else None)
-
-            if not target_file:
-                raise FileNotFoundError("No checkpoint found.")
-
-            filename = os.path.basename(target_file)
-            files_to_load.update({key: filename for key in required_keys})
-
-        loaded_keys = set()
-
-        file_to_keys_map = {}
-        for key, filename in files_to_load.items():
-            full_path = os.path.join(model_path, filename)
-            if full_path not in file_to_keys_map:
-                file_to_keys_map[full_path] = []
-            file_to_keys_map[full_path].append(key)
-
-        for file_path, keys in file_to_keys_map.items():
-            loaded_keys.update(
-                self._load_file_content(file_path, keys, embed_key, lm_head_key)
+        try:
+            tensors = load_checkpoint_tensors(
+                model_path,
+                keys=required_keys,
+                cache_dir=cache_dir,
             )
-
-        missing_keys = sorted(set(required_keys) - loaded_keys)
-        if missing_keys:
+        except KeyError as exc:
             raise RuntimeError(
-                "Required target weight tensors were not loaded from the "
-                f"checkpoint: {missing_keys}"
-            )
+                f"Required target weight tensors were not loaded: {exc}"
+            ) from exc
+
+        for key, destination in destinations:
+            tensor = tensors[key]
+            if tensor.shape != destination.shape:
+                raise RuntimeError(
+                    f"Shape mismatch for {key}. Expected {destination.shape}, "
+                    f"got {tensor.shape}"
+                )
+            destination.copy_(tensor)
 
         if tie_weights:
             print(
@@ -224,60 +196,7 @@ class TargetEmbeddingsAndHead(nn.Module):
             )
             self.lm_head.weight = self.embed_tokens.weight
 
-        return loaded_keys
-
-    def _load_file_content(
-        self,
-        file_path: str,
-        keys_to_extract: list,
-        target_embed_key: str,
-        target_head_key: str,
-    ) -> set[str]:
-        """Helper to load specific keys from a file"""
-        print(f"Loading {keys_to_extract} from {os.path.basename(file_path)}...")
-
-        state_dict_part = {}
-
-        if file_path.endswith(".safetensors"):
-            with safe_open(file_path, framework="pt") as f:
-                for k in keys_to_extract:
-                    if k in f.keys():
-                        state_dict_part[k] = f.get_tensor(k)
-        else:
-            print(
-                f"Warning: Loading .bin file {os.path.basename(file_path)} into RAM. Convert to safetensors for efficiency."
-            )
-            full_state = torch.load(file_path, map_location="cpu")
-            for k in keys_to_extract:
-                if k in full_state:
-                    state_dict_part[k] = full_state[k]
-            del full_state
-            gc.collect()
-
-        loaded_keys = set()
-        for k, tensor in state_dict_part.items():
-            if k == target_embed_key:
-                if tensor.shape != self.embed_tokens.weight.shape:
-                    raise RuntimeError(
-                        f"Shape mismatch for {k}. Expected "
-                        f"{self.embed_tokens.weight.shape}, got {tensor.shape}"
-                    )
-                with torch.no_grad():
-                    self.embed_tokens.weight.copy_(tensor)
-                print(" -> Loaded Embeddings")
-            elif k == target_head_key:
-                if tensor.shape != self.lm_head.weight.shape:
-                    raise RuntimeError(
-                        f"Shape mismatch for {k}. Expected {self.lm_head.weight.shape}, got {tensor.shape}"
-                    )
-                with torch.no_grad():
-                    self.lm_head.weight.copy_(tensor)
-                print(" -> Loaded LM Head")
-            else:
-                continue
-            loaded_keys.add(k)
-
-        return loaded_keys
+        return set(required_keys)
 
 
 __all__ = [

@@ -111,10 +111,6 @@ def write_target_head_dir(d, hidden=H, vocab=V):
         {"lm_head.weight": torch.randn(vocab, hidden, dtype=torch.float32)},
         os.path.join(d, "model.safetensors"),
     )
-    with open(os.path.join(d, "model.safetensors.index.json"), "w") as f:
-        json.dump(
-            {"metadata": {}, "weight_map": {"lm_head.weight": "model.safetensors"}}, f
-        )
     return d
 
 
