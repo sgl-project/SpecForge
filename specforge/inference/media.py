@@ -1,8 +1,11 @@
 # coding=utf-8
 """Legacy multimodal input types retained for import compatibility.
 
-The current runtime does not support VLM training or media rollout inputs.
-These types are not wired into the canonical training path.
+Multimodal training now runs through the server-capture path
+(``specforge/algorithms/common/vlm_input.py`` with
+``model.input_modality="multimodal"``), which transports images inside the
+capture request itself. These pixel-tensor types remain unused by the
+canonical training path.
 """
 
 from __future__ import annotations
