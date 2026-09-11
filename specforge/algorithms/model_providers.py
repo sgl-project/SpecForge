@@ -107,6 +107,7 @@ def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
         draft_model.load_embedding(
             cfg.model.target_model_path,
             embedding_key=cfg.model.embedding_key,
+            cache_dir=cfg.model.cache_dir,
         )
     draft_model.freeze_embedding()
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
@@ -123,6 +124,7 @@ def build_peagle_draft(cfg: Config, draft_config: PretrainedConfig):
         draft_model.load_embedding(
             cfg.model.target_model_path,
             embedding_key=cfg.model.embedding_key,
+            cache_dir=cfg.model.cache_dir,
         )
     _warm_start(
         cfg,
