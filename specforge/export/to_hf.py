@@ -17,10 +17,7 @@ own an embedding at all.
 from __future__ import annotations
 
 import argparse
-import os
 from typing import Optional
-
-import torch
 
 from specforge.export.checkpoint_io import (
     apply_legacy_rope_scaling,
