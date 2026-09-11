@@ -444,7 +444,7 @@ class SelectiveCheckpointLoadingTest(unittest.TestCase):
 
         from specforge.modeling.target.checkpoint import (
             list_checkpoint_keys,
-            load_selected_tensors,
+            load_checkpoint_tensors,
             read_weight_map,
         )
 
@@ -474,7 +474,9 @@ class SelectiveCheckpointLoadingTest(unittest.TestCase):
 
             self.assertEqual(weight_map, read_weight_map(tmpdir))
             self.assertEqual(4, len(list_checkpoint_keys(tmpdir)))
-            selected = load_selected_tensors(tmpdir, lambda key: key.startswith("mtp."))
+            selected = load_checkpoint_tensors(
+                tmpdir, key_filter=lambda key: key.startswith("mtp.")
+            )
 
         self.assertEqual({"mtp.fc.weight", "mtp.norm.weight"}, set(selected))
         self.assertTrue(torch.equal(selected["mtp.norm.weight"], torch.ones(4)))
@@ -482,14 +484,16 @@ class SelectiveCheckpointLoadingTest(unittest.TestCase):
     def test_single_file_selective_loading(self):
         from safetensors.torch import save_file
 
-        from specforge.modeling.target.checkpoint import load_selected_tensors
+        from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
         with tempfile.TemporaryDirectory(prefix="mtp-ckpt-") as tmpdir:
             save_file(
                 {"mtp.fc.weight": torch.zeros(4, 4), "other.weight": torch.zeros(1)},
                 os.path.join(tmpdir, "model.safetensors"),
             )
-            selected = load_selected_tensors(tmpdir, lambda key: key.startswith("mtp."))
+            selected = load_checkpoint_tensors(
+                tmpdir, key_filter=lambda key: key.startswith("mtp.")
+            )
         self.assertEqual({"mtp.fc.weight"}, set(selected))
 
 
@@ -500,7 +504,7 @@ class ExportRoundTripTest(unittest.TestCase):
         from safetensors.torch import save_file
 
         from specforge.export.mtp import merge_mtp_into_base
-        from specforge.modeling.target.checkpoint import load_selected_tensors
+        from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
         with tempfile.TemporaryDirectory() as tmpdir:
             base = os.path.join(tmpdir, "base")
@@ -538,7 +542,7 @@ class ExportRoundTripTest(unittest.TestCase):
 
             merge_mtp_into_base(base, draft, out)
 
-            merged = load_selected_tensors(out, lambda _key: True)
+            merged = load_checkpoint_tensors(out)
             # trained weights replace the stale native ones
             self.assertTrue(torch.equal(merged["mtp.fc.weight"], trained))
             # shared embedding copied into the native namespace
@@ -556,7 +560,7 @@ class ExportRoundTripTest(unittest.TestCase):
         from safetensors.torch import save_file
 
         from specforge.export.mtp import merge_mtp_into_base
-        from specforge.modeling.target.checkpoint import load_selected_tensors
+        from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
         with tempfile.TemporaryDirectory() as tmpdir:
             base = os.path.join(tmpdir, "base")
@@ -602,7 +606,7 @@ class ExportRoundTripTest(unittest.TestCase):
                 draft_config_path=draft_config,
             )
 
-            merged = load_selected_tensors(out, lambda _key: True)
+            merged = load_checkpoint_tensors(out)
             self.assertTrue(torch.equal(merged["mtp.fc.weight"], trained))
             self.assertTrue(torch.equal(merged["mtp.embed_tokens.weight"], base_embed))
             with open(os.path.join(out, "config.json")) as f:
@@ -633,7 +637,7 @@ class ExportRoundTripTest(unittest.TestCase):
         from safetensors.torch import save_file
 
         from specforge.export.mtp import merge_mtp_into_base
-        from specforge.modeling.target.checkpoint import load_selected_tensors
+        from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
         with tempfile.TemporaryDirectory() as tmpdir:
             base = os.path.join(tmpdir, "base")
@@ -675,7 +679,7 @@ class ExportRoundTripTest(unittest.TestCase):
 
             merge_mtp_into_base(base, runtime, out, draft_config_path=draft_config)
 
-            merged = load_selected_tensors(out, lambda _key: True)
+            merged = load_checkpoint_tensors(out)
             self.assertTrue(torch.equal(merged["mtp.embed_tokens.weight"], shared))
             self.assertTrue(torch.equal(merged["mtp.lm_head.weight"], shared))
             self.assertTrue(torch.equal(merged["mtp.fc.weight"], trained))

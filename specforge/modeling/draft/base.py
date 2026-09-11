@@ -20,19 +20,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import glob
-import json
-import os
 from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
+from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
 
 class Eagle3DraftModel(PreTrainedModel, ABC):
@@ -133,62 +129,26 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
 
     @torch.no_grad()
     def load_embedding(
-        self, model_path: str, embedding_key: str = "model.embed_tokens.weight"
+        self,
+        model_path: str,
+        embedding_key: str = "model.embed_tokens.weight",
+        cache_dir: Optional[str] = None,
     ) -> None:
         """
         Load the embedding of the draft model.
 
         Args:
             model_path (str): Path to the target model. Can be either a Hugging Face
-            repository ID or a local directory path containing the model files.
+                repository ID or a local directory path containing the model files.
+            embedding_key (str): Checkpoint key for the target token embedding.
+            cache_dir (str, optional): Hugging Face cache used for a repository ID.
         """
-        if os.path.exists(model_path):
-            # model_path is a local directory
-            # check if there is file ending with index.json
-            glob_path = os.path.join(model_path, "*.index.json")
-            index_json_path = glob.glob(glob_path)
-
-            if len(index_json_path) == 0:
-                # No index.json found, look for single model file
-                safetensors_path = os.path.join(model_path, "model.safetensors")
-                if os.path.exists(safetensors_path):
-                    with safe_open(safetensors_path, framework="pt") as f:
-                        self.embed_tokens.weight.copy_(f.get_tensor(embedding_key))
-                    return
-
-                pytorch_model_path = os.path.join(model_path, "pytorch_model.bin")
-                if os.path.exists(pytorch_model_path):
-                    state_dict = torch.load(pytorch_model_path, map_location="cpu")
-                    self.embed_tokens.weight.copy_(state_dict[embedding_key])
-                    return
-
-                raise FileNotFoundError(
-                    f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
-                )
-            if len(index_json_path) > 1:
-                raise FileNotFoundError(
-                    f"Multiple index.json files found in {model_path}"
-                )
-            index_json_path = index_json_path[0]
-
-            with open(index_json_path, "r") as f:
-                index_json = json.load(f)
-            ckpt_file = index_json["weight_map"][embedding_key]
-
-            if ckpt_file.endswith(".safetensors"):
-                with safe_open(
-                    os.path.join(model_path, ckpt_file), framework="pt"
-                ) as f:
-                    emb_tokens = f.get_tensor(embedding_key)
-            else:
-                state_dict = torch.load(os.path.join(model_path, ckpt_file))
-                emb_tokens = state_dict[embedding_key]
-            self.embed_tokens.weight.copy_(emb_tokens)
-        else:
-            # this is the case where model_path is a huggingface repository
-            # we first need to locate its local cache
-            local_cache_path = snapshot_download(repo_id=model_path)
-            self.load_embedding(local_cache_path, embedding_key)
+        tensors = load_checkpoint_tensors(
+            model_path,
+            keys=[embedding_key],
+            cache_dir=cache_dir,
+        )
+        self.embed_tokens.weight.copy_(tensors[embedding_key])
 
     def load_vocab_mapping(self, file_path: str) -> None:
         """

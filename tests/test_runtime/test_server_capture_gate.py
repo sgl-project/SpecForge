@@ -111,22 +111,6 @@ class TestServerCaptureGate(unittest.TestCase):
         model = LlamaForCausalLM(cfg).to(torch.bfloat16)
         cls.target_dir = os.path.join(cls.workdir, "target")
         model.save_pretrained(cls.target_dir)
-        # save_pretrained writes a single un-indexed shard for tiny models;
-        # TargetHead.load_weights locates lm_head.weight via the index file.
-        index = os.path.join(cls.target_dir, "model.safetensors.index.json")
-        if not os.path.exists(index):
-            import json
-
-            with open(index, "w") as f:
-                json.dump(
-                    {
-                        "metadata": {},
-                        "weight_map": {
-                            "lm_head.weight": "model.safetensors",
-                        },
-                    },
-                    f,
-                )
 
         cls._ensure_mooncake_master()
 
