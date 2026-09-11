@@ -29,6 +29,7 @@ CFG_PATH = "configs/qwen3-8b-domino.json"
 def build(dtype, device):
     raw = json.load(open(CFG_PATH))
     dfc = raw["dflash_config"]
+    domino_config = raw.get("domino_config", dfc)
     cfg = Qwen3Config(
         hidden_size=raw["hidden_size"],
         num_hidden_layers=raw["num_hidden_layers"],
@@ -65,7 +66,7 @@ def build(dtype, device):
         attention_backend="sdpa",
         num_anchors=NUM_ANCHORS,
         loss_decay_gamma=7.0,
-        shift_label=dfc.get("shift_label", True),
+        shift_label=domino_config.get("shift_label", True),
     )
     n_train = sum(p.numel() for p in draft.parameters() if p.requires_grad)
     return model, cfg, n_train

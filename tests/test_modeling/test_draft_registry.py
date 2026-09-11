@@ -64,9 +64,11 @@ TINY_DSPARK = {
     "layer_types": ["full_attention"],
     "dflash_config": {
         "projector_type": "dspark",
+    },
+    "dspark_config": {
         "markov_rank": 8,
         "markov_head_type": "vanilla",
-        "confidence_head_alpha": 1.0,
+        "enable_confidence_head": True,
         "confidence_head_with_markov": True,
     },
 }
@@ -91,6 +93,8 @@ TINY_DOMINO = {
     "layer_types": ["full_attention"],
     "dflash_config": {
         "projector_type": "domino",
+    },
+    "domino_config": {
         "emb_dim": 16,
         "gru_hidden_dim": 16,
         "pure_draft_prefix_len": 0,

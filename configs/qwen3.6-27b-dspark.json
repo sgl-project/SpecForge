@@ -9,11 +9,6 @@
     },
     "dflash_config": {
         "attention_mode": "gqa",
-        "confidence_head_alpha": 1.0,
-        "confidence_head_with_markov": true,
-        "enable_confidence_head": true,
-        "markov_head_type": "vanilla",
-        "markov_rank": 256,
         "mask_token_id": 248070,
         "projector_type": "dspark",
         "target_layer_ids": [
@@ -24,7 +19,12 @@
             62
         ]
     },
-
+    "dspark_config": {
+        "confidence_head_with_markov": true,
+        "enable_confidence_head": true,
+        "markov_head_type": "vanilla",
+        "markov_rank": 256
+    },
     "block_size": 16,
     "dtype": "bfloat16",
     "target_hidden_size": null,

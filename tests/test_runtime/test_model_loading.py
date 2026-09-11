@@ -448,7 +448,7 @@ class WarmStartTest(unittest.TestCase):
                         "projector_type": "dspark",
                         "markov_rank": 8,
                         "markov_head_type": "vanilla",
-                        "confidence_head_alpha": 1.0,
+                        "enable_confidence_head": True,
                         "confidence_head_with_markov": True,
                     },
                 },

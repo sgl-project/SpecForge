@@ -8,7 +8,11 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from .dflash import DFlashDraftModel, resolve_dflash_attention_mode
+from .dflash import (
+    DFlashDraftModel,
+    resolve_dflash_attention_mode,
+    resolve_dflash_variant_config,
+)
 from .registry import register_draft
 
 
@@ -336,14 +340,14 @@ class DSparkDraftModel(DFlashDraftModel):
         )
         return sampled_tokens
 
-    def _init_draft_head(self, config, dflash_config: dict) -> None:
-        self.markov_head = build_markov_head(config, dflash_config)
-        confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
+    def _init_draft_head(self, config) -> None:
+        dspark_config = resolve_dflash_variant_config(config, "dspark_config")
+        self.markov_head = build_markov_head(config, dspark_config)
         self.enable_confidence_head = bool(
-            dflash_config.get("enable_confidence_head", confidence_alpha > 0.0)
+            dspark_config.get("enable_confidence_head", False)
         )
         self.confidence_head_with_markov = bool(
-            dflash_config.get("confidence_head_with_markov", False)
+            dspark_config.get("confidence_head_with_markov", False)
         )
         if self.confidence_head_with_markov and self.markov_head is None:
             raise ValueError(

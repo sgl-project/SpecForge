@@ -11,7 +11,7 @@ from torch.func import functional_call
 
 from specforge.utils import get_device_type
 
-from .dflash import DFlashDraftModel, sample
+from .dflash import DFlashDraftModel, resolve_dflash_variant_config, sample
 from .registry import register_draft
 
 
@@ -33,11 +33,12 @@ class DominoDraftModel(DFlashDraftModel):
             )
         super().__init__(config)
 
-    def _init_draft_head(self, config, dflash_config: dict) -> None:
-        self.emb_dim = int(dflash_config["emb_dim"])
-        self.gru_hidden_dim = int(dflash_config["gru_hidden_dim"])
-        self.pure_draft_prefix_len = int(dflash_config.get("pure_draft_prefix_len", 0))
-        self.shift_label = bool(dflash_config.get("shift_label", False))
+    def _init_draft_head(self, config) -> None:
+        domino_config = resolve_dflash_variant_config(config, "domino_config")
+        self.emb_dim = int(domino_config["emb_dim"])
+        self.gru_hidden_dim = int(domino_config["gru_hidden_dim"])
+        self.pure_draft_prefix_len = int(domino_config.get("pure_draft_prefix_len", 0))
+        self.shift_label = bool(domino_config.get("shift_label", False))
 
         self.prefix_gru = nn.GRU(
             input_size=config.hidden_size,

@@ -455,7 +455,6 @@ def build_dspark(
         "mask_token_id": mask_token_id,
         "markov_rank": markov_rank,
         "markov_head_type": "vanilla",
-        "confidence_head_alpha": 1.0,
         "enable_confidence_head": True,
         "confidence_head_with_markov": True,
     }

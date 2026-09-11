@@ -7,14 +7,15 @@
   "bos_token_id": 163584,
   "dflash_config": {
     "attention_mode": "gqa",
-    "confidence_head_alpha": 1.0,
-    "confidence_head_with_markov": true,
-    "enable_confidence_head": true,
-    "markov_head_type": "vanilla",
-    "markov_rank": 256,
     "mask_token_id": 163824,
     "projector_type": "dspark",
     "target_layer_ids": [7, 23, 51, 67, 83]
+  },
+  "dspark_config": {
+    "confidence_head_with_markov": true,
+    "enable_confidence_head": true,
+    "markov_head_type": "vanilla",
+    "markov_rank": 256
   },
   "dtype": "bfloat16",
   "eos_token_id": 163586,
