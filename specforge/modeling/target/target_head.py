@@ -70,31 +70,62 @@ class TargetHead(nn.Module):
         else:
             self.model_path = snapshot_download(repo_id=model_path, cache_dir=cache_dir)
 
-        # model_path is a local directory
-        # check if there is file ending with index.json
-        glob_path = os.path.join(self.model_path, "*.index.json")
-        index_json_path = glob.glob(glob_path)
-
-        if len(index_json_path) == 0:
-            raise FileNotFoundError(f"No index.json file found in {self.model_path}")
-        if len(index_json_path) > 1:
+        index_json_paths = glob.glob(
+            os.path.join(self.model_path, "*.index.json")
+        )
+        if len(index_json_paths) > 1:
             raise FileNotFoundError(
                 f"Multiple index.json files found in {self.model_path}"
             )
-        index_json_path = index_json_path[0]
 
-        with open(index_json_path, "r") as f:
-            index_json = json.load(f)
-        ckpt_file = index_json["weight_map"][lm_head_key]
-
-        if ckpt_file.endswith(".safetensors"):
-            with safe_open(
-                os.path.join(self.model_path, ckpt_file), framework="pt"
-            ) as f:
-                lm_head = f.get_tensor(lm_head_key)
+        if index_json_paths:
+            index_json_path = index_json_paths[0]
+            with open(index_json_path, encoding="utf-8") as config_file:
+                weight_map = json.load(config_file).get("weight_map", {})
+            if lm_head_key not in weight_map:
+                raise RuntimeError(
+                    f"Target head key {lm_head_key!r} is missing from "
+                    f"{index_json_path}"
+                )
+            checkpoint_path = os.path.join(
+                self.model_path, weight_map[lm_head_key]
+            )
         else:
-            state_dict = torch.load(os.path.join(self.model_path, ckpt_file))
+            candidates = (
+                os.path.join(self.model_path, "model.safetensors"),
+                os.path.join(self.model_path, "pytorch_model.bin"),
+            )
+            checkpoint_path = next(
+                (path for path in candidates if os.path.isfile(path)),
+                None,
+            )
+            if checkpoint_path is None:
+                raise FileNotFoundError(
+                    "No index.json, model.safetensors, or pytorch_model.bin "
+                    f"found in {self.model_path}"
+                )
+
+        if checkpoint_path.endswith(".safetensors"):
+            with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
+                if lm_head_key not in checkpoint.keys():
+                    raise RuntimeError(
+                        f"Target head key {lm_head_key!r} is missing from "
+                        f"{checkpoint_path}"
+                    )
+                lm_head = checkpoint.get_tensor(lm_head_key)
+        else:
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            if lm_head_key not in state_dict:
+                raise RuntimeError(
+                    f"Target head key {lm_head_key!r} is missing from "
+                    f"{checkpoint_path}"
+                )
             lm_head = state_dict[lm_head_key]
+        if tuple(lm_head.shape) != tuple(self.fc.weight.shape):
+            raise RuntimeError(
+                f"Target head {lm_head_key!r} has shape {tuple(lm_head.shape)}, "
+                f"expected {tuple(self.fc.weight.shape)}"
+            )
         self.fc.weight.copy_(lm_head)
 
     def freeze_weights(self):
