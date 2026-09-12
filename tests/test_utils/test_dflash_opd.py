@@ -36,6 +36,15 @@ class DraftOPDTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             first_rejection_mask(torch.tensor([8]), torch.tensor([7]))
 
+    def test_partial_teacher_coverage_can_have_positive_loss_and_zero_gradient(self):
+        scores = torch.zeros(1, 1, 2, requires_grad=True)
+        p = torch.tensor([[[0.2, 0.2]]])
+        terms = opd_block_terms(scores, p, torch.ones(1, 1, dtype=torch.bool))
+        self.assertAlmostEqual(terms.loss_sum.item(), 0.6)
+        self.assertAlmostEqual(terms.overlap_sum.item(), 0.4)
+        terms.loss_sum.backward()
+        torch.testing.assert_close(scores.grad, torch.zeros_like(scores))
+
     def test_analytic_block_loss_and_early_gradient(self):
         # q=.5/.5; p(C)=.8, with a strict over/under direction at each slot.
         scores = torch.zeros(1, 3, 2, requires_grad=True)

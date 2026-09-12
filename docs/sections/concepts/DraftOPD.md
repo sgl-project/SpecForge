@@ -2,13 +2,16 @@
 
 **Experimental library support.** This provides the loss and DFlash2 replay
 forward for a future on-policy training pipeline. It does not register a new
-training strategy or provide a runnable rollout/training launcher. Existing
-DFlash training defaults are unchanged.
+training strategy or provide a runnable rollout/training launcher. Sliding
+attention honors an explicit draft configuration `is_causal=False`; absent or
+unspecified causality retains the legacy causal sliding mask.
 
 The objective is an adaptation of the
 [Draft-OPD TV variant](https://github.com/Simplified-Reasoning/Draft-OPD/tree/e81a8bc488ef762f178f8708ffbc49bd92c3a93d)
 to DFlash2's sparse, predecessor-conditioned selector. It is not a reproduction
 of the authors' training setup or a claim of measured acceptance improvement.
+The paper's accepted-token forward KL and rejected-suffix reverse KL are a
+different objective; this module implements the TV/first-rejection variant.
 
 ## Rollout contract
 
@@ -45,6 +48,22 @@ The producer must bind every record to the current draft policy and exact
 teacher sampling/filtering configuration. Final accepted text alone cannot
 reconstruct the rejected proposal or its verifier distribution.
 
+### Serving and replay must describe the same policy
+
+The frozen head supplied to replay must reproduce the head used to generate
+the draft proposals. For a quantized serving head, a separate BF16 checkpoint
+or a BF16 dequantization is not sufficient evidence of equivalence. Check both
+the natural candidate IDs and their conditional probabilities against actual
+serving captures. The same requirement applies to attention causality, KV
+precision, rotary computation and fused operations. Do not force the captured
+candidate IDs or relax the probability gate to hide a forward mismatch.
+
+With `is_causal=False`, draft positions can attend to future positions within
+their own block, while the sliding lower bound still excludes old positions.
+They cannot attend to another draft block or to target taps at or after the
+anchor. Both dense and FlexAttention masks enforce this contract. Full-attention
+behavior and the default causal sliding mask are unchanged.
+
 ## Objective and normalization
 
 `first_rejection_mask` retains accepted proposals plus the first rejection,
@@ -60,8 +79,13 @@ the candidate set.
 For a block with `N` exposed positions, minimize
 `1 - sum(cumprod(A)) / N`. With a predecessor-conditioned selector, this is a
 replay-path surrogate, not exact unconditional serving acceptance length.
-Teacher probabilities are detached. A zero-overlap block remains finite;
-its overlap gradient can be zero when all teacher mass misses the candidates.
+Teacher probabilities are detached. A zero-overlap block remains finite.
+Sparse TV can also have positive overlap and zero score gradient: when every
+selected `q(v)` exceeds `p(v)`, overlap is the constant teacher mass on the
+candidate set. For example, `q=(0.5, 0.5)` and `p(C)=(0.2, 0.2)` give overlap
+`0.4` and a one-position loss of `0.6` with zero score gradient. Report teacher
+coverage and this plateau frequency when diagnosing a weak learning signal;
+the example alone does not establish its frequency or performance impact.
 
 The wrapper returns an **unnormalized block sum**, additive block statistics,
 and replay agreement diagnostics. By default it adds `0.1` times the inherited
@@ -85,6 +109,8 @@ scheduler, rollout RNG, data cursor and policy identity together. These parts
 are not implemented by this module.
 
 CPU tests cover dense-reference values/gradients, first rejection and censoring,
-unequal rank/accumulation counts, selector/backbone gradients, and prevention
-of future-context leakage. Native backend parity, distributed optimizer
-recovery, performance and held-out acceptance gains remain unvalidated.
+unequal rank/accumulation counts, sparse-support plateaus, selector/backbone
+gradients, and prevention of future-context leakage, including noncausal sliding
+blocks. Passing these tests does not establish native backend parity,
+distributed optimizer recovery, performance or held-out acceptance gains for
+an integration using this library.
