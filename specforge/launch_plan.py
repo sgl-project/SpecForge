@@ -112,12 +112,14 @@ class ReadinessSpec:
     timeout_s: float
     tcp_host: Optional[str] = None
     tcp_port: Optional[int] = None
+    probe_timeout_s: float = 5.0
 
     def as_dict(self) -> dict:
         return {
             "kind": self.kind,
             "url": _redacted(self.url),
             "timeout_s": self.timeout_s,
+            "probe_timeout_s": self.probe_timeout_s,
             "tcp_host": self.tcp_host,
             "tcp_port": self.tcp_port,
         }
@@ -314,6 +316,8 @@ def _disaggregated_env(
         values["DISAGG_STORE_ROOT"] = deployment.store_root
     if deployment.backend == "mooncake":
         values["DISAGG_CLIENT_BUFFER_SIZE"] = str(deployment.client_buffer_size)
+        values["DISAGG_RECEIVE_BUFFERS"] = deployment.receive_buffers
+        values["DISAGG_RECEIVE_POOL_BYTES"] = str(deployment.receive_pool_bytes)
 
     optional_values = {
         "MOONCAKE_METADATA_SERVER": deployment.mooncake_metadata_server,
@@ -331,6 +335,14 @@ def _disaggregated_env(
             values[name] = str(value)
 
     if deployment.backend == "mooncake":
+        if (
+            deployment.receive_buffers == "cuda"
+            and values.get("MOONCAKE_PROTOCOL", "tcp") != "rdma"
+        ):
+            raise ValueError(
+                "receive_buffers=cuda needs an RDMA Mooncake transport; "
+                "the effective MOONCAKE_PROTOCOL must be rdma"
+            )
         required = ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
         missing = [
             name for name in required if not values.get(name) and not base_env.get(name)
@@ -466,6 +478,7 @@ def _managed_local_services(
             mooncake.startup_timeout_s,
             tcp_host="127.0.0.1",
             tcp_port=mooncake.rpc_port,
+            probe_timeout_s=mooncake.probe_timeout_s,
         ),
         log_path=str(log_dir / "mooncake.log"),
         phase=0,
@@ -545,6 +558,7 @@ def _managed_local_services(
                     "http",
                     f"http://127.0.0.1:{server.port}/health",
                     server.startup_timeout_s,
+                    probe_timeout_s=server.probe_timeout_s,
                 ),
                 log_path=str(log_dir / f"capture-server-{index}.log"),
                 phase=1,
@@ -980,9 +994,11 @@ def _managed_preflight(plan: LaunchPlan) -> None:
                 ) from exc
 
 
-def _http_ready(readiness: ReadinessSpec) -> bool:
+def _http_ready(readiness: ReadinessSpec, *, timeout_s: Optional[float] = None) -> bool:
+    if timeout_s is None:
+        timeout_s = readiness.probe_timeout_s
     try:
-        with urllib_request.urlopen(readiness.url, timeout=1.0) as response:
+        with urllib_request.urlopen(readiness.url, timeout=timeout_s) as response:
             status = getattr(response, "status", 200)
             return readiness.kind == "mooncake" or 200 <= status < 300
     except urllib_error.HTTPError as exc:
@@ -993,17 +1009,27 @@ def _http_ready(readiness: ReadinessSpec) -> bool:
         return False
 
 
-def _readiness_satisfied(readiness: ReadinessSpec) -> bool:
-    if not _http_ready(readiness):
+def _readiness_satisfied(
+    readiness: ReadinessSpec, *, deadline: Optional[float] = None
+) -> bool:
+    started = time.monotonic()
+    probe_deadline = started + readiness.probe_timeout_s
+    if deadline is not None:
+        probe_deadline = min(probe_deadline, deadline)
+    timeout_s = probe_deadline - started
+    if timeout_s <= 0 or not _http_ready(readiness, timeout_s=timeout_s):
+        return False
+    remaining = probe_deadline - time.monotonic()
+    if remaining <= 0:
         return False
     if readiness.kind != "mooncake":
         return True
     assert readiness.tcp_host is not None and readiness.tcp_port is not None
     try:
         with socket.create_connection(
-            (readiness.tcp_host, readiness.tcp_port), timeout=1.0
+            (readiness.tcp_host, readiness.tcp_port), timeout=remaining
         ):
-            return True
+            return time.monotonic() < probe_deadline
     except OSError:
         return False
 
@@ -1022,9 +1048,12 @@ def _wait_for_service(
                     f"managed service {active_service.command.label!r} exited "
                     f"with status {status}; see {active_service.log_path}"
                 )
-        if _readiness_satisfied(service.readiness):
+        if _readiness_satisfied(service.readiness, deadline=deadline):
             return
-        time.sleep(0.25)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.25, remaining))
     if process.poll() is not None:
         raise RuntimeError(
             f"managed service {service.command.label!r} exited during startup; "
