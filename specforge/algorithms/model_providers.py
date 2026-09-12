@@ -396,6 +396,7 @@ def build_dflash_model(
             selector_ramp_ratio=cfg.training.dflash2_selector_ramp_ratio,
             selector_stop_gradient=cfg.training.dflash2_selector_stop_gradient,
             lk_loss_type=cfg.training.lk_loss_type,
+            lk_target=cfg.training.dflash_lk_target,
             kl_scale=cfg.training.kl_scale,
             kl_decay=cfg.training.kl_decay,
         ),

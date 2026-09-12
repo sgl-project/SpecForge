@@ -451,9 +451,10 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     """DFlash block-parallel strategy wrapping the existing ``OnlineDFlashModel``.
 
     Shares the trainer/backend/loader/checkpoint spine with EAGLE3; only the
-    per-step forward/loss differs (single block-wise pass, scalar loss, hard
-    real-token labels — no target distribution, no vocab map). ``hidden_states``
-    is DFlash's own schema name, distinct from EAGLE3's ``hidden_state``.
+    per-step forward/loss differs (single block-wise pass and scalar loss).
+    DFlash defaults to hard real-token labels and can opt into the captured
+    full-vocabulary target distribution. ``hidden_states`` is DFlash's own
+    schema name, distinct from EAGLE3's ``hidden_state``.
     """
 
     name = "dflash"
@@ -513,7 +514,18 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         if ctx is not None:
             model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
         target_last_hidden_states = t.get("target_last_hidden_states")
-        if target_last_hidden_states is not None and collect_detailed_metrics:
+        requires_target_distribution = (
+            getattr(self.dflash_model, "lk_target", "hard_label")
+            == "target_distribution"
+        )
+        if requires_target_distribution and target_last_hidden_states is None:
+            raise ValueError(
+                "full-vocabulary DFlash LK loss requires the "
+                "target_last_hidden_states capture feature"
+            )
+        if target_last_hidden_states is not None and (
+            collect_detailed_metrics or requires_target_distribution
+        ):
             model_inputs["target_last_hidden_states"] = target_last_hidden_states.to(
                 device, non_blocking=True
             )

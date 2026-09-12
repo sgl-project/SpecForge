@@ -170,6 +170,7 @@ class DFlash2ArchitectureTest(unittest.TestCase):
             loss_decay_gamma=0.9,
             loss_type="dflash",
             lk_loss_type="lambda",
+            lk_target="target_distribution",
             kl_scale=0.9,
             kl_decay=0.8,
             mask_token_id=31,
@@ -191,6 +192,7 @@ class DFlash2ArchitectureTest(unittest.TestCase):
         self.assertEqual(contract["dflash2_selector_ramp_ratio"], 0.2)
         self.assertTrue(contract["dflash2_selector_stop_gradient"])
         self.assertEqual(contract["dflash_lk_loss_type"], "lambda")
+        self.assertEqual(contract["dflash_lk_target"], "target_distribution")
 
     def test_backward_reaches_convolution_parameters(self):
         config = _tiny_config()

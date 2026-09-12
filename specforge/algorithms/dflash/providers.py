@@ -67,6 +67,7 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_loss_type": str(training_model.loss_type),
         "dflash_dpace_alpha": float(training_model.dpace_alpha),
         "dflash_lk_loss_type": training_model.lk_loss_type,
+        "dflash_lk_target": str(getattr(training_model, "lk_target", "hard_label")),
         "dflash_kl_scale": float(training_model.kl_scale),
         "dflash_kl_decay": float(training_model.kl_decay),
     }
