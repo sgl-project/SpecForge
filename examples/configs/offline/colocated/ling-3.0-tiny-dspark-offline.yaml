@@ -1,3 +1,11 @@
+# Ling-3.0-tiny DSpark, offline (capture -> train) recipe.
+#
+# After training, the raw `specforge export --to hf` config is not directly loadable by SGLang
+# (it fails with markov_rank=0). Normalize it first, then serve:
+#   python scripts/gates/normalize_dflash_export.py --config <export>/config.json --block-size 8
+#   python -m sglang.launch_server --model-path inclusionAI/Ling-3.0-tiny --trust-remote-code \
+#     --speculative-algorithm DSPARK --speculative-draft-model-path <export>
+# See scripts/gates/README.md.
 model:
   target_model_path: inclusionAI/Ling-3.0-tiny
   draft_model_config: configs/ling-3.0-tiny-dspark.json
