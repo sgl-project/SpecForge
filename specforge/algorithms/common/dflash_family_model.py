@@ -191,6 +191,7 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     sliding_window: Optional[int] = None,
+    sliding_draft_causal: bool = True,
 ):
     """Construct a full or sliding dense boolean DFlash mask."""
 
@@ -223,7 +224,12 @@ def create_dflash_sdpa_mask(
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
     if sliding_window is not None:
         kv_block_offsets = (kv_indices - S) % block_size
-        mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
+        if sliding_draft_causal:
+            mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
+        else:
+            mask_draft = mask_draft & (
+                kv_block_offsets >= q_block_offsets - (sliding_window - 1)
+            )
 
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
@@ -239,6 +245,7 @@ def create_dflash_block_mask(
     device: torch.device,
     flex_block_size=None,
     sliding_window: Optional[int] = None,
+    sliding_draft_causal: bool = True,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training."""
 
@@ -265,7 +272,12 @@ def create_dflash_block_mask(
         mask_draft = is_draft & (q_block_id == kv_block_id)
         if sliding_window is not None:
             kv_block_offset = (kv_idx - S) % block_size
-            mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
+            if sliding_draft_causal:
+                mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
+            else:
+                mask_draft = mask_draft & (
+                    kv_block_offset >= q_block_offset - (sliding_window - 1)
+                )
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < N
@@ -612,6 +624,9 @@ class OnlineDFlashModel(nn.Module):
                 "sliding_attention": mask_builder(
                     **mask_args,
                     sliding_window=sliding_window,
+                    sliding_draft_causal=getattr(
+                        self.draft_model.config, "is_causal", None
+                    ) is not False,
                 ),
             }
 
