@@ -18,6 +18,10 @@ This reuse is intentional. The convolution and selector run entirely in the
 draft, so the target server captures the same layers and the trainer consumes
 the same tensors as standard DFlash.
 
+Experimental [Draft-OPD replay support](DraftOPD.md) adds loss and forward
+primitives for actual speculative verification records. It is a library API;
+the standard training strategy and feature protocol above remain unchanged.
+
 ## Architecture
 
 Every attention and MLP sublayer is wrapped by a grouped, dynamic depthwise
