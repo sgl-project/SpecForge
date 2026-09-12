@@ -23,8 +23,9 @@ import inspect
 import logging
 from typing import Any
 
-import torch
 from sglang.srt import utils as sglang_utils
+
+from specforge.utils import get_device_type
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +50,13 @@ def require_mlp_tp_gather(server_args: Any) -> bool:
 
 
 def resolve_device(server_args: Any) -> str:
-    """Fill in ``ServerArgs.device`` when the launcher has not resolved it."""
+    """Fill in ``ServerArgs.device`` when the launcher has not resolved it.
+
+    Uses SpecForge's own resolver (``SPECFORGE_DEVICE``, then CUDA, then NPU,
+    then CPU) so the capture backend lands on the same accelerator as training.
+    """
     if getattr(server_args, "device", None) is None:
-        server_args.device = "cuda" if torch.cuda.is_available() else "cpu"
+        server_args.device = get_device_type()
     return server_args.device
 
 

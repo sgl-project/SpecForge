@@ -59,11 +59,9 @@ class SGLangMainCompatibilityTest(unittest.TestCase):
 
     def test_resolve_device_only_fills_missing_device(self):
         server_args = types.SimpleNamespace(device=None)
-        with mock.patch.object(
-            sglang_compat.torch.cuda, "is_available", return_value=False
-        ):
-            self.assertEqual(sglang_compat.resolve_device(server_args), "cpu")
-        self.assertEqual(server_args.device, "cpu")
+        with mock.patch.object(sglang_compat, "get_device_type", return_value="npu"):
+            self.assertEqual(sglang_compat.resolve_device(server_args), "npu")
+        self.assertEqual(server_args.device, "npu")
 
         server_args = types.SimpleNamespace(device="xpu")
         self.assertEqual(sglang_compat.resolve_device(server_args), "xpu")
