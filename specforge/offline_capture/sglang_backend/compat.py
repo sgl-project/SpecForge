@@ -18,6 +18,7 @@ NOTE (sglang main, Sep 2026):
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import logging
 from typing import Any
@@ -61,7 +62,7 @@ def publish_runtime_context(server_args: Any, *, role: str = "scheduler") -> boo
     already published or the API does not exist.
     """
     try:
-        from sglang.srt import runtime_context
+        runtime_context = importlib.import_module("sglang.srt.runtime_context")
     except ImportError:
         return False
     publish = getattr(runtime_context, "publish", None)
