@@ -193,6 +193,25 @@ def parse_args():
     sglang_group.add_argument("--sglang-enable-dp-lm-head", action="store_true")
     sglang_group.add_argument("--sglang-ep-size", type=int, default=1)
     sglang_group.add_argument(
+        "--sglang-page-size",
+        type=int,
+        default=None,
+        help=(
+            "KV-cache page size for the offline SGLang capture (default: SGLang's "
+            "default). Hybrid Mamba/GDN/KDA targets on recent SGLang need a paged "
+            "allocator, e.g. 64."
+        ),
+    )
+    sglang_group.add_argument(
+        "--sglang-moe-runner-backend",
+        default=None,
+        help=(
+            "MoE runner backend for the offline SGLang capture (default: SGLang's "
+            "auto). Use e.g. triton on hosts whose CUDA toolkit cannot build the "
+            "flashinfer fused-routing kernels."
+        ),
+    )
+    sglang_group.add_argument(
         "--sglang-disable-radix-cache",
         action="store_true",
         help=(
@@ -294,7 +313,7 @@ def _generate_shared_vocab_mapping(
 
 
 def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
-    return {
+    kwargs = {
         "attention_backend": args.sglang_attention_backend,
         "mem_fraction_static": args.sglang_mem_fraction_static,
         "context_length": args.sglang_context_length,
@@ -308,6 +327,13 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
         "max_running_requests": args.batch_size,
         "max_total_tokens": args.batch_size * args.max_length,
     }
+    # Only forward the optional engine knobs when set, so the pinned SGLang's
+    # defaults stay in force otherwise.
+    if getattr(args, "sglang_page_size", None) is not None:
+        kwargs["page_size"] = args.sglang_page_size
+    if getattr(args, "sglang_moe_runner_backend", None):
+        kwargs["moe_runner_backend"] = args.sglang_moe_runner_backend
+    return kwargs
 
 
 def resolve_offline_capture_plan(
