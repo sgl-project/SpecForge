@@ -626,7 +626,8 @@ class OnlineDFlashModel(nn.Module):
                     sliding_window=sliding_window,
                     sliding_draft_causal=getattr(
                         self.draft_model.config, "is_causal", None
-                    ) is not False,
+                    )
+                    is not False,
                 ),
             }
 
