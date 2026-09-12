@@ -291,6 +291,8 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
+    #: Budget for one readiness probe, capped by the remaining startup timeout.
+    probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     #: Master key-lease TTL (ms) forwarded to ``mooncake_master
     #: --default_kv_lease_ttl``. The consumer's teardown drain allows about
     #: 19.5s for leases to settle. Keep the managed-local default at 500ms so
@@ -329,6 +331,8 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
+    #: SGLang's generation-based /health waits at least one second internally.
+    probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_devices(self):
@@ -427,6 +431,15 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: zero for both SpecForge roles.
     producer_segment_size: Optional[int] = Field(default=None, gt=0)
     client_buffer_size: int = Field(default=256 << 20, gt=0)
+    #: Consumer receive buffers for Mooncake ``get_into``: ``pageable`` allocates
+    #: a fresh host tensor per feature (registered and unregistered around each
+    #: read, then copied to the device on the training stream); ``pinned`` keeps
+    #: a bounded pool of page-locked, once-registered host buffers and copies to
+    #: the device on a side stream; ``cuda`` keeps the pool on the trainer device
+    #: for device reads (Mooncake 0.3.x stages these through its client buffer).
+    receive_buffers: Literal["pageable", "pinned", "cuda"] = "pageable"
+    #: Retained receive-pool budget per rank; excludes output copies and overflow.
+    receive_pool_bytes: int = Field(default=8 << 30, gt=0)
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
     producer_hold_s: Optional[float] = Field(default=None, gt=0)
@@ -441,6 +454,16 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     def _validate_store(self):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
+        if self.receive_buffers == "cuda" and self.managed_local is not None:
+            # External deployments resolve environment overrides in the launch
+            # plan. Managed-local transport is authoritative over the environment.
+            if self.managed_local.mooncake.protocol != "rdma":
+                raise ValueError(
+                    "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
+                    "Mooncake transport (mooncake_protocol or "
+                    "managed_local.mooncake.protocol = rdma); the TCP transport "
+                    "cannot write into device memory"
+                )
         if self.consumer_state_dir is not None and (
             not self.consumer_state_dir
             or self.consumer_state_dir.strip() != self.consumer_state_dir

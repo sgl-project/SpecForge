@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent import futures
 from dataclasses import replace
 from functools import partial
 from unittest import mock
@@ -91,6 +92,36 @@ class _RecordingQueue(SampleRefQueue):
     def fail(self, refs, reason, retryable):
         self.failures.append(([ref.sample_id for ref in refs], reason, retryable))
         super().fail(refs, reason=reason, retryable=retryable)
+
+
+class _QueuedFetchExecutor:
+    """Hold fetches until EOF so cancellation races are deterministic."""
+
+    def __init__(self, *, complete_first_only=False):
+        self.jobs = []
+        self.complete_first_only = complete_first_only
+        self.shutdown_calls = []
+
+    def submit(self, fn, *args):
+        future = futures.Future()
+        self.jobs.append((future, fn, args))
+        return future
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        self.shutdown_calls.append((wait, cancel_futures))
+        if cancel_futures:
+            for future, _, _ in self.jobs:
+                future.cancel()
+                future.set_running_or_notify_cancel()
+            return
+        # Complete in reverse order to also exercise ordered consumption.
+        jobs = self.jobs[:1] if self.complete_first_only else reversed(self.jobs)
+        for future, fn, args in jobs:
+            if future.set_running_or_notify_cancel():
+                try:
+                    future.set_result(fn(*args))
+                except BaseException as exc:
+                    future.set_exception(exc)
 
 
 class _CloneFailure:
@@ -489,6 +520,97 @@ class TestFeatureDataLoader(unittest.TestCase):
 
         self.assertEqual(store.active_leases, 0)
         self.assertEqual(store.releases, 1)
+
+    def test_prefetch_eof_drains_queued_batches_in_order(self):
+        for partial_tail in (False, True):
+            with self.subTest(partial_tail=partial_tail):
+                store = LocalFeatureStore("st")
+                refs = [
+                    store.put(
+                        {"x": torch.tensor([index])},
+                        sample_id=f"s{index}",
+                        metadata={"run_id": "run"},
+                    )
+                    for index in range(6 + int(partial_tail))
+                ]
+                queue = _RecordingQueue()
+                queue.put(refs)
+                executor = _QueuedFetchExecutor()
+                loader = FeatureDataLoader(store, queue, batch_size=2, num_workers=4)
+                with mock.patch(
+                    "specforge.runtime.data_plane.feature_dataloader.futures.ThreadPoolExecutor",
+                    return_value=executor,
+                ):
+                    try:
+                        batches = list(loader)
+                    finally:
+                        loader.close()
+                self.assertEqual(
+                    [batch.sample_ids for batch in batches],
+                    [["s0", "s1"], ["s2", "s3"], ["s4", "s5"]],
+                )
+                self.assertEqual(
+                    [batch.tensors["x"].flatten().tolist() for batch in batches],
+                    [[0, 1], [2, 3], [4, 5]],
+                )
+                self.assertEqual(executor.shutdown_calls, [(False, False)])
+                self.assertTrue(
+                    all(f.done() and not f.cancelled() for f, _, _ in executor.jobs)
+                )
+                self.assertEqual(queue.in_flight(), 0)
+                self.assertEqual(queue.depth(), 0)
+                self.assertEqual(len(queue.failures), int(partial_tail))
+                self.assertEqual(store.health()["resident_samples"], 0)
+                self.assertIsNone(loader._prefetch_state)
+
+    def test_prefetch_close_after_eof_cancels_only_unstarted_batches(self):
+        store = LocalFeatureStore("st")
+        refs = [
+            store.put(
+                {"x": torch.tensor([index])},
+                sample_id=f"s{index}",
+                metadata={"run_id": "run"},
+            )
+            for index in range(3)
+        ]
+        queue = _RecordingQueue()
+        queue.put(refs)
+        executor = _QueuedFetchExecutor(complete_first_only=True)
+        loader = FeatureDataLoader(store, queue, num_workers=4, ack=False)
+        with mock.patch(
+            "specforge.runtime.data_plane.feature_dataloader.futures.ThreadPoolExecutor",
+            return_value=executor,
+        ):
+            iterator = iter(loader)
+            try:
+                first = next(iterator)
+                self.assertEqual(first.sample_ids, ["s0"])
+                queue.ack([refs[0]])
+                state = loader._prefetch_state
+                state.thread.join(timeout=1.0)
+                self.assertFalse(state.thread.is_alive())
+                self.assertEqual(executor.shutdown_calls, [(False, False)])
+                self.assertTrue(all(not f.done() for f, _, _ in executor.jobs[1:]))
+                with mock.patch(
+                    "specforge.runtime.data_plane.feature_dataloader._PREFETCH_JOIN_TIMEOUT_S",
+                    0.05,
+                ):
+                    loader.close()
+                loader.close()  # idempotent
+            finally:
+                loader.close()
+                iterator.close()
+        self.assertFalse(executor.jobs[0][0].cancelled())
+        self.assertTrue(all(f.cancelled() for f, _, _ in executor.jobs[1:]))
+        self.assertEqual(queue.in_flight(), 0)
+        self.assertEqual(queue.depth(), 2)
+        self.assertEqual(
+            queue.failures,
+            [(["s1", "s2"], "loader_prefetch_closed_before_yield", True)],
+        )
+        self.assertEqual(store.health()["active_leases"], 0)
+        self.assertEqual(store.health()["resident_samples"], 2)
+        self.assertIsNone(loader._prefetch_state)
 
     def test_prefetch_materialization_exception_leaves_no_lease_or_thread(self):
         with tempfile.TemporaryDirectory() as d:
