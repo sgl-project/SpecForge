@@ -3,6 +3,7 @@
 
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -161,6 +162,20 @@ class CompactTeacherStrategyTest(unittest.TestCase):
         _assert_teacher_close(
             self, actual, _reference_teacher(full_logits, t2d, loss_mask)
         )
+
+    def test_compact_teacher_projects_each_vocab_row_once(self):
+        hidden, weight, t2d, loss_mask = _numerical_inputs()
+        linear = torch.nn.functional.linear
+
+        with mock.patch(
+            "specforge.core.compact_teacher.F.linear", wraps=linear
+        ) as mock_linear:
+            compute_target_from_hidden(hidden, weight, t2d, loss_mask, chunk_size=7)
+
+        projected_rows = sum(
+            call.args[1].shape[0] for call in mock_linear.call_args_list
+        )
+        self.assertEqual(projected_rows, weight.shape[0])
 
     def test_argmax_tie_across_chunks_uses_lowest_vocab_id(self):
         hidden = torch.ones(1, 1, 4)
