@@ -134,7 +134,7 @@ def run_row_parallel_linear(rank, world_size, port):
     # check
     assert torch.allclose(
         native_output, sf_output, rtol=1e-5, atol=1e-5
-    ), f"native_output: \n{native_output}, \nfull_sf_output: \n{full_sf_output}"
+    ), f"native_output: \n{native_output}, \nsf_output: \n{sf_output}"
 
 
 class TestLinear(unittest.TestCase):
@@ -143,7 +143,6 @@ class TestLinear(unittest.TestCase):
         port = get_available_port()
         mp.spawn(run_column_parallel_linear, nprocs=2, args=(2, port))
 
-    def test_column_parallel_linear(self):
         port = get_available_port()
         mp.spawn(run_column_parallel_linear, nprocs=1, args=(1, port))
 
