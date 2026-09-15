@@ -587,6 +587,9 @@ class DSparkTrainStrategy(DraftTrainStrategy):
                 device, non_blocking=True
             ),
             max_valid_anchors=max_valid_anchors,
+            collect_detailed_metrics=(
+                ctx.collect_detailed_metrics if ctx is not None else True
+            ),
         )
         metrics = {
             "accuracy": accuracy.detach(),
@@ -722,8 +725,12 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
             lambda_base=lambda_base,
             max_valid_anchors=max_valid_anchors,
+            collect_detailed_metrics=(
+                ctx.collect_detailed_metrics if ctx is not None else True
+            ),
         )
         metrics = dict(model_metrics)
+        ratio_metrics = metrics.pop("ratio_metrics", {})
         metrics["accuracy"] = accuracy.detach()
         metrics.setdefault(
             "lambda_base",
@@ -733,6 +740,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss=loss,
             metrics=metrics,
             loss_terms=model_metrics.get("loss_terms"),
+            ratio_metrics=ratio_metrics,
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
