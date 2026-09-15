@@ -143,6 +143,7 @@ def case(request):
 
 def test_walk_values_chunking_gradients_and_gating(case):
     reference = None
+    metric_reference = None
     for detailed, chunk in [(True, size) for size in (0, 1, 2, 4, 5)] + [(False, 2)]:
         case.model.objective_chunk_blocks = chunk
         case.model.zero_grad(set_to_none=True)
@@ -184,6 +185,25 @@ def test_walk_values_chunking_gradients_and_gating(case):
             else:
                 assert key not in output.ratio_metrics
         assert "ratio_metrics" not in output.metrics
+        if case.family in ("dflash", "dflash2"):
+            if detailed:
+                # Walk metrics must coexist with main's prefix diagnostics and
+                # additive counts, independently of the metric chunk size.
+                assert "dflash/hard_label/unary_greedy_prefix_acceptance" in (
+                    output.ratio_metrics
+                )
+                assert output.sum_metrics["dflash/hard_label/block_count"] == 12
+                if case.family == "dflash2":
+                    assert "dflash2/selector/greedy_prefix_acceptance" in (
+                        output.ratio_metrics
+                    )
+                metric_values = (output.ratio_metrics, output.sum_metrics)
+                if metric_reference is None:
+                    metric_reference = metric_values
+                else:
+                    torch.testing.assert_close(metric_values, metric_reference)
+            else:
+                assert output.sum_metrics == {}
 
 
 @pytest.mark.parametrize(

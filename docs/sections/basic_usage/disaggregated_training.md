@@ -218,7 +218,7 @@ config.
 The Qwen3.8-27B DFlash2 recipe fills one 8-GPU node: four TP=1 capture servers
 on GPUs 0-3 and a DP4 trainer on GPUs 4-7, with the Mooncake lease, segment
 sizes and in-flight watermarks measured for its 277-500 MB feature payloads.
-Its [recipe page](../../recipes/qwen3.8-27b-dflash2-disaggregated.md) explains
+Its [recipe page](/recipes/qwen3.8-27b-dflash2-disaggregated) explains
 how to move servers between the two lists for a different GPU generation and
 records the throughput measured on B300 and H200 nodes:
 
@@ -335,7 +335,7 @@ is set: server `i` owns the `i`-th group of `SERVER_TP` devices from
 producer as `deployment.disaggregated.server_urls`.
 `examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh` uses it for eight
 TP1 Qwen3.8-27B capture servers feeding an eight-rank DFlash2 trainer; see its
-[recipe page](../../recipes/qwen3.8-27b-dflash2-disaggregated.md).
+[recipe page](/recipes/qwen3.8-27b-dflash2-disaggregated).
 
 ## External and managed-local services
 
