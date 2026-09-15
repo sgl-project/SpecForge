@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import unittest
 
-import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
