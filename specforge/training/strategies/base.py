@@ -468,22 +468,34 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.dflash_model.parameters()).device
 
+    def _draft_attr(self, name: str, default: float) -> float:
+        """Read a schedule attribute from the draft model.
+
+        Under ``fsdp_sharding: NO_SHARD`` the backend wraps the draft in
+        ``DistributedDataParallel``, which does not forward attribute access
+        to the wrapped module, so ``selector_loss_alpha`` and the warmup and
+        ramp ratios read as their defaults and the selector objective is
+        silently disabled. Look through the wrapper when the attribute is
+        not on the outer module.
+        """
+        model = self.dflash_model
+        if not hasattr(model, name):
+            inner = getattr(model, "module", None)
+            if isinstance(inner, nn.Module):
+                model = inner
+        return float(getattr(model, name, default))
+
     def _selector_loss_alpha(self, ctx: Optional[StepContext]) -> float:
-        target = float(getattr(self.dflash_model, "selector_loss_alpha", 0.0))
+        target = self._draft_attr("selector_loss_alpha", 0.0)
         if target <= 0 or ctx is None or not ctx.total_steps:
             return target
 
         total_steps = int(ctx.total_steps)
-        warmup_steps = int(
-            total_steps
-            * float(getattr(self.dflash_model, "selector_warmup_ratio", 0.0))
-        )
+        warmup_steps = int(total_steps * self._draft_attr("selector_warmup_ratio", 0.0))
         if ctx.global_step < warmup_steps:
             return 0.0
 
-        ramp_steps = int(
-            total_steps * float(getattr(self.dflash_model, "selector_ramp_ratio", 0.0))
-        )
+        ramp_steps = int(total_steps * self._draft_attr("selector_ramp_ratio", 0.0))
         if ramp_steps <= 0:
             return target
         ramp_progress = min(
