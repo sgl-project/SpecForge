@@ -112,7 +112,15 @@ def export_to_hf(
         full_state["embed_tokens.weight"] = _load_embedding_tensor(
             embedding_source, embedding_key
         )
-    full_state.update(state["draft_state_dict"])  # trained keys win
+    # Preserve checkpoint weights at their original precision, but keep the
+    # mapping explicitly loaded by materialize_draft when one was requested.
+    full_state.update(
+        {
+            key: value
+            for key, value in state["draft_state_dict"].items()
+            if not (vocab_mapping_path and key in {"t2d", "d2t"})
+        }
+    )
     model.save_pretrained(output_dir, state_dict=full_state)
     apply_legacy_rope_scaling(output_dir)
     return output_dir
