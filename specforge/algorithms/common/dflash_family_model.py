@@ -746,6 +746,11 @@ class OnlineDFlashModel(nn.Module):
                 loss_weights = loss_weights * decay_weights
             loss_den = loss_weights.sum()
         elif self.loss_type in _DPACE_LOSS_TYPES:
+            if sequence_anchor_scale is None:
+                raise ValueError(
+                    "precomputed full-sequence sequence_anchor_scale is required "
+                    "for D-PACE chunk reduction"
+                )
             with torch.no_grad():
                 dpace_weights = self._dpace_weight(
                     target_probability.detach(),
@@ -755,8 +760,6 @@ class OnlineDFlashModel(nn.Module):
                 )
             loss_weights = weight_mask * dpace_weights
             valid_anchors = (weight_mask > 0).any(dim=-1)
-            if sequence_anchor_scale is None:
-                sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
             loss_weights = loss_weights * sequence_anchor_scale
             # Each valid anchor contributes 1 / A_b to the denominator, so
             # reducing all chunks yields the number of valid sequences. This
@@ -941,14 +944,17 @@ class OnlineDFlashModel(nn.Module):
             )
             return weight_mask * decay_weights
 
+        if sequence_anchor_scale is None:
+            raise ValueError(
+                "precomputed full-sequence sequence_anchor_scale is required "
+                "for D-PACE metric reduction"
+            )
         dpace_weights = self._dpace_weight(
             hard_label_probability,
             weight_mask,
             weight_mask > 0,
             self.loss_type,
         )
-        if sequence_anchor_scale is None:
-            sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
         return weight_mask * dpace_weights * sequence_anchor_scale
 
     @staticmethod

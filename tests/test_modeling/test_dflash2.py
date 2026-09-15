@@ -574,8 +574,14 @@ class CandidateSelectorTest(unittest.TestCase):
         weights = torch.tensor([[[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]])
         predecessors = torch.tensor([[[4, 4, 2], [4, 4, 1]]])
 
+        with self.assertRaisesRegex(ValueError, "sequence_anchor_scale"):
+            model._dflash_metric_chunk_terms(hidden, target_ids, weights, predecessors)
         terms = model._dflash_metric_chunk_terms(
-            hidden, target_ids, weights, predecessors
+            hidden,
+            target_ids,
+            weights,
+            predecessors,
+            sequence_anchor_scale=model._sequence_anchor_scale(weights),
         )
 
         self.assertEqual(terms.block_den.item(), 2.0)
@@ -925,11 +931,19 @@ class CandidateSelectorTest(unittest.TestCase):
         # position weight, and that same weight must scale both objectives.
         model.loss_type = "dpace"
         model.dpace_alpha = 0.5
+        with self.assertRaisesRegex(ValueError, "sequence_anchor_scale"):
+            model._dflash_objective_chunk_terms(
+                hidden,
+                covered_targets,
+                weights,
+                predecessors,
+            )
         dpace_terms = model._dflash_objective_chunk_terms(
             hidden,
             covered_targets,
             weights,
             predecessors,
+            sequence_anchor_scale=model._sequence_anchor_scale(weights),
         )
         unary_probability = torch.exp(-covered_base_ce)
         dpace_weight = 0.5 * unary_probability + 0.5
@@ -962,6 +976,7 @@ class CandidateSelectorTest(unittest.TestCase):
             multi_targets,
             multi_weights,
             multi_predecessors,
+            sequence_anchor_scale=model._sequence_anchor_scale(multi_weights),
         )
 
         torch.testing.assert_close(
