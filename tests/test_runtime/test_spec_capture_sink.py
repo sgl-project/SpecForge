@@ -164,6 +164,38 @@ class SpecCaptureSinkTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires MOONCAKE_PROTOCOL=rdma"):
                 self.module.gpu_put_enabled()
 
+    def test_default_publication_requires_cuda_and_rdma(self):
+        for protocol in ("tcp", "rdma"):
+            for cuda_version in (None, "13.0"):
+                for available in (False, True):
+                    with self.subTest(
+                        protocol=protocol, cuda=cuda_version, available=available
+                    ):
+                        with (
+                            mock.patch.dict(
+                                "os.environ",
+                                {"MOONCAKE_PROTOCOL": protocol},
+                                clear=True,
+                            ),
+                            mock.patch.object(torch.version, "cuda", cuda_version),
+                            mock.patch.object(
+                                torch.cuda, "is_available", return_value=available
+                            ),
+                        ):
+                            self.assertEqual(
+                                self.module.gpu_put_enabled(),
+                                protocol == "rdma"
+                                and cuda_version is not None
+                                and available,
+                            )
+
+    def test_explicit_host_publication_overrides_the_rdma_default(self):
+        with (
+            mock.patch.object(torch.version, "cuda", "13.0"),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+        ):
+            self.assertFalse(self.module.gpu_put_enabled())
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_gpu_snapshot_survives_overwrite_and_stream_handoff(self):
         store = self.sink._store = _BufferStore(device=True)

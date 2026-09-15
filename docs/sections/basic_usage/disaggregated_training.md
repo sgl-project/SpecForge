@@ -35,6 +35,20 @@ The full model and strategy index is in the
 historical identifiers; the directory and typed YAML fields define the runtime
 semantics.
 
+Mooncake training uses **pinned receive pools by default**, with a lazily allocated
+8 GiB retained-pool budget per trainer rank. On CUDA with loader prefetch enabled,
+the loader copies received features to the GPU before yielding the batch. Returned
+tensors, prefetched batches, and overflow allocations consume additional memory.
+Set `deployment.disaggregated.receive_buffers: pageable` to use fresh CPU receives.
+
+Patched CUDA capture servers automatically publish device tensors when
+`MOONCAKE_PROTOCOL=rdma`. TCP and non-CUDA workers keep host publication.
+Set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` on an external server, or `gpu_put: false`
+on a managed-local capture-server entry, to disable GPU publication explicitly.
+GPU publication needs RDMA-registerable allocations; custom expandable CUDA
+allocations may require `PYTORCH_ALLOC_CONF=expandable_segments:False` on the
+capture server. The trainer's allocator is independent.
+
 ## One config owns the launch topology
 
 Process topology and attempt paths live in the same typed run document as the

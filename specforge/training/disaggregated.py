@@ -145,7 +145,10 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     ):
         if os.environ.get(env_name):
             setup_kwargs[key] = int(os.environ[env_name])
-    receive_kwargs: Dict[str, Any] = {}
+    deployment = cfg.deployment.disaggregated
+    receive_kwargs: Dict[str, Any] = {
+        "receive_buffers": deployment.receive_buffers if deployment else "pinned"
+    }
     if os.environ.get("DISAGG_RECEIVE_BUFFERS"):
         receive_kwargs["receive_buffers"] = os.environ["DISAGG_RECEIVE_BUFFERS"]
         if (
