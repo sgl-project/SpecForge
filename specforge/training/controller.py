@@ -178,11 +178,19 @@ def _reduce_ratio_metrics(
     device: torch.device,
     process_group: Any,
     reduce: bool,
+    sums: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Form telemetry ratios only after summing their numerators and counts."""
+    """Reduce ratios and additive telemetry in one collective.
 
-    if not values:
+    Ratios with no observations retain the existing zero convention; log their
+    counts through ``sums`` when consumers need to distinguish missing data.
+    """
+
+    sums = sums or {}
+    if not values and not sums:
         return {}
+    if values.keys() & sums.keys():
+        raise ValueError("ratio and sum metric names must be distinct")
     normalized = []
     for name in sorted(values):
         pair = values[name]
@@ -199,12 +207,17 @@ def _reduce_ratio_metrics(
             )
         normalized.append((name, numerator, denominator))
 
+    normalized_sums = [
+        (name, torch.as_tensor(sums[name]).detach().float().flatten().to(device))
+        for name in sorted(sums)
+    ]
     packed = torch.cat(
         [
             tensor
             for _, numerator, denominator in normalized
             for tensor in (numerator, denominator)
         ]
+        + [tensor for _, tensor in normalized_sums]
     )
     if reduce:
         import torch.distributed as dist
@@ -234,6 +247,14 @@ def _reduce_ratio_metrics(
             output[name] = ratios.reshape(())
         else:
             output.update({f"{name}_{index}": ratios[index] for index in range(width)})
+    for name, tensor in normalized_sums:
+        width = tensor.numel()
+        total = packed[cursor : cursor + width]
+        cursor += width
+        if width == 1:
+            output[name] = total.reshape(())
+        else:
+            output.update({f"{name}_{index}": total[index] for index in range(width)})
     return output
 
 
@@ -394,6 +415,7 @@ class TrainerCore:
         self.accumulation_steps = max(1, accumulation_steps)
         self._micro = 0
         self._ratio_totals: Dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._sum_totals: Dict[str, torch.Tensor] = {}
 
     @property
     def accumulation_remainder(self) -> int:
@@ -417,6 +439,10 @@ class TrainerCore:
                 denominator,
             )
         self._accumulate_ratio_metrics(ratio_metrics)
+        for name, value in out.sum_metrics.items():
+            self._sum_totals[name] = (
+                self._sum_totals.get(name, 0) + torch.as_tensor(value).detach()
+            )
         loss = loss / self.accumulation_steps
         self._micro += 1
         # The boundary is known before backward so the backend can defer the FSDP
@@ -432,9 +458,11 @@ class TrainerCore:
             grad_norm,
             stepped,
             ratio_metrics=result_ratio_metrics,
+            sum_metrics=self._sum_totals if stepped else out.sum_metrics,
         )
         if stepped:
             self._ratio_totals = {}
+            self._sum_totals = {}
         return result
 
     def _accumulate_ratio_metrics(self, values: Dict[str, Any]) -> None:
@@ -477,6 +505,7 @@ class TrainerCore:
         stepped: bool,
         *,
         ratio_metrics: Optional[Dict[str, Any]] = None,
+        sum_metrics: Optional[Dict[str, Any]] = None,
     ) -> StepResult:
         # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
         # positions and reduce counts before ratios; scalarizing its lists here
@@ -515,6 +544,7 @@ class TrainerCore:
                 device=metric_device,
                 process_group=process_group,
                 reduce=stepped,
+                sums=out.sum_metrics if sum_metrics is None else sum_metrics,
             )
         )
         scalar_metrics: Dict[str, Any] = {}
