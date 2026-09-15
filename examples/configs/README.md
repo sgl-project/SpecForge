@@ -406,6 +406,7 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.mooncake.default_kv_lease_ttl_ms` | `500` | Master key-lease TTL (ms) forwarded to `mooncake_master --default_kv_lease_ttl`. Kept below the consumer's teardown drain window so managed_local shuts down cleanly; set `null` to inherit Mooncake's stock default. |
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
+| `deployment.disaggregated.managed_local.capture_servers[].gpu_put` | `false` | Publish captured tensors from device memory (`SGLANG_SPEC_CAPTURE_GPU_PUT=1`); requires `mooncake.protocol: rdma`. |
 | `deployment.disaggregated.managed_local.capture_servers[].tp_size` | `1` | Target-model tensor parallelism for this server. |
 | `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `null` | Optional SGLang static-memory override in `(0, 1]`; otherwise inherit `model.sglang_mem_fraction_static`. |
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
@@ -417,6 +418,12 @@ each probe within that window. Increasing only the startup timeout cannot fix
 an HTTP probe timeout that is shorter than the server's healthy response time.
 The default probe budget supports SGLang's generation-based health check without
 disabling health-endpoint generation.
+
+GPU publication retains a device snapshot until the asynchronous store write completes.
+Use RDMA-registerable CUDA allocations; with PyTorch, set
+`PYTORCH_ALLOC_CONF=expandable_segments:False` for capture servers if VMM allocations
+cannot be registered by the installed Mooncake/driver combination. Registration
+failures are reported before publishing refs.
 
 Managed-local is only for a fresh, single-node, online Mooncake run. It derives
 server URLs and Mooncake endpoints, so do not combine it with explicit external
