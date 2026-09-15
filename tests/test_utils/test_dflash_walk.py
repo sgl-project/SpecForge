@@ -20,7 +20,6 @@ from specforge.training.strategies.base import (
     StepContext,
 )
 
-
 MODEL_KINDS = (
     "dflash",
     "dflash2",
