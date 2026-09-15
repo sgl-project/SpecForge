@@ -180,9 +180,9 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
     """Build the method-specific composite model and frozen target pieces."""
     import torch
 
+    from specforge.modeling.target.target_utils import load_target_config
     from specforge.modeling.target.target_utils import (
-        load_target_config,
-        target_text_config,
+        target_hidden_size as resolve_target_hidden_size,
     )
     from specforge.modeling.target.target_utils import (
         target_vocab_size as resolve_target_vocab_size,
@@ -197,8 +197,7 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
-    text_config = target_text_config(target_config)
-    target_hidden_size = int(text_config.hidden_size)
+    target_hidden_size = resolve_target_hidden_size(target_config)
     target_vocab_size = resolve_target_vocab_size(target_config)
     draft_vocab_size = int(
         getattr(draft_config, "draft_vocab_size", draft_config.vocab_size)

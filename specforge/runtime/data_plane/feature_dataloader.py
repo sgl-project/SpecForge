@@ -21,6 +21,7 @@ import queue as queue_module
 import threading
 import time
 from collections import OrderedDict
+from concurrent import futures
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -40,6 +41,23 @@ _PREFETCH_JOIN_TIMEOUT_S = float(
 
 
 @dataclass
+class _PreparedBatch:
+    batch: TrainBatch
+    ready: Dict[torch.device, torch.cuda.Event]
+
+    def consume(self) -> TrainBatch:
+        # Futures synchronize Python threads, not CUDA work. Hand off both
+        # execution ordering and allocator lifetime to the consumer's streams.
+        for device, event in self.ready.items():
+            stream = torch.cuda.current_stream(device)
+            stream.wait_event(event)
+            for tensor in self.batch.tensors.values():
+                if tensor.device == device:
+                    tensor.record_stream(stream)
+        return self.batch
+
+
+@dataclass
 class _OutstandingRef:
     ref: SampleRef
     materialized: bool = False
@@ -54,20 +72,50 @@ class _QueuePrefetchState:
         self.thread: Optional[threading.Thread] = None
         self.outstanding: "OrderedDict[str, _OutstandingRef]" = OrderedDict()
         self.outstanding_lock = threading.Lock()
+        self.fetches: Dict[Any, List[SampleRef]] = {}
+        self.fetches_lock = threading.Lock()
         self.shutdown_lock = threading.Lock()
         self.shutdown_complete = False
+
+    def track_fetch(self, future: Any, refs: List[SampleRef]) -> None:
+        with self.fetches_lock:
+            self.fetches[future] = list(refs)
+
+    def claim_for_yield(self, future: Any) -> Optional[List[SampleRef]]:
+        """Transfer a completed fetch and its refs to the consumer."""
+        with self.fetches_lock:
+            refs = self.fetches.pop(future, None)
+            if refs is None:
+                return None
+            with self.outstanding_lock:
+                for ref in refs:
+                    self.outstanding.pop(ref.sample_id, None)
+            return refs
+
+    def settle_unyielded_fetch(
+        self, future: Any, *, materialized: bool
+    ) -> Optional[List[SampleRef]]:
+        """Stop tracking a fetch while leaving its refs for close settlement."""
+        with self.fetches_lock:
+            refs = self.fetches.pop(future, None)
+            if refs is None:
+                return None
+            if materialized:
+                with self.outstanding_lock:
+                    for ref in refs:
+                        entry = self.outstanding.get(ref.sample_id)
+                        if entry is not None:
+                            entry.materialized = True
+            return refs
+
+    def live_fetches(self) -> Dict[Any, List[SampleRef]]:
+        with self.fetches_lock:
+            return dict(self.fetches)
 
     def track(self, refs: List[SampleRef]) -> None:
         with self.outstanding_lock:
             for ref in refs:
                 self.outstanding[ref.sample_id] = _OutstandingRef(ref)
-
-    def mark_materialized(self, refs: List[SampleRef]) -> None:
-        with self.outstanding_lock:
-            for ref in refs:
-                entry = self.outstanding.get(ref.sample_id)
-                if entry is not None:
-                    entry.materialized = True
 
     def mark_yielded_or_failed(self, refs: List[SampleRef]) -> None:
         with self.outstanding_lock:
@@ -141,6 +189,50 @@ class FeatureDataLoader:
         self._lifecycle_lock = threading.Lock()
         self._prefetch_state: Optional[_QueuePrefetchState] = None
         self._queue_closed = False
+        self._perf_lock = threading.Lock()
+        self._perf = {
+            "wait_producer_s": 0.0,
+            "wait_fetch_s": 0.0,
+            "fetch_s": 0.0,
+            "fetch_bytes": 0.0,
+            "fetch_batches": 0.0,
+            "fetch_samples": 0.0,
+        }
+
+    def _perf_add(self, **deltas: float) -> None:
+        with self._perf_lock:
+            for name, delta in deltas.items():
+                self._perf[name] += delta
+
+    def perf_counters_snapshot(self, reset: bool = False) -> Dict[str, float]:
+        """Return loader counters accumulated since the last reset."""
+        with self._perf_lock:
+            snapshot = dict(self._perf)
+            if reset:
+                for name in self._perf:
+                    self._perf[name] = 0.0
+        return snapshot
+
+    def _timed_make_batch(self, refs: List[SampleRef]) -> TrainBatch:
+        started = time.perf_counter()
+        batch = self._make_batch(refs)
+        self._perf_add(
+            fetch_s=time.perf_counter() - started,
+            fetch_bytes=float(sum(int(ref.estimated_bytes or 0) for ref in refs)),
+            fetch_batches=1.0,
+            fetch_samples=float(len(refs)),
+        )
+        return batch
+
+    def _prepare_batch(self, refs: List[SampleRef]) -> _PreparedBatch:
+        batch = self._timed_make_batch(refs)
+        ready = {}
+        for tensor in batch.tensors.values():
+            if tensor.is_cuda and tensor.device not in ready:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(tensor.device))
+                ready[tensor.device] = event
+        return _PreparedBatch(batch, ready)
 
     def _maybe_gc(self) -> None:
         if self.gc_interval_s is None:
@@ -296,14 +388,14 @@ class FeatureDataLoader:
                     chunk = next(chunk_iter)
                 except StopIteration:
                     break
-                pending.append(executor.submit(self._make_batch, chunk))
+                pending.append(executor.submit(self._prepare_batch, chunk))
             while pending:
-                yield pending.popleft().result()
+                yield pending.popleft().result().consume()
                 try:
                     chunk = next(chunk_iter)
                 except StopIteration:
                     continue
-                pending.append(executor.submit(self._make_batch, chunk))
+                pending.append(executor.submit(self._prepare_batch, chunk))
 
     def seek(self, num_batches: int) -> None:
         """Skip the first ``num_batches`` of the NEXT iteration (refs mode; one-shot).
@@ -333,23 +425,23 @@ class FeatureDataLoader:
         with self._lifecycle_lock:
             if self._queue_closed:
                 return
-        # LOADER_PREFETCH=N (>0) materializes up to N batches ahead on a
-        # background thread so the training step never pays fetch latency
-        # inline. Ack still happens on the consuming thread AFTER the trainer
-        # has taken the batch (same in-flight semantics as the sync path).
         depth = self.num_workers or int(os.environ.get("LOADER_PREFETCH", "0"))
         if depth > 0:
             yield from self._iter_queue_prefetch(depth)
             return
         while True:
+            wait_started = time.perf_counter()
             refs = self.queue.get(self.batch_size, timeout_s=0.0)
+            self._perf_add(wait_producer_s=time.perf_counter() - wait_started)
             if not refs:
                 return
             if self.drop_last and len(refs) < self.batch_size:
                 self._settle_incomplete_queue_batch(refs)
                 return
             try:
-                batch = self._make_batch(refs)
+                fetch_started = time.perf_counter()
+                batch = self._timed_make_batch(refs)
+                self._perf_add(wait_fetch_s=time.perf_counter() - fetch_started)
             except Exception as exc:
                 self.queue.fail(refs, reason=f"materialize:{exc}", retryable=False)
                 raise
@@ -379,6 +471,14 @@ class FeatureDataLoader:
                 )
             return self.queue.get(self.batch_size, timeout_s=_PREFETCH_POLL_S)
 
+        # The buffer carries FUTURES, so up to `depth` batches materialize
+        # concurrently while the worker goes back to leasing; the consuming
+        # thread resolves them in submission order. Lease/ack semantics are
+        # unchanged.
+        pool = futures.ThreadPoolExecutor(
+            max_workers=depth, thread_name_prefix="loader-fetch"
+        )
+
         def _worker() -> None:
             try:
                 while not state.stop.is_set():
@@ -397,20 +497,19 @@ class FeatureDataLoader:
                             state.mark_yielded_or_failed(refs)
                         put_interruptibly(eos)
                         return
-                    try:
-                        batch = self._make_batch(refs)
-                    except Exception as exc:
-                        self.queue.fail(
-                            refs, reason=f"materialize:{exc}", retryable=False
-                        )
-                        state.mark_yielded_or_failed(refs)
-                        put_interruptibly(exc)
-                        return
-                    state.mark_materialized(refs)
-                    if not put_interruptibly((batch, refs)):
+                    future = pool.submit(self._prepare_batch, refs)
+                    state.track_fetch(future, refs)
+                    if not put_interruptibly((future, refs)):
                         return
             except BaseException as exc:  # loud failure, never a silent hang
                 put_interruptibly(exc)
+            finally:
+                # EOF stops submissions, not consumption: futures queued before
+                # eos must still complete and be yielded in order. Do not block
+                # this worker on fetches either. Early-stop cancellation and
+                # bounded waiting belong to _shutdown_prefetch, even if this
+                # worker has already exited after enqueueing eos.
+                pool.shutdown(wait=False, cancel_futures=False)
 
         worker = threading.Thread(
             target=_worker,
@@ -430,20 +529,48 @@ class FeatureDataLoader:
 
         try:
             while not state.stop.is_set():
+                # An empty buffer means the worker is still leasing refs:
+                # producer-bound wait. Time spent resolving an already
+                # submitted future is transfer-bound wait.
+                wait_started = time.perf_counter()
                 try:
                     item = state.buffer.get(timeout=_PREFETCH_POLL_S)
                 except queue_module.Empty:
+                    self._perf_add(wait_producer_s=time.perf_counter() - wait_started)
                     continue
                 if item is eos:
                     return
                 if isinstance(item, BaseException):
                     raise item
-                batch, refs = item
+                future, refs = item
+                fetch_started = time.perf_counter()
+                while not state.stop.is_set():
+                    try:
+                        batch = future.result(timeout=_PREFETCH_POLL_S).consume()
+                        break
+                    except futures.TimeoutError:
+                        continue
+                    except Exception as exc:
+                        failed_refs = state.settle_unyielded_fetch(
+                            future, materialized=True
+                        )
+                        if failed_refs is not None:
+                            self.queue.fail(
+                                failed_refs,
+                                reason=f"materialize:{exc}",
+                                retryable=False,
+                            )
+                            state.mark_yielded_or_failed(failed_refs)
+                        raise
+                else:
+                    return
+                self._perf_add(wait_fetch_s=time.perf_counter() - fetch_started)
                 # From this point the trainer owns the refs. In deferred-ack
                 # mode its optimizer-boundary transaction decides their
                 # outcome; loader shutdown must touch only batches that were
                 # materialized ahead but never yielded.
-                state.mark_yielded_or_failed(refs)
+                if state.claim_for_yield(future) is None:
+                    return
                 yield batch
                 if self.ack:
                     self.queue.ack(refs)
@@ -466,6 +593,46 @@ class FeatureDataLoader:
                         f"{_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend get/materialize "
                         f"is still blocked, outstanding_refs={outstanding_ids}"
                     )
+            live = state.live_fetches()
+            # The submitter has stopped, so this snapshot includes every fetch
+            # still owned by the loader. Normal EOF has already consumed them;
+            # early close/error cancels only jobs that have not started.
+            for future in live:
+                future.cancel()
+            # A cancelled Future need not have been dequeued by its executor
+            # yet. Exclude done futures rather than waiting for the executor's
+            # cancellation notification; only running transfers need draining.
+            pending = [future for future in live if not future.done()]
+            if (
+                pending
+                and futures.wait(pending, timeout=_PREFETCH_JOIN_TIMEOUT_S).not_done
+            ):
+                outstanding_ids = state.outstanding_ids()
+                raise RuntimeError(
+                    "FeatureDataLoader prefetch fetch did not stop within "
+                    f"{_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend get/materialize "
+                    f"is still blocked, outstanding_refs={outstanding_ids}"
+                )
+
+            # A completed future has already called _make_batch. Record that
+            # before classifying its unyielded refs; otherwise close could
+            # requeue data already released by a consume-once store. Failed
+            # materializations retain the old terminal-failure behavior.
+            for future in live:
+                if future.cancelled():
+                    state.settle_unyielded_fetch(future, materialized=False)
+                    continue
+                exc = future.exception()
+                fetched_refs = state.settle_unyielded_fetch(
+                    future, materialized=exc is None
+                )
+                if exc is not None and fetched_refs is not None:
+                    self.queue.fail(
+                        fetched_refs,
+                        reason=f"materialize:{exc}",
+                        retryable=False,
+                    )
+                    state.mark_yielded_or_failed(fetched_refs)
 
             outstanding = state.outstanding_entries()
             retryable: List[SampleRef] = []

@@ -1,7 +1,7 @@
 # Qwen3.5-4B DFlash draft, offline (features captured to disk) — AMD ROCm.
 # Trainer runs on ROCm unchanged (flex_attention). Capture the hidden states with
 # scripts/prepare_hidden_states.py using the AITER + --sglang-disable-radix-cache
-# flags (see docs/basic_usage/AMD/amd_rocm.md, Section 3).
+# flags (see docs/sections/basic_usage/AMD/amd_rocm.md, Section 3).
 model:
   target_model_path: "Qwen/Qwen3.5-4B"
   draft_model_config: "configs/qwen3.5-4b-dflash.json"

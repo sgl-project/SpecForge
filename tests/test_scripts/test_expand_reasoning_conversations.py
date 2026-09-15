@@ -26,7 +26,7 @@ def _load_preprocessing_stack():
 
     data_package_name = f"{package_name}.data"
     data_package = types.ModuleType(data_package_name)
-    data_package.__path__ = []
+    data_package.__path__ = [str(repo_root / "specforge" / "data")]
     sys.modules[data_package_name] = data_package
 
     distributed_module = types.ModuleType(f"{package_name}.distributed")

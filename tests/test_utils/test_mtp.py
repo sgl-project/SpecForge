@@ -12,6 +12,7 @@ Covers the pieces that do not need a GPU or a real target checkpoint:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -103,17 +104,107 @@ class OnlineMTPModelTest(unittest.TestCase):
         self.assertIsNotNone(draft.mtp.fc.weight.grad)
         self.assertTrue(torch.isfinite(draft.mtp.fc.weight.grad).all())
 
+    def test_chunked_objective_matches_unchunked(self):
+        self._assert_objective_parity(torch.device("cpu"), torch.float32)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_chunked_objective_cuda_matches_legacy(self):
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._assert_objective_parity(torch.device("cuda"), dtype)
+
+    def _assert_objective_parity(self, device, dtype):
+        config = _tiny_config()
+        torch.manual_seed(0)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+        # ragged supervision so chunk boundaries cross masked/unmasked rows
+        loss_mask[0, 5:9] = 0.0
+        input_ids, loss_mask = input_ids.to(device), loss_mask.to(device)
+        hidden_states = hidden_states.to(device=device, dtype=dtype)
+        for frozen_head in (False, True):
+            draft = Qwen3_5MTPDraftModel(config).to(device=device, dtype=dtype)
+            draft.mtp.lm_head.requires_grad_(not frozen_head)
+            draft.embed_tokens.requires_grad_(not frozen_head)
+            results = {}
+            for chunk_size in ("legacy", 0, 4, 4096):
+                current = copy.deepcopy(draft)
+                inputs = hidden_states.detach().clone().requires_grad_()
+                if chunk_size == "legacy":
+                    # Independent pre-chunking objective, including the full
+                    # logits projection and contiguous shifted-logits copy.
+                    shifted_ids = torch.nn.functional.pad(input_ids[:, 1:], (0, 1))
+                    positions = (
+                        torch.arange(1, input_ids.shape[1] + 1, device=device)
+                        .unsqueeze(0)
+                        .expand_as(input_ids)
+                    )
+                    logits = (
+                        current(
+                            input_ids=shifted_ids,
+                            hidden_states=inputs,
+                            position_ids=positions,
+                        )
+                        .logits[:, :-1]
+                        .contiguous()
+                    )
+                    labels = torch.nn.functional.pad(
+                        input_ids[:, 2:], (0, 1), value=-100
+                    )
+                    mask = torch.nn.functional.pad(loss_mask[:, 2:], (0, 1))
+                    losses = torch.nn.functional.cross_entropy(
+                        logits.view(-1, config.vocab_size),
+                        labels.reshape(-1),
+                        reduction="none",
+                    )
+                    loss = (losses * mask.reshape(-1)).sum() / mask.sum().clamp_min(1)
+                    corrects = [(logits.argmax(-1) == labels).float() * mask]
+                    denoms = [mask]
+                else:
+                    model = OnlineMTPModel(current, objective_chunk_size=chunk_size)
+                    loss, corrects, denoms = model(
+                        input_ids=input_ids, hidden_states=inputs, loss_mask=loss_mask
+                    )
+                loss.backward()
+                gradients = {
+                    name: parameter.grad.detach().clone()
+                    for name, parameter in current.named_parameters()
+                    if parameter.requires_grad
+                }
+                gradients["input_hidden_states"] = inputs.grad.detach().clone()
+                results[chunk_size] = (loss.detach(), corrects[0], denoms[0], gradients)
+
+            reference = results["legacy"]
+            tolerances = (
+                dict(rtol=2e-2, atol=2e-3)
+                if dtype == torch.bfloat16
+                else dict(rtol=1e-5, atol=1e-6)
+            )
+            for chunk_size in (0, 4, 4096):
+                with self.subTest(frozen_head=frozen_head, chunk_size=chunk_size):
+                    actual = results[chunk_size]
+                    torch.testing.assert_close(actual[0], reference[0], **tolerances)
+                    self.assertTrue(torch.equal(actual[1], reference[1]))
+                    self.assertTrue(torch.equal(actual[2], reference[2]))
+                    self.assertEqual(actual[3].keys(), reference[3].keys())
+                    for name in reference[3]:
+                        with self.subTest(parameter=name):
+                            torch.testing.assert_close(
+                                actual[3][name], reference[3][name], **tolerances
+                            )
+
+    def test_objective_chunk_size_rejects_negative(self):
+        with self.assertRaisesRegex(ValueError, "objective_chunk_size"):
+            OnlineMTPModel(
+                Qwen3_5MTPDraftModel(_tiny_config()), objective_chunk_size=-1
+            )
+
     def test_shift_for_next_token_matches_serving_alignment(self):
         model = OnlineMTPModel(Qwen3_5MTPDraftModel(_tiny_config()))
-        logits = torch.zeros(1, 5, 7)
         input_ids = torch.tensor([[10, 11, 12, 13, 14]])
         loss_mask = torch.ones(1, 5)
 
-        shift_logits, shift_labels, shift_mask = model._shift_for_next_token(
-            logits, input_ids, loss_mask
-        )
+        shift_labels, shift_mask = model._shift_for_next_token(input_ids, loss_mask)
 
-        self.assertEqual((1, 4, 7), shift_logits.shape)
         # labels are x_2..x_T padded with one ignore index
         self.assertEqual([12, 13, 14, -100], shift_labels[0].tolist())
         # the padded position is masked out
@@ -125,8 +216,9 @@ class OnlineMTPModelTest(unittest.TestCase):
                 super().__init__()
                 self.config = SimpleNamespace(pad_token_id=0)
                 self.position_ids = None
+                self.mtp = SimpleNamespace(lm_head=torch.nn.Linear(8, 32, bias=False))
 
-            def forward(
+            def forward_hidden(
                 self,
                 input_ids,
                 hidden_states,
@@ -134,10 +226,12 @@ class OnlineMTPModelTest(unittest.TestCase):
                 position_ids=None,
             ):
                 self.position_ids = position_ids.detach().clone()
-                logits = torch.zeros(
-                    input_ids.shape[0], input_ids.shape[1], 32, requires_grad=True
+                return torch.zeros(
+                    input_ids.shape[0],
+                    input_ids.shape[1],
+                    8,
+                    requires_grad=True,
                 )
-                return SimpleNamespace(logits=logits)
 
         draft = _RecordingDraft()
         model = OnlineMTPModel(draft)

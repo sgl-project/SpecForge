@@ -41,6 +41,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Sequence
@@ -244,25 +245,32 @@ class StreamingRefChannel:
         if quantum < 1:
             raise ValueError(f"consumer quantum must be >= 1, got {quantum}")
         path = self.path + _CONSUMER_QUANTUM_SUFFIX
+        tmp = f"{path}.tmp.{uuid.uuid4().hex}"
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError as exc:
-            if allow_existing:
-                existing = self.consumer_quantum()
-                if existing == quantum:
-                    return
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(str(quantum))
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Publish only the complete value. A hard link claims the final
+            # name atomically without replacing another consumer's contract.
+            try:
+                os.link(tmp, path)
+            except FileExistsError as exc:
+                if allow_existing:
+                    existing = self.consumer_quantum()
+                    if existing == quantum:
+                        return
+                    raise ValueError(
+                        f"consumer quantum changed across resume for {self.path!r}: "
+                        f"existing={existing}, requested={quantum}"
+                    ) from exc
                 raise ValueError(
-                    f"consumer quantum changed across resume for {self.path!r}: "
-                    f"existing={existing}, requested={quantum}"
+                    f"consumer quantum already exists for {self.path!r}; every online "
+                    "attempt requires a fresh reference channel"
                 ) from exc
-            raise ValueError(
-                f"consumer quantum already exists for {self.path!r}; every online "
-                "attempt requires a fresh reference channel"
-            ) from exc
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(str(quantum))
-            stream.flush()
-            os.fsync(stream.fileno())
+        finally:
+            os.unlink(tmp)
 
     def consumer_quantum(self) -> Optional[int]:
         """Return the consumer's global optimizer-step ref quantum, if ready."""

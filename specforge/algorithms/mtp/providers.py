@@ -204,7 +204,10 @@ def build_training_model(config, draft_model, draft_config, target_config, token
     from specforge.core.mtp import OnlineMTPModel
 
     return AlgorithmModelParts(
-        model=OnlineMTPModel(draft_model=draft_model),
+        model=OnlineMTPModel(
+            draft_model=draft_model,
+            objective_chunk_size=config.training.mtp_objective_chunk_size,
+        ),
         capture_layers=None,
     )
 

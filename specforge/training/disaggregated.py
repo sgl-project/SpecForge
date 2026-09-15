@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
@@ -145,12 +145,29 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     ):
         if os.environ.get(env_name):
             setup_kwargs[key] = int(os.environ[env_name])
+    receive_kwargs: Dict[str, Any] = {}
+    if os.environ.get("DISAGG_RECEIVE_BUFFERS"):
+        receive_kwargs["receive_buffers"] = os.environ["DISAGG_RECEIVE_BUFFERS"]
+        if (
+            receive_kwargs["receive_buffers"] == "cuda"
+            and setup_kwargs["protocol"] != "rdma"
+        ):
+            raise ValueError(
+                "DISAGG_RECEIVE_BUFFERS=cuda needs MOONCAKE_PROTOCOL=rdma; the "
+                f"{setup_kwargs['protocol']!r} transport cannot write into device memory"
+            )
+    if os.environ.get("DISAGG_RECEIVE_POOL_BYTES"):
+        receive_kwargs["receive_pool_bytes"] = int(
+            os.environ["DISAGG_RECEIVE_POOL_BYTES"]
+        )
     return MooncakeFeatureStore(
         store_id=os.environ.get("DISAGG_STORE_ID", cfg.run_id),
         setup_kwargs=setup_kwargs,
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
+        max_quarantined_bytes=cfg.runtime.feature_store_max_quarantined_bytes,
+        **receive_kwargs,
     )
 
 
@@ -497,10 +514,11 @@ def _build_offline(
     accumulation_steps = cfg.training.accumulation_steps
     if cfg.training.attention_backend == "usp":
         accumulation_steps *= cfg.training.sp_ulysses_size * cfg.training.sp_ring_size
+    store = _offline_store(cfg, retain_on_release=True)
     trainer = build_disagg_offline_runtime(
         algorithm=algorithm,
         modality=cfg.model.input_modality,
-        feature_store=_offline_store(cfg, retain_on_release=True),
+        feature_store=store,
         refs=read_ref_manifest(manifest),
         draft_model=bundle.model,
         target_head=bundle.target_head,
@@ -542,6 +560,7 @@ def _build_offline(
         trainer=trainer,
         on_success=mark_consumed,
         on_failure=mark_consumer_failed,
+        on_finally=getattr(store, "close", None),
     )
 
 
@@ -804,7 +823,7 @@ def _build_online(
         profiling_options=_profiling_options(cfg),
     )
 
-    return TrainingRun(trainer=trainer)
+    return TrainingRun(trainer=trainer, on_finally=store.close)
 
 
 def build_disaggregated_run(

@@ -1,0 +1,125 @@
+# Qwen3.8-27B DFlash2 on one 8-GPU node: four TP=1 capture servers on GPUs 0-3
+# and a DP=4 DFlash2 trainer on GPUs 4-7, all owned by `specforge train`.
+#
+# The split, flow control and Mooncake settings are the ones measured in
+# docs/recipes/qwen3.8-27b-dflash2-disaggregated.md on 8x B300 and 8x H200.
+# The balanced split depends on how fast one GPU captures relative to how fast
+# it trains the draft: on H200 (FP8 target) 5 servers + DP3 was faster than
+# this 4+4 layout (10.65 vs 9.05 samples/s); on B300 4+4 was the best split
+# with the current host receive path (11.5).  Move servers between the two
+# lists below and keep `deployment.trainer.nproc_per_node` equal to the
+# trainer device count.
+model:
+  target_model_path: Qwen/Qwen3.8-27B
+  draft_model_config: configs/qwen3.8-27b-dflash2.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 248070
+  # Capture-server settings exercised by the recipe; flashinfer was not run
+  # for this target.
+  sglang_attention_backend: triton
+  sglang_disable_radix_cache: true
+  # data.max_length + 7 tokens of request headroom for the capture endpoint.
+  sglang_context_length: 8199
+
+data:
+  # Conversations answered by the target itself (on-policy regeneration); see
+  # the recipe document for how the validated corpus was produced.
+  train_data_path: ./cache/dataset/qwen3.8-27b-regen-train.jsonl
+  max_length: 8192
+  chat_template: qwen3.5
+  build_dataset_num_proc: 32
+  # Prefetch depth of the online feature loader.  The in-flight watermarks
+  # below are sized for this value.
+  dataloader_num_workers: 8
+  cache_dir: cache/qwen3.8-27b-dflash2
+
+training:
+  # DFlash2 shares the DFlash capture and data contract; the draft JSON turns
+  # on the local convolutions and the candidate-selector objective.
+  strategy: dflash
+  num_epochs: 1
+  tp_size: 1
+  # 4 ranks x 2 x 4 = 32 samples per optimizer step is the measured
+  # configuration.  When raising accumulation_steps, raise the in-flight
+  # watermarks by the same factor.
+  batch_size: 2
+  accumulation_steps: 4
+  fsdp_sharding: SHARD_GRAD_OP
+  learning_rate: 0.0005
+  lr_scheduler: constant
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  loss_type: dflash
+  dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_stop_gradient: false
+  save_interval: 500
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 42
+
+tracking:
+  report_to: none
+
+runtime:
+  # Each capture server keeps four 4-prompt requests in flight (16 prompts).
+  producer_lease: 4
+  producer_concurrency: 4
+  # Refs stay committed-but-unacknowledged from capture until the optimizer
+  # boundary that consumed them.  With 8 prefetch workers on each of 4 ranks
+  # the leased refs alone reach 64, so 3x the step quantum (96/48) throttles
+  # the producer; 6x (192/96) does not, and 12x adds only backlog latency.
+  in_flight_high_watermark: 192
+  in_flight_low_watermark: 96
+
+run_id: qwen3.8-27b-dflash2-4server-dp4-disaggregated
+output_dir: outputs/qwen3.8-27b-dflash2-4server-dp4-disaggregated
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/qwen3.8-27b-dflash2-4server-dp4-disaggregated/control
+    consumer_state_dir: outputs/qwen3.8-27b-dflash2-4server-dp4-disaggregated/consumer-state
+    backend: mooncake
+    # Pinned staging buffer of each SpecForge role's Mooncake client.  Neutral
+    # for the current host receive path; the measured runs used 2 GiB.
+    client_buffer_size: 2147483648
+    managed_local:
+      trainer_cuda_visible_devices: ["4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        # One 8192-token sample is ~500 MB of BF16 hidden states.  The 500 ms
+        # schema default expires while several ranks fetch such samples
+        # (Mooncake -707 LEASE_EXPIRED, retried with backoff); 10 s covers it.
+        default_kv_lease_ttl_ms: 10000
+        # Store capacity is contributed per capture server: 4 x 64 GiB here,
+        # against at most 192 in-flight samples x ~500 MB.
+        global_segment_size_bytes: 68719476736
+        local_buffer_size_bytes: 4294967296
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30001
+          cuda_visible_devices: ["1"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30002
+          cuda_visible_devices: ["2"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30003
+          cuda_visible_devices: ["3"]
+          tp_size: 1
+          mem_fraction_static: 0.85

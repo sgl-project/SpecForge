@@ -139,6 +139,21 @@ class BF16Optimizer:
 
     def step(self):
         grad_norm, clip_coefficient = self._grad_norm_and_clip_coefficient()
+        if not bool(torch.isfinite(grad_norm)):
+            # The norm is already all-reduced, so every rank fails before Adam,
+            # scheduler, global-step, or durable-ack state can advance. Returning
+            # here would make the controller record an optimizer update that did
+            # not happen and permanently discard its training window.
+            with torch.no_grad():
+                for p in self.model_params:
+                    p.grad = None
+                for mp in self.fp32_params:
+                    mp.grad = None
+            self.last_grad_norm = grad_norm.detach()
+            raise FloatingPointError(
+                "refusing optimizer step with non-finite global grad norm "
+                f"(max_grad_norm={self.max_grad_norm})"
+            )
         cpu_clip_coefficient = (
             float(clip_coefficient.item()) if self.offload_master else None
         )
