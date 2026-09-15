@@ -1,9 +1,9 @@
 """Sampled-anchor walks reuse causal predictions without changing training."""
 
+import unittest
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 from torch import nn
 
@@ -21,21 +21,20 @@ from specforge.training.strategies.base import (
 )
 
 
-@pytest.fixture(
-    params=[
-        "dflash",
-        "dflash2",
-        "domino",
-        "domino_shifted",
-        "dspark",
-        "dspark_vanilla",
-        "dspark_gated",
-        "dspark_rnn",
-    ]
+MODEL_KINDS = (
+    "dflash",
+    "dflash2",
+    "domino",
+    "domino_shifted",
+    "dspark",
+    "dspark_vanilla",
+    "dspark_gated",
+    "dspark_rnn",
 )
-def case(request):
+
+
+def _make_case(kind):
     torch.manual_seed(835)
-    kind = request.param
     family = kind.split("_")[0]
     draft_class, wrapper, strategy_class = {
         "dflash": (
@@ -141,7 +140,7 @@ def case(request):
     )
 
 
-def test_walk_values_chunking_gradients_and_gating(case):
+def _check_walk_values_chunking_gradients_and_gating(case):
     reference = None
     metric_reference = None
     for detailed, chunk in [(True, size) for size in (0, 1, 2, 4, 5)] + [(False, 2)]:
@@ -206,40 +205,8 @@ def test_walk_values_chunking_gradients_and_gating(case):
                 assert output.sum_metrics == {}
 
 
-@pytest.mark.parametrize(
-    "positions,counts,valid,expected",
-    [
-        ([0, 1, 2, 3, 4, 5], [2, 0, 5, 1, 0, 3], [1] * 6, (9, 3)),
-        ([0, 1, 2, 10], [3, 0, 0, 0], [1] * 4, (5, 2)),
-        ([1, 3, 8, 0], [0, 4, 0, 8], [1, 0, 1, 0], (2, 2)),
-        ([0, 0], [9, 9], [0, 0], (0, 0)),
-    ],
-)
-def test_sparse_padded_and_empty_walks(positions, counts, valid, expected):
-    result = family_model.compute_walk_accepted_length_terms(
-        torch.tensor([counts], dtype=torch.float32),
-        torch.tensor([positions]),
-        torch.tensor([valid], dtype=torch.bool),
-    )
-    assert tuple(value.item() for value in result) == expected
-
-
-def test_prefix_stops_at_masked_holes_and_scatters_global_indices():
-    targets = torch.tensor([[[1, 2, 3], [4, 5, 6]], [[1, 2, 3], [4, 5, 6]]])
-    valid = torch.tensor(
-        [[[1, 0, 1], [0, 1, 1]], [[1, 1, 1], [0, 0, 0]]], dtype=torch.bool
-    )
-    result = family_model._scatter_accepted_prefix(
-        targets, targets, valid, torch.tensor([[1, 3]]), 5
-    )
-    assert result.tolist() == [[0, 1, 0, 0, 0], [0, 3, 0, 0, 0]]
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.no_grad()
-def test_causal_heads_match_serving_prefixes(case, dtype):
-    if case.family not in ("domino", "dspark"):
-        pytest.skip("DFlash2 already collects serving predictions")
+def _check_causal_heads_match_serving_prefixes(case, dtype):
     model, draft = case.model, case.model.draft_model
     model.to(dtype=dtype)
     hidden = torch.randn(2, 6, 4, 8, dtype=dtype)
@@ -299,3 +266,49 @@ def test_causal_heads_match_serving_prefixes(case, dtype):
             )
             accepted = terms[-1]
         torch.testing.assert_close(accepted, torch.full((2, 6), float(corrupt_at)))
+
+
+class DFlashWalkTest(unittest.TestCase):
+    def test_walk_values_chunking_gradients_and_gating(self):
+        for kind in MODEL_KINDS:
+            with self.subTest(model=kind):
+                _check_walk_values_chunking_gradients_and_gating(_make_case(kind))
+
+    def test_sparse_padded_and_empty_walks(self):
+        cases = (
+            ([0, 1, 2, 3, 4, 5], [2, 0, 5, 1, 0, 3], [1] * 6, (9, 3)),
+            ([0, 1, 2, 10], [3, 0, 0, 0], [1] * 4, (5, 2)),
+            ([1, 3, 8, 0], [0, 4, 0, 8], [1, 0, 1, 0], (2, 2)),
+            ([0, 0], [9, 9], [0, 0], (0, 0)),
+        )
+        for positions, counts, valid, expected in cases:
+            with self.subTest(positions=positions, counts=counts, valid=valid):
+                result = family_model.compute_walk_accepted_length_terms(
+                    torch.tensor([counts], dtype=torch.float32),
+                    torch.tensor([positions]),
+                    torch.tensor([valid], dtype=torch.bool),
+                )
+                self.assertEqual(tuple(value.item() for value in result), expected)
+
+    def test_prefix_stops_at_masked_holes_and_scatters_global_indices(self):
+        targets = torch.tensor([[[1, 2, 3], [4, 5, 6]], [[1, 2, 3], [4, 5, 6]]])
+        valid = torch.tensor(
+            [[[1, 0, 1], [0, 1, 1]], [[1, 1, 1], [0, 0, 0]]], dtype=torch.bool
+        )
+        result = family_model._scatter_accepted_prefix(
+            targets, targets, valid, torch.tensor([[1, 3]]), 5
+        )
+        self.assertEqual(result.tolist(), [[0, 1, 0, 0, 0], [0, 3, 0, 0, 0]])
+
+    def test_causal_heads_match_serving_prefixes(self):
+        for kind in MODEL_KINDS:
+            for dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(model=kind, dtype=dtype):
+                    case = _make_case(kind)
+                    if case.family not in ("domino", "dspark"):
+                        self.skipTest("Causal-head comparison applies to Domino/DSpark")
+                    _check_causal_heads_match_serving_prefixes(case, dtype)
+
+
+if __name__ == "__main__":
+    unittest.main()
