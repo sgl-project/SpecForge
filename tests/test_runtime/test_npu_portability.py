@@ -111,7 +111,9 @@ class NPUDistributedTest(unittest.TestCase):
         accelerator.set_device.assert_called_once_with(3)
         self.assertEqual(events[:2], [("bind", 3), ("init", "hccl")])
         self.assertEqual(init_mesh.call_args_list[0].args[:2], ("npu", (4, 2)))
-        self.assertEqual(init_mesh.call_args_list[1].args[:2], ("npu", (8, 1)))
+        # The draft mesh carries (draft_dp, ep, sp); expert parallelism is the
+        # middle dimension and is 1 here.
+        self.assertEqual(init_mesh.call_args_list[1].args[:2], ("npu", (8, 1, 1)))
         self.assertEqual(
             [call.kwargs["device_type"] for call in from_group.call_args_list],
             ["npu", "npu"],

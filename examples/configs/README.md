@@ -278,6 +278,7 @@ Common fields:
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
+| `training.expert_parallel_size` | `1` | Draft MoE expert parallelism: EP peers consume the same feature batch and each owns a disjoint slice of the routed experts. Requires a draft model that shards its experts; leave at 1 otherwise. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
 | `training.sp_ring_size` | `1` | Ring sequence-parallel factor for offline EAGLE3 USP. |
 | `training.dist_timeout` | `10` | Positive distributed-operation timeout in minutes. |
@@ -322,7 +323,8 @@ New recipes must not write the loader-only migration fields
 
 The trainer world size is `nnodes * nproc_per_node`. `training.tp_size` must
 remain 1, and the world size must be divisible by
-`training.sp_ulysses_size * training.sp_ring_size`.
+`training.expert_parallel_size * training.sp_ulysses_size * training.sp_ring_size`.
+The remaining ranks form the draft data-parallel group.
 
 For `deployment.mode: disaggregated`, also write:
 
