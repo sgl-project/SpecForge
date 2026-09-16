@@ -1611,7 +1611,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_output = getattr(config, "norm_output", True)
+        self.norm_output = getattr(config, "norm_output", False)
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
@@ -1668,21 +1668,16 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         # fc
         hidden_states = self.project_hidden_states(hidden_states)
-        hidden_states = self.midlayer(
-            input_emb=inputs_embeds,
+
+        return self.backbone(
+            input_embeds=inputs_embeds,
             hidden_states=hidden_states,
             cache_hidden=cache_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
-            output_attentions=False,
             use_cache=False,
         )
-
-        # norm
-        hidden_states = self.norm(hidden_states)
-
-        return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1698,11 +1693,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.norm_output:
-            norm_hidden_states = self.norm(hidden_states)
-        else:
-            norm_hidden_states = hidden_states
-        return self.lm_head(norm_hidden_states)
+        return self.lm_head(
+            hidden_states if self.norm_output else self.norm(hidden_states)
+        )
 
     def backbone(
         self,
@@ -1714,7 +1707,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        return self.midlayer(
+        hidden_states = self.midlayer(
             input_emb=input_embeds,
             hidden_states=hidden_states,
             cache_hidden=cache_hidden,
@@ -1724,3 +1717,4 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             output_attentions=False,
             use_cache=False,
         )
+        return self.norm(hidden_states) if self.norm_output else hidden_states
