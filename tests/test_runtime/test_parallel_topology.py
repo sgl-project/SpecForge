@@ -15,12 +15,11 @@ from specforge.launch import (
 
 class ParallelTopologyTest(unittest.TestCase):
     def test_offline_ref_sharding_pads_every_replica_to_equal_steps(self):
-        dp_group = object()
         draft_dp_group = object()
         refs = list(range(5))
 
         def world_size(group):
-            self.assertIn(group, (dp_group, draft_dp_group))
+            self.assertIs(group, draft_dp_group)
             return 2
 
         with (
@@ -28,7 +27,6 @@ class ParallelTopologyTest(unittest.TestCase):
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.get_world_size", side_effect=world_size),
             mock.patch("torch.distributed.get_rank", return_value=1),
-            mock.patch("specforge.distributed.get_dp_group", return_value=dp_group),
             mock.patch(
                 "specforge.distributed.get_draft_dp_group",
                 return_value=draft_dp_group,
@@ -70,8 +68,8 @@ class ParallelTopologyTest(unittest.TestCase):
                     dp_size=2,
                 )
                 self.assertEqual(actual, expected)
-                # Repeating a draft-DP rank models the SP peers that must share
-                # one order for USP sequence sharding.
+                # Repeating a draft-DP rank models SP or EP peers, all of which
+                # must share one sample order for model-parallel execution.
                 self.assertEqual(
                     actual,
                     _shard_offline_refs(

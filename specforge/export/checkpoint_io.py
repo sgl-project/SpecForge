@@ -102,10 +102,13 @@ def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
     if path.startswith("file://"):
         path = path[len("file://") :]
     if os.path.isfile(path):
-        return torch.load(path, map_location="cpu", weights_only=False)
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint_dir = os.path.dirname(path)
+        return _consolidate_export_state(state, checkpoint_dir)
     state_file = os.path.join(path, STATE_FILE)
     if os.path.isfile(state_file):
-        return torch.load(state_file, map_location="cpu", weights_only=False)
+        state = torch.load(state_file, map_location="cpu", weights_only=False)
+        return _consolidate_export_state(state, path)
     latest = [
         link
         for link in sorted(glob.glob(os.path.join(path, "*-latest")))
@@ -118,11 +121,13 @@ def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
             f"{{run_id}}-step{{N}} checkpoint directory explicitly"
         )
     if latest:
-        return torch.load(
-            os.path.join(os.path.realpath(latest[0]), STATE_FILE),
+        checkpoint_dir = os.path.realpath(latest[0])
+        state = torch.load(
+            os.path.join(checkpoint_dir, STATE_FILE),
             map_location="cpu",
             weights_only=False,
         )
+        return _consolidate_export_state(state, checkpoint_dir)
     # no `{run_id}-latest` pointer (e.g. symlink-free filesystem): fall back to
     # the highest step directory, mirroring CheckpointManager.latest_dir().
     steps = []
@@ -132,13 +137,26 @@ def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
             steps.append((int(m.group(1)), cand))
     if steps:
         best = max(steps)[1]
-        return torch.load(
+        state = torch.load(
             os.path.join(best, STATE_FILE), map_location="cpu", weights_only=False
         )
+        return _consolidate_export_state(state, best)
     raise FileNotFoundError(
         f"{checkpoint_path!r} is not a training_state.pt, a checkpoint directory, "
         f"or an output_dir with a '{{run_id}}-latest' pointer / step directories"
     )
+
+
+def _consolidate_export_state(
+    state: Dict[str, Any], checkpoint_dir: str
+) -> Dict[str, Any]:
+    if int(state.get("expert_parallel_size", 1)) <= 1:
+        return state
+    from specforge.training.checkpoint import consolidate_draft_state
+
+    state = dict(state)
+    state["draft_state_dict"] = consolidate_draft_state(checkpoint_dir, state)
+    return state
 
 
 def materialize_draft(
