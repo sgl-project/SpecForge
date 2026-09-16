@@ -32,6 +32,69 @@ logger = logging.getLogger(__name__)
 STATE_FILE = "training_state.pt"
 
 
+def consolidate_draft_state(
+    checkpoint_dir: str,
+    shared_state: Dict[str, Any],
+    *,
+    map_location="cpu",
+) -> Dict[str, Any]:
+    """Merge draft tensors saved by all expert-parallel group leaders.
+
+    A normal DP/FSDP checkpoint is already complete in ``training_state.pt``.
+    Under expert parallelism, each draft-DP group leader materializes only its
+    own slice of the experts, so export and warm-start must union the rank-local
+    payloads.
+    Replicated tensors occur in several files and are intentionally accepted;
+    topology/resume contracts guarantee that those replicas were synchronized.
+    """
+
+    merged: Dict[str, Any] = {}
+    shared_draft = shared_state.get("draft_state_dict")
+    if isinstance(shared_draft, dict):
+        merged.update(shared_draft)
+    rank_pattern = os.path.join(checkpoint_dir, "training_state_rank*.pt")
+    shards_found = 0
+    for rank_path in sorted(glob.glob(rank_pattern)):
+        rank_state = torch.load(
+            rank_path, map_location=map_location, weights_only=False
+        )
+        rank_draft = rank_state.get("draft_state_dict")
+        if not isinstance(rank_draft, dict):
+            continue
+        shards_found += 1
+        for name, tensor in rank_draft.items():
+            existing = merged.get(name)
+            if existing is not None and (
+                getattr(existing, "shape", None) != getattr(tensor, "shape", None)
+                or getattr(existing, "dtype", None) != getattr(tensor, "dtype", None)
+            ):
+                raise ValueError(
+                    f"conflicting expert-parallel checkpoint tensor {name!r}: "
+                    f"{getattr(existing, 'shape', None)}/"
+                    f"{getattr(existing, 'dtype', None)} vs "
+                    f"{getattr(tensor, 'shape', None)}/"
+                    f"{getattr(tensor, 'dtype', None)}"
+                )
+            merged.setdefault(name, tensor)
+    if not merged:
+        raise ValueError(
+            f"checkpoint {checkpoint_dir} contains no draft_state_dict tensors"
+        )
+    expected_shards = shared_state.get("expert_parallel_size")
+    if expected_shards is not None and int(expected_shards) > 1:
+        # Every rank file is written to a temporary and renamed into place, so a
+        # half-written shard cannot exist: counting the shards that carried draft
+        # tensors is enough, and it stays independent of how any particular draft
+        # architecture names its experts.
+        if shards_found != int(expected_shards):
+            raise ValueError(
+                "incomplete expert-parallel checkpoint in "
+                f"{checkpoint_dir}: expected {int(expected_shards)} rank shards "
+                f"carrying draft tensors, found {shards_found}"
+            )
+    return merged
+
+
 class CheckpointManager:
     def __init__(
         self,
@@ -294,6 +357,7 @@ class CheckpointManager:
         if local_error is not None:
             raise local_error
         assert state is not None
+        state["_checkpoint_dir"] = path
 
         rank = torch.distributed.get_rank() if initialized else 0
         saved_world = state.get("world_size")
