@@ -15,6 +15,7 @@ from torch import nn
 
 from .balance import MetricValue, build_balance_controller
 from .config import MoEConfig, resolve_moe_config
+from .expert_parallel import CopyToExpertParallel, reduce_replicated_gradients
 from .experts import build_routed_experts
 from .router import RoutingResult, build_router
 from .shared import build_shared_expert
@@ -35,6 +36,13 @@ class MoELayer(nn.Module):
         self.shared_experts: Optional[nn.Module] = (
             build_shared_expert(cfg, hidden_size) if cfg.n_shared_experts else None
         )
+        self.ep_size = int(getattr(self.experts, "ep_size", 1))
+        if self.ep_size > 1:
+            # The router is replicated, but this rank's loss only reaches the
+            # combine weights of the experts it owns, so its gradient here is a
+            # partial sum. The shared expert and everything else already see the
+            # whole loss and are left alone.
+            reduce_replicated_gradients(self.gate, self.experts.ep_group)
         # Detached per-expert counts of the last training forward, for metrics.
         self.last_counts: Optional[torch.Tensor] = None
 
@@ -45,11 +53,22 @@ class MoELayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.hidden_size)
-        routing: RoutingResult = self.gate(x)
+        # Under expert parallelism the tokens are replicated and the experts are
+        # not, so the router and the experts each hold a PARTIAL dL/dx: the
+        # router because only the slots of locally owned experts carry gradient,
+        # the experts because this rank ran only its own. The seam sums both.
+        # The shared expert stays outside it: it is replicated and already sees
+        # the whole loss, and reducing it would multiply it by the group size.
+        routed_x = (
+            CopyToExpertParallel.apply(x, self.experts.ep_group)
+            if self.ep_size > 1
+            else x
+        )
+        routing: RoutingResult = self.gate(routed_x)
         if self.training:
             self.last_counts = routing.counts.detach()
             self.balance.observe(routing)
-        y = self.experts(x, routing)
+        y = self.experts(routed_x, routing)
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
         return y.view(shape)
