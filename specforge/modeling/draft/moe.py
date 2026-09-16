@@ -25,6 +25,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .expert_parallel import (
+    CopyToExpertParallel,
+    draft_ep_layout,
+    reduce_replicated_gradients,
+    reduce_routed_output,
+)
+
 
 class MoEExpert(nn.Module):
     """One SwiGLU expert with the optional DeepSeek-V4 activation clamp."""
@@ -106,15 +113,34 @@ class GroupedExperts(nn.Module):
 
     _WEIGHT_NAMES = ("w1", "w2", "w3")
 
-    def __init__(
-        self, n_experts: int, dim: int, inter_dim: int, swiglu_limit: float
-    ):
+    def __init__(self, n_experts: int, dim: int, inter_dim: int, swiglu_limit: float):
         super().__init__()
         self.n_experts = n_experts
         self.swiglu_limit = swiglu_limit
-        self.w1 = nn.Parameter(torch.empty(n_experts, inter_dim, dim))
-        self.w2 = nn.Parameter(torch.empty(n_experts, dim, inter_dim))
-        self.w3 = nn.Parameter(torch.empty(n_experts, inter_dim, dim))
+        self.ep_group, ep_rank, self.ep_size = draft_ep_layout()
+        if n_experts % self.ep_size:
+            raise ValueError(
+                f"n_routed_experts={n_experts} is not divisible by "
+                f"expert_parallel_size={self.ep_size}"
+            )
+        self.n_local_experts = n_experts // self.ep_size
+        self.expert_start = ep_rank * self.n_local_experts
+        self.expert_end = self.expert_start + self.n_local_experts
+        # The stacked parameters hold only this rank's slice; expert_offset
+        # travels with them so the checkpoint converter can restore the global
+        # expert indices without knowing the topology.
+        self.register_buffer(
+            "expert_offset", torch.tensor(self.expert_start, dtype=torch.long)
+        )
+        if self.ep_size > 1:
+            # Everything else in the MoE is replicated with identical gradients;
+            # these three are the disjoint slice. The optimizer reads the marker
+            # to keep the global gradient norm exact.
+            self._specforge_rank_local_parameters = True
+        local = self.n_local_experts
+        self.w1 = nn.Parameter(torch.empty(local, inter_dim, dim))
+        self.w2 = nn.Parameter(torch.empty(local, dim, inter_dim))
+        self.w3 = nn.Parameter(torch.empty(local, inter_dim, dim))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -122,7 +148,7 @@ class GroupedExperts(nn.Module):
             return
         for name in self._WEIGHT_NAMES:
             stacked = getattr(self, name)
-            for i in range(self.n_experts):
+            for i in range(self.n_local_experts):
                 # per-expert slices match nn.Linear's default init exactly
                 nn.init.kaiming_uniform_(stacked[i], a=math.sqrt(5))
 
@@ -139,7 +165,20 @@ class GroupedExperts(nn.Module):
         # Native stacked keys (``experts.w1`` [E, out, in]) load through the
         # stock path; that is also what FSDP's use_orig_params state-dict
         # hooks require (they assert the module's own parameter FQNs exist).
+        # expert_offset describes THIS rank's topology, not the checkpoint's;
+        # a payload written by another layout must never move it.
+        state_dict[f"{prefix}expert_offset"] = self.expert_offset
         if any(f"{prefix}{name}" in state_dict for name in self._WEIGHT_NAMES):
+            if self.ep_size > 1:
+                for name in self._WEIGHT_NAMES:
+                    key = f"{prefix}{name}"
+                    tensor = state_dict.get(key)
+                    if (
+                        isinstance(tensor, torch.Tensor)
+                        and tensor.dim() == 3
+                        and tensor.shape[0] == self.n_experts
+                    ):
+                        state_dict[key] = tensor[self.expert_start : self.expert_end]
             return super()._load_from_state_dict(
                 state_dict,
                 prefix,
@@ -151,31 +190,37 @@ class GroupedExperts(nn.Module):
             )
         # Official per-expert naming: warm starts and trainer checkpoints
         # (see unstack_grouped_expert_state_dict).
-        consumed = set()
+        consumed = {f"{prefix}expert_offset"}
         for name in self._WEIGHT_NAMES:
             stacked = getattr(self, name)
-            for i in range(self.n_experts):
-                key = f"{prefix}{i}.{name}.weight"
+            # Files name experts globally; this rank fills its own slice.
+            for local, expert in enumerate(range(self.expert_start, self.expert_end)):
+                key = f"{prefix}{expert}.{name}.weight"
                 if key not in state_dict:
                     missing_keys.append(key)
                     continue
                 consumed.add(key)
                 value = state_dict[key]
-                if tuple(value.shape) != tuple(stacked[i].shape):
+                if tuple(value.shape) != tuple(stacked[local].shape):
                     error_msgs.append(
                         f"size mismatch for {key}: checkpoint "
-                        f"{tuple(value.shape)}, model {tuple(stacked[i].shape)}"
+                        f"{tuple(value.shape)}, model {tuple(stacked[local].shape)}"
                     )
                     continue
                 with torch.no_grad():
-                    stacked[i].copy_(value)
+                    stacked[local].copy_(value)
         if strict:
             for key in state_dict:
                 if key.startswith(prefix) and key not in consumed:
+                    # Experts owned by other ranks are expected to be here when a
+                    # whole-layer checkpoint is loaded into one shard.
+                    if self.ep_size > 1 and _PER_EXPERT_KEY.match(key):
+                        continue
                     unexpected_keys.append(key)
 
 
 _STACKED_EXPERT_KEY = re.compile(r"^(?P<base>(?:.*\.)?experts)\.(?P<w>w[123])$")
+_EXPERT_OFFSET_KEY = re.compile(r"^(?P<base>(?:.*\.)?experts)\.expert_offset$")
 _PER_EXPERT_KEY = re.compile(
     r"^(?P<base>(?:.*\.)?experts)\.(?P<idx>\d+)\.(?P<w>w[123])\.weight$"
 )
@@ -186,15 +231,29 @@ def unstack_grouped_expert_state_dict(state: dict) -> dict:
     naming (``experts.w1`` [E, out, in] -> ``experts.{i}.w1.weight``).
 
     A no-op for state dicts without grouped experts.
+
+    Under expert parallelism the stacked tensor holds only this rank's slice and
+    ``experts.expert_offset`` says where it starts. The file keeps global expert
+    indices and drops the offset, so a shard is described by its indices alone
+    and reads the same at any topology.
     """
+    offsets = {
+        m["base"]: int(value)
+        for key, value in state.items()
+        if (m := _EXPERT_OFFSET_KEY.match(key)) is not None
+    }
     out = {}
     for key, value in state.items():
+        if _EXPERT_OFFSET_KEY.match(key) is not None:
+            continue
         m = _STACKED_EXPERT_KEY.match(key)
         if m is None or not isinstance(value, torch.Tensor) or value.dim() != 3:
             out[key] = value
             continue
+        base = m["base"]
+        offset = offsets.get(base, 0)
         for i in range(value.shape[0]):
-            out[f"{m['base']}.{i}.{m['w']}.weight"] = value[i]
+            out[f"{base}.{offset + i}.{m['w']}.weight"] = value[i]
     return out
 
 
@@ -211,13 +270,18 @@ def stack_grouped_expert_state_dict(state: dict) -> dict:
             continue
         groups.setdefault((m["base"], m["w"]), {})[int(m["idx"])] = value
     for (base, w), members in groups.items():
-        n = max(members) + 1
-        if sorted(members) != list(range(n)):
+        present = sorted(members)
+        first, last = present[0], present[-1]
+        if present != list(range(first, last + 1)):
             raise KeyError(
-                f"{base}.*.{w}.weight is missing expert indices: have "
-                f"{sorted(members)}"
+                f"{base}.*.{w}.weight is missing expert indices: have {present}"
             )
-        out[f"{base}.{w}"] = torch.stack([members[i] for i in range(n)], dim=0)
+        out[f"{base}.{w}"] = torch.stack(
+            [members[i] for i in range(first, last + 1)], dim=0
+        )
+        if first:
+            # One expert-parallel shard rather than the whole layer.
+            out[f"{base}.expert_offset"] = torch.tensor(first, dtype=torch.long)
     return out
 
 
@@ -251,6 +315,12 @@ class SparseMoE(nn.Module):
         self.bias_update_rate = 0.0
         self.last_expert_load: Optional[torch.Tensor] = None
         self._pending_counts: Optional[torch.Tensor] = None
+        self.ep_size = self.experts.ep_size
+        if self.ep_size > 1:
+            # The gate is replicated, but this rank's loss only reaches the
+            # combine weights of the experts it owns, so its weight gradient
+            # here is a partial sum of the real one.
+            reduce_replicated_gradients(self.gate, self.experts.ep_group)
 
     def apply_pending_balance_update(self) -> None:
         """noaux_tc balancing: identical on every rank via all-reduced loads.
@@ -277,7 +347,18 @@ class SparseMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
-        weights, indices = self.gate(x)
+        # Under expert parallelism the tokens are replicated and the experts are
+        # not, so the gate and the experts each hold a PARTIAL dL/dx: the gate
+        # because only the slots of locally owned experts carry gradient, the
+        # experts because this rank ran only its own. The seam sums both. The
+        # shared expert stays outside it -- it is replicated and already sees the
+        # whole loss, and reducing it would multiply it by the group size.
+        routed_x = (
+            CopyToExpertParallel.apply(x, self.experts.ep_group)
+            if self.ep_size > 1
+            else x
+        )
+        weights, indices = self.gate(routed_x)
         # scatter_add instead of bincount: CUDA bincount hides a device sync.
         flat_indices = indices.flatten()
         counts = torch.zeros(
@@ -294,8 +375,17 @@ class SparseMoE(nn.Module):
         # ACTIVE experts — ~2x step time once the balancer spreads load.
         flat_expert = indices.flatten()  # [T*k]
         order = flat_expert.argsort(stable=True)
+        local_counts = None
+        if self.ep_size > 1:
+            # Sorting by expert makes this rank's experts one contiguous run of
+            # slots, so the slice is all it has to look at.
+            counts_list = counts.tolist()
+            experts = self.experts
+            start_slot = sum(counts_list[: experts.expert_start])
+            local_counts = counts_list[experts.expert_start : experts.expert_end]
+            order = order[start_slot : start_slot + sum(local_counts)]
         token_of = order // self.gate.topk  # routed token index per slot
-        x_sorted = x.index_select(0, token_of)
+        x_sorted = routed_x.index_select(0, token_of)
         w_sorted = weights.reshape(-1, 1).index_select(0, order).to(torch.float32)
 
         e = self.experts
@@ -303,13 +393,17 @@ class SparseMoE(nn.Module):
         if self.grouped_dispatch and x.is_cuda:
             # Three grouped GEMMs over the stacked parameters; segment
             # offsets stay on device, so no host sync in this path.
-            offs = counts.cumsum(0).to(torch.int32)
+            offs = (
+                counts.cumsum(0).to(torch.int32)
+                if local_counts is None
+                else torch.tensor(local_counts, dtype=torch.long, device=x.device)
+                .cumsum(0)
+                .to(torch.int32)
+            )
             gate_h = torch._grouped_mm(
                 x_sorted, e.w1.transpose(-1, -2), offs=offs
             ).float()
-            up = torch._grouped_mm(
-                x_sorted, e.w3.transpose(-1, -2), offs=offs
-            ).float()
+            up = torch._grouped_mm(x_sorted, e.w3.transpose(-1, -2), offs=offs).float()
             if limit > 0:
                 up = torch.clamp(up, min=-limit, max=limit)
                 gate_h = torch.clamp(gate_h, max=limit)
@@ -318,16 +412,20 @@ class SparseMoE(nn.Module):
                 h.to(x.dtype), e.w2.transpose(-1, -2), offs=offs
             )
             y = torch.zeros_like(x, dtype=torch.float32)
+            if self.ep_size > 1:
+                y = y + routed_x.float() * 0.0 + weights.float().sum() * 0.0
             y = y.index_add(0, token_of, y_routed.float())
+            if self.ep_size > 1:
+                y = reduce_routed_output(y, self.experts.ep_group)
             y = y + self.shared_experts(x)
             return y.to(x.dtype).view(shape)
 
-        counts_list = counts.tolist()  # one host sync per MoE forward
+        if local_counts is None:
+            local_counts = counts.tolist()  # one host sync per MoE forward
 
         y_parts = []
         offset = 0
-        for i in range(self.n_routed_experts):
-            n = counts_list[i]
+        for i, n in enumerate(local_counts):
             if n == 0:
                 continue
             seg = x_sorted[offset : offset + n]
@@ -340,7 +438,27 @@ class SparseMoE(nn.Module):
             y_parts.append(F.linear(h.to(seg.dtype), e.w2[i]))
             offset += n
         y = torch.zeros_like(x, dtype=torch.float32)
+        if self.ep_size > 1:
+            # A rank owning no selected expert for this microbatch is routine on
+            # an imbalanced route, and without this its routed_x and gate outputs
+            # would have no differentiable consumer at all: autograd would never
+            # reach the seam, its all-reduce would never be issued, and the peers
+            # that did issue theirs would hang. The zero terms keep the graph --
+            # and so the collective order -- identical on every rank, and add
+            # nothing to the value. The expert parameters are attached for the
+            # same reason, so DDP still sees every registered parameter.
+            y = (
+                y
+                + routed_x.float() * 0.0
+                + weights.float().sum() * 0.0
+                + sum(
+                    getattr(e, name).reshape(-1)[0].float() * 0.0
+                    for name in e._WEIGHT_NAMES
+                )
+            )
         if y_parts:
             y = y.index_add(0, token_of, torch.cat(y_parts, dim=0).float())
+        if self.ep_size > 1:
+            y = reduce_routed_output(y, self.experts.ep_group)
         y = y + self.shared_experts(x)
         return y.to(x.dtype).view(shape)
