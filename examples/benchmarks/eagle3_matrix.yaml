@@ -1,0 +1,34 @@
+# Sweep a target-only baseline and two EAGLE3 tree shapes on the same tasks.
+#
+#   specforge benchmark --config examples/benchmarks/eagle3_matrix.yaml \
+#       draft_model=/path/to/exported-draft
+model: meta-llama/Llama-3.1-8B-Instruct
+draft_model: lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B
+
+tasks:
+  - name: mtbench
+  - name: gsm8k
+    num_samples: 200
+  - name: humaneval
+    num_samples: 100
+
+server:
+  launch: true
+  base_url: http://127.0.0.1:30000
+  launch_timeout_seconds: 600
+  args: [--tp-size, "1", --mem-fraction-static, "0.8", --dtype, bfloat16]
+
+matrix:
+  - label: baseline
+  - {steps: 3, topk: 1, draft_tokens: 4}
+  - {steps: 5, topk: 4, draft_tokens: 8}
+
+sampling:
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 1
+
+concurrency: 1
+output:
+  dir: ./benchmark_results
+  name: llama3.1-8b-eagle3
