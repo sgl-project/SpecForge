@@ -1748,7 +1748,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
-            output_attentions=False,
             use_cache=False,
         )
 
