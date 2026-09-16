@@ -5,9 +5,8 @@
 Reproduces the teacher quantities of
 ``specforge.algorithms.eagle3.model._compute_target_p`` from the target's last hidden
 states and ``lm_head`` weight without materializing the full ``[B, S, vocab_size]``
-fp32 logits: the draft-vocab logits come from a ``t2d``-sliced head, and the
-full-vocab ``logsumexp``/``argmax`` from a streaming reduction over vocabulary
-chunks.
+fp32 logits: the draft-vocab logits are retained while the full-vocab
+``logsumexp``/``argmax`` streams over vocabulary chunks.
 
 Scope: offline training only. The teacher uses the full (unsharded, rank-replicated)
 target ``lm_head`` weight, so the computation is a pure function of
@@ -16,6 +15,7 @@ head; every rank computes identical teacher tensors from identical inputs. Onlin
 compact training is not supported in this release.
 """
 
+from bisect import bisect_left
 from typing import Optional, Tuple
 
 import torch
@@ -54,18 +54,13 @@ def validate_compact_teacher_config(
 
 
 @torch.no_grad()
-def tiled_logsumexp_argmax(
+def _tiled_logsumexp_argmax(
     hidden: torch.Tensor,
     weight: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Full-vocabulary fp32 ``logsumexp`` (``[..., 1]``) and ``argmax`` (``[...]``).
-
-    Streams over vocabulary chunks without allocating ``[..., vocab_size]``. Chunk
-    logits are upcast to fp32 to match ``target.float()``; ties resolve to the lowest
-    index like ``torch.argmax``.
-    """
+    selected_token_ids: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
 
@@ -81,9 +76,31 @@ def tiled_logsumexp_argmax(
     running_argval = torch.full(lead_shape, neg_inf, dtype=torch.float32, device=device)
     running_argmax = torch.zeros(lead_shape, dtype=torch.long, device=device)
 
+    selected_logits = None
+    selected_ids_host = None
+    selected_start = 0
+    if selected_token_ids is not None:
+        # Copy once so chunk boundaries do not synchronize the device inside the loop.
+        selected_ids_host = selected_token_ids.tolist()
+        selected_logits = torch.empty(
+            (*lead_shape, len(selected_ids_host)), dtype=torch.float32, device=device
+        )
+
     for start in range(0, vocab_size, chunk_size):
         end = min(start + chunk_size, vocab_size)
         chunk_logits = F.linear(hidden, weight[start:end]).float()
+
+        if selected_ids_host is not None:
+            selected_end = bisect_left(selected_ids_host, end, lo=selected_start)
+            if selected_end > selected_start:
+                chunk_indices = selected_token_ids[selected_start:selected_end] - start
+                torch.index_select(
+                    chunk_logits,
+                    -1,
+                    chunk_indices,
+                    out=selected_logits[..., selected_start:selected_end],
+                )
+            selected_start = selected_end
 
         chunk_max = chunk_logits.max(dim=-1, keepdim=True).values
         new_max = torch.maximum(running_max, chunk_max)
@@ -100,7 +117,24 @@ def tiled_logsumexp_argmax(
         running_argval = torch.where(take, chunk_val, running_argval)
 
     log_z = running_max + torch.log(running_sumexp)
-    return log_z, running_argmax
+    return log_z, running_argmax, selected_logits
+
+
+@torch.no_grad()
+def tiled_logsumexp_argmax(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Full-vocabulary fp32 ``logsumexp`` (``[..., 1]``) and ``argmax`` (``[...]``).
+
+    Streams over vocabulary chunks without allocating ``[..., vocab_size]``. Chunk
+    logits are upcast to fp32 to match ``target.float()``; ties resolve to the lowest
+    index like ``torch.argmax``.
+    """
+    log_z, argmax, _ = _tiled_logsumexp_argmax(hidden, weight, chunk_size=chunk_size)
+    return log_z, argmax
 
 
 @torch.no_grad()
@@ -130,13 +164,15 @@ def compute_target_from_hidden(
             f"{lm_head_weight.shape[1]}."
         )
 
-    # weight[t2d] keeps the same row order as (full_logits)[..., t2d] column slicing.
-    draft_logits = F.linear(hidden, lm_head_weight[t2d]).float()
-    target_p = torch.softmax(draft_logits, dim=-1)
-
-    log_z, target_token_ids = tiled_logsumexp_argmax(
-        hidden, lm_head_weight, chunk_size=chunk_size
+    selected_token_ids = torch.nonzero(t2d, as_tuple=False).flatten()
+    log_z, target_token_ids, draft_logits = _tiled_logsumexp_argmax(
+        hidden,
+        lm_head_weight,
+        chunk_size=chunk_size,
+        selected_token_ids=selected_token_ids,
     )
+    assert draft_logits is not None
+    target_p = torch.softmax(draft_logits, dim=-1)
     target_p_on_draft = torch.exp(draft_logits - log_z)
 
     target_mask = t2d[target_token_ids][..., None].int()
