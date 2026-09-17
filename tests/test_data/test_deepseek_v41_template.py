@@ -335,6 +335,103 @@ class TestDeepseekV41Template(unittest.TestCase):
                 ],
             )
 
+    def test_developer_messages_render_as_user_turns(self):
+        # The reference encoder has no developer role; an SGLang server
+        # renders it as a user turn, byte-identical to a user message.
+        with_developer = [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": "U1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "developer", "content": "D"},
+            {"role": "assistant", "content": "A2"},
+        ]
+        as_user = [
+            dict(m, role="user") if m["role"] == "developer" else m
+            for m in with_developer
+        ]
+        parser = DeepSeekV41Parser(
+            CharacterTokenizer(), TEMPLATE_REGISTRY.get("deepseek-v4.1")
+        )
+        expected = parser.apply_chat_template(as_user, tool=[])
+        # Through the full parse path: the normalization runs before the
+        # role checks, so the assistant turn after the developer message is
+        # kept and supervised.
+        processed = preprocess_conversations(
+            CharacterTokenizer(),
+            [with_developer],
+            TEMPLATE_REGISTRY.get("deepseek-v4.1"),
+            max_length=512,
+            tools=[[]],
+        )
+        rendered = "".join(chr(i) for i in processed["input_ids"][0].squeeze().tolist())
+        self.assertEqual(rendered, expected)
+        self.assertIn(
+            "<｜User｜>D<｜Assistant｜></think>A2<｜end▁of▁sentence｜>", rendered
+        )
+        supervised = "</think>A1<｜end▁of▁sentence｜>" "</think>A2<｜end▁of▁sentence｜>"
+        self.assertEqual(processed["loss_mask"][0].sum().item(), len(supervised))
+
+    def test_tools_are_hosted_by_a_system_message(self):
+        rendered = self._render(
+            [
+                {"role": "developer", "content": "D"},
+                {"role": "assistant", "content": "A"},
+            ],
+            tools=[{"type": "function", "function": {"name": "w", "parameters": {}}}],
+        )
+        # The developer turn is rendered as a user turn and never hosts the
+        # tools; they land on an inserted system message, as on the server.
+        self.assertTrue(
+            rendered.startswith("<｜begin▁of▁sentence｜><｜System｜>\n\n## Tools")
+        )
+
+    def test_namespaced_tool_calls_keep_the_namespace(self):
+        parser = DeepSeekV41Parser(None, TEMPLATE_REGISTRY.get("deepseek-v4.1"))
+        message = parser._sanitize_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "namespace": "math",
+                        "function": {"name": "add", "arguments": {"a": 1}},
+                    }
+                ],
+            }
+        )
+        self.assertEqual(message["tool_calls"][0]["namespace"], "math")
+        self.assertEqual(message["tool_calls"][0]["function"]["arguments"], '{"a": 1}')
+        rendered = self._render(
+            [
+                {"role": "user", "content": "q"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": message["tool_calls"],
+                },
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "add", "namespace": "math", "parameters": {}},
+                }
+            ],
+        )
+        self.assertIn('<｜DSML｜ invoke name="math::add">', rendered)
+        # The V4 sanitizer drops the namespace; V4's encoder has no use for it.
+        v4 = DeepSeekV4Parser(None, TEMPLATE_REGISTRY.get("deepseek-v4"))
+        self.assertNotIn(
+            "namespace",
+            v4._sanitize_message(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": message["tool_calls"],
+                }
+            )["tool_calls"][0],
+        )
+
 
 def _sglang_v41_encoder():
     try:
@@ -367,6 +464,14 @@ class TestDeepseekV41ServingParity(unittest.TestCase):
             {"role": "system", "content": "Reminder"},
             {"role": "user", "content": "Second"},
             {"role": "assistant", "reasoning_content": "new", "content": "A2"},
+        ],
+        # A developer turn: the server renders it as a user turn.
+        [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": "U1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "developer", "content": "D"},
+            {"role": "assistant", "reasoning_content": "r", "content": "A2"},
         ],
     ]
 
