@@ -521,6 +521,10 @@ An active partial window is finalized when training stops or fails.
 
 ## Evaluation and best checkpoints
 
+For a fixed-cache DFlash/DFlash2 comparison outside training, see
+[checkpoint evaluation](checkpoint_evaluation.md). This standalone command can
+evaluate saved checkpoints from either online or offline training.
+
 Offline evaluation is configured through the same YAML:
 
 ```yaml
