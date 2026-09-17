@@ -188,6 +188,7 @@ def run_checkpoint_evaluation(
 ) -> dict:
     """Build only draft/target-head modules; no optimizer or capture service."""
     from specforge.algorithms.builtin import builtin_algorithm_registry
+    from specforge.eval.report import checkpoint_metrics
     from specforge.training.assembly import build_model_bundle
     from specforge.training.model_loading import warm_start_draft_model
 
@@ -229,6 +230,7 @@ def run_checkpoint_evaluation(
             "draft_config": bundle.draft_config.to_dict(),
         }
     )
+    report["metrics"] = checkpoint_metrics(report)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x") as stream:
         json.dump(report, stream, indent=2, allow_nan=False)

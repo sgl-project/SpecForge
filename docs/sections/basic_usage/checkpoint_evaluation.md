@@ -83,15 +83,57 @@ per-example scalar metrics, additive ratio numerators/denominators, and counts.
 `mean.loss` is the mean of per-example composite losses. Ratios such as `ce_loss`
 are computed as `sum(numerator) / sum(denominator)`, not an average of ratios.
 `ratio_totals` and `sum_totals` preserve the populations behind each diagnostic.
+Composite and component losses have different averaging denominators, so the
+displayed CE and selector losses need not sum to the sample-mean composite loss.
 An absent/zero exposure has a zero raw ratio and must not be interpreted as a
 measured acceptance rate.
 
+The command prints a compact summary followed by one row per proposal position.
+The JSON's `metrics` field contains curated tracker keys:
+
+| Namespace | What to read |
+| --- | --- |
+| `eval/summary/` | Sample-mean composite loss, pooled CE/selector loss, unary and selector greedy length proxies |
+| `eval/position_1/`, `eval/position_2/`, … | Marginal unary accuracy, conditional acceptance, prefix survival, selector failure decomposition and explicitly named oracle diagnostics |
+| `eval/oracle/` | Top-K candidate-coverage bounds, not the actual selector's achieved length |
+
+For example, `eval/position_2/selector_prefix_acceptance` divides accepted
+position-2 proposals by prefixes that reached position 2.
+`eval/position_2/selector_prefix_survival` divides by **all evaluated blocks**,
+including censored tails. These values answer different questions.
+Position 1 is the first proposal after the anchor. Accepted lengths include
+one anchor token. A top-K oracle assumes perfect selection whenever the saved
+label is in the candidates; it is not a serving measurement.
+
+Auxiliary objective/teacher metrics and counts stay in the raw JSON. To include
+them in tracker output, call `checkpoint_metrics(report, include_diagnostics=True)`;
+per-position extras stay under `eval/position_N/diagnostics/` and
+`eval/position_N/counts/`, with overall extras under `eval/diagnostics/` and
+`eval/counts/`. Zero-denominator ratios are omitted from presentation rather
+than shown as measured zero acceptance. Existing training metric names do not
+change; these keys belong to the standalone checkpoint report.
+
 An external checkpoint hook can log the completed report at the saved optimizer
-step using its existing tracker:
+step using its existing tracker. With W&B:
 
 ```python
-logger({f"eval/{name}": value for name, value in report["mean"].items()}, step)
+wandb_run.log(report["metrics"], step=checkpoint_optimizer_step)
 ```
 
 Keep tracker lifecycle and distributed synchronization in the owning training
 controller. The standalone command performs no tracker writes or optimization.
+
+## Reorganize an existing report
+
+The formatter accepts the original `success`/`examples`/`mean`/`ratio_totals`
+JSON schema as well as new reports. It validates pooled ratios against their
+counts and needs no model or GPU pass:
+
+```bash
+specforge eval-report --input development-step1000.json \
+  --output development-step1000.md --metrics-output development-step1000-metrics.json
+```
+
+Omit `--output` to print Markdown to the terminal. Add `--include-diagnostics`
+for full tracker details. Existing output files are refused. This formatting
+operation neither modifies the source report nor rewrites historical W&B runs.
