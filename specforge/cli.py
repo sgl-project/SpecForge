@@ -346,6 +346,7 @@ def evaluate_checkpoint(
     from pathlib import Path
 
     from specforge.eval.checkpoint import run_checkpoint_evaluation
+    from specforge.eval.report import render_checkpoint_report
 
     report = run_checkpoint_evaluation(
         load_config(config_path, list(overrides)),
@@ -354,9 +355,57 @@ def evaluate_checkpoint(
         Path(output),
         limit,
     )
-    click.echo(
-        f"Evaluated {report['examples']} examples; teacher-forced loss={report['mean']['loss']:.6f}; report: {output}"
-    )
+    click.echo(render_checkpoint_report(report))
+    click.echo(f"Full report: {output}")
+    return 0
+
+
+@cli.command(
+    "eval-report", short_help="organize a saved checkpoint evaluation without GPU work"
+)
+@click.option(
+    "--input", "input_path", required=True, type=click.Path(exists=True, dir_okay=False)
+)
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False),
+    help="Markdown report; defaults to stdout.",
+)
+@click.option(
+    "--metrics-output",
+    type=click.Path(dir_okay=False),
+    help="Grouped tracker metrics as JSON.",
+)
+@click.option(
+    "--include-diagnostics",
+    is_flag=True,
+    help="Include auxiliary metrics in the tracker JSON.",
+)
+def eval_report(input_path, output, metrics_output, include_diagnostics) -> int:
+    """Format a saved report; does not load models or write to a tracker."""
+    import json
+    from pathlib import Path
+
+    from specforge.eval.report import checkpoint_metrics, render_checkpoint_report
+
+    destinations = [Path(path).resolve() for path in (output, metrics_output) if path]
+    if len(set(destinations)) != len(destinations):
+        raise click.UsageError("report and metrics outputs must be different files")
+    for destination in destinations:
+        if destination.exists():
+            raise click.UsageError(f"output already exists: {destination}")
+    report = json.loads(Path(input_path).read_text())
+    markdown = render_checkpoint_report(report)
+    metrics = checkpoint_metrics(report, include_diagnostics=include_diagnostics)
+    if output:
+        with open(output, "x") as stream:
+            stream.write(markdown)
+    else:
+        click.echo(markdown)
+    if metrics_output:
+        with open(metrics_output, "x") as stream:
+            json.dump(metrics, stream, indent=2, allow_nan=False)
+            stream.write("\n")
     return 0
 
 
