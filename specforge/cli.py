@@ -318,6 +318,48 @@ def export(
     return 0
 
 
+@cli.command(
+    "evaluate-checkpoint",
+    short_help="replay a DFlash checkpoint on cached teacher features",
+)
+@click.option(
+    "--config",
+    "config_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False),
+)
+@click.option("--checkpoint", required=True, metavar="PATH")
+@click.option(
+    "--feature-index", required=True, type=click.Path(exists=True, dir_okay=False)
+)
+@click.option("--output", required=True, type=click.Path(dir_okay=False))
+@click.option("--limit", type=click.IntRange(min=1), default=None)
+@click.argument("overrides", nargs=-1)
+def evaluate_checkpoint(
+    config_path, checkpoint, feature_index, output, limit, overrides
+) -> int:
+    """Evaluate fixed examples without running training or a target server.
+
+    Use an evaluation recipe with the objective and anchor settings to compare.
+    Overrides use the same section.field=value syntax as training.
+    """
+    from pathlib import Path
+
+    from specforge.eval.checkpoint import run_checkpoint_evaluation
+
+    report = run_checkpoint_evaluation(
+        load_config(config_path, list(overrides)),
+        checkpoint,
+        Path(feature_index),
+        Path(output),
+        limit,
+    )
+    click.echo(
+        f"Evaluated {report['examples']} examples; teacher-forced loss={report['mean']['loss']:.6f}; report: {output}"
+    )
+    return 0
+
+
 @cli.command(short_help="benchmark a running SGLang server")
 @click.option("--model", required=True, help="Tokenizer/model id for prompt rendering.")
 @click.option(
