@@ -8,10 +8,12 @@ import torch
 from transformers import PreTrainedTokenizer
 
 from .encoders.deepseek_v4 import encode_messages as encode_deepseek_v4_messages
+from .encoders.deepseek_v41 import encode_messages as encode_deepseek_v41_messages
 from .template import ChatTemplate
 
 __all__ = [
     "DeepSeekV4Parser",
+    "DeepSeekV41Parser",
     "GeneralParser",
     "GLMParser",
     "HarmonyParser",
@@ -583,6 +585,10 @@ class DeepSeekV4Parser(ThinkingParser):
     def _prepare_system_message(self, message: dict) -> dict:
         return self._sanitize_message(message)
 
+    # The official encoder for this template; subclasses swap it for a newer
+    # release that keeps the same message contract.
+    _encode_messages = staticmethod(encode_deepseek_v4_messages)
+
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         messages = [dict(message) for message in messages]
         if tool:
@@ -594,7 +600,7 @@ class DeepSeekV4Parser(ThinkingParser):
                 messages.insert(0, {"role": "system", "content": "", "tools": tool})
 
         enable_thinking = kwargs.pop("enable_thinking", False)
-        return encode_deepseek_v4_messages(
+        return self._encode_messages(
             messages,
             thinking_mode="thinking" if enable_thinking else "chat",
             context=kwargs.pop("context", None),
@@ -602,6 +608,19 @@ class DeepSeekV4Parser(ThinkingParser):
             add_default_bos_token=kwargs.pop("add_default_bos_token", True),
             reasoning_effort=kwargs.pop("reasoning_effort", None),
         )
+
+
+class DeepSeekV41Parser(DeepSeekV4Parser):
+    """Render DeepSeek-V4.1 conversations with its official Python encoder.
+
+    V4.1 keeps the V4 message contract but changes the prompt format: spaced
+    DSML tag names, a numeric reasoning-effort prefix rendered behind the
+    ``<｜System｜>`` token in thinking mode, and mid-conversation system
+    messages. The vendored encoder is pinned to the model release, so training
+    renders exactly what the checkpoint's own tooling renders.
+    """
+
+    _encode_messages = staticmethod(encode_deepseek_v41_messages)
 
 
 class GLMParser(GeneralParser):
