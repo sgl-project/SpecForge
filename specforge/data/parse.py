@@ -2,16 +2,18 @@ import json
 import re
 import warnings
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import PreTrainedTokenizer
 
 from .encoders.deepseek_v4 import encode_messages as encode_deepseek_v4_messages
+from .encoders.deepseek_v41 import encode_messages as encode_deepseek_v41_messages
 from .template import ChatTemplate
 
 __all__ = [
     "DeepSeekV4Parser",
+    "DeepSeekV41Parser",
     "GeneralParser",
     "GLMParser",
     "HarmonyParser",
@@ -558,43 +560,59 @@ class DeepSeekV4Parser(ThinkingParser):
         if isinstance(tool_calls, list):
             sanitized_tool_calls = []
             for tool_call in tool_calls:
-                if not isinstance(tool_call, dict):
-                    continue
-                function = tool_call.get("function")
-                if not isinstance(function, dict):
-                    continue
-                arguments = function.get("arguments", "{}")
-                if not isinstance(arguments, str):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
-                sanitized_tool_calls.append(
-                    {
-                        "id": tool_call.get("id", ""),
-                        "type": tool_call.get("type", "function"),
-                        "function": {
-                            "name": function.get("name", ""),
-                            "arguments": arguments,
-                        },
-                    }
-                )
+                sanitized = self._sanitize_tool_call(tool_call)
+                if sanitized is not None:
+                    sanitized_tool_calls.append(sanitized)
             cleaned["tool_calls"] = sanitized_tool_calls
 
         return cleaned
 
+    @staticmethod
+    def _sanitize_tool_call(tool_call) -> Optional[dict]:
+        """Rebuild one OpenAI-format tool call with the fields the encoder reads."""
+        if not isinstance(tool_call, dict):
+            return None
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            return None
+        arguments = function.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        return {
+            "id": tool_call.get("id", ""),
+            "type": tool_call.get("type", "function"),
+            "function": {
+                "name": function.get("name", ""),
+                "arguments": arguments,
+            },
+        }
+
     def _prepare_system_message(self, message: dict) -> dict:
         return self._sanitize_message(message)
 
-    def apply_chat_template(self, messages, tool, **kwargs) -> str:
+    # The official encoder for this template; subclasses swap it for a newer
+    # release that keeps the same message contract.
+    _encode_messages = staticmethod(encode_deepseek_v4_messages)
+    # Roles that may host the request tools; the first match carries them,
+    # otherwise an empty system message is inserted to hold them.
+    _tool_host_roles = ("system", "developer")
+
+    def _prepare_messages(self, messages, tool) -> list:
         messages = [dict(message) for message in messages]
         if tool:
             for message in messages:
-                if message["role"] in ("system", "developer"):
+                if message["role"] in self._tool_host_roles:
                     message.setdefault("tools", tool)
                     break
             else:
                 messages.insert(0, {"role": "system", "content": "", "tools": tool})
+        return messages
+
+    def apply_chat_template(self, messages, tool, **kwargs) -> str:
+        messages = self._prepare_messages(messages, tool)
 
         enable_thinking = kwargs.pop("enable_thinking", False)
-        return encode_deepseek_v4_messages(
+        return self._encode_messages(
             messages,
             thinking_mode="thinking" if enable_thinking else "chat",
             context=kwargs.pop("context", None),
@@ -602,6 +620,54 @@ class DeepSeekV4Parser(ThinkingParser):
             add_default_bos_token=kwargs.pop("add_default_bos_token", True),
             reasoning_effort=kwargs.pop("reasoning_effort", None),
         )
+
+
+class DeepSeekV41Parser(DeepSeekV4Parser):
+    """Render DeepSeek-V4.1 conversations with its official Python encoder.
+
+    V4.1 keeps the V4 message contract but changes the prompt format: spaced
+    DSML tag names, a numeric reasoning-effort prefix rendered behind the
+    ``<｜System｜>`` token in thinking mode, and mid-conversation system
+    messages. The vendored encoder is pinned to the model release, so training
+    renders exactly what the checkpoint's own tooling renders.
+
+    Two contract differences from V4 are absorbed here rather than in the
+    vendored file: the V4.1 reference encoder has no ``developer`` role (an
+    SGLang server renders one as a user turn, byte-identical to a user message
+    with the same content, so it is normalized to ``user`` before the role
+    checks), and request tools are hosted by a system message, as the server
+    does. Tool calls keep an OpenAI ``namespace`` so the encoder renders
+    ``namespace::name``.
+    """
+
+    _encode_messages = staticmethod(encode_deepseek_v41_messages)
+    _tool_host_roles = ("system",)
+
+    @staticmethod
+    def _developer_as_user(message: dict) -> dict:
+        if message.get("role") == "developer":
+            return {**message, "role": "user"}
+        return message
+
+    def _prepare_messages(self, messages, tool) -> list:
+        # Direct apply_chat_template callers bypass parse()'s normalization.
+        return super()._prepare_messages(
+            [self._developer_as_user(message) for message in messages], tool
+        )
+
+    def _normalize_message(self, message: dict) -> dict:
+        # Runs before parse()'s role checks, so the assistant turn after a
+        # developer message is kept rather than truncated.
+        return self._developer_as_user(super()._normalize_message(message))
+
+    def _sanitize_tool_call(self, tool_call) -> Optional[dict]:
+        sanitized = DeepSeekV4Parser._sanitize_tool_call(tool_call)
+        if sanitized is None:
+            return None
+        namespace = tool_call.get("namespace") or tool_call["function"].get("namespace")
+        if isinstance(namespace, str) and namespace:
+            sanitized["namespace"] = namespace
+        return sanitized
 
 
 class GLMParser(GeneralParser):
