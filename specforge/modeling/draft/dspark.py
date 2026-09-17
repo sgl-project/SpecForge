@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from .dflash import DFlashDraftModel, resolve_dflash_attention_mode
+from .dflash import DFlashDraftModel, resolve_dflash_attention_modes
 from .registry import register_draft
 
 
@@ -287,17 +287,18 @@ class DSparkDraftModel(DFlashDraftModel):
 
     def __init__(self, config) -> None:
         dflash_config = dict(getattr(config, "dflash_config", None) or {})
-        attention_mode = resolve_dflash_attention_mode(config)
+        attention_modes = resolve_dflash_attention_modes(config)
+        context_modes = set(attention_modes) - {"kda"}
         num_heads = int(config.num_attention_heads)
         num_kv_heads = int(config.num_key_value_heads)
         # MLA carries its own head geometry; the query/KV head-count policy
         # below only constrains the GQA/MHA projections.
-        if attention_mode != "mla" and num_heads % num_kv_heads:
+        if context_modes & {"gqa", "mha"} and num_heads % num_kv_heads:
             raise ValueError(
                 "DSpark requires num_key_value_heads to divide "
                 f"num_attention_heads, got {num_kv_heads} and {num_heads}"
             )
-        if attention_mode == "gqa" and num_kv_heads >= num_heads:
+        if "gqa" in context_modes and num_kv_heads >= num_heads:
             raise ValueError(
                 "DSpark defaults to GQA and requires num_key_value_heads < "
                 "num_attention_heads; set dflash_config.attention_mode='mha' "
@@ -305,7 +306,10 @@ class DSparkDraftModel(DFlashDraftModel):
             )
         # 'mha' head-count consistency is enforced by the shared
         # validate_dflash_attention_config at model init.
-        dflash_config["attention_mode"] = attention_mode
+        if "attention_modes" in dflash_config:
+            dflash_config["attention_modes"] = list(attention_modes)
+        else:
+            dflash_config["attention_mode"] = attention_modes[0]
         projector_type = dflash_config.get("projector_type")
         if projector_type is None:
             dflash_config["projector_type"] = self.expected_projector_type

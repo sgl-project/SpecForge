@@ -701,7 +701,7 @@ class TestPackageArchitecture(unittest.TestCase):
         present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}
         self.assertTrue(CANONICAL_DRAFT_CONFIGS.issubset(present))
 
-    def test_dspark_configs_are_qwen3_gqa_only(self):
+    def test_dspark_configs_use_supported_qwen3_attention(self):
         dspark_configs = {}
         for path in sorted((REPO_ROOT / "configs").glob("*.json")):
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -715,6 +715,8 @@ class TestPackageArchitecture(unittest.TestCase):
                 "glm-5.2-dspark.json",
                 "inkling-dspark.json",
                 "kimi-k3-dspark.json",
+                "qwen3-4b-dspark-kda-scan.json",
+                "qwen3-4b-dspark-kda.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
                 "qwen3.6-27b-dspark.json",
@@ -723,7 +725,6 @@ class TestPackageArchitecture(unittest.TestCase):
         for name, payload in dspark_configs.items():
             with self.subTest(config=name):
                 self.assertEqual(payload["model_type"], "qwen3")
-                self.assertEqual(payload["dflash_config"]["attention_mode"], "gqa")
                 self.assertLess(
                     payload["num_key_value_heads"],
                     payload["num_attention_heads"],
@@ -732,6 +733,24 @@ class TestPackageArchitecture(unittest.TestCase):
                     payload["num_attention_heads"] % payload["num_key_value_heads"],
                     0,
                 )
+                if name in (
+                    "qwen3-4b-dspark-kda.json",
+                    "qwen3-4b-dspark-kda-scan.json",
+                ):
+                    self.assertEqual(
+                        payload["dflash_config"]["attention_modes"],
+                        ["kda", "kda", "gqa", "kda", "kda"],
+                    )
+                    self.assertEqual(payload["linear_attn_config"]["backend"], "fla")
+                    self.assertEqual(payload["linear_attn_config"]["head_dim"], 128)
+                    self.assertEqual(payload["linear_attn_config"]["num_heads"], 16)
+                    expected_state = "scan" if name.endswith("-scan.json") else "reset"
+                    self.assertEqual(
+                        payload["linear_attn_config"].get("context_state", "reset"),
+                        expected_state,
+                    )
+                else:
+                    self.assertEqual(payload["dflash_config"]["attention_mode"], "gqa")
 
     def test_examples_and_scripts_do_not_bypass_the_cli(self):
         direct_imports = []
