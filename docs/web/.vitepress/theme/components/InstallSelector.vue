@@ -1,32 +1,47 @@
 <script setup lang="ts">
 /**
- * "Get Started in Seconds" configurator: pick hardware, installer and source
- * and get the matching install command with a copy button.
+ * Install configurator: pick hardware, SpecForge version, installer and
+ * optional extras, and get the matching install command with a copy button.
+ * Used on the landing page ("Get Started in Seconds") and embedded in
+ * docs/sections/get_started/installation.md.
+ *
+ * Keep the generated commands in sync with pyproject.toml extras and the
+ * hand-written notes in the installation guide.
  */
 import { computed, onMounted, ref } from 'vue'
 import { withBase } from 'vitepress'
 
+declare const __SPECFORGE_VERSION__: string
+const VERSION = __SPECFORGE_VERSION__
+
 type Hardware = 'cuda' | 'rocm' | 'npu'
+type Version = 'main' | 'release'
 type Installer = 'uv' | 'pip'
-type Source = 'source' | 'pypi'
+type Extra = 'fa' | 'liger' | 'dev'
 
 const HARDWARE: { key: Hardware; label: string }[] = [
   { key: 'cuda', label: 'NVIDIA CUDA' },
   { key: 'rocm', label: 'AMD ROCm' },
   { key: 'npu', label: 'Ascend NPU' },
 ]
+const VERSIONS: { key: Version; label: string }[] = [
+  { key: 'main', label: 'main (source)' },
+  { key: 'release', label: `v${VERSION} (PyPI)` },
+]
 const INSTALLERS: { key: Installer; label: string }[] = [
   { key: 'uv', label: 'uv' },
   { key: 'pip', label: 'pip' },
 ]
-const SOURCES: { key: Source; label: string }[] = [
-  { key: 'source', label: 'From source' },
-  { key: 'pypi', label: 'PyPI' },
+const EXTRAS: { key: Extra; label: string; hint: string; cudaOnly?: boolean }[] = [
+  { key: 'fa', label: 'flash-attn', hint: 'FlashAttention, built from source against the installed torch', cudaOnly: true },
+  { key: 'liger', label: 'liger', hint: 'liger-kernel, enables model.use_liger_kernel for DFlash training' },
+  { key: 'dev', label: 'dev', hint: 'pre-commit hooks for contributors' },
 ]
 
 const hardware = ref<Hardware>('cuda')
+const version = ref<Version>('main')
 const installer = ref<Installer>('uv')
-const source = ref<Source>('source')
+const extras = ref<Extra[]>([])
 const copied = ref(false)
 
 const STORAGE = 'specforge-install-config'
@@ -34,8 +49,11 @@ onMounted(() => {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE) ?? '{}')
     if (HARDWARE.some((h) => h.key === saved.hardware)) hardware.value = saved.hardware
+    if (VERSIONS.some((v) => v.key === saved.version)) version.value = saved.version
     if (INSTALLERS.some((i) => i.key === saved.installer)) installer.value = saved.installer
-    if (SOURCES.some((s) => s.key === saved.source)) source.value = saved.source
+    if (Array.isArray(saved.extras)) {
+      extras.value = saved.extras.filter((e: unknown) => EXTRAS.some((x) => x.key === e))
+    }
   } catch {
     /* ignore */
   }
@@ -44,11 +62,32 @@ function persist() {
   try {
     localStorage.setItem(
       STORAGE,
-      JSON.stringify({ hardware: hardware.value, installer: installer.value, source: source.value })
+      JSON.stringify({
+        hardware: hardware.value,
+        version: version.value,
+        installer: installer.value,
+        extras: extras.value,
+      })
     )
   } catch {
     /* ignore */
   }
+}
+
+function setHardware(hw: Hardware) {
+  hardware.value = hw
+  // flash-attn is CUDA only.
+  if (hw !== 'cuda') extras.value = extras.value.filter((e) => e !== 'fa')
+  persist()
+}
+function toggleExtra(e: Extra) {
+  extras.value = extras.value.includes(e)
+    ? extras.value.filter((x) => x !== e)
+    : EXTRAS.map((x) => x.key).filter((k) => k === e || extras.value.includes(k))
+  persist()
+}
+function extraDisabled(e: { key: Extra; cudaOnly?: boolean }) {
+  return !!e.cudaOnly && hardware.value !== 'cuda'
 }
 
 const REPO = 'https://github.com/sgl-project/SpecForge.git'
@@ -56,30 +95,89 @@ const REPO = 'https://github.com/sgl-project/SpecForge.git'
 const lines = computed<string[]>(() => {
   const hw = hardware.value
   const useUv = installer.value === 'uv'
-  const noDeps = hw !== 'cuda'
+  const fromSource = version.value === 'main'
   const out: string[] = []
 
-  if (hw === 'rocm') out.push('# Run inside the SGLang ROCm release container')
-  if (hw === 'npu') out.push('# After installing torch and torch_npu for your CANN release')
-
-  if (source.value === 'source') {
-    out.push(`git clone ${REPO}`, 'cd SpecForge')
-    if (hw === 'cuda') {
+  if (hw === 'cuda') {
+    // The cuda extra pins torch / sglang-kernel to CUDA 13 wheels; pre-releases
+    // are allowed because sglang pins a pre-release cuda-tile wheel. flash-attn
+    // is built separately so it can see the installed torch. uv routes torch
+    // and sglang-kernel to the cu130 indexes via [tool.uv.sources] for a
+    // source install; pip does not read that, so it gets both indexes on the
+    // command line (also needed for the PyPI release under either installer).
+    const spec = ['cuda', ...extras.value.filter((e) => e !== 'fa')].join(',')
+    const index =
+      '--extra-index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://sgl-project.github.io/whl/cu130/'
+    const pipInstall = useUv ? 'uv pip install --prerelease=allow' : 'pip install --pre'
+    if (fromSource) {
+      out.push(
+        `git clone ${REPO}`,
+        'cd SpecForge',
+        useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
+        'source .venv/bin/activate',
+        useUv ? `${pipInstall} -e ".[${spec}]"` : `${pipInstall} -e ".[${spec}]" ${index}`
+      )
+    } else {
       out.push(
         useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
-        'source .venv/bin/activate'
+        'source .venv/bin/activate',
+        `${pipInstall} "specforge[${spec}]" ${index}`
       )
     }
-    const flags = ['-e', '.']
-    if (noDeps) flags.push('--no-deps')
-    if (useUv) out.push(`uv pip install${hw === 'cuda' ? '' : ' --system'} ${flags.join(' ')}`)
-    else out.push(`${hw === 'cuda' ? 'pip' : 'python -m pip'} install ${flags.join(' ')}`)
-  } else {
-    const pkg = ['specforge']
-    if (noDeps) pkg.push('--no-deps')
-    if (useUv) out.push(`uv pip install${hw === 'cuda' ? '' : ' --system'} ${pkg.join(' ')}`)
-    else out.push(`${hw === 'cuda' ? 'pip' : 'python -m pip'} install ${pkg.join(' ')}`)
+    if (extras.value.includes('fa')) {
+      out.push(
+        '# flash-attn builds from source against the torch installed above',
+        `${useUv ? 'uv pip' : 'pip'} install ninja packaging`,
+        `MAX_JOBS=8 ${useUv ? 'uv pip' : 'pip'} install flash-attn --no-build-isolation`
+      )
+    }
+    return out
   }
+
+  if (hw === 'npu') {
+    // The npu extra pins a CPU torch plus torch_npu / triton / triton_ascend.
+    // pip does not read [tool.uv.sources], so it needs the PyTorch CPU index
+    // on the command line; uv only needs it for the PyPI release, which
+    // carries no source routing. The NPU build of SGLang, sgl_kernel_npu and
+    // hccl are not on PyPI and must already be installed from the CANN stack.
+    // No --pre: the torch_npu pre-release is an exact pin, and a global --pre
+    // would pull pre-release builds of unrelated packages. Python 3.11 is the
+    // newest interpreter with triton_ascend wheels.
+    const spec = ['npu', ...extras.value].join(',')
+    const index = '--extra-index-url https://download.pytorch.org/whl/cpu'
+    const pipInstall = useUv ? 'uv pip install' : 'pip install'
+    out.push('# On an Ascend host with CANN, an NPU-enabled SGLang and sgl_kernel_npu installed')
+    if (fromSource) {
+      out.push(
+        `git clone ${REPO}`,
+        'cd SpecForge',
+        useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
+        'source .venv/bin/activate',
+        useUv ? `${pipInstall} -e ".[${spec}]"` : `${pipInstall} -e ".[${spec}]" ${index}`
+      )
+    } else {
+      out.push(
+        useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
+        'source .venv/bin/activate',
+        `${pipInstall} "specforge[${spec}]" ${index}`
+      )
+    }
+    return out
+  }
+
+  // ROCm: the accelerator stack (torch, SGLang) already exists in the
+  // container, so install SpecForge without dependencies.
+  const pip = useUv ? 'uv pip install --system' : 'python -m pip install'
+  out.push('# Run inside the SGLang ROCm release container')
+  if (fromSource) {
+    out.push(`git clone ${REPO}`, 'cd SpecForge', `${pip} -e . --no-deps`)
+  } else {
+    out.push(`${pip} specforge --no-deps`)
+  }
+  const pkgs: string[] = []
+  if (extras.value.includes('liger')) pkgs.push('liger-kernel')
+  if (extras.value.includes('dev')) pkgs.push('pre-commit')
+  if (pkgs.length) out.push(`${pip} ${pkgs.join(' ')}`)
   return out
 })
 
@@ -95,13 +193,17 @@ const note = computed(() => {
       }
     case 'npu':
       return {
-        text: 'Install the vendor-matched PyTorch, torch_npu and a compatible SGLang/Mooncake service first. The launcher detects the NPU and selects HCCL.',
+        text: 'The npu extra pins a CPU PyTorch plus torch_npu, triton and triton_ascend from the PyTorch CPU index and PyPI. The NPU build of SGLang, sgl_kernel_npu and hccl come from your CANN stack and must be installed first. The launcher detects the NPU and selects HCCL.',
         link: '/basic_usage/Ascend/ascend_npu',
         label: 'Ascend NPU tutorial',
       }
     default:
       return {
-        text: 'Install a CUDA build of PyTorch that matches the host driver. Installing from source is recommended so you get the latest recipes and patches.',
+        text:
+          'The cuda extra pins CUDA 13 builds of PyTorch and sglang-kernel; CUDA 13 is the only supported NVIDIA path.' +
+          (version.value === 'release'
+            ? ' The hardware extras ship with the first release after 0.2.0; on older releases install from source.'
+            : ' Installing from source is recommended so you get the latest recipes and patches.'),
         link: '/get_started/installation',
         label: 'Installation guide',
       }
@@ -113,10 +215,11 @@ function tokens(line: string): { t: string; c: string }[] {
   if (line.startsWith('#')) return [{ t: line, c: 'c' }]
   return line.split(' ').map((word, i) => {
     let c = ''
-    if (i === 0 && KEYWORDS.has(word)) c = 'k'
+    if ((i === 0 || (i === 1 && line.startsWith('MAX_JOBS'))) && KEYWORDS.has(word)) c = 'k'
     else if (word === 'install' || word === 'clone' || word === 'venv' || word === 'activate') c = 'f'
     else if (word.startsWith('-')) c = 'o'
     else if (word.startsWith('http')) c = 's'
+    else if (i === 0 && word.includes('=')) c = 'o'
     return { t: word, c }
   })
 }
@@ -145,8 +248,23 @@ async function copy() {
           class="is-pill"
           :class="{ active: hardware === h.key }"
           :aria-checked="hardware === h.key"
-          @click="hardware = h.key; persist()"
+          @click="setHardware(h.key)"
         >{{ h.label }}</button>
+      </div>
+    </div>
+    <div class="is-row">
+      <span class="is-label">Version</span>
+      <div class="is-pills" role="radiogroup" aria-label="SpecForge version">
+        <button
+          v-for="v in VERSIONS"
+          :key="v.key"
+          type="button"
+          role="radio"
+          class="is-pill"
+          :class="{ active: version === v.key }"
+          :aria-checked="version === v.key"
+          @click="version = v.key; persist()"
+        >{{ v.label }}</button>
       </div>
     </div>
     <div class="is-row">
@@ -165,18 +283,20 @@ async function copy() {
       </div>
     </div>
     <div class="is-row">
-      <span class="is-label">Package</span>
-      <div class="is-pills" role="radiogroup" aria-label="Package source">
+      <span class="is-label">Extras</span>
+      <div class="is-pills" role="group" aria-label="Optional extras">
         <button
-          v-for="s in SOURCES"
-          :key="s.key"
+          v-for="e in EXTRAS"
+          :key="e.key"
           type="button"
-          role="radio"
-          class="is-pill"
-          :class="{ active: source === s.key }"
-          :aria-checked="source === s.key"
-          @click="source = s.key; persist()"
-        >{{ s.label }}</button>
+          role="checkbox"
+          class="is-pill is-check"
+          :class="{ active: extras.includes(e.key) }"
+          :aria-checked="extras.includes(e.key)"
+          :disabled="extraDisabled(e)"
+          :title="extraDisabled(e) ? 'flash-attn is CUDA only' : e.hint"
+          @click="toggleExtra(e.key)"
+        >{{ e.label }}</button>
       </div>
     </div>
 
@@ -209,6 +329,9 @@ async function copy() {
   background: var(--vp-c-bg);
   box-shadow: 0 12px 40px rgba(20, 60, 90, 0.08);
 }
+/* Inside a docs page the default theme adds margins to <p>/<pre>; reset them. */
+.vp-doc .is { margin: 20px 0; }
+.vp-doc .is p, .vp-doc .is pre { margin: 0; }
 .is-row {
   display: flex;
   align-items: center;
@@ -229,7 +352,8 @@ async function copy() {
   cursor: pointer;
   transition: all 0.15s;
 }
-.is-pill:hover { color: var(--vp-c-text-1); border-color: var(--vp-c-text-3); }
+.is-pill:hover:not(:disabled) { color: var(--vp-c-text-1); border-color: var(--vp-c-text-3); }
+.is-pill:disabled { opacity: 0.45; cursor: not-allowed; }
 .is-pill:focus-visible, .is-copy:focus-visible, .is-cmd:focus-visible {
   outline: 2px solid var(--vp-c-brand-1);
   outline-offset: 2px;
@@ -239,6 +363,15 @@ async function copy() {
   border-color: var(--vp-c-text-1);
   color: var(--vp-c-bg);
 }
+.is-check::before {
+  content: '+';
+  display: inline-block;
+  width: 1em;
+  margin-right: 2px;
+  font-weight: 600;
+  opacity: 0.7;
+}
+.is-check.active::before { content: '✓'; opacity: 1; }
 .is-cmd-head {
   display: flex;
   align-items: center;
