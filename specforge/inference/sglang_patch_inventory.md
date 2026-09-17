@@ -13,6 +13,7 @@ Online training uses one of these source-specific patches:
 |---|---|---|
 | SGLang v0.5.18 | [`patches/sglang/v0.5.18/spec-capture.patch`](../../patches/sglang/v0.5.18/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 | Kimi K3 SGLang `9acd9cb` (`f8493a4` compatible) | [`patches/sglang/kimi-k3-f8493a4/spec-capture.patch`](../../patches/sglang/kimi-k3-f8493a4/spec-capture.patch) | EAGLE3, DFlash, DSpark |
+| SGLang main `923e4a56` (2026-09-16; DeepSeek-V4.1 and anything newer than v0.5.18) | [`patches/sglang/main-923e4a56/spec-capture.patch`](../../patches/sglang/main-923e4a56/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 
 The patch adds `--enable-spec-capture` and a server-side sink that:
 
@@ -53,9 +54,12 @@ an LM-head-scaled hidden state into the logits processor. The capture patch
 restores the pre-head-scale post-norm representation because SpecForge folds
 the same multiplier into the frozen target head used during training.
 
-Apply the default patch with `scripts/apply_sglang_spec_capture_patch.sh`, or
+Apply the default patch with `scripts/apply_sglang_spec_capture_patch.sh`,
 the K3 patch with
-`scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb`.
+`scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb`, or the
+main patch with `scripts/apply_sglang_spec_capture_patch.sh --target main-923e4a56`
+(no version gate: a main checkout reports a dev version, so `git apply --check`
+is the compatibility gate; regenerate the patch when moving to a newer main).
 On the default patch, `--spec-capture-method dspark` rides the DFlash aux
 plumbing (`set_dflash_layers_to_capture`), which stock v0.5.18 models, including
 Inkling, implement; DSpark and DFlash capture the same aux/last-hidden artifacts,

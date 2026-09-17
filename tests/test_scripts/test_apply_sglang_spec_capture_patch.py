@@ -136,6 +136,27 @@ class ApplySglangSpecCapturePatchTest(unittest.TestCase):
         self.assertNotIn("WARNING: installed sglang is", result.stderr)
         self.assertEqual(self.example.read_text(encoding="utf-8"), "new patched\n")
 
+    @unittest.skipUnless(
+        os.environ.get("SPECFORGE_SGLANG_MAIN_CHECKOUT"),
+        "set SPECFORGE_SGLANG_MAIN_CHECKOUT to an sglang checkout at 923e4a56",
+    )
+    def test_main_923e4a56_patch_applies_to_the_pinned_checkout(self) -> None:
+        # The checked-in main patch against a real checkout, applied exactly
+        # the way the script does it (from the package parent, -p2, with
+        # repository discovery stopped there).
+        checkout = Path(os.environ["SPECFORGE_SGLANG_MAIN_CHECKOUT"])
+        package_parent = checkout / "python"
+        self.assertTrue((package_parent / "sglang").is_dir(), package_parent)
+        patch = ROOT / "patches" / "sglang" / "main-923e4a56" / "spec-capture.patch"
+        result = subprocess.run(
+            ["git", "-C", str(package_parent), "apply", "--check", "-p2", str(patch)],
+            check=False,
+            capture_output=True,
+            env={**os.environ, "GIT_CEILING_DIRECTORIES": str(checkout)},
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_removed_v0514_target(self) -> None:
         result = self.run_script("--target", "v0.5.14")
 
