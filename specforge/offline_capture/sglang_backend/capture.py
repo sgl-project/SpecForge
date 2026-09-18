@@ -91,7 +91,7 @@ class OfflineSGLangCaptureBackend:
             % (server_args.tp_size // server_args.moe_dp_size)
             // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
         )
-        gpu_id = torch.cuda.current_device()
+        gpu_id = torch.get_device_module().current_device()
         parallel_state = ParallelState(
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,

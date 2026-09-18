@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from contextlib import contextmanager
+from functools import lru_cache
 
 import torch
 import torch.distributed as dist
@@ -142,7 +143,8 @@ def get_device_type() -> str:
     1. SPECFORGE_DEVICE environment variable
     2. NVIDIA CUDA (torch.cuda)
     3. Ascend NPU (torch.npu)
-    4. CPU fallback
+    4. Intel GPU (torch.xpu)
+    5. CPU fallback
     """
     dt = os.environ.get("SPECFORGE_DEVICE", None)
     if dt:
@@ -151,6 +153,8 @@ def get_device_type() -> str:
         return "cuda"
     if hasattr(torch, "npu") and torch.npu.is_available():
         return "npu"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
     return "cpu"
 
 
@@ -162,6 +166,8 @@ def get_local_device() -> torch.device:
         return torch.device("cuda", local_rank)
     if device_type == "npu":
         return torch.device("npu", local_rank)
+    if device_type == "xpu":
+        return torch.device("xpu", local_rank)
     return torch.device("cpu")
 
 
@@ -274,3 +280,8 @@ def safe_conversations_generator(file_path):
             except Exception as e:
                 logger.warning(f"Skipping line {i + 1}: {e}")
                 continue
+
+
+@lru_cache(maxsize=1)
+def is_xpu() -> bool:
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
