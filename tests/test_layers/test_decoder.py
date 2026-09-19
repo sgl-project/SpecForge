@@ -127,9 +127,7 @@ def _assert_adapter_contract(
         global_input_ids=torch.zeros((1, padded_len), dtype=torch.long, device=device),
         attention_mask=torch.ones((1, padded_len), device=device),
         loss_mask=torch.ones((1, padded_len, 1), device=device),
-        position_ids=torch.arange(
-            local_seq_len, device=device
-        ).unsqueeze(0),
+        position_ids=torch.arange(local_seq_len, device=device).unsqueeze(0),
         hidden_states=torch.zeros((1, padded_len, 8), device=device),
         target_p_padded=torch.zeros((1, padded_len, 8), device=device),
         position_mask=torch.ones((1, padded_len, 1), device=device),

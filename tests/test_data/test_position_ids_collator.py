@@ -40,9 +40,9 @@ class PositionIdsCollatorTest(unittest.TestCase):
         # Ordinary alignment padding remains, but Ulysses does not multiply
         # position width: RoPE runs before the sequence exchange.
         self.assertEqual(batch["input_ids"].shape, (1, 6))
-        self.assertTrue(torch.equal(
-            batch["position_ids"], torch.tensor([[4, 5, 6, 7, 0, 0]])
-        ))
+        self.assertTrue(
+            torch.equal(batch["position_ids"], torch.tensor([[4, 5, 6, 7, 0, 0]]))
+        )
 
     def test_collates_generic_3d_position_ids(self):
         features = [
