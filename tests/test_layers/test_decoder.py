@@ -128,7 +128,7 @@ def _assert_adapter_contract(
         attention_mask=torch.ones((1, padded_len), device=device),
         loss_mask=torch.ones((1, padded_len, 1), device=device),
         position_ids=torch.arange(
-            local_seq_len * sp_ulysses_size, device=device
+            local_seq_len, device=device
         ).unsqueeze(0),
         hidden_states=torch.zeros((1, padded_len, 8), device=device),
         target_p_padded=torch.zeros((1, padded_len, 8), device=device),
@@ -137,7 +137,7 @@ def _assert_adapter_contract(
     )
     assert state.input_ids.shape[1] == local_seq_len
     assert state.hidden_states.shape[1] == local_seq_len
-    assert state.position_ids.shape[1] == local_seq_len * sp_ulysses_size
+    assert state.position_ids.shape[1] == local_seq_len
 
 
 def _run_decoder_parity(
