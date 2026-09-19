@@ -121,11 +121,6 @@ class DataCollatorWithPadding:
         """
         max_length = max(item["input_ids"].shape[1] for item in features)
 
-        # pad for sequence parrel
-        max_length = (
-            (max_length + self.sp_degree - 1) // self.sp_degree
-        ) * self.sp_degree
-
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
         )
