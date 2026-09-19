@@ -125,8 +125,6 @@ class DataCollatorWithPadding:
         max_length = (
             (max_length + self.sp_degree - 1) // self.sp_degree
         ) * self.sp_degree
-        # position max len, ulysses do not need chuck position ids
-        position_max_len = max_length * self.ulysses_degree
 
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
@@ -160,7 +158,7 @@ class DataCollatorWithPadding:
             else:
                 batch_position_ids = torch.cat(
                     [
-                        self.paddingtensor2D(item["position_ids"], position_max_len)
+                        self.paddingtensor2D(item["position_ids"], max_length)
                         for item in features
                     ]
                 )
