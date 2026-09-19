@@ -21,9 +21,13 @@ def _raw(length):
 
 def _batch_and_view(raw, *, rank, ulysses, ring, max_len, overlap):
     shard = OfflineEagle3Dataset.process_data_usp(
-        raw, max_len=max_len, ttt_length=overlap,
-        sp_rank=rank, sp_size=ulysses * ring,
-        ring_rank=rank // ulysses, sp_ring_size=ring,
+        raw,
+        max_len=max_len,
+        ttt_length=overlap,
+        sp_rank=rank,
+        sp_size=ulysses * ring,
+        ring_rank=rank // ulysses,
+        sp_ring_size=ring,
     )
     # Only topology sizes are needed for these CPU-only contracts.
     collator = DataCollatorWithPadding.__new__(DataCollatorWithPadding)
@@ -50,8 +54,12 @@ class UspPositionIdsTest(unittest.TestCase):
         for rank in (0, 1):
             with self.subTest(rank=rank):
                 shard, view = _batch_and_view(
-                    _raw(8), rank=rank, ulysses=2, ring=1,
-                    max_len=8, overlap=1,
+                    _raw(8),
+                    rank=rank,
+                    ulysses=2,
+                    ring=1,
+                    max_len=8,
+                    overlap=1,
                 )
                 expected = torch.arange(rank * 4, (rank + 1) * 4).unsqueeze(0)
                 torch.testing.assert_close(shard["position_ids"], expected)
@@ -66,12 +74,20 @@ class UspPositionIdsTest(unittest.TestCase):
                     chunk = (global_len + ulysses * ring - 1) // (ulysses * ring)
                     for rank in range(ulysses * ring):
                         with self.subTest(
-                            ulysses=ulysses, ring=ring, length=length,
-                            max_len=max_len, overlap=overlap, rank=rank,
+                            ulysses=ulysses,
+                            ring=ring,
+                            length=length,
+                            max_len=max_len,
+                            overlap=overlap,
+                            rank=rank,
                         ):
                             shard, view = _batch_and_view(
-                                raw, rank=rank, ulysses=ulysses, ring=ring,
-                                max_len=max_len, overlap=overlap,
+                                raw,
+                                rank=rank,
+                                ulysses=ulysses,
+                                ring=ring,
+                                max_len=max_len,
+                                overlap=overlap,
                             )
                             block_start = rank * chunk
                             expected_positions = torch.arange(
@@ -102,11 +118,15 @@ class UspPositionIdsTest(unittest.TestCase):
                             last = global_len - 1 - start
                             if 0 <= last < valid:
                                 expected_loss[0, last] = 0
-                            torch.testing.assert_close(shard["loss_mask"], expected_loss)
+                            torch.testing.assert_close(
+                                shard["loss_mask"], expected_loss
+                            )
                             for name, width in (("hidden_state", 6), ("target", 2)):
                                 torch.testing.assert_close(
                                     shard[name],
-                                    expected_ids.unsqueeze(-1).expand(-1, -1, width).float(),
+                                    expected_ids.unsqueeze(-1)
+                                    .expand(-1, -1, width)
+                                    .float(),
                                 )
                     self.assertTrue(raw["loss_mask"].all())
 
