@@ -185,7 +185,7 @@ class TestTrimAdapterViews(unittest.TestCase):
         self.assertEqual(view.input_ids.shape, (1, 6))
         self.assertEqual(view.hidden_states.shape, (1, 6, 3))
         self.assertEqual(view.attention_mask.shape, (1, 6))
-        self.assertEqual(view.position_ids.shape, (1, 12))
+        self.assertEqual(view.position_ids.shape, (1, 6))
 
 
 @unittest.skipUnless(CUDA, "loss kernel is a Triton kernel")
