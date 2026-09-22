@@ -431,9 +431,21 @@ class DFlash2DraftModel(DFlashDraftModel):
             initializer_range=float(config.initializer_range),
         )
 
+    def unary_logits_transform_is_identity(self) -> bool:
+        """Whether ``transform_unary_logits`` only upcasts to FP32."""
+
+        method_config = self._dflash2_config()
+        return (
+            float(method_config.get("output_multiplier", 1.0)) == 1.0
+            and method_config.get("final_logit_softcapping") is None
+        )
+
     def transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply the public DFlash2 unary-logit transform used by SGLang."""
 
+        if self.unary_logits_transform_is_identity():
+            # ``x * 1.0 == x`` bit for bit; skip the extra FP32 logit tensor.
+            return logits.float()
         method_config = self._dflash2_config()
         transformed = logits.float() * float(
             method_config.get("output_multiplier", 1.0)
