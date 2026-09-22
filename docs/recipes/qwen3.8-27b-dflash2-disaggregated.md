@@ -247,8 +247,9 @@ server; `--plan` prints each resulting server command and environment:
 
 The schema rejects passthrough flags that SpecForge renders itself (model
 path, port, TP size, dtype, context length, chunked prefill and the capture
-flags) or that another `model.sglang_*` field already sets, and environment
-keys it owns (`MOONCAKE_*`, `DISAGG_*`, device visibility). On the two-node
+flags) or that another `model.sglang_*` field already sets, abbreviations of
+those, `--api-key`, SGLang DP options and `--config`, and environment keys it
+owns (`MOONCAKE_*`, `DISAGG_*`, device visibility). On the two-node
 wrapper, `SERVER_EXTRA_ARGS_APPEND` adds flags after the recipe's server
 defaults, and exported variables reach every server.
 

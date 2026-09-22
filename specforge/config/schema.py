@@ -47,6 +47,19 @@ SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
     "--port": "capture_servers[].port",
     "--context-length": "model.sglang_context_length",
 }
+#: Passthrough flags a managed-local capture server must not receive, and why.
+_SGLANG_UNSUPPORTED_FLAGS: Mapping[str, str] = {
+    # /health stays open under --api-key, so the stack would start and then
+    # fail every unauthenticated capture /generate.
+    "--api-key": "the capture adapter sends no API key to its /generate calls",
+    "--enable-dp-attention": (
+        "managed_local capture servers do not support SGLang DP options"
+    ),
+    "--enable-dp-lm-head": (
+        "managed_local capture servers do not support SGLang DP options"
+    ),
+    "--config": "SGLang merges that file unchecked; list its flags instead",
+}
 #: Other SGLang v0.5.18 spellings of the same server options.
 _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
     "--model-path": ("--model",),
@@ -108,14 +121,21 @@ def _as_string_tokens(value, *, field_name: str):
 
 
 def _validate_sglang_extra_args(
-    tokens: List[str], *, field_name: str, reserved: Mapping[str, str]
+    tokens: List[str],
+    *,
+    field_name: str,
+    reserved: Mapping[str, str],
+    guarded: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Reject passthrough tokens that repeat or split a rendered SGLang flag.
 
     *reserved* maps every flag spelling already on the server command line to
     the setting that owns it. Flags are the ``--``-prefixed tokens; the rest
-    are their values, so the list must open with a flag.
+    are their values, so the list must open with a flag. SGLang's parser also
+    expands unambiguous prefixes, so a flag that abbreviates a *guarded*
+    spelling (default: *reserved*) or an unsupported flag is rejected too.
     """
+    guarded = reserved if guarded is None else guarded
     if tokens and not tokens[0].startswith("--"):
         raise ValueError(f"{field_name} must start with a --flag, got {tokens[0]!r}")
     seen = set()
@@ -132,6 +152,21 @@ def _validate_sglang_extra_args(
             raise ValueError(
                 f"{field_name} must not set {flag}; it is rendered from "
                 f"{reserved[flag]}"
+            )
+        if flag in _SGLANG_UNSUPPORTED_FLAGS:
+            raise ValueError(
+                f"{field_name} must not set {flag}; "
+                f"{_SGLANG_UNSUPPORTED_FLAGS[flag]}"
+            )
+        expansions = sorted(
+            spelling
+            for spelling in (*guarded, *_SGLANG_UNSUPPORTED_FLAGS)
+            if spelling != flag and spelling.startswith(flag)
+        )
+        if expansions:
+            raise ValueError(
+                f"{field_name} entry {flag} is a prefix of {expansions[0]}, "
+                "which SGLang would expand it to; spell out the full flag"
             )
         canonical = _SGLANG_CANONICAL_FLAGS.get(flag, flag)
         if canonical in seen:
@@ -1157,7 +1192,8 @@ class Config(StrictConfigModel):
                     f"tp sizes: {incompatible_tp_sizes}"
                 )
             # A flag is set in exactly one place on each server command line.
-            reserved = self.model.rendered_sglang_flags()
+            rendered = self.model.rendered_sglang_flags()
+            reserved = dict(rendered)
             global_flags = {
                 token.split("=", 1)[0]: "model.sglang_extra_args"
                 for token in self.model.sglang_extra_args
@@ -1170,6 +1206,10 @@ class Config(StrictConfigModel):
                     server.extra_args,
                     field_name=f"managed_local.capture_servers[{index}].extra_args",
                     reserved=reserved,
+                    # Global passthrough flags guard exact repeats only: a
+                    # global --enable-metrics-for-all-schedulers still allows
+                    # a distinct per-server --enable-metrics.
+                    guarded=rendered,
                 )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")

@@ -850,7 +850,7 @@ class LaunchPlanTest(unittest.TestCase):
                 sglang_linear_attn_prefill_backend="triton",
                 sglang_fp8_gemm_backend="deep_gemm",
                 sglang_disable_cuda_graph=True,
-                sglang_extra_args=["--enable-metrics", "--api-key", "top-secret"],
+                sglang_extra_args=["--enable-metrics", "--admin-api-key", "top-secret"],
             )
             cfg = Config.model_validate(raw)
             with mock.patch(
@@ -875,14 +875,14 @@ class LaunchPlanTest(unittest.TestCase):
             first.argv[-5:],
             (
                 "--enable-metrics",
-                "--api-key",
+                "--admin-api-key",
                 "top-secret",
                 "--prefill-max-requests",
                 "4",
             ),
         )
         self.assertEqual(
-            second.argv[-3:], ("--enable-metrics", "--api-key", "top-secret")
+            second.argv[-3:], ("--enable-metrics", "--admin-api-key", "top-secret")
         )
         self.assertEqual(first.env["SGLANG_SPEC_CAPTURE_TIMING"], "1")
         self.assertEqual(first.env["SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES"], "2")
@@ -896,7 +896,7 @@ class LaunchPlanTest(unittest.TestCase):
             services[1]["command"]["argv"][-5:],
             [
                 "--enable-metrics",
-                "--api-key",
+                "--admin-api-key",
                 "<redacted>",
                 "--prefill-max-requests",
                 "4",
@@ -964,6 +964,38 @@ class LaunchPlanTest(unittest.TestCase):
                 model(sglang_extra_args=["--enable-metrics", True]),
                 "quote boolean-looking values",
             ),
+            # /health stays open under --api-key; every capture call would 401.
+            "api key": (
+                model(sglang_extra_args=["--api-key", "x"]),
+                "must not set --api-key; the capture adapter sends no API key",
+            ),
+            # The typed sglang_enable_dp_* fields are rejected for managed_local.
+            "dp attention": (
+                model(sglang_extra_args=["--enable-dp-attention"]),
+                "must not set --enable-dp-attention; managed_local capture "
+                "servers do not support SGLang DP options",
+            ),
+            "server dp lm head": (
+                server(extra_args=["--enable-dp-lm-head"]),
+                "must not set --enable-dp-lm-head",
+            ),
+            "sglang config file": (
+                model(sglang_extra_args=["--config", "server.yaml"]),
+                "must not set --config",
+            ),
+            # SGLang's argparse expands unambiguous prefixes.
+            "abbreviated owned flag": (
+                model(sglang_extra_args=["--context-len=4096"]),
+                "--context-len is a prefix of --context-length",
+            ),
+            "server abbreviates a rendered field": (
+                server(extra_args=["--mem-fraction", "0.5"]),
+                "--mem-fraction is a prefix of --mem-fraction-static",
+            ),
+            "abbreviated unsupported flag": (
+                model(sglang_extra_args=["--enable-dp-att"]),
+                "is a prefix of --enable-dp-attention",
+            ),
             "server owned flag": (
                 server(extra_args=["--port", "30005"]),
                 r"--port; it is rendered from capture_servers\[\].port",
@@ -1006,6 +1038,23 @@ class LaunchPlanTest(unittest.TestCase):
                 mutate(raw)
                 with self.assertRaisesRegex(ValidationError, message):
                     Config.model_validate(raw)
+
+        # Distinct flags that merely share a prefix with another stay valid.
+        raw = cfg.model_dump()
+        model(
+            sglang_extra_args=[
+                "--enable-metrics-for-all-schedulers",
+                "--disable-cuda-graph-padding",
+                "--admin-api-key",
+                "k",
+            ]
+        )(raw)
+        server(extra_args=["--enable-metrics"])(raw)
+        valid = Config.model_validate(raw)
+        self.assertEqual(
+            valid.deployment.disaggregated.managed_local.capture_servers[0].extra_args,
+            ["--enable-metrics"],
+        )
 
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (
