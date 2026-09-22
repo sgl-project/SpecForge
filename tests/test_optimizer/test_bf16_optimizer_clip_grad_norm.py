@@ -1,6 +1,8 @@
+import copy
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -14,6 +16,73 @@ def _make_optimizer(seed=0, **kwargs):
     torch.manual_seed(seed)
     model = torch.nn.Linear(8, 8, bias=False)
     return model, BF16Optimizer(model, lr=1e-3, max_grad_norm=0.5, **kwargs)
+
+
+_ADAMW = torch.optim.AdamW
+
+
+def _unfused_adamw(params, *, fused=None, **kwargs):
+    del fused
+    return _ADAMW(params, **kwargs)
+
+
+class _LegacyBF16Optimizer(BF16Optimizer):
+    """The pre-foreach step: unfused AdamW, per-parameter kernels, host syncs."""
+
+    def __init__(self, *args, **kwargs):
+        with mock.patch("torch.optim.AdamW", _unfused_adamw):
+            super().__init__(*args, **kwargs)
+
+    def step(self):
+        grads = [p.grad.detach() for p in self.model_params if p.grad is not None]
+        norm_sq = torch.stack([grad.float().square().sum() for grad in grads]).sum()
+        grad_norm, clip_coefficient = self._reduce_grad_norm(norm_sq)
+        if not bool(torch.isfinite(grad_norm)):
+            raise FloatingPointError("non-finite global grad norm")
+        with torch.no_grad():
+            for p, mp in zip(self.model_params, self.fp32_params):
+                master_grad = p.grad.detach().to(device=mp.device, dtype=torch.float32)
+                master_grad.mul_(clip_coefficient)
+                mp.grad = master_grad
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.scheduler.step()
+        with torch.no_grad():
+            for p, mp in zip(self.model_params, self.fp32_params):
+                p.data.copy_(mp.data.to(device=p.device, dtype=p.dtype))
+                p.grad = None
+        return grad_norm
+
+
+def _run_legacy_and_current(device, *, max_grad_norm, steps=3):
+    """Drive both implementations with identical bf16 params and gradients."""
+    torch.manual_seed(11)
+    base = torch.nn.Sequential(
+        torch.nn.Linear(16, 32), torch.nn.GELU(), torch.nn.Linear(32, 8)
+    ).to(device, torch.bfloat16)
+    legacy_model, current_model = copy.deepcopy(base), copy.deepcopy(base)
+    options = dict(
+        lr=1e-2,
+        weight_decay=0.01,
+        max_grad_norm=max_grad_norm,
+        total_steps=10,
+        warmup_ratio=0.0,
+    )
+    legacy = _LegacyBF16Optimizer(legacy_model, **options)
+    current = BF16Optimizer(current_model, **options)
+    generator = torch.Generator(device=device).manual_seed(5)
+    norms = []
+    for _ in range(steps):
+        for legacy_param, current_param in zip(
+            legacy_model.parameters(), current_model.parameters()
+        ):
+            grad = torch.randn(
+                legacy_param.shape, device=device, generator=generator
+            ).mul_(3)
+            legacy_param.grad = grad.to(torch.bfloat16)
+            current_param.grad = grad.to(torch.bfloat16)
+        norms.append((legacy.step(), current.step()))
+    return legacy, current, norms
 
 
 class TestClipGradNormSingleProcess(unittest.TestCase):
@@ -63,6 +132,83 @@ class TestClipGradNormSingleProcess(unittest.TestCase):
         self.assertFalse(optimizer.optimizer.state)
         self.assertTrue(all(param.grad is None for param in optimizer.model_params))
         self.assertTrue(all(param.grad is None for param in optimizer.fp32_params))
+
+    def test_matches_legacy_step_within_fp32_rounding_with_clipping(self):
+        legacy, current, norms = _run_legacy_and_current("cpu", max_grad_norm=0.5)
+
+        for legacy_norm, current_norm in norms:
+            self.assertGreater(float(legacy_norm), 0.5)  # clipping is active
+            torch.testing.assert_close(current_norm, legacy_norm, rtol=1e-6, atol=0)
+        for legacy_master, current_master in zip(
+            legacy.fp32_params, current.fp32_params
+        ):
+            torch.testing.assert_close(
+                current_master, legacy_master, rtol=1e-5, atol=1e-7
+            )
+
+    def test_matches_legacy_step_bitwise_without_clipping(self):
+        legacy, current, _norms = _run_legacy_and_current("cpu", max_grad_norm=1e9)
+
+        for legacy_master, current_master in zip(
+            legacy.fp32_params, current.fp32_params
+        ):
+            torch.testing.assert_close(current_master, legacy_master, rtol=0, atol=0)
+        for legacy_param, current_param in zip(
+            legacy.model_params, current.model_params
+        ):
+            torch.testing.assert_close(current_param, legacy_param, rtol=0, atol=0)
+
+    def test_valid_loss_denominator_does_not_change_the_update(self):
+        plain_model, plain = _make_optimizer(seed=4)
+        checked_model, checked = _make_optimizer(seed=4)
+        grad = torch.linspace(-2.0, 3.0, 64).reshape(8, 8)
+        plain_model.weight.grad = grad.clone()
+        checked_model.weight.grad = grad.clone()
+
+        plain_norm = plain.step()
+        checked_norm = checked.step(loss_denominator=torch.tensor(12.0))
+
+        torch.testing.assert_close(checked_norm, plain_norm, rtol=0, atol=0)
+        torch.testing.assert_close(
+            checked_model.weight, plain_model.weight, rtol=0, atol=0
+        )
+
+    def test_invalid_loss_denominator_fails_before_any_state_changes(self):
+        for denominator in (0.0, -2.0, float("nan"), float("inf")):
+            with self.subTest(denominator=denominator):
+                model, optimizer = _make_optimizer()
+                model_before = model.weight.detach().clone()
+                scheduler_epoch_before = optimizer.scheduler.last_epoch
+                model.weight.grad = torch.full_like(model.weight, 0.1)
+
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    optimizer.step(loss_denominator=torch.tensor(denominator))
+
+                torch.testing.assert_close(model.weight, model_before)
+                self.assertEqual(optimizer.scheduler.last_epoch, scheduler_epoch_before)
+                self.assertFalse(optimizer.optimizer.state)
+                self.assertIsNone(model.weight.grad)
+                self.assertTrue(all(mp.grad is None for mp in optimizer.fp32_params))
+
+    def test_loaded_fused_flag_follows_this_runs_master_device(self):
+        model, source = _make_optimizer(seed=2)
+        model.weight.grad = torch.full_like(model.weight, 0.05)
+        source.step()
+        checkpoint = copy.deepcopy(source.state_dict())
+        # A checkpoint written by a fused CUDA run records fused=True and
+        # device step counters; CPU masters must keep the unfused kernel.
+        for group in checkpoint["optimizer_state_dict"]["param_groups"]:
+            group["fused"] = True
+
+        _target_model, target = _make_optimizer(seed=9)
+        with mock.patch("specforge.optimizer.print_on_rank0"):
+            target.load_state_dict(checkpoint)
+
+        self.assertTrue(
+            all(group["fused"] is None for group in target.optimizer.param_groups)
+        )
+        for state in target.optimizer.state.values():
+            self.assertEqual(state["step"].device.type, "cpu")
 
     def test_backend_configures_sharded_and_replicated_optimizers(self):
         class RecordingOptimizer:
@@ -194,6 +340,72 @@ class TestClipGradNormSingleProcess(unittest.TestCase):
                 if isinstance(tensor, torch.Tensor)
             )
         )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestBF16OptimizerCuda(unittest.TestCase):
+    def test_fused_step_matches_legacy_within_fp32_rounding(self):
+        legacy, current, norms = _run_legacy_and_current("cuda", max_grad_norm=0.5)
+
+        self.assertTrue(all(group["fused"] for group in current.optimizer.param_groups))
+        for legacy_norm, current_norm in norms:
+            self.assertGreater(float(legacy_norm), 0.5)  # clipping is active
+            torch.testing.assert_close(current_norm, legacy_norm, rtol=1e-6, atol=0)
+        for legacy_master, current_master in zip(
+            legacy.fp32_params, current.fp32_params
+        ):
+            torch.testing.assert_close(
+                current_master, legacy_master, rtol=1e-5, atol=1e-6
+            )
+
+    def test_unfused_checkpoint_resumes_on_the_fused_kernel(self):
+        torch.manual_seed(1)
+        model = torch.nn.Linear(8, 8, bias=False).cuda()
+        with mock.patch("torch.optim.AdamW", _unfused_adamw):
+            legacy = BF16Optimizer(model, lr=1e-3, max_grad_norm=0.5)
+        model.weight.grad = torch.full_like(model.weight, 0.05)
+        legacy.step()
+        checkpoint = legacy.state_dict()
+        self.assertEqual(
+            next(iter(legacy.optimizer.state.values()))["step"].device.type, "cpu"
+        )
+
+        resumed_model = torch.nn.Linear(8, 8, bias=False).cuda()
+        resumed = BF16Optimizer(resumed_model, lr=1e-3, max_grad_norm=0.5)
+        with mock.patch("specforge.optimizer.print_on_rank0"):
+            resumed.load_state_dict(checkpoint)
+
+        self.assertTrue(all(group["fused"] for group in resumed.optimizer.param_groups))
+        for state in resumed.optimizer.state.values():
+            self.assertTrue(state["step"].is_cuda)
+            self.assertEqual(state["step"].dtype, torch.float32)
+        resumed_model.weight.grad = torch.full_like(resumed_model.weight, 0.05)
+        resumed.step()
+        self.assertEqual(
+            float(next(iter(resumed.optimizer.state.values()))["step"]), 2.0
+        )
+
+    def test_backend_gradient_scaling_matches_per_tensor_mul_bitwise(self):
+        torch.manual_seed(3)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(64, 128), torch.nn.Linear(128, 16, bias=False)
+        ).cuda()
+        model[0].to(torch.bfloat16)
+        backend = FSDPTrainingBackend(ParallelConfig())
+        backend.prepare_model(model, wrap=False)
+        for param in model.parameters():
+            param.grad = torch.randn_like(param).mul_(7)
+        expected = [param.grad.clone() for param in model.parameters()]
+        factor = torch.tensor(8.0, device="cuda") / torch.tensor(
+            1234.567, device="cuda"
+        )
+        for grad in expected:
+            grad.mul_(factor)
+
+        backend.scale_gradients(factor)
+
+        for param, grad in zip(model.parameters(), expected):
+            torch.testing.assert_close(param.grad, grad, rtol=0, atol=0)
 
 
 def _distributed_worker(rank, world_size, init_file, results):
