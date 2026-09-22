@@ -126,6 +126,15 @@ def _validate_algorithm_capabilities(
             "training.trim_loss_positions"
         )
 
+    if (
+        not training.dflash_teacher_metrics
+        and not capabilities.supports_teacher_metrics_opt_out
+    ):
+        raise ValueError(
+            f"algorithm {algorithm.name!r} does not support "
+            "training.dflash_teacher_metrics=false"
+        )
+
 
 def _validate_training_topology(
     cfg: Config,

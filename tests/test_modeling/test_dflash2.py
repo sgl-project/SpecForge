@@ -500,6 +500,82 @@ class CandidateSelectorTest(unittest.TestCase):
         for actual, expected in zip(detailed_gradients, reference_gradients):
             torch.testing.assert_close(actual, expected)
 
+    def test_teacher_metrics_off_drops_only_teacher_families(self):
+        class SelectorDraft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=4,
+                    vocab_size=4,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.02,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        output_hidden = torch.tensor(
+            [[[0.0, 0.0, 0.0, 0.0], [0.0, 4.0, 1.0, 0.0], [0.0, 3.0, 4.0, 2.0]]]
+        )
+        target_hidden = torch.tensor(
+            [[[0.0, 5.0, 0.0, 0.0], [0.0, 0.0, 0.0, 5.0], [0.0, 0.0, 0.0, 0.0]]]
+        )
+
+        def run(draft, *, teacher_metrics, feed_teacher=True):
+            model = OnlineDFlashModel(
+                draft_model=draft,
+                target_lm_head=nn.Identity(),
+                target_embed_tokens=nn.Embedding(4, 4),
+                mask_token_id=3,
+                block_size=3,
+                attention_backend="eager",
+                metric_top_k=2,
+                teacher_metrics=teacher_metrics,
+            )
+            model._forward_draft_blocks = lambda **_kwargs: (
+                torch.tensor([[0]]),
+                torch.tensor([[True]]),
+                output_hidden,
+            )
+            return model(
+                input_ids=torch.tensor([[0, 1, 3]]),
+                hidden_states=torch.zeros(1, 3, 4),
+                loss_mask=torch.ones(1, 3),
+                target_last_hidden_states=target_hidden if feed_teacher else None,
+            )
+
+        def is_teacher_metric(name):
+            return "/teacher/" in name or name.endswith("teacher_argmax_agreement")
+
+        torch.manual_seed(0)
+        for label, draft in (("dflash", nn.Module()), ("dflash2", SelectorDraft())):
+            with self.subTest(draft=label):
+                loss_on, accuracy_on, metrics_on = run(draft, teacher_metrics=True)
+                for feed_teacher in (True, False):
+                    loss_off, accuracy_off, metrics_off = run(
+                        draft, teacher_metrics=False, feed_teacher=feed_teacher
+                    )
+                    ratios_on = metrics_on["ratio_metrics"]
+                    ratios_off = metrics_off["ratio_metrics"]
+                    teacher_keys = {key for key in ratios_on if is_teacher_metric(key)}
+                    self.assertIn("dflash/teacher/unary_overlap_chain_length", teacher_keys)
+                    self.assertEqual(
+                        label == "dflash2",
+                        "dflash2/selector/self_conditioned_teacher_argmax_agreement"
+                        in teacher_keys,
+                    )
+                    self.assertEqual(set(ratios_on) - teacher_keys, set(ratios_off))
+                    for key, (numerator, denominator) in ratios_off.items():
+                        torch.testing.assert_close(numerator, ratios_on[key][0])
+                        torch.testing.assert_close(denominator, ratios_on[key][1])
+                    self.assertEqual(
+                        set(metrics_on["sum_metrics"]), set(metrics_off["sum_metrics"])
+                    )
+                    torch.testing.assert_close(loss_off, loss_on)
+                    torch.testing.assert_close(accuracy_off, accuracy_on)
+
     def test_plain_dflash_draft_reports_family_metrics_without_selector_keys(self):
         # A DFlash draft has neither a candidate selector nor a unary transform.
         model = OnlineDFlashModel(

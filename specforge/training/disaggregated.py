@@ -622,6 +622,9 @@ def _build_online(
     channel = StreamingRefChannel(channel_path)
 
     if cfg.training.role == "producer":
+        from specforge.algorithms.common.providers import (
+            resolve_server_capture_layout,
+        )
         from specforge.inference.adapters.server_capture import (
             ServerCaptureSchema,
             SGLangServerCaptureAdapter,
@@ -667,7 +670,7 @@ def _build_online(
         layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
             cfg, algorithm
         )
-        layout = streaming.layout
+        layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
         capture_schema = ServerCaptureSchema(
             aux_feature=layout.aux_feature,
             last_hidden_feature=layout.last_hidden_feature,

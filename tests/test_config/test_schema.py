@@ -460,6 +460,37 @@ class ConfigSchemaTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, field):
                     Config.model_validate(invalid_payload)
 
+    def test_dflash_teacher_metrics_is_typed_and_dflash_only(self):
+        default_config = Config.model_validate(_online_payload("dflash"))
+        self.assertTrue(default_config.training.dflash_teacher_metrics)
+
+        online = _online_payload("dflash")
+        online["training"]["dflash_teacher_metrics"] = False
+        offline = copy.deepcopy(MINIMAL)
+        offline["training"] = {"strategy": "dflash", "dflash_teacher_metrics": False}
+        for payload in (online, offline):
+            with self.subTest(data=payload["data"]):
+                resolved = resolve_run(Config.model_validate(payload))
+                self.assertFalse(resolved.config.training.dflash_teacher_metrics)
+
+        for invalid in ("maybe", 2, None):
+            with self.subTest(invalid=invalid):
+                payload = _online_payload("dflash")
+                payload["training"]["dflash_teacher_metrics"] = invalid
+                with self.assertRaisesRegex(ValidationError, "dflash_teacher_metrics"):
+                    Config.model_validate(payload)
+
+        # DSpark trains on the final hidden state; the other families never
+        # request it, so the opt-out would be silently meaningless there.
+        for strategy in ("domino", "dspark", "eagle3", "peagle"):
+            with self.subTest(strategy=strategy):
+                payload = _online_payload(strategy)
+                payload["training"]["dflash_teacher_metrics"] = False
+                with self.assertRaisesRegex(
+                    ValueError, "does not support training.dflash_teacher_metrics"
+                ):
+                    resolve_run(Config.model_validate(payload))
+
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
         payload["training"]["lk_loss_type"] = "tv"

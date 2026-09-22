@@ -869,6 +869,13 @@ class TrainingConfig(StrictConfigModel):
     #: Stop selector gradients at the unary/backbone boundary while preserving
     #: the primary DFlash/D-PACE/LK gradient path.
     dflash2_selector_stop_gradient: bool = False
+    #: Online DFlash/DFlash2 only: capture the target's final hidden state for
+    #: the teacher-agreement diagnostics (``dflash/teacher/*`` and
+    #: ``dflash2/selector/self_conditioned_teacher_argmax_agreement``). The
+    #: objective never reads it; ``false`` stops the capture server from
+    #: writing it and the trainer from fetching it (one ``hidden_size`` row per
+    #: token next to the ``len(target_layer_ids) * hidden_size`` aux row).
+    dflash_teacher_metrics: bool = True
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1

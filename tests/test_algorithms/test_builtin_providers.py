@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import unittest
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,11 +18,17 @@ from specforge.algorithms.common.providers import (
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepRuntimeConfig,
+    resolve_server_capture_layout,
 )
 from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
+from specforge.algorithms.registry import AlgorithmRegistration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
+
+
+def _teacher_metrics_config(enabled: bool):
+    return SimpleNamespace(training=SimpleNamespace(dflash_teacher_metrics=enabled))
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
@@ -438,6 +444,86 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 ),
             ):
                 provider.create_input_adapter(object())
+
+    def test_dflash_teacher_metrics_selects_the_server_capture_layout(self):
+        registration = self.registry.resolve("dflash")
+        registered = registration.providers.server_streaming_for("text").layout
+        required = registration.spec.feature_contract("streaming", "text")
+
+        enabled = resolve_server_capture_layout(
+            registration, _teacher_metrics_config(True), modality="text"
+        )
+        disabled = resolve_server_capture_layout(
+            registration, _teacher_metrics_config(False), modality="text"
+        )
+
+        self.assertEqual(registered, enabled)
+        self.assertEqual("target_last_hidden_states", enabled.last_hidden_feature)
+        self.assertIsNone(disabled.last_hidden_feature)
+        self.assertEqual(
+            (registered.aux_feature, registered.passthrough),
+            (disabled.aux_feature, disabled.passthrough),
+        )
+        self.assertEqual(
+            {"input_ids", "loss_mask", "hidden_states"},
+            set(disabled.emitted_features),
+        )
+        self.assertLessEqual(required.required_tensors, disabled.emitted_features)
+        self.assertTrue(
+            registration.spec.capabilities.supports_teacher_metrics_opt_out
+        )
+
+    def test_other_builtins_always_request_their_registered_layout(self):
+        # Planning rejects the opt-out for these algorithms; resolution keeps
+        # their registered layouts regardless (DSpark trains on last_hidden).
+        for name in ("domino", "dspark", "eagle3", "mtp", "peagle"):
+            registration = self.registry.resolve(name)
+            provider = registration.providers.server_streaming_for("text")
+            with self.subTest(algorithm=name):
+                self.assertIsNone(provider.select_layout)
+                self.assertFalse(
+                    registration.spec.capabilities.supports_teacher_metrics_opt_out
+                )
+                for enabled in (True, False):
+                    self.assertEqual(
+                        provider.layout,
+                        resolve_server_capture_layout(
+                            registration,
+                            _teacher_metrics_config(enabled),
+                            modality="text",
+                        ),
+                    )
+        dspark = self.registry.resolve("dspark").providers.server_streaming_for("text")
+        self.assertEqual("target_last_hidden_states", dspark.layout.last_hidden_feature)
+
+    def test_layout_selection_may_only_drop_optional_features(self):
+        registration = self.registry.resolve("dflash")
+        provider = registration.providers.server_streaming_for("text")
+
+        def with_selector(select_layout):
+            stream = replace(provider, select_layout=select_layout)
+            return AlgorithmRegistration(
+                spec=registration.spec,
+                providers=replace(registration.providers, server_streaming=(stream,)),
+            )
+
+        added = replace(provider.layout, attention_mask_feature="attention_mask")
+        without_aux = replace(provider.layout, aux_feature=None)
+        cases = (
+            (lambda _config: added, ValueError, "may only drop features"),
+            (lambda _config: without_aux, ValueError, "required tensors"),
+            (lambda _config: {"aux": "hidden_states"}, TypeError, "ServerCaptureLayout"),
+        )
+        for select_layout, error, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(error, message):
+                    resolve_server_capture_layout(
+                        with_selector(select_layout),
+                        _teacher_metrics_config(True),
+                        modality="text",
+                    )
+        with self.assertRaisesRegex(TypeError, "select_layout must be callable"):
+            replace(provider, select_layout=object())
 
     def test_building_catalog_does_not_import_training_or_torch(self):
         code = (
