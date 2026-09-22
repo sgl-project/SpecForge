@@ -16,7 +16,10 @@ Covers the failure matrix the single-server path never hits:
   finishes the pool (no truncation, no hang);
 - all servers dead: loud RuntimeError and a failure sentinel;
 - a poisoned prompt (server rejects it every time): terminal failure after
-  ``max_prompt_attempts`` instead of a partial-success EOF.
+  ``max_prompt_attempts`` instead of a partial-success EOF;
+- continuous prompt ingestion: capture calls never drain at an ingest-chunk or
+  epoch boundary, while the dispatched plan, stop/restart replay, backpressure
+  and failure paths stay as before.
 """
 
 import os
@@ -755,6 +758,457 @@ class TestMultiServerProducer(unittest.TestCase):
                 channel,
                 producer_concurrency=0,
             )
+
+
+def _plan_task_ids(prompts, epochs, seed):
+    """The chunked producer's FIFO dispatch plan (epoch order, then shuffle)."""
+    return [
+        item["task_id"]
+        for epoch in range(epochs)
+        for item in _epoch_online_prompts(prompts, epoch, epochs, seed=seed)
+    ]
+
+
+def _record_leases(controller):
+    """Record the controller's global lease order (serialized for the test)."""
+    leased = []
+    lock = threading.Lock()
+    lease_prompt_tasks = controller.lease_prompt_tasks
+
+    def recording_lease(worker_id, max_tasks):
+        with lock:
+            tasks = lease_prompt_tasks(worker_id, max_tasks)
+            leased.extend(task.task_id for task in tasks)
+        return tasks
+
+    controller.lease_prompt_tasks = recording_lease
+    return leased
+
+
+class _OverlapCheckingServer:
+    """Stub server proving capture calls overlap across the whole prompt plan.
+
+    Every call except the one carrying the plan's final prompt holds until a
+    successor call has started, so at least one capture call is always in
+    flight. A producer that drains its capture slots at an ingest-chunk or
+    epoch boundary leaves such a call without a successor; that is recorded
+    as a gap after ``wait_s`` instead of hanging the test.
+    """
+
+    def __init__(self, stub, total_prompts, *, wait_s=2.0):
+        self.stub = stub
+        self.total_prompts = total_prompts
+        self.wait_s = wait_s
+        self.status_probe = None
+        self.max_resident_prompts = 0
+        self.dispatched = []
+        self.gaps = []
+        self._calls = 0
+        self._cond = threading.Condition()
+        self._stub_lock = threading.Lock()
+
+    def __call__(self, url, json_body, timeout):
+        with self._cond:
+            index = self._calls
+            self._calls += 1
+            self.dispatched.extend(
+                spec["sample_id"] for spec in json_body["spec_capture"]
+            )
+            if self.status_probe is not None:
+                self.max_resident_prompts = max(
+                    self.max_resident_prompts, self.status_probe()
+                )
+            self._cond.notify_all()
+            final = len(self.dispatched) >= self.total_prompts
+            if not final and not self._cond.wait_for(
+                lambda: self._calls > index + 1, timeout=self.wait_s
+            ):
+                self.gaps.append(len(self.dispatched))
+        # The fake sink uses process-global torch RNG state.
+        with self._stub_lock:
+            return self.stub(url, json_body, timeout)
+
+
+class TestContinuousPromptIngest(unittest.TestCase):
+    """The prompt feeder keeps every capture server busy across chunk and
+    epoch boundaries without changing the dispatched plan."""
+
+    def _workdir(self):
+        return tempfile.mkdtemp(prefix="disagg_ingest_")
+
+    def _refill_threshold(self, workers, concurrency, lease):
+        from specforge.launch import _ONLINE_PROMPT_REFILL_ROUNDS
+
+        return _ONLINE_PROMPT_REFILL_ROUNDS * workers * concurrency * lease
+
+    def test_capture_calls_never_drain_between_ingest_chunks_or_epochs(self):
+        N, E, chunk, lease = 11, 2, 3, 1
+        for servers, concurrency in ((1, 2), (2, 2)):
+            with self.subTest(servers=servers, concurrency=concurrency):
+                backend = _FakeMooncakeStore()
+                store = MooncakeFeatureStore(store=backend, store_id="run0")
+                server = _OverlapCheckingServer(_StubCaptureServer(backend), N * E)
+                adapters = [
+                    _adapter(store, server, url=f"http://server{i}:3000{i}")
+                    for i in range(servers)
+                ]
+                channel = StreamingRefChannel(
+                    os.path.join(self._workdir(), "refs.jsonl")
+                )
+                workers, drive = _build(
+                    adapters,
+                    _prompts(N),
+                    store,
+                    channel,
+                    lease=lease,
+                    producer_concurrency=concurrency,
+                    prompt_epochs=E,
+                    prompt_seed=3,
+                    prompt_ingest_batch_size=chunk,
+                )
+                controller = workers[0].controller
+                server.status_probe = lambda: controller.status()["prompts"]
+
+                produced = drive()
+
+                self.assertEqual(produced, N * E)
+                # Every call but the last overlapped a later call: the number
+                # of in-flight captures never reached zero before the final
+                # prompt, at chunk boundaries (every 3 prompts) and at the
+                # epoch boundary alike.
+                self.assertEqual(server.gaps, [])
+                plan = _plan_task_ids(_prompts(N), E, seed=3)
+                self.assertEqual(
+                    sorted(server.dispatched),
+                    sorted(f"run0:{task_id}" for task_id in plan),
+                )
+                # Continuous ingestion still bounds normalized residency.
+                threshold = self._refill_threshold(servers, concurrency, lease)
+                self.assertLessEqual(
+                    server.max_resident_prompts,
+                    threshold + chunk + servers * concurrency * lease,
+                )
+                self.assertEqual(controller.status()["prompts"], 0)
+                self.assertTrue(channel.is_closed())
+
+    def test_dispatch_order_matches_the_chunked_epoch_plan(self):
+        N, seed = 10, 7
+        cases = (
+            # servers, concurrency, lease, chunk, epochs
+            (1, 1, 1, 3, 3),
+            (2, 2, 2, 3, 3),
+            (3, 2, 1, 4, 2),
+            (2, 1, 2, 4096, 3),
+            (2, 2, 1, 3, 1),
+        )
+        for servers, concurrency, lease, chunk, epochs in cases:
+            with self.subTest(
+                servers=servers,
+                concurrency=concurrency,
+                lease=lease,
+                chunk=chunk,
+                epochs=epochs,
+            ):
+                backend = _FakeMooncakeStore()
+                stub = _StubCaptureServer(backend)
+                stub_lock = threading.Lock()
+
+                def serialized_post(url, json_body, timeout):
+                    with stub_lock:
+                        return stub(url, json_body, timeout)
+
+                store = MooncakeFeatureStore(store=backend, store_id="run0")
+                adapters = [
+                    _adapter(store, serialized_post, url=f"http://server{i}:3000{i}")
+                    for i in range(servers)
+                ]
+                channel = StreamingRefChannel(
+                    os.path.join(self._workdir(), "refs.jsonl")
+                )
+                workers, drive = _build(
+                    adapters,
+                    _prompts(N),
+                    store,
+                    channel,
+                    lease=lease,
+                    producer_concurrency=concurrency,
+                    prompt_epochs=epochs,
+                    prompt_seed=seed,
+                    prompt_ingest_batch_size=chunk,
+                )
+                leased = _record_leases(workers[0].controller)
+
+                produced = drive()
+
+                plan = _plan_task_ids(_prompts(N), epochs, seed=seed)
+                self.assertEqual(produced, len(plan))
+                # Global lease order is the old chunk-by-chunk FIFO plan:
+                # same task ids, same epoch identity, same per-epoch shuffle.
+                self.assertEqual(leased, plan)
+                for epoch in range(epochs):
+                    epoch_plan = [
+                        item["task_id"]
+                        for item in _epoch_online_prompts(
+                            _prompts(N), epoch, epochs, seed=seed
+                        )
+                    ]
+                    epoch_ids = set(epoch_plan)
+                    self.assertEqual(
+                        [task_id for task_id in leased if task_id in epoch_ids],
+                        epoch_plan,
+                    )
+                ids = _published_sample_ids(channel.path)
+                self.assertEqual(
+                    sorted(ids), sorted(f"run0:{task_id}" for task_id in plan)
+                )
+                self.assertEqual(len(ids), len(set(ids)))
+                self.assertEqual(workers[0].controller.status()["prompts"], 0)
+                self.assertTrue(channel.is_closed())
+
+    def test_dead_server_failover_across_chunks_keeps_the_plan_multiset(self):
+        backend = _FakeMooncakeStore()
+        healthy = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        dead_leased = threading.Event()
+
+        def dead_post(url, json_body, timeout):
+            dead_leased.set()
+            raise ConnectionError("server 1 unreachable")
+
+        def healthy_post(url, json_body, timeout):
+            dead_leased.wait(5)  # the dead server holds leases first
+            return healthy(url, json_body, timeout)
+
+        N, E = 10, 2
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [
+                _adapter(store, healthy_post, url="http://server0:30000"),
+                _adapter(store, dead_post, url="http://server1:30001"),
+            ],
+            _prompts(N),
+            store,
+            channel,
+            lease=2,
+            prompt_epochs=E,
+            prompt_seed=1,
+            prompt_ingest_batch_size=3,
+        )
+
+        produced = drive(max_rounds=10_000)
+
+        plan = _plan_task_ids(_prompts(N), E, seed=1)
+        self.assertEqual(produced, N * E)
+        self.assertTrue(dead_leased.is_set())
+        ids = _published_sample_ids(channel.path)
+        self.assertEqual(sorted(ids), sorted(f"run0:{task_id}" for task_id in plan))
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(channel.is_closed())
+
+    def test_stop_mid_plan_then_restart_replays_the_identical_plan(self):
+        N, E, chunk, seed, stop_after = 11, 2, 3, 5, 13
+        plan = _plan_task_ids(_prompts(N), E, seed=seed)
+
+        def attempt(should_stop=None):
+            backend = _FakeMooncakeStore()
+            store = MooncakeFeatureStore(store=backend, store_id="run0")
+            channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+            workers, drive = _build(
+                [_adapter(store, _StubCaptureServer(backend))],
+                _prompts(N),
+                store,
+                channel,
+                lease=1,
+                prompt_epochs=E,
+                prompt_seed=seed,
+                prompt_ingest_batch_size=chunk,
+            )
+            leased = _record_leases(workers[0].controller)
+            produced = drive(
+                should_stop=None if should_stop is None else should_stop(channel)
+            )
+            return produced, leased, channel, workers[0].controller
+
+        # A cooperative stop (consumer finished/stopped) past a chunk and an
+        # epoch boundary: publication stops cleanly at a plan prefix and the
+        # feeder stops ingesting instead of pulling in the rest of the plan.
+        produced, leased, channel, controller = attempt(
+            lambda ch: lambda: ch.published >= stop_after
+        )
+        self.assertEqual(produced, stop_after)
+        first_ids = _published_sample_ids(channel.path)
+        self.assertEqual(
+            first_ids, [f"run0:{task_id}" for task_id in plan[:stop_after]]
+        )
+        self.assertEqual(leased, plan[:stop_after])
+        self.assertTrue(channel.is_closed())
+        self.assertIsNone(channel.failure())
+        residual = controller.status()
+        self.assertEqual(residual["prompts_leased"], 0)
+        self.assertLess(residual["prompts"], self._refill_threshold(1, 1, 1) + chunk)
+        self.assertLess(stop_after + residual["prompts"], len(plan))
+
+        # A restarted producer rebuilds the same plan and sample ids, so the
+        # resumed consumer's skip set (the prior attempt's durable ids)
+        # removes exactly the already-trained prefix.
+        produced, leased, channel, _controller = attempt()
+        self.assertEqual(produced, len(plan))
+        self.assertEqual(leased, plan)
+        replay_ids = _published_sample_ids(channel.path)
+        self.assertEqual(replay_ids, [f"run0:{task_id}" for task_id in plan])
+        skip_ids = set(first_ids)
+        self.assertEqual(
+            [sample_id for sample_id in replay_ids if sample_id not in skip_ids],
+            [f"run0:{task_id}" for task_id in plan[stop_after:]],
+        )
+
+    def test_ref_backpressure_also_bounds_prompt_ingestion(self):
+        N, chunk, high = 30, 2, 3
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(N),
+            store,
+            channel,
+            lease=1,
+            prompt_ingest_batch_size=chunk,
+            in_flight_high_watermark=high,
+            in_flight_low_watermark=high,
+        )
+        controller = workers[0].controller
+        outcome = {}
+
+        def run_producer():
+            try:
+                outcome["produced"] = drive()
+            except BaseException as exc:  # expose a thread failure to the test
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run_producer, daemon=True)
+        thread.start()
+        reader = StreamingRefChannel(channel.path)
+        consumed = 0
+        max_resident = 0
+        paused_resident = []
+        deadline = time.monotonic() + 20
+        while consumed < N and time.monotonic() < deadline:
+            max_resident = max(max_resident, controller.status()["prompts"])
+            in_flight = channel.in_flight_remote()
+            if in_flight < high and consumed + in_flight < N:
+                # A slow consumer: let the producer reach its ref watermark.
+                time.sleep(0.001)
+                continue
+            if in_flight >= high:
+                # Paused on the ref watermark: the feeder must not keep
+                # normalizing the rest of the dataset in the meantime.
+                time.sleep(0.02)
+                paused_resident.append(controller.status()["prompts"])
+            refs = reader.poll()
+            if refs:
+                reader.mark_consumed(len(refs))
+                consumed += len(refs)
+        thread.join(5)
+
+        self.assertFalse(thread.is_alive(), "producer stayed ref-throttled")
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome.get("produced"), N)
+        self.assertTrue(paused_resident)
+        # pending < threshold + one chunk, plus the single leased prompt.
+        bound = self._refill_threshold(1, 1, 1) + chunk
+        self.assertLessEqual(max(paused_resident), bound)
+        self.assertLessEqual(max_resident, bound)
+        self.assertTrue(channel.is_closed())
+
+    def test_worker_fatal_error_stops_peer_workers_mid_plan(self):
+        # Workers now outlive ingest chunks, so a fatal publish failure on one
+        # worker must stop its peers instead of letting them drain the plan.
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        stub_lock = threading.Lock()
+
+        def slow_post(url, json_body, timeout):
+            time.sleep(0.005)
+            with stub_lock:
+                return stub(url, json_body, timeout)
+
+        class _OneShotFailingPublishChannel(StreamingRefChannel):
+            # Only the failing worker sees an error; its peer's publishes
+            # would keep succeeding if it were left running.
+            failed = False
+
+            def publish(self, ref):
+                if self.published >= 3 and not self.failed:
+                    self.failed = True
+                    raise OSError("injected publish failure")
+                super().publish(ref)
+
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = _OneShotFailingPublishChannel(
+            os.path.join(self._workdir(), "refs.jsonl")
+        )
+        N = 200
+        workers, drive = _build(
+            [
+                _adapter(store, slow_post, url=f"http://server{i}:3000{i}")
+                for i in range(2)
+            ],
+            _prompts(N),
+            store,
+            channel,
+            lease=1,
+            prompt_ingest_batch_size=4,
+        )
+
+        with self.assertRaisesRegex(OSError, "injected publish failure"):
+            drive()
+
+        status = workers[0].controller.status()
+        self.assertEqual(status["prompts_leased"], 0)
+        # Peers and the feeder stopped with the failed worker: most of the
+        # plan was never leased or even ingested.
+        self.assertLess(status["prompts"] + channel.published, N // 2)
+        self.assertIn("injected publish failure", channel.failure())
+        self.assertFalse(channel.is_closed())
+
+    def test_prompt_normalization_failure_mid_plan_fails_the_channel(self):
+        prompts = _prompts(12)
+
+        class _BadRowPrompts:
+            def __len__(self):
+                return len(prompts)
+
+            def __getitem__(self, index):
+                if index == 9:
+                    raise ValueError("processed dataset row 9 is corrupt")
+                return prompts[index]
+
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        workers, drive = _build(
+            [_adapter(store, stub)],
+            _BadRowPrompts(),
+            store,
+            channel,
+            lease=1,
+            prompt_ingest_batch_size=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "row 9 is corrupt"):
+            drive()
+
+        status = workers[0].controller.status()
+        self.assertEqual(status["prompts_leased"], 0)
+        # Every capture that completed before the failure was published once.
+        ids = _published_sample_ids(channel.path)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(set(ids), set(stub.expected))
+        self.assertIn("row 9 is corrupt", channel.failure())
+        self.assertFalse(channel.is_closed())
 
 
 if __name__ == "__main__":

@@ -788,6 +788,12 @@ def build_disagg_offline_runtime(
 # externally managed SGLang server source.
 # ---------------------------------------------------------------------------
 
+# The online producer's prompt feeder tops the pending pool up whenever it
+# holds fewer than this many full rounds of capture slots (workers *
+# producer_concurrency * lease prompts), so servers never drain at an ingest
+# step or epoch boundary while the next step is normalized.
+_ONLINE_PROMPT_REFILL_ROUNDS = 4
+
 
 def build_disagg_online_producer(
     *,
@@ -846,6 +852,13 @@ def build_disagg_online_producer(
     keeping a reconstructed plan stable across restarts. Prompt payloads are
     normalized and ingested in ``prompt_ingest_batch_size`` chunks so a large
     memory-mapped dataset does not expand every token list before rollout.
+    Ingestion is continuous: while every worker keeps its capture slots full,
+    the driving thread feeds the plan in order (FIFO across epochs) whenever
+    fewer than ``_ONLINE_PROMPT_REFILL_ROUNDS * workers * producer_concurrency
+    * lease`` prompts are pending, in steps of at most that threshold (and at
+    most ``prompt_ingest_batch_size``), so no server idles at a chunk or epoch
+    boundary. Fewer than the threshold plus one step are pending at once (plus
+    the prompts already leased).
 
     Failure semantics: a worker whose source raises (dead/unreachable server)
     has already failed its leases retryable — the surviving workers re-lease
@@ -978,10 +991,13 @@ def build_disagg_online_producer(
     def drive_producer(max_rounds: int = 1_000_000, should_stop=None) -> int:
         """Drive all workers until the pool drains; returns refs published.
 
-        One worker runs inline; N workers run one thread each (the blocking
-        HTTP prefill call releases the GIL, so servers genuinely overlap).
-        The controller and feature store are lock-protected; the channel is
-        not, so publishes serialize through ``publish_lock``.
+        Every worker runs on its own thread (the blocking HTTP prefill call
+        releases the GIL, so servers genuinely overlap) while this thread
+        feeds prompt chunks. The controller and feature store are
+        lock-protected; the channel is not, so publishes serialize through
+        ``publish_lock``. ``max_rounds`` still budgets each worker's capture
+        calls per ``prompt_ingest_batch_size`` chunk of the plan, now pooled
+        over the whole continuous run.
         """
         from collections import deque
 
@@ -1059,6 +1075,26 @@ def build_disagg_online_producer(
         published_sizes = deque()
         last_publish_log = {"t": time.perf_counter()}
         dead: dict = {}  # worker_id -> last failure reason
+        # Set once the feeder will ingest nothing more (plan exhausted, stop,
+        # or failure); only then may an empty pool end a worker.
+        ingest_closed = threading.Event()
+        # Set on a fatal driver/worker error so every peer stops leasing.
+        abort = threading.Event()
+        refill_threshold = (
+            _ONLINE_PROMPT_REFILL_ROUNDS
+            * len(workers)
+            * producer_concurrency
+            * worker_lease
+        )
+        # Feed in steps no larger than the threshold: a step's normalization
+        # then finishes long before the remaining pool drains, however large
+        # prompt_ingest_batch_size (the residency bound) is.
+        feed_size = min(prompt_ingest_batch_size, refill_threshold)
+        chunks_per_epoch = -(-base_prompt_count // feed_size)
+        total_chunks = prompt_epochs * chunks_per_epoch
+        round_budget = max_rounds * max(
+            1, prompt_epochs * -(-base_prompt_count // prompt_ingest_batch_size)
+        )
 
         def pool_drained() -> bool:
             st = controller.status()
@@ -1178,7 +1214,9 @@ def build_disagg_online_producer(
             ) as executor:
                 try:
                     while True:
-                        stopped = should_stop is not None and should_stop()
+                        stopped = abort.is_set() or (
+                            should_stop is not None and should_stop()
+                        )
                         if stopped:
                             accepting = False
 
@@ -1234,7 +1272,7 @@ def build_disagg_online_producer(
                         while (
                             accepting
                             and not paused
-                            and submitted < max_rounds
+                            and submitted < round_budget
                             and len(futures) < producer_concurrency
                             and status["prompts_pending"] > 0
                         ):
@@ -1248,7 +1286,9 @@ def build_disagg_online_producer(
                             status = controller.status()
 
                         if not futures:
-                            if pool_drained():
+                            # Read the feeder flag first: once it is set every
+                            # chunk is already in the pool, so empty is final.
+                            if ingest_closed.is_set() and pool_drained():
                                 producer_timing(
                                     "pool drained "
                                     f"worker={w.worker_id} "
@@ -1256,7 +1296,7 @@ def build_disagg_online_producer(
                                     f"elapsed={elapsed(drive_start)}"
                                 )
                                 return
-                            if not accepting or submitted >= max_rounds:
+                            if not accepting or submitted >= round_budget:
                                 return
                             sleep(backpressure_poll_s)
                             continue
@@ -1298,34 +1338,94 @@ def build_disagg_online_producer(
                     abort_unpublished(futures)
                     raise
 
+        last_ingest_log = {"t": None}
+
         def ingest_prompt_batch(epoch: int, batch_index: int, epoch_prompts) -> None:
             phase = time.perf_counter()
-            producer_timing(
-                "controller.ingest_prompts start "
-                f"epoch={epoch + 1}/{prompt_epochs} batch={batch_index + 1} "
-                f"prompts={len(epoch_prompts)}"
-            )
             task_ids = controller.ingest_prompts(epoch_prompts)
             status = controller.status()
-            producer_timing(
-                "controller.ingest_prompts done "
-                f"epoch={epoch + 1}/{prompt_epochs} batch={batch_index + 1} "
-                f"tasks={len(task_ids)} "
-                f"pending={status['prompts_pending']} elapsed={elapsed(phase)}"
-            )
+            now = time.perf_counter()
+            # Feed steps are small and frequent; log the first one and then at
+            # the progress interval rather than once per step.
+            if last_ingest_log["t"] is None or (
+                progress_interval > 0
+                and now - last_ingest_log["t"] >= progress_interval
+            ):
+                producer_timing(
+                    "controller.ingest_prompts done "
+                    f"epoch={epoch + 1}/{prompt_epochs} "
+                    f"batch={batch_index + 1}/{chunks_per_epoch} "
+                    f"tasks={len(task_ids)} "
+                    f"pending={status['prompts_pending']} "
+                    f"leased={status['prompts_leased']} "
+                    f"elapsed={elapsed(phase)}"
+                )
+                last_ingest_log["t"] = now
+            if batch_index + 1 == chunks_per_epoch:
+                producer_timing(
+                    "epoch ingested "
+                    f"epoch={epoch + 1}/{prompt_epochs} "
+                    f"produced={state['produced']} "
+                    f"prompts_failed={status['prompts_failed']} "
+                    f"pending={status['prompts_pending']} "
+                    f"leased={status['prompts_leased']} "
+                    f"elapsed={elapsed(drive_start)}"
+                )
 
-        def run_epoch_workers(live_workers) -> None:
-            fatal: list = []  # non-transport errors escaping a worker thread
+        def iter_plan_chunks():
+            """Yield the whole multi-epoch prompt plan in FIFO chunk order."""
+            for epoch in range(prompt_epochs):
+                epoch_batches = _iter_epoch_online_prompt_batches(
+                    prompts,
+                    epoch,
+                    prompt_epochs,
+                    seed=prompt_seed,
+                    batch_size=feed_size,
+                )
+                for batch_index, prompt_batch in enumerate(epoch_batches):
+                    yield epoch, batch_index, prompt_batch
 
-            def run_worker_guarded(w) -> None:
-                try:
-                    run_worker(w)
-                except BaseException as exc:  # e.g. a channel publish failure
-                    fatal.append((w.worker_id, exc))
+        plan_chunks = iter_plan_chunks()
+        feed = {"ingested": 0, "exhausted": total_chunks == 0, "stopped": False}
 
-            if len(live_workers) == 1:
-                run_worker(live_workers[0])
-            else:
+        def feed_pool() -> None:
+            """Ingest plan chunks until the pending pool reaches the threshold.
+
+            Runs only on the driving thread, so plan order stays FIFO across
+            chunks and epochs. Workers keep leasing from the pool meanwhile;
+            the controller lock is held only for the final append.
+            """
+            while (
+                not feed["exhausted"]
+                and not abort.is_set()
+                and controller.status()["prompts_pending"] < refill_threshold
+            ):
+                if should_stop is not None and should_stop():
+                    feed["stopped"] = True
+                    return
+                chunk = next(plan_chunks, None)
+                if chunk is not None:
+                    ingest_prompt_batch(*chunk)
+                    feed["ingested"] += 1
+                if chunk is None or feed["ingested"] == total_chunks:
+                    feed["exhausted"] = True
+
+        fatal: list = []  # errors escaping a worker thread
+
+        def run_worker_guarded(w) -> None:
+            try:
+                run_worker(w)
+            except BaseException as exc:  # e.g. a channel publish failure
+                fatal.append((w.worker_id, exc))
+                abort.set()
+
+        try:
+            threads = []
+            try:
+                if should_stop is not None and should_stop():
+                    feed["stopped"] = True
+                else:
+                    feed_pool()  # prime the pool before any capture slot opens
                 threads = [
                     threading.Thread(
                         target=run_worker_guarded,
@@ -1333,73 +1433,50 @@ def build_disagg_online_producer(
                         name=f"drive-{w.worker_id}",
                         daemon=True,
                     )
-                    for w in live_workers
+                    for w in workers
                 ]
                 for t in threads:
                     t.start()
+                # Keep feeding while any worker runs; a worker leaves an empty
+                # pool only after ingest_closed, so no chunk boundary drains
+                # the servers. All-dropped workers end the feed early.
+                while not (feed["exhausted"] or feed["stopped"] or abort.is_set()):
+                    if not any(t.is_alive() for t in threads):
+                        break
+                    sleep(backpressure_poll_s)
+                    feed_pool()
+            except BaseException:
+                abort.set()
+                raise
+            finally:
+                ingest_closed.set()
                 for t in threads:
                     t.join()
             if fatal:
                 raise fatal[0][1]
-
-        try:
-            live_workers = list(workers)
-            for epoch in range(prompt_epochs):
-                if should_stop is not None and should_stop():
-                    break
-                epoch_batches = _iter_epoch_online_prompt_batches(
-                    prompts,
-                    epoch,
-                    prompt_epochs,
-                    seed=prompt_seed,
-                    batch_size=prompt_ingest_batch_size,
-                )
-                stopped = False
-                for batch_index, prompt_batch in enumerate(epoch_batches):
-                    if should_stop is not None and should_stop():
-                        stopped = True
-                        break
-                    ingest_prompt_batch(epoch, batch_index, prompt_batch)
-                    if not live_workers:
-                        raise RuntimeError(
-                            f"all rollout workers were already dropped before "
-                            f"epoch {epoch + 1}/{prompt_epochs} batch "
-                            f"{batch_index + 1} could run — dead workers: {dead}"
-                        )
-                    run_epoch_workers(live_workers)
-                    stopped = should_stop is not None and should_stop()
-                    live_workers = [w for w in live_workers if w.worker_id not in dead]
-                    if dead and not stopped and not pool_drained():
-                        raise RuntimeError(
-                            f"all rollout workers exited with {len(dead)} dropped "
-                            f"as dead and prompts remaining — dead workers: {dead}"
-                        )
-                    if stopped:
-                        break
-                if stopped:
-                    break
-                st = controller.status()
-                producer_timing(
-                    "epoch drained "
-                    f"epoch={epoch + 1}/{prompt_epochs} "
-                    f"produced={state['produced']} "
-                    f"prompts_failed={st['prompts_failed']} "
-                    f"pending={st['prompts_pending']} leased={st['prompts_leased']} "
-                    f"elapsed={elapsed(drive_start)}"
-                )
             st = controller.status()
-            stopped = should_stop is not None and should_stop()
+            stopped = feed["stopped"] or (should_stop is not None and should_stop())
+            uningested = total_chunks - feed["ingested"]
+            remaining = bool(
+                st["prompts_pending"] or st["prompts_leased"] or not feed["exhausted"]
+            )
+            if dead and not stopped and remaining:
+                raise RuntimeError(
+                    f"all rollout workers exited with {len(dead)} dropped "
+                    f"as dead and prompts remaining — dead workers: {dead}"
+                )
             if st["prompts_failed"] and not stopped:
                 raise RuntimeError(
                     "producer finished with "
                     f"{st['prompts_failed']} terminally failed prompt(s); "
                     "refusing to publish a successful EOF for partial data"
                 )
-            if not stopped and (st["prompts_pending"] or st["prompts_leased"]):
+            if not stopped and remaining:
                 raise RuntimeError(
                     "producer exhausted max_rounds before draining the prompt "
                     f"pool: pending={st['prompts_pending']} "
-                    f"leased={st['prompts_leased']}"
+                    f"leased={st['prompts_leased']} "
+                    f"uningested_chunks={uningested}"
                 )
             producer_timing(
                 "drive_producer returning "
