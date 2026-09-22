@@ -25,6 +25,7 @@ tensors.  The application composition root injects an algorithm-owned
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
@@ -65,12 +66,32 @@ class ServerCaptureFailure:
     retryable: bool = True
 
 
-def _default_post(url: str, json_body: Dict[str, Any], timeout: float):
-    import requests
+class _SessionPost:
+    """Default ``post_fn``: one keep-alive ``requests.Session`` per thread.
 
-    resp = requests.post(url, json=json_body, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
+    ``requests.post`` opens and closes a connection for every ``/generate``.
+    A ``Session`` is not documented as thread-safe and the producer drives one
+    adapter from ``producer_concurrency`` threads, so each thread keeps its
+    own. Transport errors still raise (no automatic resend), leaving retries
+    to the lease-level policy of :meth:`SGLangServerCaptureAdapter.produce_refs`.
+    """
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _session(self):
+        session = getattr(self._local, "session", None)
+        if session is None:
+            import requests
+
+            session = requests.Session()
+            self._local.session = session
+        return session
+
+    def __call__(self, url: str, json_body: Dict[str, Any], timeout: float):
+        resp = self._session().post(url, json=json_body, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _flatten_list_wrappers(value: Any) -> List[Any]:
@@ -122,7 +143,8 @@ class SGLangServerCaptureAdapter:
     ``store`` must be the run's :class:`MooncakeFeatureStore` (its ``store_id``
     namespaces the keys and ``adopt()`` registers each ref so a later
     ``abort()``/``gc()`` on the producer side can free server-written objects).
-    ``post_fn`` is injectable for tests.
+    ``post_fn`` is injectable for tests; the default reuses one HTTP
+    connection per calling thread.
     """
 
     def __init__(
@@ -169,7 +191,7 @@ class SGLangServerCaptureAdapter:
             )
         self.request_input_adapter = request_input_adapter
         self.timeout_s = timeout_s
-        self.post_fn = post_fn or _default_post
+        self.post_fn = post_fn or _SessionPost()
         self.target_model_version = target_model_version
         self._healthy = True
 

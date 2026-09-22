@@ -14,9 +14,12 @@ zero-copy ``MooncakeFeatureStore.get``. The real-server end-to-end lives in
 """
 
 import ctypes
+import json
 import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List
 
 import torch
@@ -718,6 +721,102 @@ class TestServerCaptureAdapter(unittest.TestCase):
                 algorithm="eagle3",
                 schema=object(),
             )
+
+
+class _KeepAliveCaptureHandler(BaseHTTPRequestHandler):
+    """HTTP/1.1 front for a stub capture server that records client ports."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        sample_ids = [spec["sample_id"] for spec in body["spec_capture"]]
+        with self.server.lock:
+            self.server.requests.append((self.client_address[1], sample_ids))
+        if self.server.status != 200:
+            payload = b"injected server error"
+        else:
+            rows = self.server.capture(self.path, body, 0.0)
+            payload = json.dumps(rows).encode()
+        self.send_response(self.server.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+class TestDefaultHttpTransport(unittest.TestCase):
+    """The default ``post_fn`` over a real loopback HTTP/1.1 server."""
+
+    def _serve(self, *, status=200):
+        backend = _FakeMooncakeStore()
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _KeepAliveCaptureHandler)
+        httpd.daemon_threads = True
+        httpd.capture = _StubCaptureServer(backend)
+        httpd.status = status
+        httpd.requests = []
+        httpd.lock = threading.Lock()
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        adapter = SGLangServerCaptureAdapter(
+            f"http://127.0.0.1:{httpd.server_address[1]}",
+            store,
+            run_id="run0",
+            algorithm="eagle3",
+            schema=_capture_schema("eagle3"),
+        )
+        return httpd, adapter
+
+    def test_each_thread_reuses_one_keep_alive_connection(self):
+        httpd, adapter = self._serve()
+        contract = _eagle3_contract()
+        for index in range(3):
+            refs = adapter.produce_refs([_task(index, 5)], capture=contract)
+            self.assertIsInstance(refs[0], SampleRef)
+
+        errors = []
+
+        def worker(first):
+            try:
+                for index in (first, first + 1):
+                    refs = adapter.produce_refs([_task(index, 4)], capture=contract)
+                    assert isinstance(refs[0], SampleRef), refs
+            except Exception as exc:  # surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(first,)) for first in (10, 20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(errors, [])
+
+        ports_by_caller = {}
+        for port, sample_ids in httpd.requests:
+            index = int(sample_ids[0].removeprefix("run0:t"))
+            caller = "main" if index < 10 else index // 10 * 10
+            ports_by_caller.setdefault(caller, set()).add(port)
+        self.assertEqual(len(httpd.requests), 7)
+        self.assertEqual(
+            {caller: len(ports) for caller, ports in ports_by_caller.items()},
+            {"main": 1, 10: 1, 20: 1},
+        )
+        distinct = set().union(*ports_by_caller.values())
+        self.assertEqual(len(distinct), 3)
+
+    def test_http_errors_still_fail_the_lease_batch(self):
+        import requests
+
+        _httpd, adapter = self._serve(status=500)
+        with self.assertRaises(requests.HTTPError):
+            adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
 
 
 class TestLoaderGcPump(unittest.TestCase):
