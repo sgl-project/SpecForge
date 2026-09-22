@@ -22,12 +22,13 @@ Correctness rests on the lockstep invariant the :class:`RefDistributor`
 enforces (equal per-rank ref counts): a rank that skipped a boundary would hang
 the gather.
 
-``process_group`` carries every ack object collective. The online consumer
-passes a dedicated Gloo group (:func:`new_durable_ack_process_group`): pickled
-object collectives over NCCL stage through the device and ``.item()``/``.cpu()``
-drain the training stream at every boundary, while Gloo stays on the host and
-lets the ack run on a background thread without interleaving with the training
-thread's NCCL collectives.
+``process_group`` carries every ack object collective. With asynchronous acks
+the online consumer passes a dedicated Gloo group
+(:func:`new_durable_ack_process_group`); synchronous acks keep the default
+group. Pickled object collectives over NCCL stage through the device and
+``.item()``/``.cpu()`` drain the training stream at every boundary, while Gloo
+stays on the host and lets the ack run on a background thread without
+interleaving with the training thread's NCCL collectives.
 """
 
 from __future__ import annotations

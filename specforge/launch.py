@@ -1570,6 +1570,8 @@ def build_disagg_online_consumer(
     ``async_ack`` (default: ``DISAGG_ASYNC_ACK``, on unless ``0``) runs each
     optimizer boundary's durable ack on a background thread over a dedicated
     Gloo group while the next step computes; see :class:`TrainerController`.
+    It is on only when every rank enables it; otherwise acks stay synchronous
+    on the default process group and no Gloo group is created.
     """
     import torch.distributed as dist
 
@@ -1619,27 +1621,35 @@ def build_disagg_online_consumer(
     except BaseException as exc:
         preflight_exc = exc
 
+    if async_ack is None:
+        flag = os.environ.get("DISAGG_ASYNC_ACK", "1").strip().lower()
+        async_ack = flag not in ("0", "false", "no", "off")
+    async_ack = bool(async_ack)
     preflight_error = (
         f"{type(preflight_exc).__name__}: {preflight_exc}" if preflight_exc else None
     )
     if distributed and world > 1:
-        gathered_errors = [None] * world
-        dist.all_gather_object(gathered_errors, preflight_error)
-        preflight_error = next((error for error in gathered_errors if error), None)
+        gathered = [None] * world
+        dist.all_gather_object(gathered, (preflight_error, async_ack))
+        preflight_error = next((error for error, _ in gathered if error), None)
+        # Creating the ack group below is collective: every rank must take the
+        # same decision, so one rank opting out disables async acks for all.
+        async_ack = all(enabled for _, enabled in gathered)
     if preflight_error is not None:
         if not distributed or world == 1:
             raise preflight_exc
         raise RuntimeError(f"online consumer preflight failed: {preflight_error}")
 
-    if async_ack is None:
-        flag = os.environ.get("DISAGG_ASYNC_ACK", "1").strip().lower()
-        async_ack = flag not in ("0", "false", "no", "off")
     # Every rank creates the ack group here, in the same collective order. It
     # carries all DPAck object collectives on the host, so a background ack
     # never interleaves with (or drains the stream for) NCCL training work.
-    ack_group = new_durable_ack_process_group() if distributed and world > 1 else None
-    if ack_group is None and distributed and world > 1:
-        async_ack = False
+    # Synchronous acks (DISAGG_ASYNC_ACK=0) keep the default group, so the
+    # kill switch also removes the new Gloo connectivity requirement.
+    ack_group = None
+    if async_ack and distributed and world > 1:
+        ack_group = new_durable_ack_process_group()
+        if ack_group is None:
+            async_ack = False
 
     if inbox_dir is None:
         inbox_dir = channel.path + ".inboxes"

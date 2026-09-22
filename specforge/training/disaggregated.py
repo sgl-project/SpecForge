@@ -221,6 +221,18 @@ def _consumer_database_path(cfg: Config) -> Optional[str]:
     return os.path.join(state_dir, "consumer.sqlite")
 
 
+def _consumer_async_ack(cfg: Config) -> Optional[bool]:
+    """An explicit ``DISAGG_ASYNC_ACK`` wins; otherwise the typed switch.
+
+    ``None`` lets the consumer builder parse the environment value, so a worker
+    started without the launch plan still honours ``async_ack: false``.
+    """
+    if os.environ.get("DISAGG_ASYNC_ACK", "").strip():
+        return None
+    deployment = cfg.deployment.disaggregated
+    return None if deployment is None else deployment.async_ack
+
+
 def _online_prompt_seed(cfg: Config) -> int:
     """Resolve prompt ordering independently while preserving old configs."""
     configured = getattr(cfg.training, "prompt_seed", None)
@@ -824,6 +836,7 @@ def _build_online(
         resume_from=cfg.training.resume_from,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
+        async_ack=_consumer_async_ack(cfg),
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

@@ -42,7 +42,11 @@ from specforge.runtime.control_plane.metadata_store import (
 )
 from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import STATE_FILE, CheckpointManager
-from specforge.training.controller import TrainerController, TrainerCore
+from specforge.training.controller import (
+    TrainerController,
+    TrainerCore,
+    _AsyncAckRunner,
+)
 from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 
 WORLD_SIZE = 2
@@ -371,6 +375,26 @@ class TestAsyncDurableAck(unittest.TestCase):
     def test_ack_group_is_not_created_without_a_process_group(self):
         self.assertIsNone(new_durable_ack_process_group())
 
+    def test_interrupted_submit_cannot_strand_close(self):
+        # SIGTERM unwinds the training thread as a BaseException. Even when it
+        # lands inside submit(), the lifecycle close() must still return.
+        acked = []
+        runner = _AsyncAckRunner(lambda _ids, step: acked.append(step))
+        notify_all = runner._cv.notify_all
+
+        def interrupted_notify():
+            runner._cv.notify_all = notify_all
+            raise KeyboardInterrupt
+
+        runner._cv.notify_all = interrupted_notify
+        with self.assertRaises(KeyboardInterrupt):
+            runner.submit(["s1"], 1)
+        closer = threading.Thread(target=runner.close, daemon=True)
+        closer.start()
+        closer.join(5)
+        self.assertFalse(closer.is_alive(), "close() waited on a never-woken ack")
+        self.assertEqual(acked, [])
+
 
 class _RetainingFeatureStore:
     retain_on_release = True
@@ -400,8 +424,14 @@ class _FakeDistributor:
         pass
 
 
-def _build_consumer(work, *, resume_from=None, env=None):
-    """Enter the real online-consumer builder below model/FSDP assembly."""
+def _build_consumer(work, *, resume_from=None, env=None, dist_patches=None):
+    """Enter the real online-consumer builder below model/FSDP assembly.
+
+    ``dist_patches`` replaces the default single-process ``torch.distributed``
+    view (``is_initialized() -> False``) with a scripted one.
+    """
+    from contextlib import ExitStack
+
     from specforge.algorithms.builtin import builtin_algorithm_registry
     from specforge.launch import build_disagg_online_consumer
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
@@ -411,18 +441,27 @@ def _build_consumer(work, *, resume_from=None, env=None):
     if resume_from is not None and channel.consumer_quantum() is None:
         channel.publish_consumer_quantum(1)
     features = _RetainingFeatureStore()
-    with (
-        mock.patch.dict(os.environ, env or {}),
-        mock.patch("torch.distributed.is_initialized", return_value=False),
-        mock.patch(
-            "specforge.runtime.data_plane.ref_distributor.RefDistributor",
-            _FakeDistributor,
-        ),
-        mock.patch(
-            "specforge.launch._assemble_trainer",
-            side_effect=lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
-        ),
-    ):
+    if dist_patches is None:
+        dist_patches = [
+            mock.patch("torch.distributed.is_initialized", return_value=False)
+        ]
+    with ExitStack() as stack:
+        stack.enter_context(mock.patch.dict(os.environ, env or {}))
+        for patcher in dist_patches:
+            stack.enter_context(patcher)
+        stack.enter_context(
+            mock.patch(
+                "specforge.runtime.data_plane.ref_distributor.RefDistributor",
+                _FakeDistributor,
+            )
+        )
+        stack.enter_context(
+            mock.patch(
+                "specforge.launch._assemble_trainer",
+                side_effect=lambda **kwargs: captured.update(kwargs)
+                or SimpleNamespace(),
+            )
+        )
         build_disagg_online_consumer(
             algorithm=builtin_algorithm_registry().resolve("eagle3"),
             feature_store=features,
@@ -455,6 +494,89 @@ class TestConsumerAsyncAckSwitch(unittest.TestCase):
         for value in ("0", "false", "OFF"):
             with self.subTest(value=value):
                 self.assertIs(self._async_ack({"DISAGG_ASYNC_ACK": value}), False)
+
+    def _rank0_of_two(self, *, local, peer):
+        """Rank 0 of a scripted 2-rank consumer; the peer reports ``peer``."""
+        group = object()
+        created = []
+
+        def gather(object_list, obj, group=None):
+            # The only setup gather is the preflight (error, async) exchange.
+            object_list[:] = [obj, (None, peer)]
+
+        def new_group():
+            created.append(group)
+            return group
+
+        with tempfile.TemporaryDirectory(prefix="async_ack_2rank_switch_") as work:
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("DISAGG_ASYNC_ACK", None)
+                captured, _distributor, _features = _build_consumer(
+                    work,
+                    env={"DISAGG_ASYNC_ACK": "1" if local else "0"},
+                    dist_patches=[
+                        mock.patch(
+                            "torch.distributed.is_initialized", return_value=True
+                        ),
+                        mock.patch("torch.distributed.get_world_size", return_value=2),
+                        mock.patch("torch.distributed.get_rank", return_value=0),
+                        mock.patch(
+                            "torch.distributed.all_gather_object", side_effect=gather
+                        ),
+                        mock.patch("torch.distributed.broadcast_object_list"),
+                        mock.patch(
+                            "specforge.runtime.control_plane.dp_ack."
+                            "new_durable_ack_process_group",
+                            side_effect=new_group,
+                        ),
+                    ],
+                )
+            controller = captured["controller"]
+            controller.store.close()
+            return captured["async_ack"], created, controller.process_group, group
+
+    def test_async_ack_uses_the_dedicated_group_when_every_rank_enables_it(self):
+        enabled, created, process_group, group = self._rank0_of_two(
+            local=True, peer=True
+        )
+        self.assertIs(enabled, True)
+        self.assertEqual(len(created), 1)
+        self.assertIs(process_group, group)
+
+    def test_any_rank_opting_out_keeps_every_rank_synchronous_without_gloo(self):
+        # new_group is collective, so the decision must be rank-consistent; the
+        # synchronous kill switch must not require Gloo connectivity either.
+        for local, peer in ((False, True), (True, False), (False, False)):
+            with self.subTest(local=local, peer=peer):
+                enabled, created, process_group, _ = self._rank0_of_two(
+                    local=local, peer=peer
+                )
+                self.assertIs(enabled, False)
+                self.assertEqual(created, [])
+                self.assertIsNone(process_group)
+
+    def test_worker_honours_the_typed_switch_unless_env_is_explicit(self):
+        from specforge.training.disaggregated import _consumer_async_ack
+
+        def cfg(async_ack):
+            return SimpleNamespace(
+                deployment=SimpleNamespace(
+                    disaggregated=(
+                        None
+                        if async_ack is None
+                        else SimpleNamespace(async_ack=async_ack)
+                    )
+                )
+            )
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DISAGG_ASYNC_ACK", None)
+            self.assertIs(_consumer_async_ack(cfg(False)), False)
+            self.assertIs(_consumer_async_ack(cfg(True)), True)
+            self.assertIsNone(_consumer_async_ack(cfg(None)))
+            os.environ["DISAGG_ASYNC_ACK"] = "1"
+            # The builder parses the explicit environment value itself.
+            self.assertIsNone(_consumer_async_ack(cfg(False)))
 
 
 def _crash_mid_ack_worker(work: str) -> None:

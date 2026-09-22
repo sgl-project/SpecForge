@@ -245,6 +245,10 @@ class RemoteInboxChannel:
         self._failure: str | None = None
         self._pending: list[SampleRef] = []
         self._pull_lock = threading.Lock()
+        # The durable ack (possibly on the background ack thread) and loader
+        # failure settlement both advance the target; a lost update silently
+        # undercounts it, or posts a target that moved backwards (rejected).
+        self._consumed_lock = threading.Lock()
         self._consumed_target = 0
 
     def _pull(self) -> None:
@@ -292,6 +296,10 @@ class RemoteInboxChannel:
     def mark_consumed(self, n: int) -> None:
         if n < 1:
             return
+        with self._consumed_lock:
+            self._mark_consumed_locked(n)
+
+    def _mark_consumed_locked(self, n: int) -> None:
         target = self._consumed_target + n
         body = json.dumps({"target": target}, separators=(",", ":")).encode("utf-8")
         transient_error = None

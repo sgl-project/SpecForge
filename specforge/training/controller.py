@@ -668,11 +668,17 @@ class _AsyncAckRunner:
 
     def submit(self, sample_ids: List[str], step: int) -> None:
         self.flush()
+        job = (list(sample_ids), step)
         with self._cv:
             if self._closed:
                 raise RuntimeError("durable ack runner is closed")
-            self._job = (list(sample_ids), step)
+            # Wake the worker BEFORE publishing the job: it re-checks ``_job``
+            # only once this block releases the lock. The reverse order lets a
+            # SIGTERM unwind (raised between the two statements) strand a
+            # published job whose worker never woke, and close() would then
+            # wait on it forever.
             self._cv.notify_all()
+            self._job = job
 
     def pop_exec_seconds(self) -> float:
         """Background ack execution time since the previous call."""
