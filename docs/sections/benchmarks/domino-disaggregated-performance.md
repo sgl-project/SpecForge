@@ -61,7 +61,8 @@ server. The 50.1 samples/s result above used eight workers against one external
 server, so use the repeated-URL command in **Best measured settings** when
 reproducing that exact historical peak. `LOADER_PREFETCH=2` and
 hardware-specific RDMA settings remain opt-in runtime environment controls;
-Mooncake stores now skip the clone that `CLONE_ON_FETCH=0` removed by default.
+Mooncake stores now skip the defensive clone by default, so `CLONE_ON_FETCH=0`
+is no longer required.
 
 ## What each setting does
 

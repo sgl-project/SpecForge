@@ -358,6 +358,24 @@ class TestBF16OptimizerCuda(unittest.TestCase):
                 current_master, legacy_master, rtol=1e-5, atol=1e-6
             )
 
+    def test_grad_norm_groups_mixed_dtype_gradients(self):
+        from specforge.optimizer import _sum_of_squares
+
+        torch.manual_seed(2)
+        grads = [
+            torch.randn(n, device="cuda").mul_(3).to(dtype)
+            for n, dtype in (
+                (257, torch.bfloat16),
+                (64, torch.float32),
+                (0, torch.bfloat16),
+                (1031, torch.float32),
+                (5, torch.bfloat16),
+            )
+        ]
+        expected = torch.stack([g.float().square().sum() for g in grads]).sum()
+
+        torch.testing.assert_close(_sum_of_squares(grads), expected, rtol=1e-6, atol=0)
+
     def test_unfused_checkpoint_resumes_on_the_fused_kernel(self):
         torch.manual_seed(1)
         model = torch.nn.Linear(8, 8, bias=False).cuda()

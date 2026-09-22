@@ -13,12 +13,20 @@ logger = logging.getLogger(__name__)
 def _sum_of_squares(tensors):
     """FP32 sum of squared L2 norms of ``tensors``.
 
-    On CUDA one ``_foreach_norm`` launch per dtype group replaces three
-    kernels per tensor; the result matches up to FP32 summation order. Other
-    devices keep the per-tensor reduction.
+    On CUDA one ``_foreach_norm`` launch per (device, dtype) group replaces
+    three kernels per tensor; the result matches up to FP32 summation order.
+    Grouping matters because a mixed-dtype list falls back to one kernel per
+    tensor. Other devices keep the per-tensor reduction.
     """
     if all(tensor.is_cuda for tensor in tensors):
-        norms = torch._foreach_norm(tensors, 2.0, dtype=torch.float32)
+        groups = {}
+        for tensor in tensors:
+            groups.setdefault((tensor.device, tensor.dtype), []).append(tensor)
+        norms = [
+            norm
+            for group in groups.values()
+            for norm in torch._foreach_norm(group, 2.0, dtype=torch.float32)
+        ]
         return torch.stack(norms).square().sum()
     return torch.stack([tensor.float().square().sum() for tensor in tensors]).sum()
 

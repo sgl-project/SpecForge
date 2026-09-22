@@ -428,7 +428,9 @@ The default probe budget supports SGLang's generation-based health check without
 disabling health-endpoint generation.
 
 Disaggregated Mooncake trainers use pinned receive pools without additional settings.
-With loader prefetch enabled, H2D runs in the loader before the batch reaches training.
+With loader prefetch enabled, hidden-state H2D runs in the loader before the batch
+reaches training; integer features stay on the host (pinned by loader workers) for
+the strategy's non-blocking copy.
 Select `receive_buffers: pageable` to restore fresh host receives. The 8 GiB receive-pool
 budget is allocated lazily per rank and excludes returned tensors and overflow buffers.
 
