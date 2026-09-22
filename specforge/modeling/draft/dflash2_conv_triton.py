@@ -23,6 +23,7 @@ host stream, which keeps the result deterministic.
 import torch
 import triton
 import triton.language as tl
+from torch.autograd.function import once_differentiable
 
 __all__ = ["dflash2_grouped_conv_fused", "supports_group_size"]
 
@@ -50,6 +51,18 @@ def dflash2_grouped_conv_fused(hidden_states, delta, base, block_size, group_siz
         stride is accepted as long as the group dimension is contiguous
         ``base``: ``[taps, hidden]``
     """
+    # The kernels index with unchecked offsets, so reject shapes the eager
+    # reshapes would reject (``delta`` is checked by its row reshape).
+    _, sequence_length, hidden_size = hidden_states.shape
+    if sequence_length % block_size or hidden_size % group_size:
+        raise ValueError(
+            f"sequence length {sequence_length} and hidden size {hidden_size} must "
+            f"be multiples of block_size={block_size} and group_size={group_size}"
+        )
+    if base.dim() != 2 or base.shape[1] != hidden_size:
+        raise ValueError(
+            f"base must have shape [taps, {hidden_size}], got {tuple(base.shape)}"
+        )
     return _DFlash2GroupedConv.apply(
         hidden_states,
         delta,
@@ -107,6 +120,7 @@ class _DFlash2GroupedConv(torch.autograd.Function):
         return output.view(batch_size, sequence_length, hidden_size)
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, grad_output):
         rows, dynamic, base = ctx.saved_tensors
         num_rows, hidden_size = rows.shape

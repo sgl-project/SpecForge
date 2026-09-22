@@ -257,6 +257,35 @@ class DFlash2FusedConvParityTest(unittest.TestCase):
             _, relative, _ = _errors(actual, expected)
             self.assertLessEqual(relative, 1e-5)
 
+    def test_double_backward_raises_instead_of_dropping_terms(self):
+        conv = _random_conv(32, 4, 2, 8, device="cuda", dtype=torch.float32, seed=2)
+        inputs = torch.randn(1, 8, 32, device="cuda", requires_grad=True)
+        delta = torch.randn(1, 8, 2, 4, device="cuda", requires_grad=True)
+
+        with _count_fused_calls() as calls:
+            output = conv._convolve(inputs, delta, side=0)
+        self.assertEqual(len(calls), 1)
+        (grad_inputs,) = torch.autograd.grad(
+            output.square().sum(), inputs, create_graph=True
+        )
+        with self.assertRaisesRegex(RuntimeError, "once_differentiable"):
+            (grad_inputs.sum() + output.sum()).backward()
+
+    def test_fused_entry_rejects_mismatched_shapes(self):
+        from specforge.modeling.draft.dflash2_conv_triton import (
+            dflash2_grouped_conv_fused,
+        )
+
+        inputs = torch.randn(1, 8, 32, device="cuda")
+        delta = torch.randn(1, 8, 2, 4, device="cuda")
+        base = torch.randn(2, 32, device="cuda")
+        with self.assertRaisesRegex(ValueError, "base must have shape"):
+            dflash2_grouped_conv_fused(inputs, delta, base[:, :16], 4, 8)
+        with self.assertRaisesRegex(ValueError, "multiples of block_size"):
+            dflash2_grouped_conv_fused(inputs, delta, base, 3, 8)
+        with self.assertRaises(RuntimeError):
+            dflash2_grouped_conv_fused(inputs, delta[:, :, :1], base, 4, 8)
+
     def test_first_tap_positions_have_zero_shifted_gradients(self):
         conv = _random_conv(32, 4, 3, 8, device="cuda", dtype=torch.float32, seed=3)
         inputs = torch.randn(1, 12, 32, device="cuda")

@@ -37,7 +37,8 @@ def _load_fused_grouped_conv() -> Optional[Tuple[Callable, Callable]]:
     try:
         from .dflash2_conv_triton import dflash2_grouped_conv_fused, supports_group_size
     except ModuleNotFoundError as exc:
-        if exc.name == "triton" or exc.name.startswith("triton."):
+        name = exc.name or ""
+        if name == "triton" or name.startswith("triton."):
             return None
         raise
     return dflash2_grouped_conv_fused, supports_group_size
