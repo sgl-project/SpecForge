@@ -421,6 +421,27 @@ class LaunchPlanTest(unittest.TestCase):
                 "/local/attempt-state/inboxes",
             )
 
+    def test_online_consumer_async_ack_is_exported_and_env_overridable(self):
+        cases = {
+            "default": (None, {}, "1"),
+            "config off": (False, {}, "0"),
+            "env wins": (True, {"DISAGG_ASYNC_ACK": "0"}, "0"),
+        }
+        for name, (configured, env, expected) in cases.items():
+            with self.subTest(case=name):
+                raw = _config(mode="disaggregated", nproc=2).model_dump()
+                if configured is not None:
+                    raw["deployment"]["disaggregated"]["async_ack"] = configured
+                plan = build_launch_plan(
+                    Config.model_validate(raw),
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env={**MOONCAKE_ENV, **env},
+                )
+                for command in plan.commands:
+                    self.assertEqual(command.env["DISAGG_ASYNC_ACK"], expected)
+
     def test_consumer_state_dir_rejects_unsupported_modes_and_whitespace(self):
         cfg = _config(mode="disaggregated")
         invalid_cases = {

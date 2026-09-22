@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -597,6 +598,98 @@ class TrainerCore:
         )
 
 
+class _AsyncAckRunner:
+    """Run optimizer-boundary durable acks on ONE background thread, in order.
+
+    ``submit`` first waits for the previous ack, so at most one ack is in
+    flight, acks run strictly in optimizer-step order, and every rank issues
+    the ack's collectives in the same sequence (the ack's process group must
+    not be shared with the training thread). The first failure is sticky: it
+    re-raises from every later ``flush``/``submit`` on the training thread, so
+    no checkpoint, eval, or further ack proceeds past a failed durable ack.
+    """
+
+    def __init__(self, ack_fn: Callable[[List[str], int], None]) -> None:
+        self._ack_fn = ack_fn
+        self._cv = threading.Condition()
+        self._job: Optional[tuple] = None
+        self._closed = False
+        self._error: Optional[BaseException] = None
+        self._exec_s = 0.0
+        # CUDA's current device is per thread; pin the ack thread to the
+        # trainer's so nothing it touches lands on device 0 by default.
+        self._device = (
+            torch.cuda.current_device()
+            if torch.cuda.is_available() and torch.cuda.is_initialized()
+            else None
+        )
+        self._thread = threading.Thread(
+            target=self._run, name="specforge-durable-ack", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        if self._device is not None:
+            torch.cuda.set_device(self._device)
+        while True:
+            with self._cv:
+                while self._job is None and not self._closed:
+                    self._cv.wait()
+                if self._job is None:
+                    return
+                sample_ids, step = self._job
+            started = time.perf_counter()
+            error = None
+            try:
+                self._ack_fn(sample_ids, step)
+            except BaseException as exc:
+                exc.add_note(
+                    f"raised by the background durable ack of optimizer step {step}"
+                )
+                error = exc
+            with self._cv:
+                self._exec_s += time.perf_counter() - started
+                if error is not None and self._error is None:
+                    self._error = error
+                self._job = None
+                self._cv.notify_all()
+
+    def wait(self) -> Optional[BaseException]:
+        """Block until no ack is in flight; return the sticky failure, if any."""
+        with self._cv:
+            while self._job is not None:
+                self._cv.wait()
+            return self._error
+
+    def flush(self) -> None:
+        error = self.wait()
+        if error is not None:
+            raise error
+
+    def submit(self, sample_ids: List[str], step: int) -> None:
+        self.flush()
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("durable ack runner is closed")
+            self._job = (list(sample_ids), step)
+            self._cv.notify_all()
+
+    def pop_exec_seconds(self) -> float:
+        """Background ack execution time since the previous call."""
+        with self._cv:
+            elapsed, self._exec_s = self._exec_s, 0.0
+        return elapsed
+
+    def close(self) -> Optional[BaseException]:
+        """Wait for the in-flight ack, stop the thread, return any failure."""
+        error = self.wait()
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+        self._thread.join()
+        return error
+
+
 class TrainerController:
     """Lifecycle: fit / evaluate / checkpoint.
 
@@ -605,6 +698,15 @@ class TrainerController:
     serving or Hugging Face model format.  Evaluation is configured once at
     construction time, so the public training lifecycle remains one no-argument
     :meth:`Trainer.fit` call.
+
+    ``async_ack=True`` runs ``ack_fn`` for optimizer step N on a background
+    thread while step N+1 computes. The durable marker (and the consumed
+    counter it drives) then lags the trainer by at most one optimizer step:
+    the pending ack is flushed before the next ack starts, before eval, before
+    every checkpoint (a checkpoint is never ahead of its ack), and before
+    ``fit`` returns; an ack failure re-raises on the training thread at that
+    flush. ``ack_fn`` must be safe to call off the training thread and must
+    not share a process group with training collectives.
     """
 
     def __init__(
@@ -632,6 +734,7 @@ class TrainerController:
         checkpoint_manager: Optional[Any] = None,
         checkpoint_extra: Optional[Dict[str, Any]] = None,
         profiling_options=None,
+        async_ack: bool = False,
     ) -> None:
         if (start_batch == 0) != (start_samples == 0):
             raise ValueError(
@@ -661,6 +764,12 @@ class TrainerController:
         # ack_fn(sample_ids, global_step) records the durable ack transaction at
         # the optimizer-step boundary; None = the loader acks (simple runs).
         self.ack_fn = ack_fn
+        self.async_ack = bool(async_ack)
+        # Live only inside fit(); None means acks run inline.
+        self._ack_runner: Optional[_AsyncAckRunner] = None
+        # Training-thread time blocked on ack flushes outside the boundary
+        # submit (eval / checkpoint), folded into perf/durable_ack_time_s.
+        self._ack_flush_wait_s = 0.0
         # global_step counts OPTIMIZER steps (increments only at a grad-accum
         # boundary) so ack/checkpoint/resume semantics are in true optimizer
         # steps; micro_step counts forward/backward micro-batches.
@@ -722,11 +831,47 @@ class TrainerController:
 
     def fit(self, data: Iterable[TrainBatch]) -> int:
         progress = self._make_progress_bar()
+        if self.async_ack and self.ack_fn is not None:
+            self._ack_runner = _AsyncAckRunner(self.ack_fn)
         try:
-            return self._fit(data, progress)
+            step = self._fit(data, progress)
+            # Every optimizer boundary this call reached is durable on return.
+            self._close_ack_runner(None)
+            return step
+        except BaseException as exc:
+            self._close_ack_runner(exc)
+            raise
         finally:
             if progress is not None:
                 progress.close()
+
+    def _close_ack_runner(self, primary: Optional[BaseException]) -> None:
+        runner, self._ack_runner = self._ack_runner, None
+        if runner is None:
+            return
+        # On failure still wait: the in-flight ack's collectives are already
+        # joined by every peer's ack thread, and lifecycle cleanup (feature
+        # drains, consumer_done) must not race it.
+        error = runner.close()
+        if error is None:
+            return
+        if primary is None:
+            raise error
+        if error is not primary:
+            primary.add_note(
+                "the background durable ack also failed: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    def _flush_durable_ack(self) -> None:
+        """Wait for the in-flight async ack; re-raise its failure here."""
+        if self._ack_runner is None:
+            return
+        started = time.perf_counter()
+        try:
+            self._ack_runner.flush()
+        finally:
+            self._ack_flush_wait_s += time.perf_counter() - started
 
     def _fit(self, data: Iterable[TrainBatch], progress: Optional[Any]) -> int:
         if self.max_steps is not None and self.global_step >= self.max_steps:
@@ -811,7 +956,12 @@ class TrainerController:
                 if self.ack_fn is not None:
                     # durable ack transaction at the optimizer-step boundary
                     durable_ack_started = time.perf_counter()
-                    self.ack_fn(pending_ack, self.global_step)
+                    if self._ack_runner is None:
+                        self.ack_fn(pending_ack, self.global_step)
+                    else:
+                        # Waits only for step N-1's ack; step N's overlaps
+                        # the next step's compute.
+                        self._ack_runner.submit(pending_ack, self.global_step)
                     perf_durable_ack_s += time.perf_counter() - durable_ack_started
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
@@ -829,6 +979,15 @@ class TrainerController:
                     tp_size = int(getattr(parallel, "tp_size", 1))
                     sp_size = int(getattr(parallel, "sp_size", 1))
                     data_parallel_size = max(1, world_size // (tp_size * sp_size))
+                    # Time the training thread was BLOCKED on durable acks; in
+                    # async mode the ack itself runs behind the next step.
+                    perf_durable_ack_s += self._ack_flush_wait_s
+                    self._ack_flush_wait_s = 0.0
+                    if self._ack_runner is not None:
+                        background_s = self._ack_runner.pop_exec_seconds()
+                        log_metrics["perf/durable_ack_background_time_s"] = (
+                            background_s / max(1, perf_window_steps)
+                        )
                     log_metrics.update(
                         {
                             "perf/optimizer_steps_per_hour": (
@@ -943,6 +1102,7 @@ class TrainerController:
         factories can return an iterable context manager so each interval gets
         a fresh rollout stream without exposing an extra argument on ``fit``.
         """
+        self._flush_durable_ack()
         if self.eval_data_factory is None:
             return self.evaluate(None)
         data = self.eval_data_factory()
@@ -961,6 +1121,7 @@ class TrainerController:
         """
         from specforge.eval import Evaluator
 
+        self._flush_durable_ack()
         module = self.core.strategy.trainable_module()
         was_training = module.training
         module.eval()
@@ -997,6 +1158,9 @@ class TrainerController:
         return self._checkpoint_mgr
 
     def save_checkpoint(self, step: int) -> Checkpoint:
+        # A checkpoint must never be ahead of its durable ack: resume requires
+        # the ledger marker to equal the checkpoint step.
+        self._flush_durable_ack()
         # Every rank participates: FSDP model gathering is collective and every
         # rank persists its RNG. Sharded optimizer state stays rank-local; the
         # identical DDP optimizer is written once in the shared rank0 payload.

@@ -352,6 +352,7 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.idle_timeout_s` | `null` | Positive consumer idle timeout. |
 | `deployment.disaggregated.peer_wait_timeout_s` | `null` | Optional positive producer/consumer peer-completion timeout. Unset is unbounded; expiration fails the attempt. |
 | `deployment.disaggregated.producer_hold_s` | `null` | Optional positive offline producer retention timeout. Unset is unbounded; expiration fails the attempt. |
+| `deployment.disaggregated.async_ack` | `true` | Online consumer: overlap each optimizer boundary's durable ack (ledger commit, feature removes, DP ack collectives on a dedicated Gloo group) with the next step on a background thread. The durable marker lags by at most one optimizer step and is flushed before every checkpoint, eval, and fit end. Exported as `DISAGG_ASYNC_ACK` (`0` disables; an explicit environment value wins). |
 | `deployment.disaggregated.shutdown_grace_s` | `30.0` | SIGTERM-to-SIGKILL window for a plain supervisor teardown; must cover worker cleanup (Mooncake drains, checkpoint flush, failure sentinels). `managed_local` stacks use `managed_local.shutdown_grace_s`. |
 | `deployment.disaggregated.managed_local` | `null` | Optional owned single-node Mooncake + capture-server stack described below. |
 
