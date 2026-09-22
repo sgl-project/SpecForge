@@ -759,6 +759,15 @@ class TestMultiServerProducer(unittest.TestCase):
                 producer_concurrency=0,
             )
 
+    def test_zero_rollout_workers_rejected_at_build(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        adapter = _adapter(store, _StubCaptureServer(backend))
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+
+        with self.assertRaisesRegex(ValueError, "at least one rollout worker"):
+            _build(adapter, _prompts(2), store, channel, num_rollout_workers=0)
+
 
 def _plan_task_ids(prompts, epochs, seed):
     """The chunked producer's FIFO dispatch plan (epoch order, then shuffle)."""
@@ -836,10 +845,11 @@ class TestContinuousPromptIngest(unittest.TestCase):
     def _workdir(self):
         return tempfile.mkdtemp(prefix="disagg_ingest_")
 
-    def _refill_threshold(self, workers, concurrency, lease):
+    def _refill_threshold(self, workers, concurrency, lease, chunk):
         from specforge.launch import _ONLINE_PROMPT_REFILL_ROUNDS
 
-        return _ONLINE_PROMPT_REFILL_ROUNDS * workers * concurrency * lease
+        slots = workers * concurrency * lease
+        return min(_ONLINE_PROMPT_REFILL_ROUNDS * slots, max(chunk, slots))
 
     def test_capture_calls_never_drain_between_ingest_chunks_or_epochs(self):
         N, E, chunk, lease = 11, 2, 3, 1
@@ -883,7 +893,7 @@ class TestContinuousPromptIngest(unittest.TestCase):
                     sorted(f"run0:{task_id}" for task_id in plan),
                 )
                 # Continuous ingestion still bounds normalized residency.
-                threshold = self._refill_threshold(servers, concurrency, lease)
+                threshold = self._refill_threshold(servers, concurrency, lease, chunk)
                 self.assertLessEqual(
                     server.max_resident_prompts,
                     threshold + chunk + servers * concurrency * lease,
@@ -1045,7 +1055,9 @@ class TestContinuousPromptIngest(unittest.TestCase):
         self.assertIsNone(channel.failure())
         residual = controller.status()
         self.assertEqual(residual["prompts_leased"], 0)
-        self.assertLess(residual["prompts"], self._refill_threshold(1, 1, 1) + chunk)
+        self.assertLess(
+            residual["prompts"], self._refill_threshold(1, 1, 1, chunk) + chunk
+        )
         self.assertLess(stop_after + residual["prompts"], len(plan))
 
         # A restarted producer rebuilds the same plan and sample ids, so the
@@ -1117,9 +1129,54 @@ class TestContinuousPromptIngest(unittest.TestCase):
         self.assertEqual(outcome.get("produced"), N)
         self.assertTrue(paused_resident)
         # pending < threshold + one chunk, plus the single leased prompt.
-        bound = self._refill_threshold(1, 1, 1) + chunk
+        bound = self._refill_threshold(1, 1, 1, chunk) + chunk
         self.assertLessEqual(max(paused_resident), bound)
         self.assertLessEqual(max_resident, bound)
+        self.assertTrue(channel.is_closed())
+
+    def test_ingest_batch_size_still_caps_pending_prompts_for_wide_leases(self):
+        # Four rounds of capture slots (4 * 2 * 2 = 16 prompts) exceed the
+        # ingest batch; the feeder must cap its threshold at that batch so a
+        # wide lease/concurrency config cannot expand far more normalized
+        # prompts than prompt_ingest_batch_size promises.
+        N, chunk, concurrency, lease = 60, 6, 2, 2
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        stub_lock = threading.Lock()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        pending_seen = []
+        probe = {}
+
+        def slow_post(url, json_body, timeout):
+            pending_seen.append(probe["status"]()["prompts_pending"])
+            time.sleep(0.01)  # the feeder tops up to its threshold meanwhile
+            with stub_lock:
+                return stub(url, json_body, timeout)
+
+        workers, drive = _build(
+            [_adapter(store, slow_post)],
+            _prompts(N),
+            store,
+            channel,
+            lease=lease,
+            producer_concurrency=concurrency,
+            prompt_ingest_batch_size=chunk,
+        )
+        probe["status"] = workers[0].controller.status
+
+        produced = drive()
+
+        self.assertEqual(produced, N)
+        self.assertGreater(self._refill_threshold(1, concurrency, lease, 10**9), chunk)
+        threshold = self._refill_threshold(1, concurrency, lease, chunk)
+        self.assertEqual(threshold, chunk)
+        # pending < threshold + one feed step == two ingest batches.
+        self.assertLess(max(pending_seen), 2 * chunk)
+        self.assertEqual(
+            sorted(_published_sample_ids(channel.path)),
+            sorted(f"run0:p{i}" for i in range(N)),
+        )
         self.assertTrue(channel.is_closed())
 
     def test_worker_fatal_error_stops_peer_workers_mid_plan(self):

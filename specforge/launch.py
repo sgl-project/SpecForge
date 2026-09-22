@@ -791,7 +791,9 @@ def build_disagg_offline_runtime(
 # The online producer's prompt feeder tops the pending pool up whenever it
 # holds fewer than this many full rounds of capture slots (workers *
 # producer_concurrency * lease prompts), so servers never drain at an ingest
-# step or epoch boundary while the next step is normalized.
+# step or epoch boundary while the next step is normalized. The threshold is
+# capped at one prompt_ingest_batch_size (or one round, if larger) so wide
+# lease/concurrency configs keep the ingest batch as their residency bound.
 _ONLINE_PROMPT_REFILL_ROUNDS = 4
 
 
@@ -854,11 +856,13 @@ def build_disagg_online_producer(
     memory-mapped dataset does not expand every token list before rollout.
     Ingestion is continuous: while every worker keeps its capture slots full,
     the driving thread feeds the plan in order (FIFO across epochs) whenever
-    fewer than ``_ONLINE_PROMPT_REFILL_ROUNDS * workers * producer_concurrency
-    * lease`` prompts are pending, in steps of at most that threshold (and at
-    most ``prompt_ingest_batch_size``), so no server idles at a chunk or epoch
-    boundary. Fewer than the threshold plus one step are pending at once (plus
-    the prompts already leased).
+    fewer than ``min(_ONLINE_PROMPT_REFILL_ROUNDS * slots,
+    max(prompt_ingest_batch_size, slots))`` prompts are pending (``slots =
+    workers * producer_concurrency * lease``), in steps of at most that
+    threshold (and at most ``prompt_ingest_batch_size``), so no server idles
+    at a chunk or epoch boundary. Fewer than two ingest batches are pending at
+    once unless one round of slots alone exceeds a batch (plus the prompts
+    already leased).
 
     Failure semantics: a worker whose source raises (dead/unreachable server)
     has already failed its leases retryable — the surviving workers re-lease
@@ -982,6 +986,9 @@ def build_disagg_online_producer(
         vocab_map_version=vocab_map_version,
         num_rollout_workers=num_rollout_workers,
     )
+    if not workers:
+        # The prompt feeder sizes its refill threshold by the worker count.
+        raise ValueError("online producer requires at least one rollout worker")
     producer_timing(
         "assemble rollout workers done "
         f"workers={len(workers)} elapsed={elapsed(phase)} "
@@ -1080,11 +1087,13 @@ def build_disagg_online_producer(
         ingest_closed = threading.Event()
         # Set on a fatal driver/worker error so every peer stops leasing.
         abort = threading.Event()
-        refill_threshold = (
-            _ONLINE_PROMPT_REFILL_ROUNDS
-            * len(workers)
-            * producer_concurrency
-            * worker_lease
+        slots = len(workers) * producer_concurrency * worker_lease
+        # A step (<= threshold) normalizes long before a threshold-sized pool
+        # drains unless capture outpaces normalization, so capping at one
+        # ingest batch keeps the residency bound without reopening bubbles.
+        refill_threshold = min(
+            _ONLINE_PROMPT_REFILL_ROUNDS * slots,
+            max(prompt_ingest_batch_size, slots),
         )
         # Feed in steps no larger than the threshold: a step's normalization
         # then finishes long before the remaining pool drains, however large
