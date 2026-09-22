@@ -469,9 +469,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             set(disabled.emitted_features),
         )
         self.assertLessEqual(required.required_tensors, disabled.emitted_features)
-        self.assertTrue(
-            registration.spec.capabilities.supports_teacher_metrics_opt_out
-        )
+        self.assertTrue(registration.spec.capabilities.supports_teacher_metrics_opt_out)
 
     def test_other_builtins_always_request_their_registered_layout(self):
         # Planning rejects the opt-out for these algorithms; resolution keeps
@@ -512,7 +510,11 @@ class BuiltinProviderContractTest(unittest.TestCase):
         cases = (
             (lambda _config: added, ValueError, "may only drop features"),
             (lambda _config: without_aux, ValueError, "required tensors"),
-            (lambda _config: {"aux": "hidden_states"}, TypeError, "ServerCaptureLayout"),
+            (
+                lambda _config: {"aux": "hidden_states"},
+                TypeError,
+                "ServerCaptureLayout",
+            ),
         )
         for select_layout, error, message in cases:
             with self.subTest(message=message):

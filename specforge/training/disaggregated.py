@@ -622,9 +622,7 @@ def _build_online(
     channel = StreamingRefChannel(channel_path)
 
     if cfg.training.role == "producer":
-        from specforge.algorithms.common.providers import (
-            resolve_server_capture_layout,
-        )
+        from specforge.algorithms.common.providers import resolve_server_capture_layout
         from specforge.inference.adapters.server_capture import (
             ServerCaptureSchema,
             SGLangServerCaptureAdapter,

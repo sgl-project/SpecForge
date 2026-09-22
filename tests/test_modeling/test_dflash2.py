@@ -17,6 +17,7 @@ from specforge.modeling.draft.dflash2 import (
     DFlashGroupedConv,
     Qwen3DFlash2DecoderLayer,
 )
+from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import DFlashTrainStrategy, StepContext
 
 
@@ -560,7 +561,9 @@ class CandidateSelectorTest(unittest.TestCase):
                     ratios_on = metrics_on["ratio_metrics"]
                     ratios_off = metrics_off["ratio_metrics"]
                     teacher_keys = {key for key in ratios_on if is_teacher_metric(key)}
-                    self.assertIn("dflash/teacher/unary_overlap_chain_length", teacher_keys)
+                    self.assertIn(
+                        "dflash/teacher/unary_overlap_chain_length", teacher_keys
+                    )
                     self.assertEqual(
                         label == "dflash2",
                         "dflash2/selector/self_conditioned_teacher_argmax_agreement"
@@ -575,6 +578,91 @@ class CandidateSelectorTest(unittest.TestCase):
                     )
                     torch.testing.assert_close(loss_off, loss_on)
                     torch.testing.assert_close(accuracy_off, accuracy_on)
+
+    def test_teacher_metrics_off_keeps_real_draft_loss_and_gradients_exact(self):
+        # Unlike the stubbed block stack above, this runs a real DFlash2 draft
+        # through the strategy on a log step, so the teacher-off path must also
+        # leave the backward bit-identical for every objective variant.
+        def step(loss_kwargs, *, teacher_metrics, feed_teacher):
+            torch.manual_seed(0)
+            draft = DFlash2DraftModel(_tiny_config())
+            model = OnlineDFlashModel(
+                draft_model=draft,
+                target_lm_head=nn.Linear(16, 32, bias=False).requires_grad_(False),
+                target_embed_tokens=nn.Embedding(32, 16).requires_grad_(False),
+                mask_token_id=31,
+                block_size=4,
+                attention_backend="sdpa",
+                num_anchors=6,
+                objective_chunk_blocks=2,
+                teacher_metrics=teacher_metrics,
+                **loss_kwargs,
+            )
+            generator = torch.Generator().manual_seed(1)
+            loss_mask = torch.ones(2, 20, dtype=torch.long)
+            loss_mask[1, 14:] = 0
+            tensors = {
+                "input_ids": torch.randint(0, 30, (2, 20), generator=generator),
+                "hidden_states": torch.randn(2, 20, 16, generator=generator),
+                "loss_mask": loss_mask,
+            }
+            if feed_teacher:
+                tensors["target_last_hidden_states"] = torch.randn(
+                    2, 20, 16, generator=generator
+                )
+            batch = TrainBatch(
+                sample_ids=["a", "b"], strategy="dflash", tensors=tensors
+            )
+            torch.manual_seed(2)
+            out = DFlashTrainStrategy(model).forward_loss(
+                batch, ctx=StepContext(global_step=1, total_steps=4)
+            )
+            out.loss.backward()
+            gradients = {
+                name: parameter.grad
+                for name, parameter in model.named_parameters()
+                if parameter.grad is not None
+            }
+            return out, gradients
+
+        for loss_kwargs in (
+            {},
+            {"loss_type": "dpace"},
+            {"lk_loss_type": "lambda"},
+            {"selector_stop_gradient": True},
+        ):
+            with self.subTest(**loss_kwargs):
+                reference, reference_gradients = step(
+                    loss_kwargs, teacher_metrics=True, feed_teacher=True
+                )
+                teacher_keys = {
+                    key
+                    for key in reference.ratio_metrics
+                    if "/teacher/" in key or key.endswith("teacher_argmax_agreement")
+                }
+                self.assertIn("dflash/teacher/unary_overlap_chain_length", teacher_keys)
+                for feed_teacher in (True, False):
+                    out, gradients = step(
+                        loss_kwargs, teacher_metrics=False, feed_teacher=feed_teacher
+                    )
+                    self.assertTrue(torch.equal(out.loss, reference.loss))
+                    self.assertEqual(set(reference_gradients), set(gradients))
+                    for name, gradient in gradients.items():
+                        self.assertTrue(
+                            torch.equal(gradient, reference_gradients[name]), name
+                        )
+                    self.assertEqual(
+                        set(reference.ratio_metrics) - teacher_keys,
+                        set(out.ratio_metrics),
+                    )
+                    for key, (numerator, denominator) in out.ratio_metrics.items():
+                        self.assertTrue(
+                            torch.equal(numerator, reference.ratio_metrics[key][0])
+                        )
+                        self.assertTrue(
+                            torch.equal(denominator, reference.ratio_metrics[key][1])
+                        )
+                    self.assertEqual(reference.sum_metrics, out.sum_metrics)
 
     def test_plain_dflash_draft_reports_family_metrics_without_selector_keys(self):
         # A DFlash draft has neither a candidate selector nor a unary transform.
