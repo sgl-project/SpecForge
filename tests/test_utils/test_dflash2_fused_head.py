@@ -193,6 +193,10 @@ class FusedHeadKernelTest(unittest.TestCase):
         for vocab_size in (1000, 50003):
             with self.subTest(vocab_size=vocab_size):
                 self._compare(vocab_size)
+        # Single and non-power-of-two candidate lists pad the selection slots.
+        for vocab_size, top_k in ((1000, 3), (50003, 1)):
+            with self.subTest(vocab_size=vocab_size, top_k=top_k):
+                self._compare(vocab_size, top_k=top_k)
 
     def test_wide_candidate_sets_and_retained_graphs(self):
         from specforge.core.dflash_head_triton import (
@@ -341,11 +345,20 @@ class FusedHeadModelParityTest(unittest.TestCase):
     def test_fused_head_matches_reference_objective(self):
         device = torch.device("cuda")
         cases = [
-            {"loss_type": "dflash", "loss_decay_gamma": 7.0},
-            {"loss_type": "dpace"},
-            {"loss_type": "dflash", "lk_loss_type": "lambda"},
+            ({"loss_type": "dflash", "loss_decay_gamma": 7.0}, 1e-3),
+            ({"loss_type": "dpace"}, 1e-3),
+            ({"loss_type": "dflash", "lk_loss_type": "lambda"}, 1e-3),
+            # Continuation value divides by the prefix product and TV scales by
+            # the target probability; even the reference BF16 gradients sit
+            # ~3e-2 from an FP32 run here, so allow BF16 GEMM-order noise.
+            (
+                {"loss_type": "dpace-continuation-value-only", "lk_loss_type": "tv"},
+                5e-3,
+            ),
+            # A statically disabled selector runs the head without top-k.
+            ({"loss_type": "dflash", "selector_loss_alpha": 0.0}, 1e-3),
         ]
-        for case in cases:
+        for case, grad_tolerance in cases:
             for stop_gradient in (False, True):
                 for chunk_blocks in (0, 2):
                     kwargs = dict(
@@ -354,9 +367,9 @@ class FusedHeadModelParityTest(unittest.TestCase):
                         objective_chunk_blocks=chunk_blocks,
                     )
                     with self.subTest(**kwargs):
-                        self._compare(device, kwargs)
+                        self._compare(device, kwargs, grad_tolerance)
 
-    def _compare(self, device, kwargs):
+    def _compare(self, device, kwargs, grad_tolerance):
         fused = _online_model(device, torch.bfloat16, env="1", **kwargs)
         reference = _online_model(device, torch.bfloat16, env="0", **kwargs)
         batch = self._batch(device, 2 * 64)
@@ -371,10 +384,24 @@ class FusedHeadModelParityTest(unittest.TestCase):
             )
         )
 
-        fused_loss, fused_acc, fused_metrics, fused_grads = _run_model(
-            fused, batch, seed=5
-        )
-        ref_loss, ref_acc, ref_metrics, ref_grads = _run_model(reference, batch, seed=5)
+        from specforge.core import dflash_head_triton
+
+        # The gate above only inspects a probe tensor; also require that the
+        # objective really dispatches to (or bypasses) the fused head.
+        with mock.patch.object(
+            dflash_head_triton,
+            "dflash_unary_head_fused",
+            wraps=dflash_head_triton.dflash_unary_head_fused,
+        ) as fused_head:
+            fused_loss, fused_acc, fused_metrics, fused_grads = _run_model(
+                fused, batch, seed=5
+            )
+            self.assertGreater(fused_head.call_count, 0)
+            fused_head.reset_mock()
+            ref_loss, ref_acc, ref_metrics, ref_grads = _run_model(
+                reference, batch, seed=5
+            )
+            fused_head.assert_not_called()
 
         torch.testing.assert_close(fused_loss, ref_loss, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(fused_acc, ref_acc, rtol=1e-4, atol=1e-6)
@@ -401,7 +428,7 @@ class FusedHeadModelParityTest(unittest.TestCase):
         for name, expected in ref_grads.items():
             actual = fused_grads[name]
             error = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
-            self.assertLess(error.item(), 1e-3, name)
+            self.assertLess(error.item(), grad_tolerance, name)
 
 
 if __name__ == "__main__":

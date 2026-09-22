@@ -383,8 +383,8 @@ def _unary_head_combine_stats_kernel(
 
     ``lse = max + log(sum_s exp_sum_s * exp(max_s - max))``; the argmax is taken
     from the first split that attains the row maximum. The top-k is written in
-    descending value order, equal values by ascending index, as ``torch.topk``
-    orders them.
+    descending value order, equal values by ascending index; ``torch.topk``
+    selects the same set but leaves the order of equal values unspecified.
     """
     row = tl.program_id(0).to(tl.int64)
     splits = tl.arange(0, BLOCK_SPLITS)
