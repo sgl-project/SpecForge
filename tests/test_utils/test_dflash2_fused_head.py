@@ -167,21 +167,12 @@ class FusedHeadKernelTest(unittest.TestCase):
         torch.testing.assert_close(neg_log_q, eager_nlq, rtol=1e-5, atol=1e-5)
         self.assertTrue(torch.equal(argmax, eager_logits.argmax(dim=-1)))
         self.assertEqual(argmax[3].item(), 0)
-        reference_values, reference_ids = eager_logits.topk(top_k, dim=-1)
         # BF16 -> FP32 is exact, so the candidate values match bit for bit.
-        self.assertTrue(torch.equal(topv, reference_values))
-        self.assertTrue(torch.equal(eager_logits.gather(-1, topi), topv))
         sorted_values = eager_logits.sort(dim=-1, descending=True).values
         boundary_tie = sorted_values[:, top_k - 1] == sorted_values[:, top_k]
         self.assertTrue(boundary_tie[3].item())
-        for row in torch.nonzero(~boundary_tie).flatten().tolist():
-            self.assertTrue(
-                torch.equal(
-                    topi[row].sort().values,
-                    reference_ids[row].sort().values,
-                ),
-                row,
-            )
+        _assert_same_topk(self, topv, topi, eager_logits, top_k)
+        self.assertEqual(topi[3].tolist(), list(range(top_k)))
 
         zero_rows = (grad_nlq == 0) & (grad_topv == 0).all(dim=-1)
         self.assertTrue(zero_rows.any())
@@ -202,6 +193,38 @@ class FusedHeadKernelTest(unittest.TestCase):
         for vocab_size in (1000, 50003):
             with self.subTest(vocab_size=vocab_size):
                 self._compare(vocab_size)
+
+    def test_wide_candidate_sets_and_retained_graphs(self):
+        from specforge.core.dflash_head_triton import (
+            MAX_FUSED_TOP_K,
+            dflash_unary_head_fused,
+        )
+
+        torch.manual_seed(4)
+        device = torch.device("cuda")
+        weight = torch.randn(3001, 32, device=device, dtype=torch.bfloat16)
+        targets = torch.randint(3001, (19,), device=device)
+        for top_k in (MAX_FUSED_TOP_K, MAX_FUSED_TOP_K + 36):
+            with self.subTest(top_k=top_k):
+                hidden = torch.randn(
+                    19, 32, device=device, dtype=torch.bfloat16, requires_grad=True
+                )
+                neg_log_q, topv, topi, _ = dflash_unary_head_fused(
+                    hidden, weight, targets, top_k
+                )
+                reference_values, reference_ids = (
+                    F.linear(hidden.detach(), weight).float().topk(top_k, dim=-1)
+                )
+                self.assertTrue(torch.equal(topv, reference_values))
+                self.assertTrue(
+                    torch.equal(
+                        topi.sort(dim=-1).values, reference_ids.sort(dim=-1).values
+                    )
+                )
+                loss = neg_log_q.sum() + topv.sum()
+                loss.backward(retain_graph=True)
+                with self.assertRaisesRegex(RuntimeError, "modified by an inplace"):
+                    loss.backward()
 
     def test_argmax_and_neg_log_q_without_topk(self):
         from specforge.core.dflash_head_triton import dflash_unary_head_fused
@@ -231,23 +254,59 @@ class FusedHeadKernelTest(unittest.TestCase):
         self.assertTrue(torch.equal(argmax, logits.argmax(dim=-1)))
         torch.testing.assert_close(hidden.grad, reference.grad, rtol=1e-2, atol=1e-3)
 
-    def test_topk_matches_fp32_on_peaked_logits(self):
-        """Realistic peaked rows: a few dominant tokens over a long flat tail."""
+    def test_topk_matches_fp32_topk_at_full_vocabulary(self):
+        """Random and peaked BF16 rows over the 248k Qwen3.8 vocabulary."""
+        from specforge.core.dflash_head_triton import _launch_stats
+
         torch.manual_seed(5)
         device = torch.device("cuda")
-        rows, vocab_size = 64, 248320
-        logits = torch.randn(rows, vocab_size, device=device) * 2.0
-        hot = torch.randint(vocab_size, (rows, 24), device=device)
-        logits.scatter_(1, hot, 20.0 + 4 * torch.rand(rows, 24, device=device))
-        logits = logits.to(torch.bfloat16)
+        rows, vocab_size, top_k = 96, 248320, 16
+        random_logits = 1.5 * torch.randn(rows, vocab_size, device=device)
+        # A few dominant tokens over a long flat tail, as a trained head emits.
+        peaked_logits = 2.0 * torch.randn(rows, vocab_size, device=device)
+        hot = torch.randint(vocab_size, (rows, 8), device=device)
+        peaked_logits.scatter_(1, hot, 15.0 + 5 * torch.rand(rows, 8, device=device))
+        for name, logits in (("random", random_logits), ("peaked", peaked_logits)):
+            with self.subTest(logits=name):
+                logits = logits.to(torch.bfloat16)
+                targets = torch.randint(vocab_size, (rows,), device=device)
+                lse = torch.empty(rows, device=device)
+                target_logit = torch.empty_like(lse)
+                argmax = torch.empty(rows, device=device, dtype=torch.long)
+                topv = torch.empty(rows, top_k, device=device)
+                topi = torch.empty(rows, top_k, device=device, dtype=torch.long)
 
-        values, ids = torch.topk(logits, 16, dim=-1)
-        reference_values, reference_ids = torch.topk(logits.float(), 16, dim=-1)
+                _launch_stats(logits, targets, lse, target_logit, argmax, topv, topi)
 
-        self.assertTrue(torch.equal(values.float(), reference_values))
-        self.assertTrue(
-            torch.equal(ids.sort(dim=-1).values, reference_ids.sort(dim=-1).values)
-        )
+                reference = logits.float()
+                torch.testing.assert_close(
+                    lse, torch.logsumexp(reference, dim=-1), rtol=1e-6, atol=1e-5
+                )
+                self.assertTrue(torch.equal(argmax, reference.argmax(dim=-1)))
+                self.assertTrue(
+                    torch.equal(
+                        target_logit, reference.gather(1, targets[:, None])[:, 0]
+                    )
+                )
+                _assert_same_topk(self, topv, topi, reference, top_k)
+
+
+def _assert_same_topk(test, values, ids, reference_logits, top_k):
+    """Assert ``torch.topk``'s values and candidate sets, lowest index on ties.
+
+    The fused kernel orders equal values by ascending index; ``torch.topk``'s
+    sort leaves equal values in an unspecified order, so ids compare as sets.
+    """
+    reference_values, reference_ids = reference_logits.topk(top_k, dim=-1)
+    test.assertTrue(torch.equal(values, reference_values))
+    test.assertTrue(
+        torch.equal(ids.sort(dim=-1).values, reference_ids.sort(dim=-1).values)
+    )
+    test.assertTrue(torch.equal(reference_logits.gather(-1, ids), values))
+    equal_neighbors = values[:, 1:] == values[:, :-1]
+    test.assertTrue(
+        torch.all(ids[:, 1:][equal_neighbors] > ids[:, :-1][equal_neighbors])
+    )
 
 
 def _run_model(model, batch, seed):

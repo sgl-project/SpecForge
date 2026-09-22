@@ -1565,6 +1565,28 @@ class OnlineDFlashModel(nn.Module):
         sequence_anchor_scale = None
         if self.loss_type in _DPACE_LOSS_TYPES:
             sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
+        metric_terms = None
+        if collect_detailed_metrics:
+            # Reduce the detached diagnostics first: their full-vocabulary
+            # temporaries are released before the objective keeps state for
+            # backward (the fused head keeps its BF16 logits).
+            metric_terms = DFlashMetricTerms(
+                *checkpointed_chunk_reduce(
+                    partial(
+                        self._dflash_metric_chunk_terms,
+                        total_blocks=anchor_positions.shape[1],
+                    ),
+                    hidden_4d.detach(),
+                    target_ids,
+                    weight_mask,
+                    predecessor_ids,
+                    aligned_target_hidden,
+                    sequence_anchor_scale,
+                    torch.arange(anchor_positions.shape[1], device=device).unsqueeze(0),
+                    chunk_size=self.objective_chunk_blocks,
+                    dim=1,
+                )
+            )
         objective_function = self._dflash_objective_chunk_terms
         objective_inputs = (
             hidden_4d,
@@ -1649,23 +1671,7 @@ class OnlineDFlashModel(nn.Module):
         candidate_selector = getattr(self.draft_model, "candidate_selector", None)
         sum_metrics = {}
         if collect_detailed_metrics:
-            terms = DFlashMetricTerms(
-                *checkpointed_chunk_reduce(
-                    partial(
-                        self._dflash_metric_chunk_terms,
-                        total_blocks=anchor_positions.shape[1],
-                    ),
-                    hidden_4d.detach(),
-                    target_ids,
-                    weight_mask,
-                    predecessor_ids,
-                    aligned_target_hidden,
-                    sequence_anchor_scale,
-                    torch.arange(anchor_positions.shape[1], device=device).unsqueeze(0),
-                    chunk_size=self.objective_chunk_blocks,
-                    dim=1,
-                )
-            )
+            terms = metric_terms
             block_valid = (weight_mask[..., 1:] > 0.5).any(dim=-1)
             ratio_metrics["dflash/hard_label/walk_accepted_length"] = (
                 compute_walk_accepted_length_terms(
