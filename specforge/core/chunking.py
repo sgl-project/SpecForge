@@ -17,12 +17,15 @@ def checkpointed_chunk_reduce(
     *aligned_tensors: Optional[torch.Tensor],
     chunk_size: int,
     dim: int = 0,
+    checkpoint: bool = True,
 ) -> ChunkTerms:
     """Sum additive terms over aligned tensor slices.
 
     ``chunk_size=0`` evaluates the full dimension once without checkpointing.
     Positive chunk sizes bound intermediates and use non-reentrant activation
     checkpointing when gradients are enabled and an input requires gradients.
+    ``checkpoint=False`` keeps the chunking but saves each chunk's activations,
+    for chunk functions whose saved state is already small.
     ``None`` arguments are forwarded unchanged, which keeps optional objective
     inputs aligned with the tensors that are sliced.
     """
@@ -69,16 +72,17 @@ def checkpointed_chunk_reduce(
             for tensor in aligned_tensors
         )
         should_checkpoint = (
-            chunk_size > 0
+            checkpoint
+            and chunk_size > 0
             and torch.is_grad_enabled()
             and any(
                 tensor is not None and tensor.requires_grad for tensor in chunk_args
             )
         )
         if should_checkpoint:
-            from torch.utils.checkpoint import checkpoint
+            from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
-            chunk_terms = checkpoint(
+            chunk_terms = activation_checkpoint(
                 function,
                 *chunk_args,
                 use_reentrant=False,
