@@ -11,12 +11,15 @@ topology: Disaggregated
 Trains the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
 `Qwen/Qwen3.8-27B` on the disaggregated online data plane: patched SGLang
 capture servers publish the target's hidden states into Mooncake, and
-data-parallel trainer ranks consume them. Two recipes share every model, data
-and optimizer setting and differ only in topology:
+data-parallel trainer ranks consume them. The first two recipes share every
+model, data and optimizer setting and differ only in topology; the third is the
+tuned single-node H200 layout described in
+[One H200 node, tuned](#one-h200-node-tuned-five-servers-dp3):
 
 | Recipe | Layout | Services |
 | --- | --- | --- |
 | [`managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml) | one 8-GPU node: four TP1 capture servers on GPUs 0-3, DP4 trainer on GPUs 4-7 | owned by `specforge train` |
+| [`managed-local/qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml) | one 8x H200 node: five TP1 FP8 capture servers on GPUs 0-4, DP3 trainer on GPUs 5-7, RDMA loopback | owned by `specforge train` |
 | [`external/qwen3.8-27b-dflash2-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml) | two 8-GPU nodes: eight TP1 capture servers, the Mooncake master and the producer on the capture node, DP8 trainer on the trainer node | started by [`examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh`](https://github.com/sgl-project/SpecForge/blob/main/examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh) or by hand |
 
 Every number below is a steady-state throughput in samples per second (one
@@ -115,6 +118,66 @@ other at 4+4 because the servers, not the transport, are the limit, so the
 ordering holds for `main`. To move servers, edit `capture_servers`,
 `trainer_cuda_visible_devices` and `deployment.trainer.nproc_per_node`
 together and rescale the watermarks (next section).
+
+The H200 figures in this table were measured with DeepGEMM disabled on the
+capture servers, so every FP8 GEMM ran SGLang's untuned Triton block-FP8
+kernel. A stock `sglang[all]==0.5.18` install selects DeepGEMM: the 4+4 recipe
+then measures 13.96 samples/s at 3.67 captured prompts/s per server on 8x H200
+(next section).
+
+## One H200 node, tuned: five servers + DP3
+
+```bash
+specforge train -c \
+  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml
+```
+
+This recipe moves the whole single-node H200 stack to the kernels and
+transport of this revision and re-balances the split for them. Measured on one
+8x H200 node, `Qwen/Qwen3.8-27B-FP8`, 50k conversations of a Qwen3.8-27B
+regeneration corpus (mean 4.0k tokens, 26% at 8192), steady-state steps after
+warm-up, stock SGLang 0.5.18 with DeepGEMM:
+
+| Configuration | Split | samples/s | Limited by |
+| --- | --- | --- | --- |
+| 4+4 recipe on the previous revision (triton attention, TCP) | 4+4 | 13.96 | trainer compute (2.03 s/step) and producer drains every 4,096 prompts |
+| same, re-split | 5+3 | 12.33 | three trainer ranks |
+| same, `model.use_liger_kernel: true` | 4+4 / 5+3 | 14.00 / 13.10 | trainer ranks and producer drains |
+| this revision, FA3 + FlashInfer GDN servers, TCP | 4+4 | 18.06 | trainer compute + fetch wait |
+| + `training.dflash_teacher_metrics: false` | 4+4 | 18.70 | trainer TCP receive path |
+| + RDMA loopback | 4+4 | 18.60 | capture servers (trainers wait 0.42 s/step) |
+| + Liger, re-split | 5+3 | 22.34 | balanced, no data wait |
+| + accumulation 6 (this recipe, 36 samples/step) | 5+3 | 22.65 | balanced |
+
+What moved each side:
+
+- Capture servers, 3.67 -> 4.40 prompts/s per H200: FA3 for the 16
+  full-attention layers (+14%; the Triton extend kernel was 22.5% of server GPU
+  time) and the FlashInfer SM90 GDN prefill for the 48 linear-attention layers
+  (+8%). DeepGEMM FP8 GEMM is now 71% of server time. The FlashInfer GDN path
+  requires `--cuda-graph-backend-decode disabled` on capture servers.
+- Trainer rank, 3.96 -> 6.66 samples/s per H200 in isolation: the fused DFlash2
+  unary head (the 248k-vocabulary objective ran three GEMMs and about 330 GB of
+  fp32 traffic per micro-batch; now 3.4x faster), the fused grouped
+  convolution, one host sync per optimizer step instead of one per micro-step,
+  and Liger RMSNorm/SwiGLU.
+- RDMA loopback takes the per-byte CPU copies out of the SGLang and trainer
+  processes: at 4+4 the trainer step fell from 1.42 s to 1.22 s. The capture
+  servers publish from GPU memory on RDMA.
+- The continuous producer feed removes the fleet-wide drain at every
+  4,096-prompt boundary (about 29 s without capture on this node's CPUs), and
+  the durable ack runs off the training thread.
+
+With both sides faster, five servers are needed to feed three trainer ranks.
+The training math is unchanged apart from floating-point rounding: loss and
+accuracy over 300 optimizer steps stay inside the spread of the previous
+revision under a pure summation-order change, and FA3/FlashInfer change the
+captured states by the same amount any kernel swap does on this FP8 target
+(last hidden state cosine 0.9955; the previous revision moves a prompt's states
+by up to 17% when it is batched with other prompts). Set
+`SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` in the launching shell to skip DeepGEMM's
+warm-up sweep on every server start (20-25 min to under a minute once its JIT
+cache is populated).
 
 ## Two nodes: eight servers + DP8
 
@@ -253,26 +316,18 @@ owns (`MOONCAKE_*`, `DISAGG_*`, device visibility). On the two-node
 wrapper, `SERVER_EXTRA_ARGS_APPEND` adds flags after the recipe's server
 defaults, and exported variables reach every server.
 
-## Known limitations on current `main`
+## Known limitations
 
-1. **Acknowledgement stall on partial removals.** `MooncakeFeatureStore`
-   counts an already-removed key as a failed removal. When the optimizer
-   boundary frees a sample whose six tensors are partly under read lease and
-   partly not, the first pass frees only the unleased ones, the forced retry
-   gets `-704 OBJECT_NOT_FOUND` for those, and the sample falls into the
-   bounded drain that sleeps about 10 s. With a 3 s lease this hit every few
-   steps and cost 1.4x on a 1+7 B300 run (5.2 → 7.1 samples/s once fixed);
-   the 10 s lease makes the partial case rare, not impossible.
-   [#832](https://github.com/sgl-project/SpecForge/pull/832) treats `-704` as
-   a completed removal; cherry-pick it for production runs.
-2. **Host receive path.** The loader receives each tensor into a fresh
-   pageable buffer, registers and unregisters it per fetch, and copies to the
-   GPU on the training stream, which caps a rank at about 1.5 GB/s and slows
-   the draft step. #840 (pooled pinned or device receive buffers) and #841
-   (server-side GPU publication over RDMA) are opt-in follow-ups: on one B300
-   node they raise 4+4 from 11.5 to 18.3 samples/s and 3+5 to 22.4 (partial
-   run of 100 steps); on H200 they only shorten the trainers' exposed fetch
-   time.
+1. **Resolved: acknowledgement stall on partial removals.**
+   [#832](https://github.com/sgl-project/SpecForge/pull/832) treats Mooncake
+   `-704 OBJECT_NOT_FOUND` as a completed removal, so the bounded drain no
+   longer fires on partly leased samples.
+2. **Resolved: host receive path.**
+   [#840](https://github.com/sgl-project/SpecForge/pull/840),
+   [#841](https://github.com/sgl-project/SpecForge/pull/841) and
+   [#881](https://github.com/sgl-project/SpecForge/pull/881) made pinned
+   receives the default and publish captures from GPU memory on RDMA; the
+   tuned H200 recipe uses RDMA loopback.
 3. **Colocated online capture** ([#783](https://github.com/sgl-project/SpecForge/pull/783))
    is the other topology for this draft. It is faster than any disaggregated
    split on B300 (18.9 on eight GPUs) and slower than the tuned split on H200
@@ -289,6 +344,10 @@ Recipes and launcher were exercised as follows:
 - `specforge train -c <recipe> --plan` for both recipes on the source revision
   of this document; `tests/test_config` (recipe topology, world-size and draft
   wiring checks) pass.
+- The tuned H200 recipe: 110-200 optimizer-step runs per row of its table on
+  one 8x H200 node, a 40-step smoke of the recipe file as checked in, and
+  offline parity (identical init, data and seed) plus a 300-step training
+  comparison for the trainer kernels.
 - `DRY_RUN=1` of the two-node wrapper for both node ranks, including the
   eight-server URL list handed to the producer.
 - No full-convergence run was made in disaggregated mode. The optimizer
