@@ -155,12 +155,13 @@ def _dp_mean_scalars(
     if world <= 1:
         return normalized
     names = list(normalized)
+    # Host scalars become device fills, not synchronizing H2D copies.
     packed = torch.stack(
         [
             (
                 value.to(device)
                 if isinstance(value, torch.Tensor)
-                else torch.tensor(value, dtype=torch.float32, device=device)
+                else torch.full((), value, dtype=torch.float32, device=device)
             )
             for value in normalized.values()
         ]
@@ -450,9 +451,20 @@ class TrainerCore:
         # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
-        if stepped and out.loss_terms is not None:
-            self._normalize_gradients(self._ratio_totals["loss"][1])
-        grad_norm = self.backend.step() if stepped else None
+        grad_norm = None
+        if stepped:
+            loss_denominator = None
+            if out.loss_terms is not None:
+                # A capable backend validates the global denominator in the
+                # optimizer's single host read instead of syncing here.
+                defer_check = getattr(self.backend, "checks_loss_denominator", False)
+                loss_denominator = self._normalize_gradients(
+                    self._ratio_totals["loss"][1], defer_check=bool(defer_check)
+                )
+            if loss_denominator is None:
+                grad_norm = self.backend.step()
+            else:
+                grad_norm = self.backend.step(loss_denominator=loss_denominator)
         result_ratio_metrics = self._ratio_totals if stepped else ratio_metrics
         result = self._result(
             out,
@@ -476,7 +488,16 @@ class TrainerCore:
                 denominator = previous[1] + denominator
             self._ratio_totals[name] = (numerator, denominator)
 
-    def _normalize_gradients(self, local_denominator: torch.Tensor) -> None:
+    def _normalize_gradients(
+        self, local_denominator: torch.Tensor, *, defer_check: bool = False
+    ) -> Optional[torch.Tensor]:
+        """Scale gradients by ``world * accumulation / global denominator``.
+
+        With ``defer_check`` the global denominator stays on the device and is
+        returned for the backend step to validate; otherwise it is checked
+        here with a host synchronization. Either way an invalid denominator
+        raises before the optimizer updates any state.
+        """
         import torch.distributed as dist
 
         denominator = local_denominator.clone()
@@ -491,13 +512,16 @@ class TrainerCore:
                     op=dist.ReduceOp.SUM,
                     group=process_group,
                 )
-        denominator_value = denominator.item()
-        if not math.isfinite(denominator_value) or denominator_value <= 0:
-            raise ValueError("global loss denominator must be finite and positive")
+        if not defer_check:
+            denominator_value = denominator.item()
+            if not math.isfinite(denominator_value) or denominator_value <= 0:
+                raise ValueError("global loss denominator must be finite and positive")
+        # new_full fills on the device; new_tensor would be a synchronizing H2D.
         scale = (
-            denominator.new_tensor(world_size * self.accumulation_steps) / denominator
+            denominator.new_full((), world_size * self.accumulation_steps) / denominator
         )
         self.backend.scale_gradients(scale)
+        return denominator if defer_check else None
 
     def _result(
         self,

@@ -59,9 +59,10 @@ The recipe records batch size 2, accumulation 8, and capture-server memory
 fraction 0.5. It intentionally creates one producer worker for its one owned
 server. The 50.1 samples/s result above used eight workers against one external
 server, so use the repeated-URL command in **Best measured settings** when
-reproducing that exact historical peak. `CLONE_ON_FETCH=0`,
-`LOADER_PREFETCH=2`, and hardware-specific RDMA settings remain opt-in runtime
-environment controls.
+reproducing that exact historical peak. `LOADER_PREFETCH=2` and
+hardware-specific RDMA settings remain opt-in runtime environment controls;
+Mooncake stores now skip the defensive clone by default, so `CLONE_ON_FETCH=0`
+is no longer required.
 
 ## What each setting does
 
@@ -69,7 +70,7 @@ environment controls.
 | --- | --- | --- |
 | Repeat one URL eight times in `deployment.disaggregated.server_urls` | Breaks the single-producer ceiling | Eight rollout workers take disjoint leases and issue blocking HTTP prefill calls concurrently to one server. |
 | `training.accumulation_steps=8` | 460 to approximately 280 ms/microstep | FSDP `no_sync` amortizes reduce-scatter across eight microsteps; communication fell to about 1 ms/microstep. |
-| `CLONE_ON_FETCH=0` | Approximately 15 ms/batch lower | Mooncake `get()` already allocates a fresh tensor, so the defensive clone is redundant on this path. |
+| `CLONE_ON_FETCH=0` | Approximately 15 ms/batch lower | Mooncake `get()` already allocates a fresh tensor, so the defensive clone is redundant on this path. The loader now skips it for Mooncake by default; `CLONE_ON_FETCH=1` forces it back on. |
 | `LOADER_PREFETCH=2` | Removes fetch latency from the measured train step | A background thread materializes up to two batches before the trainer consumes them. |
 | External SGLang `--mem-fraction-static 0.5` | Server memory fell from 126 GB to about 78 GB | The default 0.85 reservation held KV-cache memory that this capture-only server did not need. |
 

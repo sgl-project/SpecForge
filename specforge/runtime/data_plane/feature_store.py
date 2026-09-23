@@ -115,6 +115,11 @@ def _mem_uri_generation(uri: str) -> Optional[int]:
 class FeatureStore(abc.ABC):
     """Stores and serves large feature tensors. Carries no scheduling state."""
 
+    #: True only when every successful ``get()`` returns freshly allocated,
+    #: caller-owned tensors that alias no store-held memory. The loader then
+    #: skips its defensive clone-on-fetch (B5 already holds).
+    get_returns_fresh_tensors: bool = False
+
     @abc.abstractmethod
     def put(
         self,
