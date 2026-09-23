@@ -460,6 +460,65 @@ class ConfigSchemaTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, field):
                     Config.model_validate(invalid_payload)
 
+    def test_dflash_teacher_metrics_is_typed_and_dflash_only(self):
+        default_config = Config.model_validate(_online_payload("dflash"))
+        self.assertTrue(default_config.training.dflash_teacher_metrics)
+
+        online = _online_payload("dflash")
+        online["training"]["dflash_teacher_metrics"] = False
+        offline = copy.deepcopy(MINIMAL)
+        offline["training"] = {"strategy": "dflash", "dflash_teacher_metrics": False}
+        for payload in (online, offline):
+            with self.subTest(data=payload["data"]):
+                resolved = resolve_run(Config.model_validate(payload))
+                self.assertFalse(resolved.config.training.dflash_teacher_metrics)
+
+        for invalid in ("maybe", 2, None):
+            with self.subTest(invalid=invalid):
+                payload = _online_payload("dflash")
+                payload["training"]["dflash_teacher_metrics"] = invalid
+                with self.assertRaisesRegex(ValidationError, "dflash_teacher_metrics"):
+                    Config.model_validate(payload)
+
+        # DSpark and MTP train on the final hidden state; the other families
+        # never request it, so the opt-out would be silently meaningless there.
+        for strategy in ("domino", "dspark", "eagle3", "mtp", "peagle"):
+            with self.subTest(strategy=strategy):
+                payload = _online_payload(strategy)
+                payload["training"]["dflash_teacher_metrics"] = False
+                if strategy == "mtp":
+                    payload["training"]["attention_backend"] = "sdpa"
+                with self.assertRaisesRegex(
+                    ValueError, "does not support training.dflash_teacher_metrics"
+                ):
+                    resolve_run(Config.model_validate(payload))
+
+    def test_dflash_teacher_metrics_reaches_the_training_model(self):
+        from unittest import mock
+
+        from specforge.algorithms.dflash.providers import build_training_model
+
+        for enabled in (True, False):
+            with self.subTest(dflash_teacher_metrics=enabled):
+                payload = _online_payload("dflash")
+                payload["training"]["dflash_teacher_metrics"] = enabled
+                config = Config.model_validate(payload)
+                # Construction only: the family builder hands the factory its
+                # shared kwargs, and the objective records the config value.
+                with (
+                    mock.patch(
+                        "specforge.algorithms.common.dflash_family_model."
+                        "OnlineDFlashModel"
+                    ) as model_cls,
+                    mock.patch(
+                        "specforge.algorithms.model_providers."
+                        "_build_dflash_family_model",
+                        side_effect=lambda _cfg, _draft, _tok, factory: factory({}),
+                    ),
+                ):
+                    build_training_model(config, None, None, None, None)
+                self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
+
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
         payload["training"]["lk_loss_type"] = "tv"

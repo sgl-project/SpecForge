@@ -20,11 +20,13 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import torch
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
+from specforge.algorithms.common.providers import resolve_server_capture_layout
 from specforge.inference.adapters.server_capture import (
     ServerCaptureFailure,
     ServerCaptureSchema,
@@ -241,9 +243,12 @@ def _dspark_contract() -> CaptureConfig:
     )
 
 
-def _capture_schema(algorithm: str) -> ServerCaptureSchema:
+def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
     registration = builtin_algorithm_registry().resolve(algorithm)
-    layout = registration.providers.server_streaming_for("text").layout
+    config = SimpleNamespace(
+        training=SimpleNamespace(dflash_teacher_metrics=teacher_metrics)
+    )
+    layout = resolve_server_capture_layout(registration, config, modality="text")
     return ServerCaptureSchema(
         aux_feature=layout.aux_feature,
         last_hidden_feature=layout.last_hidden_feature,
@@ -273,6 +278,7 @@ def _mk(
     server=None,
     backend=None,
     request_input_adapter=None,
+    teacher_metrics=True,
 ):
     backend = backend or _FakeMooncakeStore()
     server = server or _StubCaptureServer(backend)
@@ -282,7 +288,7 @@ def _mk(
         store,
         run_id="run0",
         algorithm=algorithm,
-        schema=_capture_schema(algorithm),
+        schema=_capture_schema(algorithm, teacher_metrics=teacher_metrics),
         request_input_adapter=request_input_adapter,
         post_fn=server,
     )
@@ -443,6 +449,61 @@ class TestServerCaptureAdapter(unittest.TestCase):
         out, _ = store.get(ref)
         self.assertEqual(out["input_ids"].tolist(), [list(range(1, 6))])
         self.assertEqual(out["target_last_hidden_states"].shape, (1, 5, HIDDEN))
+
+    def test_dflash_without_teacher_metrics_never_writes_or_fetches_last_hidden(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+        posted = []
+
+        def recording_server(url, json_body, timeout):
+            posted.append(json_body)
+            return server(url, json_body, timeout)
+
+        _, _, store, adapter = _mk(
+            algorithm="dflash",
+            server=recording_server,
+            backend=backend,
+            teacher_metrics=False,
+        )
+        tasks = [_task(0, 5), _task(1, 7)]
+        refs = adapter.produce_refs(tasks, capture=_dflash_contract())
+
+        # The server is asked for the aux artifact only, so its sink never
+        # stages or puts the final hidden state.
+        self.assertEqual(
+            [{"aux": "hidden_states"}] * 2,
+            [payload["features"] for payload in posted[0]["spec_capture"]],
+        )
+        self.assertFalse(any("target_last_hidden_states" in key for key in backend._d))
+        teacher_refs = _mk(algorithm="dflash")[3].produce_refs(
+            tasks, capture=_dflash_contract()
+        )
+        collate = (
+            builtin_algorithm_registry()
+            .resolve("dflash")
+            .providers.server_streaming_for("text")
+            .build_collator()
+        )
+        fetched = []
+        for ref, teacher_ref, task in zip(refs, teacher_refs, tasks):
+            self.assertIsInstance(ref, SampleRef)
+            self.assertEqual(
+                ["hidden_states", "input_ids", "loss_mask"],
+                sorted(ref.feature_specs),
+            )
+            self.assertEqual(sorted(ref.feature_specs), sorted(ref.feature_keys))
+            length = len(task.payload["input_ids"])
+            self.assertEqual(
+                teacher_ref.estimated_bytes - length * HIDDEN * 2,
+                ref.estimated_bytes,
+            )
+            out, handle = store.get(ref)
+            self.assertEqual(["hidden_states", "input_ids", "loss_mask"], sorted(out))
+            fetched.append({key: value.clone() for key, value in out.items()})
+            store.release(handle)
+        batch = collate(fetched)
+        self.assertEqual(["hidden_states", "input_ids", "loss_mask"], sorted(batch))
+        self.assertEqual((2, 7, len(AUX_LAYERS) * HIDDEN), batch["hidden_states"].shape)
 
     def test_dspark_schema_includes_target_last_hidden(self):
         backend, server, store, adapter = _mk(algorithm="dspark")

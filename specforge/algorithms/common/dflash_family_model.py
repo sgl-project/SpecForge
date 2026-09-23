@@ -364,6 +364,7 @@ class OnlineDFlashModel(nn.Module):
         kl_scale: float = 1.0,
         kl_decay: float = 1.0,
         metric_top_k: int = 16,
+        teacher_metrics: bool = True,
     ):
         super().__init__()
         if metric_top_k <= 0:
@@ -407,6 +408,8 @@ class OnlineDFlashModel(nn.Module):
         self.kl_decay = float(kl_decay)
         # Candidate-set width for top-K diagnostics on drafts without a selector.
         self.metric_top_k = int(metric_top_k)
+        # Diagnostics-only: compare against target_last_hidden_states when fed.
+        self.teacher_metrics = bool(teacher_metrics)
 
         candidate_selector = getattr(self.draft_model, "candidate_selector", None)
         self._selector_objective_enabled = (
@@ -1465,7 +1468,11 @@ class OnlineDFlashModel(nn.Module):
                 target_last_hidden_states,
                 safe_label_indices,
             )
-            if target_last_hidden_states is not None and collect_detailed_metrics
+            if (
+                target_last_hidden_states is not None
+                and collect_detailed_metrics
+                and self.teacher_metrics
+            )
             else None
         )
         sequence_anchor_scale = None
