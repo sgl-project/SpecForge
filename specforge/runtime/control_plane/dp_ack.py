@@ -21,17 +21,54 @@ drives the ``ack_sink`` (the producer-backpressure counter).
 Correctness rests on the lockstep invariant the :class:`RefDistributor`
 enforces (equal per-rank ref counts): a rank that skipped a boundary would hang
 the gather.
+
+``process_group`` carries every ack object collective. With asynchronous acks
+the online consumer passes a dedicated Gloo group
+(:func:`new_durable_ack_process_group`); synchronous acks keep the default
+group. Pickled object collectives over NCCL stage through the device and
+``.item()``/``.cpu()`` drain the training stream at every boundary, while Gloo
+stays on the host and lets the ack run on a background thread without
+interleaving with the training thread's NCCL collectives.
 """
 
 from __future__ import annotations
 
+import functools
+import logging
 from collections import OrderedDict
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from specforge.runtime.control_plane.controller import DataFlowController
 
+logger = logging.getLogger(__name__)
 
-def gather_id_union(ids: List[str]) -> List[str]:
+
+def new_durable_ack_process_group() -> Optional[Any]:
+    """Create the host-only Gloo group for durable-ack object collectives.
+
+    ``new_group`` is collective over the default group: every rank must call
+    this at the same point of its setup. Returns ``None`` when there is nothing
+    to isolate (no process group, a single rank) or Gloo is unavailable; the
+    caller then keeps acks on the default group and on the training thread.
+    """
+    try:
+        import torch.distributed as dist
+    except ModuleNotFoundError:
+        return None
+    if not (dist.is_available() and dist.is_initialized()):
+        return None
+    if dist.get_world_size() == 1:
+        return None
+    if not dist.is_gloo_available():
+        logger.warning(
+            "torch.distributed has no Gloo backend; durable acks stay on the "
+            "default process group and run synchronously"
+        )
+        return None
+    return dist.new_group(backend="gloo")
+
+
+def gather_id_union(ids: List[str], group: Optional[Any] = None) -> List[str]:
     """All-gather each rank's sample_ids; return the rank-ordered, deduped union.
 
     Identity when torch.distributed is absent/uninitialized/world=1. Dedup keeps
@@ -44,11 +81,11 @@ def gather_id_union(ids: List[str]) -> List[str]:
 
     if not (dist.is_available() and dist.is_initialized()):
         return list(ids)
-    world = dist.get_world_size()
+    world = dist.get_world_size(group)
     if world == 1:
         return list(ids)
     gathered: List[Optional[List[str]]] = [None] * world
-    dist.all_gather_object(gathered, list(ids))
+    dist.all_gather_object(gathered, list(ids), group=group)
     out: List[str] = []
     seen = set()
     for rank_ids in gathered:
@@ -59,7 +96,9 @@ def gather_id_union(ids: List[str]) -> List[str]:
     return out
 
 
-def _broadcast_authority_error(error: Optional[str]) -> Optional[str]:
+def _broadcast_authority_error(
+    error: Optional[str], group: Optional[Any] = None
+) -> Optional[str]:
     """Return rank 0's post-commit result on every rank."""
     try:
         import torch.distributed as dist
@@ -67,14 +106,17 @@ def _broadcast_authority_error(error: Optional[str]) -> Optional[str]:
         return error
     if not (dist.is_available() and dist.is_initialized()):
         return error
-    if dist.get_world_size() == 1:
+    if dist.get_world_size(group) == 1:
         return error
     payload = [error]
-    dist.broadcast_object_list(payload, src=0)
+    # The ack group spans every rank, so global rank 0 is the authority.
+    dist.broadcast_object_list(payload, src=0, group=group)
     return payload[0]
 
 
-def _gather_cleanup_errors(error: Optional[str]) -> Optional[str]:
+def _gather_cleanup_errors(
+    error: Optional[str], group: Optional[Any] = None
+) -> Optional[str]:
     """Return every rank's local cleanup failure on every rank.
 
     Cleanup is intentionally a second collective after the authority's durable
@@ -88,11 +130,11 @@ def _gather_cleanup_errors(error: Optional[str]) -> Optional[str]:
         return error
     if not (dist.is_available() and dist.is_initialized()):
         return error
-    world = dist.get_world_size()
+    world = dist.get_world_size(group)
     if world == 1:
         return error
     gathered: List[Optional[str]] = [None] * world
-    dist.all_gather_object(gathered, error)
+    dist.all_gather_object(gathered, error, group=group)
     failures = [
         f"rank {rank}: {rank_error}"
         for rank, rank_error in enumerate(gathered)
@@ -116,6 +158,11 @@ class DPAckController(DataFlowController):
     second all-rank error collective completes before any caller may advance its
     inbox acknowledgement; the distributor then mirrors those
     optimizer-boundary counts onto the source counter.
+
+    ``process_group`` (default: the default group) carries the gather and both
+    error collectives unless explicit ``gather``/``sync_*`` callables are given.
+    Every rank must issue ``ack_train_refs`` calls in the same order, from one
+    thread at a time.
     """
 
     _CLEANUP_LAG_BOUNDARIES = 1
@@ -126,21 +173,23 @@ class DPAckController(DataFlowController):
         run_id: str,
         *,
         is_authority: bool = True,
-        gather: Callable[[List[str]], List[str]] = gather_id_union,
-        sync_error: Callable[
-            [Optional[str]], Optional[str]
-        ] = _broadcast_authority_error,
-        sync_cleanup_error: Callable[
-            [Optional[str]], Optional[str]
-        ] = _gather_cleanup_errors,
+        gather: Optional[Callable[[List[str]], List[str]]] = None,
+        sync_error: Optional[Callable[[Optional[str]], Optional[str]]] = None,
+        sync_cleanup_error: Optional[Callable[[Optional[str]], Optional[str]]] = None,
         feature_store=None,
+        process_group: Optional[Any] = None,
         **kwargs,
     ) -> None:
         super().__init__(run_id, **kwargs)
         self.is_authority = is_authority
-        self._gather = gather
-        self._sync_error = sync_error
-        self._sync_cleanup_error = sync_cleanup_error
+        self.process_group = process_group
+        self._gather = gather or functools.partial(gather_id_union, group=process_group)
+        self._sync_error = sync_error or functools.partial(
+            _broadcast_authority_error, group=process_group
+        )
+        self._sync_cleanup_error = sync_cleanup_error or functools.partial(
+            _gather_cleanup_errors, group=process_group
+        )
         self.feature_store = feature_store
         self._cleanup_boundary = 0
         self._cleanup_pending: OrderedDict[str, int] = OrderedDict()
@@ -243,4 +292,4 @@ class DPAckController(DataFlowController):
             )
 
 
-__all__ = ["DPAckController", "gather_id_union"]
+__all__ = ["DPAckController", "gather_id_union", "new_durable_ack_process_group"]

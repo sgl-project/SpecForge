@@ -322,6 +322,9 @@ def _disaggregated_env(
                     )
                     / "inboxes"
                 ),
+                "DISAGG_ASYNC_ACK": base_env.get(
+                    "DISAGG_ASYNC_ACK", "1" if deployment.async_ack else "0"
+                ),
             }
         )
     else:

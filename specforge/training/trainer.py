@@ -103,6 +103,7 @@ class Trainer:
         total_steps: Optional[int] = None,
         per_sample_transform=None,
         durable_ack: bool = True,
+        async_ack: bool = False,
         resume_from: Optional[str] = None,
         resume_state: Optional[dict] = None,
         dataset_size: Optional[int] = None,
@@ -480,6 +481,9 @@ class Trainer:
             start_samples=resume["epoch_samples"] if resume else 0,
             data_prepositioned=data_prepositioned,
             profiling_options=profiling_options,
+            # Overlap each optimizer boundary's durable ack with the next step
+            # (TrainerController flushes it before eval/checkpoint/return).
+            async_ack=bool(async_ack and ack_fn is not None),
         )
         if resume is not None:
             # The loaded checkpoint already represents this durable step. If a

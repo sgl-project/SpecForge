@@ -701,6 +701,13 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
     producer_hold_s: Optional[float] = Field(default=None, gt=0)
+    #: Online consumer: run each optimizer boundary's durable ack (ledger
+    #: commit, feature removes, DP ack collectives over a dedicated Gloo group)
+    #: on a background thread while the next step computes. The durable marker
+    #: lags by at most one optimizer step and is flushed before every
+    #: checkpoint. Exported as ``DISAGG_ASYNC_ACK``; an explicit env value wins.
+    #: Off keeps acks synchronous on the default group (no Gloo group).
+    async_ack: bool = True
     #: SIGTERM-to-SIGKILL grace for a plain (non-managed) supervisor teardown.
     #: Workers translate SIGTERM into cleanup (Mooncake drains, checkpoint
     #: flush, failure sentinels), so this window must cover that work.
