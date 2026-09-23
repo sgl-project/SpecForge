@@ -1,0 +1,124 @@
+# Qwen3.8-27B DFlash2 on one 8x H200 node: five TP=1 FP8 capture servers on
+# GPUs 0-4 and a DP=3 DFlash2 trainer on GPUs 5-7, all owned by `specforge train`.
+#
+# Measured at 22.65 samples/s on 8x H200 (docs/recipes/qwen3.8-27b-dflash2-disaggregated.md,
+# "One H200 node, tuned"). The split is balanced only with the fused DFlash2
+# trainer kernels on this revision: an H200 trainer rank then trains about 7.4
+# samples/s against 4.4 captured prompts/s per server. On older revisions keep
+# the 4+4 recipe.
+model:
+  target_model_path: Qwen/Qwen3.8-27B-FP8
+  draft_model_config: configs/qwen3.8-27b-dflash2.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 248070
+  # Liger RMSNorm and SwiGLU for the draft layers (pip install liger-kernel).
+  use_liger_kernel: true
+  # Hopper kernels for the hybrid target: FA3 for the 16 full-attention layers
+  # and FlashInfer for the 48 GDN layers. Capture servers never decode, and the
+  # FlashInfer GDN path needs the decode CUDA graph off (it is captured without
+  # hidden-state output).
+  sglang_attention_backend: fa3
+  sglang_linear_attn_prefill_backend: flashinfer
+  sglang_extra_args: ["--cuda-graph-backend-decode", "disabled"]
+  sglang_disable_radix_cache: true
+  # data.max_length + 7 tokens of request headroom for the capture endpoint.
+  sglang_context_length: 8199
+
+data:
+  train_data_path: ./cache/dataset/qwen3.8-27b-regen-train.jsonl
+  max_length: 8192
+  chat_template: qwen3.5
+  build_dataset_num_proc: 32
+  dataloader_num_workers: 8
+  cache_dir: cache/qwen3.8-27b-dflash2
+
+training:
+  strategy: dflash
+  num_epochs: 1
+  tp_size: 1
+  # 3 ranks x 2 x 6 = 36 samples per optimizer step (the 4+4 recipe uses 32).
+  # With accumulation 4 (24 per step) the same layout measured 22.34 samples/s.
+  batch_size: 2
+  accumulation_steps: 6
+  fsdp_sharding: SHARD_GRAD_OP
+  learning_rate: 0.0005
+  lr_scheduler: constant
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  loss_type: dflash
+  dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_stop_gradient: false
+  # The objective never reads the target's final hidden state; it only feeds
+  # the dflash/teacher/* diagnostics on log steps. Skipping it removes 1/6 of
+  # every sample's capture, Mooncake and fetch bytes.
+  dflash_teacher_metrics: false
+  save_interval: 500
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 42
+
+tracking:
+  report_to: none
+
+runtime:
+  producer_lease: 4
+  producer_concurrency: 4
+  # 6x the 36-sample step quantum, as in the 4+4 recipe.
+  in_flight_high_watermark: 288
+  in_flight_low_watermark: 144
+
+run_id: qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated
+output_dir: outputs/qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 3
+  disaggregated:
+    control_dir: outputs/qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated/control
+    consumer_state_dir: outputs/qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated/consumer-state
+    backend: mooncake
+    client_buffer_size: 2147483648
+    managed_local:
+      trainer_cuda_visible_devices: ["5", "6", "7"]
+      mooncake:
+        # RDMA loopback through the node's HCAs. Over TCP every captured byte is
+        # copied by the CPU inside the SGLang and trainer processes, which slowed
+        # each trainer step by 14% at this split; RDMA also turns on the capture
+        # servers' GPU publication. List the node's active HCAs
+        # (ls /sys/class/infiniband).
+        protocol: rdma
+        rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+        default_kv_lease_ttl_ms: 10000
+        global_segment_size_bytes: 68719476736
+        local_buffer_size_bytes: 4294967296
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30001
+          cuda_visible_devices: ["1"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30002
+          cuda_visible_devices: ["2"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30003
+          cuda_visible_devices: ["3"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30004
+          cuda_visible_devices: ["4"]
+          tp_size: 1
+          mem_fraction_static: 0.85
