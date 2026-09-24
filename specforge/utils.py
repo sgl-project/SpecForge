@@ -188,8 +188,10 @@ def print_args_with_dots(args):
 
 
 def print_on_rank0(message):
-    if dist.get_rank() == 0:
-        logger.info(message)
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    logger.info(message)
 
 
 def safe_conversations_generator(file_path):
