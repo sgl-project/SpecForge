@@ -80,9 +80,18 @@ def export_to_sglang(
     )
     if weight_map is None:
         weight_map = WEIGHT_MAPS.get(type(model).__name__, {})
-    # the model's state dict includes any refreshed t2d/d2t buffers; drop the
-    # embeddings exactly as the trainer-side checkpoint filter does.
+    # Serialize the checkpoint tensors as stored (as the HF exporter does), but
+    # keep the mapping buffers materialize_draft loaded when one was requested;
+    # drop the embeddings exactly as the trainer-side checkpoint filter does.
     full = {k: v for k, v in model.state_dict().items() if "embed" not in k.lower()}
+    full.update(
+        {
+            key: value
+            for key, value in state["draft_state_dict"].items()
+            if "embed" not in key.lower()
+            and not (vocab_mapping_path and key in {"t2d", "d2t"})
+        }
+    )
     model.save_pretrained(output_dir, state_dict=_serving_state(full, weight_map))
     apply_legacy_rope_scaling(output_dir)
     return output_dir

@@ -699,6 +699,11 @@ specforge export --to hf \
 Pass `--vocab-mapping /path/to/mapping.pt` when the checkpoint predates the
 mapping buffers or when you intentionally need to refresh them.
 
+Both exporters write the draft weights at the precision the checkpoint was
+trained in and stamp that dtype into the exported `config.json`, so a
+Transformers reload without an explicit dtype restores the trained values;
+SGLang casts the served draft to its own dtype at load time.
+
 MTP is deployed by merging its trained native head back into the target model.
 The merge command accepts the same runtime checkpoint shapes as the generic
 exporter (`training_state.pt`, a step/latest directory, or the run output
