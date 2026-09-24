@@ -577,6 +577,10 @@ class TrainingConfig(StrictConfigModel):
     #: Trainer tensor parallelism. The unified runtime currently requires one;
     #: target-model TP belongs to external or managed capture servers.
     tp_size: int = Field(default=1, gt=0)
+    #: Draft MoE expert parallelism. EP peers consume the same feature batch and
+    #: own disjoint routed experts; a draft model opts in by sharding its experts
+    #: and marking them ``_specforge_rank_local_parameters``.
+    expert_parallel_size: int = Field(default=1, gt=0)
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
     dist_timeout: int = Field(default=10, gt=0)
@@ -959,6 +963,7 @@ class Config(StrictConfigModel):
             and deployment == "disaggregated"
             and (
                 self.training.tp_size != 1
+                or self.training.expert_parallel_size != 1
                 or self.training.sp_ulysses_size != 1
                 or self.training.sp_ring_size != 1
             )
@@ -966,7 +971,7 @@ class Config(StrictConfigModel):
             raise ValueError(
                 "the disaggregated online consumer uses every trainer rank for "
                 "data parallelism; configure target TP on the external server and "
-                "keep training.tp_size/sp sizes at 1"
+                "keep training.tp_size/expert_parallel_size/sp sizes at 1"
             )
         return self
 
@@ -984,11 +989,12 @@ class Config(StrictConfigModel):
                 f"world_size={world_size} must be divisible by "
                 f"training.tp_size={tp_size}"
             )
-        if world_size % sp_size:
+        draft_mp_size = sp_size * self.training.expert_parallel_size
+        if world_size % draft_mp_size:
             raise ValueError(
-                f"world_size={world_size} must be divisible by draft sequence "
-                f"parallel size {sp_size} "
-                "(sp_ulysses_size * sp_ring_size)"
+                f"world_size={world_size} must be divisible by draft model "
+                f"parallel size {draft_mp_size} "
+                "(expert_parallel_size * sp_ulysses_size * sp_ring_size)"
             )
 
     @classmethod

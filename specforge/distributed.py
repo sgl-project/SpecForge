@@ -13,6 +13,7 @@ _TP_GROUP = None
 _DP_DEVICE_MESH = None
 _DP_GROUP = None
 _DRAFT_DP_GROUP = None
+_DRAFT_EP_GROUP = None
 _DRAFT_SP_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
@@ -100,6 +101,11 @@ def get_draft_dp_group():
     return _DRAFT_DP_GROUP
 
 
+def get_draft_ep_group():
+    global _DRAFT_EP_GROUP
+    return _DRAFT_EP_GROUP
+
+
 def get_draft_sp_group():
     global _DRAFT_SP_GROUP
     return _DRAFT_SP_GROUP
@@ -131,7 +137,11 @@ def get_sp_ring_group():
 
 
 def init_distributed(
-    timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
+    timeout: int = 10,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    expert_parallel_size: int = 1,
 ):
     """Initialize distributed training.
 
@@ -168,15 +178,17 @@ def init_distributed(
         device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp")
     )
 
-    assert (
-        world_size % (sp_ulysses_size * sp_ring_size) == 0
-    ), f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_ulysses_size*sp_ring_size})"
+    draft_mp_size = expert_parallel_size * sp_ulysses_size * sp_ring_size
+    assert world_size % draft_mp_size == 0, (
+        f"World size ({world_size}) cannot be evenly divided by draft model "
+        f"parallel size ({draft_mp_size})"
+    )
 
-    draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
+    draft_dp_size = world_size // draft_mp_size
     draft_device_mesh = dist.device_mesh.init_device_mesh(
         device_type,
-        (draft_dp_size, sp_ulysses_size * sp_ring_size),
-        mesh_dim_names=("draft_dp", "sp"),
+        (draft_dp_size, expert_parallel_size, sp_ulysses_size * sp_ring_size),
+        mesh_dim_names=("draft_dp", "ep", "sp"),
     )
     if set_seq_parallel_pg is not None:
         set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
@@ -185,6 +197,7 @@ def init_distributed(
     tp_group = device_mesh.get_group("tp")
     dp_group = device_mesh.get_group("dp")
     draft_dp_group = draft_device_mesh.get_group("draft_dp")
+    draft_ep_group = draft_device_mesh.get_group("ep")
     draft_sp_group = draft_device_mesh.get_group("sp")
 
     if process_group is not None:
@@ -198,7 +211,7 @@ def init_distributed(
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
 
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_EP_GROUP, _DRAFT_SP_GROUP
     _DEVICE_MESH = device_mesh
     _TP_GROUP = tp_group
     _TP_DEVICE_MESH = tp_device_mesh
@@ -206,6 +219,7 @@ def init_distributed(
     _SP_RING_GROUP = sp_ring_group
     _DP_GROUP = dp_group
     _DRAFT_DP_GROUP = draft_dp_group
+    _DRAFT_EP_GROUP = draft_ep_group
     _DRAFT_SP_GROUP = draft_sp_group
     _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
@@ -218,7 +232,7 @@ def destroy_distributed(*, abort: bool = False):
     behind peers stuck in a collective; torchrun then terminates the peers.
     """
     global _DEVICE_MESH, _TP_DEVICE_MESH, _TP_GROUP
-    global _DP_DEVICE_MESH, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    global _DP_DEVICE_MESH, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_EP_GROUP, _DRAFT_SP_GROUP
     global _SP_ULYSSES_GROUP, _SP_RING_GROUP
     # Teardown must never crash the process. Several handles can alias the same
     # underlying group (e.g. DP and draft-DP when there is no sequence
@@ -234,6 +248,7 @@ def destroy_distributed(*, abort: bool = False):
         _SP_ULYSSES_GROUP,
         _SP_RING_GROUP,
         _DRAFT_DP_GROUP,
+        _DRAFT_EP_GROUP,
         _DRAFT_SP_GROUP,
         default_group,  # may alias the DP group; the seen-set dedups it
     ):
@@ -260,6 +275,7 @@ def destroy_distributed(*, abort: bool = False):
     _DP_DEVICE_MESH = None
     _DP_GROUP = None
     _DRAFT_DP_GROUP = None
+    _DRAFT_EP_GROUP = None
     _DRAFT_SP_GROUP = None
     _SP_ULYSSES_GROUP = None
     _SP_RING_GROUP = None

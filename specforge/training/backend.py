@@ -26,6 +26,25 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+DETECT_ANOMALY_ENV = "SPECFORGE_DETECT_ANOMALY"
+
+
+def detect_anomaly_enabled() -> bool:
+    """Whether to run backward under torch's anomaly detection.
+
+    Opt-in: anomaly mode records a forward traceback per node and checks every
+    node's output for NaN, which costs a device synchronisation per node. It is
+    the tool for "the loss is finite but the gradients are not", and it also
+    turns on the optimizer's report of where a non-finite gradient norm came
+    from.
+    """
+    return os.environ.get(DETECT_ANOMALY_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 
 @dataclass
 class ParallelConfig:
@@ -38,6 +57,7 @@ class ParallelConfig:
 
     world_size: int = 1
     tp_size: int = 1
+    expert_parallel_size: int = 1
     sp_ulysses_size: int = 1
     sp_ring_size: int = 1
     sharding_strategy: str = "SHARD_GRAD_OP"
@@ -45,6 +65,7 @@ class ParallelConfig:
     fsdp_process_group: Any = None
     dp_group: Any = None
     draft_dp_group: Any = None
+    draft_ep_group: Any = None
     tp_group: Any = None
     sp_ulysses_group: Any = None
     sp_ring_group: Any = None
@@ -62,6 +83,7 @@ class ParallelConfig:
         cls,
         *,
         tp_size: int = 1,
+        expert_parallel_size: int = 1,
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
         sharding_strategy: str = "SHARD_GRAD_OP",
@@ -76,6 +98,7 @@ class ParallelConfig:
             return cls(
                 world_size=1,
                 tp_size=tp_size,
+                expert_parallel_size=expert_parallel_size,
                 sp_ulysses_size=sp_ulysses_size,
                 sp_ring_size=sp_ring_size,
                 sharding_strategy=sharding_strategy,
@@ -88,6 +111,7 @@ class ParallelConfig:
             for name, getter in (
                 ("dp_group", "get_dp_group"),
                 ("draft_dp_group", "get_draft_dp_group"),
+                ("draft_ep_group", "get_draft_ep_group"),
                 ("tp_group", "get_tp_group"),
                 ("sp_ulysses_group", "get_sp_ulysses_group"),
                 ("sp_ring_group", "get_sp_ring_group"),
@@ -111,14 +135,27 @@ class ParallelConfig:
                 "ParallelConfig.from_distributed: distributed handles unavailable: %s",
                 exc,
             )
+        if expert_parallel_size > 1 and handles.get("draft_dp_group") is None:
+            raise RuntimeError(
+                "expert_parallel_size>1 requires a valid draft_dp_group; "
+                "refusing to fall back to WORLD and average different experts"
+            )
         return cls(
             world_size=dist.get_world_size(),
             tp_size=tp_size,
+            expert_parallel_size=expert_parallel_size,
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
             sharding_strategy=sharding_strategy,
             param_dtype=param_dtype,
-            fsdp_process_group=dist.group.WORLD,
+            # Preserve the established WORLD reduction for non-EP/USP runs.
+            # Expert-parallel peers own different routed experts, so only EP
+            # needs FSDP/DDP isolated to replicas sharing one expert shard.
+            fsdp_process_group=(
+                handles["draft_dp_group"]
+                if expert_parallel_size > 1
+                else dist.group.WORLD
+            ),
             **handles,
         )
 
@@ -172,8 +209,17 @@ class FSDPTrainingBackend(TrainingBackend):
 
     @property
     def optimizer_state_is_replicated(self) -> bool:
-        """Whether every rank owns the same complete optimizer state."""
-        return self._wrapper_kind == "ddp"
+        """Whether every rank owns the same complete optimizer state.
+
+        DDP only replicates across ``fsdp_process_group`` (draft-DP).  Expert
+        parallel ranks deliberately own different routed experts, so their
+        optimizer states must remain rank-local even when ``NO_SHARD`` selects
+        DDP inside each draft-DP group.
+        """
+        return (
+            self._wrapper_kind == "ddp"
+            and self.parallel_config.expert_parallel_size == 1
+        )
 
     @staticmethod
     def _frozen_target_modules(model: nn.Module) -> tuple[nn.Module, ...]:
@@ -266,6 +312,13 @@ class FSDPTrainingBackend(TrainingBackend):
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
                 )
+                # Recent PyTorch builds may choose MPS as the process-wide
+                # accelerator even when the module is intentionally on CPU.
+                # Pin CPU explicitly for Gloo correctness tests; accelerator
+                # modules continue to use their native CUDA/NPU device.
+                model_device = next(model.parameters()).device
+                if model_device.type == "cpu":
+                    fsdp_kwargs["device_id"] = model_device
                 if ignored_frozen_modules:
                     fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
                 if block_classes:
@@ -298,14 +351,61 @@ class FSDPTrainingBackend(TrainingBackend):
 
     def _configure_optimizer_grad_norm(self) -> None:
         configure = getattr(self.optimizer, "configure_grad_norm_reduction", None)
-        if configure is not None:
+        if configure is None:
+            return
+        import torch.distributed as dist
+
+        parallel = self.parallel_config
+
+        def _group_size(group):
+            """Ranks in ``group``, or None when there is no group to ask."""
+            if not (dist.is_available() and dist.is_initialized()):
+                return None
+            try:
+                return dist.get_world_size(group)
+            except Exception:
+                return None
+
+        # sharding_strategy records what the recipe ASKED for. FSDP silently
+        # downgrades to NO_SHARD when the shard group holds one rank, so keying
+        # on the string enables a reduction over a single-rank group -- a no-op
+        # that looks configured. Ask the group how big it is instead.
+        # Without a live process group there is nothing to downgrade -- keep
+        # trusting the requested strategy so single-process runs and tests
+        # configure the same way they always did.
+        shard_ranks = _group_size(parallel.fsdp_process_group)
+        sharded = parallel.sharding_strategy != "NO_SHARD" and (
+            shard_ranks is None or shard_ranks > 1
+        )
+        if self._wrapped and sharded:
+            # Sharded parameters: each rank holds a slice, so the norm has to be
+            # reduced across the shard group to be the model's norm at all.
+            configure(process_group=parallel.fsdp_process_group, enabled=True)
+            return
+        # NO_SHARD replicates every parameter, so a DDP-style run needs no
+        # reduction: each rank already computes the same norm from the same
+        # gradients. Expert parallelism breaks that assumption -- each rank
+        # additionally owns a disjoint slice of the experts, so its total norm
+        # is rank-dependent even when the replicated gradients are identical.
+        # Clipping by that norm scales the REPLICATED parameters differently on
+        # every rank, and they drift apart after the very first step.
+        expert_parallel = (
+            parallel.expert_parallel_size > 1 and parallel.draft_ep_group is not None
+        )
+        if expert_parallel:
+            # The EP group holds a mix: the routed experts are a disjoint slice
+            # per rank, everything else is replicated with identical gradients.
+            # Summing every square over the group would count the replicas once
+            # per rank and inflate the norm by up to sqrt(ep_size) -- 2.83x at
+            # EP=8 -- which then clips every step that much harder. Partition
+            # instead, which is exact and still one collective.
             configure(
-                process_group=self.parallel_config.fsdp_process_group,
-                enabled=(
-                    self._wrapped
-                    and self.parallel_config.sharding_strategy != "NO_SHARD"
-                ),
+                process_group=parallel.draft_ep_group,
+                enabled=True,
+                partition_replicated=True,
             )
+            return
+        configure(process_group=parallel.fsdp_process_group, enabled=False)
 
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
         """Backward one micro-step with one gradient collective per window.
@@ -313,11 +413,17 @@ class FSDPTrainingBackend(TrainingBackend):
         Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
         the boundary backward reduces the accumulated sum once.
         """
-        if is_boundary or not self._wrapped:
-            loss.backward()
-        else:
-            with self.module.no_sync():
+        anomaly = (
+            torch.autograd.detect_anomaly(check_nan=True)
+            if detect_anomaly_enabled()
+            else contextlib.nullcontext()
+        )
+        with anomaly:
+            if is_boundary or not self._wrapped:
                 loss.backward()
+            else:
+                with self.module.no_sync():
+                    loss.backward()
 
     def scale_gradients(self, factor: torch.Tensor) -> None:
         if self.module is None:
@@ -333,7 +439,16 @@ class FSDPTrainingBackend(TrainingBackend):
             raise RuntimeError(
                 "FSDPTrainingBackend.step called before optimizer is set"
             )
-        return self.optimizer.step()
+        grad_norm = self.optimizer.step()
+        # noaux_tc router correction is deliberately outside autograd and the
+        # optimizer. Counts span the whole accumulation window and are reduced
+        # over draft-DP replicas that train the same expert shard.
+        with torch.no_grad():
+            for module in self.module.modules():
+                after_step = getattr(module, "after_optimizer_step", None)
+                if callable(after_step):
+                    after_step(self.parallel_config.fsdp_process_group)
+        return grad_norm
 
     def state_dict(self) -> dict:
         """Full training state ``{"model", "optimizer", "rng"}`` for resume.
@@ -374,7 +489,8 @@ class FSDPTrainingBackend(TrainingBackend):
 
     def _module_state_dict(self) -> dict:
         if self._wrapper_kind == "ddp":
-            if dist.is_initialized() and dist.get_rank() != 0:
+            group = self.parallel_config.fsdp_process_group
+            if dist.is_initialized() and dist.get_rank(group) != 0:
                 return {}
             return self.module.module.state_dict()
         if self._wrapper_kind != "fsdp":
