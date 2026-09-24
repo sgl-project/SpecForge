@@ -105,7 +105,8 @@ class TargetHead(nn.Module):
         return self.fc(hidden_states)
 
     def preprocess(self, input_ids, target, loss_mask):
-        # Align each EAGLE row as (x[p + 1], g[p], y[p + 1], mask[p + 1]).
+        # Shift loss_mask with input_ids and final target states; auxiliary hidden
+        # states remain unshifted because the draft model consumes them at row p.
         target = padding(target, left=False)
         input_ids = padding(input_ids, left=False)
         loss_mask = padding(loss_mask, left=False)[..., None]
