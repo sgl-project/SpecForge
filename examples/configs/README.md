@@ -87,7 +87,10 @@ DeepSeek-V4-Flash-0731 from scratch on ShareGPT, with external capture
 servers. Its
 [runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
-template (the checkpoint ships no Jinja template).
+template (the checkpoint ships no Jinja template). `...-moe.yaml` is the
+MoE-FFN arm of the drafter-architecture ablation: identical to the dense
+recipe except the draft JSON's MoE fields (see
+`specforge/modeling/draft/moe.py`) and stabilized from-scratch hparams.
 
 `qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
 its managed-local sibling `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
