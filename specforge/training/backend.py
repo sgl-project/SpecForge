@@ -239,7 +239,7 @@ class FSDPTrainingBackend(TrainingBackend):
                 device_ids = None
                 output_device = None
                 model_device = next(model.parameters()).device
-                if model_device.type in ("cuda", "npu"):
+                if model_device.type in ("cuda", "npu", "xpu"):
                     device_ids = [model_device.index]
                     output_device = model_device.index
                 model = DDP(
@@ -405,7 +405,7 @@ class FSDPTrainingBackend(TrainingBackend):
         accelerator_state = None
         module = getattr(torch, device_type, None)
         if (
-            device_type in ("cuda", "npu")
+            device_type in ("cuda", "npu", "xpu")
             and module is not None
             and module.is_available()
         ):
@@ -413,10 +413,11 @@ class FSDPTrainingBackend(TrainingBackend):
         return {
             "torch": torch.get_rng_state(),
             "device_type": device_type,
-            # Named keys keep old CUDA checkpoints readable and make NPU state
-            # inspectable without understanding a new opaque payload.
+            # Named keys keep old CUDA checkpoints readable and make NPU/XPU
+            # state inspectable without understanding a new opaque payload.
             "cuda": accelerator_state if device_type == "cuda" else None,
             "npu": accelerator_state if device_type == "npu" else None,
+            "xpu": accelerator_state if device_type == "xpu" else None,
         }
 
     @staticmethod
