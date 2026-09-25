@@ -119,7 +119,7 @@ const p = (path: string) => withBase(path + '.html')
         <div>
           <h2 class="sf-h2">Get Started in Seconds</h2>
           <p class="sf-lead">
-            Select your hardware and installer, run the command, and you are ready to train your
+            Select your hardware, version and installer, run the command, and you are ready to train your
             first draft model.
           </p>
           <ol class="sf-steps">
