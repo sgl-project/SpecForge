@@ -42,6 +42,7 @@ from .parse import (
     GeneralParser,
     GLMParser,
     HarmonyParser,
+    LingParser,
     ThinkingParser,
 )
 from .template import TEMPLATE_REGISTRY, ChatTemplate
@@ -151,6 +152,8 @@ def preprocess_conversations(
         parser = DeepSeekV4Parser(tokenizer, chat_template)
     elif chat_template.parser_type == "glm":
         parser = GLMParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "ling":
+        parser = LingParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
     else:
