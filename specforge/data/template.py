@@ -373,6 +373,23 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# GLM-5.3 renders the same role/think tokens as GLM-5.2 (verified against
+# the zai-org chat_template.jinja: user/assistant headers with a
+# think opener and the user tag as the turn separator), so the field
+# set matches glm-5.2; a separate entry lets 5.3-specific drift diverge.
+TEMPLATE_REGISTRY.register(
+    name="glm-5.3",
+    template=ChatTemplate(
+        assistant_header="<|assistant|><think>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+        parser_type="glm",
+        assistant_pattern_type="glm",
+        ignore_token=["<|user|>"],
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="gemma",
     template=ChatTemplate(
