@@ -13,7 +13,7 @@
 # replaces package-owned files but leaves our added sink and patch record.
 #
 # Usage: scripts/apply_sglang_spec_capture_patch.sh
-#          [--target v0.5.18|kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4]
+#          [--target v0.5.18|main-923e4a56|kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4]
 #          [--reverse]
 set -euo pipefail
 
@@ -45,6 +45,13 @@ done
 case "$TARGET" in
     v0.5.18)
         EXPECTED_VERSION_PREFIX="0.5.18"
+        PATCH_TARGET="$TARGET"
+        ;;
+    main-923e4a56)
+        # SGLang main at 923e4a56 (2026-09-16), the first line that serves
+        # DeepSeek-V4.1. A main checkout reports a dev version that does not
+        # identify the revision, so patch --check is the compatibility gate.
+        EXPECTED_VERSION_PREFIX=""
         PATCH_TARGET="$TARGET"
         ;;
     kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4)

@@ -8,8 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Server-side spec-capture rollout source (zero-copy Mooncake transport).
 
-An external SGLang server patched with
-``patches/sglang/v0.5.18/spec-capture.patch`` runs
+An external SGLang server patched with one of the checked-in capture patches
+(``patches/sglang/<target>/spec-capture.patch``, applied by
+``scripts/apply_sglang_spec_capture_patch.sh --target <target>``; the targets
+are listed in ``specforge/inference/sglang_patch_inventory.md``) runs
 the prefill and writes captured features straight into Mooncake in
 :class:`MooncakeFeatureStore`'s key layout. Tensors never pass through this
 process — the ``/generate`` response's ``meta_info["spec_capture"]`` carries
