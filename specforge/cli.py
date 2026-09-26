@@ -28,7 +28,6 @@ import os
 import signal
 import socket
 from contextlib import contextmanager
-from types import SimpleNamespace
 from typing import Iterator, Optional, Sequence
 
 import click
@@ -318,31 +317,72 @@ def export(
     return 0
 
 
-@cli.command(short_help="benchmark a running SGLang server")
-@click.option("--model", required=True, help="Tokenizer/model id for prompt rendering.")
+@cli.command(short_help="benchmark an SGLang server across tasks and configurations")
 @click.option(
-    "--dataset",
-    type=click.Choice(("gsm8k", "math500", "humaneval", "mbpp", "mt-bench")),
-    required=True,
+    "-c",
+    "--config",
+    "config_path",
+    default=None,
+    metavar="PATH",
+    help="YAML or JSON benchmark config; flags below override its fields.",
 )
-@click.option("--max-new-tokens", type=int, default=2048, show_default=True)
-@click.option("--temperature", type=float, default=0.0, show_default=True)
-@click.option("--top-p", type=float, default=1.0, show_default=True)
-@click.option("--top-k", type=int, default=1, show_default=True)
-@click.option("--max-samples", type=int, default=None)
-@click.option("--num-prompts", type=int, default=1024, show_default=True)
-@click.option("--concurrency", type=int, default=1, show_default=True)
-@click.option("--base-url", default="http://127.0.0.1:30000", show_default=True)
-@click.option("--timeout-seconds", type=int, default=3600, show_default=True)
-@click.option("--enable-thinking", is_flag=True)
-@click.option("--trust-remote-code", is_flag=True)
-@click.option("--output-json", default=None, metavar="PATH")
-def benchmark(**options) -> int:
-    """Measure throughput and optional speculative-decoding telemetry from a
-    running SGLang server."""
-    from specforge.benchmarks.sglang import run
+@click.option("--model", default=None, help="Target model path or id.")
+@click.option(
+    "--draft-model",
+    default=None,
+    metavar="PATH",
+    help="Draft model used when launching speculative servers.",
+)
+@click.option(
+    "--task",
+    "tasks",
+    multiple=True,
+    metavar="NAME[:N[:SUBSET,...]]",
+    help="Task to run (repeatable); replaces the config file's task list.",
+)
+@click.option("--base-url", default=None, help="SGLang server URL.")
+@click.option(
+    "--launch-server/--no-launch-server",
+    default=None,
+    help="Launch a server per matrix entry instead of using a running one.",
+)
+@click.option("--concurrency", type=int, default=None)
+@click.option("--max-new-tokens", type=int, default=None)
+@click.option("--output-dir", default=None, metavar="PATH")
+@click.option("--name", default=None, help="Report file name prefix.")
+@click.option("--trust-remote-code", is_flag=True, default=None)
+@click.option("--enable-thinking", is_flag=True, default=None)
+@click.option("--list-tasks", is_flag=True, help="Print the available tasks and exit.")
+@click.argument("overrides", nargs=-1)
+def benchmark(
+    config_path: Optional[str],
+    tasks: Sequence[str],
+    list_tasks: bool,
+    overrides: Sequence[str],
+    **flags,
+) -> int:
+    """Measure throughput, acceptance length, and task accuracy on an SGLang
+    server.
 
-    return run(SimpleNamespace(**options))
+    Tasks are ``name[:num_samples[:subset,...]]``, e.g. ``gsm8k:200`` or
+    ``ceval:50:accountant,law``.  OVERRIDES are dotted ``section.field=value``
+    assignments such as ``sampling.temperature=0.6``.
+    """
+    from specforge.benchmarks.tasks import TASKS
+
+    if list_tasks:
+        width = max(len(name) for name in TASKS.names())
+        for task in TASKS:
+            print(f"{task.name:<{width}}  {task.description}")
+        return 0
+    from specforge.benchmarks.config import build_config
+    from specforge.benchmarks.runner import main as run_benchmark
+
+    try:
+        config = build_config(config_path, flags, list(tasks), list(overrides))
+    except (ValueError, KeyError) as error:
+        raise click.UsageError(str(error))
+    return run_benchmark(config)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
