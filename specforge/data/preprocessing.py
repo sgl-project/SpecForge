@@ -39,6 +39,7 @@ from ..distributed import get_draft_sp_group, get_sp_ring_group
 from .loss_mask import has_consecutive_supervised_tokens
 from .parse import (
     DeepSeekV4Parser,
+    DeepSeekV41Parser,
     GeneralParser,
     GLMParser,
     HarmonyParser,
@@ -150,6 +151,8 @@ def preprocess_conversations(
         parser = ThinkingParser(tokenizer, chat_template)
     elif chat_template.parser_type == "deepseek-v4":
         parser = DeepSeekV4Parser(tokenizer, chat_template)
+    elif chat_template.parser_type == "deepseek-v4.1":
+        parser = DeepSeekV41Parser(tokenizer, chat_template)
     elif chat_template.parser_type == "glm":
         parser = GLMParser(tokenizer, chat_template)
     elif chat_template.parser_type == "ling":
