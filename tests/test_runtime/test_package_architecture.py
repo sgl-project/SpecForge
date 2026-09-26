@@ -718,6 +718,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "ling-3.0-tiny-dspark.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
+                "qwen3.5-4b-dspark.json",
                 "qwen3.6-27b-dspark.json",
             },
         )
