@@ -176,6 +176,40 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "no larger"):
             Config.model_validate(invalid)
 
+    def test_sglang_server_knobs_default_off_and_load_from_yaml(self):
+        default = Config.model_validate(_managed_local_payload(ep_size=1))
+        self.assertIsNone(default.model.sglang_max_prefill_tokens)
+        self.assertIsNone(default.model.sglang_linear_attn_prefill_backend)
+        self.assertIsNone(default.model.sglang_fp8_gemm_backend)
+        self.assertFalse(default.model.sglang_disable_cuda_graph)
+        self.assertEqual(default.model.sglang_extra_args, [])
+        server = default.deployment.disaggregated.managed_local.capture_servers[0]
+        self.assertEqual((server.extra_args, server.env), ([], {}))
+
+        payload = _managed_local_payload(ep_size=1)
+        payload["model"]["sglang_extra_args"] = ["--max-prefill-tokens", 65536]
+        payload["deployment"]["disaggregated"]["managed_local"]["capture_servers"][
+            0
+        ].update(
+            extra_args=["--prefill-max-requests", 4],
+            env={"SGLANG_SPEC_CAPTURE_TIMING": 1},
+        )
+        path = _write(payload, ".yaml")
+        self.addCleanup(os.unlink, path)
+        # Unquoted YAML numbers become the CLI/env strings SGLang reads.
+        cfg = load_config(path)
+        self.assertEqual(cfg.model.sglang_extra_args, ["--max-prefill-tokens", "65536"])
+        server = cfg.deployment.disaggregated.managed_local.capture_servers[0]
+        self.assertEqual(server.extra_args, ["--prefill-max-requests", "4"])
+        self.assertEqual(server.env, {"SGLANG_SPEC_CAPTURE_TIMING": "1"})
+
+        overridden = apply_overrides(
+            cfg, ["model.sglang_extra_args=[--enable-metrics]"]
+        )
+        self.assertEqual(overridden.model.sglang_extra_args, ["--enable-metrics"])
+        with self.assertRaisesRegex(ValidationError, "must not set --dtype"):
+            apply_overrides(cfg, ["model.sglang_extra_args=[--dtype, float16]"])
+
     def test_online_eagle3_preserves_multi_sample_batches(self):
         payload = _online_payload()
         payload["training"]["batch_size"] = 4

@@ -228,6 +228,31 @@ at the high watermark is outrunning the trainers (add trainer ranks or raise
 the watermark if the loader is idle), a trainer whose data-wait share stays
 high while the producer never pauses is starved by the servers (add servers).
 
+## Capture-server knobs
+
+Both recipes keep SGLang's kernel and scheduling defaults apart from the
+settings above. The managed-local recipe passes these fields to every capture
+server; `--plan` prints each resulting server command and environment:
+
+| Setting | SGLang flag or effect |
+| --- | --- |
+| `model.sglang_max_prefill_tokens` | `--max-prefill-tokens` |
+| `model.sglang_linear_attn_prefill_backend` | `--linear-attn-prefill-backend` (the target's GDN layers) |
+| `model.sglang_fp8_gemm_backend` | `--fp8-gemm-backend` (the FP8 checkpoint) |
+| `model.sglang_disable_cuda_graph` | `--disable-cuda-graph` |
+| `model.sglang_max_running_requests` | `--max-running-requests` |
+| `model.sglang_extra_args` | any other flag, one list item per flag or value, e.g. `["--prefill-max-requests", "4", "--enable-metrics"]` |
+| `capture_servers[].extra_args` | flags for one server, after the global list |
+| `capture_servers[].env` | environment for one server, e.g. `SGLANG_SPEC_CAPTURE_TIMING: "1"` |
+
+The schema rejects passthrough flags that SpecForge renders itself (model
+path, port, TP size, dtype, context length, chunked prefill and the capture
+flags) or that another `model.sglang_*` field already sets, abbreviations of
+those, `--api-key`, SGLang DP options and `--config`, and environment keys it
+owns (`MOONCAKE_*`, `DISAGG_*`, device visibility). On the two-node
+wrapper, `SERVER_EXTRA_ARGS_APPEND` adds flags after the recipe's server
+defaults, and exported variables reach every server.
+
 ## Known limitations on current `main`
 
 1. **Acknowledgement stall on partial removals.** `MooncakeFeatureStore`

@@ -802,7 +802,8 @@ class LaunchPlanTest(unittest.TestCase):
                 ("--moe-runner-backend", "triton"),
                 ("--page-size", "64"),
                 ("--quantization", "fp8"),
-                ("--fp4-gemm-runner-backend", "cutlass"),
+                # SGLang v0.5.18 spells this option --fp4-gemm-backend.
+                ("--fp4-gemm-backend", "cutlass"),
                 ("--mamba-radix-cache-strategy", "lru"),
                 ("--max-mamba-cache-size", "1024"),
                 ("--swa-full-tokens-ratio", "0.5"),
@@ -810,6 +811,14 @@ class LaunchPlanTest(unittest.TestCase):
             ):
                 self.assertEqual(argv[argv.index(flag) + 1], expected)
             self.assertEqual(argv[argv.index("--context-length") + 1], "2055")
+            self.assertNotIn("--fp4-gemm-runner-backend", argv)
+            for flag in (
+                "--max-prefill-tokens",
+                "--linear-attn-prefill-backend",
+                "--fp8-gemm-backend",
+                "--disable-cuda-graph",
+            ):
+                self.assertNotIn(flag, argv)
         producer, consumer = plan.commands
         expected_urls = "http://127.0.0.1:30000,http://127.0.0.1:30001"
         self.assertEqual(producer.env["DISAGG_SERVER_URLS"], expected_urls)
@@ -818,6 +827,234 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(consumer.env["MOONCAKE_MASTER_SERVER_ADDR"], "127.0.0.1:35551")
         rendered = json.loads(plan.render())
         self.assertEqual(len(rendered["services"]), 3)
+
+    def test_managed_local_plan_renders_server_knobs_and_passthrough(self):
+        servers = [
+            {
+                "port": 30000,
+                "cuda_visible_devices": ["0"],
+                "tp_size": 1,
+                "extra_args": ["--prefill-max-requests", 4],
+                "env": {
+                    "SGLANG_SPEC_CAPTURE_TIMING": 1,
+                    "SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES": "2",
+                },
+            },
+            {"port": 30001, "cuda_visible_devices": ["1"], "tp_size": 1},
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"), servers=servers)
+            raw = cfg.model_dump()
+            raw["model"].update(
+                sglang_max_prefill_tokens=65536,
+                sglang_linear_attn_prefill_backend="triton",
+                sglang_fp8_gemm_backend="deep_gemm",
+                sglang_disable_cuda_graph=True,
+                sglang_extra_args=["--enable-metrics", "--admin-api-key", "top-secret"],
+            )
+            cfg = Config.model_validate(raw)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                plan = build_launch_plan(cfg, config_path="run.yaml", env={})
+
+        first, second = (service.command for service in plan.services[1:])
+        for command in (first, second):
+            argv = command.argv
+            for flag, expected in (
+                ("--max-prefill-tokens", "65536"),
+                ("--linear-attn-prefill-backend", "triton"),
+                ("--fp8-gemm-backend", "deep_gemm"),
+            ):
+                self.assertEqual(argv[argv.index(flag) + 1], expected)
+            self.assertIn("--disable-cuda-graph", argv)
+            self.assertNotIn("--extra-args", argv)
+        # Global passthrough closes every command; per-server tokens follow it.
+        self.assertEqual(
+            first.argv[-5:],
+            (
+                "--enable-metrics",
+                "--admin-api-key",
+                "top-secret",
+                "--prefill-max-requests",
+                "4",
+            ),
+        )
+        self.assertEqual(
+            second.argv[-3:], ("--enable-metrics", "--admin-api-key", "top-secret")
+        )
+        self.assertEqual(first.env["SGLANG_SPEC_CAPTURE_TIMING"], "1")
+        self.assertEqual(first.env["SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES"], "2")
+        self.assertEqual(first.env["CUDA_VISIBLE_DEVICES"], "0")
+        self.assertNotIn("SGLANG_SPEC_CAPTURE_TIMING", second.env)
+
+        rendered = plan.render()
+        self.assertNotIn("top-secret", rendered)
+        services = json.loads(rendered)["services"]
+        self.assertEqual(
+            services[1]["command"]["argv"][-5:],
+            [
+                "--enable-metrics",
+                "--admin-api-key",
+                "<redacted>",
+                "--prefill-max-requests",
+                "4",
+            ],
+        )
+        self.assertEqual(
+            services[1]["command"]["env"]["SGLANG_SPEC_CAPTURE_TIMING"], "1"
+        )
+
+    def test_managed_local_passthrough_rejects_owned_and_repeated_settings(self):
+        cfg = _managed_config("/fresh/managed-attempt")
+
+        def server(**values):
+            def mutate(raw):
+                raw["deployment"]["disaggregated"]["managed_local"]["capture_servers"][
+                    0
+                ].update(values)
+
+            return mutate
+
+        def model(**values):
+            return lambda raw: raw["model"].update(values)
+
+        invalid_cases = {
+            "launcher-owned flag": (
+                model(sglang_extra_args=["--chunked-prefill-size", "8192"]),
+                "--chunked-prefill-size; it is rendered from the capture launcher",
+            ),
+            "owned flag alias": (
+                model(sglang_extra_args=["--tensor-parallel-size", "2"]),
+                r"--tensor-parallel-size; it is rendered from capture_servers\[\]",
+            ),
+            "owned flag with inline value": (
+                model(sglang_extra_args=["--context-length=4096"]),
+                "--context-length; it is rendered from model.sglang_context_length",
+            ),
+            "flag rendered from a typed field": (
+                model(sglang_extra_args=["--mem-fraction-static", "0.5"]),
+                "rendered from model.sglang_mem_fraction_static",
+            ),
+            "flag rendered from a convenience field": (
+                model(
+                    sglang_max_prefill_tokens=8192,
+                    sglang_extra_args=["--max-prefill-tokens", "4096"],
+                ),
+                "rendered from model.sglang_max_prefill_tokens",
+            ),
+            "cache dir": (
+                model(cache_dir="/models", sglang_extra_args=["--download-dir", "x"]),
+                "rendered from model.cache_dir",
+            ),
+            "leading value": (
+                model(sglang_extra_args=["65536"]),
+                "must start with a --flag",
+            ),
+            "flag and value in one item": (
+                model(sglang_extra_args=["--max-prefill-tokens 65536"]),
+                "list each flag and each value as its own item",
+            ),
+            "repeated flag": (
+                model(sglang_extra_args=["--enable-metrics", "--enable-metrics"]),
+                "repeats --enable-metrics",
+            ),
+            "boolean token": (
+                model(sglang_extra_args=["--enable-metrics", True]),
+                "quote boolean-looking values",
+            ),
+            # /health stays open under --api-key; every capture call would 401.
+            "api key": (
+                model(sglang_extra_args=["--api-key", "x"]),
+                "must not set --api-key; the capture adapter sends no API key",
+            ),
+            # The typed sglang_enable_dp_* fields are rejected for managed_local.
+            "dp attention": (
+                model(sglang_extra_args=["--enable-dp-attention"]),
+                "must not set --enable-dp-attention; managed_local capture "
+                "servers do not support SGLang DP options",
+            ),
+            "server dp lm head": (
+                server(extra_args=["--enable-dp-lm-head"]),
+                "must not set --enable-dp-lm-head",
+            ),
+            "sglang config file": (
+                model(sglang_extra_args=["--config", "server.yaml"]),
+                "must not set --config",
+            ),
+            # SGLang's argparse expands unambiguous prefixes.
+            "abbreviated owned flag": (
+                model(sglang_extra_args=["--context-len=4096"]),
+                "--context-len is a prefix of --context-length",
+            ),
+            "server abbreviates a rendered field": (
+                server(extra_args=["--mem-fraction", "0.5"]),
+                "--mem-fraction is a prefix of --mem-fraction-static",
+            ),
+            "abbreviated unsupported flag": (
+                model(sglang_extra_args=["--enable-dp-att"]),
+                "is a prefix of --enable-dp-attention",
+            ),
+            "server owned flag": (
+                server(extra_args=["--port", "30005"]),
+                r"--port; it is rendered from capture_servers\[\].port",
+            ),
+            "server repeats a rendered field": (
+                server(extra_args=["--attention-backend", "fa3"]),
+                r"capture_servers\[0\].extra_args must not set --attention-backend",
+            ),
+            "server repeats a global passthrough flag": (
+                lambda raw: (
+                    model(sglang_extra_args=["--dp-size", "2"])(raw),
+                    server(extra_args=["--data-parallel-size", "2"])(raw),
+                ),
+                "rendered from model.sglang_extra_args",
+            ),
+            "mooncake env": (
+                server(env={"MOONCAKE_PROTOCOL": "rdma"}),
+                "must not set MOONCAKE_PROTOCOL",
+            ),
+            "transport env": (
+                server(env={"DISAGG_SERVER_URLS": "http://x:1"}),
+                "must not set DISAGG_SERVER_URLS",
+            ),
+            "device env": (
+                server(env={"CUDA_VISIBLE_DEVICES": "3"}),
+                r"set from capture_servers\[\].cuda_visible_devices",
+            ),
+            "gpu put env": (
+                server(env={"SGLANG_SPEC_CAPTURE_GPU_PUT": "1"}),
+                r"set from capture_servers\[\].gpu_put",
+            ),
+            "invalid env name": (
+                server(env={"NOT-A-NAME": "1"}),
+                "environment variable names",
+            ),
+        }
+        for name, (mutate, message) in invalid_cases.items():
+            with self.subTest(case=name):
+                raw = cfg.model_dump()
+                mutate(raw)
+                with self.assertRaisesRegex(ValidationError, message):
+                    Config.model_validate(raw)
+
+        # Distinct flags that merely share a prefix with another stay valid.
+        raw = cfg.model_dump()
+        model(
+            sglang_extra_args=[
+                "--enable-metrics-for-all-schedulers",
+                "--disable-cuda-graph-padding",
+                "--admin-api-key",
+                "k",
+            ]
+        )(raw)
+        server(extra_args=["--enable-metrics"])(raw)
+        valid = Config.model_validate(raw)
+        self.assertEqual(
+            valid.deployment.disaggregated.managed_local.capture_servers[0].extra_args,
+            ["--enable-metrics"],
+        )
 
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (

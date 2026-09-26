@@ -19,15 +19,159 @@ from __future__ import annotations
 import copy
 import json
 import os
-from typing import List, Literal, Optional
+import re
+from typing import Dict, List, Literal, Mapping, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
 SGLANG_CAPTURE_CONTEXT_HEADROOM = 7
+
+#: SGLang flags the managed-local launcher renders for every capture server,
+#: mapped to the setting that owns them. Passthrough arguments must not repeat
+#: them.
+SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
+    "--model-path": "model.target_model_path",
+    "--dtype": "model.torch_dtype",
+    "--trust-remote-code": "model.trust_remote_code",
+    "--skip-tokenizer-init": "the capture launcher",
+    "--tp-size": "capture_servers[].tp_size",
+    "--chunked-prefill-size": "the capture launcher (complete prefills)",
+    "--enable-spec-capture": "the capture launcher",
+    "--spec-capture-method": "the algorithm's capture contract",
+    "--spec-capture-aux-layer-ids": "the algorithm's capture contract",
+    "--host": "the capture launcher (loopback)",
+    "--port": "capture_servers[].port",
+    "--context-length": "model.sglang_context_length",
+}
+#: Passthrough flags a managed-local capture server must not receive, and why.
+_SGLANG_UNSUPPORTED_FLAGS: Mapping[str, str] = {
+    # /health stays open under --api-key, so the stack would start and then
+    # fail every unauthenticated capture /generate.
+    "--api-key": "the capture adapter sends no API key to its /generate calls",
+    "--enable-dp-attention": (
+        "managed_local capture servers do not support SGLang DP options"
+    ),
+    "--enable-dp-lm-head": (
+        "managed_local capture servers do not support SGLang DP options"
+    ),
+    "--config": "SGLang merges that file unchecked; list its flags instead",
+}
+#: Other SGLang v0.5.18 spellings of the same server options.
+_SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
+    "--model-path": ("--model",),
+    "--tp-size": ("--tensor-parallel-size",),
+    "--ep-size": ("--expert-parallel-size", "--ep"),
+    "--dp-size": ("--data-parallel-size",),
+    "--mamba-radix-cache-strategy": ("--mamba-scheduler-strategy",),
+}
+#: ``sglang_*`` fields whose SGLang flag does not follow the
+#: ``sglang_foo_bar`` -> ``--foo-bar`` convention.
+_SGLANG_FLAG_NAMES: Mapping[str, str] = {
+    "sglang_fp4_gemm_runner_backend": "--fp4-gemm-backend",
+}
+#: ``sglang_*`` fields that carry raw argv tokens instead of one flag.
+SGLANG_PASSTHROUGH_FIELDS = frozenset({"sglang_extra_args"})
+#: Capture-server environment the managed-local launcher sets itself.
+_OWNED_SERVER_ENV_PREFIXES = ("MOONCAKE_", "DISAGG_")
+_OWNED_SERVER_ENV = {
+    "CUDA_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "ASCEND_RT_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "ASCEND_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "HIP_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "ROCR_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "SGLANG_SPEC_CAPTURE_GPU_PUT": "capture_servers[].gpu_put",
+    "FLASHINFER_DISABLE_VERSION_CHECK": "the capture launcher",
+}
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SGLANG_CANONICAL_FLAGS = {
+    alias: flag for flag, aliases in _SGLANG_FLAG_ALIASES.items() for alias in aliases
+}
+
+
+def sglang_field_flag(name: str) -> str:
+    """The SGLang CLI flag rendered for the ``ModelConfig`` field *name*."""
+    return _SGLANG_FLAG_NAMES.get(
+        name, "--" + name.removeprefix("sglang_").replace("_", "-")
+    )
+
+
+def _with_aliases(flags: Mapping[str, str]) -> Dict[str, str]:
+    """Extend *flags* with every other SGLang spelling of the same options."""
+    expanded = dict(flags)
+    for flag, owner in flags.items():
+        canonical = _SGLANG_CANONICAL_FLAGS.get(flag, flag)
+        for spelling in (canonical, *_SGLANG_FLAG_ALIASES.get(canonical, ())):
+            expanded.setdefault(spelling, owner)
+    return expanded
+
+
+def _as_string_tokens(value, *, field_name: str):
+    """Accept unquoted YAML numbers where SGLang expects a string token."""
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{field_name} must hold strings; quote boolean-looking values"
+        )
+    if isinstance(value, (int, float)):
+        return str(value)
+    return value
+
+
+def _validate_sglang_extra_args(
+    tokens: List[str],
+    *,
+    field_name: str,
+    reserved: Mapping[str, str],
+    guarded: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Reject passthrough tokens that repeat or split a rendered SGLang flag.
+
+    *reserved* maps every flag spelling already on the server command line to
+    the setting that owns it. Flags are the ``--``-prefixed tokens; the rest
+    are their values, so the list must open with a flag. SGLang's parser also
+    expands unambiguous prefixes, so a flag that abbreviates a *guarded*
+    spelling (default: *reserved*) or an unsupported flag is rejected too.
+    """
+    guarded = reserved if guarded is None else guarded
+    if tokens and not tokens[0].startswith("--"):
+        raise ValueError(f"{field_name} must start with a --flag, got {tokens[0]!r}")
+    seen = set()
+    for token in tokens:
+        if not token.startswith("--"):
+            continue
+        flag = token.split("=", 1)[0]
+        if flag == "--" or any(character.isspace() for character in flag):
+            raise ValueError(
+                f"{field_name} entry {token!r} is not a single flag; list each "
+                "flag and each value as its own item"
+            )
+        if flag in reserved:
+            raise ValueError(
+                f"{field_name} must not set {flag}; it is rendered from "
+                f"{reserved[flag]}"
+            )
+        if flag in _SGLANG_UNSUPPORTED_FLAGS:
+            raise ValueError(
+                f"{field_name} must not set {flag}; "
+                f"{_SGLANG_UNSUPPORTED_FLAGS[flag]}"
+            )
+        expansions = sorted(
+            spelling
+            for spelling in (*guarded, *_SGLANG_UNSUPPORTED_FLAGS)
+            if spelling != flag and spelling.startswith(flag)
+        )
+        if expansions:
+            raise ValueError(
+                f"{field_name} entry {flag} is a prefix of {expansions[0]}, "
+                "which SGLang would expand it to; spell out the full flag"
+            )
+        canonical = _SGLANG_CANONICAL_FLAGS.get(flag, flag)
+        if canonical in seen:
+            raise ValueError(f"{field_name} repeats {flag}")
+        seen.add(canonical)
 
 
 class StrictConfigModel(BaseModel):
@@ -114,6 +258,53 @@ class ModelConfig(StrictConfigModel):
         gt=0.0,
         le=1.0,
     )
+    #: Positive token budget of one SGLang prefill batch.
+    sglang_max_prefill_tokens: Optional[int] = Field(default=None, gt=0)
+    #: Kernel backend for linear-attention (GDN/KDA) prefill in hybrid targets.
+    sglang_linear_attn_prefill_backend: Optional[str] = None
+    #: Blockwise FP8 GEMM runner, rendered as ``--fp8-gemm-backend``.
+    sglang_fp8_gemm_backend: Optional[str] = None
+    #: Pass SGLang's ``--disable-cuda-graph`` (decode and prefill graphs).
+    sglang_disable_cuda_graph: bool = False
+    #: Further SGLang CLI tokens appended to every managed-local capture
+    #: server, one flag or value per item. Flags the launcher or another
+    #: ``sglang_*`` field already renders are rejected.
+    sglang_extra_args: List[str] = Field(default_factory=list)
+
+    @field_validator("sglang_extra_args", mode="before")
+    @classmethod
+    def _string_extra_args(cls, value):
+        if not isinstance(value, list):
+            return value
+        return [
+            _as_string_tokens(item, field_name="model.sglang_extra_args")
+            for item in value
+        ]
+
+    def rendered_sglang_flags(self) -> Dict[str, str]:
+        """Every flag spelling the managed capture command derives from this model.
+
+        Maps each flag, including SGLang aliases, to the setting that owns it.
+        """
+        rendered = dict(SGLANG_LAUNCHER_OWNED_FLAGS)
+        if self.cache_dir:
+            rendered["--download-dir"] = "model.cache_dir"
+        for name in type(self).model_fields:
+            if not name.startswith("sglang_") or name in SGLANG_PASSTHROUGH_FIELDS:
+                continue
+            value = getattr(self, name)
+            if value is not None and value is not False:
+                rendered.setdefault(sglang_field_flag(name), f"model.{name}")
+        return _with_aliases(rendered)
+
+    @model_validator(mode="after")
+    def _check_sglang_extra_args(self):
+        _validate_sglang_extra_args(
+            self.sglang_extra_args,
+            field_name="model.sglang_extra_args",
+            reserved=self.rendered_sglang_flags(),
+        )
+        return self
 
     @model_validator(mode="after")
     def _validate_input_modality(self):
@@ -335,6 +526,37 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     gpu_put: Optional[bool] = None
     #: SGLang's generation-based /health waits at least one second internally.
     probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    #: SGLang CLI tokens for this server only, appended after
+    #: ``model.sglang_extra_args``.
+    extra_args: List[str] = Field(default_factory=list)
+    #: Extra environment for this server process, such as the capture
+    #: patch's ``SGLANG_SPEC_CAPTURE_*`` knobs. Keys the launcher sets
+    #: (Mooncake, transport and device visibility) are rejected.
+    env: Dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("extra_args", mode="before")
+    @classmethod
+    def _string_extra_args(cls, value):
+        if not isinstance(value, list):
+            return value
+        return [
+            _as_string_tokens(
+                item, field_name="managed_local.capture_servers[].extra_args"
+            )
+            for item in value
+        ]
+
+    @field_validator("env", mode="before")
+    @classmethod
+    def _string_env_values(cls, value):
+        if not isinstance(value, dict):
+            return value
+        return {
+            name: _as_string_tokens(
+                item, field_name="managed_local.capture_servers[].env"
+            )
+            for name, item in value.items()
+        }
 
     @model_validator(mode="after")
     def _validate_devices(self):
@@ -347,6 +569,32 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
                 "managed_local capture server tp_size must equal the number of "
                 "cuda_visible_devices"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_passthrough(self):
+        # Rendered model-level flags are checked by Config, which sees both.
+        _validate_sglang_extra_args(
+            self.extra_args,
+            field_name="managed_local.capture_servers[].extra_args",
+            reserved=_with_aliases(SGLANG_LAUNCHER_OWNED_FLAGS),
+        )
+        for name in self.env:
+            if not _ENV_NAME.fullmatch(name):
+                raise ValueError(
+                    "managed_local.capture_servers[].env keys must be "
+                    f"environment variable names, got {name!r}"
+                )
+            owner = _OWNED_SERVER_ENV.get(name) or (
+                "the managed Mooncake/transport settings"
+                if name.startswith(_OWNED_SERVER_ENV_PREFIXES)
+                else None
+            )
+            if owner is not None:
+                raise ValueError(
+                    f"managed_local.capture_servers[].env must not set {name}; "
+                    f"it is set from {owner}"
+                )
         return self
 
 
@@ -942,6 +1190,26 @@ class Config(StrictConfigModel):
                     "model.sglang_ep_size must be no larger than and evenly "
                     "divide every managed capture-server tp_size; incompatible "
                     f"tp sizes: {incompatible_tp_sizes}"
+                )
+            # A flag is set in exactly one place on each server command line.
+            rendered = self.model.rendered_sglang_flags()
+            reserved = dict(rendered)
+            global_flags = {
+                token.split("=", 1)[0]: "model.sglang_extra_args"
+                for token in self.model.sglang_extra_args
+                if token.startswith("--")
+            }
+            for flag, owner in _with_aliases(global_flags).items():
+                reserved.setdefault(flag, owner)
+            for index, server in enumerate(managed_local.capture_servers):
+                _validate_sglang_extra_args(
+                    server.extra_args,
+                    field_name=f"managed_local.capture_servers[{index}].extra_args",
+                    reserved=reserved,
+                    # Global passthrough flags guard exact repeats only: a
+                    # global --enable-metrics-for-all-schedulers still allows
+                    # a distinct per-server --enable-metrics.
+                    guarded=rendered,
                 )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")

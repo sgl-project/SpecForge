@@ -227,11 +227,16 @@ should make their training strategy and topology explicit.
 | `model.sglang_moe_runner_backend` | `null` | Optional SGLang MoE runner backend name. |
 | `model.sglang_page_size` | `null` | Optional positive SGLang KV-cache page size. |
 | `model.sglang_quantization` | `null` | Optional SGLang target quantization mode. |
-| `model.sglang_fp4_gemm_runner_backend` | `null` | Optional SGLang FP4 GEMM runner backend. |
+| `model.sglang_fp4_gemm_runner_backend` | `null` | Optional SGLang FP4 GEMM runner backend, passed as `--fp4-gemm-backend`. |
 | `model.sglang_mamba_radix_cache_strategy` | `null` | Optional hybrid Mamba/radix cache strategy. |
 | `model.sglang_max_mamba_cache_size` | `null` | Optional positive Mamba cache size. |
 | `model.sglang_swa_full_tokens_ratio` | `null` | Optional SGLang sliding-window full-token ratio in `(0, 1]`. |
 | `model.sglang_mamba_full_memory_ratio` | `null` | Optional SGLang Mamba full-memory ratio in `(0, 1]`. |
+| `model.sglang_max_prefill_tokens` | `null` | Optional positive token budget of one SGLang prefill batch (`--max-prefill-tokens`). |
+| `model.sglang_linear_attn_prefill_backend` | `null` | Optional linear-attention (GDN/KDA) prefill kernel backend for hybrid targets (`--linear-attn-prefill-backend`). |
+| `model.sglang_fp8_gemm_backend` | `null` | Optional blockwise FP8 GEMM runner (`--fp8-gemm-backend`). |
+| `model.sglang_disable_cuda_graph` | `false` | Pass `--disable-cuda-graph`, which disables SGLang's decode and prefill CUDA graphs. |
+| `model.sglang_extra_args` | `[]` | Further SGLang CLI tokens appended to every managed-local capture server, one flag or value per list item (`["--prefill-max-requests", "8"]`). The list must start with a `--flag`. Flags the launcher owns (`--model-path`, `--port`, `--host`, `--tp-size`, `--dtype`, `--trust-remote-code`, `--skip-tokenizer-init`, `--chunked-prefill-size`, `--context-length`, the `--spec-capture-*` flags) and flags another `model.sglang_*` field already renders are rejected, including their SGLang aliases and abbreviations; so are `--api-key` (the capture adapter sends no key), `--enable-dp-attention`/`--enable-dp-lm-head` (unsupported by managed-local capture) and `--config`. External servers take their flags from their own launch command. |
 
 ### `data`: choose exactly one training source
 
@@ -411,6 +416,8 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `null` | Optional SGLang static-memory override in `(0, 1]`; otherwise inherit `model.sglang_mem_fraction_static`. |
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
 | `deployment.disaggregated.managed_local.capture_servers[].startup_timeout_s` | `1800` | Positive server readiness timeout. |
+| `deployment.disaggregated.managed_local.capture_servers[].extra_args` | `[]` | SGLang CLI tokens for this server only, appended after `model.sglang_extra_args` under the same rules. A flag may appear once per command line, so set a per-server flag here and not in the global list. |
+| `deployment.disaggregated.managed_local.capture_servers[].env` | `{}` | Extra environment for this server process, for example the capture patch's `SGLANG_SPEC_CAPTURE_TIMING` or `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`. Keys the launcher sets are rejected: `MOONCAKE_*`, `DISAGG_*`, device-visibility variables, `SGLANG_SPEC_CAPTURE_GPU_PUT` (use `gpu_put`) and `FLASHINFER_DISABLE_VERSION_CHECK`. |
 | `deployment.disaggregated.managed_local.capture_servers[].probe_timeout_s` | `5` | Positive, finite HTTP health-probe timeout, capped by the remaining startup timeout. SGLang's generation-based `/health` waits at least one second; allow headroom instead of setting this to one second. |
 
 `startup_timeout_s` bounds the overall readiness wait; `probe_timeout_s` controls

@@ -20,6 +20,7 @@ from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config, ModelConfig
+from specforge.config.schema import SGLANG_PASSTHROUGH_FIELDS, sglang_field_flag
 
 if TYPE_CHECKING:
     from specforge.algorithms.registry import AlgorithmRegistration
@@ -37,6 +38,11 @@ _SECRET_NAMES = (
     "credential",
     "wandb_key",
     "swanlab_key",
+    # Passthrough SGLang flags (``--api-key``) and server env (``HF_TOKEN``).
+    "api_key",
+    "access_key",
+    "hf_token",
+    "hub_token",
 )
 
 
@@ -45,12 +51,17 @@ class _ForwardedSignal(BaseException):
         self.signum = signum
 
 
+def _is_secret_name(name: str) -> bool:
+    normalized = name.lower().replace("-", "_")
+    return any(fragment in normalized for fragment in _SECRET_NAMES)
+
+
 def _redacted(value: str) -> str:
     name = None
     raw = value
     if "=" in value:
         name, raw = value.split("=", 1)
-        if any(fragment in name.lower() for fragment in _SECRET_NAMES):
+        if _is_secret_name(name):
             return f"{name}=<redacted>"
     try:
         parsed = urlsplit(raw)
@@ -78,11 +89,28 @@ def _redacted(value: str) -> str:
     return f"{name}={raw}" if name is not None else raw
 
 
+def _redacted_argv(argv: Sequence[str]) -> list[str]:
+    """Redact ``name=value`` secrets and the value after a ``--secret`` flag."""
+    redacted: list[str] = []
+    for index, value in enumerate(argv):
+        previous = argv[index - 1] if index else ""
+        if (
+            previous.startswith("--")
+            and "=" not in previous
+            and _is_secret_name(previous)
+            and not value.startswith("--")
+        ):
+            redacted.append("<redacted>")
+        else:
+            redacted.append(_redacted(value))
+    return redacted
+
+
 def _redacted_env(values: Mapping[str, Optional[str]]) -> dict[str, Optional[str]]:
     return {
         name: (
             "<redacted>"
-            if any(fragment in name.lower() for fragment in _SECRET_NAMES)
+            if _is_secret_name(name)
             else (_redacted(value) if value is not None else None)
         )
         for name, value in sorted(values.items())
@@ -100,7 +128,7 @@ class CommandSpec:
     def as_dict(self) -> dict:
         return {
             "label": self.label,
-            "argv": [_redacted(value) for value in self.argv],
+            "argv": _redacted_argv(self.argv),
             "env": _redacted_env(self.env),
         }
 
@@ -415,18 +443,20 @@ def _sglang_argv(
 ) -> list[str]:
     """Derive SGLang CLI args from all ``sglang_*`` fields on *model*.
 
-    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``.
+    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``
+    unless :func:`sglang_field_flag` records SGLang's own spelling.
     Fields whose values require non-trivial resolution (server-level overrides,
     fallback computations) are passed via *overrides* keyed by the original
     field name; every other ``sglang_*`` field is read directly from *model*.
+    Raw passthrough tokens (``sglang_extra_args``) are appended by the caller.
     """
     resolved = overrides or {}
     argv: list[str] = []
     for name in ModelConfig.model_fields:
-        if not name.startswith("sglang_"):
+        if not name.startswith("sglang_") or name in SGLANG_PASSTHROUGH_FIELDS:
             continue
         value = resolved[name] if name in resolved else getattr(model, name)
-        flag = "--" + name.removeprefix("sglang_").replace("_", "-")
+        flag = sglang_field_flag(name)
         if isinstance(value, bool):
             if value:
                 argv.append(flag)
@@ -542,7 +572,12 @@ def _managed_local_services(
                 },
             )
         )
+        # The schema rejects passthrough flags that repeat any flag above.
+        argv.extend(cfg.model.sglang_extra_args)
+        argv.extend(server.extra_args)
         service_env = {
+            # Validated not to overlap the keys below, which win regardless.
+            **server.env,
             **shared_env,
             device_visibility_env: ",".join(server.cuda_visible_devices),
             **(
