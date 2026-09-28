@@ -988,6 +988,8 @@ class TrainingConfig(StrictConfigModel):
     #: Deterministic online prompt ordering. ``None`` preserves the historical
     #: behavior of using the run RNG seed for both model and prompt sampling.
     prompt_seed: Optional[int] = None
+    #: Absolute sampler epoch for curriculum stages that reset optimizer state.
+    prompt_epoch_offset: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _validate_training_shape(self):

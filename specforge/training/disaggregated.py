@@ -307,6 +307,7 @@ def _online_schedule_payload(cfg: Config, *, num_prompts: int) -> dict:
         "total_steps": total_steps,
         "num_prompts": num_prompts,
         "prompt_epochs": cfg.training.num_epochs,
+        "prompt_epoch_offset": getattr(cfg.training, "prompt_epoch_offset", 0),
         "prompt_seed": _online_prompt_seed(cfg),
         "dp_size": dp_size,
         "batch_size": cfg.training.batch_size,
@@ -334,6 +335,7 @@ def _read_online_total_steps(cfg: Config, channel_path: str) -> int:
     expected = {
         "version": 1,
         "prompt_epochs": cfg.training.num_epochs,
+        "prompt_epoch_offset": getattr(cfg.training, "prompt_epoch_offset", 0),
         "prompt_seed": _online_prompt_seed(cfg),
         "dp_size": trainer.nnodes * trainer.nproc_per_node,
         "batch_size": cfg.training.batch_size,
@@ -705,6 +707,7 @@ def _build_online(
             target_repr=target_repr,
             aux_hidden_state_layer_ids=layers,
             prompt_epochs=cfg.training.num_epochs,
+            prompt_epoch_offset=cfg.training.prompt_epoch_offset,
             prompt_seed=_online_prompt_seed(cfg),
             lease=cfg.runtime.producer_lease,
             in_flight_high_watermark=in_flight_high_watermark,
