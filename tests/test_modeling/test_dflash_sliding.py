@@ -4,12 +4,16 @@ from unittest import mock
 
 import torch
 from torch import nn
-from transformers import Qwen3Config
+from transformers import DynamicCache, Qwen3Config
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.modeling.draft.dflash import (
     DFlashDraftModel,
     resolve_dflash_attention_layout,
+)
+from specforge.modeling.draft.dflash_mask import (
+    build_block_mask,
+    build_dense_mask,
 )
 
 
@@ -62,7 +66,7 @@ def _capture_model(layer_types, sliding_window=None):
     return model, capture_layers
 
 
-def _forward(model, attention_mask):
+def _forward(model, attention_mask, **kwargs):
     noise_embedding = torch.randn(1, 2, model.config.hidden_size)
     target_hidden = torch.randn(1, 4, model.config.hidden_size)
     position_ids = torch.arange(6).unsqueeze(0)
@@ -71,7 +75,175 @@ def _forward(model, attention_mask):
         noise_embedding=noise_embedding,
         target_hidden=target_hidden,
         attention_mask=attention_mask,
+        **kwargs,
     )
+
+
+def _reference_generation_mask(context_length, query_length, causal, window):
+    return torch.tensor(
+        [
+            [
+                (not causal or key <= context_length + query)
+                and (window is None or abs(key - context_length - query) < window)
+                for key in range(context_length + query_length)
+            ]
+            for query in range(query_length)
+        ]
+    )[None, None]
+
+
+class TestDFlashGenerationMasks(unittest.TestCase):
+    @torch.no_grad()
+    def test_forward_fallback_matches_explicit_mask(self):
+        for implementation in ("eager", "sdpa"):
+            for window in (None, 1, 3):
+                for causal, override in (
+                    (None, None),
+                    (False, None),
+                    (True, None),
+                    (False, True),
+                    (True, False),
+                ):
+                    for cached_length, query_length in ((0, 4), (3, 4), (3, 1)):
+                        with self.subTest(
+                            backend=implementation,
+                            window=window,
+                            causal=causal,
+                            override=override,
+                            cache=cached_length,
+                            query=query_length,
+                        ):
+                            config = _draft_config(
+                                [
+                                    (
+                                        "full_attention"
+                                        if window is None
+                                        else "sliding_attention"
+                                    )
+                                ],
+                                window,
+                            )
+                            config._attn_implementation = implementation
+                            if causal is not None:
+                                config.is_causal = causal
+                            model = DFlashDraftModel(config).eval()
+                            self.assertEqual(
+                                model.layers[0].self_attn.is_causal,
+                                window is not None if causal is None else causal,
+                            )
+                            resolved = causal if override is None else override
+                            if resolved is None:
+                                resolved = window is not None
+                            inputs = dict(
+                                noise_embedding=torch.randn(2, query_length, 8),
+                                target_hidden=torch.randn(2, 2, model.fc.in_features),
+                                position_ids=torch.arange(
+                                    cached_length,
+                                    cached_length + 2 + query_length,
+                                )[None],
+                            )
+                            if override is not None:
+                                inputs["is_causal"] = override
+                            actual_cache, expected_cache = (
+                                DynamicCache(),
+                                DynamicCache(),
+                            )
+                            if cached_length:
+                                k = torch.randn(2, 1, cached_length, 4)
+                                v = torch.randn_like(k)
+                                actual_cache.update(k, v, 0)
+                                expected_cache.update(k.clone(), v.clone(), 0)
+                            actual = model(**inputs, past_key_values=actual_cache)
+                            mask = _reference_generation_mask(
+                                cached_length + 2,
+                                query_length,
+                                resolved,
+                                window,
+                            )
+                            expected = model(
+                                **inputs,
+                                past_key_values=expected_cache,
+                                attention_mask=mask,
+                            )
+                            torch.testing.assert_close(
+                                actual, expected, rtol=1e-5, atol=1e-6
+                            )
+
+    def test_default_masks_are_shared_by_layer_type(self):
+        for implementation, builder in (
+            ("sdpa", build_dense_mask),
+            ("flex_attention", build_block_mask),
+        ):
+            model, layers = _capture_model(
+                ["full_attention", "sliding_attention"] * 2,
+                sliding_window=3,
+            )
+            model.config._attn_implementation = implementation
+            model.config.is_causal = True
+            name = (
+                "build_block_mask"
+                if implementation == "flex_attention"
+                else "build_dense_mask"
+            )
+            with mock.patch(
+                "specforge.modeling.draft.dflash." + name,
+                wraps=builder,
+            ) as create_mask:
+                _forward(model, None)
+            self.assertEqual(create_mask.call_count, 2)
+            self.assertIs(layers[0].attention_mask, layers[2].attention_mask)
+            self.assertIs(layers[1].attention_mask, layers[3].attention_mask)
+            for layer, window in ((layers[0], None), (layers[1], 3)):
+                expected = _reference_generation_mask(4, 2, True, window)
+                if implementation == "flex_attention":
+                    actual = layer.attention_mask.mask_mod(
+                        0,
+                        0,
+                        torch.arange(2)[:, None],
+                        torch.arange(6)[None],
+                    )
+                    torch.testing.assert_close(actual, expected[0, 0])
+                else:
+                    torch.testing.assert_close(layer.attention_mask, expected)
+
+    def test_no_fallback_for_supplied_masks_or_flash_attention(self):
+        model, layers = _capture_model(
+            ["full_attention", "sliding_attention"],
+            sliding_window=3,
+        )
+        model.config.is_causal = True
+        for supplied in (
+            torch.ones(1, 1, 2, 6, dtype=torch.bool),
+            {"full_attention": object(), "sliding_attention": object()},
+        ):
+            with mock.patch(
+                "specforge.modeling.draft.dflash.build_dense_mask",
+            ) as create_mask:
+                _forward(model, supplied)
+            create_mask.assert_not_called()
+            for layer_type, layer in zip(model.layer_types, layers):
+                expected = (
+                    supplied[layer_type] if isinstance(supplied, dict) else supplied
+                )
+                self.assertIs(layer.attention_mask, expected)
+        model.config._attn_implementation = "flash_attention_2"
+        with mock.patch(
+            "specforge.modeling.draft.dflash.build_dense_mask",
+        ) as create_mask:
+            _forward(model, None)
+        create_mask.assert_not_called()
+        self.assertTrue(all(layer.attention_mask is None for layer in layers))
+
+    def test_bidirectional_full_attention_remains_unmasked(self):
+        model, layers = _capture_model(["full_attention"])
+        for causal in (None, False):
+            model.config.is_causal = causal
+            with mock.patch(
+                "specforge.modeling.draft.dflash.build_dense_mask",
+            ) as create_mask:
+                _forward(model, None)
+            create_mask.assert_not_called()
+            self.assertIsNone(layers[0].attention_mask)
 
 
 class TestDFlashSlidingDispatch(unittest.TestCase):

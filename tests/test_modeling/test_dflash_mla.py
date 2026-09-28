@@ -437,6 +437,12 @@ class TestDFlashMLAAttention(unittest.TestCase):
 
 class TestDFlashMLASpecGenerate(unittest.TestCase):
     def test_spec_generate_decode_smoke(self):
+        for implementation in ("eager", "sdpa"):
+            for causal, window in ((None, None), (True, None), (False, 2), (None, 2)):
+                with self.subTest(backend=implementation, causal=causal, window=window):
+                    self._run_spec_generate(implementation, causal, window)
+
+    def _run_spec_generate(self, implementation, causal, window):
         torch.manual_seed(3)
         target_config = Qwen3Config(
             hidden_size=24,
@@ -452,7 +458,12 @@ class TestDFlashMLASpecGenerate(unittest.TestCase):
         target_config._attn_implementation = "sdpa"
         target = Qwen3ForCausalLM(target_config).eval()
 
-        config = _mla_config()
+        config = _mla_config(implementation=implementation)
+        if causal is not None:
+            config.is_causal = causal
+        if window is not None:
+            config.layer_types = ["sliding_attention"]
+            config.sliding_window = window
         config.dflash_config["mask_token_id"] = 0
         model = DFlashDraftModel(config).eval()
 
