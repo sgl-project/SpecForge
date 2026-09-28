@@ -4,7 +4,6 @@ from typing import Callable, Optional
 
 import torch
 from torch import nn
-
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast

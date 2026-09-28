@@ -1,6 +1,6 @@
 """Shared DFlash-family attention masks."""
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 

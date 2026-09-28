@@ -10,10 +10,7 @@ from specforge.algorithms.common.dflash_family_model import (
     OnlineDominoModel,
     OnlineDSparkModel,
 )
-from specforge.modeling.draft.dflash_mask import (
-    build_block_mask,
-    build_dense_mask,
-)
+from specforge.modeling.draft.dflash_mask import build_block_mask, build_dense_mask
 from specforge.utils import get_device_type
 
 
@@ -153,6 +150,7 @@ class TestDFlashMask(unittest.TestCase):
 
     def test_checkpoint_causality_reaches_both_layer_masks(self):
         from pathlib import Path
+
         from transformers import Qwen3Config
 
         checkpoint = Qwen3Config.from_json_file(

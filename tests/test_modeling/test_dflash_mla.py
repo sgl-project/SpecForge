@@ -10,7 +10,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
-
 from specforge.modeling.draft.dflash import (
     DFlashDraftModel,
     Qwen3DFlashAttention,

@@ -11,10 +11,7 @@ from specforge.modeling.draft.dflash import (
     DFlashDraftModel,
     resolve_dflash_attention_layout,
 )
-from specforge.modeling.draft.dflash_mask import (
-    build_block_mask,
-    build_dense_mask,
-)
+from specforge.modeling.draft.dflash_mask import build_block_mask, build_dense_mask
 
 
 def _draft_config(layer_types, sliding_window=None):
@@ -288,8 +285,7 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
                 return_value=noise_embedding,
             ),
             mock.patch(
-                "specforge.algorithms.common.dflash_family_model."
-                "build_dense_mask",
+                "specforge.algorithms.common.dflash_family_model." "build_dense_mask",
                 side_effect=(full_mask, sliding_mask),
             ) as create_mask,
         ):
@@ -330,8 +326,7 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
                 return_value=torch.randn(1, 2, model.config.hidden_size),
             ),
             mock.patch(
-                "specforge.algorithms.common.dflash_family_model."
-                "build_block_mask",
+                "specforge.algorithms.common.dflash_family_model." "build_block_mask",
                 return_value=torch.tensor([1]),
             ),
         ):

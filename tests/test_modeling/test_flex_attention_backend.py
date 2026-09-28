@@ -6,12 +6,9 @@ import torch
 from torch.nn.attention.flex_attention import flex_attention
 from transformers import Qwen3Config
 
-from specforge.modeling.draft.dflash_mask import (
-    build_block_mask,
-    build_dense_mask,
-)
 from specforge.modeling.draft.dflash import DFlashDraftModel, Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
+from specforge.modeling.draft.dflash_mask import build_block_mask, build_dense_mask
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 

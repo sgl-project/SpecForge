@@ -12,10 +12,7 @@ import torch.nn.functional as F
 from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.draft.dflash_mask import (
-    build_block_mask,
-    build_dense_mask,
-)
+from specforge.modeling.draft.dflash_mask import build_block_mask, build_dense_mask
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 try:
