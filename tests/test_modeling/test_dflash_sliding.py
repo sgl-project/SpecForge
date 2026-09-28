@@ -132,6 +132,49 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
         self.assertIs(layers[1].attention_mask, full_mask)
         self.assertTrue(all(layer.kernel_options is None for layer in layers))
 
+    def test_online_wrapper_builds_only_the_sliding_mask_for_sliding_model(self):
+        model, layers = _capture_model(
+            ["sliding_attention", "sliding_attention"],
+            sliding_window=4,
+        )
+        wrapper = OnlineDFlashModel(
+            draft_model=model,
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(32, model.config.hidden_size),
+            mask_token_id=31,
+            block_size=2,
+            attention_backend="sdpa",
+            num_anchors=1,
+        )
+        sliding_mask = torch.tensor([2])
+
+        with (
+            mock.patch.object(
+                wrapper,
+                "_sample_anchor_positions",
+                return_value=(torch.tensor([[2]]), torch.tensor([[True]])),
+            ),
+            mock.patch.object(
+                wrapper,
+                "_create_noise_embed",
+                return_value=torch.randn(1, 2, model.config.hidden_size),
+            ),
+            mock.patch(
+                "specforge.algorithms.common.dflash_family_model."
+                "create_dflash_sdpa_mask",
+                return_value=sliding_mask,
+            ) as create_mask,
+        ):
+            wrapper._forward_draft_blocks(
+                input_ids=torch.ones(1, 4, dtype=torch.long),
+                hidden_states=torch.randn(1, 4, model.config.hidden_size),
+                loss_mask=torch.ones(1, 4),
+            )
+
+        create_mask.assert_called_once()
+        self.assertEqual(create_mask.call_args.kwargs["sliding_window"], 4)
+        self.assertTrue(all(layer.attention_mask is sliding_mask for layer in layers))
+
     def test_online_wrapper_forces_standard_triton_flex_backend(self):
         model, layers = _capture_model(["full_attention"])
         wrapper = OnlineDFlashModel(
