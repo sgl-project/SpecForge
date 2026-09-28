@@ -409,6 +409,23 @@ class TestCliLifecycle(unittest.TestCase):
         )
         _validate_world_size(consumer, 8)
 
+    def test_world_size_must_divide_the_expert_parallel_product(self):
+        """EP multiplies into the draft model-parallel size like SP does.
+
+        The ranks left over after it form the draft data-parallel group, so a
+        world size the product does not divide has no valid topology at all.
+        """
+        config = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"hidden_states_path": "/features"},
+                "training": {"batch_size": 1, "expert_parallel_size": 4},
+            }
+        )
+        _validate_world_size(config, 8)
+        with self.assertRaisesRegex(ValueError, "expert_parallel_size"):
+            _validate_world_size(config, 6)
+
     def test_direct_invocation_bootstraps_one_process_rendezvous(self):
         rendezvous = mock.MagicMock()
         rendezvous.__enter__.return_value.getsockname.return_value = (

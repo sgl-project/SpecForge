@@ -68,6 +68,7 @@ def _assemble_trainer(
     checkpoint_extra: Optional[dict] = None,
     max_checkpoints: int = 0,
     tp_size: int = 1,
+    expert_parallel_size: int = 1,
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     dataloader_num_workers: int = 0,
@@ -142,6 +143,7 @@ def _assemble_trainer(
         checkpoint_extra=checkpoint_extra,
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,
+        expert_parallel_size=expert_parallel_size,
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         dataloader_num_workers=dataloader_num_workers,
@@ -197,9 +199,11 @@ def _shard_offline_refs(
         raise ValueError("dp_rank and dp_size must be provided together")
     if dp_rank is None:
         if dist.is_available() and dist.is_initialized():
-            from specforge.distributed import get_dp_group, get_draft_dp_group
+            from specforge.distributed import get_draft_dp_group
 
-            group = get_draft_dp_group() if use_usp_preprocess else get_dp_group()
+            # SP and EP peers operate on one logical sample. Only draft-DP
+            # replicas receive disjoint refs.
+            group = get_draft_dp_group()
             dp_rank, dp_size = dist.get_rank(group), dist.get_world_size(group)
         else:
             dp_rank, dp_size = 0, 1
@@ -558,6 +562,7 @@ def build_offline_runtime(
     eval_hidden_states_path: Optional[str] = None,
     eval_data_factory=None,
     tp_size: int = 1,
+    expert_parallel_size: int = 1,
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     use_usp_preprocess: bool = False,
@@ -654,6 +659,7 @@ def build_offline_runtime(
         },
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,
+        expert_parallel_size=expert_parallel_size,
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         dataloader_num_workers=dataloader_num_workers,
@@ -684,6 +690,7 @@ def build_disagg_offline_runtime(
     eval_hidden_states_path: Optional[str] = None,
     eval_data_factory=None,
     tp_size: int = 1,
+    expert_parallel_size: int = 1,
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     use_usp_preprocess: bool = False,
@@ -776,6 +783,7 @@ def build_disagg_offline_runtime(
         },
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,
+        expert_parallel_size=expert_parallel_size,
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         dataloader_num_workers=dataloader_num_workers,
