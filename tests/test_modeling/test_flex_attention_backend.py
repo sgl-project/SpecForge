@@ -6,12 +6,9 @@ import torch
 from torch.nn.attention.flex_attention import flex_attention
 from transformers import Qwen3Config
 
-from specforge.algorithms.common.dflash_family_model import (
-    create_dflash_block_mask,
-    create_dflash_sdpa_mask,
-)
 from specforge.modeling.draft.dflash import DFlashDraftModel, Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
+from specforge.modeling.draft.dflash_mask import build_block_mask, build_dense_mask
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 
@@ -30,7 +27,7 @@ class FlexAttentionBackendTest(unittest.TestCase):
         key = torch.randn(1, 2, kv_len, 64, device=device, dtype=dtype)
         value = torch.randn(1, 2, kv_len, 64, device=device, dtype=dtype)
 
-        block_mask = create_dflash_block_mask(
+        block_mask = build_block_mask(
             anchor_positions=anchors,
             block_keep_mask=keep_blocks,
             S=context_len,
@@ -38,7 +35,7 @@ class FlexAttentionBackendTest(unittest.TestCase):
             device=device,
             sliding_window=8,
         )
-        dense_mask = create_dflash_sdpa_mask(
+        dense_mask = build_dense_mask(
             anchor_positions=anchors,
             block_keep_mask=keep_blocks,
             S=context_len,
@@ -204,13 +201,17 @@ class FlexAttentionBackendTest(unittest.TestCase):
         )
 
         def run_backend(backend, flex_block_size=None):
-            block_mask = create_dflash_block_mask(
+            block_mask = build_block_mask(
                 anchor_positions=anchors,
                 block_keep_mask=keep_blocks,
                 S=context_len,
                 block_size=draft_block_size,
                 device=device,
-                flex_block_size=flex_block_size,
+                **(
+                    {"BLOCK_SIZE": flex_block_size}
+                    if flex_block_size is not None
+                    else {}
+                ),
                 sliding_window=128,
             )
 
@@ -284,13 +285,13 @@ class FlexAttentionBackendTest(unittest.TestCase):
             dtype=torch.bfloat16,
             requires_grad=True,
         )
-        block_mask = create_dflash_block_mask(
+        block_mask = build_block_mask(
             anchor_positions=torch.tensor([[64, 128, 192, 224]], device="cuda"),
             block_keep_mask=torch.ones(1, 4, dtype=torch.bool, device="cuda"),
             S=256,
             block_size=64,
             device=torch.device("cuda"),
-            flex_block_size=(256, 128),
+            BLOCK_SIZE=(256, 128),
         )
         cos = torch.ones(1, 512, config.head_dim, device="cuda", dtype=torch.bfloat16)
         sin = torch.zeros_like(cos)

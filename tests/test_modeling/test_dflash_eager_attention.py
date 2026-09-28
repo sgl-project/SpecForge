@@ -1,16 +1,17 @@
 import unittest
+from unittest import mock
 
 import torch
 from torch import nn
 from torch.testing import assert_close
 from transformers import Qwen3Config
 
-from specforge.algorithms.common.dflash_family_model import create_dflash_sdpa_mask
 from specforge.modeling.draft.dflash import Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DFlashKernels
+from specforge.modeling.draft.dflash_mask import build_dense_mask
 
 
-def _make_attention(layer_type, implementation, sliding_window):
+def _make_attention(layer_type, implementation, sliding_window, is_causal=None):
     config = Qwen3Config(
         hidden_size=8,
         intermediate_size=16,
@@ -26,6 +27,8 @@ def _make_attention(layer_type, implementation, sliding_window):
         attention_bias=False,
         attention_dropout=0.0,
     )
+    if is_causal is not None:
+        config.is_causal = is_causal
     config._attn_implementation = implementation
     kernels = DFlashKernels(
         make_rms_norm=lambda *_: nn.Identity(),
@@ -34,7 +37,7 @@ def _make_attention(layer_type, implementation, sliding_window):
     return Qwen3DFlashAttention(config, layer_idx=0, kernels=kernels).eval()
 
 
-def _forward(attention, hidden_states, target_hidden, attention_mask):
+def _forward(attention, hidden_states, target_hidden, attention_mask, **kwargs):
     total_length = target_hidden.shape[1] + hidden_states.shape[1]
     position_embeddings = (
         hidden_states.new_ones(1, total_length, attention.head_dim),
@@ -45,28 +48,76 @@ def _forward(attention, hidden_states, target_hidden, attention_mask):
         target_hidden=target_hidden,
         position_embeddings=position_embeddings,
         attention_mask=attention_mask,
+        **kwargs,
     )
 
 
 class TestDFlashEagerAttentionMasking(unittest.TestCase):
+    def test_supplied_mask_overrides_configured_causality(self):
+        for implementation in ("eager", "sdpa"):
+            attention = _make_attention("full_attention", implementation, None, True)
+            hidden, context = torch.randn(1, 3, 8), torch.randn(1, 2, 8)
+            mask = torch.ones(1, 1, 3, 5, dtype=torch.bool)
+            actual, _ = _forward(attention, hidden, context, mask)
+            expected, _ = _forward(attention, hidden, context, None, is_causal=False)
+            assert_close(actual, expected)
+
+    def test_flash_attention_receives_native_causality_and_window(self):
+        for causal in (None, False, True):
+            for window in (None, 3):
+                attention = _make_attention(
+                    "full_attention" if window is None else "sliding_attention",
+                    "flash_attention_2",
+                    window,
+                    causal,
+                )
+                hidden, context = torch.randn(1, 3, 8), torch.randn(1, 2, 8)
+                backend = mock.Mock(return_value=(torch.zeros(1, 3, 2, 4), None))
+                with mock.patch(
+                    "specforge.modeling.draft.dflash.ALL_ATTENTION_FUNCTIONS",
+                    {"flash_attention_2": backend},
+                ):
+                    _forward(attention, hidden, context, None)
+                self.assertIsNone(backend.call_args.args[4])
+                self.assertEqual(
+                    backend.call_args.args[0].is_causal,
+                    window is not None if causal is None else causal,
+                )
+                self.assertEqual(backend.call_args.kwargs["sliding_window"], window)
+                self.assertNotIn("is_causal", backend.call_args.kwargs)
+                with mock.patch(
+                    "specforge.modeling.draft.dflash.ALL_ATTENTION_FUNCTIONS",
+                    {"flash_attention_2": backend},
+                ):
+                    _forward(attention, hidden, context, None, is_causal=True)
+                self.assertIs(backend.call_args.kwargs["is_causal"], True)
+
     def test_eager_matches_sdpa_for_full_and_sliding_masks(self):
-        for layer_type, sliding_window in (
-            ("full_attention", None),
-            ("sliding_attention", 2),
+        for layer_type, sliding_window, is_causal in (
+            (layer_type, window, causal)
+            for layer_type, window in (
+                ("full_attention", None),
+                ("sliding_attention", 1),
+                ("sliding_attention", 2),
+            )
+            for causal in (None, False, True)
         ):
-            with self.subTest(layer_type=layer_type):
+            with self.subTest(
+                layer_type=layer_type, window=sliding_window, is_causal=is_causal
+            ):
                 torch.manual_seed(17)
                 eager = _make_attention(layer_type, "eager", sliding_window)
                 sdpa = _make_attention(layer_type, "sdpa", sliding_window)
                 sdpa.load_state_dict(eager.state_dict())
 
-                mask = create_dflash_sdpa_mask(
+                mask = build_dense_mask(
                     anchor_positions=torch.tensor([[2, 4]]),
                     block_keep_mask=torch.tensor([[True, False]]),
                     S=4,
                     block_size=2,
                     device=torch.device("cpu"),
                     sliding_window=sliding_window,
+                    is_causal=is_causal,
                 )
                 eager_hidden = torch.randn(1, 4, 8, requires_grad=True)
                 eager_target = torch.randn(1, 4, 8, requires_grad=True)

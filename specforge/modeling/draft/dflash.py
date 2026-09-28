@@ -6,7 +6,6 @@ import torch
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
-from transformers.integrations.flex_attention import compile_friendly_flex_attention
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
@@ -21,6 +20,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from typing_extensions import Tuple, Unpack
 
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
+from .dflash_mask import build_block_mask, build_dense_mask
+from .flex_attention import compile_friendly_flex_attention
 from .flex_attention_backend import flex_attention_backend
 from .registry import register_draft
 
@@ -242,11 +243,14 @@ class Qwen3DFlashAttentionBase(nn.Module):
             assert (
                 config.attention_dropout == 0.0
             ), "DFlash FlexAttention requires attention_dropout=0.0"
-        self.is_causal = False
         self.sliding_window = (
             config.sliding_window
             if config.layer_types[layer_idx] == SLIDING_ATTENTION
             else None
+        )
+        is_causal = getattr(config, "is_causal", None)
+        self.is_causal = (
+            self.sliding_window is not None if is_causal is None else is_causal
         )
         self._init_projections(config, kernels)
         for attribute in ("scaling", "num_key_value_groups", "o_proj"):
@@ -785,6 +789,87 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
         return sample(draft_logits)
 
+    def _prepare_attention_mask(
+        self,
+        attention_mask,
+        hidden_states,
+        target_hidden,
+        past_key_values,
+        is_causal=None,
+    ):
+        """Preserve supplied masks or build one default mask per layer type."""
+        if attention_mask is not None:
+            return attention_mask
+
+        attention_mask = {}
+        if self.config._attn_implementation in (
+            "eager",
+            "sdpa",
+            "flex_attention",
+        ):
+            # A mask-free call represents one draft block after contiguous context.
+            # Count cached keys before any layer appends this call's context/draft.
+            cached_length = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
+            )
+            context_length = cached_length + target_hidden.shape[1]
+            batch_size, block_size = hidden_states.shape[:2]
+            anchor_positions = torch.full(
+                (batch_size, 1),
+                context_length,
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            block_keep_mask = torch.ones_like(anchor_positions, dtype=torch.bool)
+            if is_causal is None:
+                is_causal = getattr(self.config, "is_causal", None)
+            mask_builder = (
+                build_block_mask
+                if self.config._attn_implementation == "flex_attention"
+                else build_dense_mask
+            )
+            mask_args = {
+                "anchor_positions": anchor_positions,
+                "block_keep_mask": block_keep_mask,
+                "S": context_length,
+                "block_size": block_size,
+                "device": hidden_states.device,
+                "is_causal": is_causal,
+            }
+            if (
+                self.config._attn_implementation == "flex_attention"
+                and flex_attention_backend() == "FLASH"
+            ):
+                # FLASH requires a minimum of this block size.
+                mask_args["BLOCK_SIZE"] = (256, 128)
+
+            if "full_attention" in self.layer_types:
+                attention_mask = {
+                    "full_attention": mask_builder(**mask_args) if is_causal else None
+                }
+            sliding_window = self.sliding_window
+            if "sliding_attention" in self.layer_types and sliding_window is not None:
+                attention_mask["sliding_attention"] = mask_builder(
+                    sliding_window=sliding_window,
+                    **mask_args,
+                )
+        else:
+            raise NotImplementedError(
+                "DFlash default attention-mask generation is not implemented for "
+                f"attention backend {self.config._attn_implementation!r}. "
+                "Supported backends: eager, sdpa, flex_attention."
+            )
+
+        if not attention_mask:
+            raise ValueError(
+                "DFlash could not build an attention mask: expected a full_attention "
+                "layer or a sliding_attention layer with a configured sliding_window. "
+                f"Got layer_types={self.layer_types!r}, "
+                f"sliding_window={self.sliding_window!r}."
+            )
+
+        return attention_mask
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -798,6 +883,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        attention_mask = self._prepare_attention_mask(
+            attention_mask,
+            hidden_states,
+            target_hidden,
+            past_key_values,
+            is_causal=kwargs.get("is_causal"),
+        )
         for layer_type, layer in zip(self.layer_types, self.layers):
             layer_attention_mask = (
                 attention_mask[layer_type]
@@ -876,7 +968,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 ],
                 past_key_values=past_key_values_draft,
                 use_cache=True,
-                is_causal=False,
             )
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = self._sample_draft_tokens(
