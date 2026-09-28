@@ -90,9 +90,12 @@ covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
 `qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
-its managed-local sibling `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
-(one node, four capture servers plus a DP4 trainer) train the DFlash2 drafter
-in `configs/qwen3.8-27b-dflash2.json` for Qwen3.8-27B. Their
+its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
+(one node, four capture servers plus a DP4 trainer) and
+`qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml` (one 8x H200 node,
+five FP8 capture servers with FA3 and FlashInfer GDN, a DP3 trainer, RDMA
+loopback) train the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
+Qwen3.8-27B. Their
 [runbook](../../docs/recipes/qwen3.8-27b-dflash2-disaggregated.md) records the
 server/trainer splits, Mooncake lease, in-flight watermarks and throughput
 measured on B300 and H200 nodes, and the two-node launcher that starts eight
@@ -294,6 +297,7 @@ Common fields:
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
+| `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
