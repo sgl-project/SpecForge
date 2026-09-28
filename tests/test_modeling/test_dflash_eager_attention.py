@@ -5,9 +5,9 @@ from torch import nn
 from torch.testing import assert_close
 from transformers import Qwen3Config
 
-from specforge.algorithms.common.dflash_family_model import create_dflash_sdpa_mask
 from specforge.modeling.draft.dflash import Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DFlashKernels
+from specforge.modeling.draft.dflash_mask import build_dense_mask
 
 
 def _make_attention(layer_type, implementation, sliding_window):
@@ -50,23 +50,31 @@ def _forward(attention, hidden_states, target_hidden, attention_mask):
 
 class TestDFlashEagerAttentionMasking(unittest.TestCase):
     def test_eager_matches_sdpa_for_full_and_sliding_masks(self):
-        for layer_type, sliding_window in (
-            ("full_attention", None),
-            ("sliding_attention", 2),
+        for layer_type, sliding_window, is_causal in (
+            (layer_type, window, causal)
+            for layer_type, window in (
+                ("full_attention", None),
+                ("sliding_attention", 1),
+                ("sliding_attention", 2),
+            )
+            for causal in (None, False, True)
         ):
-            with self.subTest(layer_type=layer_type):
+            with self.subTest(
+                layer_type=layer_type, window=sliding_window, is_causal=is_causal
+            ):
                 torch.manual_seed(17)
                 eager = _make_attention(layer_type, "eager", sliding_window)
                 sdpa = _make_attention(layer_type, "sdpa", sliding_window)
                 sdpa.load_state_dict(eager.state_dict())
 
-                mask = create_dflash_sdpa_mask(
+                mask = build_dense_mask(
                     anchor_positions=torch.tensor([[2, 4]]),
                     block_keep_mask=torch.tensor([[True, False]]),
                     S=4,
                     block_size=2,
                     device=torch.device("cpu"),
                     sliding_window=sliding_window,
+                    is_causal=is_causal,
                 )
                 eager_hidden = torch.randn(1, 4, 8, requires_grad=True)
                 eager_target = torch.randn(1, 4, 8, requires_grad=True)

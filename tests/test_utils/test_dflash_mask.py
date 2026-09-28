@@ -9,8 +9,10 @@ from specforge.algorithms.common.dflash_family_model import (
     OnlineDFlashModel,
     OnlineDominoModel,
     OnlineDSparkModel,
-    create_dflash_block_mask,
-    create_dflash_sdpa_mask,
+)
+from specforge.modeling.draft.dflash_mask import (
+    build_block_mask,
+    build_dense_mask,
 )
 from specforge.utils import get_device_type
 
@@ -22,42 +24,36 @@ def _reference_dflash_mask(
     block_size,
     device,
     sliding_window=None,
+    is_causal=None,
 ):
-    """Element-level reference for full and sliding DFlash attention.
-
-    This uses plain Python loops so correctness is obvious by inspection.
-    """
+    """Independent reference using absolute positions in each serving block."""
     B, N = anchor_positions.shape
-    Q_LEN = N * block_size
-    KV_LEN = S + N * block_size
-
-    mask = torch.zeros(B, 1, Q_LEN, KV_LEN, dtype=torch.bool, device=device)
+    mask = torch.zeros(
+        B, 1, N * block_size, S + N * block_size, dtype=torch.bool, device=device
+    )
+    causal = (sliding_window is not None) if is_causal is None else is_causal
     for b in range(B):
-        for q_idx in range(Q_LEN):
-            q_block_id = q_idx // block_size
-            q_offset = q_idx % block_size
-            anchor_pos = anchor_positions[b, q_block_id].item()
-            is_valid = block_keep_mask[b, q_block_id].item()
-            if not is_valid:
+        for block in range(N):
+            if not block_keep_mask[b, block].item():
                 continue
-            for kv_idx in range(KV_LEN):
-                is_context = kv_idx < S
-                ctx_visible = is_context and kv_idx < anchor_pos
-
-                is_draft = kv_idx >= S
-                kv_block_id = (kv_idx - S) // block_size
-                draft_visible = is_draft and (q_block_id == kv_block_id)
-
-                if sliding_window is not None:
-                    q_offset = q_idx % block_size
-                    kv_offset = (kv_idx - S) % block_size
-                    ctx_visible = ctx_visible and (
-                        kv_idx >= anchor_pos + q_offset - (sliding_window - 1)
-                    )
-                    draft_visible = draft_visible and kv_offset <= q_offset
-
-                if ctx_visible or draft_visible:
-                    mask[b, 0, q_idx, kv_idx] = True
+            anchor = anchor_positions[b, block].item()
+            # Serving sees only the committed context prefix and this draft block.
+            keys = [(pos, pos) for pos in range(anchor)]
+            keys += [
+                (S + block * block_size + offset, anchor + offset)
+                for offset in range(block_size)
+            ]
+            for offset in range(block_size):
+                query_pos = anchor + offset
+                for column, key_pos in keys:
+                    if causal and key_pos > query_pos:
+                        continue
+                    if (
+                        sliding_window is not None
+                        and abs(key_pos - query_pos) >= sliding_window
+                    ):
+                        continue
+                    mask[b, 0, block * block_size + offset, column] = True
     return mask
 
 
@@ -78,6 +74,133 @@ class _RecordingDraftModel(nn.Module):
 
 class TestDFlashMask(unittest.TestCase):
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA FlexAttention required")
+    def test_flex_output_and_gradients_match_sdpa(self):
+        from torch.nn.attention.flex_attention import flex_attention
+
+        attention = torch.compile(flex_attention)
+        device = torch.device("cuda")
+        torch.manual_seed(17)
+        for causal in (None, False, True):
+            for window in (None, 1, 3):
+                with self.subTest(is_causal=causal, window=window):
+                    args = dict(
+                        anchor_positions=torch.tensor([[2, 6]], device=device),
+                        block_keep_mask=torch.tensor([[True, False]], device=device),
+                        S=8,
+                        block_size=4,
+                        device=device,
+                        sliding_window=window,
+                        is_causal=causal,
+                    )
+                    dense_mask = build_dense_mask(**args)
+                    block_mask = build_block_mask(**args)
+                    q = torch.randn(1, 2, 8, 32, device=device, requires_grad=True)
+                    k = torch.randn(1, 2, 16, 32, device=device, requires_grad=True)
+                    v = torch.randn_like(k, requires_grad=True)
+                    output = attention(q, k, v, block_mask=block_mask)
+                    expected = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, attn_mask=dense_mask
+                    )
+                    torch.testing.assert_close(output, expected, atol=1e-4, rtol=1e-4)
+                    grad = torch.randn_like(output)
+                    actual_grads = torch.autograd.grad(output, (q, k, v), grad)
+                    expected_grads = torch.autograd.grad(expected, (q, k, v), grad)
+                    for actual, reference in zip(actual_grads, expected_grads):
+                        torch.testing.assert_close(
+                            actual, reference, atol=1e-4, rtol=1e-4
+                        )
+
+    def test_causality_and_windows_against_absolute_position_reference(self):
+        device = torch.device("cpu")
+        anchors = torch.tensor([[0, 4, 7], [2, 6, 0]])
+        keep = torch.tensor([[True, False, True], [True, True, False]])
+        for causal in (None, False, True):
+            for window in (None, 1, 3, 8):
+                with self.subTest(is_causal=causal, window=window):
+                    args = dict(
+                        anchor_positions=anchors,
+                        block_keep_mask=keep,
+                        S=8,
+                        block_size=5,
+                        device=device,
+                        sliding_window=window,
+                        is_causal=causal,
+                    )
+                    expected = _reference_dflash_mask(**args)
+                    dense = build_dense_mask(**args)
+                    torch.testing.assert_close(dense, expected)
+                    block_mask = build_block_mask(**args)
+                    q = torch.arange(15).unsqueeze(1)
+                    kv = torch.arange(23).unsqueeze(0)
+                    for batch in range(2):
+                        actual = block_mask.mask_mod(batch, 0, q, kv)
+                        torch.testing.assert_close(actual, expected[batch, 0])
+
+    def test_bidirectional_window_counts_draft_tokens(self):
+        mask = build_dense_mask(
+            torch.tensor([[6]]),
+            torch.tensor([[True]]),
+            6,
+            4,
+            torch.device("cpu"),
+            sliding_window=3,
+            is_causal=False,
+        )
+        expected = ([4, 5, 6, 7, 8], [5, 6, 7, 8, 9], [6, 7, 8, 9], [7, 8, 9])
+        for row, columns in enumerate(expected):
+            self.assertEqual(mask[0, 0, row].nonzero().flatten().tolist(), columns)
+
+    def test_checkpoint_causality_reaches_both_layer_masks(self):
+        from pathlib import Path
+        from transformers import Qwen3Config
+
+        checkpoint = Qwen3Config.from_json_file(
+            str(
+                Path(__file__).resolve().parents[2] / "configs/qwen3.8-27b-dflash2.json"
+            )
+        )
+        self.assertIs(checkpoint.is_causal, False)
+        for model_class in (OnlineDFlashModel, OnlineDominoModel, OnlineDSparkModel):
+            for causal in (None, False, True):
+                with self.subTest(model=model_class.__name__, is_causal=causal):
+                    draft = _RecordingDraftModel()
+                    if causal is not None:
+                        draft.config.is_causal = (
+                            checkpoint.is_causal if not causal else True
+                        )
+                    model = model_class(
+                        draft_model=draft,
+                        target_lm_head=nn.Identity(),
+                        target_embed_tokens=nn.Embedding(32, 8),
+                        mask_token_id=31,
+                        block_size=4,
+                        attention_backend="sdpa",
+                    )
+                    anchors, keep = torch.tensor([[6]]), torch.tensor([[True]])
+                    with mock.patch.object(
+                        model, "_sample_anchor_positions", return_value=(anchors, keep)
+                    ):
+                        model._forward_draft_blocks(
+                            input_ids=torch.arange(12).unsqueeze(0),
+                            hidden_states=torch.randn(1, 12, 8),
+                            loss_mask=torch.ones(1, 12),
+                        )
+                    for name, window in (
+                        ("full_attention", None),
+                        ("sliding_attention", 8),
+                    ):
+                        expected = _reference_dflash_mask(
+                            anchors,
+                            keep,
+                            12,
+                            4,
+                            torch.device("cpu"),
+                            sliding_window=window,
+                            is_causal=causal,
+                        )
+                        torch.testing.assert_close(draft.attention_mask[name], expected)
+
     def setUp(self):
         torch.manual_seed(42)
         self.device = torch.device(get_device_type())
@@ -90,11 +213,11 @@ class TestDFlashMask(unittest.TestCase):
         block_size,
         sliding_window=None,
     ):
-        """Compare create_dflash_sdpa_mask against element-level reference (ground truth)."""
+        """Compare build_dense_mask against element-level reference (ground truth)."""
         anchor_positions = anchor_positions.to(self.device)
         block_keep_mask = block_keep_mask.to(self.device)
 
-        sdpa_mask = create_dflash_sdpa_mask(
+        sdpa_mask = build_dense_mask(
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
             S=S,
@@ -133,11 +256,11 @@ class TestDFlashMask(unittest.TestCase):
         block_size,
         sliding_window=None,
     ):
-        """Verify create_dflash_block_mask block-level mask is consistent with reference."""
+        """Verify build_block_mask block-level mask is consistent with reference."""
         anchor_positions = anchor_positions.to(self.device)
         block_keep_mask = block_keep_mask.to(self.device)
 
-        block_mask = create_dflash_block_mask(
+        block_mask = build_block_mask(
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
             S=S,
@@ -237,7 +360,7 @@ class TestDFlashMask(unittest.TestCase):
         """The context window advances while the draft block stays causal."""
         anchor_positions = torch.tensor([[6]])
         block_keep_mask = torch.tensor([[True]])
-        mask = create_dflash_sdpa_mask(
+        mask = build_dense_mask(
             anchor_positions=anchor_positions.to(self.device),
             block_keep_mask=block_keep_mask.to(self.device),
             S=12,
@@ -256,8 +379,8 @@ class TestDFlashMask(unittest.TestCase):
                 actual = mask[0, 0, query_offset].nonzero().flatten().tolist()
                 self.assertEqual(actual, expected)
 
-    def test_sliding_window_one_has_no_context_and_causal_draft(self):
-        """A one-token window removes context but keeps causal own-block keys."""
+    def test_sliding_window_one_has_only_self_attention(self):
+        """A one-token window excludes both context and other draft tokens."""
         anchor_positions = torch.tensor([[4, 9]])
         block_keep_mask = torch.tensor([[True, True]])
         self._compare_masks(
@@ -282,7 +405,7 @@ class TestDFlashMask(unittest.TestCase):
     def test_invalid_sliding_window(self):
         anchor_positions = torch.tensor([[12]], device=self.device)
         block_keep_mask = torch.tensor([[True]], device=self.device)
-        for factory in (create_dflash_sdpa_mask, create_dflash_block_mask):
+        for factory in (build_dense_mask, build_block_mask):
             with self.subTest(factory=factory.__name__):
                 with self.assertRaisesRegex(ValueError, "sliding_window must be > 0"):
                     factory(
@@ -420,8 +543,8 @@ class TestDFlashMask(unittest.TestCase):
             "device": self.device,
             "sliding_window": 5,
         }
-        dense_mask = create_dflash_sdpa_mask(**mask_args)
-        block_mask = create_dflash_block_mask(**mask_args)
+        dense_mask = build_dense_mask(**mask_args)
+        block_mask = build_block_mask(**mask_args)
         q_idx = torch.arange(8, device=self.device).unsqueeze(1)
         kv_idx = torch.arange(24, device=self.device).unsqueeze(0)
         flex_mask = block_mask.mask_mod(0, 0, q_idx, kv_idx)

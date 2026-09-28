@@ -10,7 +10,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
-from specforge.algorithms.common.dflash_family_model import create_dflash_block_mask
+
 from specforge.modeling.draft.dflash import (
     DFlashDraftModel,
     Qwen3DFlashAttention,
@@ -18,6 +18,7 @@ from specforge.modeling.draft.dflash import (
     apply_mla_rope,
 )
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
+from specforge.modeling.draft.dflash_mask import build_block_mask
 from specforge.modeling.draft.dspark import DSparkDraftModel
 
 
@@ -412,7 +413,7 @@ class TestDFlashMLAAttention(unittest.TestCase):
             dtype=torch.bfloat16,
             requires_grad=True,
         )
-        block_mask = create_dflash_block_mask(
+        block_mask = build_block_mask(
             anchor_positions=torch.tensor([[2, 5]], device="cuda"),
             block_keep_mask=torch.tensor([[True, True]], device="cuda"),
             S=6,

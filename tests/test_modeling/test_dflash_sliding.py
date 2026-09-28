@@ -117,7 +117,7 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
             ),
             mock.patch(
                 "specforge.algorithms.common.dflash_family_model."
-                "create_dflash_sdpa_mask",
+                "build_dense_mask",
                 side_effect=(full_mask, sliding_mask),
             ) as create_mask,
         ):
@@ -159,7 +159,7 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
             ),
             mock.patch(
                 "specforge.algorithms.common.dflash_family_model."
-                "create_dflash_block_mask",
+                "build_block_mask",
                 return_value=torch.tensor([1]),
             ),
         ):
