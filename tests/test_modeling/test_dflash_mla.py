@@ -1,6 +1,7 @@
 import copy
 import math
 import unittest
+from unittest import mock
 
 import torch
 from torch.testing import assert_close
@@ -437,9 +438,12 @@ class TestDFlashMLAAttention(unittest.TestCase):
 class TestDFlashMLASpecGenerate(unittest.TestCase):
     def test_spec_generate_decode_smoke(self):
         for implementation in ("eager", "sdpa"):
-            for causal, window in ((None, None), (True, None), (False, 2), (None, 2)):
-                with self.subTest(backend=implementation, causal=causal, window=window):
-                    self._run_spec_generate(implementation, causal, window)
+            for causal in (None, False, True):
+                for window in (None, 2):
+                    with self.subTest(
+                        backend=implementation, causal=causal, window=window
+                    ):
+                        self._run_spec_generate(implementation, causal, window)
 
     def _run_spec_generate(self, implementation, causal, window):
         torch.manual_seed(3)
@@ -466,15 +470,52 @@ class TestDFlashMLASpecGenerate(unittest.TestCase):
         config.dflash_config["mask_token_id"] = 0
         model = DFlashDraftModel(config).eval()
 
-        input_ids = torch.randint(1, 64, (1, 6))
-        output_ids = model.spec_generate(
-            target,
-            input_ids,
-            max_new_tokens=8,
-            stop_token_ids=None,
-            temperature=0.0,
-        )
+        prepare_mask = model._prepare_attention_mask
+        cached_lengths = []
 
+        def check_mask(attention_mask, hidden_states, target_hidden, cache, **kwargs):
+            # Inspect each call before forward appends to the mutable KV cache.
+            cached_length = cache.get_seq_length() if cache is not None else 0
+            cached_lengths.append(cached_length)
+            context_length = cached_length + target_hidden.shape[1]
+            query_length = hidden_states.shape[1]
+            masks = prepare_mask(
+                attention_mask, hidden_states, target_hidden, cache, **kwargs
+            )
+            self.assertIsNone(attention_mask)
+            layer_type = "full_attention" if window is None else "sliding_attention"
+            resolved = window is not None if causal is None else causal
+            actual = masks[layer_type]
+            if window is None and not resolved:
+                self.assertIsNone(actual)
+            else:
+                # Independent serving-position reference, not the mask builder.
+                queries = context_length + torch.arange(query_length)[:, None]
+                keys = torch.arange(context_length + query_length)[None, :]
+                expected = torch.ones(
+                    query_length, context_length + query_length, dtype=torch.bool
+                )
+                if resolved:
+                    expected &= keys <= queries
+                if window is not None:
+                    expected &= (keys - queries).abs() < window
+                assert_close(actual, expected[None, None])
+            return masks
+
+        input_ids = torch.randint(1, 64, (1, 6))
+        with mock.patch.object(
+            model, "_prepare_attention_mask", side_effect=check_mask
+        ):
+            output_ids = model.spec_generate(
+                target,
+                input_ids,
+                max_new_tokens=8,
+                stop_token_ids=None,
+                temperature=0.0,
+            )
+
+        self.assertEqual(cached_lengths[0], 0)
+        self.assertTrue(any(length > 0 for length in cached_lengths))
         self.assertEqual(output_ids.shape[0], 1)
         self.assertLessEqual(output_ids.shape[1], input_ids.shape[1] + 8)
         self.assertTrue(torch.equal(output_ids[:, :6], input_ids))
