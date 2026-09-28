@@ -5,9 +5,9 @@ from typing import Optional, Tuple
 import torch
 
 try:
-    from torch.nn.attention.flex_attention import create_block_mask
+    from .flex_attention import compile_friendly_create_block_mask
 except ImportError:
-    create_block_mask = None
+    compile_friendly_create_block_mask = None
 
 
 def build_dense_mask(
@@ -119,7 +119,7 @@ def build_block_mask(
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
 
-    return create_block_mask(
+    return compile_friendly_create_block_mask(
         mask_mod,
         B=B,
         H=None,
