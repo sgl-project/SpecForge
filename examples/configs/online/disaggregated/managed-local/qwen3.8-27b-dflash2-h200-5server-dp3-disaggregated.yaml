@@ -71,7 +71,7 @@ tracking:
 runtime:
   producer_lease: 4
   producer_concurrency: 4
-  # 6x the 36-sample step quantum, as in the 4+4 recipe.
+  # High/low watermarks hold 8/4 global optimizer steps (36 samples each).
   in_flight_high_watermark: 288
   in_flight_low_watermark: 144
 
