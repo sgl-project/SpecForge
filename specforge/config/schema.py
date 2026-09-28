@@ -407,6 +407,8 @@ class DataConfig(StrictConfigModel):
     train_data_path: str = ""
     #: online mode — already-tokenized JSONL records.
     prompts_path: str = ""
+    #: Optional immutable offset manifest for a fully admitted JSONL corpus.
+    prompts_index_path: Optional[str] = None
     #: offline mode — directory of precomputed hidden-state .ckpt files.
     hidden_states_path: str = ""
     #: Reserved migration field. Online evaluation is unsupported; keep empty.
@@ -438,6 +440,8 @@ class DataConfig(StrictConfigModel):
                 "data.prompts_path (pre-tokenized online data), or "
                 "data.hidden_states_path (offline features)"
             )
+        if self.prompts_index_path is not None and not self.prompts_path:
+            raise ValueError('data.prompts_index_path requires data.prompts_path')
         return self
 
 

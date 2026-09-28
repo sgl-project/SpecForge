@@ -31,6 +31,7 @@ def prepare_prompt_tasks(
     min_loss_tokens: int = 1,
     max_prompts: int | None = None,
     loss_mask_filter: Callable[[Sequence[int]], bool] | None = None,
+    index_path: str | None = None,
 ) -> Sequence[PromptTaskDict]:
     """Prepare runtime prompt dictionaries from a JSONL file.
 
@@ -54,6 +55,14 @@ def prepare_prompt_tasks(
         loss_mask_filter=loss_mask_filter,
     )
     path_string = os.fspath(path)
+    if index_path is not None:
+        from .indexed_prompts import IndexedPromptSequence
+
+        return IndexedPromptSequence(
+            path_string, index_path, max_length=max_length,
+            min_loss_tokens=min_loss_tokens, max_prompts=max_prompts,
+            loss_mask_filter=loss_mask_filter,
+        )
     first_record = next(_iter_records(path_string), None)
     if first_record is None:
         return []
