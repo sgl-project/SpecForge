@@ -811,6 +811,30 @@ def resolve_server_capture_layout(
                 f"select_layout for {modality!r} may only drop features of the "
                 f"registered layout; it added {sorted(added)}"
             )
+        for field_name in (
+            "aux_feature",
+            "last_hidden_feature",
+            "attention_mask_feature",
+        ):
+            selected = getattr(layout, field_name)
+            if selected is not None and selected != getattr(
+                provider.layout, field_name
+            ):
+                raise ValueError(
+                    f"select_layout for {modality!r} may only drop features; "
+                    f"{field_name} must keep its registered mapping or be None"
+                )
+        # Retained entries must preserve their source and trailing shape.
+        # Remove each match so a selector cannot duplicate a registered entry.
+        remaining = list(provider.layout.passthrough)
+        for entry in layout.passthrough:
+            if entry not in remaining:
+                raise ValueError(
+                    f"select_layout for {modality!r} may only drop features; "
+                    "passthrough entries must keep their registered mappings "
+                    "and shapes without adding duplicates"
+                )
+            remaining.remove(entry)
     _require_contract_tensors(
         modality,
         layout,

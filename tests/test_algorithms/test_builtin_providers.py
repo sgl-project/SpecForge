@@ -511,6 +511,48 @@ class BuiltinProviderContractTest(unittest.TestCase):
             (lambda _config: added, ValueError, "may only drop features"),
             (lambda _config: without_aux, ValueError, "required tensors"),
             (
+                lambda _config: replace(
+                    provider.layout,
+                    aux_feature=provider.layout.last_hidden_feature,
+                    last_hidden_feature=provider.layout.aux_feature,
+                ),
+                ValueError,
+                "aux_feature",
+            ),
+            (
+                lambda _config: replace(
+                    provider.layout,
+                    passthrough=(
+                        ("input_ids", "loss_mask", ()),
+                        ("loss_mask", "input_ids", ()),
+                    ),
+                ),
+                ValueError,
+                "passthrough",
+            ),
+            (
+                lambda _config: replace(
+                    provider.layout,
+                    passthrough=(
+                        ("input_ids", "input_ids", (1,)),
+                        provider.layout.passthrough[1],
+                    ),
+                ),
+                ValueError,
+                "passthrough",
+            ),
+            (
+                lambda _config: replace(
+                    provider.layout,
+                    passthrough=(
+                        *provider.layout.passthrough,
+                        provider.layout.passthrough[0],
+                    ),
+                ),
+                ValueError,
+                "passthrough",
+            ),
+            (
                 lambda _config: {"aux": "hidden_states"},
                 TypeError,
                 "ServerCaptureLayout",

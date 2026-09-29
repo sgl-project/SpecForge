@@ -1108,6 +1108,50 @@ class LaunchPlanTest(unittest.TestCase):
                         ):
                             Config.model_validate(raw)
 
+    def test_passthrough_rejects_aliases_of_the_same_option(self):
+        pairs = (
+            (
+                ("--smg-http-sidecar-port", "31000"),
+                ("--grpc-http-sidecar-port", "32000"),
+            ),
+            (("--pp-size", "1"), ("--pipeline-parallel-size", "2")),
+            (
+                ("--speculative-draft-model-path", "a"),
+                ("--speculative-draft-model", "b"),
+            ),
+            (("--lora-strict-loading",), ("--no-lora-strict-loading",)),
+        )
+        for pair in pairs:
+            for first, second in (pair, pair[::-1]):
+                for inline in (False, True):
+                    args = [
+                        (
+                            [f"{tokens[0]}={tokens[1]}"]
+                            if inline and len(tokens) == 2
+                            else list(tokens)
+                        )
+                        for tokens in (first, second)
+                    ]
+                    for placement in ("global", "server", "both"):
+                        with self.subTest(
+                            first=first, inline=inline, placement=placement
+                        ):
+                            raw = _managed_config("/fresh/managed-attempt").model_dump()
+                            server = raw["deployment"]["disaggregated"][
+                                "managed_local"
+                            ]["capture_servers"][0]
+                            if placement == "global":
+                                raw["model"]["sglang_extra_args"] = args[0] + args[1]
+                            elif placement == "server":
+                                server["extra_args"] = args[0] + args[1]
+                            else:
+                                raw["model"]["sglang_extra_args"] = args[0]
+                                server["extra_args"] = args[1]
+                            with self.assertRaisesRegex(
+                                ValidationError, "repeats|rendered from"
+                            ):
+                                Config.model_validate(raw)
+
     def test_secret_abbreviations_are_rejected_and_redacted(self):
         secret = "example-secret-value"
         for flag in ("--admin", "--admin-api-k", "--admin-api-ke"):
@@ -1152,12 +1196,15 @@ class LaunchPlanTest(unittest.TestCase):
                             server["extra_args"] = [second]
                         Config.model_validate(raw)
 
-    def test_exact_prefix_flags_match_the_pinned_sglang_parser(self):
+    def test_flag_tables_match_the_pinned_sglang_parser(self):
         import argparse
 
         from sglang.srt.server_args import ServerArgs
 
-        from specforge.config.schema import _SGLANG_EXACT_PREFIX_FLAGS
+        from specforge.config.schema import (
+            _SGLANG_EXACT_PREFIX_FLAGS,
+            _SGLANG_FLAG_ALIASES,
+        )
 
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -1173,6 +1220,23 @@ class LaunchPlanTest(unittest.TestCase):
             if any(other != flag and other.startswith(flag) for other in flags)
         }
         self.assertEqual(_SGLANG_EXACT_PREFIX_FLAGS, prefixes)
+
+        # Deprecated aliases may be separate actions with the same dest.
+        # BooleanOptionalAction's positive/negative spellings also write one
+        # setting and must not bypass the no-overrides rule.
+        by_dest = {}
+        for action in parser._actions:
+            by_dest.setdefault(action.dest, set()).update(
+                flag for flag in action.option_strings if flag.startswith("--")
+            )
+        actual_groups = {
+            frozenset(group) for group in by_dest.values() if len(group) > 1
+        }
+        configured_groups = {
+            frozenset((flag, *aliases))
+            for flag, aliases in _SGLANG_FLAG_ALIASES.items()
+        }
+        self.assertEqual(configured_groups, actual_groups)
 
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (

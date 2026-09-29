@@ -60,13 +60,45 @@ _SGLANG_UNSUPPORTED_FLAGS: Mapping[str, str] = {
     ),
     "--config": "SGLang merges that file unchecked; list its flags instead",
 }
-#: Other SGLang v0.5.18 spellings of the same server options.
+#: SGLang v0.5.18 spellings that write the same option, checked against its
+#: parser in tests. Positive/negative boolean flags belong to one group too:
+#: they conflict under the no-overrides rule, but their argv is never rewritten.
 _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
     "--model-path": ("--model",),
+    "--dist-init-addr": ("--nccl-init-addr",),
     "--tp-size": ("--tensor-parallel-size",),
+    "--dcp-size": ("--decode-context-parallel-size",),
+    "--pp-size": ("--pipeline-parallel-size",),
     "--ep-size": ("--expert-parallel-size", "--ep"),
     "--dp-size": ("--data-parallel-size",),
+    "--attn-cp-size": ("--attention-context-parallel-size",),
+    "--moe-dp-size": ("--moe-data-parallel-size",),
+    "--dcp-replicate-q-proj": ("--no-dcp-replicate-q-proj",),
+    "--enable-tp-lm-head-all-to-all": ("--no-enable-tp-lm-head-all-to-all",),
+    "--smg-http-sidecar-port": ("--grpc-http-sidecar-port",),
+    "--speculative-draft-model-path": ("--speculative-draft-model",),
+    "--hisparse-config": ("--hierarchical-sparse-attention-extra-config",),
+    "--experts-shared-outer-loras": ("--no-experts-shared-outer-loras",),
+    "--lora-strict-loading": ("--no-lora-strict-loading",),
+    "--dllm-fdfo": ("--no-dllm-fdfo",),
     "--mamba-radix-cache-strategy": ("--mamba-scheduler-strategy",),
+    "--stream-output": ("--incremental-streaming-output",),
+    "--cuda-graph-bs-decode": ("--cuda-graph-bs",),
+    "--cuda-graph-max-bs-decode": ("--cuda-graph-max-bs",),
+    "--cuda-graph-bs-prefill": ("--piecewise-cuda-graph-tokens",),
+    "--cuda-graph-max-bs-prefill": ("--piecewise-cuda-graph-max-tokens",),
+    "--cuda-graph-backend-prefill": (
+        "--enable-breakable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
+        "--enforce-piecewise-cuda-graph",
+    ),
+    "--cuda-graph-tc-compiler": ("--piecewise-cuda-graph-compiler",),
+    "--dsa-prefill-cp-mode": ("--nsa-prefill-cp-mode",),
+    "--dsa-prefill-backend": ("--nsa-prefill-backend",),
+    "--dsa-decode-backend": ("--nsa-decode-backend",),
+    "--enable-dsa-prefill-context-parallel": ("--enable-nsa-prefill-context-parallel",),
+    "--enable-linear-replayssm-spec": ("--enable-gdn-replayssm-spec",),
+    "--speculative-draft-window-size": ("--speculative-dflash-draft-window-size",),
 }
 #: Complete SGLang v0.5.18 options that are also prefixes of other options.
 #: argparse matches these exactly instead of expanding them. Keep this small
