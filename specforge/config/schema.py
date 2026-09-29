@@ -68,6 +68,40 @@ _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
     "--dp-size": ("--data-parallel-size",),
     "--mamba-radix-cache-strategy": ("--mamba-scheduler-strategy",),
 }
+#: Complete SGLang v0.5.18 options that are also prefixes of other options.
+#: argparse matches these exactly instead of expanding them. Keep this small
+#: table in sync with the pinned parser (covered by the launch-plan tests),
+#: without importing SGLang/PyTorch during configuration validation.
+_SGLANG_EXACT_PREFIX_FLAGS = frozenset(
+    {
+        "--cuda-graph-bs",
+        "--cuda-graph-max-bs",
+        "--disable-cuda-graph",
+        "--dllm-algorithm",
+        "--enable-dp-attention",
+        "--enable-linear-replayssm",
+        "--enable-lora",
+        "--enable-metrics",
+        "--enable-torch-compile",
+        "--ep",
+        "--export-metrics-to-file",
+        "--hicache-storage-backend",
+        "--kv-canary",
+        "--log-level",
+        "--log-requests",
+        "--model",
+        "--quantization",
+        "--sidecar",
+        "--speculative-adaptive",
+        "--speculative-draft-model",
+        "--ssl-keyfile",
+    }
+)
+#: Secret-valued SGLang options must be spelled out; plan rendering also
+#: recognizes their prefixes so even an unvalidated command stays redacted.
+SGLANG_SECRET_FLAGS = ("--api-key", "--admin-api-key")
+
+
 #: ``sglang_*`` fields whose SGLang flag does not follow the
 #: ``sglang_foo_bar`` -> ``--foo-bar`` convention.
 _SGLANG_FLAG_NAMES: Mapping[str, str] = {
@@ -125,19 +159,31 @@ def _validate_sglang_extra_args(
     *,
     field_name: str,
     reserved: Mapping[str, str],
-    guarded: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Reject passthrough tokens that repeat or split a rendered SGLang flag.
 
     *reserved* maps every flag spelling already on the server command line to
     the setting that owns it. Flags are the ``--``-prefixed tokens; the rest
     are their values, so the list must open with a flag. SGLang's parser also
-    expands unambiguous prefixes, so a flag that abbreviates a *guarded*
-    spelling (default: *reserved*) or an unsupported flag is rejected too.
+    expands unambiguous prefixes, so abbreviations of reserved, supplied,
+    unsupported, or secret flags are rejected too. Exact options that happen
+    to be prefixes remain valid.
     """
-    guarded = reserved if guarded is None else guarded
     if tokens and not tokens[0].startswith("--"):
         raise ValueError(f"{field_name} must start with a --flag, got {tokens[0]!r}")
+    supplied = _with_aliases(
+        {
+            token.split("=", 1)[0]: field_name
+            for token in tokens
+            if token.startswith("--")
+        }
+    )
+    spellings = sorted(
+        set(reserved)
+        | set(supplied)
+        | set(_SGLANG_UNSUPPORTED_FLAGS)
+        | set(SGLANG_SECRET_FLAGS)
+    )
     seen = set()
     for token in tokens:
         if not token.startswith("--"):
@@ -158,16 +204,20 @@ def _validate_sglang_extra_args(
                 f"{field_name} must not set {flag}; "
                 f"{_SGLANG_UNSUPPORTED_FLAGS[flag]}"
             )
-        expansions = sorted(
-            spelling
-            for spelling in (*guarded, *_SGLANG_UNSUPPORTED_FLAGS)
-            if spelling != flag and spelling.startswith(flag)
-        )
-        if expansions:
-            raise ValueError(
-                f"{field_name} entry {flag} is a prefix of {expansions[0]}, "
-                "which SGLang would expand it to; spell out the full flag"
-            )
+        for other in spellings:
+            # Compare both directions: a global abbreviation can precede a
+            # full per-server flag, or the abbreviation can come second.
+            short, full = sorted((flag, other), key=len)
+            if (
+                short != full
+                and short not in _SGLANG_EXACT_PREFIX_FLAGS
+                and full.startswith(short)
+            ):
+                owner = reserved.get(other, field_name)
+                raise ValueError(
+                    f"{field_name} entry {flag} conflicts with {other} from {owner}: "
+                    f"{short} is a prefix of {full}; spell out the full flag"
+                )
         canonical = _SGLANG_CANONICAL_FLAGS.get(flag, flag)
         if canonical in seen:
             raise ValueError(f"{field_name} repeats {flag}")
@@ -1206,10 +1256,6 @@ class Config(StrictConfigModel):
                     server.extra_args,
                     field_name=f"managed_local.capture_servers[{index}].extra_args",
                     reserved=reserved,
-                    # Global passthrough flags guard exact repeats only: a
-                    # global --enable-metrics-for-all-schedulers still allows
-                    # a distinct per-server --enable-metrics.
-                    guarded=rendered,
                 )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")

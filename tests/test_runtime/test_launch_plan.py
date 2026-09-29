@@ -1056,6 +1056,103 @@ class LaunchPlanTest(unittest.TestCase):
             ["--enable-metrics"],
         )
 
+    def test_passthrough_rejects_abbreviated_duplicates_in_either_order(self):
+        # Include a passthrough-only option: this must not depend on whether
+        # ModelConfig has a typed field for the full spelling.
+        for full, short in (
+            ("--max-prefill-tokens", "--max-prefill-token"),
+            ("--prefill-max-requests", "--prefill-max-request"),
+        ):
+            for first, second in ((full, short), (short, full)):
+                for placement in ("global", "server", "both"):
+                    with self.subTest(first=first, second=second, placement=placement):
+                        raw = _managed_config("/fresh/managed-attempt").model_dump()
+                        server = raw["deployment"]["disaggregated"]["managed_local"][
+                            "capture_servers"
+                        ][0]
+                        if placement == "global":
+                            raw["model"]["sglang_extra_args"] = [
+                                first,
+                                "8",
+                                second,
+                                "4",
+                            ]
+                        elif placement == "server":
+                            server["extra_args"] = [first, "8", second, "4"]
+                        else:
+                            raw["model"]["sglang_extra_args"] = [first, "8"]
+                            server["extra_args"] = [f"{second}=4"]
+                        with self.assertRaisesRegex(
+                            ValidationError, "spell out the full flag"
+                        ):
+                            Config.model_validate(raw)
+
+    def test_secret_abbreviations_are_rejected_and_redacted(self):
+        secret = "example-secret-value"
+        for flag in ("--admin", "--admin-api-k", "--admin-api-ke"):
+            for args in ([flag, secret], [f"{flag}={secret}"]):
+                with self.subTest(args=args):
+                    # Rendering is defensive even before config validation.
+                    command = CommandSpec("capture", tuple(args))
+                    self.assertNotIn(secret, json.dumps(command.as_dict()))
+                    self.assertIn("<redacted>", json.dumps(command.as_dict()))
+                    self.assertEqual(command.argv, tuple(args))
+                    for placement in ("global", "server"):
+                        raw = _managed_config("/fresh/managed-attempt").model_dump()
+                        if placement == "global":
+                            raw["model"]["sglang_extra_args"] = args
+                        else:
+                            raw["deployment"]["disaggregated"]["managed_local"][
+                                "capture_servers"
+                            ][0]["extra_args"] = args
+                        with self.assertRaisesRegex(
+                            ValidationError, "spell out the full flag"
+                        ):
+                            Config.model_validate(raw)
+
+    def test_distinct_full_passthrough_flags_with_shared_prefix_remain_valid(self):
+        for short, full in (
+            ("--enable-metrics", "--enable-metrics-for-all-schedulers"),
+            ("--disable-cuda-graph", "--disable-cuda-graph-padding"),
+        ):
+            for first, second in ((short, full), (full, short)):
+                for placement in ("global", "server", "both"):
+                    with self.subTest(first=first, second=second, placement=placement):
+                        raw = _managed_config("/fresh/managed-attempt").model_dump()
+                        server = raw["deployment"]["disaggregated"]["managed_local"][
+                            "capture_servers"
+                        ][0]
+                        if placement == "global":
+                            raw["model"]["sglang_extra_args"] = [first, second]
+                        elif placement == "server":
+                            server["extra_args"] = [first, second]
+                        else:
+                            raw["model"]["sglang_extra_args"] = [first]
+                            server["extra_args"] = [second]
+                        Config.model_validate(raw)
+
+    def test_exact_prefix_flags_match_the_pinned_sglang_parser(self):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        from specforge.config.schema import _SGLANG_EXACT_PREFIX_FLAGS
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        flags = {
+            flag
+            for action in parser._actions
+            for flag in action.option_strings
+            if flag.startswith("--")
+        }
+        prefixes = {
+            flag
+            for flag in flags
+            if any(other != flag and other.startswith(flag) for other in flags)
+        }
+        self.assertEqual(_SGLANG_EXACT_PREFIX_FLAGS, prefixes)
+
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (
             Path(__file__).resolve().parents[2]

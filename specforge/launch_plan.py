@@ -20,7 +20,11 @@ from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config, ModelConfig
-from specforge.config.schema import SGLANG_PASSTHROUGH_FIELDS, sglang_field_flag
+from specforge.config.schema import (
+    SGLANG_PASSTHROUGH_FIELDS,
+    SGLANG_SECRET_FLAGS,
+    sglang_field_flag,
+)
 
 if TYPE_CHECKING:
     from specforge.algorithms.registry import AlgorithmRegistration
@@ -53,7 +57,11 @@ class _ForwardedSignal(BaseException):
 
 def _is_secret_name(name: str) -> bool:
     normalized = name.lower().replace("-", "_")
-    return any(fragment in normalized for fragment in _SECRET_NAMES)
+    return any(fragment in normalized for fragment in _SECRET_NAMES) or (
+        name.startswith("--")
+        and len(name) > 2
+        and any(flag.startswith(name) for flag in SGLANG_SECRET_FLAGS)
+    )
 
 
 def _redacted(value: str) -> str:
