@@ -27,7 +27,8 @@ Contract carried from the reference backend:
 
 * **B5 — no use-after-free.** ``get()`` after ``release``/``abort`` raises
   ``KeyError``; a generation guard rejects a stale ref after a re-``put``;
-  clone-on-fetch is the default.
+  every ``get()`` returns fresh caller-owned tensors, so the loader skips its
+  otherwise-default defensive clone.
 * **B9 — auth in disaggregated mode** (shared-secret :class:`AuthPolicy`).
 
 Lifetime: Mooncake's default eviction is approximate-LRU for a KV *cache*, which
@@ -237,6 +238,18 @@ def _alloc_from_spec(spec) -> torch.Tensor:
 
 def _nbytes(t: torch.Tensor) -> int:
     return t.numel() * t.element_size()
+
+
+def _stays_on_host(dtype: torch.dtype) -> bool:
+    """Whether a pooled device read still delivers this feature to the host.
+
+    Integer features (token ids, loss and attention masks) are a few bytes per
+    token, and strategies read them on the host: DFlash-family anchor sizing
+    counts valid anchors from the CPU loss mask. Delivering them on the device
+    forces a CUDA synchronization per micro-step, while their non-blocking H2D
+    in the strategy is negligible. Hidden states stay on the device.
+    """
+    return not (dtype.is_floating_point or dtype.is_complex)
 
 
 RECEIVE_BUFFER_KINDS = ("pageable", "pinned", "cuda")
@@ -521,6 +534,10 @@ class MooncakeFeatureStore(FeatureStore):
     connections, whose effective protocol is validated here.
     """
 
+    # Every read lands in a fresh spec-allocated tensor or is copied out of its
+    # pooled receive slot before the slot is reused (``_fetch_tensor_once``).
+    get_returns_fresh_tensors = True
+
     def __init__(
         self,
         *,
@@ -681,7 +698,11 @@ class MooncakeFeatureStore(FeatureStore):
             raise RuntimeError(f"mooncake put_from failed (status {rc}) for {key}")
 
     def consumer_device(self) -> Optional[torch.device]:
-        """Request device tensors so pooled copies run in the loader worker."""
+        """Request device tensors so pooled copies run in the loader worker.
+
+        Only floating-point features are placed on this device; integer
+        features stay on the host (see :func:`_stays_on_host`).
+        """
         if self.receive_buffers == "pageable":
             return None
         if self.receive_buffers == "pinned":
@@ -770,16 +791,19 @@ class MooncakeFeatureStore(FeatureStore):
             _check_get_result(key, rc, nbytes)
         view = slot.storage[:nbytes].view(dtype).view(shape)
         target = torch.device(device)
+        if _stays_on_host(dtype):
+            target = torch.device("cpu")
         try:
-            if target.type == "cpu":
+            if target.type == "cpu" and not view.is_cuda:
                 out = view.clone()
             else:
-                stream = pool.copy_stream(target)
+                stream = pool.copy_stream(view.device if view.is_cuda else target)
                 with torch.cuda.stream(stream):
                     out = view.to(target, non_blocking=True, copy=True)
                 # RDMA cannot wait on a CUDA event before reusing this slot.
                 stream.synchronize()
-                out.record_stream(torch.cuda.current_stream(target))
+                if out.is_cuda:
+                    out.record_stream(torch.cuda.current_stream(target))
         except Exception:
             pool.release(slot, pooled, quarantine=True)
             raise
@@ -1041,7 +1065,9 @@ class MooncakeFeatureStore(FeatureStore):
                 )
         wanted = names or list(sample_ref.feature_keys.keys())
         out, gen = self._get_tensors(sample_ref, wanted, device)
-        if str(device) != "cpu":
+        # Pooled reads already placed every feature (integer features on the
+        # host); pageable reads land on the host and move here.
+        if self._receive_pool is None and str(device) != "cpu":
             target = torch.device(device)
             out = {
                 k: (v if v.device == target else v.to(target)) for k, v in out.items()

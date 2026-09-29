@@ -90,9 +90,12 @@ covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
 `qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
-its managed-local sibling `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
-(one node, four capture servers plus a DP4 trainer) train the DFlash2 drafter
-in `configs/qwen3.8-27b-dflash2.json` for Qwen3.8-27B. Their
+its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
+(one node, four capture servers plus a DP4 trainer) and
+`qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml` (one 8x H200 node,
+five FP8 capture servers with FA3 and FlashInfer GDN, a DP3 trainer, RDMA
+loopback) train the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
+Qwen3.8-27B. Their
 [runbook](../../docs/recipes/qwen3.8-27b-dflash2-disaggregated.md) records the
 server/trainer splits, Mooncake lease, in-flight watermarks and throughput
 measured on B300 and H200 nodes, and the two-node launcher that starts eight
@@ -294,6 +297,7 @@ Common fields:
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
+| `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
@@ -352,6 +356,7 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.idle_timeout_s` | `null` | Positive consumer idle timeout. |
 | `deployment.disaggregated.peer_wait_timeout_s` | `null` | Optional positive producer/consumer peer-completion timeout. Unset is unbounded; expiration fails the attempt. |
 | `deployment.disaggregated.producer_hold_s` | `null` | Optional positive offline producer retention timeout. Unset is unbounded; expiration fails the attempt. |
+| `deployment.disaggregated.async_ack` | `true` | Online consumer: overlap each optimizer boundary's durable ack (ledger commit, feature removes, DP ack collectives on a dedicated Gloo group) with the next step on a background thread. The durable marker lags by at most one optimizer step and is flushed before every checkpoint, eval, and fit end. Exported as `DISAGG_ASYNC_ACK` (`0` disables; an explicit environment value wins). Multi-node trainers need Gloo TCP reachability between ranks (set `GLOO_SOCKET_IFNAME` when the hostname does not resolve to a routable address); disabling it on any rank keeps every rank's acks synchronous on the default process group and creates no Gloo group. |
 | `deployment.disaggregated.shutdown_grace_s` | `30.0` | SIGTERM-to-SIGKILL window for a plain supervisor teardown; must cover worker cleanup (Mooncake drains, checkpoint flush, failure sentinels). `managed_local` stacks use `managed_local.shutdown_grace_s`. |
 | `deployment.disaggregated.managed_local` | `null` | Optional owned single-node Mooncake + capture-server stack described below. |
 
@@ -427,7 +432,9 @@ The default probe budget supports SGLang's generation-based health check without
 disabling health-endpoint generation.
 
 Disaggregated Mooncake trainers use pinned receive pools without additional settings.
-With loader prefetch enabled, H2D runs in the loader before the batch reaches training.
+With loader prefetch enabled, hidden-state H2D runs in the loader before the batch
+reaches training; integer features stay on the host (pinned by loader workers) for
+the strategy's non-blocking copy.
 Select `receive_buffers: pageable` to restore fresh host receives. The 8 GiB receive-pool
 budget is allocated lazily per rank and excludes returned tensors and overflow buffers.
 

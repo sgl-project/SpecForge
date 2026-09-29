@@ -62,6 +62,7 @@ def _assemble_trainer(
     strategy_kwargs: Optional[Mapping[str, Any]] = None,
     per_sample_transform=None,
     durable_ack: bool = True,
+    async_ack: bool = False,
     resume_from: Optional[str] = None,
     resume_state: Optional[dict] = None,
     dataset_size: Optional[int] = None,
@@ -136,6 +137,7 @@ def _assemble_trainer(
         strategy_kwargs=strategy_kwargs,
         per_sample_transform=per_sample_transform,
         durable_ack=durable_ack,
+        async_ack=async_ack,
         resume_from=resume_from,
         resume_state=resume_state,
         dataset_size=dataset_size,
@@ -1550,6 +1552,7 @@ def build_disagg_online_consumer(
     resume_from: Optional[str] = None,
     dataloader_num_workers: int = 0,
     profiling_options=None,
+    async_ack: Optional[bool] = None,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1563,10 +1566,19 @@ def build_disagg_online_consumer(
     ledger, skips optimizer-durable refs, requeues the unacked tail, and requires
     the durable marker to match the checkpoint step. The producer and original
     data plane must still be available; this does not restart a producer.
+
+    ``async_ack`` (default: ``DISAGG_ASYNC_ACK``, on unless ``0``) runs each
+    optimizer boundary's durable ack on a background thread over a dedicated
+    Gloo group while the next step computes; see :class:`TrainerController`.
+    It is on only when every rank enables it; otherwise acks stay synchronous
+    on the default process group and no Gloo group is created.
     """
     import torch.distributed as dist
 
-    from specforge.runtime.control_plane.dp_ack import DPAckController
+    from specforge.runtime.control_plane.dp_ack import (
+        DPAckController,
+        new_durable_ack_process_group,
+    )
     from specforge.runtime.data_plane.ref_distributor import (
         InboxChannel,
         RefDistributor,
@@ -1609,17 +1621,35 @@ def build_disagg_online_consumer(
     except BaseException as exc:
         preflight_exc = exc
 
+    if async_ack is None:
+        flag = os.environ.get("DISAGG_ASYNC_ACK", "1").strip().lower()
+        async_ack = flag not in ("0", "false", "no", "off")
+    async_ack = bool(async_ack)
     preflight_error = (
         f"{type(preflight_exc).__name__}: {preflight_exc}" if preflight_exc else None
     )
     if distributed and world > 1:
-        gathered_errors = [None] * world
-        dist.all_gather_object(gathered_errors, preflight_error)
-        preflight_error = next((error for error in gathered_errors if error), None)
+        gathered = [None] * world
+        dist.all_gather_object(gathered, (preflight_error, async_ack))
+        preflight_error = next((error for error, _ in gathered if error), None)
+        # Creating the ack group below is collective: every rank must take the
+        # same decision, so one rank opting out disables async acks for all.
+        async_ack = all(enabled for _, enabled in gathered)
     if preflight_error is not None:
         if not distributed or world == 1:
             raise preflight_exc
         raise RuntimeError(f"online consumer preflight failed: {preflight_error}")
+
+    # Every rank creates the ack group here, in the same collective order. It
+    # carries all DPAck object collectives on the host, so a background ack
+    # never interleaves with (or drains the stream for) NCCL training work.
+    # Synchronous acks (DISAGG_ASYNC_ACK=0) keep the default group, so the
+    # kill switch also removes the new Gloo connectivity requirement.
+    ack_group = None
+    if async_ack and distributed and world > 1:
+        ack_group = new_durable_ack_process_group()
+        if ack_group is None:
+            async_ack = False
 
     if inbox_dir is None:
         inbox_dir = channel.path + ".inboxes"
@@ -1638,6 +1668,7 @@ def build_disagg_online_consumer(
                 is_authority=True,
                 metadata_store=store,
                 feature_store=feature_store,
+                process_group=ack_group,
             )
             skip_ids = None
             requeued_ids = None
@@ -1736,6 +1767,7 @@ def build_disagg_online_consumer(
             is_authority=False,
             metadata_store=InMemoryMetadataStore(),
             feature_store=feature_store,
+            process_group=ack_group,
         )
 
     # The successful rank-0 setup broadcast guarantees inbox recreation and the
@@ -1866,6 +1898,7 @@ def build_disagg_online_consumer(
             resume_from=resume_from,
             dataloader_num_workers=dataloader_num_workers,
             profiling_options=profiling_options,
+            async_ack=async_ack,
             on_fit_success=mark_consumer_done,
             on_fit_failure=mark_consumer_failed,
             on_fit_finally=stop_distributor_and_drain,
