@@ -653,6 +653,45 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         )
         self.assertEqual(health["receive_buffers"], "pinned")
 
+    def test_pooled_device_reads_keep_integer_features_on_host(self):
+        # Integer features never touch the device copy stream, so this runs
+        # without CUDA; hidden-state placement is covered by the CUDA suite.
+        store = _store(receive_buffers="pinned")
+        integer_features = {
+            "input_ids": torch.arange(6).unsqueeze(0),
+            "loss_mask": torch.tensor([[0, 1, 1, 0, 1, 1]]),
+            "attention_mask": torch.ones(1, 6, dtype=torch.bool),
+        }
+        ref = store.put(
+            {**integer_features, "hidden_states": torch.randn(1, 6, 4)},
+            sample_id="s0",
+            metadata=_meta(),
+        )
+
+        got, _ = store.get(ref, device="cuda", names=list(integer_features))
+
+        for name, expected in integer_features.items():
+            self.assertEqual(got[name].device.type, "cpu", name)
+            self.assertTrue(torch.equal(got[name], expected), name)
+
+    def test_every_receive_mode_returns_fresh_tensors(self):
+        self.assertTrue(MooncakeFeatureStore.get_returns_fresh_tensors)
+        self.assertFalse(LocalFeatureStore.get_returns_fresh_tensors)
+        for kind in ("pageable", "pinned"):
+            with self.subTest(kind=kind):
+                store = _store(receive_buffers=kind)
+                source = _tensors()
+                ref = store.put(source, sample_id="s0", metadata=_meta())
+                first, _ = store.get(ref)
+                for tensor in first.values():
+                    tensor.add_(1)
+                again, _ = store.get(ref)
+                for name, expected in source.items():
+                    self.assertTrue(torch.equal(again[name], expected), name)
+                    self.assertNotEqual(
+                        again[name].data_ptr(), first[name].data_ptr(), name
+                    )
+
     def test_receive_pool_budget_overflows_to_one_off_buffers(self):
         fake = _FakeMooncakeStore()
         producer = MooncakeFeatureStore(store=fake, store_id="run0")

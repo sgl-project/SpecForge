@@ -751,6 +751,13 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
     producer_hold_s: Optional[float] = Field(default=None, gt=0)
+    #: Online consumer: run each optimizer boundary's durable ack (ledger
+    #: commit, feature removes, DP ack collectives over a dedicated Gloo group)
+    #: on a background thread while the next step computes. The durable marker
+    #: lags by at most one optimizer step and is flushed before every
+    #: checkpoint. Exported as ``DISAGG_ASYNC_ACK``; an explicit env value wins.
+    #: Off keeps acks synchronous on the default group (no Gloo group).
+    async_ack: bool = True
     #: SIGTERM-to-SIGKILL grace for a plain (non-managed) supervisor teardown.
     #: Workers translate SIGTERM into cleanup (Mooncake drains, checkpoint
     #: flush, failure sentinels), so this window must cover that work.
@@ -912,6 +919,13 @@ class TrainingConfig(StrictConfigModel):
     #: Stop selector gradients at the unary/backbone boundary while preserving
     #: the primary DFlash/D-PACE/LK gradient path.
     dflash2_selector_stop_gradient: bool = False
+    #: Online DFlash/DFlash2 only: capture the target's final hidden state for
+    #: the teacher-agreement diagnostics (``dflash/teacher/*`` and
+    #: ``dflash2/selector/self_conditioned_teacher_argmax_agreement``). The
+    #: objective never reads it; ``false`` stops the capture server from
+    #: writing it and the trainer from fetching it (one ``hidden_size`` row per
+    #: token next to the ``len(target_layer_ids) * hidden_size`` aux row).
+    dflash_teacher_metrics: bool = True
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1
