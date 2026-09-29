@@ -73,10 +73,12 @@ def linear_lambda_base(
 def _cpu_max_valid_anchors(loss_mask: torch.Tensor) -> Optional[int]:
     """Count the widest valid anchor row without synchronizing the GPU.
 
-    Online/offline loaders hand strategies CPU tensors.  Computing this one
-    scalar before the asynchronous H2D copies lets DFlash-family models size
-    their anchor tensors without a CUDA ``item()`` in the forward critical
-    path.  Direct GPU callers keep the model's existing fallback.
+    Online/offline loaders hand strategies CPU integer features; Mooncake
+    device consumers keep them on the host while hidden states land on the
+    GPU.  Computing this one scalar before the asynchronous H2D copies lets
+    DFlash-family models size their anchor tensors without a CUDA ``item()``
+    in the forward critical path.  Direct GPU callers keep the model's
+    existing fallback.
     """
     if loss_mask.device.type != "cpu":
         return None
@@ -472,7 +474,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         return next(self.dflash_model.parameters()).device
 
     def _draft_attr(self, name: str, default: float) -> float:
-        """Read a schedule attribute from the draft model.
+        """Read a schedule or diagnostics attribute from the draft model.
 
         Under ``fsdp_sharding: NO_SHARD`` the backend wraps the draft in
         ``DistributedDataParallel``, which does not forward attribute access
@@ -528,7 +530,13 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         if ctx is not None:
             model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
         target_last_hidden_states = t.get("target_last_hidden_states")
-        if target_last_hidden_states is not None and collect_detailed_metrics:
+        # Teacher hidden states only feed diagnostics; skip the copy when the
+        # run disabled them (training.dflash_teacher_metrics=false).
+        if (
+            target_last_hidden_states is not None
+            and collect_detailed_metrics
+            and bool(self._draft_attr("teacher_metrics", 1.0))
+        ):
             model_inputs["target_last_hidden_states"] = target_last_hidden_states.to(
                 device, non_blocking=True
             )
@@ -649,10 +657,12 @@ class MTPTrainStrategy(DraftTrainStrategy):
         device = self._device()
         # OnlineMTPModel performs the next-token shift internally and returns
         # per-position correct/denominator tensors (single-layer: length-1 lists).
+        # Non-blocking like the other strategies: pinned Mooncake receives keep
+        # integer features on the host, and a blocking H2D would sync the GPU.
         loss, corrects, denoms = self.mtp_model(
-            input_ids=t["input_ids"].to(device),
-            hidden_states=t["target_last_hidden_states"].to(device),
-            loss_mask=t["loss_mask"].to(device),
+            input_ids=t["input_ids"].to(device, non_blocking=True),
+            hidden_states=t["target_last_hidden_states"].to(device, non_blocking=True),
+            loss_mask=t["loss_mask"].to(device, non_blocking=True),
         )
         correct_sum = corrects[0].sum()
         denom_sum = denoms[0].sum()

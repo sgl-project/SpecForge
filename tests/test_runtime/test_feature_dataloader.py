@@ -508,6 +508,48 @@ class TestFeatureDataLoader(unittest.TestCase):
         self.assertEqual(len(worker_names), 8)
         self.assertTrue(all(name.startswith("feature-loader") for name in worker_names))
 
+    def test_clone_on_fetch_defaults_to_the_store_fresh_tensor_contract(self):
+        class FreshStore(LocalFeatureStore):
+            get_returns_fresh_tensors = True
+
+        cases = (
+            (LocalFeatureStore, {}, None, True),
+            (FreshStore, {}, None, False),
+            (FreshStore, {"clone_on_fetch": True}, None, True),
+            (LocalFeatureStore, {"clone_on_fetch": False}, None, False),
+            (LocalFeatureStore, {}, "0", False),
+            (FreshStore, {}, "1", True),
+            (FreshStore, {"clone_on_fetch": False}, "1", True),
+        )
+        for store_type, kwargs, env, expected in cases:
+            with self.subTest(store=store_type.__name__, kwargs=kwargs, env=env):
+                environ = {} if env is None else {"CLONE_ON_FETCH": env}
+                with mock.patch.dict(os.environ, environ):
+                    if env is None:
+                        os.environ.pop("CLONE_ON_FETCH", None)
+                    loader = FeatureDataLoader(store_type("st"), refs=[], **kwargs)
+                self.assertIs(loader.clone_on_fetch, expected)
+
+    def test_fresh_tensor_store_materializes_without_a_copy(self):
+        class FreshStore(LocalFeatureStore):
+            get_returns_fresh_tensors = True
+
+            def get(self, sample_ref, *, device="cpu", names=None):
+                tensors, handle = super().get(sample_ref, device=device, names=names)
+                self.served = {k: v.clone() for k, v in tensors.items()}
+                return self.served, handle
+
+        store = FreshStore("st")
+        ref = store.put(
+            {"x": torch.arange(4)}, sample_id="s0", metadata={"run_id": "run"}
+        )
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CLONE_ON_FETCH", None)
+            loader = FeatureDataLoader(store, refs=[ref], drop_last=False)
+        tensors = loader._materialize(ref)
+
+        self.assertIs(tensors["x"], store.served["x"])
+
     def test_materialize_releases_handle_when_clone_raises(self):
         with tempfile.TemporaryDirectory() as d:
             self._write_offline_files(d, n=1)
