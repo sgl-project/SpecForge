@@ -176,6 +176,40 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "no larger"):
             Config.model_validate(invalid)
 
+    def test_sglang_server_knobs_default_off_and_load_from_yaml(self):
+        default = Config.model_validate(_managed_local_payload(ep_size=1))
+        self.assertIsNone(default.model.sglang_max_prefill_tokens)
+        self.assertIsNone(default.model.sglang_linear_attn_prefill_backend)
+        self.assertIsNone(default.model.sglang_fp8_gemm_backend)
+        self.assertFalse(default.model.sglang_disable_cuda_graph)
+        self.assertEqual(default.model.sglang_extra_args, [])
+        server = default.deployment.disaggregated.managed_local.capture_servers[0]
+        self.assertEqual((server.extra_args, server.env), ([], {}))
+
+        payload = _managed_local_payload(ep_size=1)
+        payload["model"]["sglang_extra_args"] = ["--max-prefill-tokens", 65536]
+        payload["deployment"]["disaggregated"]["managed_local"]["capture_servers"][
+            0
+        ].update(
+            extra_args=["--prefill-max-requests", 4],
+            env={"SGLANG_SPEC_CAPTURE_TIMING": 1},
+        )
+        path = _write(payload, ".yaml")
+        self.addCleanup(os.unlink, path)
+        # Unquoted YAML numbers become the CLI/env strings SGLang reads.
+        cfg = load_config(path)
+        self.assertEqual(cfg.model.sglang_extra_args, ["--max-prefill-tokens", "65536"])
+        server = cfg.deployment.disaggregated.managed_local.capture_servers[0]
+        self.assertEqual(server.extra_args, ["--prefill-max-requests", "4"])
+        self.assertEqual(server.env, {"SGLANG_SPEC_CAPTURE_TIMING": "1"})
+
+        overridden = apply_overrides(
+            cfg, ["model.sglang_extra_args=[--enable-metrics]"]
+        )
+        self.assertEqual(overridden.model.sglang_extra_args, ["--enable-metrics"])
+        with self.assertRaisesRegex(ValidationError, "must not set --dtype"):
+            apply_overrides(cfg, ["model.sglang_extra_args=[--dtype, float16]"])
+
     def test_online_eagle3_preserves_multi_sample_batches(self):
         payload = _online_payload()
         payload["training"]["batch_size"] = 4
@@ -425,6 +459,65 @@ class ConfigSchemaTest(unittest.TestCase):
                 invalid_payload["training"][field] = invalid
                 with self.assertRaisesRegex(ValidationError, field):
                     Config.model_validate(invalid_payload)
+
+    def test_dflash_teacher_metrics_is_typed_and_dflash_only(self):
+        default_config = Config.model_validate(_online_payload("dflash"))
+        self.assertTrue(default_config.training.dflash_teacher_metrics)
+
+        online = _online_payload("dflash")
+        online["training"]["dflash_teacher_metrics"] = False
+        offline = copy.deepcopy(MINIMAL)
+        offline["training"] = {"strategy": "dflash", "dflash_teacher_metrics": False}
+        for payload in (online, offline):
+            with self.subTest(data=payload["data"]):
+                resolved = resolve_run(Config.model_validate(payload))
+                self.assertFalse(resolved.config.training.dflash_teacher_metrics)
+
+        for invalid in ("maybe", 2, None):
+            with self.subTest(invalid=invalid):
+                payload = _online_payload("dflash")
+                payload["training"]["dflash_teacher_metrics"] = invalid
+                with self.assertRaisesRegex(ValidationError, "dflash_teacher_metrics"):
+                    Config.model_validate(payload)
+
+        # DSpark and MTP train on the final hidden state; the other families
+        # never request it, so the opt-out would be silently meaningless there.
+        for strategy in ("domino", "dspark", "eagle3", "mtp", "peagle"):
+            with self.subTest(strategy=strategy):
+                payload = _online_payload(strategy)
+                payload["training"]["dflash_teacher_metrics"] = False
+                if strategy == "mtp":
+                    payload["training"]["attention_backend"] = "sdpa"
+                with self.assertRaisesRegex(
+                    ValueError, "does not support training.dflash_teacher_metrics"
+                ):
+                    resolve_run(Config.model_validate(payload))
+
+    def test_dflash_teacher_metrics_reaches_the_training_model(self):
+        from unittest import mock
+
+        from specforge.algorithms.dflash.providers import build_training_model
+
+        for enabled in (True, False):
+            with self.subTest(dflash_teacher_metrics=enabled):
+                payload = _online_payload("dflash")
+                payload["training"]["dflash_teacher_metrics"] = enabled
+                config = Config.model_validate(payload)
+                # Construction only: the family builder hands the factory its
+                # shared kwargs, and the objective records the config value.
+                with (
+                    mock.patch(
+                        "specforge.algorithms.common.dflash_family_model."
+                        "OnlineDFlashModel"
+                    ) as model_cls,
+                    mock.patch(
+                        "specforge.algorithms.model_providers."
+                        "_build_dflash_family_model",
+                        side_effect=lambda _cfg, _draft, _tok, factory: factory({}),
+                    ),
+                ):
+                    build_training_model(config, None, None, None, None)
+                self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")

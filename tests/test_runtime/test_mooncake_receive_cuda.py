@@ -110,6 +110,48 @@ class MooncakeReceiveCudaTest(unittest.TestCase):
                 self.assertTrue(torch.all(next_output["hidden_state"] == 11).item())
                 self.assertEqual(pool.health()["receive_pool_hits"], 1)
 
+    def test_device_reads_keep_integer_features_on_host(self):
+        features = {
+            "hidden_states": torch.randn(1, 64, 32).to(torch.bfloat16),
+            "input_ids": torch.arange(64).unsqueeze(0),
+            "loss_mask": (torch.arange(64) % 3 > 0).long().unsqueeze(0),
+        }
+        for kind in ("pinned", "cuda"):
+            with self.subTest(kind=kind):
+                backend = _DeviceReads() if kind == "cuda" else _FakeMooncakeStore()
+                producer = MooncakeFeatureStore(store=backend, store_id="test")
+                consumer = MooncakeFeatureStore(
+                    store=backend, store_id="test", receive_buffers=kind
+                )
+                ref = producer.put(features, sample_id="sample", metadata=_meta())
+                try:
+                    got, _ = consumer.get(ref, device="cuda")
+                    torch.cuda.synchronize()
+                finally:
+                    consumer.close()
+                self.assertTrue(got["hidden_states"].is_cuda)
+                self.assertEqual(got["input_ids"].device.type, "cpu")
+                self.assertEqual(got["loss_mask"].device.type, "cpu")
+                for name, expected in features.items():
+                    self.assertTrue(torch.equal(got[name].cpu(), expected), name)
+
+    def test_pageable_device_reads_still_move_every_feature(self):
+        backend = _FakeMooncakeStore()
+        producer = MooncakeFeatureStore(store=backend, store_id="test")
+        consumer = MooncakeFeatureStore(store=backend, store_id="test")
+        features = {
+            "hidden_states": torch.randn(1, 8, 4),
+            "loss_mask": torch.ones(1, 8, dtype=torch.long),
+        }
+        ref = producer.put(features, sample_id="sample", metadata=_meta())
+
+        got, _ = consumer.get(ref, device="cuda")
+
+        self.assertIsNone(consumer.consumer_device())
+        for name, expected in features.items():
+            self.assertTrue(got[name].is_cuda, name)
+            self.assertTrue(torch.equal(got[name].cpu(), expected), name)
+
     def test_cuda_staging_fallback_reports_registration_failure_once(self):
         backend = _DeviceReads()
         producer = MooncakeFeatureStore(store=backend, store_id="test")

@@ -99,6 +99,26 @@ class TestHTTPInbox(unittest.TestCase):
             thread.join()
         self.assertEqual(self.local.consumed_remote(), 5)
 
+    def test_concurrent_client_acks_accumulate_exactly(self):
+        # The background durable ack and loader failure settlement can both
+        # advance one client's target; neither update may be lost.
+        errors = []
+
+        def ack_many():
+            try:
+                for _ in range(25):
+                    self.remote.mark_consumed(1)
+            except BaseException as exc:  # surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=ack_many) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(self.local.consumed_remote(), 150)
+
     def test_pull_treats_connection_reset_as_transient(self):
         with mock.patch(
             "specforge.runtime.data_plane.http_inbox.urlopen",
