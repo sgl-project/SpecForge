@@ -30,7 +30,8 @@ scheduler starts, before `/health` succeeds: it refuses an empty
 `MOONCAKE_RDMA_DEVICES`, for which Mooncake would auto-discover HCAs and fall
 back to TCP silently, and `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` or
 `MC_USE_TEV1`. The Mooncake connection itself stays lazy. The Kimi K3 patch
-does not check.
+does not check. When a GPU capture buffer fails to register, the error names
+the GPUDirect RDMA requirement and the `SGLANG_SPEC_CAPTURE_GPU_PUT=0` opt-out.
 
 Capture transfers overlap the next target prefill instead of blocking it:
 the aux/last-hidden D2H rides the overlap scheduler's `copy_to_cpu` copy
