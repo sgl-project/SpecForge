@@ -123,31 +123,37 @@ class ApplySglangSpecCapturePatchTest(unittest.TestCase):
         self.assertEqual(self.sink.read_text(encoding="utf-8"), "old sink\n")
         self.assertEqual(self.record.read_text(encoding="utf-8"), old_patch)
 
-    def test_main_923e4a56_target_applies_without_version_gate(self) -> None:
-        # A main checkout reports a dev version; the target relies on
-        # patch --check instead of a version prefix, so no warning is printed.
+    def test_v0520_target_is_version_gated(self) -> None:
+        # The v0.5.20 target checks the installed version prefix like the
+        # default target: a matching install applies silently, any other
+        # version still applies but warns.
         self.example.write_text("new base\n", encoding="utf-8")
-        self.env["SPECFORGE_SGLANG_VERSION"] = "0.0.0.dev1+g923e4a56"
+        self.env["SPECFORGE_SGLANG_VERSION"] = "0.5.20"
 
-        result = self.run_script("--target", "main-923e4a56")
+        result = self.run_script("--target", "v0.5.20")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("applied at", result.stdout)
         self.assertNotIn("WARNING: installed sglang is", result.stderr)
         self.assertEqual(self.example.read_text(encoding="utf-8"), "new patched\n")
 
+        self.env["SPECFORGE_SGLANG_VERSION"] = "0.5.18"
+        result = self.run_script("--target", "v0.5.20")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the patch targets v0.5.20", result.stderr)
+
     @unittest.skipUnless(
-        os.environ.get("SPECFORGE_SGLANG_MAIN_CHECKOUT"),
-        "set SPECFORGE_SGLANG_MAIN_CHECKOUT to an sglang checkout at 923e4a56",
+        os.environ.get("SPECFORGE_SGLANG_V0520_CHECKOUT"),
+        "set SPECFORGE_SGLANG_V0520_CHECKOUT to an sglang checkout at v0.5.20",
     )
-    def test_main_923e4a56_patch_applies_to_the_pinned_checkout(self) -> None:
-        # The checked-in main patch against a real checkout, applied exactly
+    def test_v0520_patch_applies_to_the_pinned_checkout(self) -> None:
+        # The checked-in v0.5.20 patch against a real checkout, applied exactly
         # the way the script does it (from the package parent, -p2, with
         # repository discovery stopped there).
-        checkout = Path(os.environ["SPECFORGE_SGLANG_MAIN_CHECKOUT"])
+        checkout = Path(os.environ["SPECFORGE_SGLANG_V0520_CHECKOUT"])
         package_parent = checkout / "python"
         self.assertTrue((package_parent / "sglang").is_dir(), package_parent)
-        patch = ROOT / "patches" / "sglang" / "main-923e4a56" / "spec-capture.patch"
+        patch = ROOT / "patches" / "sglang" / "v0.5.20" / "spec-capture.patch"
         result = subprocess.run(
             ["git", "-C", str(package_parent), "apply", "--check", "-p2", str(patch)],
             check=False,

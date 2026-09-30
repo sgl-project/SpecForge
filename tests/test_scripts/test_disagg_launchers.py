@@ -18,9 +18,7 @@ KIMI_K3_CAPTURE_PATCH = (
     ROOT / "patches" / "sglang" / "kimi-k3-f8493a4" / "spec-capture.patch"
 )
 V0518_CAPTURE_PATCH = ROOT / "patches" / "sglang" / "v0.5.18" / "spec-capture.patch"
-MAIN_923E4A56_CAPTURE_PATCH = (
-    ROOT / "patches" / "sglang" / "main-923e4a56" / "spec-capture.patch"
-)
+V0520_CAPTURE_PATCH = ROOT / "patches" / "sglang" / "v0.5.20" / "spec-capture.patch"
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):
@@ -148,11 +146,11 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", source)
         self.assertIn("req.finished() and req.spec_capture_result is None", source)
 
-    def test_main_923e4a56_capture_patch_keeps_the_v0518_contract(self):
-        # The port to SGLang main keeps the writer-rank, sink and capture-only
+    def test_v0520_capture_patch_keeps_the_v0518_contract(self):
+        # The port to SGLang v0.5.20 keeps the writer-rank, sink and capture-only
         # DSpark routing of the v0.5.18 patch, and declares the server args in
         # the arg-group structs that replaced the flat ServerArgs fields.
-        source = MAIN_923E4A56_CAPTURE_PATCH.read_text(encoding="utf-8")
+        source = V0520_CAPTURE_PATCH.read_text(encoding="utf-8")
         added_source = "\n".join(
             line[1:]
             for line in source.splitlines()

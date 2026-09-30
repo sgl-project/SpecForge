@@ -1,8 +1,8 @@
 diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
-index 3195265e9..46c56e4be 100644
+index 42446c8379..5fd5cbdd95 100644
 --- a/python/sglang/kernels/ops/layernorm/mhc.py
 +++ b/python/sglang/kernels/ops/layernorm/mhc.py
-@@ -790,6 +790,9 @@ def prewarm_mhc_pre(
+@@ -781,6 +781,9 @@ def prewarm_mhc_pre(
  
      hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
      max_num_tokens = get_schedule().chunked_prefill_size
@@ -13,10 +13,10 @@ index 3195265e9..46c56e4be 100644
          max_num_tokens, hc_mult * hidden_size
      )
 diff --git a/python/sglang/srt/arg_groups/field_order.py b/python/sglang/srt/arg_groups/field_order.py
-index 88185e363..1b900d4f7 100644
+index 992a91b172..01f1668aaf 100644
 --- a/python/sglang/srt/arg_groups/field_order.py
 +++ b/python/sglang/srt/arg_groups/field_order.py
-@@ -497,6 +497,9 @@ POSITIONAL_FIELD_ORDER = (
+@@ -496,6 +496,9 @@ POSITIONAL_FIELD_ORDER = (
      "return_hidden_states_mode",
      "enable_return_routed_experts",
      "enable_return_indexer_topk",
@@ -27,10 +27,10 @@ index 88185e363..1b900d4f7 100644
      "disable_outlines_disk_cache",
      "enable_mis",
 diff --git a/python/sglang/srt/arg_groups/fields/exec_.py b/python/sglang/srt/arg_groups/fields/exec_.py
-index 05c80805c..943969c1a 100644
+index e70086e611..8f007bcfd8 100644
 --- a/python/sglang/srt/arg_groups/fields/exec_.py
 +++ b/python/sglang/srt/arg_groups/fields/exec_.py
-@@ -96,6 +96,29 @@ class ExecFeatures(msgspec.Struct):
+@@ -95,6 +95,29 @@ class ExecFeatures(msgspec.Struct):
          bool,
          "Enable returning indexer topk indices of layers with indexer with responses.",
      ] = False
@@ -61,7 +61,7 @@ index 05c80805c..943969c1a 100644
          int,
          "The maximum number of token IDs in a returned sampling mask. Requests "
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index 6aac6eb21..464f28c12 100644
+index b488bfa9d8..7108c1b1ef 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
 @@ -208,6 +208,11 @@ class LogitsProcessorOutput:
@@ -76,7 +76,7 @@ index 6aac6eb21..464f28c12 100644
  
      ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
      # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
-@@ -521,6 +526,27 @@ class LogitsProcessor(nn.Module):
+@@ -526,6 +531,27 @@ class LogitsProcessor(nn.Module):
              sample_indices,
              logits_metadata,
          )
@@ -104,7 +104,7 @@ index 6aac6eb21..464f28c12 100644
          del hidden_states
  
          if not logits_metadata.extend_return_logprob:
-@@ -534,6 +560,7 @@ class LogitsProcessor(nn.Module):
+@@ -539,6 +565,7 @@ class LogitsProcessor(nn.Module):
              return LogitsProcessorOutput(
                  next_token_logits=sampled_logits,
                  hidden_states=hidden_states_to_store,
@@ -112,7 +112,7 @@ index 6aac6eb21..464f28c12 100644
                  mm_input_embeds=logits_metadata.mm_input_embeds,
              )
  
-@@ -551,6 +578,7 @@ class LogitsProcessor(nn.Module):
+@@ -556,6 +583,7 @@ class LogitsProcessor(nn.Module):
          logits_output = LogitsProcessorOutput(
              next_token_logits=sampled_logits,
              hidden_states=hidden_states_to_store,
@@ -120,7 +120,7 @@ index 6aac6eb21..464f28c12 100644
              mm_input_embeds=logits_metadata.mm_input_embeds,
          )
          logprobs_result.write_input_to(logits_output)
-@@ -756,10 +784,12 @@ class LogitsProcessor(nn.Module):
+@@ -761,10 +789,12 @@ class LogitsProcessor(nn.Module):
          if logits_metadata.capture_hidden_mode.need_capture():
              if logits_metadata.capture_hidden_mode.is_full():
                  if aux_hidden_states is not None:
@@ -134,35 +134,8 @@ index 6aac6eb21..464f28c12 100644
              elif logits_metadata.capture_hidden_mode.is_last():
                  # Get the last token hidden states. If sample_indices is None,
                  # pruned states only contain the last tokens already.
-diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
-index 53d088690..23692e85d 100644
---- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
-+++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
-@@ -1,6 +1,7 @@
- from __future__ import annotations
- 
- import logging
-+import os
- from typing import TYPE_CHECKING
- 
- import torch
-@@ -24,7 +25,13 @@ from sglang.srt.utils import (
- )
- from sglang.srt.utils.common import next_power_of_2, print_warning_once
- 
--_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
-+# FLASHINFER_USE_CUDA_QUANT=1 forces the "cuda" mxfp8-quantize backend; the
-+# CuTe-DSL kernels miscompile against some nvidia-cutlass-dsl pins.
-+_MXFP8_QUANTIZE_BACKEND = (
-+    "cuda"
-+    if not get_platform().is_sm100 or os.environ.get("FLASHINFER_USE_CUDA_QUANT") == "1"
-+    else "cute-dsl"
-+)
- 
- if is_flashinfer_available():
-     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
-index a15bb1d7b..9c815077c 100644
+index a15bb1d7b1..9c815077c8 100644
 --- a/python/sglang/srt/managers/detokenizer_manager.py
 +++ b/python/sglang/srt/managers/detokenizer_manager.py
 @@ -497,6 +497,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
@@ -174,7 +147,7 @@ index a15bb1d7b..9c815077c 100644
              indexer_topk=indexer_topk,
              customized_info=recv_obj.customized_info,
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index d3f13eba8..8cc29a945 100644
+index d3f13eba89..8cc29a9456 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
 @@ -248,6 +248,9 @@ class GenerateReqInput:
@@ -230,10 +203,10 @@ index d3f13eba8..8cc29a945 100644
      token_steps: Optional[List[List[int]]] = None
  
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 5297d9a84..cc0438459 100755
+index 7811e4477a..043c3ecc04 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -1020,6 +1020,7 @@ class Req(ReqDllmMixin):
+@@ -975,6 +975,7 @@ class Req(ReqDllmMixin):
              Union[APIServerReqTimeStats, DPControllerReqTimeStats]
          ] = None,
          return_pooled_hidden_states: bool = False,
@@ -241,7 +214,7 @@ index 5297d9a84..cc0438459 100755
          multi_item_delimiter_indices: Optional[List[int]] = None,
          session_id: Optional[str] = None,
          cache_salt: Optional[str] = None,
-@@ -1087,10 +1088,18 @@ class Req(ReqDllmMixin):
+@@ -1042,10 +1043,18 @@ class Req(ReqDllmMixin):
              }
          self.sampling_params = sampling_params
          self.custom_logit_processor = custom_logit_processor
@@ -261,10 +234,10 @@ index 5297d9a84..cc0438459 100755
          # Extra key for caller-defined request classification.
          if lora_id is not None:
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 7c7410828..a56e45854 100644
+index 743c8afe06..8f1ceb5594 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -725,6 +725,19 @@ class Scheduler(
+@@ -723,6 +723,19 @@ class Scheduler(
  
          self.init_batch_result_processor()
  
@@ -284,7 +257,7 @@ index 7c7410828..a56e45854 100644
          self.init_rank_consensus_checker()
  
          self.is_initializing = False
-@@ -2818,6 +2831,7 @@ class Scheduler(
+@@ -2789,6 +2802,7 @@ class Scheduler(
                  dllm_config=self.dllm_config,
                  time_stats=recv_req.time_stats,
                  multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
@@ -292,7 +265,7 @@ index 7c7410828..a56e45854 100644
              )
              req.tokenizer = self.tokenizer
  
-@@ -4250,6 +4264,23 @@ class Scheduler(
+@@ -4197,6 +4211,23 @@ class Scheduler(
          # GenerationBatchResult.extra_keep_alive_refs after forward returns.
          self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
  
@@ -316,7 +289,7 @@ index 7c7410828..a56e45854 100644
      @contextmanager
      def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
          """Make SB transactional across one forward (overlap and non-overlap).
-@@ -4405,7 +4436,16 @@ class Scheduler(
+@@ -4352,7 +4383,16 @@ class Scheduler(
                                  # overlaps.
                                  batch_result.copy_to_cpu(
                                      return_logprob=batch.return_logprob,
@@ -334,7 +307,7 @@ index 7c7410828..a56e45854 100644
                                  )
                              else:
                                  # Result D2H on copy_stream overlaps the next forward
-@@ -4415,7 +4455,16 @@ class Scheduler(
+@@ -4362,7 +4402,16 @@ class Scheduler(
                                  with self.copy_stream_ctx:
                                      batch_result.copy_to_cpu(
                                          return_logprob=batch.return_logprob,
@@ -352,23 +325,23 @@ index 7c7410828..a56e45854 100644
                                      )
                          else:
                              batch_result.future_indices = future_indices
-@@ -4527,7 +4576,14 @@ class Scheduler(
-                     if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
-                         batch_result.copy_to_cpu(
-                             return_logprob=batch.return_logprob,
--                            return_hidden_states=batch.return_hidden_states,
-+                            return_hidden_states=self._should_copy_hidden_states_to_cpu(
-+                                batch
-+                            ),
-+                            capture_stream=(
-+                                self.forward_stream
-+                                if self._should_capture_hidden_states_on_device(batch)
-+                                else None
-+                            ),
-                         )
+@@ -4406,7 +4455,14 @@ class Scheduler(
+                 if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
+                     batch_result.copy_to_cpu(
+                         return_logprob=batch.return_logprob,
+-                        return_hidden_states=batch.return_hidden_states,
++                        return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                            batch
++                        ),
++                        capture_stream=(
++                            self.forward_stream
++                            if self._should_capture_hidden_states_on_device(batch)
++                            else None
++                        ),
+                     )
              else:
                  kwargs = (
-@@ -4698,7 +4754,12 @@ class Scheduler(
+@@ -4577,7 +4633,12 @@ class Scheduler(
          with self.copy_stream_ctx:
              batch_result.copy_to_cpu(
                  return_logprob=cur_batch.return_logprob,
@@ -382,7 +355,7 @@ index 7c7410828..a56e45854 100644
              )
  
          # Release the closure and large GPU tensors that are no longer needed.
-@@ -4717,6 +4778,11 @@ class Scheduler(
+@@ -4596,6 +4657,11 @@ class Scheduler(
          batch: ScheduleBatch,
          result: Union[GenerationBatchResult, EmbeddingBatchResult],
      ):
@@ -394,7 +367,7 @@ index 7c7410828..a56e45854 100644
          # Flush async trace ops here: in overlap mode this CPU work runs while
          # the next batch's GPU forward is in flight, giving free overlap.
          flush_trace_batch(batch.reqs)
-@@ -4844,6 +4910,16 @@ class Scheduler(
+@@ -4723,6 +4789,19 @@ class Scheduler(
          # Flush any health-check signal deferred while the engine was busy.
          self.maybe_send_health_check_signal()
  
@@ -403,15 +376,18 @@ index 7c7410828..a56e45854 100644
 +        # the ZeroMQ output socket remains single-threaded.  Do not enter the
 +        # idle sleeper while a future is outstanding or the producer waiting
 +        # for that response could deadlock.
-+        self.batch_result_processor.drain_spec_captures()
-+        if self.batch_result_processor.has_pending_spec_captures():
-+            time.sleep(0.001)
-+            return
++        # (getattr: upstream unit tests drive on_idle on a bare Scheduler stub.)
++        processor = getattr(self, "batch_result_processor", None)
++        if processor is not None:
++            processor.drain_spec_captures()
++            if processor.has_pending_spec_captures():
++                time.sleep(0.001)
++                return
 +
          # Publish before the fully-idle gate: a no-batch-but-not-idle stall
          # (queues parked under KV pressure / disagg transfer) has no
          # process_batch_result to publish the growing gauge, and gating here
-@@ -4943,6 +5019,7 @@ class Scheduler(
+@@ -4818,6 +4897,7 @@ class Scheduler(
              and not self.dllm_manager.any_staging_reqs()
              and (self.last_batch is None or self.last_batch.is_empty())
              and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -420,7 +396,7 @@ index 7c7410828..a56e45854 100644
          )
  
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 386e8d10f..776855866 100644
+index 386e8d10f6..776855866f 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -1,7 +1,9 @@
@@ -724,7 +700,7 @@ index 386e8d10f..776855866 100644
          self,
          *,
 diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-index 15659cf2d..a919f2d30 100644
+index 15659cf2dc..a919f2d306 100644
 --- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
 +++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
 @@ -178,6 +178,17 @@ class SchedulerOutputStreamer:
@@ -771,10 +747,10 @@ index 15659cf2d..a919f2d30 100644
              indexer_topk=self.indexer_topk,
              customized_info=(
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 628d94be0..06ecacc03 100644
+index 1b63fb642b..5bbf2f6439 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1458,6 +1458,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1519,6 +1519,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  num_items_assigned=obj.num_items_assigned,
                  multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                  encoder_urls=obj.encoder_urls,
@@ -782,7 +758,7 @@ index 628d94be0..06ecacc03 100644
              )
          elif isinstance(obj, EmbeddingReqInput):
              # Resolve unresolved embed overrides now that input_ids are available
-@@ -2382,6 +2383,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -2443,6 +2444,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  hidden_states = recv_obj.output_hidden_states[i]
                  if hidden_states is not None:
                      meta_info["hidden_states"] = hidden_states
@@ -794,10 +770,10 @@ index 628d94be0..06ecacc03 100644
                  val = recv_obj.routed_experts[i]
                  if val is not None:
 diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
-index f739fb998..88baa5c4b 100644
+index be44849baa..65d82e953a 100644
 --- a/python/sglang/srt/managers/utils.py
 +++ b/python/sglang/srt/managers/utils.py
-@@ -149,11 +149,35 @@ class GenerationBatchResult:
+@@ -130,11 +130,35 @@ class GenerationBatchResult:
          return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
  
      @torch.profiler.record_function("copy_result_to_cpu")
@@ -835,7 +811,7 @@ index f739fb998..88baa5c4b 100644
              if self.logits_output.next_token_logprobs is not None:
                  self.logits_output.next_token_logprobs = _async_d2h(
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 7b0fdf83a..68fc72923 100644
+index 40a7ce1049..e5eef67cd6 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -394,6 +394,25 @@ class ModelRunner:
@@ -864,7 +840,7 @@ index 7b0fdf83a..68fc72923 100644
          # Apply the rank zero filter to logger
          if get_observability().show_time_cost:
              enable_show_time_cost()
-@@ -1021,7 +1040,13 @@ class ModelRunner:
+@@ -1020,7 +1039,13 @@ class ModelRunner:
              eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
              dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
              dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
@@ -881,7 +857,7 @@ index 7b0fdf83a..68fc72923 100644
          # they construct (the FlashInfer KV-access check).
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 000000000..37692fdb9
+index 0000000000..37692fdb9a
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
 @@ -0,0 +1,455 @@
