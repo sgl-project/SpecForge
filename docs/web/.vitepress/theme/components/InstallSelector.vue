@@ -80,6 +80,10 @@ const lines = computed<string[]>(() => {
     if (useUv) out.push(`uv pip install${hw === 'cuda' ? '' : ' --system'} ${pkg.join(' ')}`)
     else out.push(`${hw === 'cuda' ? 'pip' : 'python -m pip'} install ${pkg.join(' ')}`)
   }
+  // DFlash drafts use Liger kernels by default on ROCm; keep the ROCm Triton.
+  if (hw === 'rocm') {
+    out.push(`${useUv ? 'uv pip install --system' : 'python -m pip install'} --no-deps liger-kernel`)
+  }
   return out
 })
 

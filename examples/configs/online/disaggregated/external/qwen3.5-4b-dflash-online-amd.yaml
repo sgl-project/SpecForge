@@ -11,7 +11,8 @@ model:
   embedding_key: "model.language_model.embed_tokens.weight"
   torch_dtype: "bfloat16"
   # Liger fused RMSNorm/SwiGLU: validated on MI355X (+10% tokens/s, -15% peak
-  # mem, loss parity). Requires the flex-backend fix (torch<2.11) to run.
+  # mem, loss parity). Requires the flex-backend fix (torch<2.11) to run. Also
+  # the ROCm default; install it with `pip install --no-deps liger-kernel`.
   use_liger_kernel: true
 data:
   train_data_path: "./cache/dataset/sharegpt_train.jsonl"

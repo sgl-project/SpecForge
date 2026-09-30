@@ -24,6 +24,11 @@ python -m pip install -e . --no-deps
 torch/sglang. If a later step reports a missing lightweight dependency, install
 just that package, also with `--no-deps`.
 
+`liger-kernel` is not needed: on NPU, DFlash drafts keep the native
+RMSNorm/SwiGLU (`model.use_liger_kernel` resolves to off). Liger's Ascend
+backend is not validated in SpecForge; an explicit `model.use_liger_kernel:
+true` tries it and logs a warning.
+
 ### Apply the SGLang capture patches (online runs only)
 
 Online capture needs two patches on top of the installed SGLang, applied **in
