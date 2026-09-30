@@ -112,9 +112,9 @@ class ConfigSchemaTest(unittest.TestCase):
                         continue
                     with self.assertRaisesRegex(
                         ValueError,
-                        "model.use_liger_kernel=true is supported only for "
-                        rf"training.strategy 'dflash' \(DFlash/DFlash2 drafts\); "
-                        f"got '{strategy}'. Remove the key or set it to false.",
+                        rf"algorithm '{strategy}' does not support "
+                        r"model.use_liger_kernel=true \(its draft does not wire "
+                        r"Liger kernels\); remove the key or set it to false",
                     ):
                         resolve_run(cfg)
 

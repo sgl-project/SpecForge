@@ -592,7 +592,7 @@ checked-in environment before installing SpecForge:
 ```bash
 python -m pip install -r requirements-rocm.txt
 python -m pip install -e . --no-deps
-python -m pip install --no-deps liger-kernel
+python -m pip install --no-deps "liger-kernel>=0.8.3,<0.9"
 ```
 
 Use a model/backend combination supported by that PyTorch ROCm environment;

@@ -82,7 +82,7 @@ const lines = computed<string[]>(() => {
   }
   // DFlash drafts use Liger kernels by default on ROCm; keep the ROCm Triton.
   if (hw === 'rocm') {
-    out.push(`${useUv ? 'uv pip install --system' : 'python -m pip install'} --no-deps liger-kernel`)
+    out.push(`${useUv ? 'uv pip install --system' : 'python -m pip install'} --no-deps "liger-kernel>=0.8.3,<0.9"`)
   }
   return out
 })

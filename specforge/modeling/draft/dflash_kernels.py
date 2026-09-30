@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch import nn
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config, Qwen3MLP, Qwen3RMSNorm
 
+#: The Liger series the DFlash integration is checked against; pyproject.toml
+#: pins the same range.
+LIGER_REQUIREMENT = "liger-kernel>=0.8.3,<0.9"
 #: Activations Liger's SwiGLU MLP implements.
 LIGER_HIDDEN_ACTS = ("silu", "swish")
 #: Liger kernels are Triton programs. SpecForge validates them on CUDA and ROCm;
@@ -21,6 +24,8 @@ _NO_DEPS_STACKS = {
     "npu": "torch_npu/triton-ascend",
     "xpu": "XPU PyTorch/Triton",
 }
+#: Top-level modules whose absence means Liger is not installed.
+_LIGER_IMPORT_ROOTS = ("triton", "liger_kernel")
 
 
 @dataclass(frozen=True)
@@ -102,9 +107,10 @@ def resolve_liger_kernel_choice(
 
     if platform not in _LIGER_DEFAULT_PLATFORMS + _LIGER_UNVALIDATED_PLATFORMS:
         raise ValueError(
-            "model.use_liger_kernel=true requires a CUDA or ROCm GPU (Liger "
-            f"kernels are Triton); this trainer's device is {platform!r}. Remove "
-            "the key or set it to false to use the native Qwen3 RMSNorm/SwiGLU."
+            "model.use_liger_kernel=true requires a Triton GPU backend: CUDA or "
+            "ROCm, or Ascend NPU/XPU where it is unvalidated in SpecForge; this "
+            f"trainer's device is {platform!r}. Remove the key or set it to "
+            "false to use the native Qwen3 RMSNorm/SwiGLU."
         )
     if hidden_act not in LIGER_HIDDEN_ACTS:
         raise ValueError(
@@ -119,11 +125,25 @@ def resolve_liger_kernel_choice(
     return LigerKernelChoice(True, "explicit", platform)
 
 
+def resolve_draft_liger_kernel_choice(
+    requested: Optional[bool], draft_config: Any
+) -> LigerKernelChoice:
+    """Resolve the flag for one draft config on this process's accelerator."""
+    return resolve_liger_kernel_choice(
+        requested,
+        platform=current_liger_platform(),
+        hidden_act=str(getattr(draft_config, "hidden_act", "silu")),
+    )
+
+
 def _liger_install_hint(platform: str) -> str:
     stack = _NO_DEPS_STACKS.get(platform)
     if stack is None:
-        return 'pip install "specforge[liger]", or pip install liger-kernel'
-    return f"pip install --no-deps liger-kernel into the existing {stack} stack"
+        return f'pip install "{LIGER_REQUIREMENT}"'
+    return (
+        f'pip install --no-deps "{LIGER_REQUIREMENT}" into the existing {stack} '
+        "stack"
+    )
 
 
 def load_liger_dflash_kernels(
@@ -131,12 +151,20 @@ def load_liger_dflash_kernels(
 ) -> DFlashKernels:
     """Load Liger lazily and adapt its constructors to the DFlash boundary."""
 
-    choice = choice or LigerKernelChoice(True, "explicit", "cuda")
+    choice = choice or LigerKernelChoice(True, "explicit", current_liger_platform())
     try:
         # Liger's kernels are Triton programs; name a missing Triton directly.
         import triton  # noqa: F401
         from liger_kernel.transformers import LigerRMSNorm, LigerSwiGLUMLP
     except ImportError as exc:
+        if (exc.name or "").partition(".")[0] not in _LIGER_IMPORT_ROOTS:
+            raise ImportError(
+                f"model.use_liger_kernel resolved to true ({choice.reason}) but "
+                f"importing Liger failed inside an installed package: {exc}. "
+                f"Check that the installed liger-kernel matches {LIGER_REQUIREMENT} "
+                "and this PyTorch stack, or set model.use_liger_kernel: false to "
+                "use the native Qwen3 RMSNorm/SwiGLU."
+            ) from exc
         raise ImportError(
             f"model.use_liger_kernel resolved to true ({choice.reason}) but Liger "
             f"could not be imported: {exc}. Install it "
