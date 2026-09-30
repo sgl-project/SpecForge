@@ -163,10 +163,11 @@ What moved each side:
   and Liger RMSNorm/SwiGLU.
 - RDMA loopback takes the per-byte CPU copies out of the SGLang and trainer
   processes: at 4+4 the trainer step fell from 1.42 s to 1.22 s. The capture
-  servers publish from GPU memory on RDMA. The recipe leaves
-  `rdma_devices` unset, so the launcher uses every usable HCA of the node and,
-  instead of falling back to TCP, stops with the reason when none is usable (in
-  a container, pass `--device /dev/infiniband` and `--ulimit memlock=-1`).
+  servers publish from GPU memory on RDMA, which needs GPUDirect RDMA
+  (`nvidia_peermem` or DMA-BUF). The recipe pins the eight HCAs it was measured
+  on; instead of falling back to TCP, the launcher stops with the reason when
+  one of them is not usable (in a container, pass `--device /dev/infiniband`
+  and `--ulimit memlock=-1`).
 - The continuous producer feed removes the fleet-wide drain at every
   4,096-prompt boundary (about 29 s without capture on this node's CPUs), and
   the durable ack runs off the training thread.
@@ -200,8 +201,9 @@ producer. Rank 1 waits for readiness and runs the eight-rank consumer. Both
 nodes must see the fresh `DISAGG_RUN_ROOT`; feature tensors travel only through
 Mooncake. `DRY_RUN=1` prints every command instead of running it. Override
 `SERVER_COUNT`, `SERVER_GPUS`, `TRAINER_GPUS` and `TRAINER_NPROC` for another
-allocation, `MOONCAKE_PROTOCOL=rdma` plus `MOONCAKE_RDMA_DEVICES=<hca>` for an
-InfiniBand fabric, and `TARGET_MODEL_PATH=Qwen/Qwen3.8-27B-FP8` for Hopper.
+allocation, `MOONCAKE_PROTOCOL=rdma` for an InfiniBand fabric (each node then
+uses its usable HCAs; `MOONCAKE_RDMA_DEVICES=<hca>` pins a list), and
+`TARGET_MODEL_PATH=Qwen/Qwen3.8-27B-FP8` for Hopper.
 
 Without the wrapper, start the services on the capture node with the settings
 the wrapper uses. Replace `CAPTURE_IP` with the address the trainer node can

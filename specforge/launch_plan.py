@@ -194,8 +194,13 @@ class LaunchPlan:
     managed_root: Optional[str] = None
     managed_ports: tuple[int, ...] = ()
     #: Host bytes the largest owned Mooncake client registers over RDMA, which
-    #: RLIMIT_MEMLOCK must cover; None when the managed stack uses TCP.
+    #: RLIMIT_MEMLOCK must cover; None when the managed stack uses TCP or its
+    #: RDMA devices are unresolved.
     managed_rdma_memlock_bytes: Optional[int] = None
+    #: Why the managed stack's RDMA devices could not be resolved on this host.
+    #: The plan still renders (``--plan`` off the training node); the managed
+    #: preflight raises it before anything starts.
+    managed_rdma_error: Optional[str] = None
     # SIGTERM-trapped workers run Mooncake drains, checkpoint flushes, and
     # failure-sentinel publication inside this window before SIGKILL.
     shutdown_grace_s: float = 30.0
@@ -214,6 +219,7 @@ class LaunchPlan:
                     "managed_root": self.managed_root,
                     "managed_ports": list(self.managed_ports),
                     "managed_rdma_memlock_bytes": self.managed_rdma_memlock_bytes,
+                    "managed_rdma_error": self.managed_rdma_error,
                     "shutdown_grace_s": self.shutdown_grace_s,
                 }
             )
@@ -403,7 +409,9 @@ def _disaggregated_env(
     return values
 
 
-def _resolve_managed_rdma_devices(requested: Optional[str], *, defaulted: bool) -> str:
+def _resolve_managed_rdma_devices(
+    requested: Optional[str], *, defaulted: bool, env: Mapping[str, str]
+) -> str:
     return resolve_rdma_devices(
         requested,
         selected_by=(
@@ -412,6 +420,7 @@ def _resolve_managed_rdma_devices(requested: Optional[str], *, defaulted: bool) 
         ),
         devices_setting="managed_local.mooncake.rdma_devices",
         opt_out="set managed_local.mooncake.protocol: tcp",
+        env=env,
     )
 
 
@@ -421,15 +430,23 @@ def _managed_mooncake_transport(
     *,
     managed_child: bool,
     rdma_device_resolver: Callable[..., str],
-) -> tuple[str, Optional[str]]:
-    """Resolve the owned stack's Mooncake protocol and RDMA devices once."""
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Resolve the owned stack's Mooncake protocol and RDMA devices once.
+
+    Returns ``(protocol, rdma_devices, error)``; *error* says why the RDMA
+    devices could not be resolved on this host.
+    """
     deployment = cfg.deployment.disaggregated
     assert deployment is not None and deployment.managed_local is not None
     managed = deployment.managed_local
     mooncake = managed.mooncake
     if managed_child and base_env.get("MOONCAKE_PROTOCOL"):
         # The supervisor rendered its resolution into this child's environment.
-        return base_env["MOONCAKE_PROTOCOL"], base_env.get("MOONCAKE_RDMA_DEVICES")
+        return (
+            base_env["MOONCAKE_PROTOCOL"],
+            base_env.get("MOONCAKE_RDMA_DEVICES"),
+            None,
+        )
     if mooncake.protocol is not None:
         protocol = mooncake.protocol
     elif _device_visibility_env_var() == "ASCEND_RT_VISIBLE_DEVICES":
@@ -439,9 +456,17 @@ def _managed_mooncake_transport(
     else:
         protocol = "rdma"
     if protocol == "rdma":
-        return protocol, rdma_device_resolver(
-            mooncake.rdma_devices, defaulted=mooncake.protocol is None
-        )
+        try:
+            devices = rdma_device_resolver(
+                mooncake.rdma_devices,
+                defaulted=mooncake.protocol is None,
+                env=base_env,
+            )
+        except RuntimeError as error:
+            # Keep --plan usable off the training node; the configured list, if
+            # any, is rendered and nothing starts (see _managed_rdma_preflight).
+            return protocol, mooncake.rdma_devices, str(error)
+        return protocol, devices, None
     # The schema rejects these with an explicit tcp; recheck the Ascend default.
     if any(server.gpu_put for server in managed.capture_servers):
         raise ValueError(
@@ -457,7 +482,7 @@ def _managed_mooncake_transport(
             "host and the tcp transport cannot write into device memory; set "
             "managed_local.mooncake.protocol: rdma or use pinned receive buffers"
         )
-    return protocol, mooncake.rdma_devices
+    return protocol, mooncake.rdma_devices, None
 
 
 def _managed_local_environment(
@@ -499,6 +524,9 @@ def _managed_rdma_memlock_bytes(
     register one transient buffer per fetch).
     """
     if environment["MOONCAKE_PROTOCOL"] != "rdma":
+        return None
+    if not environment.get("MOONCAKE_RDMA_DEVICES"):
+        # Unresolved; the preflight refuses the plan before sizing matters.
         return None
     deployment = cfg.deployment.disaggregated
     assert deployment is not None and deployment.managed_local is not None
@@ -588,6 +616,14 @@ def _managed_local_services(
     device_visibility_env = _device_visibility_env_var()
     capture_context_length = cfg.model.sglang_context_length or (
         cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
+    )
+    # GPU publication also needs GPUDirect RDMA (nvidia_peermem or DMA-BUF),
+    # which the preflight cannot see and the sink meets only at its first
+    # capture, so only an explicit protocol: rdma turns it on automatically.
+    default_gpu_put = (
+        False
+        if mooncake.protocol is None and shared_env["MOONCAKE_PROTOCOL"] == "rdma"
+        else None
     )
 
     mooncake_service = ServiceSpec(
@@ -681,14 +717,15 @@ def _managed_local_services(
         # The schema rejects passthrough flags that repeat any flag above.
         argv.extend(cfg.model.sglang_extra_args)
         argv.extend(server.extra_args)
+        gpu_put = server.gpu_put if server.gpu_put is not None else default_gpu_put
         service_env = {
             # Validated not to overlap the keys below, which win regardless.
             **server.env,
             **shared_env,
             device_visibility_env: ",".join(server.cuda_visible_devices),
             **(
-                {"SGLANG_SPEC_CAPTURE_GPU_PUT": "1" if server.gpu_put else "0"}
-                if server.gpu_put is not None
+                {"SGLANG_SPEC_CAPTURE_GPU_PUT": "1" if gpu_put else "0"}
+                if gpu_put is not None
                 else {}
             ),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
@@ -859,8 +896,10 @@ def build_launch_plan(
     """Resolve one validated config into a side-effect-free process plan.
 
     A managed-local stack on RDMA reads the host's HCAs from sysfs;
-    *rdma_device_resolver* replaces that probe (``(rdma_devices, *, defaulted)
-    -> device list``).
+    *rdma_device_resolver* replaces that probe (``(rdma_devices, *, defaulted,
+    env) -> device list``). A probe that fails is recorded as
+    ``managed_rdma_error`` instead of raising, so the plan still renders on a
+    host without the HCAs, and the managed preflight refuses to launch it.
     """
     if cfg.mode == "online":
         if cfg.deployment.mode != "disaggregated":
@@ -924,8 +963,9 @@ def build_launch_plan(
     if cfg.deployment.mode == "disaggregated":
         role_base_env = base_env
         managed_environment: dict[str, str] = {}
+        managed_rdma_error: Optional[str] = None
         if managed_local is not None:
-            protocol, rdma_devices = _managed_mooncake_transport(
+            protocol, rdma_devices, managed_rdma_error = _managed_mooncake_transport(
                 cfg,
                 base_env,
                 managed_child=managed_child,
@@ -1051,6 +1091,7 @@ def build_launch_plan(
             managed_rdma_memlock_bytes=_managed_rdma_memlock_bytes(
                 cfg, managed_environment
             ),
+            managed_rdma_error=managed_rdma_error,
             shutdown_grace_s=managed_local.shutdown_grace_s,
         )
     return LaunchPlan(
@@ -1126,6 +1167,8 @@ def _terminate_processes(
 
 def _managed_rdma_preflight(plan: LaunchPlan) -> None:
     """Refuse an RDMA stack that would fall back to TCP or fail to register."""
+    if plan.managed_rdma_error is not None:
+        raise RuntimeError(plan.managed_rdma_error)
     opt_out = "set managed_local.mooncake.protocol: tcp"
     for command in (*(service.command for service in plan.services), *plan.commands):
         if command.env.get("MOONCAKE_PROTOCOL") != "rdma":
@@ -1136,6 +1179,7 @@ def _managed_rdma_preflight(plan: LaunchPlan) -> None:
             {name: value for name, value in child_env.items() if value is not None},
             where=f"the {command.label} environment",
             opt_out=opt_out,
+            devices=command.env.get("MOONCAKE_RDMA_DEVICES"),
         )
     required = plan.managed_rdma_memlock_bytes
     if required is None:

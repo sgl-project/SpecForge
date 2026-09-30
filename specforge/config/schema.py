@@ -560,8 +560,8 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
     #: Transport for every owned Mooncake client. None is resolved once when
-    #: the launch plan is built: tcp on Ascend hosts and rdma everywhere else,
-    #: failing when no usable HCA is found. tcp opts out of RDMA.
+    #: the launch plan is built: tcp on Ascend hosts and rdma everywhere else;
+    #: the launch fails when no usable HCA is found. tcp opts out of RDMA.
     protocol: Optional[Literal["tcp", "rdma"]] = None
     #: Comma-separated HCAs for rdma. None selects every usable HCA of one link
     #: layer; a listed device that is not usable is an error.
@@ -609,7 +609,9 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
-    #: None selects CUDA publication on RDMA in the capture worker.
+    #: None selects CUDA publication in the capture worker when
+    #: mooncake.protocol is rdma explicitly, and host publication when the
+    #: protocol is left unset (CUDA publication also needs GPUDirect RDMA).
     gpu_put: Optional[bool] = None
     #: SGLang's generation-based /health waits at least one second internally.
     probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)

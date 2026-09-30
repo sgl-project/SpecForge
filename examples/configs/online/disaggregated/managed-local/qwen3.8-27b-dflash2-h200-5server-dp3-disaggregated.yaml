@@ -93,13 +93,14 @@ deployment:
       mooncake:
         # RDMA loopback through the node's HCAs. Over TCP every captured byte is
         # copied by the CPU inside the SGLang and trainer processes, which slowed
-        # each trainer step by 14% at this split; RDMA also turns on the capture
-        # servers' GPU publication. rdma is the managed-local default on CUDA
-        # hosts; it is spelled out because the measured split depends on it.
-        # With rdma_devices unset the launcher selects every usable HCA (ACTIVE
-        # port, /dev/infiniband node present) and fails instead of falling back
-        # to TCP when there is none; set rdma_devices to pin a subset.
+        # each trainer step by 14% at this split. The explicit rdma also turns on
+        # the capture servers' GPU publication, which needs GPUDirect RDMA
+        # (nvidia_peermem or DMA-BUF). The split was measured on these eight
+        # HCAs; the launcher refuses a listed HCA that is missing or not usable
+        # instead of falling back to TCP, so match the list to the node
+        # (ls /sys/class/infiniband).
         protocol: rdma
+        rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
         default_kv_lease_ttl_ms: 10000
         global_segment_size_bytes: 68719476736
         local_buffer_size_bytes: 4294967296

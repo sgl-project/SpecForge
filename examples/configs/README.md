@@ -347,8 +347,8 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.mooncake_metadata_server` | `null` | External Mooncake metadata URL. |
 | `deployment.disaggregated.mooncake_master_server_addr` | `null` | External Mooncake RPC `host:port`. |
 | `deployment.disaggregated.mooncake_local_hostname` | `null` | Node-local Mooncake transfer hostname; usually supplied through the environment. |
-| `deployment.disaggregated.mooncake_protocol` | `null` | External transfer protocol, `tcp` or `rdma`. Unset uses `MOONCAKE_PROTOCOL`, else `tcp`: SpecForge cannot see an external server's protocol, and every server and trainer of one store must use the same one. |
-| `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection. Under `rdma`, unset selects the usable HCAs of each producer or trainer node; external capture servers must list theirs in `MOONCAKE_RDMA_DEVICES`. |
+| `deployment.disaggregated.mooncake_protocol` | `null` | External transfer protocol, `tcp` or `rdma`. An exported `MOONCAKE_PROTOCOL` overrides this value; with neither set, `tcp`: SpecForge cannot see an external server's protocol, and every server and trainer of one store must use the same one. |
+| `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection; an exported `MOONCAKE_RDMA_DEVICES` overrides it. Under `rdma`, a producer or trainer checks every listed device, and unset selects the usable HCAs of its node; external capture servers must list theirs in `MOONCAKE_RDMA_DEVICES`. |
 | `deployment.disaggregated.producer_segment_size` | `null` | Positive allocation owned by an offline Mooncake producer. Online capture is server-owned and forces client segments to zero. |
 | `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. For `receive_buffers: cuda`, size for the largest concurrently fetched tensors; an 8k-token Qwen3.8-27B feature can exceed this default. Use e.g. `2147483648` and increase with fetch concurrency. |
 | `deployment.disaggregated.receive_buffers` | `pinned` | Consumer receive buffers for feature reads: `pinned` (pooled page-locked host buffers, side-stream device copy), `pageable` (fresh host tensor per feature), or `cuda` (pooled device buffers; Mooncake 0.3.x stages RDMA reads through its client buffer). |
@@ -414,7 +414,7 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.mooncake.default_kv_lease_ttl_ms` | `500` | Master key-lease TTL (ms) forwarded to `mooncake_master --default_kv_lease_ttl`. Kept below the consumer's teardown drain window so managed_local shuts down cleanly; set `null` to inherit Mooncake's stock default. |
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
-| `deployment.disaggregated.managed_local.capture_servers[].gpu_put` | `null` | Automatically publish from CUDA memory when the capture worker uses RDMA. Set `false` to use host publication or `true` to require GPU publication; `true` requires the stack to resolve to RDMA. |
+| `deployment.disaggregated.managed_local.capture_servers[].gpu_put` | `null` | Publish from CUDA memory automatically when `mooncake.protocol: rdma` is set explicitly; with the protocol unset, `null` keeps host publication. Set `false` to use host publication or `true` to require GPU publication; `true` requires the stack to resolve to RDMA. GPU publication needs GPUDirect RDMA (`nvidia_peermem` or DMA-BUF support). |
 | `deployment.disaggregated.managed_local.capture_servers[].tp_size` | `1` | Target-model tensor parallelism for this server. |
 | `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `null` | Optional SGLang static-memory override in `(0, 1]`; otherwise inherit `model.sglang_mem_fraction_static`. |
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
@@ -427,16 +427,27 @@ Managed-local stacks use Mooncake RDMA by default and never fall back to TCP
 silently. The launcher resolves the transport once, when it builds the plan, and
 renders the resolved `MOONCAKE_PROTOCOL` and `MOONCAKE_RDMA_DEVICES` into every
 capture server, the producer and the trainer; `--plan` prints them. An HCA is
-usable when it has an ACTIVE InfiniBand port, or an ACTIVE RoCE port with a RoCE
-v2 GID bound to a network interface, and its `/dev/infiniband/uverbs*` node is
-readable and writable by the launching process. The launch fails, naming the
-reason for each device, when no HCA is usable, when a listed device is not,
+usable when the one port Mooncake opens (`MC_IB_PORT`, default 1) is ACTIVE
+InfiniBand, or ACTIVE RoCE with a RoCE v2 GID bound to a network interface (a
+non-zero GID at `MC_GID_INDEX` when that is set), when its
+`/dev/infiniband/uverbs*` node is readable and writable by the launching
+process, and when `MC_TE_FILTERS`, if set, admits it. The launch fails, naming
+the reason for each device, when no HCA is usable, when a listed device is not,
 when `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` or `MC_USE_TEV1` is
-set, or when `RLIMIT_MEMLOCK` is below the host memory Mooncake registers
-(every host buffer once per HCA; `ulimit -l unlimited` or `CAP_IPC_LOCK`
-satisfies it). In a container, pass `--device /dev/infiniband` and
-`--ulimit memlock=-1`. Set `mooncake.protocol: tcp` to opt out; Ascend hosts
-default to TCP.
+set, when `MC_TE_FILTERS` excludes a selected device, or when `RLIMIT_MEMLOCK`
+is below the host memory Mooncake registers (every host buffer once per HCA;
+`ulimit -l unlimited` or `CAP_IPC_LOCK` satisfies it). In a container, pass
+`--device /dev/infiniband` and `--ulimit memlock=-1`. Set
+`mooncake.protocol: tcp` to opt out; Ascend hosts default to TCP. On a host
+without the HCAs, such as a laptop, `--plan` still prints the plan with the
+configured devices and reports why they do not resolve (`managed_rdma_error`);
+launching it there fails.
+
+With the protocol unset, capture servers keep host publication unless an entry
+sets `gpu_put: true`. An explicit `protocol: rdma` also turns on GPU
+publication, whose GPUDirect RDMA requirement is met only at the first capture,
+after the servers report healthy; set `gpu_put: false` to keep RDMA with host
+publication.
 
 `startup_timeout_s` bounds the overall readiness wait; `probe_timeout_s` controls
 each probe within that window. Increasing only the startup timeout cannot fix
@@ -452,7 +463,8 @@ Select `receive_buffers: pageable` to restore fresh host receives. The 8 GiB rec
 budget is allocated lazily per rank and excludes returned tensors and overflow buffers.
 
 Patched CUDA capture servers use GPU publication automatically when
-`MOONCAKE_PROTOCOL=rdma`; TCP and non-CUDA workers use host publication. External
+`MOONCAKE_PROTOCOL=rdma` (managed-local: when `mooncake.protocol: rdma` is set
+explicitly); TCP and non-CUDA workers use host publication. External
 servers can set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` to disable it or `1` to explicitly
 enable it. Managed-local `gpu_put: false` also disables an inherited enable flag.
 
