@@ -254,6 +254,20 @@ Managed capture derives SGLang `--context-length` as `data.max_length + 7` to
 reserve the request headroom required by the capture endpoint. An explicit
 `model.sglang_context_length` must be at least that value.
 
+Managed-local stacks move Mooncake traffic over RDMA by default. The launcher
+resolves `managed_local.mooncake.protocol` once, when it builds the plan: unset
+means `rdma`, except on Ascend hosts, which keep `tcp`. Under RDMA it selects
+every usable HCA of one link layer (InfiniBand before RoCE) when `rdma_devices`
+is unset, checks every listed device otherwise, and renders the result into
+every owned process, so `--plan` shows the exact `MOONCAKE_PROTOCOL` and
+`MOONCAKE_RDMA_DEVICES`. It never falls back to TCP. The launch fails with the
+reason and the fix when no HCA is usable, when a listed device is not, when
+`MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` or `MC_USE_TEV1` is set, or
+when `RLIMIT_MEMLOCK` cannot cover the host memory Mooncake registers. A
+container needs `--device /dev/infiniband` and `--ulimit memlock=-1` (or
+`--cap-add IPC_LOCK`). Set `protocol: tcp` to opt out; recipes that already do
+behave as before.
+
 ## Split pools and multi-node consumers
 
 The same YAML launches either role explicitly:
@@ -386,6 +400,16 @@ export MOONCAKE_LOCAL_HOSTNAME=this-node-routable-address
 Keep `DISAGG_AUTH_TOKEN`, node-local hostnames, and device visibility out of
 checked-in YAML. `MOONCAKE_PROTOCOL` and `MOONCAKE_RDMA_DEVICES` may also be
 node-local deployment values.
+
+External deployments stay on `tcp` unless `mooncake_protocol` or
+`MOONCAKE_PROTOCOL` selects `rdma`. SpecForge cannot see the servers' protocol,
+and a store whose clients mix TCP and RDMA fails on the first read, so set the
+same value for every server, producer and trainer. Under RDMA a producer or
+trainer without `MOONCAKE_RDMA_DEVICES` uses its node's usable HCAs and fails
+when there is none, and a patched capture server refuses to start without an
+explicit `MOONCAKE_RDMA_DEVICES`. Both reject `MC_FORCE_TCP`,
+`MC_MS_AUTO_DISC=1`, `MC_USE_TENT` and `MC_USE_TEV1`, which would put Mooncake
+on TCP or ignore the device list.
 
 The online producer sends prompts to the URLs in
 `deployment.disaggregated.server_urls`. Start a patched SGLang server separately

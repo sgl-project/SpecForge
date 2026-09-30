@@ -163,7 +163,10 @@ What moved each side:
   and Liger RMSNorm/SwiGLU.
 - RDMA loopback takes the per-byte CPU copies out of the SGLang and trainer
   processes: at 4+4 the trainer step fell from 1.42 s to 1.22 s. The capture
-  servers publish from GPU memory on RDMA.
+  servers publish from GPU memory on RDMA. The recipe leaves
+  `rdma_devices` unset, so the launcher uses every usable HCA of the node and,
+  instead of falling back to TCP, stops with the reason when none is usable (in
+  a container, pass `--device /dev/infiniband` and `--ulimit memlock=-1`).
 - The continuous producer feed removes the fleet-wide drain at every
   4,096-prompt boundary (about 29 s without capture on this node's CPUs), and
   the durable ack runs off the training thread.

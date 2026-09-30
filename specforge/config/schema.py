@@ -559,7 +559,12 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metadata_port: int = Field(default=35880, gt=0, le=65535)
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
-    protocol: Literal["tcp", "rdma"] = "tcp"
+    #: Transport for every owned Mooncake client. None is resolved once when
+    #: the launch plan is built: tcp on Ascend hosts and rdma everywhere else,
+    #: failing when no usable HCA is found. tcp opts out of RDMA.
+    protocol: Optional[Literal["tcp", "rdma"]] = None
+    #: Comma-separated HCAs for rdma. None selects every usable HCA of one link
+    #: layer; a listed device that is not usable is an error.
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
@@ -708,8 +713,10 @@ class ManagedLocalStackConfig(StrictConfigModel):
         capture_ports = [server.port for server in self.capture_servers]
         if len(set(capture_ports)) != len(capture_ports):
             raise ValueError("managed_local capture server ports must be unique")
+        # An unset protocol can still resolve to tcp; the launch plan repeats
+        # this check after resolving it.
         if any(server.gpu_put for server in self.capture_servers) and (
-            self.mooncake.protocol != "rdma"
+            self.mooncake.protocol == "tcp"
         ):
             raise ValueError(
                 "managed_local capture_servers[].gpu_put needs mooncake.protocol "
@@ -803,8 +810,9 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
         if self.receive_buffers == "cuda" and self.managed_local is not None:
             # External deployments resolve environment overrides in the launch
-            # plan. Managed-local transport is authoritative over the environment.
-            if self.managed_local.mooncake.protocol != "rdma":
+            # plan. Managed-local transport is authoritative over the environment;
+            # an unset protocol is checked after the launch plan resolves it.
+            if self.managed_local.mooncake.protocol == "tcp":
                 raise ValueError(
                     "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
                     "Mooncake transport (mooncake_protocol or "

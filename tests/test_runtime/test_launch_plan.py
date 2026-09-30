@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import signal
@@ -26,18 +27,54 @@ from specforge.launch_plan import (
     ReadinessSpec,
     ServiceSpec,
     _http_ready,
+    _managed_rdma_preflight,
 )
 from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
+from specforge.runtime.data_plane import mooncake_rdma
 from specforge.training.capture_contract import ServerCaptureContract
 from tests.utils import wait_for_processes_to_stop
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
 
+FAKE_RDMA_DEVICES = "mlx5_0,mlx5_1"
+
+
+def _fake_rdma_devices(requested, *, defaulted):
+    """Stand in for the sysfs HCA probe so plan tests never read this host."""
+    return requested or FAKE_RDMA_DEVICES
+
+
+def _unexpected_rdma_devices(requested, *, defaulted):
+    raise AssertionError("this plan must not resolve RDMA devices")
+
+
 def build_launch_plan(cfg, **kwargs):
     """Build every test plan with one already-resolved registration."""
+    kwargs.setdefault("rdma_device_resolver", _fake_rdma_devices)
     return _build_launch_plan(cfg, algorithm=ALGORITHM, **kwargs)
+
+
+def _managed_raw(control_dir="/fresh/managed-transport", **mooncake):
+    raw = _managed_config(control_dir).model_dump()
+    raw["deployment"]["disaggregated"]["managed_local"]["mooncake"].update(mooncake)
+    return raw
+
+
+def _build_managed(raw, **kwargs):
+    with mock.patch(
+        "specforge.training.capture_contract.resolve_server_capture_contract",
+        return_value=CAPTURE_CONTRACT,
+    ):
+        return build_launch_plan(
+            Config.model_validate(raw), config_path="run.yaml", env={}, **kwargs
+        )
+
+
+def _mooncake_clients(plan):
+    """Every owned command that opens a Mooncake transfer client."""
+    return (*(service.command for service in plan.services[1:]), *plan.commands)
 
 
 def _config(*, mode="local_colocated", nproc=1, nnodes=1):
@@ -249,6 +286,134 @@ class LaunchPlanTest(unittest.TestCase):
             )
         for command in plan.commands:
             self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "rdma")
+
+    def test_managed_protocol_defaults_to_rdma_on_resolved_devices(self):
+        calls = []
+
+        def resolver(requested, *, defaulted):
+            calls.append((requested, defaulted))
+            return "mlx5_2,mlx5_3"
+
+        raw = _managed_raw()
+        managed = Config.model_validate(raw).deployment.disaggregated.managed_local
+        self.assertIsNone(managed.mooncake.protocol)
+        plan = _build_managed(raw, rdma_device_resolver=resolver)
+
+        self.assertEqual(calls, [(None, True)])
+        self.assertNotIn("MOONCAKE_PROTOCOL", plan.services[0].command.env)
+        for command in _mooncake_clients(plan):
+            with self.subTest(command=command.label):
+                self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "rdma")
+                self.assertEqual(command.env["MOONCAKE_RDMA_DEVICES"], "mlx5_2,mlx5_3")
+        # Two HCAs register the largest client: the trainer's 256 MiB client
+        # buffer plus its 8 GiB pinned receive pool.
+        self.assertEqual(plan.managed_rdma_memlock_bytes, 2 * ((256 << 20) + (8 << 30)))
+        rendered = json.loads(plan.render())
+        self.assertEqual(
+            rendered["services"][1]["command"]["env"]["MOONCAKE_RDMA_DEVICES"],
+            "mlx5_2,mlx5_3",
+        )
+        self.assertEqual(
+            rendered["managed_rdma_memlock_bytes"], plan.managed_rdma_memlock_bytes
+        )
+
+        calls.clear()
+        plan = _build_managed(
+            _managed_raw(protocol="rdma", rdma_devices="mlx5_4"),
+            rdma_device_resolver=lambda requested, *, defaulted: (
+                calls.append((requested, defaulted)) or requested
+            ),
+        )
+        self.assertEqual(calls, [("mlx5_4", False)])
+        for command in _mooncake_clients(plan):
+            self.assertEqual(command.env["MOONCAKE_RDMA_DEVICES"], "mlx5_4")
+
+    def test_managed_rdma_without_usable_devices_names_the_opt_out(self):
+        with tempfile.TemporaryDirectory() as root:
+            # The default resolver probes sysfs; point it at an empty host.
+            with mock.patch(
+                "specforge.launch_plan.resolve_rdma_devices",
+                side_effect=functools.partial(
+                    mooncake_rdma.resolve_rdma_devices, root=root
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    with mock.patch(
+                        "specforge.training.capture_contract."
+                        "resolve_server_capture_contract",
+                        return_value=CAPTURE_CONTRACT,
+                    ):
+                        _build_launch_plan(
+                            Config.model_validate(_managed_raw()),
+                            algorithm=ALGORITHM,
+                            config_path="run.yaml",
+                            env={},
+                        )
+        message = str(raised.exception)
+        self.assertIn(
+            "managed_local.mooncake.protocol defaulted to rdma and "
+            "managed_local.mooncake.rdma_devices is unset, but no usable RDMA "
+            "device was found on this host:",
+            message,
+        )
+        self.assertIn("To use TCP, set managed_local.mooncake.protocol: tcp.", message)
+        self.assertIn("--device /dev/infiniband", message)
+
+    def test_managed_explicit_tcp_is_unchanged(self):
+        plan = _build_managed(
+            _managed_raw(protocol="tcp", rdma_devices="mlx5_0"),
+            rdma_device_resolver=_unexpected_rdma_devices,
+        )
+        for command in _mooncake_clients(plan):
+            self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "tcp")
+            self.assertEqual(command.env["MOONCAKE_RDMA_DEVICES"], "mlx5_0")
+        self.assertIsNone(plan.managed_rdma_memlock_bytes)
+        self.assertIsNone(json.loads(plan.render())["managed_rdma_memlock_bytes"])
+
+    def test_managed_ascend_default_keeps_tcp(self):
+        ascend = mock.patch(
+            "specforge.launch_plan._device_visibility_env_var",
+            return_value="ASCEND_RT_VISIBLE_DEVICES",
+        )
+        with ascend:
+            plan = _build_managed(
+                _managed_raw(), rdma_device_resolver=_unexpected_rdma_devices
+            )
+        for command in _mooncake_clients(plan):
+            self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "tcp")
+            self.assertNotIn("MOONCAKE_RDMA_DEVICES", command.env)
+        self.assertIsNone(plan.managed_rdma_memlock_bytes)
+
+        gpu_put = _managed_raw()
+        managed = gpu_put["deployment"]["disaggregated"]["managed_local"]
+        managed["capture_servers"][0]["gpu_put"] = True
+        cuda = _managed_raw()
+        cuda["deployment"]["disaggregated"]["receive_buffers"] = "cuda"
+        for name, raw, message in (
+            ("gpu_put", gpu_put, "gpu_put needs Mooncake RDMA"),
+            ("cuda", cuda, "receive_buffers=cuda needs Mooncake RDMA"),
+        ):
+            with self.subTest(feature=name), ascend:
+                with self.assertRaisesRegex(
+                    ValueError, rf"{message}, but .*defaulted to tcp on this Ascend"
+                ):
+                    _build_managed(raw, rdma_device_resolver=_unexpected_rdma_devices)
+
+    def test_managed_rdma_features_are_checked_after_resolution(self):
+        raw = _managed_raw()
+        deployment = raw["deployment"]["disaggregated"]
+        deployment["receive_buffers"] = "cuda"
+        deployment["managed_local"]["capture_servers"][0]["gpu_put"] = True
+        # An unset protocol passes the schema and resolves to rdma here.
+        plan = _build_managed(raw)
+        self.assertEqual(
+            plan.services[1].command.env["SGLANG_SPEC_CAPTURE_GPU_PUT"], "1"
+        )
+        consumer = plan.commands[1]
+        self.assertEqual(consumer.env["DISAGG_RECEIVE_BUFFERS"], "cuda")
+        self.assertEqual(consumer.env["MOONCAKE_PROTOCOL"], "rdma")
+        # cuda receive pools live in device memory.
+        self.assertEqual(plan.managed_rdma_memlock_bytes, 2 * (256 << 20))
 
     def test_disaggregated_receives_default_to_pinned_and_allow_override(self):
         for requested, expected in ((None, "pinned"), ("pageable", "pageable")):
@@ -1307,13 +1472,18 @@ class LaunchPlanTest(unittest.TestCase):
                 )
             os.makedirs(os.path.join(control_dir, "logs"))
 
+            # Children reuse the supervisor's resolution instead of reprobing.
             producer = build_launch_plan(
                 cfg,
                 config_path="run.yaml",
                 requested_role="producer",
                 env=parent.commands[0].env,
+                rdma_device_resolver=_unexpected_rdma_devices,
             )
             self.assertEqual((producer.kind, producer.role), ("worker", "producer"))
+            self.assertEqual(
+                producer.worker_env["MOONCAKE_RDMA_DEVICES"], FAKE_RDMA_DEVICES
+            )
 
             consumer_env = {
                 **parent.commands[1].env,
@@ -1328,8 +1498,13 @@ class LaunchPlanTest(unittest.TestCase):
                 config_path="run.yaml",
                 requested_role="consumer",
                 env=consumer_env,
+                rdma_device_resolver=_unexpected_rdma_devices,
             )
             self.assertEqual((consumer.kind, consumer.role), ("worker", "consumer"))
+            self.assertEqual(consumer.worker_env["MOONCAKE_PROTOCOL"], "rdma")
+            self.assertEqual(
+                consumer.worker_env["MOONCAKE_RDMA_DEVICES"], FAKE_RDMA_DEVICES
+            )
 
             for role in ("producer", "consumer"):
                 with self.subTest(projected_role=role):
@@ -1865,6 +2040,126 @@ class LaunchPlanTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "is unavailable"),
             ):
                 run_commands(plan, popen=mock.Mock())
+
+    def _rdma_plan(self, root, *, server_env=None, memlock_bytes=None):
+        plan = _managed_plan(root)
+        mooncake, capture = plan.services
+        env = {
+            "MOONCAKE_PROTOCOL": "rdma",
+            "MOONCAKE_RDMA_DEVICES": "mlx5_0",
+            **(server_env or {}),
+        }
+        capture = ServiceSpec(
+            CommandSpec(capture.command.label, capture.command.argv, env),
+            capture.readiness,
+            capture.log_path,
+            capture.phase,
+        )
+        return LaunchPlan(
+            **{
+                **plan.__dict__,
+                "services": (mooncake, capture),
+                "managed_rdma_memlock_bytes": memlock_bytes,
+            }
+        )
+
+    def _run_preflight(self, plan):
+        popen = mock.Mock()
+        with (
+            mock.patch(
+                "specforge.launch_plan.shutil.which",
+                return_value="/usr/bin/mooncake_master",
+            ),
+            mock.patch(
+                "specforge.launch_plan.importlib.util.find_spec",
+                return_value=object(),
+            ),
+        ):
+            try:
+                run_commands(plan, popen=popen)
+            finally:
+                popen.assert_not_called()
+
+    def test_managed_preflight_rejects_mooncake_tcp_overrides(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = os.path.join(parent, "attempt")
+            with mock.patch.dict(os.environ, {"MC_FORCE_TCP": "1"}, clear=True):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"Mooncake RDMA is selected, but the capture-server-0 "
+                    r"environment sets MC_FORCE_TCP='1' \(installs the TCP "
+                    r"transport\)\. Unset it, or, to use TCP, set "
+                    r"managed_local\.mooncake\.protocol: tcp\.",
+                ):
+                    self._run_preflight(self._rdma_plan(root))
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "MC_USE_TENT='1'"):
+                    self._run_preflight(
+                        self._rdma_plan(root, server_env={"MC_USE_TENT": "1"})
+                    )
+            for environ, plan in (
+                ({"MC_MS_AUTO_DISC": "0"}, self._rdma_plan(root)),
+                ({"MC_FORCE_TCP": "1"}, _managed_plan(root)),
+            ):
+                with (
+                    self.subTest(environ=environ),
+                    mock.patch.dict(os.environ, environ, clear=True),
+                ):
+                    _managed_rdma_preflight(plan)
+            with mock.patch.dict(os.environ, {"MC_MS_AUTO_DISC": "1"}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "MC_MS_AUTO_DISC='1'"):
+                    _managed_rdma_preflight(self._rdma_plan(root))
+
+    def test_managed_preflight_requires_memlock_for_rdma_registration(self):
+        with tempfile.TemporaryDirectory() as parent:
+            host = os.path.join(parent, "host")
+            os.makedirs(os.path.join(host, "proc", "self"))
+            with open(
+                os.path.join(host, "proc", "self", "status"), "w", encoding="utf-8"
+            ) as status:
+                status.write("CapEff:\t0000000000000000\n")
+            shortfall = mock.patch(
+                "specforge.launch_plan.memlock_shortfall",
+                side_effect=functools.partial(
+                    mooncake_rdma.memlock_shortfall, root=host
+                ),
+            )
+            plan = self._rdma_plan(
+                os.path.join(parent, "attempt"), memlock_bytes=1 << 30
+            )
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                shortfall,
+                mock.patch.object(
+                    mooncake_rdma.resource, "getrlimit", return_value=(65536, 65536)
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    self._run_preflight(plan)
+            self.assertEqual(
+                str(raised.exception),
+                "managed_local Mooncake RDMA registers up to 1073741824 bytes "
+                "(1.0 GiB) of host memory in one process (every host buffer once "
+                "per selected HCA), but RLIMIT_MEMLOCK is 65536 bytes and this "
+                "process lacks CAP_IPC_LOCK; owned processes inherit both. Raise "
+                "the limit before launching (ulimit -l unlimited; in a container "
+                "--ulimit memlock=-1 or --cap-add IPC_LOCK), or, to use TCP, set "
+                "managed_local.mooncake.protocol: tcp.",
+            )
+            unlimited = mooncake_rdma.resource.RLIM_INFINITY
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                shortfall,
+                mock.patch.object(
+                    mooncake_rdma.resource,
+                    "getrlimit",
+                    return_value=(unlimited, unlimited),
+                ),
+            ):
+                _managed_rdma_preflight(plan)
+            with mock.patch.object(mooncake_rdma.resource, "getrlimit") as getrlimit:
+                _managed_rdma_preflight(_managed_plan(os.path.join(parent, "tcp")))
+            getrlimit.assert_not_called()
 
     def test_mooncake_readiness_accepts_missing_key_but_rejects_server_errors(self):
         readiness = ReadinessSpec(
