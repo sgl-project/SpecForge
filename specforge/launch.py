@@ -453,6 +453,7 @@ def _iter_epoch_online_prompt_batches(
     *,
     seed: int = 0,
     batch_size: int = 4096,
+    skip_task_ids: set[str] | None = None,
 ):
     """Yield a shuffled epoch while bounding expanded token-list residency."""
     indices = _epoch_prompt_indices(prompts, epoch, seed=seed)
@@ -460,6 +461,7 @@ def _iter_epoch_online_prompt_batches(
         yield [
             _epoch_online_prompt(prompts[index], index, epoch, prompt_epochs)
             for index in indices[start : start + batch_size]
+            if not skip_task_ids or f"epoch{epoch:04d}-prompt{index:012d}" not in skip_task_ids
         ]
 
 
@@ -831,6 +833,7 @@ def build_disagg_online_producer(
     prompt_epoch_offset: int = 0,
     prompt_seed: int = 0,
     prompt_ingest_batch_size: int = 4096,
+    excluded_sample_ids: set[str] | None = None,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -955,6 +958,14 @@ def build_disagg_online_producer(
     if not hasattr(prompts, "__len__") or not hasattr(prompts, "__getitem__"):
         prompts = list(prompts)
     base_prompt_count = len(prompts)
+    skip_task_ids = set()
+    if excluded_sample_ids is not None:
+        from specforge.training.replay import validate_replay_ids
+
+        skip_task_ids = validate_replay_ids(
+            excluded_sample_ids, run_id=run_id, prompt_count=base_prompt_count,
+            prompt_epochs=prompt_epochs, prompt_epoch_offset=prompt_epoch_offset,
+        )
     producer_timing(
         "build_disagg_online_producer enter "
         f"algorithm={algorithm.name} modality={modality} "
@@ -1396,6 +1407,7 @@ def build_disagg_online_producer(
                     prompt_epochs,
                     seed=prompt_seed,
                     batch_size=feed_size,
+                    skip_task_ids=skip_task_ids,
                 )
                 for batch_index, prompt_batch in enumerate(epoch_batches):
                     yield epoch, batch_index, prompt_batch

@@ -593,6 +593,29 @@ def _producer_capture_metadata(cfg: Config, algorithm: AlgorithmRegistration):
     )
 
 
+def _load_online_replay(path, cfg):
+    from specforge.training.replay import load_replay_exclusions
+
+    if cfg.training.role == "producer":
+        return load_replay_exclusions(path, cfg)
+
+    import torch.distributed as dist
+
+    distributed = dist.is_initialized()
+    failures = [None]
+    # Only consumer rank 0 owns the SQLite ledger; propagate its result to every rank.
+    if not distributed or dist.get_rank() == 0:
+        try:
+            load_replay_exclusions(path, cfg)
+        except Exception as exc:
+            failures[0] = f"{type(exc).__name__}: {exc}"
+    if distributed:
+        dist.broadcast_object_list(failures, src=0)
+    if failures[0] is not None:
+        raise ValueError(f"online replay validation failed: {failures[0]}")
+    return None
+
+
 def _build_online(
     cfg: Config,
     *,
@@ -609,6 +632,10 @@ def _build_online(
         _profiling_options,
     )
 
+    excluded_sample_ids = None
+    replay_path = os.environ.get("SPECFORGE_REPLAY_MANIFEST")
+    if replay_path:
+        excluded_sample_ids = _load_online_replay(replay_path, cfg)
     modality = cfg.model.input_modality
     streaming = algorithm.providers.server_streaming_for(modality)
     channel_path = _env("DISAGG_REF_CHANNEL")
@@ -691,6 +718,11 @@ def _build_online(
         ]
         target_repr = streaming.target_representation
         peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
+        if replay_path:
+            with open(replay_path, encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            if len(prompts) != manifest["corpus_records"]:
+                raise ValueError("prepared prompt count differs from the immutable replay plan")
         _workers, drive = build_disagg_online_producer(
             algorithm=algorithm,
             modality=modality,
@@ -726,6 +758,7 @@ def _build_online(
                 cfg.runtime.feature_store_max_resident_bytes
             ),
             peer_wait_timeout_s=peer_wait_timeout_s,
+            excluded_sample_ids=excluded_sample_ids,
         )
 
         def produce() -> int:
