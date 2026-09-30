@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import replace
 from functools import partial
 
@@ -37,8 +36,6 @@ from specforge.algorithms.contracts import (
     OfflineStorageContract,
 )
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
-
-logger = logging.getLogger(__name__)
 
 ALGORITHM_NAME = "dflash"
 DRAFT_ARCHITECTURE = "DFlashDraftModel"
@@ -109,12 +106,6 @@ def resume_contract(_config, draft_model, training_model):
     return contract
 
 
-def _is_rank0() -> bool:
-    import torch.distributed as dist
-
-    return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
-
-
 def resolve_dflash_kernels(config, draft_config):
     """Resolve ``model.use_liger_kernel`` on this trainer rank's device.
 
@@ -122,25 +113,22 @@ def resolve_dflash_kernels(config, draft_config):
     and inference build the draft without kernels, so they stay native.
     """
     from specforge.modeling.draft.dflash_kernels import (
-        current_liger_platform,
         load_liger_dflash_kernels,
-        resolve_liger_kernel_choice,
+        resolve_draft_liger_kernel_choice,
     )
+    from specforge.training.checkpoint import CheckpointManager
 
-    choice = resolve_liger_kernel_choice(
-        config.model.use_liger_kernel,
-        platform=current_liger_platform(),
-        hidden_act=str(getattr(draft_config, "hidden_act", "silu")),
+    choice = resolve_draft_liger_kernel_choice(
+        config.model.use_liger_kernel, draft_config
     )
     kernels = load_liger_dflash_kernels(choice) if choice.enabled else None
-    if _is_rank0():
-        print(f"[dflash] {choice.describe()}", flush=True)
-        if choice.unvalidated:
-            logger.warning(
-                "model.use_liger_kernel=true on %s has not been validated in "
-                "SpecForge; compare the loss against model.use_liger_kernel: false",
-                choice.platform,
-            )
+    if CheckpointManager.is_rank0():
+        advice = (
+            "; compare the loss against model.use_liger_kernel: false"
+            if choice.unvalidated
+            else ""
+        )
+        print(f"[dflash] {choice.describe()}{advice}", flush=True)
     return kernels
 
 

@@ -1907,7 +1907,7 @@ class LaunchPlanTest(unittest.TestCase):
                 self.assertRaisesRegex(
                     ImportError,
                     r"resolved to true \(auto: DFlash on ROCm\) but Liger could "
-                    r"not be imported.*pip install --no-deps liger-kernel",
+                    r'not be imported.*pip install --no-deps "liger-kernel>=',
                 ),
             ):
                 plan.preflight_checks[0]()

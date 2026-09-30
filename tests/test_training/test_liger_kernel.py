@@ -4,9 +4,13 @@ import contextlib
 import importlib.util
 import io
 import itertools
+import os
+import re
 import sys
+import tomllib
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -20,9 +24,13 @@ from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash2 import DFlash2DraftModel
 from specforge.modeling.draft.dflash_kernels import (
     DEFAULT_DFLASH_KERNELS,
+    LIGER_REQUIREMENT,
     DFlashKernels,
     resolve_liger_kernel_choice,
 )
+from specforge.training.checkpoint import CheckpointManager
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _PLATFORMS = ("cuda", "rocm", "npu", "xpu", "cpu")
 _ACTIVATIONS = ("silu", "swish", "gelu")
@@ -58,6 +66,20 @@ def _importable_liger_modules() -> dict:
 _MISSING_LIGER_MODULES = {"liger_kernel": None, "liger_kernel.transformers": None}
 
 
+def _broken_liger_modules() -> dict:
+    """An installed Liger whose own import fails on a missing transformers API."""
+    modules = _importable_liger_modules()
+
+    def missing_transformers_api(name):
+        raise ImportError(
+            "cannot import name 'RemovedApi' from 'transformers'", name="transformers"
+        )
+
+    del modules["liger_kernel.transformers"].LigerRMSNorm
+    modules["liger_kernel.transformers"].__getattr__ = missing_transformers_api
+    return modules
+
+
 def _expected_choice(requested, platform, hidden_act):
     """Documented resolution: an ``(enabled, reason)`` pair or an error regex."""
     supported_act = hidden_act in ("silu", "swish")
@@ -71,7 +93,10 @@ def _expected_choice(requested, platform, hidden_act):
             return False, f"auto: draft hidden_act '{hidden_act}' is not silu/swish"
         return True, f"auto: DFlash on {names[platform]}"
     if platform == "cpu":
-        return "requires a CUDA or ROCm GPU .*device is 'cpu'"
+        return (
+            r"requires a Triton GPU backend: CUDA or ROCm, or Ascend NPU/XPU "
+            r"where it is unvalidated in SpecForge; this trainer's device is 'cpu'"
+        )
     if not supported_act:
         return "requires the draft hidden_act to be 'silu' or 'swish'.*got 'gelu'"
     if platform in ("npu", "xpu"):
@@ -123,7 +148,7 @@ class TestLigerKernelResolution(unittest.TestCase):
                     dflash_kernels, "current_liger_platform", return_value=platform
                 ),
                 mock.patch.dict(sys.modules, modules),
-                mock.patch.object(providers, "_is_rank0", return_value=False),
+                mock.patch.object(CheckpointManager, "is_rank0", return_value=False),
             ):
                 draft_config = types.SimpleNamespace(hidden_act=hidden_act)
                 if isinstance(expected, str):
@@ -161,7 +186,7 @@ class TestLigerKernelResolution(unittest.TestCase):
                 mock.patch.object(
                     dflash_kernels, "load_liger_dflash_kernels"
                 ) as loader,
-                mock.patch.object(providers, "_is_rank0", return_value=False),
+                mock.patch.object(CheckpointManager, "is_rank0", return_value=False),
             ):
                 kernels = providers.resolve_dflash_kernels(
                     _cfg(False), types.SimpleNamespace(hidden_act="silu")
@@ -170,12 +195,13 @@ class TestLigerKernelResolution(unittest.TestCase):
             loader.assert_not_called()
 
     def test_import_error_hint_matches_the_platform_install(self):
-        """Verify CUDA points at the extra and no-deps stacks at --no-deps."""
+        """Verify every hint installs the pinned Liger, --no-deps off CUDA."""
+        pinned = re.escape(f'"{LIGER_REQUIREMENT}"')
         for platform, hint in (
-            ("cuda", r'pip install "specforge\[liger\]", or pip install liger-kernel'),
-            ("rocm", r"pip install --no-deps liger-kernel into the existing ROCm"),
-            ("npu", r"pip install --no-deps liger-kernel into the existing torch_npu"),
-            ("xpu", r"pip install --no-deps liger-kernel into the existing XPU"),
+            ("cuda", rf"Install it \(pip install {pinned}\)"),
+            ("rocm", rf"pip install --no-deps {pinned} into the existing ROCm"),
+            ("npu", rf"pip install --no-deps {pinned} into the existing torch_npu"),
+            ("xpu", rf"pip install --no-deps {pinned} into the existing XPU"),
         ):
             choice = resolve_liger_kernel_choice(
                 True, platform=platform, hidden_act="silu"
@@ -187,6 +213,17 @@ class TestLigerKernelResolution(unittest.TestCase):
             ):
                 dflash_kernels.load_liger_dflash_kernels(choice)
 
+    def test_default_choice_uses_this_process_platform_hint(self):
+        """Verify a caller without a choice gets its own platform's hint."""
+        with (
+            mock.patch.object(
+                dflash_kernels, "current_liger_platform", return_value="rocm"
+            ),
+            mock.patch.dict(sys.modules, _MISSING_LIGER_MODULES),
+            self.assertRaisesRegex(ImportError, r"pip install --no-deps .*ROCm"),
+        ):
+            dflash_kernels.load_liger_dflash_kernels()
+
     def test_missing_triton_is_reported_even_when_liger_is_installed(self):
         """Verify a missing Triton raises the same actionable error."""
         modules = {**_importable_liger_modules(), "triton": None}
@@ -195,6 +232,46 @@ class TestLigerKernelResolution(unittest.TestCase):
             self.assertRaisesRegex(ImportError, r"could not be imported: .*triton"),
         ):
             dflash_kernels.load_liger_dflash_kernels()
+
+    def test_installed_liger_that_fails_internally_is_not_told_to_install(self):
+        """Verify an import failure inside an installed Liger names the cause."""
+        with (
+            mock.patch.dict(sys.modules, _broken_liger_modules()),
+            self.assertRaises(ImportError) as raised,
+        ):
+            dflash_kernels.load_liger_dflash_kernels()
+        message = str(raised.exception)
+        self.assertRegex(
+            message,
+            r"importing Liger failed inside an installed package: cannot import "
+            r"name 'RemovedApi' from 'transformers'\. Check that the installed "
+            rf"liger-kernel matches {re.escape(LIGER_REQUIREMENT)}",
+        )
+        self.assertNotIn("Install it", message)
+
+    def test_install_pin_matches_packaging_and_docs(self):
+        """Verify packaging and every documented install use the hint's pin."""
+        with open(REPO_ROOT / "pyproject.toml", "rb") as stream:
+            project = tomllib.load(stream)["project"]
+        self.assertIn(
+            f"{LIGER_REQUIREMENT}; sys_platform == 'linux'", project["dependencies"]
+        )
+        for name in ("pyproject.toml", "pyproject_xpu.toml"):
+            with open(REPO_ROOT / name, "rb") as stream:
+                extras = tomllib.load(stream)["project"]["optional-dependencies"]
+            self.assertEqual([LIGER_REQUIREMENT], extras["liger"], name)
+
+        installs = []
+        for root in ("docs/sections", "docs/web/.vitepress/theme", "examples"):
+            for path in sorted((REPO_ROOT / root).rglob("*")):
+                if path.suffix not in (".md", ".vue", ".yaml") or not path.is_file():
+                    continue
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if re.search(r"pip install.*liger-kernel", line):
+                        installs.append((path.relative_to(REPO_ROOT), line))
+        self.assertTrue(installs)
+        for path, line in installs:
+            self.assertIn(f'"{LIGER_REQUIREMENT}"', line, str(path))
 
     def test_resolved_choice_is_printed_once_on_rank0(self):
         """Verify rank 0 reports the resolved choice and other ranks stay quiet."""
@@ -206,7 +283,7 @@ class TestLigerKernelResolution(unittest.TestCase):
             output = io.StringIO()
             with (
                 self.subTest(rank0=is_rank0),
-                mock.patch.object(providers, "_is_rank0", return_value=is_rank0),
+                mock.patch.object(CheckpointManager, "is_rank0", return_value=is_rank0),
                 mock.patch.object(
                     dflash_kernels, "current_liger_platform", return_value="cuda"
                 ),
@@ -218,21 +295,53 @@ class TestLigerKernelResolution(unittest.TestCase):
 
     def test_explicit_true_on_unvalidated_backend_warns(self):
         """Verify NPU/XPU honour an explicit true and warn it is unvalidated."""
-        for platform in ("npu", "xpu"):
+        for platform, name in (("npu", "Ascend NPU"), ("xpu", "XPU")):
+            output = io.StringIO()
             with (
                 self.subTest(platform=platform),
                 mock.patch.object(
                     dflash_kernels, "current_liger_platform", return_value=platform
                 ),
                 mock.patch.dict(sys.modules, _importable_liger_modules()),
-                contextlib.redirect_stdout(io.StringIO()),
-                self.assertLogs(providers.logger, "WARNING") as logs,
+                mock.patch.object(CheckpointManager, "is_rank0", return_value=True),
+                contextlib.redirect_stdout(output),
             ):
                 kernels = providers.resolve_dflash_kernels(
                     _cfg(True), types.SimpleNamespace(hidden_act="silu")
                 )
             self.assertIsNotNone(kernels)
-            self.assertIn("has not been validated in SpecForge", logs.output[0])
+            self.assertEqual(
+                f"[dflash] Liger kernels: on (explicit, unvalidated in SpecForge "
+                f"on {name}); compare the loss against model.use_liger_kernel: "
+                "false\n",
+                output.getvalue(),
+            )
+
+    def test_platform_detection_tells_rocm_apart_and_honours_override(self):
+        """Verify the real platform probe: ROCm via torch.version.hip, env wins."""
+        for device, hip, expected in (
+            ("cuda", "6.4.0", "rocm"),
+            ("cuda", None, "cuda"),
+            ("npu", None, "npu"),
+            ("cpu", "6.4.0", "cpu"),
+        ):
+            with (
+                self.subTest(device=device, hip=hip),
+                mock.patch("specforge.utils.get_device_type", return_value=device),
+                mock.patch.object(torch.version, "hip", hip),
+            ):
+                self.assertEqual(expected, dflash_kernels.current_liger_platform())
+
+        for forced, hip, expected in (
+            ("npu", None, "npu"),
+            ("cuda", "6.4.0", "rocm"),
+        ):
+            with (
+                self.subTest(SPECFORGE_DEVICE=forced, hip=hip),
+                mock.patch.dict(os.environ, {"SPECFORGE_DEVICE": forced}),
+                mock.patch.object(torch.version, "hip", hip),
+            ):
+                self.assertEqual(expected, dflash_kernels.current_liger_platform())
 
 
 class TestLigerKernelIntegration(unittest.TestCase):

@@ -139,9 +139,9 @@ def _validate_algorithm_capabilities(
     # for drafts that do not wire the kernels.
     if cfg.model.use_liger_kernel is True and not capabilities.supports_liger_kernel:
         raise ValueError(
-            "model.use_liger_kernel=true is supported only for training.strategy "
-            f"'dflash' (DFlash/DFlash2 drafts); got {algorithm.name!r}. Remove "
-            "the key or set it to false."
+            f"algorithm {algorithm.name!r} does not support "
+            "model.use_liger_kernel=true (its draft does not wire Liger "
+            "kernels); remove the key or set it to false"
         )
 
 

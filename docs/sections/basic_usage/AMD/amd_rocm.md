@@ -74,7 +74,7 @@ cannot be imported. Install it without dependencies so pip keeps the image's
 ROCm Triton instead of pulling the CUDA `triton` wheel:
 
 ```bash
-python -m pip install --no-deps liger-kernel
+python -m pip install --no-deps "liger-kernel>=0.8.3,<0.9"
 ```
 
 Set `model.use_liger_kernel: false` to train with the native Qwen3 modules

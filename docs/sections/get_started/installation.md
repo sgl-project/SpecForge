@@ -57,7 +57,7 @@ cd /workspace/SpecForge
 python -m pip install -e . --no-deps
 # DFlash drafts use Liger RMSNorm/SwiGLU by default on ROCm; --no-deps keeps
 # the container's ROCm Triton.
-python -m pip install --no-deps liger-kernel
+python -m pip install --no-deps "liger-kernel>=0.8.3,<0.9"
 ```
 
 For the complete container setup and an end-to-end walkthrough covering
