@@ -18,6 +18,9 @@ dependencies = [
     "accelerate",
     "click>=8.0",
     "huggingface-hub",
+    # DFlash drafts default to Liger RMSNorm/SwiGLU on CUDA. Its Triton
+    # dependency ships only Linux wheels.
+    "liger-kernel>=0.8.3,<0.9; sys_platform == 'linux'",
     "numpy",
     "openai-harmony",
     "pydantic",
@@ -44,7 +47,7 @@ dev = [
     "pre-commit",
 ]
 fa = ["flash-attn", "ninja", "packaging"]
-liger = ["liger-kernel"]
+liger = ["liger-kernel>=0.8.3,<0.9"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}

@@ -14,7 +14,8 @@ model:
   embedding_key: model.language_model.embed_tokens.weight
   torch_dtype: bfloat16
   mask_token_id: 248070
-  # Liger RMSNorm and SwiGLU for the draft layers (pip install liger-kernel).
+  # Liger RMSNorm and SwiGLU for the draft layers. On by default on CUDA; kept
+  # explicit because the 5+3 split is balanced only with these kernels.
   use_liger_kernel: true
   # Hopper kernels for the hybrid target: FA3 for the 16 full-attention layers
   # and FlashInfer for the 48 GDN layers. Capture servers never decode, and the
