@@ -78,6 +78,10 @@ from specforge.runtime.data_plane.feature_store import (
     FeatureStore,
     spec_from_tensor,
 )
+from specforge.runtime.data_plane.mooncake_rdma import (
+    check_rdma_environment,
+    resolve_rdma_devices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +93,16 @@ MOONCAKE_OBJECT_HAS_LEASE = -706  # remove() during a live read lease
 _MOONCAKE_SETUP_DEFAULTS = {
     "global_segment_size": 1 << 30,  # 1 GiB per-node segment
     "local_buffer_size": 1 << 30,
-    "protocol": "tcp",  # bring up on TCP; flip to "rdma" once NICs are verified
+    # Every client of one store must use the same protocol, and SpecForge
+    # cannot see an external server's, so the default stays explicit tcp.
+    "protocol": "tcp",
+    # Empty under rdma selects this node's usable HCAs (see _connect_store).
     "rdma_devices": "",
 }
+_RDMA_OPT_OUT = (
+    "set MOONCAKE_PROTOCOL=tcp (deployment.disaggregated.mooncake_protocol or "
+    "managed_local.mooncake.protocol) for every capture server and trainer"
+)
 
 _GET_RETRY_DELAYS_S = (2.0, 4.0, 8.0)
 # TRANSFER_FAIL and a lease that expired during transfer are retryable with a
@@ -179,9 +190,21 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
             "official wheel (`mooncake-transfer-engine` for CUDA < 13, or "
             "`mooncake-transfer-engine-cuda13` for CUDA >= 13)."
         ) from e
+    setup_kwargs = dict(setup_kwargs)
+    if setup_kwargs.get("protocol") == "rdma":
+        check_rdma_environment(
+            os.environ, where="this process's environment", opt_out=_RDMA_OPT_OUT
+        )
+        if not setup_kwargs.get("rdma_devices"):
+            # Mooncake would auto-discover HCAs and fall back to TCP silently.
+            setup_kwargs["rdma_devices"] = resolve_rdma_devices(
+                None,
+                selected_by="MOONCAKE_PROTOCOL is rdma",
+                devices_setting="MOONCAKE_RDMA_DEVICES",
+                opt_out=_RDMA_OPT_OUT,
+            )
     # Ascend's transport needs a bound device context (see _bind_transport_device).
     _bind_transport_device()
-    setup_kwargs = dict(setup_kwargs)
     if _ascend_runtime_available():
         # Ascend rejects the wildcard-location staging-buffer registration
         # ("location:* is not supported"); zero-copy clients can drop it.
