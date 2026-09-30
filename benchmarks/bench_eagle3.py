@@ -95,6 +95,25 @@ def parse_args():
         action="store_true",
         default=False,
     )
+    benchmark_group.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for run_batch (0.0 = greedy verify path).",
+    )
+    benchmark_group.add_argument(
+        "--reasoning-effort",
+        choices=["low", "medium", "high"],
+        default=None,
+        help="gpt-oss harmony reasoning level. Unset = template default (medium).",
+    )
+    benchmark_group.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Qwen3 thinking mode. Use --no-enable-thinking to disable. "
+        "Unset = template default (True for Qwen3).",
+    )
     return parser.parse_args()
 
 
@@ -205,6 +224,18 @@ def main():
     results = {}
     results["model"] = server_args.speculative_draft_model_path
 
+    # Shared timestamp for both the metrics summary and the merged answers
+    # file written during this run, so paired files line up by suffix.
+    run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+    os.makedirs(args.output_dir, exist_ok=True)
+    name_prefix = f"{args.name}_" if args.name else ""
+    answers_path = os.path.join(
+        args.output_dir,
+        f"{name_prefix}results_{run_timestamp}_answers.jsonl",
+    )
+    # Truncate once so every benchmark for this session appends into a fresh file.
+    open(answers_path, "w").close()
+
     def run_benchmarks(batch_size: int, steps: int, topk: int, num_draft_tokens: int):
         for benchmark_name, num_prompts, subset in benchmark_list:
             print(
@@ -217,7 +248,24 @@ def main():
             else:
                 benchmarker = benchmarkder_cls(num_samples=num_prompts, subset=subset)
             metrics_list = benchmarker.run(
-                host=args.host, port=args.port, batch_size=batch_size
+                host=args.host,
+                port=args.port,
+                batch_size=batch_size,
+                generations_path=answers_path,
+                record_extras={
+                    "benchmark": benchmark_name,
+                    "batch_size": batch_size,
+                    "steps": steps,
+                    "topk": topk,
+                    "num_draft_tokens": num_draft_tokens,
+                    "temperature": args.temperature,
+                    "reasoning_effort": args.reasoning_effort,
+                    "enable_thinking": args.enable_thinking,
+                },
+                model_path=server_args.model_path,
+                temperature=args.temperature,
+                reasoning_effort=args.reasoning_effort,
+                enable_thinking=args.enable_thinking,
             )
             send_flush_cache_request(base_url)
             if benchmark_name not in results:
@@ -254,14 +302,14 @@ def main():
             process.wait()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
     result_file = os.path.join(
         args.output_dir,
-        f"{args.name + '_' if args.name else ''}results_{timestamp}.jsonl",
+        f"{name_prefix}results_{run_timestamp}.jsonl",
     )
     with open(result_file, "w") as f:
         json.dump(results, f, indent=4)
     print(f"Results saved to {result_file}")
+    print(f"Per-prompt answers saved to {answers_path}")
 
 
 if __name__ == "__main__":
