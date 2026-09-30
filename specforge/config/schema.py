@@ -286,8 +286,12 @@ class ModelConfig(StrictConfigModel):
     #: text only; unsupported modalities fail during application resolution.
     input_modality: str = "text"
     trust_remote_code: bool = False
-    #: Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash. Requires ``specforge[liger]``.
-    use_liger_kernel: bool = False
+    #: Liger RMSNorm/SwiGLU kernels for DFlash/DFlash2 drafts. ``None`` (auto)
+    #: enables them for training.strategy=dflash on a CUDA/ROCm trainer with a
+    #: silu/swish draft and keeps the native Qwen3 modules otherwise; ``true``
+    #: fails when they cannot be used; ``false`` disables them. Resolved kernels
+    #: that cannot be imported are an error in both the auto and explicit cases.
+    use_liger_kernel: Optional[bool] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).

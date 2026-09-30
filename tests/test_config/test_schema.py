@@ -76,13 +76,47 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
-    def test_liger_kernel_flag_is_typed_and_defaults_off(self):
+    def test_liger_kernel_flag_is_tri_state_and_defaults_to_auto(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
-        self.assertFalse(default.model.use_liger_kernel)
+        self.assertIsNone(default.model.use_liger_kernel)
+
+        for value in (True, False):
+            payload = copy.deepcopy(MINIMAL)
+            payload["model"]["use_liger_kernel"] = value
+            self.assertIs(Config.model_validate(payload).model.use_liger_kernel, value)
 
         payload = copy.deepcopy(MINIMAL)
-        payload["model"]["use_liger_kernel"] = True
-        self.assertTrue(Config.model_validate(payload).model.use_liger_kernel)
+        payload["model"]["use_liger_kernel"] = "maybe"
+        with self.assertRaisesRegex(ValidationError, "use_liger_kernel"):
+            Config.model_validate(payload)
+
+    def test_explicit_liger_kernel_is_rejected_for_strategies_that_ignore_it(self):
+        dflash = _online_payload("dflash")
+        dflash["model"]["use_liger_kernel"] = True
+        self.assertIs(
+            resolve_run(Config.model_validate(dflash)).config.model.use_liger_kernel,
+            True,
+        )
+
+        for strategy in ("domino", "dspark", "eagle3", "mtp", "peagle"):
+            for value in (None, False, True):
+                with self.subTest(strategy=strategy, use_liger_kernel=value):
+                    payload = _online_payload(strategy)
+                    if value is not None:
+                        payload["model"]["use_liger_kernel"] = value
+                    if strategy == "mtp":
+                        payload["training"]["attention_backend"] = "sdpa"
+                    cfg = Config.model_validate(payload)
+                    if value is not True:
+                        resolve_run(cfg)
+                        continue
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "model.use_liger_kernel=true is supported only for "
+                        rf"training.strategy 'dflash' \(DFlash/DFlash2 drafts\); "
+                        f"got '{strategy}'. Remove the key or set it to false.",
+                    ):
+                        resolve_run(cfg)
 
     def test_finite_online_run_can_derive_its_schedule_from_the_producer(self):
         payload = _online_payload("domino")

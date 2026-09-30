@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, Optional, Sequence
 from urllib import error as urllib_error
@@ -201,6 +202,9 @@ class LaunchPlan:
     #: The plan still renders (``--plan`` off the training node); the managed
     #: preflight raises it before anything starts.
     managed_rdma_error: Optional[str] = None
+    #: Deferred trainer-side dependency checks the managed supervisor runs
+    #: before it starts any service; planning itself stays side-effect free.
+    preflight_checks: tuple[Callable[[], None], ...] = ()
     # SIGTERM-trapped workers run Mooncake drains, checkpoint flushes, and
     # failure-sentinel publication inside this window before SIGKILL.
     shutdown_grace_s: float = 30.0
@@ -750,6 +754,46 @@ def _managed_local_services(
     return (mooncake_service, *capture_services)
 
 
+def _check_trainer_liger_kernels(
+    cfg: Config,
+    algorithm: "AlgorithmRegistration",
+) -> None:
+    """Import the Liger kernels the trainer will resolve, before any service.
+
+    The supervisor runs on the trainer host, so its device matches the
+    trainer's; the trainer rank still owns the authoritative resolution.
+    """
+    from specforge.modeling.draft.dflash_kernels import (
+        current_liger_platform,
+        load_liger_dflash_kernels,
+        resolve_liger_kernel_choice,
+    )
+    from specforge.training.model_loading import resolve_draft_config
+
+    draft_config = resolve_draft_config(
+        cfg, provider=algorithm.providers.model.draft_config
+    )
+    choice = resolve_liger_kernel_choice(
+        cfg.model.use_liger_kernel,
+        platform=current_liger_platform(),
+        hidden_act=str(getattr(draft_config, "hidden_act", "silu")),
+    )
+    if choice.enabled:
+        load_liger_dflash_kernels(choice)
+
+
+def _managed_preflight_checks(
+    cfg: Config,
+    algorithm: "AlgorithmRegistration",
+) -> tuple[Callable[[], None], ...]:
+    if (
+        cfg.model.use_liger_kernel is False
+        or not algorithm.spec.capabilities.supports_liger_kernel
+    ):
+        return ()
+    return (partial(_check_trainer_liger_kernels, cfg, algorithm),)
+
+
 def _worker_argv(
     command_prefix: Sequence[str],
     config_path: str,
@@ -1092,6 +1136,7 @@ def build_launch_plan(
                 cfg, managed_environment
             ),
             managed_rdma_error=managed_rdma_error,
+            preflight_checks=_managed_preflight_checks(cfg, algorithm),
             shutdown_grace_s=managed_local.shutdown_grace_s,
         )
     return LaunchPlan(
@@ -1247,6 +1292,10 @@ def _managed_preflight(plan: LaunchPlan) -> None:
                 raise RuntimeError(
                     f"managed_local port 127.0.0.1:{port} is unavailable: {exc}"
                 ) from exc
+    # Trainer dependencies otherwise fail only after every capture server has
+    # warmed up.
+    for check in plan.preflight_checks:
+        check()
 
 
 def _http_ready(readiness: ReadinessSpec, *, timeout_s: Optional[float] = None) -> bool:
