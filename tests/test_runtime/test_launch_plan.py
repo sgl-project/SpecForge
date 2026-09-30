@@ -1866,6 +1866,97 @@ class LaunchPlanTest(unittest.TestCase):
             ):
                 run_commands(plan, popen=mock.Mock())
 
+    def test_managed_plan_defers_the_trainer_liger_import_check(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"))
+            raw = cfg.model_dump()
+            raw["model"]["use_liger_kernel"] = False
+            disabled = Config.model_validate(raw)
+            with (
+                mock.patch(
+                    "specforge.training.capture_contract.resolve_server_capture_contract",
+                    return_value=CAPTURE_CONTRACT,
+                ),
+                mock.patch(
+                    "specforge.training.model_loading.resolve_draft_config"
+                ) as resolve_draft_config,
+            ):
+                plan = build_launch_plan(cfg, config_path="run.yaml", env={})
+                disabled_plan = build_launch_plan(
+                    disabled, config_path="run.yaml", env={}
+                )
+            # Planning only records the check; the preflight runs it.
+            resolve_draft_config.assert_not_called()
+            self.assertEqual(1, len(plan.preflight_checks))
+            self.assertEqual((), disabled_plan.preflight_checks)
+
+            draft_config = mock.Mock(hidden_act="silu")
+            with (
+                mock.patch(
+                    "specforge.training.model_loading.resolve_draft_config",
+                    return_value=draft_config,
+                ),
+                mock.patch(
+                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
+                    return_value="rocm",
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {"liger_kernel": None, "liger_kernel.transformers": None},
+                ),
+                self.assertRaisesRegex(
+                    ImportError,
+                    r"resolved to true \(auto: DFlash on ROCm\) but Liger could "
+                    r"not be imported.*pip install --no-deps liger-kernel",
+                ),
+            ):
+                plan.preflight_checks[0]()
+
+            draft_config.hidden_act = "gelu"
+            with (
+                mock.patch(
+                    "specforge.training.model_loading.resolve_draft_config",
+                    return_value=draft_config,
+                ),
+                mock.patch(
+                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
+                    return_value="cuda",
+                ),
+                mock.patch(
+                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
+                ) as load_liger,
+            ):
+                plan.preflight_checks[0]()
+            load_liger.assert_not_called()
+
+    def test_managed_preflight_runs_trainer_checks_before_spawning(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = os.path.join(parent, "attempt")
+            check = mock.Mock(side_effect=ImportError("liger missing"))
+            plan = LaunchPlan(
+                **{
+                    **_managed_plan(root).__dict__,
+                    "managed_ports": (),
+                    "preflight_checks": (check,),
+                }
+            )
+            popen = mock.Mock()
+            with (
+                mock.patch(
+                    "specforge.launch_plan.shutil.which",
+                    return_value="/usr/bin/mooncake_master",
+                ),
+                mock.patch(
+                    "specforge.launch_plan.importlib.util.find_spec",
+                    return_value=object(),
+                ),
+                self.assertRaisesRegex(ImportError, "liger missing"),
+            ):
+                run_commands(plan, popen=popen)
+            check.assert_called_once_with()
+            popen.assert_not_called()
+            self.assertFalse(os.path.exists(root))
+
     def test_mooncake_readiness_accepts_missing_key_but_rejects_server_errors(self):
         readiness = ReadinessSpec(
             "mooncake",
