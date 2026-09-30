@@ -360,6 +360,34 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# DeepSeek-V4.1 ships a Python encoder instead of Jinja, like V4, but with a
+# different prompt format (spaced DSML tags, numeric reasoning-effort prefix,
+# mid-conversation system messages), so it gets its own parser. Both entries
+# keep V4's mask convention: the header stops at the assistant token.
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v4.1",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        parser_type="deepseek-v4.1",
+        enable_thinking=False,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v4.1-thinking",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        parser_type="deepseek-v4.1",
+        enable_thinking=True,
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="glm-5.2",
     template=ChatTemplate(
