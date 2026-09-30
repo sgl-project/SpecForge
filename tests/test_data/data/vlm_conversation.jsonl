@@ -1,0 +1,2 @@
+
+{"id": 1, "image": "/data/images/test.jpg", "conversations": [{"role": "user", "content": "Describe this image."}, {"role": "assistant", "content": "A cat."}]}
