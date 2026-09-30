@@ -189,8 +189,8 @@ class LaunchPlan:
     services: tuple[ServiceSpec, ...] = ()
     managed_root: Optional[str] = None
     managed_ports: tuple[int, ...] = ()
-    #: Deferred trainer-side dependency checks the managed supervisor runs
-    #: before it starts any service; planning itself stays side-effect free.
+    #: Deferred trainer-side dependency checks a supervisor runs before it
+    #: starts any service or worker; planning itself stays side-effect free.
     preflight_checks: tuple[Callable[[], None], ...] = ()
     # SIGTERM-trapped workers run Mooncake drains, checkpoint flushes, and
     # failure-sentinel publication inside this window before SIGKILL.
@@ -622,44 +622,20 @@ def _managed_local_services(
     return (mooncake_service, *capture_services)
 
 
-def _check_trainer_liger_kernels(
+def _trainer_preflight_checks(
     cfg: Config,
-    algorithm: "AlgorithmRegistration",
-) -> None:
-    """Import the Liger kernels the trainer will resolve, before any service.
+    algorithm: Optional["AlgorithmRegistration"],
+) -> tuple[Callable[[], None], ...]:
+    """Trainer-side import checks a supervisor runs before it spawns anything.
 
     The supervisor runs on the trainer host, so its device matches the
     trainer's; the trainer rank still owns the authoritative resolution.
     """
-    from specforge.modeling.draft.dflash_kernels import (
-        current_liger_platform,
-        load_liger_dflash_kernels,
-        resolve_liger_kernel_choice,
-    )
-    from specforge.training.model_loading import resolve_draft_config
-
-    draft_config = resolve_draft_config(
-        cfg, provider=algorithm.providers.model.draft_config
-    )
-    choice = resolve_liger_kernel_choice(
-        cfg.model.use_liger_kernel,
-        platform=current_liger_platform(),
-        hidden_act=str(getattr(draft_config, "hidden_act", "silu")),
-    )
-    if choice.enabled:
-        load_liger_dflash_kernels(choice)
-
-
-def _managed_preflight_checks(
-    cfg: Config,
-    algorithm: "AlgorithmRegistration",
-) -> tuple[Callable[[], None], ...]:
-    if (
-        cfg.model.use_liger_kernel is False
-        or not algorithm.spec.capabilities.supports_liger_kernel
-    ):
+    if algorithm is None:
         return ()
-    return (partial(_check_trainer_liger_kernels, cfg, algorithm),)
+    from specforge.training.model_loading import preflight_draft_kernels
+
+    return (partial(preflight_draft_kernels, cfg, algorithm=algorithm),)
 
 
 def _worker_argv(
@@ -979,13 +955,14 @@ def build_launch_plan(
                 managed_local.mooncake.metrics_port,
                 *[server.port for server in managed_local.capture_servers],
             ),
-            preflight_checks=_managed_preflight_checks(cfg, algorithm),
+            preflight_checks=_trainer_preflight_checks(cfg, algorithm),
             shutdown_grace_s=managed_local.shutdown_grace_s,
         )
     return LaunchPlan(
         "supervisor",
         "both",
         commands=(producer, consumer),
+        preflight_checks=_trainer_preflight_checks(cfg, algorithm),
         shutdown_grace_s=deployment.shutdown_grace_s,
     )
 
@@ -1292,6 +1269,11 @@ def run_commands(
                     services.append((service, _spawn_service(service, popen=popen)))
                 for service, process in services[-len(current_phase) :]:
                     readiness_waiter(service, process, tuple(services))
+        elif plan.kind == "supervisor":
+            # Otherwise a trainer dependency fails only in the consumer, after
+            # the producer has started its work.
+            for check in plan.preflight_checks:
+                check()
         for command in plan.commands:
             processes.append(_spawn_command(command, popen=popen))
         remaining = set(range(len(processes)))
