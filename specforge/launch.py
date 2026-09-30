@@ -461,7 +461,8 @@ def _iter_epoch_online_prompt_batches(
         yield [
             _epoch_online_prompt(prompts[index], index, epoch, prompt_epochs)
             for index in indices[start : start + batch_size]
-            if not skip_task_ids or f"epoch{epoch:04d}-prompt{index:012d}" not in skip_task_ids
+            if not skip_task_ids
+            or f"epoch{epoch:04d}-prompt{index:012d}" not in skip_task_ids
         ]
 
 
@@ -963,8 +964,11 @@ def build_disagg_online_producer(
         from specforge.training.replay import validate_replay_ids
 
         skip_task_ids = validate_replay_ids(
-            excluded_sample_ids, run_id=run_id, prompt_count=base_prompt_count,
-            prompt_epochs=prompt_epochs, prompt_epoch_offset=prompt_epoch_offset,
+            excluded_sample_ids,
+            run_id=run_id,
+            prompt_count=base_prompt_count,
+            prompt_epochs=prompt_epochs,
+            prompt_epoch_offset=prompt_epoch_offset,
         )
     producer_timing(
         "build_disagg_online_producer enter "
@@ -1400,7 +1404,9 @@ def build_disagg_online_producer(
 
         def iter_plan_chunks():
             """Yield the whole multi-epoch prompt plan in FIFO chunk order."""
-            for epoch in range(prompt_epoch_offset, prompt_epoch_offset + prompt_epochs):
+            for epoch in range(
+                prompt_epoch_offset, prompt_epoch_offset + prompt_epochs
+            ):
                 epoch_batches = _iter_epoch_online_prompt_batches(
                     prompts,
                     epoch,

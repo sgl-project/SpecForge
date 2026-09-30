@@ -722,7 +722,9 @@ def _build_online(
             with open(replay_path, encoding="utf-8") as stream:
                 manifest = json.load(stream)
             if len(prompts) != manifest["corpus_records"]:
-                raise ValueError("prepared prompt count differs from the immutable replay plan")
+                raise ValueError(
+                    "prepared prompt count differs from the immutable replay plan"
+                )
         _workers, drive = build_disagg_online_producer(
             algorithm=algorithm,
             modality=modality,

@@ -441,7 +441,7 @@ class DataConfig(StrictConfigModel):
                 "data.hidden_states_path (offline features)"
             )
         if self.prompts_index_path is not None and not self.prompts_path:
-            raise ValueError('data.prompts_index_path requires data.prompts_path')
+            raise ValueError("data.prompts_index_path requires data.prompts_path")
         return self
 
 

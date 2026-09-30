@@ -59,8 +59,11 @@ def prepare_prompt_tasks(
         from .indexed_prompts import IndexedPromptSequence
 
         return IndexedPromptSequence(
-            path_string, index_path, max_length=max_length,
-            min_loss_tokens=min_loss_tokens, max_prompts=max_prompts,
+            path_string,
+            index_path,
+            max_length=max_length,
+            min_loss_tokens=min_loss_tokens,
+            max_prompts=max_prompts,
             loss_mask_filter=loss_mask_filter,
         )
     first_record = next(_iter_records(path_string), None)

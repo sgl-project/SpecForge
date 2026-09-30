@@ -605,14 +605,24 @@ class TestMultiServerProducer(unittest.TestCase):
         store = MooncakeFeatureStore(store=backend, store_id="run0")
         channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
         _, drive = _build(
-            [_adapter(store, stub)], _prompts(3), store, channel,
-            lease=2, prompt_epochs=2, prompt_epoch_offset=1, prompt_seed=42,
+            [_adapter(store, stub)],
+            _prompts(3),
+            store,
+            channel,
+            lease=2,
+            prompt_epochs=2,
+            prompt_epoch_offset=1,
+            prompt_seed=42,
         )
         self.assertEqual(drive(), 6)
-        self.assertEqual(set(_published_sample_ids(channel.path)), {
-            f"run0:epoch{epoch:04d}-prompt{index:012d}"
-            for epoch in (1, 2) for index in range(3)
-        })
+        self.assertEqual(
+            set(_published_sample_ids(channel.path)),
+            {
+                f"run0:epoch{epoch:04d}-prompt{index:012d}"
+                for epoch in (1, 2)
+                for index in range(3)
+            },
+        )
         # A one-pass continuation must also carry its absolute epoch identity.
         one = _epoch_online_prompts(_prompts(3), 2, 1, seed=42)
         self.assertEqual({item["metadata"]["epoch"] for item in one}, {2})
