@@ -41,9 +41,17 @@ class FakeHost:
         link_layer: str = "InfiniBand",
         gids=(),
         node: str = "char",
+        other_ports=(),
     ) -> Path:
-        """Add one single-port HCA; return its ``/dev/infiniband`` node path."""
+        """Add one HCA with an ``InfiniBand`` port 1 and *other_ports*.
+
+        *other_ports* holds ``(port, state)`` pairs. Return the device's
+        ``/dev/infiniband`` node path.
+        """
         device = Path(self.root, "sys", "class", "infiniband", name)
+        for other, other_state in other_ports:
+            _write(device / "ports" / other / "state", other_state)
+            _write(device / "ports" / other / "link_layer", "InfiniBand")
         port = device / "ports" / "1"
         _write(port / "state", state)
         _write(port / "link_layer", link_layer)
@@ -64,13 +72,15 @@ class FakeHost:
             path.write_text("", encoding="utf-8")
         return path
 
-    def resolve(self, requested=None) -> str:
+    def resolve(self, requested=None, env=None) -> str:
         return resolve_rdma_devices(
             requested,
             selected_by="protocol is rdma",
             devices_setting="rdma_devices",
             opt_out="set protocol: tcp",
             root=self.root,
+            # Keep this host's Mooncake switches out of the fake one.
+            env=env or {},
         )
 
 
@@ -157,7 +167,7 @@ class MooncakeRdmaDeviceTest(unittest.TestCase):
         self.assertEqual(
             [
                 (device.name, device.link_layer)
-                for device in probe_rdma_devices(root=self.host.root)
+                for device in probe_rdma_devices(root=self.host.root, env={})
             ],
             [
                 ("mlx5_0", "Ethernet"),
@@ -188,6 +198,63 @@ class MooncakeRdmaDeviceTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no devices under .*infiniband"):
             self.host.resolve()
 
+    def test_only_the_port_mooncake_opens_counts(self):
+        # Mooncake opens every HCA on MC_IB_PORT (default 1) and disables the
+        # whole HCA when that port is down, whatever its other ports do.
+        self.host.add("mlx4_0", state="1: DOWN", other_ports=[("2", "4: ACTIVE")])
+        with self.assertRaises(RuntimeError) as raised:
+            self.host.resolve()
+        self.assertIn(
+            "mlx4_0: port 1 is not ACTIVE (state '1: DOWN'); Mooncake opens only "
+            "port 1 (MC_IB_PORT), and port 2 is '4: ACTIVE'",
+            str(raised.exception),
+        )
+        self.assertEqual(self.host.resolve(env={"MC_IB_PORT": "2"}), "mlx4_0")
+        with self.assertRaisesRegex(RuntimeError, "mlx4_0: has no port 3;"):
+            self.host.resolve(env={"MC_IB_PORT": "3"})
+        # Mooncake ignores an out-of-range port and keeps port 1.
+        with self.assertRaisesRegex(RuntimeError, "port 1 is not ACTIVE"):
+            self.host.resolve(env={"MC_IB_PORT": "300"})
+
+    def test_a_configured_gid_index_must_hold_a_gid(self):
+        gids = [("IB/RoCE v1", None, _ROCE_V2_GID[2]), ("RoCE v2", "eth0", _ZERO_GID)]
+        self.host.add("mlx5_0", link_layer="Ethernet", gids=gids)
+        # No usable RoCE v2 GID for Mooncake's own selection ...
+        with self.assertRaisesRegex(RuntimeError, "without a RoCE v2 GID"):
+            self.host.resolve()
+        # ... but a configured index is used as is, and only a null GID fails.
+        self.assertEqual(self.host.resolve(env={"MC_GID_INDEX": "0"}), "mlx5_0")
+        for env in (
+            {"MC_GID_INDEX": "1"},
+            {"NCCL_IB_GID_INDEX": "1"},
+            {"MC_GID_INDEX": "7", "NCCL_IB_GID_INDEX": "0"},
+        ):
+            with self.subTest(env=env):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"port 1 has no GID at index \d \(MC_GID_INDEX or "
+                    r"NCCL_IB_GID_INDEX\)",
+                ):
+                    self.host.resolve(env=env)
+
+    def test_mooncake_device_filter_limits_selection_and_listed_devices(self):
+        for name in ("mlx5_0", "mlx5_1", "mlx5_2"):
+            self.host.add(name)
+        env = {"MC_TE_FILTERS": " mlx5_2, mlx5_0 "}
+        self.assertEqual(self.host.resolve(env=env), "mlx5_0,mlx5_2")
+        with self.assertRaises(RuntimeError) as raised:
+            self.host.resolve("mlx5_0,mlx5_1", env=env)
+        self.assertIn(
+            "mlx5_1: excluded by MC_TE_FILTERS=' mlx5_2, mlx5_0 '",
+            str(raised.exception),
+        )
+        with self.assertRaisesRegex(RuntimeError, "no usable RDMA device"):
+            self.host.resolve(env={"MC_TE_FILTERS": "mlx5_9"})
+        # An empty whitelist admits every device, as in Mooncake.
+        self.assertEqual(
+            self.host.resolve(env={"MC_TE_FILTERS": " , "}), "mlx5_0,mlx5_1,mlx5_2"
+        )
+
 
 class MooncakeRdmaEnvironmentTest(unittest.TestCase):
     def test_overrides_that_force_tcp_or_ignore_devices_are_rejected(self):
@@ -208,6 +275,24 @@ class MooncakeRdmaEnvironmentTest(unittest.TestCase):
                         where="the trainer environment",
                         opt_out="set protocol: tcp",
                     )
+
+    def test_device_filter_must_admit_every_listed_device(self):
+        environment = {"MC_TE_FILTERS": "mlx5_0,mlx5_2"}
+        check_rdma_environment(
+            environment, where="env", opt_out="set tcp", devices="mlx5_0,mlx5_2"
+        )
+        check_rdma_environment(environment, where="env", opt_out="set tcp")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"env sets MC_TE_FILTERS='mlx5_0,mlx5_2' \(Mooncake skips mlx5_1, "
+            r"mlx5_3 of the RDMA device list without a warning\)\. Unset it",
+        ):
+            check_rdma_environment(
+                environment,
+                where="env",
+                opt_out="set tcp",
+                devices="mlx5_0,mlx5_1,mlx5_3",
+            )
 
     def test_auto_discovery_is_rejected_only_when_enabled(self):
         for value in ("0", "", "yes"):

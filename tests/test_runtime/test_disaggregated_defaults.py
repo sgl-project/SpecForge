@@ -140,15 +140,48 @@ class MooncakeStoreTransportTest(unittest.TestCase):
         self.assertEqual(setup["protocol"], "rdma")
         self.assertEqual(setup["rdma_devices"], "mlx5_0")
 
-    def test_explicit_devices_and_tcp_pass_through(self):
+    def test_explicit_devices_are_checked_and_tcp_passes_through(self):
+        self.host.add("mlx5_0")
+        self.host.add("mlx5_7")
         setup, resolve = self._connect(
             {"MOONCAKE_PROTOCOL": "rdma", "MOONCAKE_RDMA_DEVICES": "mlx5_7"}
         )
         self.assertEqual(setup["rdma_devices"], "mlx5_7")
-        resolve.assert_not_called()
+        self.assertEqual(resolve.call_args.args, ("mlx5_7",))
         setup, resolve = self._connect({"MC_FORCE_TCP": "1"})
         self.assertEqual((setup["protocol"], setup["rdma_devices"]), ("tcp", ""))
         resolve.assert_not_called()
+
+        # Mooncake would drop the typo and run on mlx5_0 alone.
+        _RecordingStore.setups = []
+        with self.assertRaises(RuntimeError) as raised:
+            self._connect(
+                {"MOONCAKE_PROTOCOL": "rdma", "MOONCAKE_RDMA_DEVICES": "mlx5_0,mlx5_9"}
+            )
+        self.assertIn(
+            "MOONCAKE_RDMA_DEVICES lists RDMA devices that Mooncake cannot use",
+            str(raised.exception),
+        )
+        self.assertIn("mlx5_9: not under", str(raised.exception))
+        self.assertEqual(_RecordingStore.setups, [])
+
+    def test_rdma_honours_mooncake_device_filter(self):
+        self.host.add("mlx5_0")
+        self.host.add("mlx5_1")
+        setup, _ = self._connect(
+            {"MOONCAKE_PROTOCOL": "rdma", "MC_TE_FILTERS": "mlx5_1"}
+        )
+        self.assertEqual(setup["rdma_devices"], "mlx5_1")
+        with self.assertRaisesRegex(
+            RuntimeError, "mlx5_0: excluded by MC_TE_FILTERS='mlx5_1'"
+        ):
+            self._connect(
+                {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "MOONCAKE_RDMA_DEVICES": "mlx5_0,mlx5_1",
+                    "MC_TE_FILTERS": "mlx5_1",
+                }
+            )
 
     def test_rdma_without_usable_devices_fails_before_setup(self):
         self.host.add("mlx5_0", node=None)

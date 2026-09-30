@@ -11,10 +11,12 @@
 Mooncake does not refuse an unusable RDMA setup by itself. With
 ``protocol="rdma"`` and an empty device list it auto-discovers HCAs, and the
 x86 CUDA wheels install the TCP transport, logging only at INFO, when none is
-usable. A listed device that Mooncake cannot use is dropped without a warning.
-SpecForge therefore never passes Mooncake an empty or unchecked list: it reads
-sysfs itself, applies the per-device checks of Mooncake's topology discovery,
-and raises with the reason for every rejected device.
+usable. A listed device that Mooncake cannot use, or that ``MC_TE_FILTERS``
+excludes, is dropped without a warning. SpecForge's own clients therefore never
+pass Mooncake an empty or unchecked list: they read sysfs, apply the per-device
+checks Mooncake applies on the port and GID index it will open, and raise with
+the reason for every rejected device. The patched SGLang capture server does
+not use this module; it only refuses an empty list.
 
 Torch-free, so the launch supervisor can import it.
 """
@@ -35,6 +37,8 @@ _SYSFS_DEVICES = os.path.join("sys", "class", "infiniband")
 _DEVICE_NODES = os.path.join("dev", "infiniband")
 _INFINIBAND = "InfiniBand"
 _ETHERNET = "Ethernet"
+#: Mooncake opens every HCA on this one port unless MC_IB_PORT names another.
+_DEFAULT_IB_PORT = 1
 #: Linux capability that exempts memory registration from RLIMIT_MEMLOCK.
 _CAP_IPC_LOCK_BIT = 14
 _EXPOSE_HCAS = (
@@ -85,6 +89,44 @@ def _natural_key(name: str):
     return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
 
 
+def _leading_int(value: str) -> Optional[int]:
+    # Mooncake parses its integer switches with atoi or std::stoi.
+    match = re.match(r"\s*[+-]?\d+", value)
+    return int(match.group()) if match is not None else None
+
+
+def _ib_port(env: Mapping[str, str]) -> int:
+    """The one port Mooncake opens on every HCA (``MC_IB_PORT``)."""
+    value = env.get("MC_IB_PORT")
+    if value is None:
+        return _DEFAULT_IB_PORT
+    port = _leading_int(value) or 0
+    # Mooncake ignores an out-of-range value with a warning.
+    return port if 0 <= port < 256 else _DEFAULT_IB_PORT
+
+
+def _gid_index(env: Mapping[str, str]) -> Optional[int]:
+    """The GID index Mooncake uses on every port; None selects one per port."""
+    value = env.get("MC_GID_INDEX")
+    if value is None:
+        value = env.get("NCCL_IB_GID_INDEX")
+    if value is None:
+        return None
+    index = _leading_int(value) or 0
+    return index if 0 <= index < 256 else None
+
+
+def _device_whitelist(env: Mapping[str, str]) -> List[str]:
+    """Mooncake's ``MC_TE_FILTERS`` whitelist; empty admits every device."""
+    return [
+        name.strip() for name in env.get("MC_TE_FILTERS", "").split(",") if name.strip()
+    ]
+
+
+def _is_nonzero_gid(gid: Optional[str]) -> bool:
+    return bool((gid or "").replace(":", "").strip("0"))
+
+
 def _has_roce_v2_gid(port_dir: str) -> bool:
     """Mooncake needs a RoCE v2 GID bound to a network interface."""
     types_dir = os.path.join(port_dir, "gid_attrs", "types")
@@ -93,26 +135,32 @@ def _has_roce_v2_gid(port_dir: str) -> bool:
             continue
         if not _read(os.path.join(port_dir, "gid_attrs", "ndevs", index)):
             continue
-        gid = _read(os.path.join(port_dir, "gids", index)) or ""
-        if gid.replace(":", "").strip("0"):
+        if _is_nonzero_gid(_read(os.path.join(port_dir, "gids", index))):
             return True
     return False
 
 
-def _port_problem(port_dir: str, port: str) -> tuple[Optional[str], Optional[str]]:
+def _port_problem(
+    port_dir: str, port: int, gid_index: Optional[int]
+) -> tuple[Optional[str], Optional[str]]:
     """Return ``(link_layer, None)`` for a usable port, else ``(None, problem)``."""
     state = _read(os.path.join(port_dir, "state")) or "unreadable"
     if not state.startswith("4:"):
         return None, f"port {port} is not ACTIVE (state {state!r})"
     link_layer = _read(os.path.join(port_dir, "link_layer"))
-    if link_layer == _INFINIBAND:
-        return link_layer, None
-    if link_layer == _ETHERNET:
-        if _has_roce_v2_gid(port_dir):
-            return link_layer, None
+    if link_layer not in (_INFINIBAND, _ETHERNET):
+        return None, f"port {port} has unsupported link layer {link_layer!r}"
+    if gid_index is not None:
+        # Mooncake uses exactly this GID and refuses a null one.
+        if not _is_nonzero_gid(_read(os.path.join(port_dir, "gids", str(gid_index)))):
+            return None, (
+                f"port {port} has no GID at index {gid_index} (MC_GID_INDEX or "
+                "NCCL_IB_GID_INDEX)"
+            )
+    elif link_layer == _ETHERNET and not _has_roce_v2_gid(port_dir):
         missing = "without a RoCE v2 GID bound to a network interface"
         return None, f"port {port} is RoCE {missing}"
-    return None, f"port {port} has unsupported link layer {link_layer!r}"
+    return link_layer, None
 
 
 def _verbs_node_problem(device_dir: str, root: str) -> Optional[str]:
@@ -134,31 +182,52 @@ def _verbs_node_problem(device_dir: str, root: str) -> Optional[str]:
     return None
 
 
-def _probe_device(name: str, root: str) -> RdmaDevice:
+def _probe_device(name: str, root: str, env: Mapping[str, str]) -> RdmaDevice:
+    whitelist = _device_whitelist(env)
+    if whitelist and name not in whitelist:
+        return RdmaDevice(
+            name, problem=f"excluded by MC_TE_FILTERS={env['MC_TE_FILTERS']!r}"
+        )
     device_dir = os.path.join(root, _SYSFS_DEVICES, name)
     problem = _verbs_node_problem(device_dir, root)
     if problem is not None:
         return RdmaDevice(name, problem=problem)
     ports_dir = os.path.join(device_dir, "ports")
-    link_layers = []
-    problems = []
-    for port in sorted(_listdir(ports_dir), key=_natural_key):
-        link_layer, problem = _port_problem(os.path.join(ports_dir, port), port)
-        if link_layer is not None:
-            link_layers.append(link_layer)
-        else:
-            problems.append(problem)
-    if not link_layers:
-        return RdmaDevice(name, problem="; ".join(problems) or "has no ports")
-    return RdmaDevice(
-        name, link_layer=_INFINIBAND if _INFINIBAND in link_layers else _ETHERNET
-    )
+    ports = sorted(_listdir(ports_dir), key=_natural_key)
+    port = _ib_port(env)
+    if str(port) in ports:
+        link_layer, problem = _port_problem(
+            os.path.join(ports_dir, str(port)), port, _gid_index(env)
+        )
+        if problem is None:
+            return RdmaDevice(name, link_layer=link_layer)
+    else:
+        problem = f"has no port {port}"
+    others = []
+    for other in ports:
+        if other != str(port):
+            state = _read(os.path.join(ports_dir, other, "state")) or "unreadable"
+            others.append(f"port {other} is {state!r}")
+    if others:
+        # Mooncake disables the whole HCA when this one port is unusable.
+        problem += f"; Mooncake opens only port {port} (MC_IB_PORT), and " + (
+            ", ".join(others)
+        )
+    return RdmaDevice(name, problem=problem)
 
 
-def probe_rdma_devices(*, root: str = HOST_ROOT) -> List[RdmaDevice]:
-    """Every HCA under ``/sys/class/infiniband``, in natural name order."""
+def probe_rdma_devices(
+    *, root: str = HOST_ROOT, env: Optional[Mapping[str, str]] = None
+) -> List[RdmaDevice]:
+    """Every HCA under ``/sys/class/infiniband``, in natural name order.
+
+    *env* supplies the Mooncake switches that decide usability
+    (``MC_IB_PORT``, ``MC_GID_INDEX``/``NCCL_IB_GID_INDEX``, ``MC_TE_FILTERS``);
+    it defaults to this process's environment.
+    """
+    env = os.environ if env is None else env
     names = _listdir(os.path.join(root, _SYSFS_DEVICES))
-    return [_probe_device(name, root) for name in sorted(names, key=_natural_key)]
+    return [_probe_device(name, root, env) for name in sorted(names, key=_natural_key)]
 
 
 def resolve_rdma_devices(
@@ -168,6 +237,7 @@ def resolve_rdma_devices(
     devices_setting: str,
     opt_out: str,
     root: str = HOST_ROOT,
+    env: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Return the comma-separated HCAs a Mooncake RDMA client must use.
 
@@ -175,9 +245,10 @@ def resolve_rdma_devices(
     InfiniBand before RoCE, so a client never mixes fabrics. A requested list
     is returned only when every listed device is usable. For the error
     messages, *selected_by* says why RDMA is in use, *devices_setting* names
-    the device setting and *opt_out* says how to select TCP instead.
+    the device setting and *opt_out* says how to select TCP instead. *env* is
+    the client's environment (see :func:`probe_rdma_devices`).
     """
-    devices = probe_rdma_devices(root=root)
+    devices = probe_rdma_devices(root=root, env=env)
     usable = [device for device in devices if device.problem is None]
     names = list(
         dict.fromkeys(
@@ -220,19 +291,36 @@ def resolve_rdma_devices(
 
 
 def _forces_auto_discovery(value: Optional[str]) -> bool:
-    # Mooncake parses MC_MS_AUTO_DISC with std::stoi and acts only on 1.
-    match = re.match(r"\s*[+-]?\d+", value or "")
-    return match is not None and int(match.group()) == 1
+    # Mooncake acts on MC_MS_AUTO_DISC only when it parses as 1.
+    return _leading_int(value or "") == 1
 
 
-def check_rdma_environment(env: Mapping[str, str], *, where: str, opt_out: str) -> None:
-    """Reject Mooncake switches that defeat an explicit RDMA device list."""
+def check_rdma_environment(
+    env: Mapping[str, str],
+    *,
+    where: str,
+    opt_out: str,
+    devices: Optional[str] = None,
+) -> None:
+    """Reject Mooncake switches that defeat an explicit RDMA device list.
+
+    *devices* is the list the client passes Mooncake; ``MC_TE_FILTERS`` must
+    admit every name on it.
+    """
     conflicts = [
         f"{name}={env[name]!r} ({effect})"
         for name, effect in _RDMA_OVERRIDES
         if name in env
         and (name != "MC_MS_AUTO_DISC" or _forces_auto_discovery(env[name]))
     ]
+    whitelist = _device_whitelist(env)
+    listed = [name.strip() for name in (devices or "").split(",") if name.strip()]
+    skipped = [name for name in listed if whitelist and name not in whitelist]
+    if skipped:
+        conflicts.append(
+            f"MC_TE_FILTERS={env['MC_TE_FILTERS']!r} (Mooncake skips "
+            f"{', '.join(skipped)} of the RDMA device list without a warning)"
+        )
     if conflicts:
         raise RuntimeError(
             f"Mooncake RDMA is selected, but {where} sets "

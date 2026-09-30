@@ -192,17 +192,20 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
         ) from e
     setup_kwargs = dict(setup_kwargs)
     if setup_kwargs.get("protocol") == "rdma":
-        check_rdma_environment(
-            os.environ, where="this process's environment", opt_out=_RDMA_OPT_OUT
+        # Mooncake would auto-discover HCAs for an empty list and fall back to
+        # TCP silently, and drops a listed device it cannot use without a warning.
+        setup_kwargs["rdma_devices"] = resolve_rdma_devices(
+            setup_kwargs.get("rdma_devices") or None,
+            selected_by="MOONCAKE_PROTOCOL is rdma",
+            devices_setting="MOONCAKE_RDMA_DEVICES",
+            opt_out=_RDMA_OPT_OUT,
         )
-        if not setup_kwargs.get("rdma_devices"):
-            # Mooncake would auto-discover HCAs and fall back to TCP silently.
-            setup_kwargs["rdma_devices"] = resolve_rdma_devices(
-                None,
-                selected_by="MOONCAKE_PROTOCOL is rdma",
-                devices_setting="MOONCAKE_RDMA_DEVICES",
-                opt_out=_RDMA_OPT_OUT,
-            )
+        check_rdma_environment(
+            os.environ,
+            where="this process's environment",
+            opt_out=_RDMA_OPT_OUT,
+            devices=setup_kwargs["rdma_devices"],
+        )
     # Ascend's transport needs a bound device context (see _bind_transport_device).
     _bind_transport_device()
     if _ascend_runtime_available():
