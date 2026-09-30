@@ -5,7 +5,7 @@ YAML recipes themselves live under `examples/configs`. Disaggregated training
 uses the same typed config and public command as every other run:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml
 ```
 
 For a single trainer node, that command supervises the SpecForge producer and
@@ -31,10 +31,10 @@ wrappers only add the config path and forward arguments to `specforge train`;
 they contain no second trainer, torchrun construction, or transport validation:
 
 ```bash
-CONFIG=examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml \
+CONFIG=examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml \
   examples/disagg/run_online.sh
 
-CONFIG=examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml \
+CONFIG=examples/configs/offline/disaggregated/qwen3-8b-eagle3.yaml \
   examples/disagg/run_offline.sh
 ```
 
@@ -44,7 +44,7 @@ rank dispatcher on both nodes. The cluster launcher supplies
 
 ```bash
 rcli exec --per-node <job> \
-  'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
+  'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3.yaml bash examples/disagg/run_offline_2node.sh'
 ```
 
 This wrapper only maps rank to `specforge train --role`; the YAML still owns
@@ -58,10 +58,10 @@ not expose the corresponding `RCLI_*` variables.
 Use the same YAML when producer and consumer belong to different pools:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml \
   --role producer
 
-specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml \
   --role consumer
 ```
 
@@ -200,10 +200,10 @@ trainer in one YAML:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml
 
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7.yaml
 ```
 
 These recipes preserve the old DFlash and Domino one-server + DP7
@@ -211,17 +211,17 @@ self-contained topologies. The genuine two-server Domino recipe is:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml
 ```
 
 Qwen3.6 DFlash has both one-server and larger two-TP2-server managed recipes:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2.yaml
 
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-2server-dp2.yaml
 ```
 
 The first command preserves the historical one-server + DP2 self-contained
@@ -232,7 +232,7 @@ servers on GPUs 0-3 and a DP4 trainer on GPUs 4-7:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml
 ```
 
 That opt-in profile starts, health-checks, and cleans up the owned local
