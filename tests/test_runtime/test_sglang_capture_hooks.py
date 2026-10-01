@@ -17,6 +17,17 @@ def _backend_with(model):
 
 
 class CaptureLayerHookTest(unittest.TestCase):
+    def test_hspec_uses_the_dflash_hidden_capture_hook(self):
+        model = mock.Mock(spec=["set_dflash_layers_to_capture"])
+
+        _backend_with(model).set_capture_layers(
+            [1, 9, 17, 25, 33], capture_method="hspec"
+        )
+
+        model.set_dflash_layers_to_capture.assert_called_once_with(
+            [1, 9, 17, 25, 33]
+        )
+
     def test_dspark_prefers_its_native_capture_hook(self):
         model = mock.Mock(
             spec=["set_dspark_layers_to_capture", "set_dflash_layers_to_capture"]

@@ -908,9 +908,13 @@ class TrainingConfig(StrictConfigModel):
     #: remains on the accelerator.
     optimizer_cpu_offload: bool = False
     ttt_length: int = Field(default=7, gt=0)
-    attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
-        "flex_attention"
-    )
+    #: Trainer attention backend. None resolves from the selected algorithm's
+    #: capability set (flex_attention preferred, then sdpa/eager) so restricted
+    #: algorithms such as H-Spec (eager/sdpa only) are not forced through a
+    #: global flex_attention default.
+    attention_backend: Optional[
+        Literal["eager", "sdpa", "flex_attention", "fa", "usp"]
+    ] = None
     #: Trainer tensor parallelism. The unified runtime currently requires one;
     #: target-model TP belongs to external or managed capture servers.
     tp_size: int = Field(default=1, gt=0)

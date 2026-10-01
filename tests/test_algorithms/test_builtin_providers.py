@@ -24,7 +24,7 @@ from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "eagle3", "hspec", "mtp", "peagle")
 
 
 def _teacher_metrics_config(enabled: bool):
@@ -97,6 +97,13 @@ class BuiltinProviderContractTest(unittest.TestCase):
 
     def test_builtin_online_providers_are_server_streaming_only(self):
         for registration in self.registry:
+            if not any(
+                contract.mode is FeatureMode.STREAMING
+                for contract in registration.spec.feature_contracts
+            ):
+                # Offline-only algorithms (e.g. hspec) ship no streaming
+                # provider until their streaming K/V producer exists.
+                continue
             with self.subTest(algorithm=registration.name):
                 providers = registration.providers
                 self.assertGreaterEqual(len(providers.server_streaming), 1)
@@ -183,6 +190,8 @@ class BuiltinProviderContractTest(unittest.TestCase):
             layers=[object(), object()],
             norm_before_residual=True,
             target_layer_ids=[3, 7],
+            target_kv_layer_ids=[3],
+            block_pattern=["mamba", "attention"],
             pure_draft_prefix_len=2,
         )
         dflash_family = SimpleNamespace(
@@ -218,6 +227,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "dflash": dflash_family,
             "domino": dflash_family,
             "dspark": dflash_family,
+            "hspec": dflash_family,
             "mtp": SimpleNamespace(),
         }
         expected_keys = {
@@ -256,6 +266,20 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
+            },
+            "hspec": {
+                "hspec_draft_num_hidden_layers",
+                "hspec_target_layer_ids",
+                "hspec_target_kv_layer_ids",
+                "hspec_block_pattern",
+                "hspec_block_size",
+                "hspec_mask_token_id",
+                "hspec_attention_backend",
+                "hspec_num_anchors",
+                "hspec_loss_decay_gamma",
+                "hspec_ce_loss_alpha",
+                "hspec_l1_loss_alpha",
+                "hspec_confidence_head_alpha",
             },
             "mtp": {
                 "mtp_draft_num_hidden_layers",
@@ -573,7 +597,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==6; "
+            "r=builtin_algorithm_registry(); assert len(r)==7; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

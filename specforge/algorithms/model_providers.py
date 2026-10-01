@@ -445,6 +445,55 @@ def build_dspark_model(
     )
 
 
+def build_hspec_model(
+    cfg: Config,
+    draft_model: Any,
+    _draft_config: Any,
+    _target_config: Any,
+    tokenizer: Any,
+) -> AlgorithmModelParts:
+    from specforge.algorithms.common.dflash_family_model import OnlineHSpecModel
+
+    return _build_dflash_family_model(
+        cfg,
+        draft_model,
+        tokenizer,
+        lambda common: OnlineHSpecModel(
+            **common,
+            dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
+            dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
+            dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
+        ),
+    )
+
+
+def resolve_hspec_capture_layers(
+    _cfg: Config, draft_config: Any, _target_config: Any
+) -> List[int]:
+    """Resolve H-Spec hidden capture layers from the draft config.
+
+    H-Spec fuses target latents from ``hspec_config.latent_fusion_layer_ids``;
+    the dflash ``target_layer_ids`` remain the fallback so existing dflash
+    drafts keep producing a usable latent set.
+    """
+
+    if isinstance(draft_config, dict):
+        method_config = draft_config.get("hspec_config", {}) or {}
+        dflash_config = draft_config.get("dflash_config", {}) or {}
+    else:
+        method_config = getattr(draft_config, "hspec_config", {}) or {}
+        dflash_config = getattr(draft_config, "dflash_config", {}) or {}
+    layers = method_config.get("latent_fusion_layer_ids")
+    if not layers:
+        layers = dflash_config.get("target_layer_ids")
+    if not layers:
+        raise ValueError(
+            "draft config does not define hspec_config."
+            "latent_fusion_layer_ids or dflash_config.target_layer_ids"
+        )
+    return list(layers)
+
+
 def eagle3_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
     return {
         "trim_loss_positions": cfg.training.trim_loss_positions,

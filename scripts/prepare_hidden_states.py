@@ -94,6 +94,7 @@ class OfflineCapturePlan:
     capture_layers: tuple[int, ...]
     layout: OfflineCaptureLayout
     loss_mask_filter: Optional[Callable[[object], bool]]
+    kv_layer_ids: Optional[tuple[int, ...]] = None
 
 
 def parse_args():
@@ -181,6 +182,14 @@ def parse_args():
     )
 
     sglang_group = parser.add_argument_group("sglang")
+    parser.add_argument(
+        "--attention-backend",
+        default="flex_attention",
+        help=(
+            "Trainer attention backend recorded in the capture plan "
+            "(algorithms restrict the supported set, e.g. hspec: eager/sdpa)"
+        ),
+    )
     sglang_group.add_argument(
         "--sglang-attention-backend",
         default="flashinfer",
@@ -331,9 +340,20 @@ def resolve_offline_capture_plan(
             "hidden_states_path": args.output_path or "__offline_capture__",
             "max_length": args.max_length,
         },
-        training={"strategy": strategy},
+        training={"strategy": strategy, "attention_backend": args.attention_backend},
     )
     resolved = resolve_offline_capture(cfg, target_config=target_config)
+    kv_layer_ids = None
+    if resolved.capture_method == "hspec":
+        hspec_config = getattr(resolved.draft_config, "hspec_config", None) or {}
+        kv_layer_ids = hspec_config.get("attn_kv_layer_ids") or hspec_config.get(
+            "target_kv_layer_ids"
+        )
+        if not kv_layer_ids:
+            raise ValueError(
+                "strategy hspec requires the draft config to define "
+                "hspec_config.attn_kv_layer_ids"
+            )
     return OfflineCapturePlan(
         strategy=resolved.run.algorithm.name,
         draft_config=resolved.draft_config,
@@ -341,6 +361,7 @@ def resolve_offline_capture_plan(
         capture_layers=resolved.capture_layers,
         layout=resolved.layout,
         loss_mask_filter=resolved.loss_mask_filter,
+        kv_layer_ids=tuple(int(x) for x in kv_layer_ids) if kv_layer_ids else None,
     )
 
 
@@ -349,6 +370,7 @@ def build_target_model(
     model_config: AutoConfig,
     capture_layers: List[int],
     capture_method: str = "eagle3",
+    kv_layer_ids: Optional[tuple[int, ...]] = None,
 ) -> OfflineSGLangCapture:
     """Build the local target used only by this preprocessing command."""
     target_model = load_offline_capture(
@@ -364,6 +386,7 @@ def build_target_model(
     target_model.set_capture_layers(
         capture_layers,
         capture_method=capture_method,
+        kv_layer_ids=list(kv_layer_ids) if kv_layer_ids else None,
     )
     return target_model
 
@@ -382,6 +405,7 @@ class HiddenStatesGenerator:
         self,
         target_model,
         capture_layout: Optional[OfflineCaptureLayout] = None,
+        capture_method: str = "eagle3",
         num_io_threads: int = 4,
         io_queue_size: int = 50,
         file_group_size: int = 2000,
@@ -397,6 +421,7 @@ class HiddenStatesGenerator:
             file_group_size: Number of files per subdirectory.
         """
         self.model = target_model
+        self.capture_method = capture_method
         self.capture_layout = capture_layout or OfflineCaptureLayout(
             capture_method="eagle3",
             aux_feature="aux_hidden_state",
@@ -681,6 +706,11 @@ class HiddenStatesGenerator:
             captured = self.model.capture(
                 **filtered_batch_gpu,
             )
+            hspec_feature_rows = (
+                list(captured.feature_rows())
+                if self.capture_method == "hspec" and self.model.capture_method == "hspec"
+                else []
+            )
             aux_hidden_states_list = captured.hidden_states
             last_hidden_states_list = captured.last_hidden_states
             if aux_hidden_states_list is None:
@@ -691,45 +721,56 @@ class HiddenStatesGenerator:
             del filtered_batch_gpu
 
             if is_tp_rank_0():
-                for i, (
-                    current_global_idx,
-                    aux_hidden_states,
-                    last_hidden_states,
-                ) in enumerate(
-                    zip(
-                        sample_global_indices,
-                        aux_hidden_states_list,
-                        last_hidden_states_list,
-                    )
-                ):
+                if hspec_feature_rows:
+                    for current_global_idx, record in zip(
+                        sample_global_indices, hspec_feature_rows
+                    ):
+                        self._save_tensor_async(
+                            {key: value.cpu().clone() for key, value in record.items()},
+                            self._get_file_path(output_path, current_global_idx),
+                        )
+                else:
+                    for i, (
+                        current_global_idx,
+                        aux_hidden_states,
+                        last_hidden_states,
+                    ) in enumerate(
+                        zip(
+                            sample_global_indices,
+                            aux_hidden_states_list,
+                            last_hidden_states_list,
+                        )
+                    ):
 
-                    # Process ONE sample at a time to minimize CPU RAM footprint
-                    # 1. Transfer only the required slice for one sample to CPU
-                    aux_hidden_states = (
-                        aux_hidden_states.cpu().clone().unsqueeze(0)
-                        if aux_hidden_states is not None
-                        else None
-                    )
-                    last_hidden_states = (
-                        last_hidden_states.cpu().clone().unsqueeze(0)
-                        if last_hidden_states is not None
-                        else None
-                    )
-                    record = self.capture_layout.materialize(
-                        {
-                            "input_ids": filtered_batch["input_ids"][i].clone(),
-                            "loss_mask": filtered_batch["loss_mask"][i].clone(),
-                            "aux_hidden_states": aux_hidden_states,
-                            "last_hidden_states": last_hidden_states,
-                        }
-                    )
+                        # Process ONE sample at a time to minimize CPU RAM footprint
+                        # 1. Transfer only the required slice for one sample to CPU
+                        aux_hidden_states = (
+                            aux_hidden_states.cpu().clone().unsqueeze(0)
+                            if aux_hidden_states is not None
+                            else None
+                        )
+                        last_hidden_states = (
+                            last_hidden_states.cpu().clone().unsqueeze(0)
+                            if last_hidden_states is not None
+                            else None
+                        )
+                        record = self.capture_layout.materialize(
+                            {
+                                "input_ids": filtered_batch["input_ids"][i].clone(),
+                                "loss_mask": filtered_batch["loss_mask"][i].clone(),
+                                "aux_hidden_states": aux_hidden_states,
+                                "last_hidden_states": last_hidden_states,
+                            }
+                        )
 
-                    # 3. Save asynchronously (the backpressure logic is still crucial)
-                    output_file = self._get_file_path(output_path, current_global_idx)
-                    self._save_tensor_async(record, output_file)
+                        # 3. Save asynchronously (the backpressure logic is still crucial)
+                        output_file = self._get_file_path(
+                            output_path, current_global_idx
+                        )
+                        self._save_tensor_async(record, output_file)
 
-                    # 4. Immediately clean up the single-sample CPU tensors
-                    del last_hidden_states, aux_hidden_states
+                        # 4. Immediately clean up the single-sample CPU tensors
+                        del last_hidden_states, aux_hidden_states
 
                 total_processed += len(sample_global_indices)
 
@@ -737,7 +778,10 @@ class HiddenStatesGenerator:
             del aux_hidden_states_list, last_hidden_states_list, filtered_batch
 
             if batch_idx % 5 == 0:  # Make GC and cache clearing more frequent
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+                    torch.npu.empty_cache()
                 gc.collect()
 
             if self.show_progress:
@@ -796,6 +840,7 @@ def main():
         target_model_config,
         capture_layers=list(capture_plan.capture_layers),
         capture_method=capture_plan.capture_method,
+        kv_layer_ids=capture_plan.kv_layer_ids,
     )
     target_text_config = getattr(
         target_model_config, "text_config", target_model_config
@@ -912,6 +957,7 @@ def main():
         with HiddenStatesGenerator(
             target_model,
             capture_layout=capture_plan.layout,
+            capture_method=capture_plan.capture_method,
             num_io_threads=args.num_io_threads,
             io_queue_size=args.io_queue_size,
             file_group_size=args.file_group_size,

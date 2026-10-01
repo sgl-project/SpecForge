@@ -157,7 +157,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
         backend = mock.Mock()
         capture = OfflineSGLangCapture(backend)
 
-        for capture_method in ("dflash", "dspark"):
+        for capture_method in ("dflash", "dspark", "hspec"):
             with self.subTest(capture_method=capture_method):
                 backend.reset_mock()
                 capture.set_capture_layers(
@@ -170,6 +170,55 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                     [1, 9, 17, 25, 33],
                     capture_method=capture_method,
                 )
+
+    def test_hspec_kv_layers_are_only_set_when_given_explicitly(self):
+        backend = mock.Mock()
+        capture = OfflineSGLangCapture(backend)
+
+        capture.set_capture_layers(
+            [1, 9, 17, 25, 33], capture_method="hspec"
+        )
+        backend.set_hspec_kv_layer_ids.assert_not_called()
+
+        capture.set_hspec_kv_layer_ids([17])
+        backend.set_hspec_kv_layer_ids.assert_called_once_with([17])
+
+    def test_hspec_capture_stacks_per_sample_features(self):
+        backend = mock.Mock()
+        seq, width = 3, 8
+        features = []
+        for _ in range(2):
+            features.append(
+                {
+                    "input_ids": torch.arange(seq).unsqueeze(0),
+                    "loss_mask": torch.ones(1, seq, dtype=torch.long),
+                    "prefix_masks": torch.ones(1, seq, dtype=torch.long),
+                    "hidden_states": torch.randn(seq, width),
+                    "target_last_hidden_states": torch.randn(seq, width),
+                    "selected_target_k": torch.randn(seq, width),
+                    "selected_target_v": torch.randn(seq, width),
+                }
+            )
+        backend.capture_hspec.return_value = features
+        capture = OfflineSGLangCapture(backend, capture_method="hspec")
+
+        batch = capture.capture(
+            input_ids=torch.zeros(2, seq, dtype=torch.long),
+            attention_mask=torch.ones(2, seq, dtype=torch.long),
+            loss_mask=torch.ones(2, seq, dtype=torch.long),
+        )
+
+        self.assertEqual(batch.hidden_states.shape, (2, seq, width))
+        self.assertEqual(batch.last_hidden_states.shape, (2, seq, width))
+        self.assertEqual(batch.selected_target_k.shape, (2, seq, width))
+        self.assertEqual(batch.selected_target_v.shape, (2, seq, width))
+        self.assertEqual(batch.prefix_masks.shape, (2, 1, seq))
+        rows = list(batch.feature_rows())
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["hidden_states"].shape, (seq, width))
+            self.assertEqual(row["selected_target_k"].shape, (seq, width))
+            self.assertEqual(row["prefix_masks"].shape, (1, seq))
 
 
 if __name__ == "__main__":
