@@ -2,12 +2,25 @@
 
 import unittest
 
+from specforge.data.preprocessing import preprocess_conversations
 from specforge.data.template import TEMPLATE_REGISTRY
 
 
 class TemplateRegistryTest(unittest.TestCase):
     def test_qwen2_vl_is_not_a_builtin_template(self):
         self.assertNotIn("qwen2-vl", TEMPLATE_REGISTRY.get_all_template_names())
+
+    def test_every_registered_template_builds_its_parser(self):
+        # The parser is chosen from parser_type and compiles its assistant-span
+        # pattern before any conversation is read, so no tokenizer is needed.
+        for name in TEMPLATE_REGISTRY.get_all_template_names():
+            with self.subTest(template=name):
+                preprocess_conversations(
+                    tokenizer=None,
+                    conversations=[],
+                    chat_template=TEMPLATE_REGISTRY.get(name),
+                    tools=[],
+                )
 
     def test_deepseek_v2_uses_its_plain_text_tokenizer_headers(self):
         template = TEMPLATE_REGISTRY.get("deepseek-v2")

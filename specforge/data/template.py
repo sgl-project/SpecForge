@@ -181,12 +181,15 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# DeepSeek-R1-Distill renders every assistant turn as
+# '<｜Assistant｜>' + answer + '<｜end▁of▁sentence｜>'; the end-of-sentence token
+# closes each supervised span, as it does for DeepSeek-V3.
 TEMPLATE_REGISTRY.register(
     name="deepseek-r1-distill",
     template=ChatTemplate(
         assistant_header="<｜Assistant｜>",
         user_header="<｜User｜>",
-        end_of_turn_token=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
         system_prompt=None,
     ),
 )

@@ -187,16 +187,27 @@ class GeneralParser(Parser):
                 re.escape(self.assistant_message_separator)
                 + r"(?:</think>)?"
                 + r"([\s\S]*?(?:"
-                + re.escape(self.chat_template.end_of_turn_token)
+                + re.escape(self._end_of_turn_token())
                 + "|$))"
             )
         else:
             self.assistant_pattern = (
                 re.escape(self.assistant_message_separator)
                 + r"([\s\S]*?(?:"
-                + re.escape(self.chat_template.end_of_turn_token)
+                + re.escape(self._end_of_turn_token())
                 + "|$))"
             )
+
+    def _end_of_turn_token(self) -> str:
+        end_of_turn_token = self.chat_template.end_of_turn_token
+        if not end_of_turn_token:
+            pattern_type = self.chat_template.assistant_pattern_type
+            raise ValueError(
+                f"assistant_pattern_type={pattern_type!r} needs the chat "
+                "template's end_of_turn_token to end each supervised "
+                "assistant turn"
+            )
+        return end_of_turn_token
 
     def parse(
         self,
