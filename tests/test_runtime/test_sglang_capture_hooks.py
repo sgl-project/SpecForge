@@ -24,9 +24,7 @@ class CaptureLayerHookTest(unittest.TestCase):
             [1, 9, 17, 25, 33], capture_method="hspec"
         )
 
-        model.set_dflash_layers_to_capture.assert_called_once_with(
-            [1, 9, 17, 25, 33]
-        )
+        model.set_dflash_layers_to_capture.assert_called_once_with([1, 9, 17, 25, 33])
 
     def test_dspark_prefers_its_native_capture_hook(self):
         model = mock.Mock(

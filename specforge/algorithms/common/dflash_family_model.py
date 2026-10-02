@@ -2574,4 +2574,3 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
 class OnlineHSpecModel(OnlineDSparkModel):
     """DSpark objective over a hybrid Mamba/target-KV drafter."""
-

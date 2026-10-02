@@ -785,7 +785,9 @@ class HiddenStatesGenerator:
             if batch_idx % 5 == 0:  # Make GC and cache clearing more frequent
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+                elif (
+                    getattr(torch, "npu", None) is not None and torch.npu.is_available()
+                ):
                     torch.npu.empty_cache()
                 gc.collect()
 

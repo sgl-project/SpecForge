@@ -175,9 +175,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
         backend = mock.Mock()
         capture = OfflineSGLangCapture(backend)
 
-        capture.set_capture_layers(
-            [1, 9, 17, 25, 33], capture_method="hspec"
-        )
+        capture.set_capture_layers([1, 9, 17, 25, 33], capture_method="hspec")
         backend.set_hspec_kv_layer_ids.assert_not_called()
 
         capture.set_hspec_kv_layer_ids([17])

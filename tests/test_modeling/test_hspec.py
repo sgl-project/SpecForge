@@ -56,9 +56,7 @@ class HSpecReferenceTest(unittest.TestCase):
         module = HSpecMamba2Reference(_config())
         module.eval()
         hidden = torch.randn(2, 5, 8)
-        state = torch.randn(
-            2, module.num_heads, module.head_dim, module.state_size
-        )
+        state = torch.randn(2, module.num_heads, module.head_dim, module.state_size)
 
         with torch.no_grad():
             current = state.clone()
@@ -82,9 +80,7 @@ class HSpecReferenceTest(unittest.TestCase):
                 ],
                 dim=-1,
             )
-            decay = torch.exp(
-                -dt[..., None] * torch.exp(module.A_log)[..., None]
-            )
+            decay = torch.exp(-dt[..., None] * torch.exp(module.A_log)[..., None])
             for step in range(hidden.shape[1]):
                 current = current * decay[:, step][..., None]
                 value = value_states[:, step].view(2, 4, 2)
@@ -94,11 +90,9 @@ class HSpecReferenceTest(unittest.TestCase):
                 state_b = state_b.repeat_interleave(
                     module.num_heads // module.n_groups, dim=1
                 )
-                current = current + state_b.to(torch.float32).unsqueeze(
-                    2
-                ) * value.to(torch.float32).unsqueeze(-1) * dt[
-                    :, step
-                ].to(torch.float32).view(2, 4, 1, 1)
+                current = current + state_b.to(torch.float32).unsqueeze(2) * value.to(
+                    torch.float32
+                ).unsqueeze(-1) * dt[:, step].to(torch.float32).view(2, 4, 1, 1)
 
             actual, final_state = module(hidden, initial_state=state)
 
@@ -150,9 +144,7 @@ class HSpecTargetKVAttentionTest(unittest.TestCase):
             )
 
         self.assertEqual(eager_output.shape, (2, 3, 8))
-        torch.testing.assert_close(
-            sdpa_output, eager_output, rtol=1e-4, atol=1e-5
-        )
+        torch.testing.assert_close(sdpa_output, eager_output, rtol=1e-4, atol=1e-5)
 
     def test_prefix_mask_excludes_disabled_context(self):
         config = _config()
@@ -262,18 +254,14 @@ class HSpecSplitSourceAttentionTest(unittest.TestCase):
         torch.manual_seed(12)
         attention = self._attention("eager")
         dense = torch.randn(2, 4, 2, 2)
-        reference = self._run(
-            attention, dense, dense, None, "split"
-        )
+        reference = self._run(attention, dense, dense, None, "split")
         for layout, expected in (
             (dense.transpose(1, 2).contiguous(), reference),
             (dense.reshape(2, 4, 4), reference),
         ):
             with self.subTest(layout=tuple(layout.shape)):
                 output = self._run(attention, layout, layout, None, "split")
-                torch.testing.assert_close(
-                    output, expected, rtol=1e-5, atol=1e-5
-                )
+                torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
         shared = dense[0].reshape(4, 4)
         broadcast = dense[0].unsqueeze(0).expand(2, -1, -1, -1)
         shared_expected = self._run(
@@ -289,9 +277,7 @@ class HSpecSplitSourceAttentionTest(unittest.TestCase):
         empty_value = torch.randn(2, 0, 4)
         empty_prefix = self._run(attention, empty_key, empty_value, None, "split")
         draft_only = self._run(attention, empty_key, empty_value, None, "cat")
-        torch.testing.assert_close(
-            empty_prefix, draft_only, rtol=1e-5, atol=1e-5
-        )
+        torch.testing.assert_close(empty_prefix, draft_only, rtol=1e-5, atol=1e-5)
 
     def test_fully_masked_prefix_equals_empty_prefix(self):
         torch.manual_seed(14)
@@ -308,9 +294,7 @@ class HSpecSplitSourceAttentionTest(unittest.TestCase):
         empty_key = torch.randn(2, 0, 4)
         empty_value = torch.randn(2, 0, 4)
         empty_prefix = self._run(attention, empty_key, empty_value, None, "split")
-        torch.testing.assert_close(
-            blocked, empty_prefix, rtol=1e-5, atol=1e-5
-        )
+        torch.testing.assert_close(blocked, empty_prefix, rtol=1e-5, atol=1e-5)
 
     @unittest.skipIf(
         not (hasattr(torch, "npu") and torch.npu.is_available()),
@@ -341,22 +325,17 @@ class HSpecSplitSourceAttentionTest(unittest.TestCase):
                 position_embeddings=position_embeddings,
                 prefix_mask=prefix_mask,
             )
-            npu_output = (
-                npu_attention(
-                    hidden.to("npu"),
-                    target_key=target_key.to("npu"),
-                    target_value=target_value.to("npu"),
-                    position_embeddings=(
-                        position_embeddings[0].to("npu"),
-                        position_embeddings[1].to("npu"),
-                    ),
-                    prefix_mask=prefix_mask.to("npu"),
-                )
-                .cpu()
-            )
-        torch.testing.assert_close(
-            npu_output, cpu_output, rtol=1e-4, atol=1e-5
-        )
+            npu_output = npu_attention(
+                hidden.to("npu"),
+                target_key=target_key.to("npu"),
+                target_value=target_value.to("npu"),
+                position_embeddings=(
+                    position_embeddings[0].to("npu"),
+                    position_embeddings[1].to("npu"),
+                ),
+                prefix_mask=prefix_mask.to("npu"),
+            ).cpu()
+        torch.testing.assert_close(npu_output, cpu_output, rtol=1e-4, atol=1e-5)
 
     @unittest.skipIf(
         not (hasattr(torch, "npu") and torch.npu.is_available()),
@@ -392,9 +371,7 @@ class HSpecSplitSourceAttentionTest(unittest.TestCase):
         self.assertIsNotNone(hidden.grad)
         self.assertTrue(torch.isfinite(hidden.grad).all())
         for name, parameter in layer.named_parameters():
-            self.assertIsNotNone(
-                parameter.grad, f"no gradient for {name}"
-            )
+            self.assertIsNotNone(parameter.grad, f"no gradient for {name}")
 
 
 class HSpecDraftMaskSemanticsTest(unittest.TestCase):
@@ -464,9 +441,7 @@ class HSpecDraftMaskSemanticsTest(unittest.TestCase):
                 # The anchor sits at position 2: target tokens >= 2 must be
                 # invisible, otherwise the draft attends to the answer's own
                 # future K/V (the leak the serving path cannot have).
-                mask[..., :seq_len] = torch.tensor(
-                    [[True, True, False, False, False]]
-                )
+                mask[..., :seq_len] = torch.tensor([[True, True, False, False, False]])
             with torch.no_grad():
                 return model(
                     position_ids=position_ids,
@@ -535,19 +510,13 @@ class HSpecOnlineModelIntegrationTest(unittest.TestCase):
 
         loss, accuracy, metrics = model(
             input_ids=input_ids,
-            hidden_states=torch.randn(
-                batch_size, seq_len, 40, generator=generator
-            ),
+            hidden_states=torch.randn(batch_size, seq_len, 40, generator=generator),
             loss_mask=loss_mask,
             target_last_hidden_states=torch.randn(
                 batch_size, seq_len, 8, generator=generator
             ),
-            selected_target_k=torch.randn(
-                batch_size, seq_len, 4, generator=generator
-            ),
-            selected_target_v=torch.randn(
-                batch_size, seq_len, 4, generator=generator
-            ),
+            selected_target_k=torch.randn(batch_size, seq_len, 4, generator=generator),
+            selected_target_v=torch.randn(batch_size, seq_len, 4, generator=generator),
             prefix_masks=prefix_masks,
         )
         self.assertTrue(torch.isfinite(loss))

@@ -112,7 +112,9 @@ class OfflineSGLangCapture:
                     [feature["target_last_hidden_states"] for feature in features],
                     dim=0,
                 ),
-                input_ids=torch.cat([feature["input_ids"] for feature in features], dim=0),
+                input_ids=torch.cat(
+                    [feature["input_ids"] for feature in features], dim=0
+                ),
                 attention_mask=attention_mask,
                 loss_mask=torch.cat(
                     [feature["loss_mask"] for feature in features], dim=0

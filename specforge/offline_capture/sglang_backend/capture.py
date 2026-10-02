@@ -210,9 +210,7 @@ class OfflineSGLangCaptureBackend:
                     "SGLang did not return hidden states required for H-Spec capture"
                 )
             kv_layer_ids = self._hspec_kv_layer_ids()
-            kv_rows = self._capture_target_kv(
-                forward_batch, input_lens, kv_layer_ids
-            )
+            kv_rows = self._capture_target_kv(forward_batch, input_lens, kv_layer_ids)
             hidden_rows = torch.split(aux_hidden_states, input_lens, dim=0)
             last_rows = torch.split(last_hidden_states, input_lens, dim=0)
             features = []
@@ -258,9 +256,7 @@ class OfflineSGLangCaptureBackend:
         if method is None:
             draft_config = ModelConfig.from_server_args(
                 self.model_runner.server_args,
-                model_path=(
-                    self.model_runner.server_args.speculative_draft_model_path
-                ),
+                model_path=(self.model_runner.server_args.speculative_draft_model_path),
                 is_draft_model=True,
             )
             method = getattr(draft_config.hf_config, "hspec_config", {}) or {}
@@ -303,7 +299,11 @@ class OfflineSGLangCaptureBackend:
             layer_kv = []
             for layer_id in kv_layer_ids:
                 key_cache, value_cache = pool.get_kv_buffer(layer_id)
-                if key_cache.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                if key_cache.dtype not in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                ):
                     raise RuntimeError(
                         f"unsupported KV dtype {key_cache.dtype} for H-Spec capture"
                     )

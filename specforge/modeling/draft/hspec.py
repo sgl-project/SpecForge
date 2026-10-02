@@ -17,9 +17,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers.models.qwen3.modeling_qwen3 import (
-    Qwen3Config,
-)
+from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from .dflash import apply_rotary_pos_emb
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
@@ -124,15 +122,17 @@ class HSpecMamba2Reference(nn.Module):
         bc = bc.transpose(1, 2)
         # Evaluate the conv in float32 (weights included) so the recurrence
         # matches the serving-side explicit fp32 tap-sum numerically.
-        bc = F.conv1d(
-            bc.float(),
-            self.conv1d.weight.float(),
-            self.conv1d.bias.float(),
-            padding=self.conv_kernel_size - 1,
-            groups=self.conv_dim,
-        )[
-            ..., :sequence_length
-        ].transpose(1, 2).to(hidden_states.dtype)
+        bc = (
+            F.conv1d(
+                bc.float(),
+                self.conv1d.weight.float(),
+                self.conv1d.bias.float(),
+                padding=self.conv_kernel_size - 1,
+                groups=self.conv_dim,
+            )[..., :sequence_length]
+            .transpose(1, 2)
+            .to(hidden_states.dtype)
+        )
         bc = F.silu(bc)
         state_value, state_b, state_c = torch.split(
             bc,
@@ -178,16 +178,13 @@ class HSpecMamba2Reference(nn.Module):
             output = (state * state_c[:, step].to(torch.float32).unsqueeze(2)).sum(-1)
             outputs.append(
                 output.reshape(batch_size, self.intermediate_size)
-                + self.D.to(output.dtype).repeat_interleave(self.head_dim)[
-                    None, :
-                ]
+                + self.D.to(output.dtype).repeat_interleave(self.head_dim)[None, :]
                 * state_value[:, step].reshape(batch_size, self.intermediate_size)
             )
         scan_output = torch.stack(outputs, dim=1).to(hidden_states.dtype)
         scan_output = self.norm(scan_output, gate)
         final_state = state.to(hidden_states.dtype)
         return self.out_proj(scan_output), final_state
-
 
 
 def merge_attention_states(
@@ -214,9 +211,9 @@ def merge_attention_states(
         torch.zeros_like(merged_lse),
     ).unsqueeze(-1)
     return (
-        prefix_output.float() * prefix_weight
-        + block_output.float() * block_weight
+        prefix_output.float() * prefix_weight + block_output.float() * block_weight
     ).to(prefix_output.dtype)
+
 
 class HSpecTargetKVAttention(nn.Module):
     """Draft attention with externally supplied target KVs."""
@@ -238,7 +235,9 @@ class HSpecTargetKVAttention(nn.Module):
                     f"got {config.attention_dropout}"
                 )
         self.head_dim = int(
-            getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+            getattr(
+                config, "head_dim", config.hidden_size // config.num_attention_heads
+            )
         )
         self.num_heads = int(config.num_attention_heads)
         self.num_key_value_heads = int(config.num_key_value_heads)
@@ -417,9 +416,7 @@ class HSpecTargetKVAttention(nn.Module):
             row_valid.unsqueeze(-1), scores, torch.zeros_like(scores)
         )
         lse = torch.logsumexp(safe_scores, dim=-1)
-        lse = torch.where(
-            row_valid, lse, torch.full_like(lse, float("-inf"))
-        )
+        lse = torch.where(row_valid, lse, torch.full_like(lse, float("-inf")))
         probabilities = torch.exp(safe_scores - lse.unsqueeze(-1))
         probabilities = torch.where(
             row_valid.unsqueeze(-1), probabilities, torch.zeros_like(probabilities)
@@ -484,9 +481,7 @@ class HSpecTargetKVAttention(nn.Module):
             merged = merge_attention_states(
                 prefix_output, prefix_lse, block_output, block_lse
             )
-        return self.o_proj(
-            merged.transpose(1, 2).reshape(batch_size, query_length, -1)
-        )
+        return self.o_proj(merged.transpose(1, 2).reshape(batch_size, query_length, -1))
 
     def _cat_attention(
         self,
@@ -522,9 +517,7 @@ class HSpecTargetKVAttention(nn.Module):
                 dtype=torch.bool,
             ).tril()
         if prefix_mask.dim() == 2:
-            prefix_mask = prefix_mask[:, None, :].expand(
-                batch_size, query_length, -1
-            )
+            prefix_mask = prefix_mask[:, None, :].expand(batch_size, query_length, -1)
         key_mask = torch.cat(
             [
                 prefix_mask,
@@ -558,12 +551,9 @@ class HSpecTargetKVAttention(nn.Module):
                 scale=self.scaling,
             )
         else:
+            from torch.nn.attention.flex_attention import create_block_mask
             from transformers.integrations.flex_attention import (
                 compile_friendly_flex_attention,
-            )
-
-            from torch.nn.attention.flex_attention import (
-                create_block_mask,
             )
 
             key_length = key.shape[2]
@@ -593,9 +583,8 @@ class HSpecTargetKVAttention(nn.Module):
                 scale=self.scaling,
                 kernel_options=kernel_options or None,
             )
-        return self.o_proj(output.transpose(1, 2).reshape(
-            batch_size, query_length, -1
-        ))
+        return self.o_proj(output.transpose(1, 2).reshape(batch_size, query_length, -1))
+
 
 class HSpecDecoderLayer(nn.Module):
     """Mamba -> target-KV attention -> MLP hybrid layer."""
@@ -643,9 +632,7 @@ class HSpecDecoderLayer(nn.Module):
                 batch_size * (sequence_length // block_size), block_size, -1
             )
             mamba_output, final_state = self.mamba(per_block, initial_state)
-            mamba_output = mamba_output.reshape(
-                batch_size, sequence_length, -1
-            )
+            mamba_output = mamba_output.reshape(batch_size, sequence_length, -1)
         else:
             mamba_output, final_state = self.mamba(normalized, initial_state)
         hidden_states = residual + mamba_output
@@ -703,9 +690,7 @@ class HSpecDraftModel(DSparkDraftModel):
                 f"num_hidden_layers={config.num_hidden_layers}, "
                 f"got {len(block_pattern)}"
             )
-        if any(
-            token not in {"mamba", "attention", "mlp"} for token in block_pattern
-        ):
+        if any(token not in {"mamba", "attention", "mlp"} for token in block_pattern):
             raise ValueError(
                 "hspec_config.block_pattern supports only 'mamba', 'attention', "
                 f"'mlp'; got {block_pattern}"
@@ -757,13 +742,10 @@ class HSpecDraftModel(DSparkDraftModel):
         self.attn_kv_layer_ids = self.target_kv_layer_ids
         self.latent_fusion_layer_ids = tuple(
             int(layer_id)
-            for layer_id in method.get(
-                "latent_fusion_layer_ids", self.target_layer_ids
-            )
+            for layer_id in method.get("latent_fusion_layer_ids", self.target_layer_ids)
         )
-        self.target_kv_width = (
-            config.num_key_value_heads
-            * int(config.head_dim or config.hidden_size // config.num_attention_heads)
+        self.target_kv_width = config.num_key_value_heads * int(
+            config.head_dim or config.hidden_size // config.num_attention_heads
         )
         self.tp_shard_count = 1
         # Per-mamba-layer seed projections, matching the serving-side
@@ -776,20 +758,15 @@ class HSpecDraftModel(DSparkDraftModel):
                 "hspec_config.mamba_seed_mode must be 'per_layer' or 'shared', "
                 f"got {self.mamba_seed_mode!r}"
             )
-        self.mamba_layers = (
-            [layer.mamba for layer in self.hybrid_layers]
-            + list(self.partial_layers)
+        self.mamba_layers = [layer.mamba for layer in self.hybrid_layers] + list(
+            self.partial_layers
         )
         num_seed_projs = (
-            len(self.mamba_layers)
-            if self.mamba_seed_mode == "per_layer"
-            else 1
+            len(self.mamba_layers) if self.mamba_seed_mode == "per_layer" else 1
         )
         if not self.mamba_layers:
             raise ValueError("H-Spec block_pattern must contain mamba layers")
-        seed_out = int(
-            torch.tensor(self.mamba_layers[0].state_shape).prod()
-        )
+        seed_out = int(torch.tensor(self.mamba_layers[0].state_shape).prod())
         self.seed_projs = nn.ModuleList(
             [
                 nn.Linear(config.hidden_size, seed_out, bias=False)
@@ -845,10 +822,7 @@ class HSpecDraftModel(DSparkDraftModel):
         if getattr(self, "fc_norm", None) is not None:
             chunks = torch.chunk(latent, len(self.fc_norm), dim=-1)
             latent = torch.cat(
-                [
-                    norm(chunk)
-                    for norm, chunk in zip(self.fc_norm, chunks, strict=True)
-                ],
+                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks, strict=True)],
                 dim=-1,
             )
         z = self.hidden_norm(latent)
@@ -949,7 +923,8 @@ class HSpecDraftModel(DSparkDraftModel):
         if (
             isinstance(flat_attention_mask, torch.Tensor)
             and flat_attention_mask.dim() == 3
-            and tuple(flat_attention_mask.shape) == (
+            and tuple(flat_attention_mask.shape)
+            == (
                 batch_size,
                 query_length,
                 prefix_length + query_length,
@@ -999,9 +974,7 @@ class HSpecDraftModel(DSparkDraftModel):
                 target_value=layer_value,
                 initial_state=seed_states[mamba_index],
                 prefix_mask=(
-                    per_query_prefix
-                    if per_query_prefix is not None
-                    else prefix_masks
+                    per_query_prefix if per_query_prefix is not None else prefix_masks
                 ),
                 position_embeddings=(cos, sin),
                 block_mask=block_mask,
@@ -1017,9 +990,7 @@ class HSpecDraftModel(DSparkDraftModel):
                 normalized,
                 initial_state=seed_states[mamba_index],
             )
-            hidden_states = partial_output.reshape(
-                batch_size, sequence_length, -1
-            )
+            hidden_states = partial_output.reshape(batch_size, sequence_length, -1)
             mamba_index += 1
         return self.norm(hidden_states)
 
