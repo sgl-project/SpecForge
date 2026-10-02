@@ -513,3 +513,79 @@ The optional scripts `examples/disagg/run_online.sh` and
 `examples/disagg/run_offline.sh` are thin delegates to the same command. Their
 arguments use the CLI form, for example `run_online.sh --role producer`; they do
 not parse `NPROC_PER_NODE`, construct torchrun, or manage transport state.
+
+## Checkpoint-aligned continuation with a fresh feature store
+
+A producer can rebuild an immutable prompt plan while excluding exactly the
+sample IDs acknowledged by a saved optimizer checkpoint. Unacknowledged samples
+are captured again; stale feature references are discarded. The consumer uses
+the existing full-state `training.resume_from` path to restore model, optimizer,
+scheduler, and per-rank RNG state.
+
+This is an explicit restart of a **stopped, checkpoint-aligned run**. The ledger's
+durable step must equal the checkpoint step, and its unique acknowledged count
+must equal `step * global_batch`. A ledger ahead of the checkpoint is rejected;
+this command does not roll back acknowledgements or infer which samples belonged
+to an older optimizer state. It also does not convert sharded optimizer layouts
+or remap RNG streams across world sizes. The normal trainer resume contract still
+applies. Recapture preserves sample identity and coverage, but asynchronous
+capture order and floating-point kernels need not reproduce the exact trajectory.
+
+The prompt plan must use epoch-tagged IDs (`training.num_epochs > 1` or
+`training.prompt_epoch_offset > 0`) and a verified pre-tokenized corpus index in
+`data.prompts_index_path`. Legacy single-epoch IDs are rejected. Prompt shuffling
+uses `training.prompt_seed`, falling back to `training.seed`. An explicit
+`prompt_epoch_offset` retains absolute epoch IDs when planning later passes.
+
+Create the restart ledger with the original run configuration and a complete
+checkpoint that remains immutable for the restart. Preparation trusts the supplied
+original prompt configuration; it cannot recover or prove a prior corpus/seed
+contract that was never recorded in the checkpoint. The generated manifest locks
+that contract for the new attempt:
+
+```bash
+python -m specforge.training.replay \
+  --config original-run.yaml \
+  --checkpoint outputs/training-run-step100 \
+  --destination outputs/restart-state
+```
+
+The destination must not exist. It receives `consumer.sqlite`, `acked-ids.txt`,
+and `replay.json`. The original ledger and checkpoint are never edited. The
+manifest binds the run, prompt plan, corpus/index hashes, acknowledged-ID hash,
+global batch, and the shared/per-rank checkpoint file hashes. A failed preparation
+never publishes `replay.json`; retry in a new destination after fixing the cause.
+
+For the new attempt:
+
+1. Keep the same run ID, immutable corpus/index, prompt epochs, seed, and trainer
+   configuration. Set fresh control, inbox, output, and feature-store attempt paths.
+2. Set `deployment.disaggregated.consumer_state_dir` to the generated destination.
+   Set `training.resume_from` to the bound checkpoint in the consumer config and
+   leave it unset in the producer config.
+3. Set `SPECFORGE_REPLAY_MANIFEST` to the generated `replay.json` in both roles and
+   launch them through the normal explicit-role workflow.
+
+The producer and consumer rank 0 need read access to the manifest, acknowledged
+IDs, corpus index, checkpoint files, and new ledger. Other consumer ranks use
+normal checkpoint access; they do not need the rank-0 SQLite database mounted.
+Validation errors on rank 0 propagate to every consumer rank before assembly.
+`DISAGG_DB`, when set, overrides the ledger path for preparation and validation
+just as it does for the consumer. Filtering occurs before prompt payload loading,
+so acknowledged rows are not materialized or submitted for capture.
+
+### Immutable corpus index format
+
+An index is an admission artifact, not a replacement for checking each row's
+eligibility. Its JSON fields are `schema_version: 1`, `records`, `source_bytes`,
+`source_sha256`, `offsets_file`, `offsets_sha256`, `max_length`, `min_loss_tokens`,
+and `loss_mask_filter` (the admission filter's function name, or null).
+`offsets_file` is relative to the manifest and contains `records + 1` little-endian
+unsigned 64-bit byte offsets, beginning at zero and ending at the JSONL file size.
+Each span contains one accepted, pre-tokenized JSON record. Admission must use the
+same truncation and loss-mask rules as training; rejected rows must already have
+been removed from the corpus.
+
+The reader verifies the source and offset digests, admission settings, offset
+bounds, and each requested row. A changed file or invalid admitted row fails
+instead of changing the mapping between prompt indices and sample IDs.

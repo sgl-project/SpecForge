@@ -429,7 +429,7 @@ def _epoch_prompt_indices(prompts, epoch: int, *, seed: int = 0):
 
 def _epoch_online_prompt(prompt, index: int, epoch: int, prompt_epochs: int):
     """Apply epoch identity while preserving the single-epoch prompt shape."""
-    if prompt_epochs == 1:
+    if prompt_epochs == 1 and epoch == 0:
         return prompt
 
     item = dict(prompt)
@@ -453,6 +453,7 @@ def _iter_epoch_online_prompt_batches(
     *,
     seed: int = 0,
     batch_size: int = 4096,
+    skip_task_ids: set[str] | None = None,
 ):
     """Yield a shuffled epoch while bounding expanded token-list residency."""
     indices = _epoch_prompt_indices(prompts, epoch, seed=seed)
@@ -460,6 +461,8 @@ def _iter_epoch_online_prompt_batches(
         yield [
             _epoch_online_prompt(prompts[index], index, epoch, prompt_epochs)
             for index in indices[start : start + batch_size]
+            if not skip_task_ids
+            or f"epoch{epoch:04d}-prompt{index:012d}" not in skip_task_ids
         ]
 
 
@@ -828,8 +831,10 @@ def build_disagg_online_producer(
     max_prompt_attempts: Optional[int] = 5,
     sleep=None,
     prompt_epochs: int = 1,
+    prompt_epoch_offset: int = 0,
     prompt_seed: int = 0,
     prompt_ingest_batch_size: int = 4096,
+    excluded_sample_ids: set[str] | None = None,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -852,7 +857,8 @@ def build_disagg_online_producer(
 
     ``prompt_epochs`` repeats the prompt stream on the producer side by minting
     epoch-tagged task/sample ids. Each pass uses the deterministic
-    ``prompt_seed + epoch`` order, matching sampler-style epoch semantics while
+    ``prompt_seed + epoch`` order, beginning at ``prompt_epoch_offset`` for
+    weights-only curriculum transitions, matching sampler-style epoch semantics while
     keeping a reconstructed plan stable across restarts. Prompt payloads are
     normalized and ingested in ``prompt_ingest_batch_size`` chunks so a large
     memory-mapped dataset does not expand every token list before rollout.
@@ -948,14 +954,27 @@ def build_disagg_online_producer(
     worker_lease = flow_control.prompt_lease(lease)
     build_start = time.perf_counter()
     prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
+    if prompt_epoch_offset < 0:
+        raise ValueError("prompt_epoch_offset must be nonnegative")
     if not hasattr(prompts, "__len__") or not hasattr(prompts, "__getitem__"):
         prompts = list(prompts)
     base_prompt_count = len(prompts)
+    skip_task_ids = set()
+    if excluded_sample_ids is not None:
+        from specforge.training.replay import validate_replay_ids
+
+        skip_task_ids = validate_replay_ids(
+            excluded_sample_ids,
+            run_id=run_id,
+            prompt_count=base_prompt_count,
+            prompt_epochs=prompt_epochs,
+            prompt_epoch_offset=prompt_epoch_offset,
+        )
     producer_timing(
         "build_disagg_online_producer enter "
         f"algorithm={algorithm.name} modality={modality} "
         f"base_prompts={base_prompt_count} "
-        f"prompt_epochs={prompt_epochs} "
+        f"prompt_epochs={prompt_epochs} prompt_epoch_offset={prompt_epoch_offset} "
         f"prompt_ingest_batch_size={prompt_ingest_batch_size} "
         f"lease={worker_lease} workers={num_rollout_workers} "
         f"concurrency={producer_concurrency} "
@@ -1364,7 +1383,7 @@ def build_disagg_online_producer(
             ):
                 producer_timing(
                     "controller.ingest_prompts done "
-                    f"epoch={epoch + 1}/{prompt_epochs} "
+                    f"epoch={epoch} pass={epoch - prompt_epoch_offset + 1}/{prompt_epochs} "
                     f"batch={batch_index + 1}/{chunks_per_epoch} "
                     f"tasks={len(task_ids)} "
                     f"pending={status['prompts_pending']} "
@@ -1375,7 +1394,7 @@ def build_disagg_online_producer(
             if batch_index + 1 == chunks_per_epoch:
                 producer_timing(
                     "epoch ingested "
-                    f"epoch={epoch + 1}/{prompt_epochs} "
+                    f"epoch={epoch} pass={epoch - prompt_epoch_offset + 1}/{prompt_epochs} "
                     f"produced={state['produced']} "
                     f"prompts_failed={status['prompts_failed']} "
                     f"pending={status['prompts_pending']} "
@@ -1385,13 +1404,16 @@ def build_disagg_online_producer(
 
         def iter_plan_chunks():
             """Yield the whole multi-epoch prompt plan in FIFO chunk order."""
-            for epoch in range(prompt_epochs):
+            for epoch in range(
+                prompt_epoch_offset, prompt_epoch_offset + prompt_epochs
+            ):
                 epoch_batches = _iter_epoch_online_prompt_batches(
                     prompts,
                     epoch,
                     prompt_epochs,
                     seed=prompt_seed,
                     batch_size=feed_size,
+                    skip_task_ids=skip_task_ids,
                 )
                 for batch_index, prompt_batch in enumerate(epoch_batches):
                     yield epoch, batch_index, prompt_batch
