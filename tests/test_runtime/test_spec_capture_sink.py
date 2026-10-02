@@ -196,6 +196,66 @@ class SpecCaptureSinkTest(unittest.TestCase):
         ):
             self.assertFalse(self.module.gpu_put_enabled())
 
+    def _init_sink(self, environ):
+        server_args = types.SimpleNamespace(
+            enable_spec_capture=True, spec_capture_aux_layer_ids=None
+        )
+        with mock.patch.dict("os.environ", environ, clear=True):
+            self.module.maybe_init_sink(server_args)
+        sink = self.module.get_sink()
+        if sink is not None:
+            self.addCleanup(sink._executor.shutdown)
+        return sink
+
+    def test_server_start_refuses_rdma_that_would_fall_back_to_tcp(self):
+        for environ, message in (
+            ({"MOONCAKE_PROTOCOL": "rdma"}, "requires MOONCAKE_RDMA_DEVICES"),
+            (
+                {"MOONCAKE_PROTOCOL": "rdma", "MOONCAKE_RDMA_DEVICES": " "},
+                "requires MOONCAKE_RDMA_DEVICES",
+            ),
+            (
+                {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "MOONCAKE_RDMA_DEVICES": "mlx5_0",
+                    "MC_FORCE_TCP": "1",
+                },
+                r"conflicts with MC_FORCE_TCP='1' \(installs the TCP transport\)",
+            ),
+            (
+                {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "MOONCAKE_RDMA_DEVICES": "mlx5_0",
+                    "MC_MS_AUTO_DISC": "1",
+                    "MC_USE_TEV1": "",
+                },
+                "MC_MS_AUTO_DISC='1' .*; MC_USE_TEV1=''",
+            ),
+        ):
+            with self.subTest(environ=environ):
+                self.module = _load_sink()
+                with self.assertRaisesRegex(ValueError, message):
+                    self._init_sink(environ)
+                self.assertIsNone(self.module.get_sink())
+
+    def test_server_start_accepts_tcp_and_explicit_rdma_devices(self):
+        for environ in (
+            {"MC_FORCE_TCP": "1"},
+            {"MOONCAKE_PROTOCOL": "tcp", "MC_USE_TENT": "1"},
+            {
+                "MOONCAKE_PROTOCOL": "rdma",
+                "MOONCAKE_RDMA_DEVICES": "mlx5_0,mlx5_1",
+                "MC_MS_AUTO_DISC": "0",
+                "SGLANG_SPEC_CAPTURE_GPU_PUT": "0",
+            },
+        ):
+            with self.subTest(environ=environ):
+                self.module = _load_sink()
+                sink = self._init_sink(environ)
+                self.assertIsNotNone(sink)
+                # The Mooncake connection itself stays lazy.
+                self.assertIsNone(sink._store)
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_gpu_snapshot_survives_overwrite_and_stream_handoff(self):
         store = self.sink._store = _BufferStore(device=True)

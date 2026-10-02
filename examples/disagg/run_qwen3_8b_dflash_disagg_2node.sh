@@ -224,6 +224,33 @@ export_common_environment() {
     )
 }
 
+export_rdma_devices() {
+    # A patched capture server refuses MOONCAKE_PROTOCOL=rdma without an
+    # explicit MOONCAKE_RDMA_DEVICES (Mooncake would fall back to TCP when it
+    # finds no usable HCA), and only after loading the target. Resolve this
+    # node's usable HCAs up front, as the trainer node's client does for itself.
+    [[ "$MOONCAKE_PROTOCOL" == "rdma" && -z "${MOONCAKE_RDMA_DEVICES:-}" ]] || return 0
+    MOONCAKE_RDMA_DEVICES="$(python -c '
+import sys
+
+from specforge.runtime.data_plane.mooncake_rdma import resolve_rdma_devices
+
+try:
+    print(
+        resolve_rdma_devices(
+            None,
+            selected_by="MOONCAKE_PROTOCOL is rdma",
+            devices_setting="MOONCAKE_RDMA_DEVICES",
+            opt_out="set MOONCAKE_PROTOCOL=tcp",
+        )
+    )
+except RuntimeError as error:
+    sys.exit(str(error))
+')" || fail "could not resolve this node's RDMA devices"
+    export MOONCAKE_RDMA_DEVICES
+    log "MOONCAKE_RDMA_DEVICES=$MOONCAKE_RDMA_DEVICES"
+}
+
 export_mooncake_bind_address() {
     # Mooncake's transfer engine advertises the first active interface unless
     # told otherwise; on multi-interface or containerized hosts that can be a
@@ -316,6 +343,7 @@ run_inference_node() {
 
     command -v mooncake_master >/dev/null || fail "mooncake_master is not on PATH"
     command -v curl >/dev/null || fail "curl is not on PATH"
+    export_rdma_devices
     if [[ "$APPLY_SGLANG_CAPTURE_PATCH" == "1" ]]; then
         "$ROOT_DIR/scripts/apply_sglang_spec_capture_patch.sh"
     fi
