@@ -55,7 +55,9 @@ def _build_model(workdir: str, attention_backend: str):
     ).cuda()
 
 
-def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
+def _worker(
+    rank: int, world_size: int, port: int, workdir: str, training_backend: str
+) -> None:
     fx.init_rank_distributed(
         rank,
         world_size,
@@ -146,6 +148,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             draft_model=usp_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
+            training_backend=training_backend,
             run_id="usp-parity",
             output_dir=os.path.join(workdir, "output"),
             ttt_length=3,
@@ -195,6 +198,12 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
 )
 class TestEquiv4Rank(unittest.TestCase):
     def test_dp2_sp2_trainer_loss_matches_full_sequence_reference(self):
+        self._check_backend("fsdp")
+
+    def test_fsdp2_dp2_sp2_matches_full_sequence_reference(self):
+        self._check_backend("fsdp2")
+
+    def _check_backend(self, training_backend):
         import torch.multiprocessing as mp
 
         from tests.utils import get_available_port
@@ -209,7 +218,7 @@ class TestEquiv4Rank(unittest.TestCase):
             mp.spawn(
                 _worker,
                 nprocs=WORLD_SIZE,
-                args=(WORLD_SIZE, get_available_port(), work),
+                args=(WORLD_SIZE, get_available_port(), work, training_backend),
                 join=True,
             )
 
