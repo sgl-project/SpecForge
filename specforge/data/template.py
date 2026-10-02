@@ -22,7 +22,8 @@ class ChatTemplate(BaseModel):
     end_of_turn_token: Optional[str] = None
     parser_type: str = "general"
     assistant_pattern_type: str = "general"
-    enable_thinking: bool = False
+    # None preserves the tokenizer default; booleans explicitly select a mode.
+    enable_thinking: Optional[bool] = None
     ignore_token: Optional[List[str]] = None
 
 
@@ -263,7 +264,8 @@ TEMPLATE_REGISTRY.register(
         system_prompt=None,
         end_of_turn_token="<|end_of_msg|>",
         parser_type="thinking",
-        enable_thinking=False,
+        # Keep the XTML renderer default for reasoning stored inline.
+        enable_thinking=None,
         ignore_token=["<|end_of_msg|>"],
     ),
 )
@@ -316,7 +318,7 @@ TEMPLATE_REGISTRY.register(
         user_header="<role>HUMAN</role>",
         system_prompt=None,
         end_of_turn_token="<|role_end|>",
-        parser_type="ling",
+        parser_type="thinking",
         enable_thinking=False,
     ),
 )

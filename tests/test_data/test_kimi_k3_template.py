@@ -11,8 +11,9 @@ class TestKimiK3Template(unittest.TestCase):
         self.assertIsNotNone(t)
         self.assertEqual(t.parser_type, "thinking")
         # Reasoning is stored inline in assistant content (deepspec-style
-        # regenerations), so the split-field thinking path stays off.
-        self.assertFalse(t.enable_thinking)
+        # regenerations), so preserve the XTML renderer default without
+        # passing an explicit thinking flag.
+        self.assertIsNone(t.enable_thinking)
         # The assistant header must end inside the think block: the chat
         # template emits the opening think tag as part of the generation
         # prompt, so it is never model output.
