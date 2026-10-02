@@ -6,20 +6,25 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.dp_ack import DPAckController, gather_id_union
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
-from specforge.runtime.data_plane.ref_distributor import InboxChannel, RefDistributor
+from specforge.runtime.data_plane.ref_distributor import (
+    InboxChannel,
+    RefDistributor,
+    _length_grouped_window,
+)
 from specforge.runtime.data_plane.streaming_ref_channel import (
     StreamingRefChannel,
     StreamingRefQueue,
 )
 
 
-def _ref(sid):
+def _ref(sid, num_tokens=4):
     spec = FeatureSpec(name="hidden_state", shape=(4, 8), dtype="float32")
     return SampleRef(
         sample_id=sid,
@@ -29,7 +34,7 @@ def _ref(sid):
         feature_keys={"hidden_state": f"{sid}/hidden_state"},
         feature_specs={"hidden_state": spec},
         strategy="eagle3",
-        num_tokens=4,
+        num_tokens=num_tokens,
     )
 
 
@@ -507,6 +512,258 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5", "s7"])
         self.assertEqual(dist.stats["dispatched"], 8)
         self.assertEqual(dist._window_dispatched, 0)
+
+    def test_length_grouping_reduces_single_sample_round_skew_within_each_window(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=4,
+            refs_per_rank_batch=1,
+            length_aware_scheduling=True,
+        )
+        lengths = [80, 8, 70, 7, 60, 6, 50, 5]
+        refs = [_ref(f"s{i}", length) for i, length in enumerate(lengths)]
+        # No first-round release and no extra lookahead beyond the same window
+        # the original dispatcher already requires.
+        self.producer.publish_batch(refs[:7])
+        _pump_until_quiet(dist)
+        self.assertEqual(dist.stats["dispatched"], 0)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
+        self.producer.publish(refs[7])
+        _pump_until_quiet(dist)
+        self.assertEqual(dist.stats["dispatched"], 8)
+
+        # A longer future window cannot steal a sample from the first window.
+        next_refs = [_ref(f"t{i}", 1000 + i) for i in range(8)]
+        self.producer.publish_batch(next_refs)
+        _pump_until_quiet(dist)
+        ranks = [_inbox_ids(self.inbox_dir, rank) for rank in range(2)]
+        by_id = {ref.sample_id: ref.num_tokens for ref in refs + next_refs}
+        rounds = [
+            sorted((by_id[ranks[0][i]], by_id[ranks[1][i]]), reverse=True)
+            for i in range(4)
+        ]
+        self.assertEqual(rounds, [[80, 70], [60, 50], [8, 7], [6, 5]])
+        self.assertLess(
+            sum(max(row) for row in rounds),
+            sum(max(lengths[i : i + 2]) for i in range(0, 8, 2)),
+        )
+        self.assertCountEqual(ranks[0][:4] + ranks[1][:4], [r.sample_id for r in refs])
+        self.assertCountEqual(
+            ranks[0][4:] + ranks[1][4:], [r.sample_id for r in next_refs]
+        )
+        self.assertEqual(self.producer.consumed_remote(), 0)
+
+    def test_length_grouping_multisample_rounds_reduce_padding_and_spread_maxima(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=8,
+            refs_per_rank_batch=2,
+            length_aware_scheduling=True,
+        )
+        lengths = [100, 1, 2, 99, 98, 3, 4, 97, 90, 5, 6, 89, 88, 7, 8, 87]
+        refs = [_ref(f"s{i}", length) for i, length in enumerate(lengths)]
+        self.producer.publish_batch(refs)
+        _pump_until_quiet(dist)
+        by_id = {ref.sample_id: ref.num_tokens for ref in refs}
+        ranks = [_inbox_ids(self.inbox_dir, rank) for rank in range(2)]
+        self.assertEqual([len(rank) for rank in ranks], [8, 8])
+        self.assertCountEqual(ranks[0] + ranks[1], list(by_id))
+        padded = 0
+        for start in range(0, 8, 2):
+            batches = [
+                [by_id[sid] for sid in rank[start : start + 2]] for rank in ranks
+            ]
+            # Striped assignment gives each rank one of the two longest
+            # samples in a round, instead of putting both on the first rank.
+            self.assertEqual(abs(max(batches[0]) - max(batches[1])), 1)
+            padded += sum(2 * max(batch) for batch in batches)
+        baseline_padded = sum(
+            2 * max(lengths[start + rank : start + 4 : 2])
+            for start in range(0, len(lengths), 4)
+            for rank in range(2)
+        )
+        self.assertLess(padded, baseline_padded)
+
+    def test_length_grouping_disabled_preserves_original_round_robin(self):
+        dist = self._distributor(dp_size=2, refs_per_rank_step=4, refs_per_rank_batch=2)
+        refs = [
+            _ref(f"s{i}", length) for i, length in enumerate([9, 1, 8, 2, 7, 3, 6, 4])
+        ]
+        self.producer.publish_batch(refs)
+        _pump_until_quiet(dist)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0", "s2", "s4", "s6"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 1), ["s1", "s3", "s5", "s7"])
+
+    def test_length_grouping_unknown_length_keeps_entire_window_fifo(self):
+        for unknown in (0, -1, None, True):
+            with self.subTest(unknown=unknown):
+                refs = [
+                    _ref("short", 1),
+                    _ref("unknown", unknown),
+                    _ref("long", 99),
+                    _ref("mid", 8),
+                ]
+                self.assertEqual(_length_grouped_window(refs, 2, 1), refs)
+        refs = [_ref(f"s{i}", 7) for i in range(8)]
+        self.assertEqual(_length_grouped_window(refs, 2, 2), refs)
+
+    def test_length_grouping_uses_input_ids_shape_without_fetching_features(self):
+        shape_only = replace(
+            _ref("long", 0),
+            feature_specs={
+                "input_ids": FeatureSpec(name="input_ids", shape=(1, 99), dtype="int64")
+            },
+        )
+        ordered = _length_grouped_window([_ref("short", 1), shape_only], 2, 1)
+        self.assertEqual([ref.sample_id for ref in ordered], ["long", "short"])
+
+    def test_length_grouping_eof_keeps_tail_out_of_completed_window(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=2,
+            refs_per_rank_batch=1,
+            length_aware_scheduling=True,
+        )
+        refs = [_ref(f"s{i}", length) for i, length in enumerate([4, 1, 3, 2, 99, 98])]
+        self.producer.publish_batch(refs)
+        self.producer.publish(refs[0])
+        self.producer.close()
+        dist._run_guarded()
+        self.assertIsNone(dist.error)
+        self.assertEqual(dist.stats["dispatched"], 4)
+        self.assertEqual(dist.stats["duplicates"], 1)
+        self.assertEqual(dist.stats["dropped"], 2)
+        self.assertEqual(self.feature_store.adopted, ["s4", "s5"])
+        for rank in range(2):
+            queue = StreamingRefQueue(
+                InboxChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            )
+            batch = queue.get(2)
+            self.assertEqual(len(batch), 2)
+            queue.ack(batch)
+            self.assertEqual(queue.get(1), [])
+        # A finished distributor does not pump counters again; the explicit
+        # forward models its last counter poll after the trainer's durable ack.
+        dist._forward_consumed()
+        self.assertEqual(self.producer.consumed_remote(), 7)
+        self.assertEqual(self.producer.in_flight_remote(), 0)
+
+    def test_length_grouping_resume_replays_only_unacked_window_in_same_order(self):
+        store = SQLiteMetadataStore(os.path.join(self.dir, "length-resume.sqlite"))
+        self.addCleanup(store.close)
+        controller = DataFlowController("run0", metadata_store=store)
+        options = dict(
+            dp_size=2,
+            refs_per_rank_step=2,
+            refs_per_rank_batch=1,
+            length_aware_scheduling=True,
+        )
+        dist = self._distributor(controller=controller, **options)
+        refs = [
+            _ref(f"s{i}", length) for i, length in enumerate([9, 1, 8, 2, 7, 3, 6, 4])
+        ]
+        self.producer.publish_batch(refs)
+        _pump_until_quiet(dist)
+        original_ranks = [_inbox_ids(self.inbox_dir, rank) for rank in range(2)]
+        queues = [
+            StreamingRefQueue(
+                StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            )
+            for rank in range(2)
+        ]
+        acked = [queue.get(2) for queue in queues]
+        # Match the real ordering: record the complete DP window durably, then
+        # release each rank's leased inbox prefix, then crash in the next window.
+        controller.ack_train_refs(
+            "trainer",
+            [ref.sample_id for batch in acked for ref in batch],
+            global_step=1,
+            optimizer_durable=True,
+        )
+        for queue, batch in zip(queues, acked):
+            queue.ack(batch)
+        _pump_until_quiet(dist)
+        self.assertEqual(self.producer.consumed_remote(), 4)
+
+        restarted = DataFlowController("run0", metadata_store=store)
+        report = restarted.reconcile_on_restart(self.feature_store)
+        self.source = StreamingRefChannel(self.src_path)
+        replay = self._distributor(
+            controller=restarted,
+            skip_ids=report["released"],
+            requeued_ids=report["requeued"],
+            **options,
+        )
+        _pump_until_quiet(replay)
+        replay_queues = []
+        replay_batches = []
+        for rank in range(2):
+            self.assertEqual(_inbox_ids(self.inbox_dir, rank), original_ranks[rank][2:])
+            queue = StreamingRefQueue(
+                StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            )
+            replay_queues.append(queue)
+            replay_batches.append(queue.get(2))
+        restarted.ack_train_refs(
+            "trainer",
+            [ref.sample_id for batch in replay_batches for ref in batch],
+            global_step=2,
+            optimizer_durable=True,
+        )
+        for queue, batch in zip(replay_queues, replay_batches):
+            queue.ack(batch)
+        _pump_until_quiet(replay)
+        self.assertEqual(replay.stats["dispatched"], 4)
+        self.assertEqual(replay.stats["skipped"], 4)
+        self.assertEqual(self.producer.consumed_remote(), 8)
+        self.assertEqual(
+            set(store.durable_marker()["acked"]), {ref.sample_id for ref in refs}
+        )
+
+    def test_length_grouping_partial_publication_failure_replays_full_window(self):
+        store = SQLiteMetadataStore(
+            os.path.join(self.dir, "length-failed-publish.sqlite")
+        )
+        self.addCleanup(store.close)
+        original = DataFlowController("run0", metadata_store=store)
+        options = dict(
+            dp_size=2,
+            refs_per_rank_step=2,
+            refs_per_rank_batch=1,
+            length_aware_scheduling=True,
+        )
+        dist = self._distributor(controller=original, **options)
+        refs = [_ref(f"s{i}", length) for i, length in enumerate([9, 1, 8, 2])]
+        self.producer.publish_batch(refs)
+        with mock.patch.object(
+            dist._inboxes[1],
+            "publish_batch",
+            side_effect=OSError("injected publication failure"),
+        ):
+            dist._run_guarded()
+        self.assertIsInstance(dist.error, OSError)
+        self.assertEqual(len(_inbox_ids(self.inbox_dir, 0)), 1)
+        self.assertEqual(self.producer.consumed_remote(), 0)
+        self.assertEqual(self.feature_store.aborted, [])
+
+        restarted = DataFlowController("run0", metadata_store=store)
+        report = restarted.reconcile_on_restart(self.feature_store)
+        self.assertCountEqual(report["requeued"], [ref.sample_id for ref in refs])
+        self.source = StreamingRefChannel(self.src_path)
+        replay = self._distributor(
+            controller=restarted,
+            skip_ids=report["released"],
+            requeued_ids=report["requeued"],
+            **options,
+        )
+        _pump_until_quiet(replay)
+        replayed = _inbox_ids(self.inbox_dir, 0) + _inbox_ids(self.inbox_dir, 1)
+        self.assertCountEqual(replayed, [ref.sample_id for ref in refs])
+        self.assertEqual(replay.stats["dispatched"], 4)
+        self.assertEqual(replay.stats["duplicates"], 4)
+        for rank in range(2):
+            reader = InboxChannel(RefDistributor.inbox_path(self.inbox_dir, rank))
+            self.assertIsNone(reader.failure())
 
     def test_streamed_partial_optimizer_window_settles_cleanly_at_eof(self):
         # End-of-stream below one optimizer window terminates the run cleanly
