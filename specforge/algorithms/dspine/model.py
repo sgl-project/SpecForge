@@ -118,6 +118,7 @@ class OnlineDSpineModel(OnlineDFlashModel):
         global_step: int = 0,
         total_steps: int | None = None,
         collect_detailed_metrics: bool = True,
+        alignment_ce: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
         del collect_detailed_metrics
         batch, length = input_ids.shape
@@ -198,14 +199,15 @@ class OnlineDSpineModel(OnlineDFlashModel):
             supervised.reshape(-1, tokens),
             chunk_size=self.objective_chunk_blocks,
         )
-        # All ranks use the same detached backbone CE to scale alignment.
-        scale_terms = torch.stack((ce.detach(), denominator.detach()))
-        if dist.is_initialized():
-            dist.all_reduce(scale_terms)
-        torch._assert_async(
-            scale_terms[1] > 0, "DSpine has no supervised proposal tokens"
-        )
-        alignment_scale = beta * scale_terms[0] / scale_terms[1]
+        if alignment_ce is None:
+            scale_terms = torch.stack((ce.detach(), denominator.detach()))
+            if dist.is_initialized():
+                dist.all_reduce(scale_terms)
+            torch._assert_async(
+                scale_terms[1] > 0, "DSpine has no supervised proposal tokens"
+            )
+            alignment_ce = scale_terms[0] / scale_terms[1]
+        alignment_scale = beta * alignment_ce.detach()
         numerator = (
             self.dspine_config.ce_weight * ce
             + (1 - self.dspine_config.ce_weight) * l1
