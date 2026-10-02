@@ -680,6 +680,11 @@ class HSpecDraftModel(DSparkDraftModel):
                 "hspec_config.mamba_backend='reference' only"
             )
         super().__init__(config)
+        # The base class builds a uniform decoder stack that H-Spec never
+        # runs (the hybrid/partial stacks below replace it); keeping it
+        # would add dead parameters that break DDP with
+        # find_unused_parameters=False.
+        del self.layers
         self.num_hybrid_layers = int(method.get("num_hybrid_layers", 3))
         self.num_partial_layers = int(method.get("num_partial_layers", 1))
         if "block_pattern" in method:
