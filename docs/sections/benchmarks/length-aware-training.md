@@ -155,12 +155,25 @@ gradient error and 3.41% update error. At the largest update discrepancy, small
 gradients changed sign (for example, `1.19e-7` versus `-1.19e-7`). This is
 consistent with accumulation-order rounding amplified by the first AdamW update.
 It does **not** establish that all feature-induced differences are harmless, or
-that trained-model quality is preserved. BF16 update agreement and real-model
-held-out/serving validation remain unresolved.
+that trained-model quality is preserved. BF16 update agreement and representative
+convergence/serving validation remain unresolved.
 
-All 20 raw reports (about 203 KB), including failed gates and the earlier
+The 20 initial raw reports (about 203 KB), including failed gates and the earlier
 fixed-anchor performance diagnostic, are retained in
 [`benchmarks/results/length-aware-h200`](../../../benchmarks/results/length-aware-h200).
 The fixed-anchor performance file is explicitly a diagnostic; the main table
-uses the native-sampler reports. No real-model convergence or serving benchmark
-was run.
+uses the native-sampler reports. These initial experiments did not run a
+real-model convergence or serving benchmark.
+
+Follow-up diagnostics are documented separately:
+
+- [BF16 trajectories over 50 updates and three seeds](length-aware-trajectory.md),
+  including baseline repeatability, heldout synthetic loss, and gradient-norm
+  differences. These checks do not replace the failed one-update gate.
+- [Profiler analysis of the synthetic fixture](length-aware-profile.md),
+  including the gap between this small model and the production DFlash2 recipe.
+  Profiler timings are not speedup measurements.
+- [Pretrained DFlash2 with captured ShareGPT features](length-aware-pretrained.md),
+  using the full draft checkpoint and vocabulary, 512 training anchors, and
+  separate processes for each throughput measurement. This remains a short,
+  selected-data experiment rather than convergence or serving validation.

@@ -1,0 +1,1798 @@
+{
+  "scope": "Real pretrained target/draft and ShareGPT assistant features; 16 training and 8 disjoint heldout sequences. Short fine-tuning smoke, not convergence or serving acceptance. Training anchors sampled natively; evaluation uses 8 fixed anchors/sample, a smaller diagnostic budget. Feature tensors preloaded; timing excludes target capture and disk IO. Offline bucket confined to one optimizer window. LR 1e-5 is a predeclared conservative smoke variation from the recipe's 5e-4.",
+  "anchors": 512,
+  "eval_anchors": 8,
+  "attention_backend": "flex_attention",
+  "objective_chunk_blocks": 128,
+  "loss_type": "dflash",
+  "loss_decay_gamma": 7.0,
+  "learning_rate": 1e-05,
+  "precision": "bfloat16",
+  "backend": "FSDP SHARD_GRAD_OP, production TrainerCore and BF16Optimizer",
+  "protocol": {
+    "total_steps_per_run": 8,
+    "warmup_steps": 3,
+    "measured_steps": 5,
+    "repeats": 3,
+    "order": [
+      "baseline",
+      "online",
+      "offline",
+      "offline",
+      "online",
+      "baseline",
+      "baseline",
+      "online",
+      "offline"
+    ],
+    "training_seed": 42,
+    "train_samples": 16,
+    "heldout_samples": 8,
+    "batch_size_per_rank": 2,
+    "world_size": 2,
+    "accumulation_steps": 4,
+    "independent_processes": true,
+    "repeat_indices": [
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      2,
+      2,
+      2
+    ]
+  },
+  "layouts": {
+    "baseline": {
+      "sample_ids_by_rank_and_microstep": [
+        [
+          [
+            "7",
+            "5"
+          ],
+          [
+            "14",
+            "12"
+          ],
+          [
+            "1",
+            "13"
+          ],
+          [
+            "4",
+            "0"
+          ]
+        ],
+        [
+          [
+            "9",
+            "6"
+          ],
+          [
+            "10",
+            "8"
+          ],
+          [
+            "2",
+            "15"
+          ],
+          [
+            "11",
+            "3"
+          ]
+        ]
+      ],
+      "valid_context_tokens": 7680,
+      "padded_context_positions": 9984,
+      "padding_fraction": 0.23076923076923073,
+      "padded_context_positions_by_rank": [
+        3840,
+        6144
+      ],
+      "sum_of_microstep_max_padded_positions": 7168
+    },
+    "online": {
+      "sample_ids_by_rank_and_microstep": [
+        [
+          [
+            "7",
+            "11"
+          ],
+          [
+            "6",
+            "10"
+          ],
+          [
+            "9",
+            "1"
+          ],
+          [
+            "12",
+            "4"
+          ]
+        ],
+        [
+          [
+            "15",
+            "3"
+          ],
+          [
+            "14",
+            "2"
+          ],
+          [
+            "5",
+            "13"
+          ],
+          [
+            "8",
+            "0"
+          ]
+        ]
+      ],
+      "valid_context_tokens": 7680,
+      "padded_context_positions": 7680,
+      "padding_fraction": 0.0,
+      "padded_context_positions_by_rank": [
+        3840,
+        3840
+      ],
+      "sum_of_microstep_max_padded_positions": 3840
+    },
+    "offline": {
+      "sample_ids_by_rank_and_microstep": [
+        [
+          [
+            "9",
+            "5"
+          ],
+          [
+            "6",
+            "14"
+          ],
+          [
+            "12",
+            "8"
+          ],
+          [
+            "7",
+            "15"
+          ]
+        ],
+        [
+          [
+            "1",
+            "13"
+          ],
+          [
+            "10",
+            "2"
+          ],
+          [
+            "4",
+            "0"
+          ],
+          [
+            "11",
+            "3"
+          ]
+        ]
+      ],
+      "valid_context_tokens": 7680,
+      "padded_context_positions": 7680,
+      "padding_fraction": 0.0,
+      "padded_context_positions_by_rank": [
+        3840,
+        3840
+      ],
+      "sum_of_microstep_max_padded_positions": 3840
+    }
+  },
+  "provenance": {
+    "git_head": "e8e51f2cf26e56174c375dae8e64af904dd09e6d",
+    "source_sha256": {
+      "benchmarks/pretrained_length_smoke.py": "1069ff4633bfaad6e51dcd4bda86652344008cc60002cd25dc56240f50edf922",
+      "benchmarks/length_aware_training.py": "8d0c970832c0e909314c6298da8c9f6dc91a638dfb2b860cfaae3545cf9e03ef",
+      "specforge/runtime/data_plane/ref_distributor.py": "6e8a7b4201654f65ccaa87b793508845dc589652edd02bc03ca5b55723f27e4b",
+      "specforge/data/length_bucketing.py": "88bb89fcd66f6afb26360eee738c0592b79859c265c91140f06e08dc4e55f7c1",
+      "specforge/algorithms/common/dflash_family_model.py": "3ea975b866f9f8190d052e726c72d0993a7009cd0edca37a3be3a3a8590b63b1",
+      "specforge/modeling/draft/dflash2.py": "819c6b3d8d6d8ffc31a843ed40d539ddf635f58b148a01c8c43d0bff1dd02b09",
+      "specforge/training/controller.py": "16322d15235ea7001f60b7b24e0de92bbb8a5f3b6b80da799b9bfbf17719d9f0",
+      "specforge/training/backend.py": "0b47b95e0aebbcd6f44aa94e17a62906ebcab36a44eb1fb4e7b7e4abbe5741f2",
+      "specforge/optimizer.py": "a136f17a4612eb31c842ddac79c35bfdcb1e62ab410046433bfd6008265ddc81"
+    },
+    "draft_config": {
+      "architectures": [
+        "DFlash2DraftModel"
+      ],
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "bos_token_id": null,
+      "is_causal": false,
+      "dflash_config": {
+        "block_size": 8,
+        "conv_group_size": 16,
+        "conv_kernel_size": 2,
+        "mask_token_id": 248070,
+        "selector_rank": 256,
+        "selector_top_k": 16,
+        "target_layer_ids": [
+          5,
+          19,
+          33,
+          47,
+          61
+        ]
+      },
+      "dtype": "bfloat16",
+      "eos_token_id": 248044,
+      "head_dim": 128,
+      "hidden_act": "silu",
+      "hidden_size": 5120,
+      "initializer_range": 0.02,
+      "intermediate_size": 17408,
+      "layer_types": [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention"
+      ],
+      "max_position_embeddings": 262144,
+      "max_window_layers": 5,
+      "model_type": "qwen3",
+      "num_attention_heads": 32,
+      "num_hidden_layers": 5,
+      "num_key_value_heads": 8,
+      "num_target_layers": 64,
+      "pad_token_id": 248044,
+      "rms_norm_eps": 1e-06,
+      "rope_parameters": {
+        "rope_theta": 10000000,
+        "rope_type": "default"
+      },
+      "sliding_window": 2048,
+      "tie_word_embeddings": false,
+      "transformers_version": "5.15.0",
+      "use_cache": true,
+      "use_sliding_window": true,
+      "vocab_size": 248320
+    },
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "gpu": "NVIDIA H200"
+  },
+  "capture": {
+    "target": "/cluster-storage/models/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "draft": "/cluster-storage/models/models--incoai--Qwen3.8-27B-DFlash2/snapshots/dedf8df68adfb1afeaf7b7480c0a0243108177b4",
+    "dataset": "/cluster-storage/models/datasets--anon8231489123--ShareGPT_Vicuna_unfiltered/snapshots/192ab2185289094fc556ec8ce5ce1e8e587154ca/ShareGPT_V3_unfiltered_cleaned_split.json",
+    "capture": "Transformers BF16 SDPA, post-decoder target layers; no generated/random teacher features",
+    "target_layer_ids": [
+      5,
+      19,
+      33,
+      47,
+      61
+    ],
+    "hf_hidden_state_indices": [
+      6,
+      20,
+      34,
+      48,
+      62
+    ],
+    "target_load_seconds": 56.523283088579774,
+    "capture_seconds": [
+      1.8671224042773247,
+      0.29659973084926605,
+      0.3386215493083,
+      0.4253983795642853,
+      0.23020150884985924,
+      0.24937365390360355,
+      0.29640745744109154,
+      0.3831456806510687,
+      0.2281194981187582,
+      0.24613073095679283,
+      0.2853015922009945,
+      0.38268138840794563,
+      0.22868801467120647,
+      0.2483753953129053,
+      0.28447079472243786,
+      0.3818689491599798,
+      0.22862490639090538,
+      0.24635744653642178,
+      0.2833844218403101,
+      0.38088560104370117,
+      0.2295939400792122,
+      0.24622350744903088,
+      0.28269146382808685,
+      0.3797405567020178
+    ],
+    "samples": [
+      {
+        "sample_id": "0",
+        "length": 128,
+        "supervised_tokens": 82,
+        "split": "train",
+        "source_sha256": "58a9b8f2ec71d3ac6c04bbb5a6d3dc77ed22e23819ac1b16316f242556d50137"
+      },
+      {
+        "sample_id": "1",
+        "length": 256,
+        "supervised_tokens": 182,
+        "split": "train",
+        "source_sha256": "03d0c394f33d4818b009b02d89e87ad4d914301ab361a33110b0b396e5dfb5d7"
+      },
+      {
+        "sample_id": "2",
+        "length": 512,
+        "supervised_tokens": 450,
+        "split": "train",
+        "source_sha256": "9989bcb114aee3422010761d729ca87f964639025fa471e4f16bff89a6f00fd9"
+      },
+      {
+        "sample_id": "3",
+        "length": 1024,
+        "supervised_tokens": 225,
+        "split": "train",
+        "source_sha256": "70e1224cae35a19b3cd9735343fda907b9604fb2a218c60c84bc418ee49d88e6"
+      },
+      {
+        "sample_id": "4",
+        "length": 128,
+        "supervised_tokens": 96,
+        "split": "train",
+        "source_sha256": "ccc8457c417ea7389555208a62bd91eb38c1e3a39d2ae6ef2094800674c1a73a"
+      },
+      {
+        "sample_id": "5",
+        "length": 256,
+        "supervised_tokens": 89,
+        "split": "train",
+        "source_sha256": "2405edccd1a117d48a4ff9274e29ceaaff0384dc849523a5d51a3481f402a932"
+      },
+      {
+        "sample_id": "6",
+        "length": 512,
+        "supervised_tokens": 421,
+        "split": "train",
+        "source_sha256": "0696abd626b761e180249f35db7775881c57abccce819a41f418b233c72c9232"
+      },
+      {
+        "sample_id": "7",
+        "length": 1024,
+        "supervised_tokens": 147,
+        "split": "train",
+        "source_sha256": "4fa713bd3617ea5e3be930d85c9ddbbc8886444f864dd0e1120f3dd9952964fc"
+      },
+      {
+        "sample_id": "8",
+        "length": 128,
+        "supervised_tokens": 96,
+        "split": "train",
+        "source_sha256": "2e5b1712f1614a28309d53af91044d7c3e09363f12666b42be7fb7d100647173"
+      },
+      {
+        "sample_id": "9",
+        "length": 256,
+        "supervised_tokens": 195,
+        "split": "train",
+        "source_sha256": "e30ea142409f59ce336ae7ec29d1ad4ec7e260f46f6ba39dfd2b4f06c4c006d1"
+      },
+      {
+        "sample_id": "10",
+        "length": 512,
+        "supervised_tokens": 443,
+        "split": "train",
+        "source_sha256": "ad816f937886b3b4e4b77185b07241664fe887682965deaad564ab1f9c15c10c"
+      },
+      {
+        "sample_id": "11",
+        "length": 1024,
+        "supervised_tokens": 127,
+        "split": "train",
+        "source_sha256": "9a136f41ff6afd20df72815dbe0f7eb131f8b24e027b9f42cbfe5e0117725575"
+      },
+      {
+        "sample_id": "12",
+        "length": 128,
+        "supervised_tokens": 49,
+        "split": "train",
+        "source_sha256": "f33973b7b1400a5336fe32604e52a0c9fb83f3f5de593c1a750f66a5756182f9"
+      },
+      {
+        "sample_id": "13",
+        "length": 256,
+        "supervised_tokens": 219,
+        "split": "train",
+        "source_sha256": "546e86daeb8a49b560e043bca3bc5880f3c4348f497efceb2b65e77b7cef1a8c"
+      },
+      {
+        "sample_id": "14",
+        "length": 512,
+        "supervised_tokens": 463,
+        "split": "train",
+        "source_sha256": "ca8e24ff95d450b81b1705f61bece482d84dc9914c8b7c101f4b28f030ad14c9"
+      },
+      {
+        "sample_id": "15",
+        "length": 1024,
+        "supervised_tokens": 574,
+        "split": "train",
+        "source_sha256": "fceb01001bf1dccab781e7155e09c37769dfcc2b7eb5af5ccbeb9ee72a013d7c"
+      },
+      {
+        "sample_id": "16",
+        "length": 128,
+        "supervised_tokens": 63,
+        "split": "heldout",
+        "source_sha256": "04b138c9783d0aaed8f21857bf8ab4e96f7f20fa26354d282982bfa1a32408ff"
+      },
+      {
+        "sample_id": "17",
+        "length": 256,
+        "supervised_tokens": 174,
+        "split": "heldout",
+        "source_sha256": "4ed149a9b73931ffa2e7cc619b326bfa6ff4aa4d6d6c938fc6f7fca0cca5a8e0"
+      },
+      {
+        "sample_id": "18",
+        "length": 512,
+        "supervised_tokens": 489,
+        "split": "heldout",
+        "source_sha256": "36483f2fc6499c04beb53d625718d7f621a402fe510fb8bbade19f39ca171705"
+      },
+      {
+        "sample_id": "19",
+        "length": 1024,
+        "supervised_tokens": 108,
+        "split": "heldout",
+        "source_sha256": "8efff9ff66368847bf3eddb997e9103dc51e6b3d90db36c905d26602e0e41f73"
+      },
+      {
+        "sample_id": "20",
+        "length": 128,
+        "supervised_tokens": 84,
+        "split": "heldout",
+        "source_sha256": "71067773231b8a4e8343deba8bb24320c5580faab09a2875cb843e6a268b92a4"
+      },
+      {
+        "sample_id": "21",
+        "length": 256,
+        "supervised_tokens": 200,
+        "split": "heldout",
+        "source_sha256": "908af32f9dca1a347b4acbc10f801b33fbf2170fc025c6cea415f96bfb48fc7c"
+      },
+      {
+        "sample_id": "22",
+        "length": 512,
+        "supervised_tokens": 489,
+        "split": "heldout",
+        "source_sha256": "90aba0cc7c27290e54414e6e9cd4e699aad7934411de15128389b455f33cd94d"
+      },
+      {
+        "sample_id": "23",
+        "length": 1024,
+        "supervised_tokens": 267,
+        "split": "heldout",
+        "source_sha256": "1df0dd6e786e64320b85b766eeb51ce1c5f38f1d40f22b042352af46c4c36e72"
+      }
+    ]
+  },
+  "runs": [
+    {
+      "schedule": "baseline",
+      "repeat": 0,
+      "seconds_per_step": [
+        2.4571666717529297,
+        0.807487428188324,
+        0.804288923740387,
+        0.8024558424949646,
+        0.7992206811904907,
+        0.7981736660003662,
+        0.7994505763053894,
+        0.8012700080871582
+      ],
+      "warmup_steps_excluded": 3,
+      "median_measured_seconds": 0.7994505763053894,
+      "supervised_positions_per_step": [
+        26135,
+        26137,
+        26145,
+        26135,
+        26137,
+        26134,
+        26131,
+        26131
+      ],
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.286356744354612,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.35044642857142855
+      },
+      "train_metrics": [
+        {
+          "acc": 0.4730820655822754,
+          "ce_loss": 2.8026156425476074,
+          "dflash2/objective/weighted_covered_accuracy": 0.7380714416503906,
+          "dflash2/selector/loss": 0.9287524819374084,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6988292932510376,
+          "loss": 3.5626938343048096,
+          "target_probability": 0.43786752223968506,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.733821868896484
+        },
+        {
+          "acc": 0.4748823642730713,
+          "ce_loss": 2.786128282546997,
+          "dflash2/objective/weighted_covered_accuracy": 0.7392809987068176,
+          "dflash2/selector/loss": 0.920470654964447,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6998104453086853,
+          "loss": 3.5404419898986816,
+          "target_probability": 0.43913909792900085,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.74638366699219
+        },
+        {
+          "acc": 0.47584623098373413,
+          "ce_loss": 2.769042730331421,
+          "dflash2/objective/weighted_covered_accuracy": 0.741533100605011,
+          "dflash2/selector/loss": 0.9080969095230103,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7008497714996338,
+          "loss": 3.513493776321411,
+          "target_probability": 0.4390888810157776,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.460670471191406
+        },
+        {
+          "acc": 0.4766022562980652,
+          "ce_loss": 2.7603189945220947,
+          "dflash2/objective/weighted_covered_accuracy": 0.7411640286445618,
+          "dflash2/selector/loss": 0.9058519601821899,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7010071277618408,
+          "loss": 3.5035006999969482,
+          "target_probability": 0.4394772946834564,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.206844329833984
+        },
+        {
+          "acc": 0.47889965772628784,
+          "ce_loss": 2.7150988578796387,
+          "dflash2/objective/weighted_covered_accuracy": 0.7449696660041809,
+          "dflash2/selector/loss": 0.8774974942207336,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7029444575309753,
+          "loss": 3.436171770095825,
+          "target_probability": 0.440071702003479,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 54.15422058105469
+        },
+        {
+          "acc": 0.479796439409256,
+          "ce_loss": 2.69732403755188,
+          "dflash2/objective/weighted_covered_accuracy": 0.746763288974762,
+          "dflash2/selector/loss": 0.8676396012306213,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7039045095443726,
+          "loss": 3.4110758304595947,
+          "target_probability": 0.4404875338077545,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.38789367675781
+        },
+        {
+          "acc": 0.47973671555519104,
+          "ce_loss": 2.692584276199341,
+          "dflash2/objective/weighted_covered_accuracy": 0.7465800046920776,
+          "dflash2/selector/loss": 0.8687122464179993,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7029949426651001,
+          "loss": 3.4075510501861572,
+          "target_probability": 0.43979212641716003,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.142250061035156
+        },
+        {
+          "acc": 0.4868164360523224,
+          "ce_loss": 2.571165084838867,
+          "dflash2/objective/weighted_covered_accuracy": 0.7546955347061157,
+          "dflash2/selector/loss": 0.8135836720466614,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7057833671569824,
+          "loss": 3.2442150115966797,
+          "target_probability": 0.4412572383880615,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 45.42507553100586
+        }
+      ],
+      "peak_allocated_gb": 43.836987392,
+      "peak_memory_scope": "Maximum allocated across ranks during measured training steps; counter reset after warmup, before timed steps; heldout evaluation excluded"
+    },
+    {
+      "schedule": "online",
+      "repeat": 0,
+      "seconds_per_step": [
+        1.3001660108566284,
+        0.6476237773895264,
+        0.6648033261299133,
+        0.6493545174598694,
+        0.6595437526702881,
+        0.6524585485458374,
+        0.914986252784729,
+        0.6583539843559265
+      ],
+      "warmup_steps_excluded": 3,
+      "median_measured_seconds": 0.6583539843559265,
+      "supervised_positions_per_step": [
+        26131,
+        26136,
+        26132,
+        26131,
+        26135,
+        26134,
+        26131,
+        26136
+      ],
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.280659765601582,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.3482142857142857
+      },
+      "train_metrics": [
+        {
+          "acc": 0.4732310175895691,
+          "ce_loss": 2.8026061058044434,
+          "dflash2/objective/weighted_covered_accuracy": 0.7385143637657166,
+          "dflash2/selector/loss": 0.9285473823547363,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6991888880729675,
+          "loss": 3.5625803470611572,
+          "target_probability": 0.4381450414657593,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.248565673828125
+        },
+        {
+          "acc": 0.47444137930870056,
+          "ce_loss": 2.791173219680786,
+          "dflash2/objective/weighted_covered_accuracy": 0.7390754222869873,
+          "dflash2/selector/loss": 0.9208195805549622,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6996352672576904,
+          "loss": 3.5452985763549805,
+          "target_probability": 0.43834659457206726,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.23107147216797
+        },
+        {
+          "acc": 0.47562375664711,
+          "ce_loss": 2.771117925643921,
+          "dflash2/objective/weighted_covered_accuracy": 0.7410224080085754,
+          "dflash2/selector/loss": 0.9096004366874695,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7006615400314331,
+          "loss": 3.5170440673828125,
+          "target_probability": 0.43908199667930603,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.46282196044922
+        },
+        {
+          "acc": 0.47625425457954407,
+          "ce_loss": 2.762559175491333,
+          "dflash2/objective/weighted_covered_accuracy": 0.7406306862831116,
+          "dflash2/selector/loss": 0.9086939692497253,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7003799080848694,
+          "loss": 3.508150100708008,
+          "target_probability": 0.4388687014579773,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.45741653442383
+        },
+        {
+          "acc": 0.4787067174911499,
+          "ce_loss": 2.7140088081359863,
+          "dflash2/objective/weighted_covered_accuracy": 0.7451037764549255,
+          "dflash2/selector/loss": 0.878477156162262,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.702741801738739,
+          "loss": 3.436373710632324,
+          "target_probability": 0.4401288628578186,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 54.156494140625
+        },
+        {
+          "acc": 0.4797581732273102,
+          "ce_loss": 2.6978352069854736,
+          "dflash2/objective/weighted_covered_accuracy": 0.7467426061630249,
+          "dflash2/selector/loss": 0.8679361343383789,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7034155130386353,
+          "loss": 3.411766290664673,
+          "target_probability": 0.4402906000614166,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.63686752319336
+        },
+        {
+          "acc": 0.48038727045059204,
+          "ce_loss": 2.685896635055542,
+          "dflash2/objective/weighted_covered_accuracy": 0.7478043437004089,
+          "dflash2/selector/loss": 0.8634927272796631,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7039677500724792,
+          "loss": 3.396805763244629,
+          "target_probability": 0.44079121947288513,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 52.87501525878906
+        },
+        {
+          "acc": 0.48706763982772827,
+          "ce_loss": 2.5697553157806396,
+          "dflash2/objective/weighted_covered_accuracy": 0.7549325823783875,
+          "dflash2/selector/loss": 0.8127534985542297,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7063334584236145,
+          "loss": 3.2419660091400146,
+          "target_probability": 0.4414704740047455,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 45.17325210571289
+        }
+      ],
+      "peak_allocated_gb": 42.065794048,
+      "peak_memory_scope": "Maximum allocated across ranks during measured training steps; counter reset after warmup, before timed steps; heldout evaluation excluded"
+    },
+    {
+      "schedule": "offline",
+      "repeat": 0,
+      "seconds_per_step": [
+        1.2936604022979736,
+        0.6303700804710388,
+        0.6367397904396057,
+        0.6308808922767639,
+        0.6335399746894836,
+        0.6375139355659485,
+        0.6382577419281006,
+        0.6357368230819702
+      ],
+      "warmup_steps_excluded": 3,
+      "median_measured_seconds": 0.6357368230819702,
+      "supervised_positions_per_step": [
+        26131,
+        26131,
+        26136,
+        26131,
+        26135,
+        26131,
+        26132,
+        26133
+      ],
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.267282989560434,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.35044642857142855
+      },
+      "train_metrics": [
+        {
+          "acc": 0.4736902415752411,
+          "ce_loss": 2.797398805618286,
+          "dflash2/objective/weighted_covered_accuracy": 0.7387769818305969,
+          "dflash2/selector/loss": 0.9261870980262756,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6994051337242126,
+          "loss": 3.5555081367492676,
+          "target_probability": 0.438398540019989,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.228763580322266
+        },
+        {
+          "acc": 0.47556543350219727,
+          "ce_loss": 2.7836759090423584,
+          "dflash2/objective/weighted_covered_accuracy": 0.7404447793960571,
+          "dflash2/selector/loss": 0.9197499752044678,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7002600431442261,
+          "loss": 3.5373451709747314,
+          "target_probability": 0.4396689832210541,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.228763580322266
+        },
+        {
+          "acc": 0.47539791464805603,
+          "ce_loss": 2.7786707878112793,
+          "dflash2/objective/weighted_covered_accuracy": 0.7403674721717834,
+          "dflash2/selector/loss": 0.9129217863082886,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6999930143356323,
+          "loss": 3.5268852710723877,
+          "target_probability": 0.4382299482822418,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.722293853759766
+        },
+        {
+          "acc": 0.47575676441192627,
+          "ce_loss": 2.7686562538146973,
+          "dflash2/objective/weighted_covered_accuracy": 0.7404036521911621,
+          "dflash2/selector/loss": 0.9092583656311035,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7002984285354614,
+          "loss": 3.514009714126587,
+          "target_probability": 0.43859535455703735,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.460906982421875
+        },
+        {
+          "acc": 0.47782665491104126,
+          "ce_loss": 2.7206764221191406,
+          "dflash2/objective/weighted_covered_accuracy": 0.7443670034408569,
+          "dflash2/selector/loss": 0.8797480463981628,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.702158510684967,
+          "loss": 3.4436237812042236,
+          "target_probability": 0.4389694631099701,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 54.409122467041016
+        },
+        {
+          "acc": 0.47885653376579285,
+          "ce_loss": 2.702524423599243,
+          "dflash2/objective/weighted_covered_accuracy": 0.7462140917778015,
+          "dflash2/selector/loss": 0.8698520064353943,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7031237483024597,
+          "loss": 3.4176690578460693,
+          "target_probability": 0.439498633146286,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.64254379272461
+        },
+        {
+          "acc": 0.4799096882343292,
+          "ce_loss": 2.691657066345215,
+          "dflash2/objective/weighted_covered_accuracy": 0.7474410533905029,
+          "dflash2/selector/loss": 0.8638383150100708,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7036293148994446,
+          "loss": 3.4022552967071533,
+          "target_probability": 0.4399072527885437,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 52.882286071777344
+        },
+        {
+          "acc": 0.4873914122581482,
+          "ce_loss": 2.568023920059204,
+          "dflash2/objective/weighted_covered_accuracy": 0.7553049921989441,
+          "dflash2/selector/loss": 0.812690019607544,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7061412334442139,
+          "loss": 3.240572929382324,
+          "target_probability": 0.44173043966293335,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 45.17410659790039
+        }
+      ],
+      "peak_allocated_gb": 43.788691456,
+      "peak_memory_scope": "Maximum allocated across ranks during measured training steps; counter reset after warmup, before timed steps; heldout evaluation excluded"
+    },
+    {
+      "schedule": "offline",
+      "repeat": 1,
+      "seconds_per_step": [
+        1.3119803667068481,
+        0.6238152384757996,
+        0.6369237899780273,
+        0.6344754099845886,
+        0.6345889568328857,
+        0.6366456747055054,
+        0.8949376344680786,
+        0.6382378339767456
+      ],
+      "warmup_steps_excluded": 3,
+      "median_measured_seconds": 0.6366456747055054,
+      "supervised_positions_per_step": [
+        26131,
+        26131,
+        26136,
+        26131,
+        26135,
+        26131,
+        26132,
+        26133
+      ],
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.267282989560434,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.35044642857142855
+      },
+      "train_metrics": [
+        {
+          "acc": 0.4736902415752411,
+          "ce_loss": 2.797398805618286,
+          "dflash2/objective/weighted_covered_accuracy": 0.7387769818305969,
+          "dflash2/selector/loss": 0.9261870980262756,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6994051337242126,
+          "loss": 3.5555081367492676,
+          "target_probability": 0.438398540019989,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.228763580322266
+        },
+        {
+          "acc": 0.47556543350219727,
+          "ce_loss": 2.7836759090423584,
+          "dflash2/objective/weighted_covered_accuracy": 0.7404447793960571,
+          "dflash2/selector/loss": 0.9197499752044678,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7002600431442261,
+          "loss": 3.5373451709747314,
+          "target_probability": 0.4396689832210541,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.228763580322266
+        },
+        {
+          "acc": 0.47539791464805603,
+          "ce_loss": 2.7786707878112793,
+          "dflash2/objective/weighted_covered_accuracy": 0.7403674721717834,
+          "dflash2/selector/loss": 0.9129217863082886,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6999930143356323,
+          "loss": 3.5268852710723877,
+          "target_probability": 0.4382299482822418,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.722293853759766
+        },
+        {
+          "acc": 0.47575676441192627,
+          "ce_loss": 2.7686562538146973,
+          "dflash2/objective/weighted_covered_accuracy": 0.7404036521911621,
+          "dflash2/selector/loss": 0.9092583656311035,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7002984285354614,
+          "loss": 3.514009714126587,
+          "target_probability": 0.43859535455703735,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.460906982421875
+        },
+        {
+          "acc": 0.47782665491104126,
+          "ce_loss": 2.7206764221191406,
+          "dflash2/objective/weighted_covered_accuracy": 0.7443670034408569,
+          "dflash2/selector/loss": 0.8797480463981628,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.702158510684967,
+          "loss": 3.4436237812042236,
+          "target_probability": 0.4389694631099701,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 54.409122467041016
+        },
+        {
+          "acc": 0.47885653376579285,
+          "ce_loss": 2.702524423599243,
+          "dflash2/objective/weighted_covered_accuracy": 0.7462140917778015,
+          "dflash2/selector/loss": 0.8698520064353943,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7031237483024597,
+          "loss": 3.4176690578460693,
+          "target_probability": 0.439498633146286,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.64254379272461
+        },
+        {
+          "acc": 0.4799096882343292,
+          "ce_loss": 2.691657066345215,
+          "dflash2/objective/weighted_covered_accuracy": 0.7474410533905029,
+          "dflash2/selector/loss": 0.8638383150100708,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7036293148994446,
+          "loss": 3.4022552967071533,
+          "target_probability": 0.4399072527885437,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 52.882286071777344
+        },
+        {
+          "acc": 0.4873914122581482,
+          "ce_loss": 2.568023920059204,
+          "dflash2/objective/weighted_covered_accuracy": 0.7553049921989441,
+          "dflash2/selector/loss": 0.812690019607544,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7061412334442139,
+          "loss": 3.240572929382324,
+          "target_probability": 0.44173043966293335,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 45.17410659790039
+        }
+      ],
+      "peak_allocated_gb": 43.788691456,
+      "peak_memory_scope": "Maximum allocated across ranks during measured training steps; counter reset after warmup, before timed steps; heldout evaluation excluded"
+    },
+    {
+      "schedule": "online",
+      "repeat": 1,
+      "seconds_per_step": [
+        1.279042363166809,
+        0.6495804190635681,
+        0.6555655002593994,
+        0.6492938995361328,
+        0.6549227833747864,
+        0.7936669588088989,
+        0.9196710586547852,
+        0.6558904647827148
+      ],
+      "warmup_steps_excluded": 3,
+      "median_measured_seconds": 0.6558904647827148,
+      "supervised_positions_per_step": [
+        26131,
+        26136,
+        26132,
+        26131,
+        26135,
+        26134,
+        26131,
+        26136
+      ],
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.280659765601582,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.3482142857142857
+      },
+      "train_metrics": [
+        {
+          "acc": 0.4732310175895691,
+          "ce_loss": 2.8026061058044434,
+          "dflash2/objective/weighted_covered_accuracy": 0.7385143637657166,
+          "dflash2/selector/loss": 0.9285473823547363,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6991888880729675,
+          "loss": 3.5625803470611572,
+          "target_probability": 0.4381450414657593,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.248565673828125
+        },
+        {
+          "acc": 0.47444137930870056,
+          "ce_loss": 2.791173219680786,
+          "dflash2/objective/weighted_covered_accuracy": 0.7390754222869873,
+          "dflash2/selector/loss": 0.9208195805549622,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6996352672576904,
+          "loss": 3.5452985763549805,
+          "target_probability": 0.43834659457206726,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.23107147216797
+        },
+        {
+          "acc": 0.47562375664711,
+          "ce_loss": 2.771117925643921,
+          "dflash2/objective/weighted_covered_accuracy": 0.7410224080085754,
+          "dflash2/selector/loss": 0.9096004366874695,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7006615400314331,
+          "loss": 3.5170440673828125,
+          "target_probability": 0.43908199667930603,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.46282196044922
+        },
+        {
+          "acc": 0.47625425457954407,
+          "ce_loss": 2.762559175491333,
+          "dflash2/objective/weighted_covered_accuracy": 0.7406306862831116,
+          "dflash2/selector/loss": 0.9086939692497253,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7003799080848694,
+          "loss": 3.508150100708008,
+          "target_probability": 0.4388687014579773,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.45741653442383
+        },
+        {
+          "acc": 0.4787067174911499,
+          "ce_loss": 2.7140088081359863,
+          "dflash2/objective/weighted_covered_accuracy": 0.7451037764549255,
+          "dflash2/selector/loss": 0.878477156162262,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.702741801738739,
+          "loss": 3.436373710632324,
+          "target_probability": 0.4401288628578186,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 54.156494140625
+        },
+        {
+          "acc": 0.4797581732273102,
+          "ce_loss": 2.6978352069854736,
+          "dflash2/objective/weighted_covered_accuracy": 0.7467426061630249,
+          "dflash2/selector/loss": 0.8679361343383789,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7034155130386353,
+          "loss": 3.411766290664673,
+          "target_probability": 0.4402906000614166,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.63686752319336
+        },
+        {
+          "acc": 0.48038727045059204,
+          "ce_loss": 2.685896635055542,
+          "dflash2/objective/weighted_covered_accuracy": 0.7478043437004089,
+          "dflash2/selector/loss": 0.8634927272796631,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7039677500724792,
+          "loss": 3.396805763244629,
+          "target_probability": 0.44079121947288513,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 52.87501525878906
+        },
+        {
+          "acc": 0.48706763982772827,
+          "ce_loss": 2.5697553157806396,
+          "dflash2/objective/weighted_covered_accuracy": 0.7549325823783875,
+          "dflash2/selector/loss": 0.8127534985542297,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7063334584236145,
+          "loss": 3.2419660091400146,
+          "target_probability": 0.4414704740047455,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 45.17325210571289
+        }
+      ],
+      "peak_allocated_gb": 42.065794048,
+      "peak_memory_scope": "Maximum allocated across ranks during measured training steps; counter reset after warmup, before timed steps; heldout evaluation excluded"
+    },
+    {
+      "schedule": "baseline",
+      "repeat": 1,
+      "seconds_per_step": [
+        1.5434980392456055,
+        0.7916827201843262,
+        0.7998021245002747,
+        0.8005532622337341,
+        0.8022211194038391,
+        0.7961302995681763,
+        0.8022593855857849,
+        0.7983102798461914
+      ],
+      "warmup_steps_excluded": 3,
+      "median_measured_seconds": 0.8005532622337341,
+      "supervised_positions_per_step": [
+        26135,
+        26137,
+        26145,
+        26135,
+        26137,
+        26134,
+        26131,
+        26131
+      ],
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.286356744354612,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.35044642857142855
+      },
+      "train_metrics": [
+        {
+          "acc": 0.4730820655822754,
+          "ce_loss": 2.8026156425476074,
+          "dflash2/objective/weighted_covered_accuracy": 0.7380714416503906,
+          "dflash2/selector/loss": 0.9287524819374084,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6988292932510376,
+          "loss": 3.5626938343048096,
+          "target_probability": 0.43786752223968506,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.733821868896484
+        },
+        {
+          "acc": 0.4748823642730713,
+          "ce_loss": 2.786128282546997,
+          "dflash2/objective/weighted_covered_accuracy": 0.7392809987068176,
+          "dflash2/selector/loss": 0.920470654964447,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6998104453086853,
+          "loss": 3.5404419898986816,
+          "target_probability": 0.43913909792900085,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.74638366699219
+        },
+        {
+          "acc": 0.47584623098373413,
+          "ce_loss": 2.769042730331421,
+          "dflash2/objective/weighted_covered_accuracy": 0.741533100605011,
+          "dflash2/selector/loss": 0.9080969095230103,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7008497714996338,
+          "loss": 3.513493776321411,
+          "target_probability": 0.4390888810157776,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.460670471191406
+        },
+        {
+          "acc": 0.4766022562980652,
+          "ce_loss": 2.7603189945220947,
+          "dflash2/objective/weighted_covered_accuracy": 0.7411640286445618,
+          "dflash2/selector/loss": 0.9058519601821899,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7010071277618408,
+          "loss": 3.5035006999969482,
+          "target_probability": 0.4394772946834564,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.206844329833984
+        },
+        {
+          "acc": 0.47889965772628784,
+          "ce_loss": 2.7150988578796387,
+          "dflash2/objective/weighted_covered_accuracy": 0.7449696660041809,
+          "dflash2/selector/loss": 0.8774974942207336,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7029444575309753,
+          "loss": 3.436171770095825,
+          "target_probability": 0.440071702003479,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 54.15422058105469
+        },
+        {
+          "acc": 0.479796439409256,
+          "ce_loss": 2.69732403755188,
+          "dflash2/objective/weighted_covered_accuracy": 0.746763288974762,
+          "dflash2/selector/loss": 0.8676396012306213,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7039045095443726,
+          "loss": 3.4110758304595947,
+          "target_probability": 0.4404875338077545,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.38789367675781
+        },
+        {
+          "acc": 0.47973671555519104,
+          "ce_loss": 2.692584276199341,
+          "dflash2/objective/weighted_covered_accuracy": 0.7465800046920776,
+          "dflash2/selector/loss": 0.8687122464179993,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7029949426651001,
+          "loss": 3.4075510501861572,
+          "target_probability": 0.43979212641716003,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.142250061035156
+        },
+        {
+          "acc": 0.4868164360523224,
+          "ce_loss": 2.571165084838867,
+          "dflash2/objective/weighted_covered_accuracy": 0.7546955347061157,
+          "dflash2/selector/loss": 0.8135836720466614,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7057833671569824,
+          "loss": 3.2442150115966797,
+          "target_probability": 0.4412572383880615,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 45.42507553100586
+        }
+      ],
+      "peak_allocated_gb": 43.836987392,
+      "peak_memory_scope": "Maximum allocated across ranks during measured training steps; counter reset after warmup, before timed steps; heldout evaluation excluded"
+    },
+    {
+      "schedule": "baseline",
+      "repeat": 2,
+      "seconds_per_step": [
+        1.4268982410430908,
+        0.7907076478004456,
+        0.801979660987854,
+        0.8006519675254822,
+        0.8007833361625671,
+        0.9793382883071899,
+        1.07505464553833,
+        0.8012087941169739
+      ],
+      "warmup_steps_excluded": 3,
+      "median_measured_seconds": 0.8012087941169739,
+      "supervised_positions_per_step": [
+        26135,
+        26137,
+        26145,
+        26135,
+        26137,
+        26134,
+        26131,
+        26131
+      ],
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.286356744354612,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.35044642857142855
+      },
+      "train_metrics": [
+        {
+          "acc": 0.4730820655822754,
+          "ce_loss": 2.8026156425476074,
+          "dflash2/objective/weighted_covered_accuracy": 0.7380714416503906,
+          "dflash2/selector/loss": 0.9287524819374084,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6988292932510376,
+          "loss": 3.5626938343048096,
+          "target_probability": 0.43786752223968506,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.733821868896484
+        },
+        {
+          "acc": 0.4748823642730713,
+          "ce_loss": 2.786128282546997,
+          "dflash2/objective/weighted_covered_accuracy": 0.7392809987068176,
+          "dflash2/selector/loss": 0.920470654964447,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6998104453086853,
+          "loss": 3.5404419898986816,
+          "target_probability": 0.43913909792900085,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.74638366699219
+        },
+        {
+          "acc": 0.47584623098373413,
+          "ce_loss": 2.769042730331421,
+          "dflash2/objective/weighted_covered_accuracy": 0.741533100605011,
+          "dflash2/selector/loss": 0.9080969095230103,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7008497714996338,
+          "loss": 3.513493776321411,
+          "target_probability": 0.4390888810157776,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.460670471191406
+        },
+        {
+          "acc": 0.4766022562980652,
+          "ce_loss": 2.7603189945220947,
+          "dflash2/objective/weighted_covered_accuracy": 0.7411640286445618,
+          "dflash2/selector/loss": 0.9058519601821899,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7010071277618408,
+          "loss": 3.5035006999969482,
+          "target_probability": 0.4394772946834564,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.206844329833984
+        },
+        {
+          "acc": 0.47889965772628784,
+          "ce_loss": 2.7150988578796387,
+          "dflash2/objective/weighted_covered_accuracy": 0.7449696660041809,
+          "dflash2/selector/loss": 0.8774974942207336,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7029444575309753,
+          "loss": 3.436171770095825,
+          "target_probability": 0.440071702003479,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 54.15422058105469
+        },
+        {
+          "acc": 0.479796439409256,
+          "ce_loss": 2.69732403755188,
+          "dflash2/objective/weighted_covered_accuracy": 0.746763288974762,
+          "dflash2/selector/loss": 0.8676396012306213,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7039045095443726,
+          "loss": 3.4110758304595947,
+          "target_probability": 0.4404875338077545,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.38789367675781
+        },
+        {
+          "acc": 0.47973671555519104,
+          "ce_loss": 2.692584276199341,
+          "dflash2/objective/weighted_covered_accuracy": 0.7465800046920776,
+          "dflash2/selector/loss": 0.8687122464179993,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7029949426651001,
+          "loss": 3.4075510501861572,
+          "target_probability": 0.43979212641716003,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.142250061035156
+        },
+        {
+          "acc": 0.4868164360523224,
+          "ce_loss": 2.571165084838867,
+          "dflash2/objective/weighted_covered_accuracy": 0.7546955347061157,
+          "dflash2/selector/loss": 0.8135836720466614,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7057833671569824,
+          "loss": 3.2442150115966797,
+          "target_probability": 0.4412572383880615,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 45.42507553100586
+        }
+      ],
+      "peak_allocated_gb": 43.836987392,
+      "peak_memory_scope": "Maximum allocated across ranks during measured training steps; counter reset after warmup, before timed steps; heldout evaluation excluded"
+    },
+    {
+      "schedule": "online",
+      "repeat": 2,
+      "seconds_per_step": [
+        1.2810554504394531,
+        0.6477742195129395,
+        0.6577553749084473,
+        0.6498578190803528,
+        0.6579409241676331,
+        0.6510869860649109,
+        0.8206116557121277,
+        0.6595239043235779
+      ],
+      "warmup_steps_excluded": 3,
+      "median_measured_seconds": 0.6579409241676331,
+      "supervised_positions_per_step": [
+        26131,
+        26136,
+        26132,
+        26131,
+        26135,
+        26134,
+        26131,
+        26136
+      ],
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.280659765601582,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.3482142857142857
+      },
+      "train_metrics": [
+        {
+          "acc": 0.4732310175895691,
+          "ce_loss": 2.8026061058044434,
+          "dflash2/objective/weighted_covered_accuracy": 0.7385143637657166,
+          "dflash2/selector/loss": 0.9285473823547363,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6991888880729675,
+          "loss": 3.5625803470611572,
+          "target_probability": 0.4381450414657593,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.248565673828125
+        },
+        {
+          "acc": 0.47444137930870056,
+          "ce_loss": 2.791173219680786,
+          "dflash2/objective/weighted_covered_accuracy": 0.7390754222869873,
+          "dflash2/selector/loss": 0.9208195805549622,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6996352672576904,
+          "loss": 3.5452985763549805,
+          "target_probability": 0.43834659457206726,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.23107147216797
+        },
+        {
+          "acc": 0.47562375664711,
+          "ce_loss": 2.771117925643921,
+          "dflash2/objective/weighted_covered_accuracy": 0.7410224080085754,
+          "dflash2/selector/loss": 0.9096004366874695,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7006615400314331,
+          "loss": 3.5170440673828125,
+          "target_probability": 0.43908199667930603,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.46282196044922
+        },
+        {
+          "acc": 0.47625425457954407,
+          "ce_loss": 2.762559175491333,
+          "dflash2/objective/weighted_covered_accuracy": 0.7406306862831116,
+          "dflash2/selector/loss": 0.9086939692497253,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7003799080848694,
+          "loss": 3.508150100708008,
+          "target_probability": 0.4388687014579773,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.45741653442383
+        },
+        {
+          "acc": 0.4787067174911499,
+          "ce_loss": 2.7140088081359863,
+          "dflash2/objective/weighted_covered_accuracy": 0.7451037764549255,
+          "dflash2/selector/loss": 0.878477156162262,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.702741801738739,
+          "loss": 3.436373710632324,
+          "target_probability": 0.4401288628578186,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 54.156494140625
+        },
+        {
+          "acc": 0.4797581732273102,
+          "ce_loss": 2.6978352069854736,
+          "dflash2/objective/weighted_covered_accuracy": 0.7467426061630249,
+          "dflash2/selector/loss": 0.8679361343383789,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7034155130386353,
+          "loss": 3.411766290664673,
+          "target_probability": 0.4402906000614166,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.63686752319336
+        },
+        {
+          "acc": 0.48038727045059204,
+          "ce_loss": 2.685896635055542,
+          "dflash2/objective/weighted_covered_accuracy": 0.7478043437004089,
+          "dflash2/selector/loss": 0.8634927272796631,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7039677500724792,
+          "loss": 3.396805763244629,
+          "target_probability": 0.44079121947288513,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 52.87501525878906
+        },
+        {
+          "acc": 0.48706763982772827,
+          "ce_loss": 2.5697553157806396,
+          "dflash2/objective/weighted_covered_accuracy": 0.7549325823783875,
+          "dflash2/selector/loss": 0.8127534985542297,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7063334584236145,
+          "loss": 3.2419660091400146,
+          "target_probability": 0.4414704740047455,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 45.17325210571289
+        }
+      ],
+      "peak_allocated_gb": 42.065794048,
+      "peak_memory_scope": "Maximum allocated across ranks during measured training steps; counter reset after warmup, before timed steps; heldout evaluation excluded"
+    },
+    {
+      "schedule": "offline",
+      "repeat": 2,
+      "seconds_per_step": [
+        1.3528470993041992,
+        0.6321864128112793,
+        0.637320876121521,
+        0.6322173476219177,
+        0.6327093839645386,
+        0.6367539763450623,
+        0.898539662361145,
+        0.6368259191513062
+      ],
+      "warmup_steps_excluded": 3,
+      "median_measured_seconds": 0.6367539763450623,
+      "supervised_positions_per_step": [
+        26131,
+        26131,
+        26136,
+        26131,
+        26135,
+        26131,
+        26132,
+        26133
+      ],
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.267282989560434,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.35044642857142855
+      },
+      "train_metrics": [
+        {
+          "acc": 0.4736902415752411,
+          "ce_loss": 2.797398805618286,
+          "dflash2/objective/weighted_covered_accuracy": 0.7387769818305969,
+          "dflash2/selector/loss": 0.9261870980262756,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6994051337242126,
+          "loss": 3.5555081367492676,
+          "target_probability": 0.438398540019989,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.228763580322266
+        },
+        {
+          "acc": 0.47556543350219727,
+          "ce_loss": 2.7836759090423584,
+          "dflash2/objective/weighted_covered_accuracy": 0.7404447793960571,
+          "dflash2/selector/loss": 0.9197499752044678,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7002600431442261,
+          "loss": 3.5373451709747314,
+          "target_probability": 0.4396689832210541,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 57.228763580322266
+        },
+        {
+          "acc": 0.47539791464805603,
+          "ce_loss": 2.7786707878112793,
+          "dflash2/objective/weighted_covered_accuracy": 0.7403674721717834,
+          "dflash2/selector/loss": 0.9129217863082886,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.6999930143356323,
+          "loss": 3.5268852710723877,
+          "target_probability": 0.4382299482822418,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.722293853759766
+        },
+        {
+          "acc": 0.47575676441192627,
+          "ce_loss": 2.7686562538146973,
+          "dflash2/objective/weighted_covered_accuracy": 0.7404036521911621,
+          "dflash2/selector/loss": 0.9092583656311035,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7002984285354614,
+          "loss": 3.514009714126587,
+          "target_probability": 0.43859535455703735,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 56.460906982421875
+        },
+        {
+          "acc": 0.47782665491104126,
+          "ce_loss": 2.7206764221191406,
+          "dflash2/objective/weighted_covered_accuracy": 0.7443670034408569,
+          "dflash2/selector/loss": 0.8797480463981628,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.702158510684967,
+          "loss": 3.4436237812042236,
+          "target_probability": 0.4389694631099701,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 54.409122467041016
+        },
+        {
+          "acc": 0.47885653376579285,
+          "ce_loss": 2.702524423599243,
+          "dflash2/objective/weighted_covered_accuracy": 0.7462140917778015,
+          "dflash2/selector/loss": 0.8698520064353943,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7031237483024597,
+          "loss": 3.4176690578460693,
+          "target_probability": 0.439498633146286,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 53.64254379272461
+        },
+        {
+          "acc": 0.4799096882343292,
+          "ce_loss": 2.691657066345215,
+          "dflash2/objective/weighted_covered_accuracy": 0.7474410533905029,
+          "dflash2/selector/loss": 0.8638383150100708,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7036293148994446,
+          "loss": 3.4022552967071533,
+          "target_probability": 0.4399072527885437,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 52.882286071777344
+        },
+        {
+          "acc": 0.4873914122581482,
+          "ce_loss": 2.568023920059204,
+          "dflash2/objective/weighted_covered_accuracy": 0.7553049921989441,
+          "dflash2/selector/loss": 0.812690019607544,
+          "dflash2/selector/teacher_forced_covered_gold_probability": 0.7061412334442139,
+          "loss": 3.240572929382324,
+          "target_probability": 0.44173043966293335,
+          "selector_loss_alpha": 1.0,
+          "grad_norm": 45.17410659790039
+        }
+      ],
+      "peak_allocated_gb": 43.788691456,
+      "peak_memory_scope": "Maximum allocated across ranks during measured training steps; counter reset after warmup, before timed steps; heldout evaluation excluded"
+    }
+  ],
+  "metric_definitions": {
+    "heldout_loss": "Combined decayed DFlash token objective plus selector objective with alpha=1",
+    "unary_hard_label_accuracy": "Unary-logit argmax accuracy before candidate-selector decisions; not serving acceptance"
+  },
+  "postprocessing": {
+    "version": 1,
+    "raw_bundle": "pretrained-dflash2-isolated-raw.json",
+    "raw_sha256": "9467f3838d965e0e5ba19a412f8f2c38e4b45a6d3eb52ef7616875047058ded1",
+    "changes": [
+      "Rename heldout hard_label_accuracy to unary_hard_label_accuracy without changing values",
+      "Replace hardcoded multi-variant per-process order with actual process-isolated wrapper order",
+      "Aggregate 9 unmodified process runs and compute summaries from retained counts and times"
+    ],
+    "runtime_utility_sha256": "1069ff4633bfaad6e51dcd4bda86652344008cc60002cd25dc56240f50edf922",
+    "current_utility_sha256": "8ddc4d2f5afec86e0c55203e2afcfaf49413d7368501dc41351e2882ea3428d5",
+    "utility_postrun_changes": "Metadata-only: accurate selected-schedule order and heldout metric names/definitions; no model/data/timing changes"
+  },
+  "summary": {
+    "baseline": {
+      "median_step_ms_by_repeat": [
+        799.4505763053894,
+        800.5532622337341,
+        801.2087941169739
+      ],
+      "paired_speedup_by_repeat": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median_all_steps_ms": 800.7833361625671,
+      "supervised_positions_per_second": 31468.364357340757,
+      "supervised_positions_per_step_range": [
+        26131,
+        26137
+      ],
+      "valid_context_tokens_per_second": 9247.751487142108,
+      "peak_allocated_gb_by_repeat": [
+        43.836987392,
+        43.836987392,
+        43.836987392
+      ],
+      "context_padding_fraction": 0.23076923076923073,
+      "allocated_anchor_blocks_per_window": 5038,
+      "valid_anchor_blocks_per_window": 3781,
+      "anchor_block_padding_fraction": 0.24950377133783253,
+      "all_train_metrics_finite": true,
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.286356744354612,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.35044642857142855
+      }
+    },
+    "online": {
+      "median_step_ms_by_repeat": [
+        658.3539843559265,
+        655.8904647827148,
+        657.940924167633
+      ],
+      "paired_speedup_by_repeat": [
+        1.2143172142984733,
+        1.2205593848645804,
+        1.2177518751103533
+      ],
+      "median_all_steps_ms": 657.940924167633,
+      "supervised_positions_per_second": 36817.41147489185,
+      "supervised_positions_per_step_range": [
+        26131,
+        26136
+      ],
+      "valid_context_tokens_per_second": 10819.783117664345,
+      "peak_allocated_gb_by_repeat": [
+        42.065794048,
+        42.065794048,
+        42.065794048
+      ],
+      "context_padding_fraction": 0.0,
+      "allocated_anchor_blocks_per_window": 4328,
+      "valid_anchor_blocks_per_window": 3781,
+      "anchor_block_padding_fraction": 0.12638632162661734,
+      "all_train_metrics_finite": true,
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.280659765601582,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.3482142857142857
+      }
+    },
+    "offline": {
+      "median_step_ms_by_repeat": [
+        635.7368230819702,
+        636.6456747055054,
+        636.7539763450623
+      ],
+      "paired_speedup_by_repeat": [
+        1.2575181227190144,
+        1.2574549612766126,
+        1.258270578404354
+      ],
+      "median_all_steps_ms": 636.6456747055054,
+      "supervised_positions_per_second": 38996.36032466029,
+      "supervised_positions_per_step_range": [
+        26131,
+        26135
+      ],
+      "valid_context_tokens_per_second": 11460.564176784032,
+      "peak_allocated_gb_by_repeat": [
+        43.788691456,
+        43.788691456,
+        43.788691456
+      ],
+      "context_padding_fraction": 0.0,
+      "allocated_anchor_blocks_per_window": 4498,
+      "valid_anchor_blocks_per_window": 3781,
+      "anchor_block_padding_fraction": 0.15940417963539355,
+      "all_train_metrics_finite": true,
+      "heldout_before": {
+        "loss": 4.454172517388481,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.34375
+      },
+      "heldout_after": {
+        "loss": 4.267282989560434,
+        "supervised_positions": 448.0,
+        "finite": true,
+        "unary_hard_label_accuracy": 0.35044642857142855
+      }
+    }
+  }
+}
