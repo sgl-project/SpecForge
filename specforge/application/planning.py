@@ -11,6 +11,29 @@ def _feature_mode(cfg: Config) -> FeatureMode:
     return FeatureMode.OFFLINE if cfg.mode == "offline" else FeatureMode.STREAMING
 
 
+def _resolve_attention_backend(
+    cfg: Config,
+    algorithm: AlgorithmRegistration,
+) -> None:
+    """Fill in the trainer attention backend when the config leaves it unset.
+
+    The schema default is ``None`` so that H-Spec (eager/sdpa only) and other
+    restricted algorithms do not trip over a global ``flex_attention`` default;
+    the algorithm capability set picks the backend instead.
+    """
+
+    if cfg.training.attention_backend is not None:
+        return
+    for candidate in ("flex_attention", "sdpa", "eager"):
+        if candidate in algorithm.spec.capabilities.attention_backends:
+            cfg.training.attention_backend = candidate
+            return
+    raise ValueError(
+        f"algorithm {algorithm.name!r} supports no known attention backend; "
+        f"supported: {sorted(algorithm.spec.capabilities.attention_backends)}"
+    )
+
+
 def _validate_feature_provider(
     cfg: Config,
     algorithm: AlgorithmRegistration,
@@ -213,6 +236,7 @@ def validate_resolved_run(
             f"{algorithm.name!r} != {cfg.training.strategy!r}"
         )
     mode = _feature_mode(cfg)
+    _resolve_attention_backend(cfg, algorithm)
     _validate_feature_provider(cfg, algorithm, mode)
     _validate_draft_options(cfg, algorithm)
     _validate_algorithm_capabilities(cfg, algorithm, mode)
