@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from specforge.algorithms.common.providers import DraftConfigProvider
+    from specforge.algorithms.registry import AlgorithmRegistration
     from specforge.config import Config
 
 logger = logging.getLogger(__name__)
@@ -301,6 +302,34 @@ def resolve_draft_config(
     return draft_config
 
 
+def preflight_draft_kernels(
+    cfg: "Config", *, algorithm: "AlgorithmRegistration"
+) -> None:
+    """Import the Liger kernels this host's trainer draft build will resolve.
+
+    A supervisor about to start services or workers, and a disaggregated
+    consumer about to wait on its producer, call this so a missing install
+    fails at startup. The trainer's ``build_draft`` still owns the resolution.
+    """
+
+    if (
+        cfg.model.use_liger_kernel is False
+        or not algorithm.spec.capabilities.supports_liger_kernel
+    ):
+        return
+    from specforge.modeling.draft.dflash_kernels import (
+        load_liger_dflash_kernels,
+        resolve_draft_liger_kernel_choice,
+    )
+
+    draft_config = resolve_draft_config(
+        cfg, provider=algorithm.providers.model.draft_config
+    )
+    choice = resolve_draft_liger_kernel_choice(cfg.model.use_liger_kernel, draft_config)
+    if choice.enabled:
+        load_liger_dflash_kernels(choice)
+
+
 def draft_config_dict(
     cfg: "Config", *, provider: "DraftConfigProvider"
 ) -> Dict[str, Any]:
@@ -470,6 +499,7 @@ __all__ = [
     "WarmStartReport",
     "draft_config_dict",
     "load_draft_config_source",
+    "preflight_draft_kernels",
     "resolve_draft_config",
     "warm_start_draft_model",
 ]

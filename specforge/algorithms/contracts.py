@@ -244,6 +244,8 @@ class AlgorithmCapabilities:
     #: ``training.dflash_teacher_metrics=false`` can drop the teacher-only
     #: final hidden state from the streaming capture.
     supports_teacher_metrics_opt_out: bool = False
+    #: The draft builder wires ``model.use_liger_kernel`` into its modules.
+    supports_liger_kernel: bool = False
 
     def __post_init__(self) -> None:
         attention_backends = _normalized_names(
@@ -262,6 +264,7 @@ class AlgorithmCapabilities:
             "supports_vocab_mapping",
             "allows_aux_layer_override",
             "supports_teacher_metrics_opt_out",
+            "supports_liger_kernel",
         ):
             if not isinstance(getattr(self, field_name), bool):
                 raise TypeError(f"{field_name} must be a bool")

@@ -326,6 +326,78 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 with open(channel + suffix, encoding="utf-8") as stream:
                     self.assertIn("RuntimeError: assembly exploded", stream.read())
 
+    def test_consumer_preflight_fails_before_waiting_on_the_producer(self):
+        import tempfile
+
+        for mode in ("offline", "online"):
+            with self.subTest(mode=mode):
+                root = tempfile.mkdtemp(prefix=f"preflight_{mode}_")
+                control = os.path.join(root, "control")
+                cfg = Config.model_validate(
+                    {
+                        "model": {"target_model_path": "t", "draft_model_config": "d"},
+                        "data": (
+                            {"hidden_states_path": "/features"}
+                            if mode == "offline"
+                            else {"prompts_path": "/prompts.jsonl"}
+                        ),
+                        "training": {"strategy": "dflash", "role": "consumer"},
+                        "deployment": _disaggregated_deployment(root),
+                    }
+                )
+                env_name = (
+                    "DISAGG_MANIFEST" if mode == "offline" else "DISAGG_REF_CHANNEL"
+                )
+                build_model_bundle = mock.Mock()
+                preflight = mock.Mock(side_effect=ImportError("liger missing"))
+                with (
+                    mock.patch.dict(os.environ, {env_name: control}),
+                    mock.patch("specforge.training.disaggregated._mooncake_store"),
+                    mock.patch(
+                        "specforge.runtime.data_plane.streaming_ref_channel."
+                        "StreamingRefChannel"
+                    ),
+                    mock.patch("specforge.training.disaggregated._wait_for") as wait,
+                    self.assertRaisesRegex(ImportError, "liger missing"),
+                ):
+                    build_disaggregated_run(
+                        cfg,
+                        algorithm=ALGORITHM,
+                        build_model_bundle=build_model_bundle,
+                        prepare_prompts=mock.Mock(),
+                        optimizer_factory=mock.Mock(),
+                        logger=mock.Mock(),
+                        preflight_model_bundle=preflight,
+                    )
+                preflight.assert_called_once_with(cfg)
+                wait.assert_not_called()
+                build_model_bundle.assert_not_called()
+                with open(control + ".consumer_failed", encoding="utf-8") as stream:
+                    self.assertIn("ImportError: liger missing", stream.read())
+
+    def test_disaggregated_run_preflights_the_resolved_draft_kernels(self):
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"hidden_states_path": "/features"},
+                "training": {"strategy": "dflash", "role": "consumer"},
+                "deployment": _disaggregated_deployment("/shared/attempt"),
+            }
+        )
+        with (
+            mock.patch(
+                "specforge.training.disaggregated.build_disaggregated_run"
+            ) as build,
+            mock.patch(
+                "specforge.training.model_loading.preflight_draft_kernels"
+            ) as preflight,
+        ):
+            from specforge.training.assembly import build_training_run
+
+            build_training_run(cfg, algorithm=ALGORITHM)
+            build.call_args.kwargs["preflight_model_bundle"](cfg)
+        preflight.assert_called_once_with(cfg, algorithm=ALGORITHM)
+
     def test_failed_claim_does_not_poison_an_existing_attempt(self):
         import tempfile
 
