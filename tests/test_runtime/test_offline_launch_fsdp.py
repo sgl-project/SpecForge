@@ -24,12 +24,21 @@ ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 @unittest.skipUnless(CUDA, "launcher FSDP path requires CUDA")
 class TestOfflineLaunchFSDP(unittest.TestCase):
     def test_fsdp_in_forward_path_and_optimizer_step_semantics(self):
+        self._check_backend("fsdp")
+
+    def test_fsdp2_trains_through_the_same_launcher(self):
+        self._check_backend("fsdp2")
+
+    def _check_backend(self, training_backend):
         torch.manual_seed(0)
         from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port="29566")
 
+        from torch.distributed.fsdp import FSDPModule
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        expected_wrapper = FSDPModule if training_backend == "fsdp2" else FSDP
 
         from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
@@ -54,6 +63,7 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
             draft_model=eagle3_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
+            training_backend=training_backend,
             run_id="launch",
             output_dir=os.path.join(workdir, "out"),
             ttt_length=TTT,
@@ -67,7 +77,7 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
         # Issue 1: the strategy runs forward through the FSDP-wrapped module
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(
-            module, FSDP, "strategy must hold the FSDP-wrapped module"
+            module, expected_wrapper, "strategy must hold the FSDP-wrapped module"
         )
         self.assertIsNotNone(trainer.core.backend.optimizer)
 
