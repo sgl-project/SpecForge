@@ -279,11 +279,19 @@ Common fields:
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
+| `training.optimizer` | `adamw` | `adamw` or the hybrid `muon`/AdamW optimizer. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
+| `training.weight_decay` | `0.0` | Non-negative AdamW weight decay, including the auxiliary AdamW group in Muon mode. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
-| `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
+| `training.optimizer_cpu_offload` | `false` | Keep FP32 masters and Adam state on CPU. It is not supported with Muon. |
+| `training.muon_learning_rate` | `null` | Positive Muon peak learning rate; `null` reuses `training.learning_rate`. |
+| `training.muon_weight_decay` | `0.1` | Non-negative decoupled weight decay for Muon matrices. |
+| `training.muon_momentum` | `0.95` | Muon momentum in `[0, 1)`. |
+| `training.muon_nesterov` | `true` | Apply Nesterov momentum before Muon's Newton--Schulz transform. |
+| `training.muon_ns_steps` | `5` | Newton--Schulz iteration count in `[1, 99]`. |
+| `training.muon_adjust_lr_fn` | `match_rms_adamw` | Shape-aware Muon scaling: `original` or `match_rms_adamw`. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |

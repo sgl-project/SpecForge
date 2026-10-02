@@ -1067,6 +1067,10 @@ class TrainerController:
                                 ),
                             }
                         )
+                    get_learning_rates = getattr(optimizer, "get_learning_rates", None)
+                    if callable(get_learning_rates):
+                        for name, learning_rate in get_learning_rates().items():
+                            log_metrics[f"lr_{name}"] = float(learning_rate)
                     self.logger(log_metrics, self.global_step)
                     perf_window_started = time.perf_counter()
                     perf_window_steps = 0

@@ -1,10 +1,24 @@
+from __future__ import annotations
+
 import logging
 import math
+from dataclasses import dataclass
+from typing import Mapping, Sequence
 
 import torch
 import torch.distributed as dist
 
 from specforge.lr_scheduler import ConstantWarmupLR, CosineAnnealingWarmupLR
+from specforge.muon import (
+    ADAMW_OPTIMIZER,
+    DEFAULT_MUON_EXCLUDED_MODULES,
+    MUON_OPTIMIZER,
+    SUPPORTED_OPTIMIZERS,
+    FSDPShardedMuon,
+    MuonParameterMetadata,
+    MuonParameterPartition,
+    partition_parameters_for_muon,
+)
 from specforge.utils import print_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -31,9 +45,50 @@ def _sum_of_squares(tensors):
     return torch.stack([tensor.float().square().sum() for tensor in tensors]).sum()
 
 
+@dataclass
+class _SchedulerCollection:
+    """Expose multiple schedulers through the existing scheduler interface."""
+
+    schedulers: Mapping[str, torch.optim.lr_scheduler.LRScheduler]
+
+    _FORMAT_VERSION = 1
+
+    def step(self) -> None:
+        for scheduler in self.schedulers.values():
+            scheduler.step()
+
+    def state_dict(self) -> dict:
+        return {
+            "format_version": self._FORMAT_VERSION,
+            "schedulers": {
+                name: scheduler.state_dict()
+                for name, scheduler in self.schedulers.items()
+            },
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        if state_dict.get("format_version") != self._FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported hybrid scheduler state format: "
+                f"{state_dict.get('format_version')!r}"
+            )
+        scheduler_states = state_dict.get("schedulers")
+        if not isinstance(scheduler_states, dict):
+            raise ValueError("Hybrid scheduler state is missing 'schedulers'")
+        if set(scheduler_states) != set(self.schedulers):
+            raise ValueError(
+                "Hybrid scheduler groups do not match: "
+                f"expected={sorted(self.schedulers)}, "
+                f"received={sorted(scheduler_states)}"
+            )
+        for name, scheduler in self.schedulers.items():
+            scheduler.load_state_dict(scheduler_states[name])
+
+
 class BF16Optimizer:
-    """AdamW over fp32 master copies of the bf16 trainable params, with grad
-    clipping and configurable warmup scheduling."""
+    """FP32-master AdamW or hybrid Muon, with clipping and warmup scheduling."""
+
+    _HYBRID_STATE_FORMAT_VERSION = 2
 
     #: ``step(loss_denominator=...)`` validates the caller's global loss
     #: denominator in the same host read as the grad norm (see TrainerCore).
@@ -49,8 +104,27 @@ class BF16Optimizer:
         warmup_ratio=0.015,
         lr_scheduler="cosine",
         offload_master=False,
+        *,
+        optimizer_type: str = ADAMW_OPTIMIZER,
+        muon_lr: float | None = None,
+        muon_weight_decay: float = 0.1,
+        muon_momentum: float = 0.95,
+        muon_nesterov: bool = True,
+        muon_ns_steps: int = 5,
+        muon_adjust_lr_fn: str = "match_rms_adamw",
+        muon_excluded_module_names: Sequence[str] = DEFAULT_MUON_EXCLUDED_MODULES,
+        muon_metadata: MuonParameterMetadata | None = None,
     ):
-        # defaults copied from EAGLE traineagle3 ds_config.json
+        optimizer_type = optimizer_type.lower()
+        if optimizer_type not in SUPPORTED_OPTIMIZERS:
+            raise ValueError(
+                f"Unknown optimizer_type={optimizer_type!r}; "
+                f"expected one of {SUPPORTED_OPTIMIZERS}"
+            )
+        if optimizer_type == MUON_OPTIMIZER and offload_master:
+            raise ValueError("Muon does not support optimizer CPU offload")
+
+        self.optimizer_type = optimizer_type
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
@@ -72,12 +146,42 @@ class BF16Optimizer:
             if self.fp32_params and all(mp.is_cuda for mp in self.fp32_params)
             else None
         )
-        self.optimizer = torch.optim.AdamW(
-            self.fp32_params,
-            lr=lr,
-            weight_decay=weight_decay,
-            fused=self._adamw_fused,
-        )
+        if optimizer_type == ADAMW_OPTIMIZER:
+            self.optimizer = torch.optim.AdamW(
+                self.fp32_params,
+                lr=lr,
+                weight_decay=weight_decay,
+                fused=self._adamw_fused,
+            )
+            self._optimizers = {ADAMW_OPTIMIZER: self.optimizer}
+        else:
+            partition = partition_parameters_for_muon(
+                model,
+                excluded_module_names=muon_excluded_module_names,
+                metadata=muon_metadata,
+            )
+            master_by_name = dict(
+                zip(
+                    (
+                        name
+                        for name, parameter in model.named_parameters()
+                        if parameter.requires_grad
+                    ),
+                    self.fp32_params,
+                )
+            )
+            self._init_muon(
+                partition=partition,
+                master_by_name=master_by_name,
+                adamw_lr=lr,
+                adamw_weight_decay=weight_decay,
+                muon_lr=lr if muon_lr is None else muon_lr,
+                muon_weight_decay=muon_weight_decay,
+                muon_momentum=muon_momentum,
+                muon_nesterov=muon_nesterov,
+                muon_ns_steps=muon_ns_steps,
+                muon_adjust_lr_fn=muon_adjust_lr_fn,
+            )
         self.last_grad_norm = None
         self._grad_norm_process_group = None
         self._reduce_grad_norm_across_ranks = True
@@ -91,11 +195,90 @@ class BF16Optimizer:
                 f"expected one of {sorted(scheduler_types)}"
             )
         self.lr_scheduler_type = lr_scheduler
-        self.scheduler = scheduler_types[lr_scheduler](
-            self.optimizer,
-            total_steps=total_steps,
-            warmup_steps=int(warmup_ratio * total_steps),
+        schedulers = {
+            name: scheduler_types[lr_scheduler](
+                optimizer,
+                total_steps=total_steps,
+                warmup_steps=int(warmup_ratio * total_steps),
+            )
+            for name, optimizer in self._optimizers.items()
+        }
+        self.scheduler = (
+            schedulers[ADAMW_OPTIMIZER]
+            if optimizer_type == ADAMW_OPTIMIZER
+            else _SchedulerCollection(schedulers)
         )
+
+    def _init_muon(
+        self,
+        *,
+        partition: MuonParameterPartition,
+        master_by_name: Mapping[str, torch.Tensor],
+        adamw_lr: float,
+        adamw_weight_decay: float,
+        muon_lr: float,
+        muon_weight_decay: float,
+        muon_momentum: float,
+        muon_nesterov: bool,
+        muon_ns_steps: int,
+        muon_adjust_lr_fn: str,
+    ) -> None:
+        if not partition.muon:
+            raise ValueError(
+                "Muon mode found no eligible hidden nn.Linear weight matrices"
+            )
+        muon_parameters = [master_by_name[item.name] for item in partition.muon]
+        adamw_parameters = [master_by_name[item.name] for item in partition.adamw]
+        locally_sharded = any(
+            tuple(parameter.shape) != tuple(item.logical_shape)
+            for parameter, item in zip(muon_parameters, partition.muon)
+        )
+        muon_kwargs = dict(
+            lr=muon_lr,
+            weight_decay=muon_weight_decay,
+            momentum=muon_momentum,
+            nesterov=muon_nesterov,
+            ns_steps=muon_ns_steps,
+            adjust_lr_fn=muon_adjust_lr_fn,
+        )
+        self.optimizer = (
+            FSDPShardedMuon(
+                muon_parameters,
+                [item.logical_shape for item in partition.muon],
+                **muon_kwargs,
+            )
+            if locally_sharded
+            else torch.optim.Muon(muon_parameters, **muon_kwargs)
+        )
+
+        self.aux_optimizer = (
+            torch.optim.AdamW(
+                adamw_parameters,
+                lr=adamw_lr,
+                weight_decay=adamw_weight_decay,
+                fused=self._adamw_fused,
+            )
+            if adamw_parameters
+            else None
+        )
+        self._optimizers = {MUON_OPTIMIZER: self.optimizer}
+        if self.aux_optimizer is not None:
+            self._optimizers[ADAMW_OPTIMIZER] = self.aux_optimizer
+        parameter_layout = {
+            item.name: (
+                item.name,
+                tuple(item.logical_shape),
+                tuple(item.parameter.shape),
+                name,
+            )
+            for name, parameters in (
+                (MUON_OPTIMIZER, partition.muon),
+                (ADAMW_OPTIMIZER, partition.adamw),
+            )
+            for item in parameters
+        }
+        # FP32 masters follow model order, which may interleave optimizer groups.
+        self._parameter_layout = [parameter_layout[name] for name in master_by_name]
 
     def configure_grad_norm_reduction(
         self, *, process_group=None, enabled: bool = True
@@ -106,6 +289,12 @@ class BF16Optimizer:
         """
         self._grad_norm_process_group = process_group
         self._reduce_grad_norm_across_ranks = enabled
+        if isinstance(self.optimizer, FSDPShardedMuon):
+            if not enabled:
+                raise RuntimeError(
+                    "Flattened Muon parameters require sharded gradient reduction"
+                )
+            self.optimizer.configure_process_group(process_group)
 
     def _reduce_grad_norm(self, total_norm_sq):
         """All-reduce the squared L2 norm across shard ranks and derive the
@@ -239,8 +428,9 @@ class BF16Optimizer:
                 torch._foreach_copy_(master_grads, model_grads)
                 torch._foreach_mul_(master_grads, clip_coefficient)
         self.last_grad_norm = grad_norm.detach()
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+        for optimizer in self._optimizers.values():
+            optimizer.step()
+            optimizer.zero_grad()
         self.scheduler.step()
         with torch.no_grad():
             if self.offload_master:
@@ -255,7 +445,7 @@ class BF16Optimizer:
                 p.grad = None
         return self.last_grad_norm
 
-    def _restore_adamw_implementation(self) -> None:
+    def _restore_adamw_implementation(self, optimizer) -> None:
         """Re-apply this run's AdamW kernel choice after a checkpoint load.
 
         ``Optimizer.load_state_dict`` adopts the saved param-group flags, so a
@@ -263,11 +453,11 @@ class BF16Optimizer:
         (and a fused one would enable it for CPU masters). Fused AdamW reads
         its step counters on the parameter device; unfused keeps them on CPU.
         """
-        for group in self.optimizer.param_groups:
+        for group in optimizer.param_groups:
             group["fused"] = self._adamw_fused
             if self._adamw_fused:
                 group["foreach"] = None
-        for param, state in self.optimizer.state.items():
+        for param, state in optimizer.state.items():
             step = state.get("step")
             if isinstance(step, torch.Tensor):
                 state["step"] = (
@@ -299,8 +489,15 @@ class BF16Optimizer:
         # offload_master is a pure device-placement choice: restored fp32
         # masters and Adam moments are relocated to the current master device,
         # so toggling it on resume is safe and intentionally not gated here.
-        self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
-        self._restore_adamw_implementation()
+        checkpoint_type = state_dict.get("optimizer_type", ADAMW_OPTIMIZER)
+        if self.optimizer_type == ADAMW_OPTIMIZER:
+            if checkpoint_type != ADAMW_OPTIMIZER:
+                raise ValueError("Cannot load a Muon optimizer state into AdamW")
+            self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
+        else:
+            self._load_hybrid_optimizer_state(state_dict)
+        if ADAMW_OPTIMIZER in self._optimizers:
+            self._restore_adamw_implementation(self._optimizers[ADAMW_OPTIMIZER])
         print_on_rank0("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
         print_on_rank0("Successfully loaded scheduler state_dict.")
@@ -328,15 +525,66 @@ class BF16Optimizer:
                 for p, mp in zip(self.model_params, self.fp32_params):
                     mp.data.copy_(p.detach().to(device=mp.device, dtype=mp.dtype))
 
+    def _load_hybrid_optimizer_state(self, state_dict: dict) -> None:
+        if state_dict.get("optimizer_type") != MUON_OPTIMIZER:
+            raise ValueError("Cannot load a non-Muon optimizer state into Muon")
+        optimizer_state = state_dict.get("optimizer_state_dict")
+        if not isinstance(optimizer_state, dict):
+            raise ValueError("Muon checkpoint is missing 'optimizer_state_dict'")
+        if optimizer_state.get("format_version") != self._HYBRID_STATE_FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported hybrid optimizer state format: "
+                f"{optimizer_state.get('format_version')!r}"
+            )
+
+        if optimizer_state.get("parameter_layout") != self._parameter_layout:
+            raise ValueError(
+                "Muon parameter layout differs from the checkpoint; "
+                "parameter order, shapes, and optimizer assignment must match"
+            )
+
+        saved_optimizers = optimizer_state.get("optimizers")
+        if not isinstance(saved_optimizers, dict):
+            raise ValueError("Muon checkpoint is missing optimizer group states")
+        if set(saved_optimizers) != set(self._optimizers):
+            raise ValueError(
+                "Muon optimizer groups do not match: "
+                f"expected={sorted(self._optimizers)}, "
+                f"received={sorted(saved_optimizers)}"
+            )
+        for name, optimizer in self._optimizers.items():
+            optimizer.load_state_dict(saved_optimizers[name])
+
     def state_dict(self):
-        return {
-            "optimizer_state_dict": self.optimizer.state_dict(),
+        common_state = {
             "scheduler_state_dict": self.scheduler.state_dict(),
             "lr_scheduler_type": self.lr_scheduler_type,
             "max_grad_norm": self.max_grad_norm,
-            # rank-local fp32 masters; without them a resume re-quantizes from bf16
-            "fp32_params": [t.detach().cpu() for t in self.fp32_params],
+            "fp32_params": [tensor.detach().cpu() for tensor in self.fp32_params],
+        }
+        if self.optimizer_type == ADAMW_OPTIMIZER:
+            return {
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                **common_state,
+            }
+        return {
+            "optimizer_type": MUON_OPTIMIZER,
+            "optimizer_state_dict": {
+                "format_version": self._HYBRID_STATE_FORMAT_VERSION,
+                "parameter_layout": self._parameter_layout,
+                "optimizers": {
+                    name: optimizer.state_dict()
+                    for name, optimizer in self._optimizers.items()
+                },
+            },
+            **common_state,
         }
 
     def get_learning_rate(self):
         return self.optimizer.param_groups[0]["lr"]
+
+    def get_learning_rates(self) -> dict[str, float]:
+        return {
+            name: float(optimizer.param_groups[0]["lr"])
+            for name, optimizer in self._optimizers.items()
+        }
