@@ -498,7 +498,10 @@ training:
 
 Both backends retain BF16 compute, FP32 optimizer masters, gradient accumulation,
 and `training.optimizer_cpu_offload`. `SHARD_GRAD_OP` keeps parameters gathered
-between forward and backward; `FULL_SHARD` reshards them after forward. Both
+through backward and between gradient-accumulation micro-steps, resharding at
+the optimizer boundary. This trades higher live memory between micro-steps for
+fewer all-gathers. `FULL_SHARD` reshards child blocks after forward but keeps the
+root gathered for backward; all units reshard after each backward. Both
 backends use DDP for `NO_SHARD`. Configured sharding takes precedence over the
 legacy `FSDP_SHARDING` environment fallback used by direct Python builders.
 

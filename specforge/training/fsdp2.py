@@ -34,7 +34,6 @@ class FSDP2TrainingBackend(DistributedTrainingBackend):
                     setattr(module, name, buffer.float())
         kwargs = dict(
             mesh=mesh,
-            reshard_after_forward=pc.sharding_strategy == "FULL_SHARD",
             ignored_params=ignored_params,
         )
         # Bottom-up application preserves the FSDP1 block/root boundaries.
@@ -44,6 +43,7 @@ class FSDP2TrainingBackend(DistributedTrainingBackend):
             if module is not model and type(module) in block_classes:
                 fully_shard(
                     module,
+                    reshard_after_forward=pc.sharding_strategy == "FULL_SHARD",
                     mp_policy=MixedPrecisionPolicy(
                         param_dtype=pc.param_dtype, cast_forward_inputs=False
                     ),
@@ -51,6 +51,9 @@ class FSDP2TrainingBackend(DistributedTrainingBackend):
                 )
         fully_shard(
             model,
+            # Like FSDP1, reuse the root's full parameters in backward even
+            # under FULL_SHARD. Child blocks still reshard after forward.
+            reshard_after_forward=False,
             mp_policy=MixedPrecisionPolicy(param_dtype=pc.param_dtype),
             **kwargs,
         )
@@ -60,10 +63,17 @@ class FSDP2TrainingBackend(DistributedTrainingBackend):
         if self._wrapper_kind != "fsdp2":
             return super().backward(loss, is_boundary=is_boundary)
         self.module.set_requires_gradient_sync(is_boundary)
+        # FSDP1 SHARD_GRAD_OP retains parameters across no_sync micro-steps.
+        # Retain them until the optimizer boundary to avoid re-gathering on
+        # every forward; FULL_SHARD still releases them after each backward.
+        self.module.set_reshard_after_backward(
+            is_boundary or self.parallel_config.sharding_strategy != "SHARD_GRAD_OP"
+        )
         try:
             loss.backward()
         finally:
             self.module.set_requires_gradient_sync(True)
+            self.module.set_reshard_after_backward(True)
 
     def _sharded_model_state_dict(self) -> dict:
         from torch.distributed.checkpoint.state_dict import (

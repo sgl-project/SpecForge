@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 import torch
@@ -223,6 +224,129 @@ def _numeric_worker(rank, world_size, port, workdir):
         destroy_distributed(abort=sys.exc_info()[0] is not None)
 
 
+def _collective_worker(rank, world_size, port):
+    from tests.test_runtime import _fixtures as fx
+
+    fx.init_rank_distributed(rank, world_size, port=str(port))
+    try:
+        for sharding in ("SHARD_GRAD_OP", "FULL_SHARD"):
+            for accumulation in (1, 4):
+                torch.manual_seed(42)
+                template = TinyComposite().cuda()
+                reference_model = copy.deepcopy(template)
+                reference = create_training_backend(
+                    "fsdp", ParallelConfig(), optimizer_factory=_optimizer
+                )
+                reference.prepare_model(
+                    reference_model,
+                    wrap=False,
+                    optimizer_target=reference_model.draft_model,
+                )
+                pc = ParallelConfig.from_distributed(
+                    sharding_strategy=sharding, param_dtype=torch.float32
+                )
+                backends = []
+                for name in ("fsdp", "fsdp2"):
+                    model = copy.deepcopy(template)
+                    backend = create_training_backend(
+                        name, pc, optimizer_factory=_optimizer
+                    )
+                    backend.prepare_model(model, optimizer_target=model.draft_model)
+                    backends.append(backend)
+
+                def accumulate(backend, step, *, full_batch=False):
+                    for micro in range(accumulation):
+                        x = torch.arange(
+                            world_size * 21, device="cuda", dtype=torch.float32
+                        ).reshape(world_size * 3, 7)
+                        x = x / 31 + micro * 0.1 + step * 0.2
+                        if not full_batch:
+                            x = x[rank * 3 : (rank + 1) * 3]
+                        loss = backend.module(x).square().mean() / accumulation
+                        backend.backward(loss, is_boundary=micro == accumulation - 1)
+
+                # Warm up lazy FSDP state, then measure two consecutive windows.
+                # No checkpoint/unshard operation may reset parameter residency
+                # between them and hide a missing boundary reshard.
+                for step in range(4):
+                    accumulate(reference, step, full_batch=True)
+                    expected_grads = {
+                        name: param.grad.detach().clone()
+                        for name, param in reference_model.named_parameters()
+                        if param.requires_grad
+                    }
+                    expected_norm = reference.step()
+                    counts = []
+                    for backend in backends:
+                        torch.cuda.synchronize()
+                        context = (
+                            torch.profiler.profile(
+                                activities=[torch.profiler.ProfilerActivity.CPU]
+                            )
+                            if step >= 2
+                            else nullcontext()
+                        )
+                        with context as profile:
+                            accumulate(backend, step)
+                            torch.cuda.synchronize()
+                        if step >= 2:
+                            counts.append(
+                                sum(
+                                    event.count
+                                    for event in profile.key_averages()
+                                    if event.key == "c10d::_allgather_base_"
+                                )
+                            )
+                        if backend.name == "fsdp2":
+                            # Gather gradients outside the measured region;
+                            # full_tensor does not change parameter residency.
+                            for name, param in backend.module.named_parameters():
+                                if param.requires_grad:
+                                    assert param.grad is not None, name
+                                    actual = param.grad.full_tensor()
+                                    torch.testing.assert_close(
+                                        actual,
+                                        expected_grads[name],
+                                        rtol=2e-5,
+                                        atol=2e-6,
+                                    )
+                        torch.testing.assert_close(
+                            backend.step(), expected_norm, rtol=2e-5, atol=2e-6
+                        )
+                    if step >= 2:
+                        blocks = len(template.draft_model.layers)
+                        # SHARD_GRAD_OP gathers each unit once per window.
+                        # FULL_SHARD re-gathers each child in backward, while
+                        # the root reuses its forward buffer until backward ends.
+                        expected = (
+                            blocks + 1
+                            if sharding == "SHARD_GRAD_OP"
+                            else (2 * blocks + 1) * accumulation
+                        )
+                        assert counts == [expected, expected], (
+                            sharding,
+                            accumulation,
+                            step,
+                            counts,
+                            expected,
+                        )
+                for backend in backends:
+                    state = backend.state_dict()["model"]
+                    if rank == 0:
+                        for name, expected in reference_model.state_dict().items():
+                            torch.testing.assert_close(
+                                state[name].cpu(),
+                                expected.cpu(),
+                                rtol=2e-5,
+                                atol=2e-6,
+                            )
+                dist.barrier()
+    finally:
+        from specforge.distributed import destroy_distributed
+
+        destroy_distributed(abort=sys.exc_info()[0] is not None)
+
+
 class TestBackendSelection(unittest.TestCase):
     def test_default_and_explicit_sharding(self):
         from specforge.config.schema import TrainingConfig
@@ -271,9 +395,52 @@ class TestBackendSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported training backend"):
             create_training_backend("unknown", ParallelConfig())
 
+    def test_backward_failure_restores_sync_and_reshard(self):
+        for sharding in ("SHARD_GRAD_OP", "FULL_SHARD"):
+            for boundary in (False, True):
+                with self.subTest(sharding=sharding, boundary=boundary):
+                    backend = create_training_backend(
+                        "fsdp2", ParallelConfig(sharding_strategy=sharding)
+                    )
+                    backend._wrapper_kind = "fsdp2"
+                    backend.module = mock.Mock(
+                        spec=[
+                            "set_requires_gradient_sync",
+                            "set_reshard_after_backward",
+                        ]
+                    )
+                    loss = mock.Mock()
+                    loss.backward.side_effect = RuntimeError("backward failed")
+                    with self.assertRaisesRegex(RuntimeError, "backward failed"):
+                        backend.backward(loss, is_boundary=boundary)
+                    loss.backward.assert_called_once_with()
+                    self.assertEqual(
+                        backend.module.set_requires_gradient_sync.call_args_list,
+                        [mock.call(boundary), mock.call(True)],
+                    )
+                    self.assertEqual(
+                        backend.module.set_reshard_after_backward.call_args_list,
+                        [
+                            mock.call(
+                                boundary if sharding == "SHARD_GRAD_OP" else True
+                            ),
+                            mock.call(True),
+                        ],
+                    )
+
 
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires two CUDA devices")
 class TestFSDP2Distributed(unittest.TestCase):
+    def test_collective_counts_and_accumulated_updates(self):
+        from tests.utils import get_available_port
+
+        torch.multiprocessing.spawn(
+            _collective_worker,
+            args=(2, get_available_port()),
+            nprocs=2,
+            join=True,
+        )
+
     def test_dense_equivalence_and_resume(self):
         from tests.utils import get_available_port
 
