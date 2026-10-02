@@ -97,7 +97,7 @@ ROCm. The `fa` (flash-attn) and `usp` backends, and `yunchang`-based
 Ulysses/Ring sequence parallel (`sp_ulysses_size` / `sp_ring_size` > 1), depend
 on a CUDA flash-attn build; the single-GPU / data-parallel path never loads
 `yunchang`, and selecting those backends raises a clear error. The checked-in
-[`qwen3.5-4b-dflash-offline-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml)
+[`qwen3.5-4b-dflash-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3.5-4b-dflash-amd.yaml)
 recipe already uses `flex_attention`, so it runs on ROCm unchanged as a
 single-GPU offline DFlash example.
 
@@ -177,13 +177,13 @@ The checked-in offline recipe already uses `flex_attention` for the trainer, so
 it runs on ROCm unchanged:
 
 ```bash
-specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml
+specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-amd.yaml
 ```
 
 Override any field inline without copying the YAML, e.g. a quick smoke run:
 
 ```bash
-specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml \
+specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-amd.yaml \
   training.max_steps=20 output_dir=./outputs/dflash-offline-smoke
 ```
 
@@ -220,7 +220,7 @@ command supervises the producer and consumer. Mooncake and SGLang remain
 external services started by the user.
 
 This section uses the external
-[`qwen3.5-4b-dflash-online-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml)
+[`qwen3.5-4b-dflash-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml)
 recipe as a single-node smoke test. `external` means that the user starts
 Mooncake and SGLang; the services still run locally in this example. Complete
 Step 4 of the installation first.
@@ -298,7 +298,7 @@ MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
 MOONCAKE_PROTOCOL=tcp \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=$((32<<30)) \
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml \
   training.max_steps=20 training.num_epochs=1 \
   training.save_interval=20 training.log_interval=5
 ```
@@ -338,10 +338,10 @@ launched explicitly:
 
 ```bash
 # Inference / capture pool
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml --role producer
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml --role producer
 
 # Trainer pool
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml --role consumer
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml --role consumer
 ```
 
 The checked-in AMD recipe is a single-node example and deliberately uses

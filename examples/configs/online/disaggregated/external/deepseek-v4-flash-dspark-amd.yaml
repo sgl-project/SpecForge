@@ -1,5 +1,5 @@
 # DeepSeek-V4-Flash-0731 DSpark draft, online disaggregated — AMD MI355X, one node.
-# Same recipe as deepseek-v4-flash-dspark-disaggregated.yaml (two TP2 capture servers on
+# Same recipe as deepseek-v4-flash-dspark.yaml (two TP2 capture servers on
 # GPUs 0-3, four trainer ranks on GPUs 4-7, global batch 128); only the capture-server
 # fields differ. Server launch flags and the required AITER setting: "On AMD MI355X" in
 # docs/recipes/deepseek-v4-flash-dspark-disaggregated.md.

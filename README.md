@@ -32,7 +32,7 @@ Check out [**our documentation**](https://docs.sglang.io/SpecForge/) to get star
 Every method uses the same typed training entry point:
 
 ```bash
-specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml
 ```
 
 The path under `examples/configs` identifies feature mode, topology, and online
@@ -45,13 +45,13 @@ There are no method-specific Python training entry points.
 
 | Method | Description | Example config | Optimization |
 | --- | --- | --- | --- |
-| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml) / [Offline disaggregated](./examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) | [LK loss](https://arxiv.org/pdf/2602.23881) |
-| **[P-EAGLE](https://arxiv.org/abs/2602.01469)** | Parallel EAGLE | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-peagle-disaggregated.yaml) | — |
-| **EAGLE3.1** | Feature-based autoregressive drafting with attention drift | [Online external](./examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1-online.yaml) | — |
-| **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-dflash-online.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810) |
-| **[DFlash2](https://inco.ai/blog/dflash2/)** | DFlash with grouped dynamic convolution and top-k path selection | [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810)|
-| **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) | — |
-| **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Online external](./examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) | — |
+| **[EAGLE3](https://arxiv.org/abs/2503.01840)** | Feature-based autoregressive drafting | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-eagle3.yaml) / [Offline disaggregated](./examples/configs/offline/disaggregated/qwen3-8b-eagle3.yaml) | [LK loss](https://arxiv.org/pdf/2602.23881) |
+| **[P-EAGLE](https://arxiv.org/abs/2602.01469)** | Parallel EAGLE | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-peagle.yaml) | — |
+| **EAGLE3.1** | Feature-based autoregressive drafting with attention drift | [Online external](./examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1.yaml) | — |
+| **[DFlash](https://arxiv.org/abs/2602.06036)** | Block-parallel drafting | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-dflash.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-dflash.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810) |
+| **[DFlash2](https://inco.ai/blog/dflash2/)** | DFlash with grouped dynamic convolution and top-k path selection | [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810)|
+| **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-domino.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-domino.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml) | — |
+| **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Online external](./examples/configs/online/disaggregated/external/qwen3-4b-dspark.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-4b-dspark.yaml) | — |
 
 See the [training guide](./docs/sections/basic_usage/training.md) for the supported
 method/topology matrix and the
