@@ -64,6 +64,7 @@ class OfflineSGLangCaptureBackend:
 
     def __init__(self, model_runner: SGLangRunner) -> None:
         self.model_runner = model_runner
+        self._hspec_kv_layer_ids_override: Optional[List[int]] = None
 
     @classmethod
     def build(
@@ -195,21 +196,7 @@ class OfflineSGLangCaptureBackend:
         rows = [input_row.view(-1).tolist() for input_row, _, _ in data]
         input_lens = [len(row) for row in rows]
 
-        sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
-        reqs: list[Req] = []
-        for idx, input_row in enumerate(rows):
-            req = Req(
-                rid=str(idx),
-                origin_input_text="",
-                origin_input_ids=list(input_row),
-                sampling_params=sampling_params,
-            )
-            req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.set_extend_range(
-                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-            )
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-            reqs.append(req)
+        reqs = self._build_extend_reqs(rows)
 
         try:
             output = self._forward_extend(reqs)
@@ -262,15 +249,13 @@ class OfflineSGLangCaptureBackend:
         self._hspec_kv_layer_ids_override = [int(x) for x in layer_ids]
 
     def _hspec_kv_layer_ids(self) -> list[int]:
-        override = getattr(self, "_hspec_kv_layer_ids_override", None)
+        override = self._hspec_kv_layer_ids_override
         if override:
             return [int(x) for x in override]
         config = self.model_runner.model_config
         hf_config = getattr(config, "hf_config", config)
         method = getattr(hf_config, "hspec_config", None)
         if method is None:
-            from sglang.srt.configs.model_config import ModelConfig
-
             draft_config = ModelConfig.from_server_args(
                 self.model_runner.server_args,
                 model_path=(
@@ -284,7 +269,8 @@ class OfflineSGLangCaptureBackend:
             layer_ids = method.get("target_kv_layer_ids")
         if not layer_ids:
             raise ValueError(
-                "target config must define hspec_config.attn_kv_layer_ids"
+                "draft config must define hspec_config.attn_kv_layer_ids "
+                "(or target_kv_layer_ids)"
             )
         return [int(layer_id) for layer_id in layer_ids]
 
@@ -336,7 +322,7 @@ class OfflineSGLangCaptureBackend:
                 key = key.contiguous()
                 value = value.contiguous()
                 if key.device.type == "npu":
-                    # NDVI/NZ layout for the NPU attention kernels; a no-op
+                    # ND/NZ layout for the NPU attention kernels; a no-op
                     # elsewhere where the dense layout is already canonical.
                     key = torch.ops.npu.npu_format_cast(key, 2)
                     value = torch.ops.npu.npu_format_cast(value, 2)
@@ -385,21 +371,12 @@ class OfflineSGLangCaptureBackend:
         self.model_runner.token_to_kv_pool_allocator.clear()
 
     @torch.no_grad()
-    def capture_rows(self, input_ids: list[list[int]]):
-        """Capture variable-length request rows in one packed prefill.
+    def _build_extend_reqs(self, rows: list[list[int]]) -> list[Req]:
+        """Build one extend request per token row for a packed prefill."""
 
-        Returns ``(aux_rows, last_rows)``: per-row auxiliary and final hidden
-        states split from the packed forward, so callers never build padded
-        tensors. The KV/request pools are cleared after every call.
-        """
-
-        if not input_ids:
-            return (), ()
-        if any(not row for row in input_ids):
-            raise ValueError("SGLang capture rows must contain at least one token")
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1, top_k=1)
         reqs: list[Req] = []
-        for idx, input_row in enumerate(input_ids):
+        for idx, input_row in enumerate(rows):
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
@@ -412,6 +389,21 @@ class OfflineSGLangCaptureBackend:
             )
             req.logprob_start_len = len(req.origin_input_ids) - 1
             reqs.append(req)
+        return reqs
+
+    def capture_rows(self, input_ids: list[list[int]]):
+        """Capture variable-length request rows in one packed prefill.
+
+        Returns ``(aux_rows, last_rows)``: per-row auxiliary and final hidden
+        states split from the packed forward, so callers never build padded
+        tensors. The KV/request pools are cleared after every call.
+        """
+
+        if not input_ids:
+            return (), ()
+        if any(not row for row in input_ids):
+            raise ValueError("SGLang capture rows must contain at least one token")
+        reqs = self._build_extend_reqs(input_ids)
 
         input_lens = [len(req.origin_input_ids) for req in reqs]
         try:
@@ -463,9 +455,10 @@ class OfflineSGLangCaptureBackend:
     ):
         """Capture generic auxiliary and final target states."""
 
-        raise NotImplementedError(
-            "OfflineSGLangCaptureBackend.capture is not used; "
-            "OfflineSGLangCapture dispatches by capture method"
+        return self.capture_eagle3(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
         )
 
 

@@ -215,8 +215,8 @@ class HSpecSplitSourceAttentionTest(unittest.TestCase):
         return attention
 
     @staticmethod
-    def _inputs(target_key, target_value, seed=0):
-        generator = torch.Generator().manual_seed(seed)
+    def _inputs():
+        generator = torch.Generator().manual_seed(0)
         hidden = torch.randn(2, 3, 8, generator=generator)
         position_embeddings = (
             hidden.new_ones(1, 4, 2),
@@ -226,9 +226,7 @@ class HSpecSplitSourceAttentionTest(unittest.TestCase):
 
     @staticmethod
     def _run(attention, target_key, target_value, prefix_mask, merge_mode=None):
-        hidden, position_embeddings = HSpecSplitSourceAttentionTest._inputs(
-            target_key, target_value
-        )
+        hidden, position_embeddings = HSpecSplitSourceAttentionTest._inputs()
         env = {"SPECFORGE_HSPEC_ATTENTION_MERGE": merge_mode} if merge_mode else {}
         with mock.patch.dict(os.environ, env, clear=False):
             with torch.no_grad():

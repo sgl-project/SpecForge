@@ -300,25 +300,17 @@ def build_hspec_offline_normalizer(max_len, **_topology):
 
 
 def build_hspec_collator():
-    sequence_axes = {
-        "input_ids": 1,
-        "loss_mask": 1,
-        "prefix_masks": 1,
-        "hidden_states": 1,
-        "target_last_hidden_states": 1,
-        "selected_target_k": 1,
-        "selected_target_v": 1,
-    }
-    required_keys = tuple(sequence_axes)
-
-    def collate(features):
-        return pad_and_concatenate_features(
-            features,
-            sequence_axes=sequence_axes,
-            required_keys=required_keys,
+    return _padded_collator(
+        (
+            "input_ids",
+            "loss_mask",
+            "prefix_masks",
+            "hidden_states",
+            "target_last_hidden_states",
+            "selected_target_k",
+            "selected_target_v",
         )
-
-    return collate
+    )
 
 
 def normalize_mtp_offline_sample(raw, max_len: int):

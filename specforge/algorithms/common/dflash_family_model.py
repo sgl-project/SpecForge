@@ -472,12 +472,7 @@ class OnlineDFlashModel(nn.Module):
             # Training strategies pass the CPU-computed value and avoid this
             # synchronizing fallback on CUDA.
             max_valid_anchors = int(valid_counts.max().item())
-        max_valid_count = int(valid_counts.max().item())
-        width = min(
-            self.num_anchors,
-            max(0, int(max_valid_anchors)),
-            max(0, max_valid_count),
-        )
+        width = min(self.num_anchors, max(0, int(max_valid_anchors)))
         if width == 0:
             raise ValueError(
                 "DFlash-family training requires two consecutive supervised tokens"
@@ -978,9 +973,9 @@ class OnlineDFlashModel(nn.Module):
                 else logits
             )
             if _USE_FUSED_DFLASH_CE:
-                _V = objective_logits.shape[-1]
+                vocab_size = objective_logits.shape[-1]
                 neg_log_q = _fused_ce_label_loss(
-                    objective_logits.reshape(batch_size, -1, _V),
+                    objective_logits.reshape(batch_size, -1, vocab_size),
                     target_ids.reshape(batch_size, -1),
                 ).reshape_as(target_ids)
             else:
@@ -2520,66 +2515,19 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
-        max_valid_anchors: Optional[int] = None,
-        collect_detailed_metrics: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
-        """Parallel DSpark training forward pass."""
-        if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
-            raise ValueError(
-                "flex_attention is not available on this device; use sdpa/eager."
-            )
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            loss_mask=loss_mask,
-            max_valid_anchors=max_valid_anchors,
-        )
-
-        (
-            target_ids,
-            eval_mask,
-            safe_label_indices,
-        ) = self._build_dspark_labels_and_mask(
-            input_ids=input_ids,
-            loss_mask=loss_mask,
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-        )
-        anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
-        prev_token_ids = torch.cat(
-            [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
-            dim=-1,
-        )
-        loss, metrics = self._compute_dspark_loss(
-            output_hidden=output_hidden,
-            target_ids=target_ids,
-            eval_mask=eval_mask,
-            prev_token_ids=prev_token_ids,
-            safe_label_indices=safe_label_indices,
-            target_last_hidden_states=target_last_hidden_states,
-            anchor_positions=anchor_positions,
-            collect_detailed_metrics=collect_detailed_metrics,
-        )
-        accuracy = metrics.pop("accuracy")
-        return loss, accuracy, metrics
-
-
-class OnlineHSpecModel(OnlineDSparkModel):
-    """DSpark objective over a hybrid Mamba/target-KV drafter."""
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
-        loss_mask: torch.Tensor,
-        target_last_hidden_states: torch.Tensor,
-        selected_target_k: torch.Tensor,
-        selected_target_v: torch.Tensor,
+        selected_target_k: Optional[torch.Tensor] = None,
+        selected_target_v: Optional[torch.Tensor] = None,
         prefix_masks: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
         collect_detailed_metrics: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
-        """Parallel H-Spec training forward pass."""
+        """Parallel DSpark training forward pass.
+
+        The borrowed-KV features (``selected_target_k/v``, ``prefix_masks``)
+        are H-Spec strategy additions; they thread through to
+        ``_forward_draft_blocks`` only when provided, so plain dspark batches
+        are unaffected.
+        """
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
@@ -2622,3 +2570,8 @@ class OnlineHSpecModel(OnlineDSparkModel):
         )
         accuracy = metrics.pop("accuracy")
         return loss, accuracy, metrics
+
+
+class OnlineHSpecModel(OnlineDSparkModel):
+    """DSpark objective over a hybrid Mamba/target-KV drafter."""
+

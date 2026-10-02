@@ -591,6 +591,13 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
+        # H-Spec strategy subclasses add borrowed-KV features; forward them
+        # when the batch carries them so dspark batches stay unchanged.
+        extra_features = {
+            name: t[name].to(device, non_blocking=True)
+            for name in ("selected_target_k", "selected_target_v", "prefix_masks")
+            if name in t
+        }
         loss, accuracy, model_metrics = self.dspark_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
@@ -602,6 +609,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             collect_detailed_metrics=(
                 ctx.collect_detailed_metrics if ctx is not None else True
             ),
+            **extra_features,
         )
         metrics = {
             "accuracy": accuracy.detach(),
@@ -631,7 +639,11 @@ class DSparkTrainStrategy(DraftTrainStrategy):
 
 
 class HSpecTrainStrategy(DSparkTrainStrategy):
-    """H-Spec strategy: DSpark objective over borrowed target K/V features."""
+    """H-Spec strategy: DSpark objective over borrowed target K/V features.
+
+    Reuses DSparkTrainStrategy.forward_loss, which forwards the borrowed-KV
+    features below to ``OnlineHSpecModel`` when the batch carries them.
+    """
 
     name = "hspec"
     required_features = DSparkTrainStrategy.required_features | {
@@ -639,47 +651,6 @@ class HSpecTrainStrategy(DSparkTrainStrategy):
         "selected_target_v",
         "prefix_masks",
     }
-
-    def forward_loss(
-        self, batch: TrainBatch, ctx: Optional[StepContext] = None
-    ) -> StepOutput:
-        self.validate_batch(batch)
-        t = batch.tensors
-        device = self._device()
-        max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
-        loss, accuracy, model_metrics = self.dspark_model(
-            input_ids=t["input_ids"].to(device, non_blocking=True),
-            hidden_states=t["hidden_states"].to(device, non_blocking=True),
-            loss_mask=t["loss_mask"].to(device, non_blocking=True),
-            target_last_hidden_states=t["target_last_hidden_states"].to(
-                device, non_blocking=True
-            ),
-            selected_target_k=t["selected_target_k"].to(device, non_blocking=True),
-            selected_target_v=t["selected_target_v"].to(device, non_blocking=True),
-            prefix_masks=t["prefix_masks"].to(device, non_blocking=True),
-            max_valid_anchors=max_valid_anchors,
-            collect_detailed_metrics=(
-                ctx.collect_detailed_metrics if ctx is not None else True
-            ),
-        )
-        metrics = {
-            "accuracy": accuracy.detach(),
-        }
-        ratio_metrics = model_metrics.get("ratio_metrics", {})
-        for name in (
-            "accuracy_denom",
-            "ce_loss",
-            "l1_loss",
-            "confidence_loss",
-            "confidence_abs_error",
-        ):
-            if name in model_metrics:
-                metrics[name] = model_metrics[name]
-        return StepOutput(
-            loss=loss,
-            metrics=metrics,
-            ratio_metrics=ratio_metrics,
-        )
 
 
 class MTPTrainStrategy(DraftTrainStrategy):

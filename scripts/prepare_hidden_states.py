@@ -184,10 +184,11 @@ def parse_args():
     sglang_group = parser.add_argument_group("sglang")
     parser.add_argument(
         "--attention-backend",
-        default="flex_attention",
+        default=None,
         help=(
-            "Trainer attention backend recorded in the capture plan "
-            "(algorithms restrict the supported set, e.g. hspec: eager/sdpa)"
+            "Trainer attention backend recorded in the capture plan; when "
+            "unset it resolves from the algorithm capability set "
+            "(e.g. hspec: eager/sdpa)"
         ),
     )
     sglang_group.add_argument(
@@ -706,11 +707,15 @@ class HiddenStatesGenerator:
             captured = self.model.capture(
                 **filtered_batch_gpu,
             )
-            hspec_feature_rows = (
-                list(captured.feature_rows())
-                if self.capture_method == "hspec" and self.model.capture_method == "hspec"
-                else []
-            )
+            if self.capture_method == "hspec":
+                hspec_feature_rows = list(captured.feature_rows())
+                if not hspec_feature_rows:
+                    raise RuntimeError(
+                        "hspec capture produced no feature rows; the target "
+                        "backend did not provide selected target K/V"
+                    )
+            else:
+                hspec_feature_rows = []
             aux_hidden_states_list = captured.hidden_states
             last_hidden_states_list = captured.last_hidden_states
             if aux_hidden_states_list is None:

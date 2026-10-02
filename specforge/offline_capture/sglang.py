@@ -64,8 +64,7 @@ class OfflineSGLangCapture:
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
-        capture = cls(backend, capture_method=capture_method)
-        return capture
+        return cls(backend, capture_method=capture_method)
 
     def set_capture_layers(
         self,

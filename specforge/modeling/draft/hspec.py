@@ -1,11 +1,11 @@
-"""H-Spec hybrid Mamba-attention draft architecture skeleton.
+"""H-Spec hybrid Mamba-attention draft architecture.
 
-This first SpecForge integration keeps the DSpark block-parallel training and
+This SpecForge integration keeps the DSpark block-parallel training and
 Markov objective while replacing the target-context attention path.  Target
 KVs are supplied directly rather than materialized from hidden states.  The
 Mamba module uses a reference recurrence so its correctness can be tested
-before introducing a fused parallel-scan kernel; configs should explicitly
-enable ``hspec_config.use_fused_mamba`` only after kernel parity is available.
+before introducing a fused parallel-scan kernel; ``hspec_config``
+``mamba_backend`` stays ``'reference'`` until kernel parity is available.
 """
 
 from __future__ import annotations
@@ -113,10 +113,7 @@ class HSpecMamba2Reference(nn.Module):
         self,
         hidden_states: torch.Tensor,
         initial_state: Optional[torch.Tensor] = None,
-        *,
-        parallel_scan: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del parallel_scan
         batch_size, sequence_length, _ = hidden_states.shape
         projected = self.in_proj(hidden_states)
         gate, bc, dt = torch.split(
@@ -234,9 +231,12 @@ class HSpecTargetKVAttention(nn.Module):
             )
         self.config = config
         self.layer_idx = layer_idx
-        self.attention_dropout = config.attention_dropout
         if config._attn_implementation == "flex_attention":
-            assert config.attention_dropout == 0.0
+            if config.attention_dropout != 0.0:
+                raise ValueError(
+                    "flex_attention does not support attention_dropout; "
+                    f"got {config.attention_dropout}"
+                )
         self.head_dim = int(
             getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         )
@@ -706,8 +706,8 @@ class HSpecDraftModel(DSparkDraftModel):
                 f"'mlp'; got {block_pattern}"
             )
         self.block_pattern = tuple(block_pattern)
-        self.debug_only_block_pattern = bool(method.get("debug_only", False))
-        if self.debug_only_block_pattern:
+        self.debug_only = bool(method.get("debug_only", False))
+        if self.debug_only:
             warnings.warn(
                 "hspec_config.block_pattern is marked debug_only=True; this "
                 "topology is for NPU smoke/debug runs only and must not train "
@@ -1017,14 +1017,6 @@ class HSpecDraftModel(DSparkDraftModel):
             )
             mamba_index += 1
         return self.norm(hidden_states)
-
-    def _sample_draft_tokens(
-        self,
-        target: nn.Module,
-        draft_hidden: torch.Tensor,
-        block_output_ids: torch.LongTensor,
-    ) -> torch.LongTensor:
-        return super()._sample_draft_tokens(target, draft_hidden, block_output_ids)
 
 
 __all__ = ["HSpecDraftModel", "HSpecDecoderLayer", "HSpecMamba2Reference"]
