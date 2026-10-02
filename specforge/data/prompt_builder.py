@@ -94,7 +94,7 @@ def prepare_prompt_tasks(
         num_proc=num_proc,
         min_loss_tokens=min_loss_tokens,
         limit=limit,
-        loss_mask_filter=None,
+        loss_mask_filter=loss_mask_filter,
     )
 
 
@@ -143,7 +143,6 @@ def _prepare_raw_prompts(
         processed_dataset,
         max_length=max_length,
         min_loss_tokens=min_loss_tokens,
-        loss_mask_filter=loss_mask_filter,
     )
 
 
@@ -156,12 +155,10 @@ class _ProcessedPromptSequence(Sequence[PromptTaskDict]):
         *,
         max_length: int,
         min_loss_tokens: int,
-        loss_mask_filter: Callable[[Sequence[int]], bool] | None,
     ) -> None:
         self._dataset = dataset
         self._max_length = max_length
         self._min_loss_tokens = min_loss_tokens
-        self._loss_mask_filter = loss_mask_filter
 
     def __len__(self) -> int:
         return len(self._dataset)

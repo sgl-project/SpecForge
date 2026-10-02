@@ -201,6 +201,68 @@ class TestPreparePromptTasks(unittest.TestCase):
         self.assertEqual(build_calls[0]["minimum_valid_tokens"], 2)
         self.assertTrue(build_calls[0]["train_only_last_turn"])
 
+    def test_raw_conversations_forward_loss_mask_filter(self):
+        raw_rows = [
+            {"conversations": [{"role": "user", "content": "one"}]},
+            {"conversations": [{"role": "user", "content": "two"}]},
+        ]
+        loaded_dataset = _FakeDataset(raw_rows)
+        processed_dataset = _FakeDataset(
+            [
+                {
+                    "input_ids": [[10, 11, 12]],
+                    "loss_mask": [[0, 1, 1]],
+                    "attention_mask": [[1, 1, 1]],
+                }
+            ]
+        )
+        build_calls = []
+
+        def fake_load_dataset(*args, **kwargs):
+            return loaded_dataset
+
+        def fake_build_eagle3_dataset(**kwargs):
+            build_calls.append(kwargs)
+            return processed_dataset
+
+        fake_datasets = types.ModuleType("datasets")
+        fake_datasets.load_dataset = fake_load_dataset
+        fake_preprocessing = types.ModuleType("specforge.data.preprocessing")
+        fake_preprocessing.build_eagle3_dataset = fake_build_eagle3_dataset
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "raw.jsonl")
+            _write_jsonl(path, raw_rows)
+            with patch.dict(
+                sys.modules,
+                {
+                    "datasets": fake_datasets,
+                    "specforge.data.preprocessing": fake_preprocessing,
+                },
+            ):
+                prepare_prompt_tasks(
+                    path,
+                    tokenizer="tokenizer",
+                    chat_template="text-template",
+                    max_length=128,
+                    is_preformatted=False,
+                    train_only_last_turn=True,
+                    cache_dir=tmp_dir,
+                    cache_key="cache-key",
+                    num_proc=3,
+                    min_loss_tokens=2,
+                    max_prompts=1,
+                    loss_mask_filter=has_consecutive_supervised_tokens,
+                )
+
+        self.assertEqual(len(build_calls), 1)
+        self.assertIs(
+            build_calls[0]["loss_mask_filter"], has_consecutive_supervised_tokens
+        )
+        # The predicate can drop rows, so the raw path has to hand the whole
+        # dataset to the preprocessor instead of pre-selecting `max_prompts` rows.
+        self.assertEqual(len(build_calls[0]["dataset"]), 2)
+
     def test_rejects_incomplete_or_mismatched_token_records(self):
         cases = [
             ({"input_ids": [1, 2]}, "missing loss_mask"),
