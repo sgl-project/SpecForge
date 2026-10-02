@@ -66,6 +66,59 @@ _INBOX_SUFFIXES = (
 )
 
 
+def _ref_sequence_length(ref: SampleRef) -> Optional[int]:
+    """Read sequence length from metadata only, or leave the window in FIFO order."""
+    length = ref.num_tokens
+    if isinstance(length, int) and not isinstance(length, bool) and length > 0:
+        return length
+    spec = ref.feature_specs.get("input_ids")
+    if spec is not None:
+        shape = spec.shape
+        if len(shape) == 1 or (len(shape) == 2 and shape[0] == 1):
+            length = shape[-1]
+            if isinstance(length, int) and not isinstance(length, bool) and length > 0:
+                return length
+    return None
+
+
+def _length_grouped_window(
+    refs: List[SampleRef], dp_size: int, refs_per_rank_batch: int
+) -> List[SampleRef]:
+    """Order one complete optimizer window for the existing round-robin dispatcher.
+
+    Nearby lengths share a DP micro-batch round. Within a round, descending
+    lengths are striped across ranks so one rank cannot receive all the longest
+    samples. The heavier padded batches go to ranks with less accumulated
+    padded-token work in this window. This is a metadata cost estimate, not a
+    promise of equal runtime for different attention backends.
+
+    No refs cross optimizer boundaries and every rank keeps the same number of
+    samples in every round. Unknown lengths preserve the entire window's FIFO
+    order; ties are stable, making restart from the committed order reproducible.
+    """
+    lengths = [_ref_sequence_length(ref) for ref in refs]
+    if any(length is None for length in lengths):
+        return list(refs)
+    ordered = sorted(zip(refs, lengths), key=lambda item: item[1], reverse=True)
+    round_size = dp_size * refs_per_rank_batch
+    loads = [0] * dp_size
+    result = []
+    for start in range(0, len(ordered), round_size):
+        round_refs = ordered[start : start + round_size]
+        rank_order = sorted(range(dp_size), key=lambda rank: loads[rank])
+        rank_batches = [[] for _ in range(dp_size)]
+        for index, (ref, length) in enumerate(round_refs):
+            rank = rank_order[index % dp_size]
+            if not rank_batches[rank]:
+                # The round is descending: its first sample sets the padded
+                # length of this rank's micro-batch.
+                loads[rank] += refs_per_rank_batch * length
+            rank_batches[rank].append(ref)
+        for index in range(refs_per_rank_batch):
+            result.extend(batch[index] for batch in rank_batches)
+    return result
+
+
 class InboxChannel(StreamingRefChannel):
     """Reader view of a distributor inbox: fails loudly if the distributor died.
 
@@ -101,6 +154,7 @@ class RefDistributor:
         feature_store,
         refs_per_rank_step: int,
         refs_per_rank_batch: Optional[int] = None,
+        length_aware_scheduling: bool = False,
         skip_ids: Optional[Iterable[str]] = None,
         requeued_ids: Optional[Iterable[str]] = None,
         worker_id: str = "ref-distributor",
@@ -132,6 +186,7 @@ class RefDistributor:
         self.feature_store = feature_store
         self.refs_per_rank_step = refs_per_rank_step
         self.refs_per_rank_batch = refs_per_rank_batch
+        self.length_aware_scheduling = length_aware_scheduling
         self.dispatch_quantum = dp_size * refs_per_rank_step
         self.dispatch_round_quantum = dp_size * refs_per_rank_batch
         self.worker_id = worker_id
@@ -263,6 +318,35 @@ class RefDistributor:
                 # Once secured, the window completes within this same loop.
                 if len(self._window) + queue.depth() < self.dispatch_quantum:
                     break
+                if self.length_aware_scheduling:
+                    # The baseline already waits for this full quantum. Lease
+                    # exactly those refs before sorting, never future windows
+                    # or feature tensors, and publish in each inbox's lease
+                    # order so optimizer-durable prefix acks stay unchanged.
+                    self._window.extend(
+                        queue.get(
+                            self.dispatch_quantum - len(self._window), timeout_s=0.0
+                        )
+                    )
+                    if len(self._window) < self.dispatch_quantum:
+                        break
+                    self._window = _length_grouped_window(
+                        self._window, self.dp_size, self.refs_per_rank_batch
+                    )
+                    for start in range(
+                        0, self.dispatch_quantum, self.dispatch_round_quantum
+                    ):
+                        round_refs = self._window[
+                            start : start + self.dispatch_round_quantum
+                        ]
+                        for rank, inbox in enumerate(self._inboxes):
+                            inbox.publish_batch(round_refs[rank :: self.dp_size])
+                        self.stats["dispatched"] += self.dispatch_round_quantum
+                        self._window_dispatched += self.dispatch_round_quantum
+                    self._window = []
+                    self._window_dispatched = 0
+                    progress = True
+                    continue
             need = self.dispatch_round_quantum - len(self._window)
             if need:
                 self._window.extend(queue.get(need, timeout_s=0.0))

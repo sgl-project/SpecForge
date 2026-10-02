@@ -1,0 +1,190 @@
+{
+  "config": {
+    "algorithm": "eagle3",
+    "schedule": "online",
+    "pattern": "heterogeneous",
+    "batch_size": 1,
+    "accumulation_steps": 4,
+    "lengths": [
+      32,
+      64,
+      96,
+      128
+    ],
+    "hidden_size": 64,
+    "vocab_size": 128,
+    "draft_layers": 2,
+    "num_anchors": 8,
+    "block_size": 8,
+    "ttt_length": 3,
+    "seed": 42,
+    "warmup": 2,
+    "steps": 8,
+    "repeats": 3,
+    "parity_dtype": "float32",
+    "sharding": "SHARD_GRAD_OP",
+    "attention_backend": "sdpa",
+    "perf_dtype": "bfloat16",
+    "atol": 2e-05,
+    "rtol": 0.0005,
+    "skip_parity": false,
+    "skip_performance": true,
+    "dry_run": false,
+    "world_size": 2,
+    "output": "/tmp/specforge-length-aware-yusheng/results/eagle3-online-parity.json"
+  },
+  "world_size": 2,
+  "layouts": {
+    "baseline": {
+      "sample_ids_by_rank_and_microstep": [
+        [
+          [
+            "0"
+          ],
+          [
+            "2"
+          ],
+          [
+            "4"
+          ],
+          [
+            "6"
+          ]
+        ],
+        [
+          [
+            "1"
+          ],
+          [
+            "3"
+          ],
+          [
+            "5"
+          ],
+          [
+            "7"
+          ]
+        ]
+      ],
+      "valid_context_tokens": 640,
+      "padded_context_positions": 640,
+      "padding_fraction": 0.0,
+      "padded_context_positions_by_rank": [
+        352,
+        288
+      ],
+      "sum_of_microstep_max_padded_positions": 416
+    },
+    "length_aware": {
+      "sample_ids_by_rank_and_microstep": [
+        [
+          [
+            "0"
+          ],
+          [
+            "2"
+          ],
+          [
+            "5"
+          ],
+          [
+            "1"
+          ]
+        ],
+        [
+          [
+            "3"
+          ],
+          [
+            "4"
+          ],
+          [
+            "7"
+          ],
+          [
+            "6"
+          ]
+        ]
+      ],
+      "valid_context_tokens": 640,
+      "padded_context_positions": 640,
+      "padding_fraction": 0.0,
+      "padded_context_positions_by_rank": [
+        320,
+        320
+      ],
+      "sum_of_microstep_max_padded_positions": 320
+    }
+  },
+  "limitations": [
+    "Synthetic random models/features, not evidence of real-model convergence or serving acceptance.",
+    "This fixture is one optimizer window; offline sample order across multiple optimizer windows can change the trajectory.",
+    "No guaranteed speedup; uniform-length runs are the required negative control."
+  ],
+  "git_sha": null,
+  "source_sha256": {
+    "benchmarks/length_aware_training.py": "d02bab58ba549e2e1c7698157c9a970a7743c32aa0a28ffe579146454d3b6eee",
+    "specforge/data/length_bucketing.py": "d909236cc07c5715ceabce61a780b80b9da02a6d0af657843580d2c904f88d8d",
+    "specforge/runtime/data_plane/ref_distributor.py": "6e8a7b4201654f65ccaa87b793508845dc589652edd02bc03ca5b55723f27e4b",
+    "specforge/training/controller.py": "16322d15235ea7001f60b7b24e0de92bbb8a5f3b6b80da799b9bfbf17719d9f0",
+    "specforge/training/backend.py": "0b47b95e0aebbcd6f44aa94e17a62906ebcab36a44eb1fb4e7b7e4abbe5741f2",
+    "specforge/training/strategies/base.py": "88ea9e4ce7fe8c83e887b0df79857c22359987a2f55b6900c5b3d3907a4ab73f",
+    "specforge/algorithms/eagle3/model.py": "3987b312c8bb82956e8f5e48daf8beb90f4ccb958371e4abcf46888e1e2ff46f",
+    "specforge/algorithms/common/dflash_family_model.py": "3ea975b866f9f8190d052e726c72d0993a7009cd0edca37a3be3a3a8590b63b1",
+    "specforge/modeling/draft/dflash2.py": "819c6b3d8d6d8ffc31a843ed40d539ddf635f58b148a01c8c43d0bff1dd02b09"
+  },
+  "environment": {
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "gpu": "NVIDIA H200",
+    "tf32": false
+  },
+  "numerical_parity": {
+    "passed": true,
+    "by_rank": [
+      {
+        "reference_loss": 8.708559036254883,
+        "length_aware_loss": 8.708558082580566,
+        "loss_abs_diff": 9.5367431640625e-07,
+        "dtype": "float32",
+        "atol": 2e-05,
+        "rtol": 0.0005,
+        "gradients": {
+          "passed": true,
+          "max_abs_diff": 5.820766091346741e-11,
+          "relative_l2_error": 1.3973101431474788e-07,
+          "reference_l2_norm": 0.006432921625673771
+        },
+        "updates": {
+          "passed": true,
+          "max_abs_diff": 1.9744038581848145e-07,
+          "relative_l2_error": 1.7836839560914086e-06,
+          "reference_l2_norm": 0.20077300071716309
+        },
+        "passed": true
+      },
+      {
+        "reference_loss": 8.708559036254883,
+        "length_aware_loss": 8.708558082580566,
+        "loss_abs_diff": 9.5367431640625e-07,
+        "dtype": "float32",
+        "atol": 2e-05,
+        "rtol": 0.0005,
+        "gradients": {
+          "passed": true,
+          "max_abs_diff": 3.4924596548080444e-10,
+          "relative_l2_error": 1.0956603802014797e-07,
+          "reference_l2_norm": 0.07943762838840485
+        },
+        "updates": {
+          "passed": true,
+          "max_abs_diff": 1.55717134475708e-06,
+          "relative_l2_error": 7.916775757621508e-06,
+          "reference_l2_norm": 0.2213236391544342
+        },
+        "passed": true
+      }
+    ],
+    "scope": "One optimizer window; identical sample IDs, per-sample DFlash anchors and production objective. TF32 disabled; not a convergence or serving accuracy result."
+  }
+}

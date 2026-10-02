@@ -560,6 +560,7 @@ def _build_offline(
         sp_ring_size=cfg.training.sp_ring_size,
         use_usp_preprocess=(cfg.training.attention_backend == "usp"),
         seed=cfg.training.seed,
+        length_bucket_size=cfg.training.length_bucket_size,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )
@@ -838,6 +839,7 @@ def _build_online(
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
         async_ack=_consumer_async_ack(cfg),
+        length_aware_scheduling=cfg.training.length_aware_scheduling,
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

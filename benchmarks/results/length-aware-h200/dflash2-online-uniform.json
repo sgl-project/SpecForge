@@ -1,0 +1,424 @@
+{
+  "config": {
+    "algorithm": "dflash2",
+    "schedule": "online",
+    "pattern": "uniform",
+    "batch_size": 2,
+    "accumulation_steps": 8,
+    "lengths": [
+      128,
+      256,
+      1024,
+      2048
+    ],
+    "hidden_size": 256,
+    "vocab_size": 4096,
+    "draft_layers": 2,
+    "num_anchors": 32,
+    "block_size": 8,
+    "ttt_length": 3,
+    "seed": 42,
+    "warmup": 3,
+    "steps": 10,
+    "repeats": 3,
+    "parity_dtype": "float32",
+    "sharding": "SHARD_GRAD_OP",
+    "attention_backend": "sdpa",
+    "perf_dtype": "bfloat16",
+    "atol": 2e-05,
+    "rtol": 0.0005,
+    "skip_parity": true,
+    "skip_performance": false,
+    "dry_run": false,
+    "world_size": 2,
+    "output": "/tmp/specforge-length-aware-yusheng/results/dflash2-online-uniform.json"
+  },
+  "world_size": 2,
+  "layouts": {
+    "baseline": {
+      "sample_ids_by_rank_and_microstep": [
+        [
+          [
+            "0",
+            "2"
+          ],
+          [
+            "4",
+            "6"
+          ],
+          [
+            "8",
+            "10"
+          ],
+          [
+            "12",
+            "14"
+          ],
+          [
+            "16",
+            "18"
+          ],
+          [
+            "20",
+            "22"
+          ],
+          [
+            "24",
+            "26"
+          ],
+          [
+            "28",
+            "30"
+          ]
+        ],
+        [
+          [
+            "1",
+            "3"
+          ],
+          [
+            "5",
+            "7"
+          ],
+          [
+            "9",
+            "11"
+          ],
+          [
+            "13",
+            "15"
+          ],
+          [
+            "17",
+            "19"
+          ],
+          [
+            "21",
+            "23"
+          ],
+          [
+            "25",
+            "27"
+          ],
+          [
+            "29",
+            "31"
+          ]
+        ]
+      ],
+      "valid_context_tokens": 65536,
+      "padded_context_positions": 65536,
+      "padding_fraction": 0.0,
+      "padded_context_positions_by_rank": [
+        32768,
+        32768
+      ],
+      "sum_of_microstep_max_padded_positions": 32768
+    },
+    "length_aware": {
+      "sample_ids_by_rank_and_microstep": [
+        [
+          [
+            "0",
+            "2"
+          ],
+          [
+            "4",
+            "6"
+          ],
+          [
+            "8",
+            "10"
+          ],
+          [
+            "12",
+            "14"
+          ],
+          [
+            "16",
+            "18"
+          ],
+          [
+            "20",
+            "22"
+          ],
+          [
+            "24",
+            "26"
+          ],
+          [
+            "28",
+            "30"
+          ]
+        ],
+        [
+          [
+            "1",
+            "3"
+          ],
+          [
+            "5",
+            "7"
+          ],
+          [
+            "9",
+            "11"
+          ],
+          [
+            "13",
+            "15"
+          ],
+          [
+            "17",
+            "19"
+          ],
+          [
+            "21",
+            "23"
+          ],
+          [
+            "25",
+            "27"
+          ],
+          [
+            "29",
+            "31"
+          ]
+        ]
+      ],
+      "valid_context_tokens": 65536,
+      "padded_context_positions": 65536,
+      "padding_fraction": 0.0,
+      "padded_context_positions_by_rank": [
+        32768,
+        32768
+      ],
+      "sum_of_microstep_max_padded_positions": 32768
+    }
+  },
+  "limitations": [
+    "Synthetic random models/features, not evidence of real-model convergence or serving acceptance.",
+    "This fixture is one optimizer window; offline sample order across multiple optimizer windows can change the trajectory.",
+    "No guaranteed speedup; uniform-length runs are the required negative control."
+  ],
+  "git_sha": null,
+  "source_sha256": {
+    "benchmarks/length_aware_training.py": "81e249ac8f08c1e9e9b131ba7402cd5712d6109fe2bfe84b0a37a84ec0e1f10c",
+    "specforge/data/length_bucketing.py": "88bb89fcd66f6afb26360eee738c0592b79859c265c91140f06e08dc4e55f7c1",
+    "specforge/runtime/data_plane/ref_distributor.py": "6e8a7b4201654f65ccaa87b793508845dc589652edd02bc03ca5b55723f27e4b",
+    "specforge/training/controller.py": "16322d15235ea7001f60b7b24e0de92bbb8a5f3b6b80da799b9bfbf17719d9f0",
+    "specforge/training/backend.py": "0b47b95e0aebbcd6f44aa94e17a62906ebcab36a44eb1fb4e7b7e4abbe5741f2",
+    "specforge/training/strategies/base.py": "88ea9e4ce7fe8c83e887b0df79857c22359987a2f55b6900c5b3d3907a4ab73f",
+    "specforge/algorithms/eagle3/model.py": "3987b312c8bb82956e8f5e48daf8beb90f4ccb958371e4abcf46888e1e2ff46f",
+    "specforge/algorithms/common/dflash_family_model.py": "3ea975b866f9f8190d052e726c72d0993a7009cd0edca37a3be3a3a8590b63b1",
+    "specforge/modeling/draft/dflash2.py": "819c6b3d8d6d8ffc31a843ed40d539ddf635f58b148a01c8c43d0bff1dd02b09"
+  },
+  "environment": {
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "gpu": "NVIDIA H200",
+    "tf32": false
+  },
+  "performance": {
+    "repetitions": [
+      {
+        "baseline": {
+          "optimizer_window_ms_median": 135.9049128368497,
+          "optimizer_window_ms_min": 133.3475559949875,
+          "optimizer_window_ms_max": 145.85479721426964,
+          "optimizer_window_ms_samples": [
+            145.85479721426964,
+            139.13502171635628,
+            139.14130628108978,
+            134.61649790406227,
+            135.14934480190277,
+            136.6604808717966,
+            133.87631624937057,
+            136.88647374510765,
+            133.4647536277771,
+            133.3475559949875
+          ],
+          "valid_context_tokens_per_second": 479017.9144288392,
+          "samples_per_second": 233.89546602970665,
+          "microstep_rank_time_skew_ms_mean": 1.4560783863067628,
+          "peak_allocated_bytes_by_rank": [
+            151874048,
+            151870464
+          ],
+          "rank_time_skew_note": "Difference in recorded CUDA microstep durations, including collectives; not a direct measurement of GPU idle or NCCL wait time.",
+          "supervised_draft_positions": 71450,
+          "supervised_draft_positions_per_second": 52224.47202444544,
+          "anchor_sampling": "native production random sampler"
+        },
+        "length_aware": {
+          "optimizer_window_ms_median": 134.33043006807566,
+          "optimizer_window_ms_min": 132.7748242765665,
+          "optimizer_window_ms_max": 146.96981199085712,
+          "optimizer_window_ms_samples": [
+            132.7748242765665,
+            134.3696489930153,
+            134.02212597429752,
+            134.29121114313602,
+            133.82789120078087,
+            133.54384526610374,
+            134.54321958124638,
+            146.96981199085712,
+            135.71464456617832,
+            135.68050786852837
+          ],
+          "valid_context_tokens_per_second": 483397.330532311,
+          "samples_per_second": 236.03385279897998,
+          "microstep_rank_time_skew_ms_mean": 1.1289748549461365,
+          "peak_allocated_bytes_by_rank": [
+            174017024,
+            174009856
+          ],
+          "rank_time_skew_note": "Difference in recorded CUDA microstep durations, including collectives; not a direct measurement of GPU idle or NCCL wait time.",
+          "supervised_draft_positions": 71450,
+          "supervised_draft_positions_per_second": 52701.93369527225,
+          "anchor_sampling": "native production random sampler"
+        },
+        "median_speedup": 1.0117209687185258,
+        "scope": "Preloaded synthetic CPU features through production model, strategy, TrainerCore, FSDP/DDP and AdamW; excludes teacher capture, feature storage/transport and scheduling latency. Warmup is excluded. Both variants update weights.",
+        "variant_execution_order": [
+          "baseline",
+          "length_aware"
+        ]
+      },
+      {
+        "length_aware": {
+          "optimizer_window_ms_median": 136.02132815867662,
+          "optimizer_window_ms_min": 135.52040234208107,
+          "optimizer_window_ms_max": 137.36782409250736,
+          "optimizer_window_ms_samples": [
+            135.52125915884972,
+            135.52040234208107,
+            136.5965288132429,
+            136.68566197156906,
+            135.65797545015812,
+            136.38468086719513,
+            135.6267873197794,
+            137.0392069220543,
+            137.36782409250736,
+            135.63791662454605
+          ],
+          "valid_context_tokens_per_second": 481161.2325114395,
+          "samples_per_second": 234.9420080622263,
+          "microstep_rank_time_skew_ms_mean": 1.2162971138954162,
+          "peak_allocated_bytes_by_rank": [
+            174033408,
+            174026240
+          ],
+          "rank_time_skew_note": "Difference in recorded CUDA microstep durations, including collectives; not a direct measurement of GPU idle or NCCL wait time.",
+          "supervised_draft_positions": 71450,
+          "supervised_draft_positions_per_second": 52458.14523764397,
+          "anchor_sampling": "native production random sampler"
+        },
+        "baseline": {
+          "optimizer_window_ms_median": 135.19197516143322,
+          "optimizer_window_ms_min": 134.58962179720402,
+          "optimizer_window_ms_max": 135.49950532615185,
+          "optimizer_window_ms_samples": [
+            135.20449213683605,
+            134.9763162434101,
+            135.17295196652412,
+            135.1794581860304,
+            135.27048751711845,
+            135.49950532615185,
+            135.2998372167349,
+            135.30592434108257,
+            134.8793338984251,
+            134.58962179720402
+          ],
+          "valid_context_tokens_per_second": 484956.862263264,
+          "samples_per_second": 236.79534290198438,
+          "microstep_rank_time_skew_ms_mean": 1.0666164398193358,
+          "peak_allocated_bytes_by_rank": [
+            174033920,
+            174026752
+          ],
+          "rank_time_skew_note": "Difference in recorded CUDA microstep durations, including collectives; not a direct measurement of GPU idle or NCCL wait time.",
+          "supervised_draft_positions": 71450,
+          "supervised_draft_positions_per_second": 52871.960157333706,
+          "anchor_sampling": "native production random sampler"
+        },
+        "median_speedup": 0.9939027723926066,
+        "scope": "Preloaded synthetic CPU features through production model, strategy, TrainerCore, FSDP/DDP and AdamW; excludes teacher capture, feature storage/transport and scheduling latency. Warmup is excluded. Both variants update weights.",
+        "variant_execution_order": [
+          "length_aware",
+          "baseline"
+        ]
+      },
+      {
+        "baseline": {
+          "optimizer_window_ms_median": 135.6701124459505,
+          "optimizer_window_ms_min": 135.06343960762024,
+          "optimizer_window_ms_max": 147.22815528512,
+          "optimizer_window_ms_samples": [
+            135.06343960762024,
+            136.32158376276493,
+            135.78583300113678,
+            135.18929854035378,
+            135.19372418522835,
+            147.22815528512,
+            135.28560660779476,
+            136.77578419446945,
+            136.4803221076727,
+            135.55439189076424
+          ],
+          "valid_context_tokens_per_second": 478757.00636959565,
+          "samples_per_second": 233.76806951640413,
+          "microstep_rank_time_skew_ms_mean": 1.314768373966217,
+          "peak_allocated_bytes_by_rank": [
+            174033408,
+            174026240
+          ],
+          "rank_time_skew_note": "Difference in recorded CUDA microstep durations, including collectives; not a direct measurement of GPU idle or NCCL wait time.",
+          "supervised_draft_positions": 71450,
+          "supervised_draft_positions_per_second": 52196.026771709614,
+          "anchor_sampling": "native production random sampler"
+        },
+        "length_aware": {
+          "optimizer_window_ms_median": 134.89424716681242,
+          "optimizer_window_ms_min": 134.53568890690804,
+          "optimizer_window_ms_max": 136.93826273083687,
+          "optimizer_window_ms_samples": [
+            135.57416759431362,
+            134.6617005765438,
+            135.7090137898922,
+            135.3355534374714,
+            136.93826273083687,
+            134.8668746650219,
+            134.66333597898483,
+            134.7487047314644,
+            134.92161966860294,
+            134.53568890690804
+          ],
+          "valid_context_tokens_per_second": 484749.8901751109,
+          "samples_per_second": 236.69428231206587,
+          "microstep_rank_time_skew_ms_mean": 1.2292827844619751,
+          "peak_allocated_bytes_by_rank": [
+            174033920,
+            174026752
+          ],
+          "rank_time_skew_note": "Difference in recorded CUDA microstep durations, including collectives; not a direct measurement of GPU idle or NCCL wait time.",
+          "supervised_draft_positions": 71450,
+          "supervised_draft_positions_per_second": 52849.39522249096,
+          "anchor_sampling": "native production random sampler"
+        },
+        "median_speedup": 1.0057516558002555,
+        "scope": "Preloaded synthetic CPU features through production model, strategy, TrainerCore, FSDP/DDP and AdamW; excludes teacher capture, feature storage/transport and scheduling latency. Warmup is excluded. Both variants update weights.",
+        "variant_execution_order": [
+          "baseline",
+          "length_aware"
+        ]
+      }
+    ],
+    "median_speedup": 1.0057516558002555,
+    "min_speedup": 0.9939027723926066,
+    "max_speedup": 1.0117209687185258,
+    "baseline_window_ms_median": 135.6701124459505,
+    "length_aware_window_ms_median": 134.89424716681242,
+    "scope": "Preloaded synthetic CPU features through production model, strategy, TrainerCore, FSDP/DDP and AdamW; excludes teacher capture, feature storage/transport and scheduling latency. Warmup is excluded. Both variants update weights."
+  }
+}

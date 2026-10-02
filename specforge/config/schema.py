@@ -899,6 +899,12 @@ class TrainingConfig(StrictConfigModel):
     total_steps: Optional[int] = Field(default=None, gt=0)
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
+    #: Reorder already-ready online optimizer windows by sample length. No
+    #: additional buffering or change to the window's sample membership.
+    length_aware_scheduling: bool = False
+    #: Offline grouping window in global microbatches (0 preserves the legacy
+    #: sampler). First use indexes missing lengths in output_dir/length-cache.
+    length_bucket_size: int = Field(default=0, ge=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
@@ -1115,6 +1121,28 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+
+        if self.training.length_aware_scheduling and mode != "online":
+            raise ValueError(
+                "training.length_aware_scheduling requires online training"
+            )
+        if self.training.length_bucket_size and mode != "offline":
+            raise ValueError("training.length_bucket_size requires offline training")
+        if self.training.length_bucket_size and self.training.strategy != "dflash":
+            raise ValueError(
+                "offline length bucketing currently supports strategy=dflash "
+                "(DFlash/DFlash2); EAGLE3's padded-length loss normalization "
+                "would change with regrouping"
+            )
+        if self.training.length_aware_scheduling and (
+            self.training.strategy not in {"dflash", "eagle3"}
+            or (self.training.strategy == "eagle3" and self.training.batch_size != 1)
+        ):
+            raise ValueError(
+                "online length-aware scheduling supports DFlash/DFlash2 or "
+                "EAGLE3 with batch_size=1; other objectives and EAGLE3 "
+                "variable-length multi-sample collation are not supported"
+            )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

@@ -1,0 +1,221 @@
+{
+  "config": {
+    "algorithm": "dflash2",
+    "schedule": "offline",
+    "pattern": "heterogeneous",
+    "batch_size": 2,
+    "accumulation_steps": 4,
+    "lengths": [
+      32,
+      64,
+      96,
+      128
+    ],
+    "hidden_size": 64,
+    "vocab_size": 128,
+    "draft_layers": 2,
+    "num_anchors": 8,
+    "block_size": 8,
+    "ttt_length": 3,
+    "seed": 42,
+    "warmup": 2,
+    "steps": 8,
+    "repeats": 3,
+    "parity_dtype": "bfloat16",
+    "sharding": "SHARD_GRAD_OP",
+    "attention_backend": "sdpa",
+    "perf_dtype": "bfloat16",
+    "atol": 0.0002,
+    "rtol": 0.03,
+    "skip_parity": false,
+    "skip_performance": true,
+    "permutation_control": false,
+    "dry_run": false,
+    "world_size": 2,
+    "output": "/tmp/specforge-length-aware-yusheng/results/dflash2-offline-bf16-parity.json"
+  },
+  "world_size": 2,
+  "layouts": {
+    "baseline": {
+      "sample_ids_by_rank_and_microstep": [
+        [
+          [
+            "0",
+            "2"
+          ],
+          [
+            "4",
+            "6"
+          ],
+          [
+            "8",
+            "10"
+          ],
+          [
+            "12",
+            "14"
+          ]
+        ],
+        [
+          [
+            "1",
+            "3"
+          ],
+          [
+            "5",
+            "7"
+          ],
+          [
+            "9",
+            "11"
+          ],
+          [
+            "13",
+            "15"
+          ]
+        ]
+      ],
+      "valid_context_tokens": 1280,
+      "padded_context_positions": 1536,
+      "padding_fraction": 0.16666666666666663,
+      "padded_context_positions_by_rank": [
+        640,
+        896
+      ],
+      "sum_of_microstep_max_padded_positions": 960
+    },
+    "length_aware": {
+      "sample_ids_by_rank_and_microstep": [
+        [
+          [
+            "1",
+            "2"
+          ],
+          [
+            "3",
+            "4"
+          ],
+          [
+            "6",
+            "7"
+          ],
+          [
+            "0",
+            "11"
+          ]
+        ],
+        [
+          [
+            "8",
+            "10"
+          ],
+          [
+            "5",
+            "9"
+          ],
+          [
+            "12",
+            "14"
+          ],
+          [
+            "13",
+            "15"
+          ]
+        ]
+      ],
+      "valid_context_tokens": 1280,
+      "padded_context_positions": 1280,
+      "padding_fraction": 0.0,
+      "padded_context_positions_by_rank": [
+        640,
+        640
+      ],
+      "sum_of_microstep_max_padded_positions": 640
+    }
+  },
+  "limitations": [
+    "Synthetic random models/features, not evidence of real-model convergence or serving acceptance.",
+    "This fixture is one optimizer window; offline sample order across multiple optimizer windows can change the trajectory.",
+    "No guaranteed speedup; uniform-length runs are the required negative control."
+  ],
+  "git_sha": null,
+  "source_sha256": {
+    "benchmarks/length_aware_training.py": "8d0c970832c0e909314c6298da8c9f6dc91a638dfb2b860cfaae3545cf9e03ef",
+    "specforge/data/length_bucketing.py": "88bb89fcd66f6afb26360eee738c0592b79859c265c91140f06e08dc4e55f7c1",
+    "specforge/runtime/data_plane/ref_distributor.py": "6e8a7b4201654f65ccaa87b793508845dc589652edd02bc03ca5b55723f27e4b",
+    "specforge/training/controller.py": "16322d15235ea7001f60b7b24e0de92bbb8a5f3b6b80da799b9bfbf17719d9f0",
+    "specforge/training/backend.py": "0b47b95e0aebbcd6f44aa94e17a62906ebcab36a44eb1fb4e7b7e4abbe5741f2",
+    "specforge/training/strategies/base.py": "88ea9e4ce7fe8c83e887b0df79857c22359987a2f55b6900c5b3d3907a4ab73f",
+    "specforge/algorithms/eagle3/model.py": "3987b312c8bb82956e8f5e48daf8beb90f4ccb958371e4abcf46888e1e2ff46f",
+    "specforge/algorithms/common/dflash_family_model.py": "3ea975b866f9f8190d052e726c72d0993a7009cd0edca37a3be3a3a8590b63b1",
+    "specforge/modeling/draft/dflash2.py": "819c6b3d8d6d8ffc31a843ed40d539ddf635f58b148a01c8c43d0bff1dd02b09"
+  },
+  "environment": {
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "gpu": "NVIDIA H200",
+    "tf32": false
+  },
+  "numerical_parity": {
+    "passed": false,
+    "by_rank": [
+      {
+        "reference_loss": 10.019929885864258,
+        "length_aware_loss": 10.019918441772461,
+        "loss_abs_diff": 1.1444091796875e-05,
+        "dtype": "bfloat16",
+        "atol": 0.0002,
+        "rtol": 0.03,
+        "gradients": {
+          "passed": true,
+          "max_abs_diff": 0.00048828125,
+          "relative_l2_error": 0.0038433135487139225,
+          "reference_l2_norm": 0.21705439686775208,
+          "sign_disagreement_count": 88
+        },
+        "updates": {
+          "passed": false,
+          "max_abs_diff": 0.001987457275390625,
+          "relative_l2_error": 0.04418700560927391,
+          "reference_l2_norm": 0.2555425465106964,
+          "gradient_pair_at_max_update_diff": [
+            -1.9073486328125e-06,
+            9.5367431640625e-07
+          ]
+        },
+        "updated_parameter_relative_l2_error": 0.0009064260520972311,
+        "comparison": "length_aware",
+        "passed": false
+      },
+      {
+        "reference_loss": 10.019929885864258,
+        "length_aware_loss": 10.019918441772461,
+        "loss_abs_diff": 1.1444091796875e-05,
+        "dtype": "bfloat16",
+        "atol": 0.0002,
+        "rtol": 0.03,
+        "gradients": {
+          "passed": true,
+          "max_abs_diff": 1.52587890625e-05,
+          "relative_l2_error": 0.0041766236536204815,
+          "reference_l2_norm": 0.04983007162809372,
+          "sign_disagreement_count": 127
+        },
+        "updates": {
+          "passed": false,
+          "max_abs_diff": 0.00201416015625,
+          "relative_l2_error": 0.05142278969287872,
+          "reference_l2_norm": 0.2493051290512085,
+          "gradient_pair_at_max_update_diff": [
+            -1.9073486328125e-06,
+            2.384185791015625e-06
+          ]
+        },
+        "updated_parameter_relative_l2_error": 0.00043807851034216583,
+        "comparison": "length_aware",
+        "passed": false
+      }
+    ],
+    "scope": "One optimizer window; identical sample IDs, per-sample DFlash anchors and production objective. TF32 disabled; not a convergence or serving accuracy result."
+  }
+}
