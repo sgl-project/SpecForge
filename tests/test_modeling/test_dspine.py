@@ -505,6 +505,25 @@ def test_bf16_training_keeps_frozen_state_and_gradients_finite():
     assert not model.draft_model.transfer_codes.requires_grad
 
 
+@pytest.mark.parametrize(
+    "step", [100, 300], ids=["teacher-replacement", "predicted-predecessors"]
+)
+def test_bf16_injection_and_refinement_accept_fp32_transfer_buffers(step):
+    model = training_model(chunk_size=2).to(dtype=torch.bfloat16)
+    model.draft_model.transfer_codes = model.draft_model.transfer_codes.float()
+    inputs = training_inputs()
+    for name in ("hidden_states", "target_last_hidden_states"):
+        inputs[name] = inputs[name].to(torch.bfloat16)
+    loss, _, _ = model(**inputs, global_step=step, total_steps=600)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert model.draft_model.transfer_codes.dtype == torch.float32
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.draft_model.parameters()
+    )
+
+
 def test_gradient_checkpointing_preserves_the_complete_training_objective():
     model = training_model(chunk_size=2)
     checkpointed = copy.deepcopy(model)

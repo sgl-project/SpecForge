@@ -118,6 +118,8 @@ class AdjacentInjection(nn.Module):
         predecessor: torch.Tensor,
         layer: int,
     ) -> torch.Tensor:
+        # FSDP may keep the token-code buffer in FP32 while projections use BF16.
+        predecessor = predecessor.to(receiver.dtype)
         gate = torch.sigmoid(
             self.receiver_gate(receiver)
             + self.predecessor_gate(predecessor)
