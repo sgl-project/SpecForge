@@ -24,7 +24,7 @@ from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "dspine", "eagle3", "mtp", "peagle")
 
 
 def _teacher_metrics_config(enabled: bool):
@@ -169,6 +169,8 @@ class BuiltinProviderContractTest(unittest.TestCase):
             self.assertEqual({"text"}, modalities, registration.name)
 
     def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
+        from specforge.modeling.draft.dspine import DSpineConfig
+
         training = SimpleNamespace(
             attention_backend="flex_attention",
             trim_loss_positions=True,
@@ -184,6 +186,8 @@ class BuiltinProviderContractTest(unittest.TestCase):
             norm_before_residual=True,
             target_layer_ids=[3, 7],
             pure_draft_prefix_len=2,
+            block_size=16,
+            dspine_config=DSpineConfig(),
         )
         dflash_family = SimpleNamespace(
             block_size=16,
@@ -218,6 +222,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "dflash": dflash_family,
             "domino": dflash_family,
             "dspark": dflash_family,
+            "dspine": dflash_family,
             "mtp": SimpleNamespace(),
         }
         expected_keys = {
@@ -256,6 +261,13 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
+            },
+            "dspine": {
+                "dspine_options",
+                "dspine_block_size",
+                "dspine_target_layer_ids",
+                "dspine_attention_backend",
+                "dspine_loss_decay_gamma",
             },
             "mtp": {
                 "mtp_draft_num_hidden_layers",
@@ -573,7 +585,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==6; "
+            "r=builtin_algorithm_registry(); assert len(r)==7; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )
