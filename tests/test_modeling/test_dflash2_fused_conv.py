@@ -172,6 +172,66 @@ class DFlash2FusedConvParityTest(unittest.TestCase):
                 _, relative, _ = _errors(actual[name], expected[name])
                 self.assertLessEqual(relative, tolerance)
 
+    def test_compile_preserves_fused_prepare_finish_and_gradients(self):
+        from torch._dynamo.backends.registry import lookup_backend
+
+        for dtype, tolerance in (
+            (torch.float32, 1e-6),
+            (torch.bfloat16, 1e-2),
+        ):
+            with self.subTest(dtype=dtype):
+                conv = _random_conv(256, 16, 2, 16, device="cuda", dtype=dtype, seed=11)
+                torch.manual_seed(72)
+                inputs = torch.randn(1, 512, 256, device="cuda", dtype=dtype)
+                mixer = torch.randn_like(inputs)
+                grad_seed = (torch.randn_like(inputs), torch.randn_like(inputs))
+                expected = _prepare_finish_step(conv, inputs, mixer, grad_seed)
+                inputs = inputs.detach().clone().requires_grad_(True)
+                mixer = mixer.detach().clone().requires_grad_(True)
+                conv.zero_grad(set_to_none=True)
+                targets = []
+
+                def backend(graph, example_inputs):
+                    # Autograd Function bodies are nested GraphModules. Inspect
+                    # them too so an ATen fallback cannot pass this regression.
+                    for module in graph.modules():
+                        if isinstance(module, torch.fx.GraphModule):
+                            targets.extend(
+                                str(node.target) for node in module.graph.nodes
+                            )
+                    return lookup_backend("inductor")(graph, example_inputs)
+
+                def prepare_finish(x, scale):
+                    prepared, dynamic = conv.prepare(x)
+                    return prepared, conv.finish(prepared * scale, dynamic)
+
+                # Compilation must also work when the lazy loader cache is cold.
+                dflash2._load_fused_grouped_conv.cache_clear()
+                compiled = torch.compile(
+                    prepare_finish, backend=backend, fullgraph=True
+                )
+                prepared, finished = compiled(inputs, mixer)
+                torch.autograd.backward((prepared, finished), grad_seed)
+                actual = {
+                    "prepared": prepared.detach(),
+                    "finished": finished.detach(),
+                    "grad_inputs": inputs.grad,
+                    "grad_mixer": mixer.grad,
+                    "grad_base_kernel": conv.base_kernel.grad,
+                    "grad_kernel_projection": conv.kernel_projection.weight.grad,
+                }
+                self.assertTrue(
+                    any("triton_kernel_wrapper" in target for target in targets)
+                )
+                for name in ("prepared", "finished"):
+                    torch.testing.assert_close(
+                        actual[name], expected[name], rtol=0, atol=0
+                    )
+                # Inductor can fuse the surrounding BF16 gradient accumulation;
+                # this checks every input and parameter gradient, without
+                # claiming bitwise equality for that separate compiler policy.
+                self.assert_step_close(actual, expected, tolerance=tolerance)
+
     def test_fp32_prepare_finish_matches_eager(self):
         # (batch, num_blocks, block_size, taps, group_size, hidden_size)
         cases = [

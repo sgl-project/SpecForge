@@ -448,6 +448,7 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         device: torch.device,
         max_valid_anchors: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample anchors whose clean token and first target are supervised."""
 
@@ -467,7 +468,7 @@ class OnlineDFlashModel(nn.Module):
                 "DFlash-family training requires two consecutive supervised tokens"
             )
 
-        random_values = torch.rand(valid.shape, device=device)
+        random_values = torch.rand(valid.shape, device=device, generator=generator)
         random_values.masked_fill_(~valid, 2.0)
         candidates = random_values.argsort(dim=1)[:, :width]
         keep_mask = torch.arange(width, device=device).unsqueeze(
@@ -700,16 +701,21 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len,
-            loss_mask,
-            device,
-            max_valid_anchors=max_valid_anchors,
-        )
+        if (anchor_positions is None) != (block_keep_mask is None):
+            raise ValueError("Prepared anchors require both positions and keep mask")
+        if anchor_positions is None:
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len,
+                loss_mask,
+                device,
+                max_valid_anchors=max_valid_anchors,
+            )
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -782,6 +788,41 @@ class OnlineDFlashModel(nn.Module):
             **draft_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
+
+    def _dflash_weight_mask(self, loss_mask, anchor_positions, block_keep_mask):
+        """Shared target mask for forward and prepared optimizer windows."""
+        seq_len = loss_mask.shape[1]
+        offsets = torch.arange(self.block_size, device=loss_mask.device).view(1, 1, -1)
+        indices = anchor_positions.unsqueeze(-1) + offsets
+        safe_indices = indices.clamp(max=seq_len - 1)
+        mask = block_keep_mask.unsqueeze(-1).expand_as(indices).float()
+        mask = mask * (indices < seq_len).float() * (offsets > 0).float()
+        mask = mask * torch.gather(
+            loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+            2,
+            safe_indices,
+        )
+        return safe_indices, mask
+
+    def prepared_objective_denominator(
+        self, loss_mask, anchor_positions, block_keep_mask
+    ):
+        """Compute the objective measure without running the draft model."""
+        _, weights = self._dflash_weight_mask(
+            loss_mask, anchor_positions, block_keep_mask
+        )
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            valid = (weights > 0).any(dim=-1)
+            return (
+                valid.float() * self._sequence_anchor_scale(weights).squeeze(-1)
+            ).sum()
+        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+            positions = torch.arange(self.block_size, device=weights.device)
+            decay = torch.exp(
+                -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
+            )
+            weights = weights * decay.view(1, 1, -1)
+        return weights.sum()
 
     def _selector_chunk_terms(
         self,
@@ -899,11 +940,16 @@ class OnlineDFlashModel(nn.Module):
         if not isinstance(head, nn.Linear) or head.bias is not None:
             return False
         weight = head.weight
+        from torch._subclasses.fake_tensor import FakeTensor
+
         if (
             weight.requires_grad
             or weight.dtype != torch.bfloat16
             or not weight.is_cuda
-            or type(weight.data) is not torch.Tensor
+            # make_fx represents the same replicated teacher weight with a
+            # FakeTensor. Wrapped Triton launches retain the fused path while
+            # tracing; actual distributed tensor wrappers remain unsupported.
+            or type(weight.data) not in (torch.Tensor, FakeTensor)
         ):
             return False
         if hidden.dtype != torch.bfloat16 or not hidden.is_cuda:
@@ -1464,6 +1510,16 @@ class OnlineDFlashModel(nn.Module):
 
         if self.lk_loss_type != "lambda":
             return None
+        context_group = getattr(self, "objective_context_group", None)
+        if context_group is not None:
+            import torch.distributed as dist
+
+            if dist.get_world_size(context_group) > 1:
+                totals = torch.stack(
+                    (probability_num.detach(), probability_den.detach())
+                )
+                dist.all_reduce(totals, group=context_group)
+                probability_num, probability_den = totals.unbind()
         acceptance = probability_num / probability_den.clamp_min(1.0)
         return self.kl_scale * torch.exp(-self.kl_decay * acceptance.detach())
 
@@ -1493,8 +1549,12 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
-        selector_loss_alpha: Optional[float] = None,
+        selector_loss_alpha: Optional[float | torch.Tensor] = None,
         collect_detailed_metrics: bool = True,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        output_hidden: Optional[torch.Tensor] = None,
+        prepared_sequence_anchor_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -1505,17 +1565,26 @@ class OnlineDFlashModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            loss_mask=loss_mask,
-            max_valid_anchors=max_valid_anchors,
-        )
+        if output_hidden is not None:
+            if anchor_positions is None or block_keep_mask is None:
+                raise ValueError(
+                    "Prepared backbone output requires anchors and keep mask"
+                )
+        else:
+            anchor_positions, block_keep_mask, output_hidden = (
+                self._forward_draft_blocks(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    loss_mask=loss_mask,
+                    max_valid_anchors=max_valid_anchors,
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                )
+            )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
 
         target_ids = torch.gather(
@@ -1528,21 +1597,9 @@ class OnlineDFlashModel(nn.Module):
             dim=-1,
         )
 
-        # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
-        weight_mask = (
-            block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
+        _, weight_mask = self._dflash_weight_mask(
+            loss_mask, anchor_positions, block_keep_mask
         )
-        weight_mask = weight_mask * valid_label_mask.float()
-
-        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        weight_mask = weight_mask * (pos_in_block > 0).float()
-
-        original_loss_mask_gathered = torch.gather(
-            loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
-            2,
-            safe_label_indices,
-        )
-        weight_mask = weight_mask * original_loss_mask_gathered
 
         hidden_4d = output_hidden.reshape(
             bsz,
@@ -1562,8 +1619,8 @@ class OnlineDFlashModel(nn.Module):
             )
             else None
         )
-        sequence_anchor_scale = None
-        if self.loss_type in _DPACE_LOSS_TYPES:
+        sequence_anchor_scale = prepared_sequence_anchor_scale
+        if self.loss_type in _DPACE_LOSS_TYPES and sequence_anchor_scale is None:
             sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
         metric_terms = None
         if collect_detailed_metrics:
@@ -1634,13 +1691,25 @@ class OnlineDFlashModel(nn.Module):
             accuracy_denom,
         )
         loss_num = token_loss_num
-        effective_selector_alpha = (
-            self.selector_loss_alpha
-            if selector_loss_alpha is None
-            else float(selector_loss_alpha)
-        )
-        if effective_selector_alpha < 0:
-            raise ValueError("selector_loss_alpha must be >= 0")
+        if isinstance(selector_loss_alpha, torch.Tensor):
+            if selector_loss_alpha.ndim != 0:
+                raise ValueError("selector_loss_alpha tensor must be scalar")
+            # Keep scheduled weights as graph inputs. Converting to a Python
+            # float would synchronize the device and freeze the captured value.
+            effective_selector_alpha = selector_loss_alpha.to(
+                device=loss_num.device, dtype=torch.float32
+            )
+            torch._assert_async(
+                effective_selector_alpha >= 0, "selector_loss_alpha must be >= 0"
+            )
+        else:
+            effective_selector_alpha = (
+                self.selector_loss_alpha
+                if selector_loss_alpha is None
+                else float(selector_loss_alpha)
+            )
+            if effective_selector_alpha < 0:
+                raise ValueError("selector_loss_alpha must be >= 0")
         selector_loss_num = loss_num.new_zeros(())
         has_selector_objective = self._selector_objective_enabled
         if has_selector_objective:
@@ -2195,6 +2264,17 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_weight_mask = loss_weight_mask * decay_weights
         return loss_weight_mask
 
+    def prepared_objective_denominator(
+        self, loss_mask, anchor_positions, block_keep_mask
+    ):
+        _, eval_mask, _ = self._build_dspark_labels_and_mask(
+            input_ids=loss_mask,
+            loss_mask=loss_mask,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+        )
+        return self._dspark_loss_weight_mask(eval_mask).sum()
+
     def _aligned_target_hidden(
         self,
         target_last_hidden_states: torch.Tensor,
@@ -2422,24 +2502,22 @@ class OnlineDSparkModel(OnlineDFlashModel):
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
-            world_size = dist.get_world_size()
+            group = getattr(self, "objective_process_group", None)
+            world_size = dist.get_world_size(group)
             if world_size > 1:
-                dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
+                dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM, group=group)
         # Device-side assert: a host-side float() here drains the stream per
         # microbatch right after a collective, serializing all ranks.
         torch._assert_async(
             (global_loss_den > 0).any(),
             "DSpark objective has no supervised target tokens",
         )
-        loss = (
-            world_size
-            * (
-                self.dspark_ce_loss_alpha * ce_num
-                + self.dspark_l1_loss_alpha * l1_num
-                + self.dspark_confidence_head_alpha * confidence_num
-            )
-            / global_loss_den
+        loss_num = (
+            self.dspark_ce_loss_alpha * ce_num
+            + self.dspark_l1_loss_alpha * l1_num
+            + self.dspark_confidence_head_alpha * confidence_num
         )
+        loss = world_size * loss_num / global_loss_den
 
         ratio_metrics = {
             "acc": (correct_num, eval_den),
@@ -2477,6 +2555,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 for name, (numerator, denominator) in ratio_metrics.items()
             },
             "accuracy_denom": eval_den.detach(),
+            "loss_terms": (loss_num, local_loss_den.detach()),
         }
         accuracy = correct_num / eval_den.clamp_min(1.0)
         return loss, {"accuracy": accuracy.detach(), **metrics}
@@ -2489,18 +2568,31 @@ class OnlineDSparkModel(OnlineDFlashModel):
         target_last_hidden_states: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
         collect_detailed_metrics: bool = True,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        output_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
             )
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            loss_mask=loss_mask,
-            max_valid_anchors=max_valid_anchors,
-        )
+        if output_hidden is not None:
+            if anchor_positions is None or block_keep_mask is None:
+                raise ValueError(
+                    "Prepared backbone output requires anchors and keep mask"
+                )
+        else:
+            anchor_positions, block_keep_mask, output_hidden = (
+                self._forward_draft_blocks(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    loss_mask=loss_mask,
+                    max_valid_anchors=max_valid_anchors,
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                )
+            )
 
         (
             target_ids,
