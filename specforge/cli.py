@@ -117,7 +117,7 @@ def _train(resolved) -> int:
     from accelerate.utils import set_seed
 
     cfg = resolved.config
-    if cfg.training.backend == "torchtitan":
+    if cfg.training.backend == "torchtitan" and cfg.training.role != "producer":
         # The Titan Trainer owns distributed initialization and its mesh. Do
         # not construct the legacy FSDP/USP groups before entering that runtime.
         from specforge.application import build_application_run

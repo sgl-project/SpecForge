@@ -16,15 +16,21 @@ from .parallelize import HeterogeneousGradientNorms
 
 
 class SpecForgeTitanTrainer(Trainer):
+    _fixed_graph_shapes = False
+
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
         resume_contract: dict = field(default_factory=dict)
         schedule_total_steps: int | None = None
 
     def __init__(self, config: Config):
-        if not config.training.disable_cuda_graphs:
+        self._fixed_graph_shapes = (
+            not config.training.disable_cuda_graphs
+            or getattr(getattr(config, "compile", None), "mode", None) == "aot_fx_trace"
+        )
+        if self._fixed_graph_shapes and config.parallelism.pipeline_parallel_degree > 1:
             raise ValueError(
-                "SpecForge dynamic feature preparation requires disable_cuda_graphs"
+                "SpecForge graph training currently requires pipeline_parallel_degree=1"
             )
         if (
             config.parallelism.pipeline_parallel_degree > 1
@@ -83,8 +89,10 @@ class SpecForgeTitanTrainer(Trainer):
                     generator=self._anchor_generator,
                 )
                 inputs = dict(inputs)
-                inputs["collect_detailed_metrics"] = self.metrics_processor.should_log(
-                    self.step
+                inputs["collect_detailed_metrics"] = (
+                    False
+                    if self._fixed_graph_shapes
+                    else self.metrics_processor.should_log(self.step)
                 )
                 local_den = model.prepared_objective_denominator(mask, anchors, keep)
                 if algorithm == "dspark":
@@ -95,7 +103,12 @@ class SpecForgeTitanTrainer(Trainer):
                     denominator[group_index] += local_den
                 else:
                     denominator += local_den
-                    inputs["selector_loss_alpha"] = self._selector_alpha(model)
+                    alpha = self._selector_alpha(model)
+                    inputs["selector_loss_alpha"] = (
+                        torch.tensor(alpha, dtype=torch.float32)
+                        if self._fixed_graph_shapes
+                        else alpha
+                    )
                     if model.loss_type != "dflash":
                         _, weights = model._dflash_weight_mask(mask, anchors, keep)
                         scale = model._sequence_anchor_scale(weights).squeeze(-1)
@@ -107,6 +120,7 @@ class SpecForgeTitanTrainer(Trainer):
                             capacity=(
                                 model.num_anchors
                                 if self.parallel_dims.pp_enabled
+                                or self._fixed_graph_shapes
                                 else None
                             ),
                         )
@@ -119,7 +133,9 @@ class SpecForgeTitanTrainer(Trainer):
                     rank=context_mesh.get_local_rank(),
                     degree=context_mesh.size(),
                     capacity=(
-                        model.num_anchors if self.parallel_dims.pp_enabled else None
+                        model.num_anchors
+                        if self.parallel_dims.pp_enabled or self._fixed_graph_shapes
+                        else None
                     ),
                 )
                 inputs["anchor_positions"] = anchors

@@ -339,6 +339,101 @@ def _tokenizer_config(vocab_size: int):
     return FeatureTokenizer.Config(vocab_size=vocab_size)
 
 
+@dataclass
+class _OnlineSourceFactory:
+    """Open the existing retained feature stream after native DCP restore."""
+
+    cfg: Any
+    algorithm: Any
+    natural_steps: int
+    store: Any = None
+
+    def __call__(
+        self, *, dp_rank, dp_world_size, local_batch_size, seq_len, resume_step
+    ):
+        del seq_len
+        from specforge.launch import build_online_consumer_resources
+        from specforge.runtime.data_plane import FeatureDataLoader
+        from specforge.runtime.data_plane.streaming_ref_channel import (
+            StreamingRefChannel,
+        )
+        from specforge.training.assembly import _dataloader_num_workers
+        from specforge.training.disaggregated import (
+            _consumer_database_path,
+            _env,
+            _mooncake_store,
+        )
+
+        channel = StreamingRefChannel(_env("DISAGG_REF_CHANNEL"))
+        resources = None
+        try:
+            self.store = _mooncake_store(self.cfg, retain_on_release=True)
+            resources = build_online_consumer_resources(
+                run_id=self.cfg.run_id,
+                feature_store=self.store,
+                channel=channel,
+                batch_size=local_batch_size,
+                accumulation_steps=self.cfg.training.accumulation_steps,
+                idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", "0"))
+                or None,
+                metadata_db_path=_consumer_database_path(self.cfg),
+                dp_rank=dp_rank,
+                dp_size=dp_world_size,
+                inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
+                resume_from=self.cfg.training.resume_from,
+                resume_step=resume_step,
+                async_ack=False,
+            )
+            source = FeatureDataLoader(
+                self.store,
+                queue=resources.queue,
+                ack=False,
+                device="cpu",
+                batch_size=local_batch_size,
+                collate_fn=self.algorithm.providers.server_streaming_for(
+                    self.cfg.model.input_modality
+                ).build_collator(),
+                strategy=self.algorithm.name,
+                num_workers=_dataloader_num_workers(self.cfg, self.algorithm),
+                pin_memory=True,
+            )
+            return source, resources
+        except BaseException as exc:
+            cleanups = (
+                (lambda: resources.on_failure(exc), resources.close)
+                if resources is not None
+                else (
+                    lambda: channel.mark_consumer_failed(
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+            )
+            for cleanup in cleanups:
+                try:
+                    cleanup()
+                except BaseException:
+                    logging.getLogger(__name__).exception(
+                        "Online source setup cleanup failed"
+                    )
+            raise
+
+    def close(self):
+        store, self.store = self.store, None
+        if store is not None:
+            store.close()
+
+
+def _online_training_horizon(cfg, natural_steps):
+    """Keep the producer's finite stream length separate from the LR horizon."""
+    if natural_steps < 1:
+        raise ValueError("The online producer must supply a complete optimizer window")
+    training = cfg.training
+    return (
+        min(natural_steps, training.max_steps or natural_steps),
+        training.total_steps or training.max_steps or natural_steps,
+    )
+
+
 def _scheduler_config(cfg, total_steps: int):
     from torchtitan.components.optimizer.lr_scheduler import LRSchedulersContainer
 
@@ -522,11 +617,21 @@ def _resume_location(resume_from: str | None, checkpoint_dir: Path):
 
 
 def _native_config(
-    cfg, algorithm, refs, model_sources, layout, data_degree, stop_steps, schedule_steps
+    cfg,
+    algorithm,
+    refs,
+    model_sources,
+    layout,
+    data_degree,
+    stop_steps,
+    schedule_steps,
+    *,
+    online_source=None,
 ):
     from torchtitan.components.checkpoint import CheckpointManager
     from torchtitan.components.metrics import MetricsProcessor
     from torchtitan.components.optimizer.optimizer import default_adamw
+    from torchtitan.components.validate import Validator
     from torchtitan.config import (
         CompileConfig,
         DebugConfig,
@@ -574,16 +679,93 @@ def _native_config(
         seed=training.seed,
         parallelism=layout,
     )
+    # Preserve the original BF16 Trainer contract for existing checkpoints;
+    # opting into a different engine must still reject a resume
+    # from incompatible optimizer/model state.
+    if titan.engine != "trainer":
+        contract.update(engine=titan.engine)
+    if online_source is not None:
+        from specforge.training.disaggregated import _consumer_database_path, _env
+
+        contract.update(
+            feature_source="online",
+            stream_run_id=cfg.run_id,
+            stream_natural_steps=online_source.natural_steps,
+            stream_path=str(Path(_env("DISAGG_REF_CHANNEL")).resolve()),
+            ledger_path=str(Path(_consumer_database_path(cfg)).resolve()),
+        )
     activation_checkpoint = {
         "none": None,
         "full": FullAC.Config(),
         "selective": SelectiveAC.Config(),
     }[titan.activation_checkpoint]
-    native = SpecForgeTitanTrainer.Config(
+    validator_options = Validator.Config(enable=False)
+    if cfg.data.eval_hidden_states_path:
+        from .validation import OfflineEvalSourceFactory, SpecForgeValidator
+
+        eval_refs = (
+            algorithm.providers.offline_for(cfg.model.input_modality)
+            .build_reader(
+                cfg.data.eval_hidden_states_path,
+                run_id=f"{cfg.run_id}-eval",
+                ttt_length=training.ttt_length,
+                max_len=cfg.data.max_length,
+            )
+            .read()
+        )
+        if not eval_refs:
+            raise ValueError("The offline evaluation dataset is empty")
+        validator_options = SpecForgeValidator.Config(
+            enable=True,
+            freq=training.eval_interval,
+            source_factory=OfflineEvalSourceFactory(cfg, algorithm, eval_refs),
+            num_batches=math.ceil(len(eval_refs) / (data_degree * training.batch_size)),
+            algorithm=variant,
+            seed=training.seed,
+            schedule_total_steps=schedule_steps,
+        )
+    trainer_config = SpecForgeTitanTrainer.Config
+    model_config = SpecForgeTitanModel.Config
+    parallelize_fn = parallelize_dflash
+    compile_options = CompileConfig(enable=titan.compile, components=["model"])
+    dataloader_options = FeatureDataLoader.Config(
+        source_factory=_OfflineSourceFactory(cfg, algorithm, refs),
+        epochs=training.num_epochs,
+        pad_to_seq_len=(
+            titan.pp_size > 1
+            or not titan.disable_cuda_graphs
+            or titan.engine == "graph"
+        ),
+    )
+    if online_source is not None:
+        from .online import OnlineFeatureDataLoader, SpecForgeOnlineTrainer
+
+        trainer_config = SpecForgeOnlineTrainer.Config
+        dataloader_options = OnlineFeatureDataLoader.Config(
+            source_factory=online_source
+        )
+    if titan.engine == "graph":
+        from torchtitan.experiments.graph_trainer.configs import (
+            GraphTrainerCompileConfig,
+        )
+
+        from .graph import SpecForgeGraphModel, SpecForgeGraphTrainer
+        from .graph_parallelize import parallelize_graph_dflash
+
+        trainer_config = SpecForgeGraphTrainer.Config
+        model_config = SpecForgeGraphModel.Config
+        parallelize_fn = parallelize_graph_dflash
+        compile_options = GraphTrainerCompileConfig(
+            enable=True,
+            components=["model"],
+            inductor_compilation=titan.graph_inductor,
+            disable_passes=["cudagraph_pass"] if titan.disable_cuda_graphs else [],
+        )
+    native = trainer_config(
         model_spec=ModelSpec(
             name="specforge",
             flavor=variant,
-            model=SpecForgeTitanModel.Config(
+            model=model_config(
                 draft_config=draft_config.to_dict(),
                 algorithm=variant,
                 objective=objective,
@@ -591,18 +773,14 @@ def _native_config(
                 draft_state_path=draft_path,
                 init_seed=training.seed,
             ),
-            parallelize_fn=parallelize_dflash,
+            parallelize_fn=parallelize_fn,
             pipelining_fn=pipeline_dflash,
             post_optimizer_build_fn=group_optimizer_parameters_by_mesh,
             state_dict_adapter=None,
         ),
         dump_folder=str(dump_folder),
         tokenizer=_tokenizer_config(int(draft_config.vocab_size)),
-        dataloader=FeatureDataLoader.Config(
-            source_factory=_OfflineSourceFactory(cfg, algorithm, refs),
-            epochs=training.num_epochs,
-            pad_to_seq_len=titan.pp_size > 1,
-        ),
+        dataloader=dataloader_options,
         loss=SpecForgeObjectiveLoss.Config(algorithm=variant),
         optimizer=default_adamw(
             lr=training.learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
@@ -619,11 +797,13 @@ def _native_config(
             dtype="float32",
             mixed_precision_param="bfloat16",
             mixed_precision_reduce="float32",
-            disable_cuda_graphs=titan.disable_cuda_graphs,
+            disable_cuda_graphs=(
+                True if titan.engine == "graph" else titan.disable_cuda_graphs
+            ),
         ),
         parallelism=ParallelismConfig(**layout),
         activation_checkpoint=activation_checkpoint,
-        compile=CompileConfig(enable=titan.compile, components=["model"]),
+        compile=compile_options,
         checkpoint=CheckpointManager.Config(
             enable=True,
             folder="checkpoint",
@@ -642,6 +822,7 @@ def _native_config(
         debug=DebugConfig(seed=training.seed),
         resume_contract=contract,
         schedule_total_steps=schedule_steps,
+        validator=validator_options,
     )
     native.comm.init_timeout_seconds = training.dist_timeout * 60
     native.comm.train_timeout_seconds = training.dist_timeout * 60
@@ -653,8 +834,23 @@ def build_torchtitan_training_run(cfg, *, algorithm):
     from specforge.training.assembly import TrainingRun
 
     _validate_runtime_versions()
-    if cfg.mode != "offline" or cfg.deployment.mode != "local_colocated":
-        raise ValueError("TorchTitan currently requires offline colocated features")
+    online = cfg.mode == "online"
+    if online:
+        if cfg.deployment.mode != "disaggregated" or cfg.training.role != "consumer":
+            raise ValueError(
+                "TorchTitan online training requires a disaggregated consumer"
+            )
+        titan = cfg.training.torchtitan
+        if cfg.training.tp_size != 1 or titan.cp_size != 1 or titan.pp_size != 1:
+            raise ValueError("TorchTitan online training currently supports DP only")
+        if titan.engine != "trainer" or not titan.disable_cuda_graphs:
+            raise ValueError(
+                "TorchTitan online features do not yet support graph capture"
+            )
+    elif cfg.deployment.mode != "local_colocated":
+        raise ValueError(
+            "TorchTitan offline training currently requires colocated features"
+        )
     if algorithm.name != cfg.training.strategy or algorithm.name not in {
         "dflash",
         "dspark",
@@ -670,8 +866,14 @@ def build_torchtitan_training_run(cfg, *, algorithm):
         raise ValueError(
             "TorchTitan currently supports tracking.report_to none or tensorboard"
         )
-    if cfg.data.eval_hidden_states_path or cfg.training.eval_interval:
-        raise ValueError("TorchTitan offline validation is not yet wired")
+    if bool(cfg.data.eval_hidden_states_path) != bool(cfg.training.eval_interval):
+        raise ValueError(
+            "TorchTitan evaluation requires both eval_hidden_states_path and eval_interval"
+        )
+    if cfg.training.eval_interval and cfg.training.torchtitan.pp_size > 1:
+        raise ValueError(
+            "TorchTitan evaluation does not yet support pipeline parallelism"
+        )
     if cfg.profiling.enabled:
         raise ValueError("SpecForge profiling options are not yet mapped to TorchTitan")
     if cfg.training.max_checkpoints == 1:
@@ -681,14 +883,23 @@ def build_torchtitan_training_run(cfg, *, algorithm):
     layout, data_degree = _parallelism_layout(
         cfg, int(os.environ.get("WORLD_SIZE", "1"))
     )
-    provider = algorithm.providers.offline_for(cfg.model.input_modality)
-    refs = provider.build_reader(
-        cfg.data.hidden_states_path,
-        run_id=cfg.run_id,
-        ttt_length=cfg.training.ttt_length,
-        max_len=cfg.data.max_length,
-    ).read()
-    stop_steps, schedule_steps = _training_horizon(cfg, len(refs), data_degree)
+    online_source = None
+    if online:
+        from specforge.training.disaggregated import _env, _read_online_total_steps
+
+        natural_steps = _read_online_total_steps(cfg, _env("DISAGG_REF_CHANNEL"))
+        stop_steps, schedule_steps = _online_training_horizon(cfg, natural_steps)
+        refs = []
+        online_source = _OnlineSourceFactory(cfg, algorithm, natural_steps)
+    else:
+        provider = algorithm.providers.offline_for(cfg.model.input_modality)
+        refs = provider.build_reader(
+            cfg.data.hidden_states_path,
+            run_id=cfg.run_id,
+            ttt_length=cfg.training.ttt_length,
+            max_len=cfg.data.max_length,
+        ).read()
+        stop_steps, schedule_steps = _training_horizon(cfg, len(refs), data_degree)
 
     def execute():
         import torch.distributed as dist
@@ -719,6 +930,7 @@ def build_torchtitan_training_run(cfg, *, algorithm):
                     data_degree,
                     stop_steps,
                     schedule_steps,
+                    online_source=online_source,
                 )
                 trainer = native.build()
                 trainer.train()
@@ -727,12 +939,28 @@ def build_torchtitan_training_run(cfg, *, algorithm):
                         trainer, model_sources[0], Path(native.dump_folder) / "draft"
                     )
                 return int(trainer.step)
-        except BaseException:
+        except BaseException as exc:
             failed = True
             logging.getLogger(__name__).exception("Native TorchTitan training failed")
+            if online:
+                from specforge.training.disaggregated import (
+                    _publish_role_assembly_failure,
+                )
+
+                _publish_role_assembly_failure(cfg, exc)
             _abort_titan_process_groups()
             raise
         finally:
+            if online_source is not None:
+                try:
+                    online_source.close()
+                except BaseException:
+                    logging.getLogger(__name__).exception(
+                        "Online feature store cleanup failed"
+                    )
+                    if not failed:
+                        _abort_titan_process_groups()
+                        raise
             if not failed:
                 try:
                     if trainer is not None:

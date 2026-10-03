@@ -26,10 +26,10 @@ uv pip install --python .venv-titan/bin/python \
 uv pip install --python .venv-titan/bin/python --no-deps -e .
 ```
 
-SGLang feature capture runs separately. This runtime currently reads existing
-offline feature files through the same algorithm reader, normalizer and
-collator as SpecForge's FSDP runtime. Live queue acknowledgements and online
-consumer recovery need their own stateful data adapter.
+SGLang feature capture runs separately. Offline features use the same algorithm
+reader, normalizer and collator as SpecForge's FSDP runtime. Online consumers
+reuse SpecForge's retained Mooncake feature stream and durable ACK ledger; the
+capture producer continues using its existing runtime and environment.
 
 ## Recipe
 
@@ -86,10 +86,78 @@ PP with `lk_loss_type=lambda` is rejected: its nonlinear coefficient depends on
 the full logical batch and cannot be recomputed independently per microbatch.
 
 Activation checkpointing and per-block `torch.compile` use TorchTitan's
-implementations. CUDA graphs remain disabled because the custom objective has
-dynamic work and host synchronization. Enabling the flag fails explicitly.
-The separate upstream GraphTrainer, expert parallelism, FP8, async TP, USP and
-non-GQA tensor-parallel plans are outside this adapter's supported contract.
+implementations. The feature projector is compiled as well. Expert parallelism,
+FP8, async TP, USP and non-GQA tensor-parallel plans are unsupported.
+
+## CUDA Graph and GraphTrainer
+
+For offline features, the ordinary native Trainer can capture its forward and
+backward with `training.torchtitan.disable_cuda_graphs=false`. Pair it with
+`compile=true` to retain per-block compilation. DP, TP and block CP are
+supported; PP with capture is rejected. Sequence length and anchor capacity
+are padded to fixed shapes. This can waste work on short examples, so measure
+with the actual length distribution. Detailed training diagnostics stay outside
+this graph path; native weighted loss, gradient norm and throughput remain.
+
+The separate experimental upstream GraphTrainer is selected explicitly:
+
+```yaml
+training:
+  backend: torchtitan
+  tp_size: 1
+  torchtitan:
+    engine: graph
+    compile: true
+    graph_inductor: regional
+    disable_cuda_graphs: false
+    activation_checkpoint: none
+```
+
+This executes TorchTitan's joint forward/loss/backward tracing, graph passes,
+SimpleFSDP communication, and CUDA Graph pass. It currently supports DP only.
+`graph_inductor=full` compiles the full traced graph; `regional` compiles tagged
+regions such as FlexAttention and leaves the rest interpreted. GraphTrainer uses
+its default selective activation memory policy and honors the configured FSDP
+resharding policy. It owns activation-memory planning, so the ordinary
+activation-checkpoint setting must remain `none`. Compilation and capture costs
+are separate from steady training speed.
+
+Full-graph compilation can change kernel selection and BF16 numerical behavior.
+The DFlash2 synthetic benchmark showed a different loss trajectory from the
+ordinary Trainer. Treat this engine as experimental and validate convergence
+before adopting it for a training run; successful replay and resume do not
+establish equivalent model quality.
+
+The adapter functionalizes traced Triton buffer writes before graph elimination
+and retains the DFlash2 fused convolution/head. It also gives accumulated
+gradients independent storage so CUDA replay cannot overwrite the previous
+microbatch's gradient. The usual native Trainer and legacy FSDP paths continue
+using their existing eager kernels.
+
+## Evaluation and online features
+
+Set `data.eval_hidden_states_path` and `training.eval_interval` together to run
+periodic offline evaluation from the native training loop. Evaluation visits
+each example once; tail batches are padded with zero-weight rows so every rank
+executes the same number of forwards. It reduces objective numerators and
+denominators over DP/CP, without counting TP replicas or normalizing the weighted
+objective again by token count. It preserves training RNG, data cursor, gradients
+and model mode. PP evaluation is rejected; the sequence-walk acceptance metric
+is omitted under CP because separate local walks cannot be summed correctly.
+
+Online training uses the existing disaggregated Mooncake recipe and the same
+producer/consumer commands, with `training.backend=torchtitan`. This first
+adapter supports the native Trainer with DP only, synchronous ACKs and native
+DCP checkpoints. TP, CP, PP and either graph-capture path are rejected for online
+features. It currently receives features on the host before native H2D transfer.
+
+The online loader opens only after native DCP restore. It never seeks a live
+queue. Each successful optimizer window commits its sample IDs to the existing
+ledger and inbox before checkpoint/evaluation; a failed or partial window is
+not ACKed. Resume requires the retained producer/feature store and a ledger
+boundary matching the selected checkpoint. An ACK ledger ahead of an older
+checkpoint is rejected, matching the existing recovery contract. Enabling
+online features or evaluation is a workflow capability, not a promised speedup.
 
 ## Checkpoints and precision
 
@@ -112,9 +180,10 @@ weights with FP32 masters. Report this difference in performance comparisons.
 MFU is an analytical dense-work estimate; use measured step time and peak GPU
 memory when comparing these custom sparse objectives.
 
-Current frontend constraints: offline colocated text features, BF16 compute,
-tracking `none` or `tensorboard`, and no periodic validation, SpecForge profiler
-configuration or optimizer CPU offload. The runtime emits native weighted loss,
+Current frontend constraints include text features, BF16 compute, tracking
+`none` or `tensorboard`, and no SpecForge profiler configuration or optimizer
+CPU offload. Offline disaggregated ingestion is not connected to this adapter.
+The runtime emits native weighted loss,
 gradient norm, learning-rate and throughput metrics; selector, teacher and
 acceptance diagnostics are not connected to its logger yet. Titan's
 token-normalized maximum-local-loss diagnostic is omitted because it does not

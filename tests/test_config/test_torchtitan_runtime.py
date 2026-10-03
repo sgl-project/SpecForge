@@ -68,6 +68,23 @@ class TorchTitanRecipeTest(unittest.TestCase):
         self.assertEqual(cfg.training.tp_size, 2)
         self.assertTrue(cfg.training.torchtitan.disable_cuda_graphs)
 
+    def test_graph_engine_rejects_incompatible_parallelism(self):
+        options = {"engine": "graph", "compile": True}
+        recipe(backend="torchtitan", torchtitan=options)
+        for training in (
+            {"tp_size": 2, "torchtitan": options},
+            {"torchtitan": {**options, "cp_size": 2}},
+            {"torchtitan": {**options, "pp_size": 2}},
+        ):
+            with self.subTest(training=training):
+                with self.assertRaisesRegex(ValueError, "supports DP only"):
+                    recipe(backend="torchtitan", **training)
+        with self.assertRaisesRegex(ValueError, "activation memory"):
+            recipe(
+                backend="torchtitan",
+                torchtitan={**options, "activation_checkpoint": "full"},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

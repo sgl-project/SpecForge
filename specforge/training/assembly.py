@@ -591,10 +591,19 @@ def build_training_run(
             f"{algorithm.name!r} != {cfg.training.strategy!r}"
         )
 
-    if cfg.training.backend == "torchtitan":
+    if cfg.training.backend == "torchtitan" and cfg.training.role != "producer":
         from specforge.training.torchtitan.frontend import build_torchtitan_training_run
 
-        return build_torchtitan_training_run(cfg, algorithm=algorithm)
+        try:
+            return build_torchtitan_training_run(cfg, algorithm=algorithm)
+        except BaseException as exc:
+            if cfg.mode == "online":
+                from specforge.training.disaggregated import (
+                    _publish_role_assembly_failure,
+                )
+
+                _publish_role_assembly_failure(cfg, exc)
+            raise
 
     t = cfg.training
     if t.role != "producer":

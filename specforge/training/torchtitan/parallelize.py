@@ -171,6 +171,11 @@ def parallelize_dflash(
         ac_config.build(dump_folder=dump_folder).apply(draft)
     if compile_config.enable and "model" in compile_config.components:
         apply_compile(draft, compile_config=compile_config, parallel_dims=parallel_dims)
+        # Titan's decoder helper visits only layers. The teacher feature
+        # projection is another large GEMM whose surrounding casts benefit
+        # from fusion. Later PP stages have no feature projector.
+        if draft.fc is not None:
+            draft.fc.compile(backend=compile_config.backend, fullgraph=True)
 
     dp_names = (
         ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]

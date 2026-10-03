@@ -940,11 +940,16 @@ class OnlineDFlashModel(nn.Module):
         if not isinstance(head, nn.Linear) or head.bias is not None:
             return False
         weight = head.weight
+        from torch._subclasses.fake_tensor import FakeTensor
+
         if (
             weight.requires_grad
             or weight.dtype != torch.bfloat16
             or not weight.is_cuda
-            or type(weight.data) is not torch.Tensor
+            # make_fx represents the same replicated teacher weight with a
+            # FakeTensor. Wrapped Triton launches retain the fused path while
+            # tracing; actual distributed tensor wrappers remain unsupported.
+            or type(weight.data) not in (torch.Tensor, FakeTensor)
         ):
             return False
         if hidden.dtype != torch.bfloat16 or not hidden.is_cuda:
@@ -1544,7 +1549,7 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
-        selector_loss_alpha: Optional[float] = None,
+        selector_loss_alpha: Optional[float | torch.Tensor] = None,
         collect_detailed_metrics: bool = True,
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
@@ -1686,13 +1691,25 @@ class OnlineDFlashModel(nn.Module):
             accuracy_denom,
         )
         loss_num = token_loss_num
-        effective_selector_alpha = (
-            self.selector_loss_alpha
-            if selector_loss_alpha is None
-            else float(selector_loss_alpha)
-        )
-        if effective_selector_alpha < 0:
-            raise ValueError("selector_loss_alpha must be >= 0")
+        if isinstance(selector_loss_alpha, torch.Tensor):
+            if selector_loss_alpha.ndim != 0:
+                raise ValueError("selector_loss_alpha tensor must be scalar")
+            # Keep scheduled weights as graph inputs. Converting to a Python
+            # float would synchronize the device and freeze the captured value.
+            effective_selector_alpha = selector_loss_alpha.to(
+                device=loss_num.device, dtype=torch.float32
+            )
+            torch._assert_async(
+                effective_selector_alpha >= 0, "selector_loss_alpha must be >= 0"
+            )
+        else:
+            effective_selector_alpha = (
+                self.selector_loss_alpha
+                if selector_loss_alpha is None
+                else float(selector_loss_alpha)
+            )
+            if effective_selector_alpha < 0:
+                raise ValueError("selector_loss_alpha must be >= 0")
         selector_loss_num = loss_num.new_zeros(())
         has_selector_objective = self._selector_objective_enabled
         if has_selector_objective:

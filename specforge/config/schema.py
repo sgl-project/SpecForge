@@ -907,12 +907,22 @@ class TorchTitanConfig(StrictConfigModel):
     )
     activation_checkpoint: Literal["none", "full", "selective"] = "none"
     compile: bool = False
+    engine: Literal["trainer", "graph"] = "trainer"
+    graph_inductor: Literal["regional", "full"] = "regional"
     disable_cuda_graphs: bool = True
 
     @model_validator(mode="after")
     def _validate_degrees(self):
         if self.dp_shard == 0:
             raise ValueError("training.torchtitan.dp_shard must be -1 or positive")
+        if self.engine == "graph" and not self.compile:
+            raise ValueError("TorchTitan GraphTrainer requires compile=true")
+        if self.engine == "graph" and self.activation_checkpoint != "none":
+            raise ValueError(
+                "GraphTrainer manages activation memory through graph passes"
+            )
+        if self.engine != "graph" and self.graph_inductor != "regional":
+            raise ValueError("graph_inductor requires TorchTitan engine=graph")
         return self
 
 
@@ -1038,6 +1048,12 @@ class TrainingConfig(StrictConfigModel):
                 raise ValueError(
                     "TorchTitan v0.3 does not support pipeline parallelism with CUDA graphs"
                 )
+            if self.torchtitan.engine == "graph" and (
+                self.tp_size != 1
+                or self.torchtitan.cp_size != 1
+                or self.torchtitan.pp_size != 1
+            ):
+                raise ValueError("SpecForge GraphTrainer currently supports DP only")
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:
@@ -1209,7 +1225,11 @@ class Config(StrictConfigModel):
                 "an eval data source and training.eval_interval must be "
                 "configured together"
             )
-        if self.data.eval_hidden_states_path and mode != "offline":
+        if (
+            self.data.eval_hidden_states_path
+            and mode != "offline"
+            and self.training.backend != "torchtitan"
+        ):
             raise ValueError(
                 "data.eval_hidden_states_path requires an offline training data source"
             )

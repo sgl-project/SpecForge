@@ -3,8 +3,11 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from specforge.training.torchtitan.frontend import (
+    _online_training_horizon,
     _parallelism_layout,
     _resume_location,
     _training_horizon,
@@ -13,6 +16,39 @@ from tests.test_config.test_torchtitan_runtime import recipe
 
 
 class TorchTitanFrontendTest(unittest.TestCase):
+    def test_online_assembly_failure_notifies_waiting_producer(self):
+        from specforge.training.assembly import build_training_run
+
+        cfg = SimpleNamespace(
+            mode="online",
+            training=SimpleNamespace(
+                backend="torchtitan", role="consumer", strategy="dflash"
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            channel = str(Path(directory) / "refs")
+            with (
+                mock.patch.dict("os.environ", {"DISAGG_REF_CHANNEL": channel}),
+                mock.patch(
+                    "specforge.training.torchtitan.frontend.build_torchtitan_training_run",
+                    side_effect=RuntimeError("engine unavailable"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "engine unavailable"):
+                    build_training_run(cfg, algorithm=SimpleNamespace(name="dflash"))
+            self.assertIn(
+                "engine unavailable", Path(channel + ".consumer_failed").read_text()
+            )
+
+    def test_online_schedule_does_not_stop_the_finite_stream(self):
+        for schedule in (10, 1000):
+            cfg = recipe(backend="torchtitan", total_steps=schedule)
+            self.assertEqual(_online_training_horizon(cfg, 100), (100, schedule))
+        cfg = recipe(backend="torchtitan", total_steps=1000, max_steps=20)
+        self.assertEqual(_online_training_horizon(cfg, 100), (20, 1000))
+        cfg = recipe(backend="torchtitan", max_steps=200)
+        self.assertEqual(_online_training_horizon(cfg, 100), (100, 200))
+
     def test_tp_cp_pp_axes_leave_only_data_ranks_for_sampling(self):
         cfg = recipe(
             backend="torchtitan", tp_size=2, torchtitan={"cp_size": 2, "pp_size": 2}
