@@ -40,6 +40,29 @@ from types import SimpleNamespace
 import training_benchmark_recipes as recipes
 
 
+def source_hashes(root):
+    """Include model and custom kernel code, not just the training adapters."""
+    root = Path(root)
+    files = sorted((root / "specforge").rglob("*.py"))
+    if not files:
+        raise ValueError(f"No SpecForge Python sources found under {root}")
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in files
+    }
+
+
+def package_versions():
+    """The original FSDP environment does not need TorchTitan installed."""
+    versions = {}
+    for name in ("torch", "torchtitan", "transformers", "triton"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--specforge-root", required=True, type=Path)
@@ -494,29 +517,7 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    source_files = [
-        "specforge/training/backend.py",
-        "specforge/training/controller.py",
-        "specforge/optimizer.py",
-        "specforge/algorithms/common/dflash_family_model.py",
-        "specforge/training/torchtitan/runtime.py",
-        "specforge/training/torchtitan/frontend.py",
-        "specforge/training/torchtitan/model.py",
-        "specforge/training/torchtitan/parallelize.py",
-        "specforge/training/torchtitan/data.py",
-        "specforge/training/torchtitan/loss.py",
-        "specforge/training/torchtitan/metrics.py",
-        "specforge/training/torchtitan/graph.py",
-        "specforge/training/torchtitan/graph_parallelize.py",
-    ]
-
-    def source_hashes():
-        return {
-            name: hashlib.sha256((args.specforge_root / name).read_bytes()).hexdigest()
-            for name in source_files
-        }
-
-    source_before = source_hashes()
+    source_before = source_hashes(args.specforge_root)
     config, source = recipes.resolve_config(args.algorithm, args.recipe, tiny=args.tiny)
     trainer, failed = None, False
     started = time.perf_counter()
@@ -553,7 +554,7 @@ def main():
             dist.all_gather_object(identities, identity)
             train()
             result = measurement.result(cache_bytes, data_degree)
-            if source_hashes() != source_before:
+            if source_hashes(args.specforge_root) != source_before:
                 raise RuntimeError("Benchmark source changed during this trial")
             payload = {
                 "benchmark": "native-torchtitan-v1",
@@ -615,6 +616,14 @@ def main():
                     ),
                     "compute_dtype": "bfloat16",
                     "adam_state_dtype": "float32",
+                    "gradient_accumulation_dtype": (
+                        "float32" if args.backend == "torchtitan" else "bfloat16"
+                    ),
+                    "float32_matmul_precision": torch.get_float32_matmul_precision(),
+                    "allow_tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
+                    "allow_tf32_cudnn": torch.backends.cudnn.allow_tf32,
+                    "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+                    "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                     "kernel_environment": {
                         key: os.environ.get(key, "1")
                         for key in (
@@ -623,10 +632,7 @@ def main():
                         )
                     },
                 },
-                "versions": {
-                    name: importlib.metadata.version(name)
-                    for name in ("torch", "torchtitan", "transformers", "triton")
-                },
+                "versions": package_versions(),
                 "cuda": torch.version.cuda,
                 "device": torch.cuda.get_device_name(),
                 "source_sha256": source_before,
