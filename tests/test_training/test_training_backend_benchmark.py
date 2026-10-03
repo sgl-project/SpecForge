@@ -152,9 +152,112 @@ class BackendBenchmarkContractTest(unittest.TestCase):
             self.assertIsNone(benchmark.package_versions()["torchtitan"])
 
 
+class NonpersistentBufferTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import torch
+        except (ImportError, OSError) as error:
+            raise unittest.SkipTest(f"Working CPU Torch unavailable: {error}")
+        cls.torch = torch
+
+    def test_restores_precise_fresh_buffers_without_changing_parameters_or_state(self):
+        torch = self.torch
+        model = torch.nn.Module()
+        model.rotary_emb = torch.nn.Module()
+        model.rotary_emb.register_buffer(
+            "inv_freq",
+            torch.tensor([0.6493816376], dtype=torch.float32),
+            persistent=False,
+        )
+        model.rotary_emb.register_buffer(
+            "original_inv_freq",
+            model.rotary_emb.inv_freq.clone(),
+            persistent=False,
+        )
+        model.register_parameter("weight", torch.nn.Parameter(torch.ones(2)))
+        reference = recipes.nonpersistent_buffers(model, clone=True)
+        before = recipes.nonpersistent_buffer_metadata(model)
+        model.to(torch.bfloat16)
+        self.assertNotEqual(recipes.nonpersistent_buffer_metadata(model), before)
+        state = recipes._tensor_fingerprint(model.state_dict())
+        recipes.restore_nonpersistent_buffers(model, reference)
+        self.assertEqual(recipes.nonpersistent_buffer_metadata(model), before)
+        self.assertEqual(recipes._tensor_fingerprint(model.state_dict()), state)
+        self.assertEqual(model.weight.dtype, torch.bfloat16)
+        # This matches the FSDP wrapper's actual buffer policy: no re-rounding.
+        model.rotary_emb.to(torch.float32)
+        self.assertEqual(recipes.nonpersistent_buffer_metadata(model), before)
+        self.assertEqual(set(model.state_dict()), {"weight"})
+
+    def test_content_hash_detects_untracked_buffer_value_and_dtype_changes(self):
+        torch = self.torch
+        model = torch.nn.Module()
+        model.register_buffer("rope", torch.ones(2), persistent=False)
+        before = recipes.nonpersistent_buffer_metadata(model)
+        model.rope[1] += 0.1
+        self.assertNotEqual(recipes.nonpersistent_buffer_metadata(model), before)
+        model.rope.fill_(1)
+        model.to(torch.bfloat16)
+        self.assertNotEqual(recipes.nonpersistent_buffer_metadata(model), before)
+        self.assertEqual(model.state_dict(), {})
+
+    def test_draft_constructor_without_uniform_cast_preserves_parameter_seed(self):
+        torch = self.torch
+        from transformers import Qwen3Config
+
+        from specforge.modeling.auto import AutoDraftModel
+
+        old_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            for algorithm in recipes.ARCHITECTURES:
+                config, _ = recipes.resolve_config(algorithm, tiny=True)
+                cfg = Qwen3Config.from_dict(config)
+                with self.subTest(algorithm=algorithm):
+                    torch.manual_seed(2026)
+                    original = AutoDraftModel.from_config(
+                        cfg, torch_dtype=torch.bfloat16
+                    )
+                    torch.manual_seed(2026)
+                    fresh = AutoDraftModel.from_config(cfg)
+                    self.assertEqual(
+                        recipes._tensor_fingerprint(original.state_dict()),
+                        recipes._tensor_fingerprint(fresh.state_dict()),
+                    )
+                    self.assertNotEqual(
+                        recipes.nonpersistent_buffer_metadata(original),
+                        recipes.nonpersistent_buffer_metadata(fresh),
+                    )
+                    self.assertTrue(
+                        all(
+                            value.dtype == torch.float32
+                            for value in recipes.nonpersistent_buffers(fresh).values()
+                        )
+                    )
+                    self.assertEqual(len(recipes.nonpersistent_buffers(fresh)), 2)
+        finally:
+            torch.set_default_dtype(old_dtype)
+
+
 class MatchedBackendMatrixTest(unittest.TestCase):
     def records(self):
         records = {}
+        buffers = {
+            "sha256": "a" * 64,
+            "tensors": {
+                "rotary_emb.inv_freq": {
+                    "shape": [64],
+                    "dtype": "torch.float32",
+                    "sha256": "b" * 64,
+                },
+                "rotary_emb.original_inv_freq": {
+                    "shape": [64],
+                    "dtype": "torch.float32",
+                    "sha256": "c" * 64,
+                },
+            },
+        }
         for algorithm in matrix.ALGORITHMS:
             for case in matrix.CASES:
                 native = case not in ("fsdp213", "fsdp214")
@@ -175,6 +278,13 @@ class MatchedBackendMatrixTest(unittest.TestCase):
                         "config": {"architectures": [recipes.ARCHITECTURES[algorithm]]},
                         "warmup_steps": 1,
                         "steps": 2,
+                        "world_size": 2,
+                        "nonpersistent_buffer_policy": recipes.NONPERSISTENT_BUFFER_POLICY,
+                        "initial_nonpersistent_buffers": copy.deepcopy(buffers),
+                        "runtime_nonpersistent_buffers_by_rank": [
+                            {"rank": rank, **copy.deepcopy(buffers)}
+                            for rank in range(2)
+                        ],
                     },
                     "runtime": {
                         "titan_engine": "graph" if graph else "trainer",
@@ -337,6 +447,55 @@ class MatchedBackendMatrixTest(unittest.TestCase):
         records = self.records()
         records.pop(("dspark", "fsdp213", 1))
         with self.assertRaises(ValueError):
+            matrix.validate_and_summarize(records, self.tolerances(), repeats=1)
+
+    def test_missing_buffers_rejected_even_when_all_old_contracts_match(self):
+        for key in (
+            "nonpersistent_buffer_policy",
+            "initial_nonpersistent_buffers",
+            "runtime_nonpersistent_buffers_by_rank",
+        ):
+            records = self.records()
+            for payload in records.values():
+                payload["comparison_contract"].pop(key)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "buffer"):
+                matrix.validate_and_summarize(records, self.tolerances(), repeats=1)
+
+    def test_runtime_buffer_mismatch_rejected_even_when_all_contracts_match(self):
+        for change in (
+            lambda value: value["runtime_nonpersistent_buffers_by_rank"].pop(),
+            lambda value: value["runtime_nonpersistent_buffers_by_rank"][1].update(
+                sha256="c" * 64
+            ),
+            lambda value: value["runtime_nonpersistent_buffers_by_rank"][0].update(
+                rank=1
+            ),
+            lambda value: value["initial_nonpersistent_buffers"].update(tensors={}),
+        ):
+            records = self.records()
+            for payload in records.values():
+                change(payload["comparison_contract"])
+            with (
+                self.subTest(change=change),
+                self.assertRaisesRegex(ValueError, "buffer"),
+            ):
+                matrix.validate_and_summarize(records, self.tolerances(), repeats=1)
+
+    def test_matching_bf16_rotary_hashes_cannot_claim_fp32_buffer_policy(self):
+        records = self.records()
+        for payload in records.values():
+            contract = payload["comparison_contract"]
+            contract["initial_nonpersistent_buffers"]["tensors"]["rotary_emb.inv_freq"][
+                "dtype"
+            ] = "torch.bfloat16"
+            contract["runtime_nonpersistent_buffers_by_rank"] = [
+                {
+                    "rank": rank,
+                    **copy.deepcopy(contract["initial_nonpersistent_buffers"]),
+                }
+                for rank in range(2)
+            ]
+        with self.assertRaisesRegex(ValueError, "FP32"):
             matrix.validate_and_summarize(records, self.tolerances(), repeats=1)
 
     def test_first_step_uses_its_own_stricter_tolerance(self):

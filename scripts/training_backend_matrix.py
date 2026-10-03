@@ -24,7 +24,11 @@ import time
 from pathlib import Path
 
 from benchmark_training_backends import source_hashes
-from training_benchmark_recipes import ARCHITECTURES, STOCK_CONFIGS
+from training_benchmark_recipes import (
+    ARCHITECTURES,
+    NONPERSISTENT_BUFFER_POLICY,
+    STOCK_CONFIGS,
+)
 
 ALGORITHMS = ("dflash", "dflash2", "dspark")
 CASES = {
@@ -160,6 +164,45 @@ def validate_algorithm_identity(payload, algorithm):
         raise ValueError(f"Unexpected recipe source for {algorithm}: {source}")
 
 
+def validate_nonpersistent_buffer_identity(contract):
+    """state_dict hashes alone omit the RoPE state used by the forward pass."""
+    if contract.get("nonpersistent_buffer_policy") != NONPERSISTENT_BUFFER_POLICY:
+        raise ValueError("Missing or unsupported nonpersistent buffer policy")
+    initial = contract.get("initial_nonpersistent_buffers")
+    runtime = contract.get("runtime_nonpersistent_buffers_by_rank")
+    if not isinstance(initial, dict) or not initial.get("tensors"):
+        raise ValueError("Missing initial nonpersistent buffer fingerprints")
+    if not isinstance(initial.get("sha256"), str) or len(initial["sha256"]) != 64:
+        raise ValueError("Invalid nonpersistent buffer aggregate fingerprint")
+    for name, value in initial["tensors"].items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(value, dict)
+            or set(value) != {"shape", "dtype", "sha256"}
+            or not isinstance(value["shape"], list)
+            or not isinstance(value["dtype"], str)
+            or not isinstance(value["sha256"], str)
+            or len(value["sha256"]) != 64
+        ):
+            raise ValueError("Incomplete nonpersistent buffer fingerprint")
+    for name in ("rotary_emb.inv_freq", "rotary_emb.original_inv_freq"):
+        if initial["tensors"].get(name, {}).get("dtype") != "torch.float32":
+            raise ValueError("Fresh-reference RoPE buffers must be recorded in FP32")
+    world = contract.get("world_size")
+    if (
+        not isinstance(world, int)
+        or world < 1
+        or not isinstance(runtime, list)
+        or len(runtime) != world
+    ):
+        raise ValueError("Missing per-rank runtime nonpersistent buffer fingerprints")
+    for rank, value in enumerate(runtime):
+        if value != {"rank": rank, **initial}:
+            raise ValueError(
+                "Runtime nonpersistent buffers differ from initial reference"
+            )
+
+
 def validate_and_summarize(records, tolerances, *, repeats):
     """Reject mixed snapshots/inputs and gate every repeat against its peers."""
     required = {
@@ -222,6 +265,7 @@ def validate_and_summarize(records, tolerances, *, repeats):
             for repeat in range(1, repeats + 1):
                 payload = records[(algorithm, case, repeat)]
                 validate_algorithm_identity(payload, algorithm)
+                validate_nonpersistent_buffer_identity(payload["comparison_contract"])
                 if identify_case(payload) != case:
                     raise ValueError("Trial name disagrees with its runtime")
                 if payload["recipe_source"] != reference_source:
@@ -433,6 +477,7 @@ def main(argv=None):
         "OMP_NUM_THREADS": "1",
         "SPECFORGE_DFLASH_FUSED_HEAD": "1",
         "SPECFORGE_DFLASH2_FUSED_CONV": "1",
+        "SPECFORGE_FLEX_ATTENTION_BACKEND": "",
     }
     launches, records = [], {}
     for trial in trials:
@@ -471,6 +516,7 @@ def main(argv=None):
                             "OMP_NUM_THREADS",
                             "SPECFORGE_DFLASH_FUSED_HEAD",
                             "SPECFORGE_DFLASH2_FUSED_CONV",
+                            "SPECFORGE_FLEX_ATTENTION_BACKEND",
                         )
                     },
                 )

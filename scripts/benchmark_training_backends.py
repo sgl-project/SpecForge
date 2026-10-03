@@ -234,7 +234,7 @@ def anchor_plan_hash(model, batches, args, data_rank):
     return digest.hexdigest()
 
 
-def run_fsdp(args, model, draft, batches, measurement):
+def run_fsdp(args, model, draft, batches, measurement, reference_buffers):
     import torch
     import torch.distributed as dist
 
@@ -250,6 +250,7 @@ def run_fsdp(args, model, draft, batches, measurement):
 
     init_distributed()
     model.to(device=measurement.device, dtype=torch.bfloat16)
+    recipes.restore_nonpersistent_buffers(draft, reference_buffers)
     parallel = ParallelConfig.from_distributed(
         sharding_strategy=args.sharding, param_dtype=torch.bfloat16
     )
@@ -321,7 +322,7 @@ def run_fsdp(args, model, draft, batches, measurement):
                 global_mean=args.algorithm == "dspark",
             )
 
-    return train, None
+    return train, None, draft
 
 
 def run_titan(args, config, model, batches, measurement, directory):
@@ -499,7 +500,7 @@ def run_titan(args, config, model, batches, measurement, directory):
     )
     init_logger()
     trainer = TimedTrainer(native)
-    return trainer.train, trainer
+    return trainer.train, trainer, trainer.model_parts[0].draft_model
 
 
 def main():
@@ -528,19 +529,38 @@ def main():
             model, draft, counts, draft_hash, teacher_hash = recipes._build_model(
                 args, config, "cpu", torch.bfloat16
             )
+            reference_buffers = recipes.nonpersistent_buffers(draft, clone=True)
+            initial_buffers = recipes.nonpersistent_buffer_metadata(draft)
             batches, feature_hashes, cache_bytes = recipes._make_batches(
                 args, config, data_rank, device, torch.bfloat16
             )
             anchors_hash = anchor_plan_hash(model, batches, args, data_rank)
             measurement = Measurement(args, device)
             if args.backend == "fsdp":
-                train, trainer = run_fsdp(args, model, draft, batches, measurement)
+                train, trainer, runtime_draft = run_fsdp(
+                    args, model, draft, batches, measurement, reference_buffers
+                )
             else:
-                train, trainer = run_titan(
+                train, trainer, runtime_draft = run_titan(
                     args, config, model, batches, measurement, directory
                 )
                 del model, draft
                 gc.collect()
+            runtime_buffers = recipes.nonpersistent_buffer_metadata(runtime_draft)
+            if runtime_buffers != initial_buffers:
+                raise RuntimeError(
+                    "Backend changed nonpersistent buffer initialization"
+                )
+            runtime_buffers_by_rank = [None] * world
+            dist.all_gather_object(
+                runtime_buffers_by_rank, {"rank": rank, **runtime_buffers}
+            )
+            if any(
+                {key: value for key, value in item.items() if key != "rank"}
+                != initial_buffers
+                for item in runtime_buffers_by_rank
+            ):
+                raise RuntimeError("Nonpersistent buffers differ across ranks")
             build_seconds = torch.tensor(
                 time.perf_counter() - started, device=device, dtype=torch.float64
             )
@@ -553,6 +573,10 @@ def main():
             identities = [None] * world
             dist.all_gather_object(identities, identity)
             train()
+            # FSDP lazily applies its buffer policy on the first forward; check
+            # the actual live buffers again after all timed windows.
+            if recipes.nonpersistent_buffer_metadata(runtime_draft) != initial_buffers:
+                raise RuntimeError("Training changed controlled nonpersistent buffers")
             result = measurement.result(cache_bytes, data_degree)
             if source_hashes(args.specforge_root) != source_before:
                 raise RuntimeError("Benchmark source changed during this trial")
@@ -577,6 +601,9 @@ def main():
                     "sharding": args.sharding,
                     "learning_rate": args.learning_rate,
                     "initial_draft_sha256": draft_hash,
+                    "nonpersistent_buffer_policy": recipes.NONPERSISTENT_BUFFER_POLICY,
+                    "initial_nonpersistent_buffers": initial_buffers,
+                    "runtime_nonpersistent_buffers_by_rank": runtime_buffers_by_rank,
                     "frozen_target_sha256": teacher_hash,
                     "features_and_anchors_by_rank": identities,
                     "warmup_steps": args.warmup_steps,
@@ -625,11 +652,16 @@ def main():
                     "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
                     "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                     "kernel_environment": {
-                        key: os.environ.get(key, "1")
-                        for key in (
-                            "SPECFORGE_DFLASH_FUSED_HEAD",
-                            "SPECFORGE_DFLASH2_FUSED_CONV",
-                        )
+                        **{
+                            key: os.environ.get(key, "1")
+                            for key in (
+                                "SPECFORGE_DFLASH_FUSED_HEAD",
+                                "SPECFORGE_DFLASH2_FUSED_CONV",
+                            )
+                        },
+                        "SPECFORGE_FLEX_ATTENTION_BACKEND": os.environ.get(
+                            "SPECFORGE_FLEX_ATTENTION_BACKEND", ""
+                        ),
                     },
                 },
                 "versions": package_versions(),

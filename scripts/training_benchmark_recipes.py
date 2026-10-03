@@ -121,6 +121,63 @@ def _tensor_fingerprint(values):
     return digest.hexdigest()
 
 
+NONPERSISTENT_BUFFER_POLICY = "fresh-reference-fp32-v1"
+
+
+def nonpersistent_buffers(model, *, clone=False):
+    """Read buffers omitted by state_dict, retaining stable unwrapped names."""
+    result = {}
+    for module_name, module in model.named_modules():
+        parts = [
+            part
+            for part in module_name.split(".")
+            if part not in {"_fsdp_wrapped_module", "_orig_mod"}
+        ]
+        for name in sorted(module._non_persistent_buffers_set):
+            value = module._buffers.get(name)
+            if value is None:
+                continue
+            path = ".".join([part for part in parts if part] + [name])
+            if path in result:
+                raise ValueError(f"Duplicate normalized buffer name: {path}")
+            result[path] = value.detach().cpu().clone() if clone else value
+    return result
+
+
+def restore_nonpersistent_buffers(model, reference):
+    """Undo benchmark-only dtype conversions using fresh pre-cast values.
+
+    Legacy production construction casts all buffers to BF16. For this
+    controlled comparison only, preserve the fresh constructor's FP32 RoPE
+    frequencies, as native Titan initialization does. Copying into an already
+    BF16 tensor would round again, so restore the reference dtype as well.
+    """
+    live = nonpersistent_buffers(model)
+    if set(live) != set(reference):
+        raise ValueError("Nonpersistent buffer names differ from fresh reference")
+    for name, value in reference.items():
+        if live[name].shape != value.shape:
+            raise ValueError(f"Nonpersistent buffer shape differs: {name}")
+        module_name, _, leaf = name.rpartition(".")
+        module = model.get_submodule(module_name) if module_name else model
+        module._buffers[leaf] = value.to(device=live[name].device).clone()
+
+
+def nonpersistent_buffer_metadata(model):
+    values = nonpersistent_buffers(model)
+    return {
+        "sha256": _tensor_fingerprint(values),
+        "tensors": {
+            name: {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "sha256": _tensor_fingerprint({name: value}),
+            }
+            for name, value in sorted(values.items())
+        },
+    }
+
+
 def _build_model(args, config, device, dtype):
     import torch
     from torch import nn
@@ -138,12 +195,16 @@ def _build_model(args, config, device, dtype):
         torch.manual_seed(args.seed)
         draft_config = Qwen3Config.from_dict(copy.deepcopy(config))
         draft_config._attn_implementation = args.attention
-        draft = AutoDraftModel.from_config(draft_config, torch_dtype=dtype)
+        # Keep a fresh reference before AutoDraftModel's uniform dtype cast
+        # can round explicit FP32 nonpersistent buffers (notably HF RoPE).
+        # Parameters still initialize in the requested default dtype, with
+        # exactly the same seed and values as the original benchmark.
+        draft = AutoDraftModel.from_config(draft_config)
+        reference_buffers = nonpersistent_buffers(draft, clone=True)
         if args.activation_checkpointing:
             draft.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
-        draft_hash = _tensor_fingerprint(draft.state_dict())
         # Independent seed makes the target identical across algorithms, too.
         torch.manual_seed(args.seed + 1)
         embedding = nn.Embedding(config["vocab_size"], config["hidden_size"])
@@ -177,8 +238,11 @@ def _build_model(args, config, device, dtype):
                 p.numel() for p in model.parameters() if not p.requires_grad
             ),
         }
+        model.to(device=device, dtype=dtype)
+        restore_nonpersistent_buffers(draft, reference_buffers)
+        draft_hash = _tensor_fingerprint(draft.state_dict())
         return (
-            model.to(device=device, dtype=dtype),
+            model,
             draft,
             counts,
             draft_hash,
