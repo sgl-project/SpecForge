@@ -120,6 +120,10 @@ def _train(resolved) -> int:
     # Make the typed recipe authoritative for the backend's existing FSDP
     # sharding seam in both direct and managed-local worker processes.
     os.environ["FSDP_SHARDING"] = cfg.training.fsdp_sharding
+    if cfg.training.ddp_bucket_cap_mb is None:
+        os.environ.pop("SPECFORGE_DDP_BUCKET_CAP_MB", None)
+    else:
+        os.environ["SPECFORGE_DDP_BUCKET_CAP_MB"] = str(cfg.training.ddp_bucket_cap_mb)
     set_seed(cfg.training.seed)
     if cfg.training.role == "producer":
         # A server-capture/offline-ingest producer owns no trainer process

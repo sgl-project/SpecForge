@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
@@ -107,6 +108,148 @@ class TestRefDistributor(unittest.TestCase):
             refs_per_rank_step=refs_per_rank_step,
             **kwargs,
         )
+
+    def test_cost_balancing_preserves_windows_and_balances_accumulation(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=2,
+            refs_per_rank_batch=1,
+            dispatch_policy="cost_balanced",
+        )
+        for window in range(2):
+            for index, anchors in enumerate((400, 100, 300, 200)):
+                self.producer.publish(
+                    replace(
+                        _ref(f"w{window}s{index}"),
+                        num_tokens=1024,
+                        metadata={"valid_anchor_count": anchors},
+                    )
+                )
+        _pump_until_quiet(dist)
+        first = _inbox_ids(self.inbox_dir, 0)
+        second = _inbox_ids(self.inbox_dir, 1)
+        self.assertEqual(first, ["w0s0", "w0s1", "w1s0", "w1s1"])
+        self.assertEqual(second, ["w0s2", "w0s3", "w1s2", "w1s3"])
+        self.assertEqual(dist.stats["dispatched"], 8)
+        self.assertEqual(dist._window_dispatched, 0)
+
+    def test_domino_balancing_uses_two_windows_without_losing_samples(self):
+        dist = self._distributor(
+            dp_size=2, refs_per_rank_step=2, refs_per_rank_batch=1,
+            dispatch_policy="domino_balanced",
+        )
+        for index, anchors in enumerate((512, 4, 400, 8, 500, 3, 450, 9)):
+            self.producer.publish(replace(
+                _ref(f"s{index}"), strategy="domino", num_tokens=600,
+                metadata={"valid_anchor_count": anchors},
+            ))
+            if index == 3:
+                _pump_until_quiet(dist)
+                self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
+        _pump_until_quiet(dist)
+        delivered = [_inbox_ids(self.inbox_dir, rank) for rank in range(2)]
+        self.assertEqual([len(items) for items in delivered], [4, 4])
+        self.assertEqual(set(sum(delivered, [])), {f"s{index}" for index in range(8)})
+        self.assertEqual(set(delivered[0][:2] + delivered[1][:2]), {"s0", "s2", "s4", "s6"})
+
+    def test_domino_balancing_flushes_one_closed_window_and_drops_only_tail(self):
+        dist = self._distributor(
+            dp_size=2, refs_per_rank_step=4, refs_per_rank_batch=2,
+            dispatch_policy="domino_balanced",
+        )
+        for index in range(11):
+            self.producer.publish(replace(_ref(f"s{index}"), strategy="domino"))
+        self.producer.publish(replace(_ref("s3"), strategy="domino"))
+        self.producer.close()
+        _pump_until_quiet(dist)
+        delivered = sum([_inbox_ids(self.inbox_dir, rank) for rank in range(2)], [])
+        self.assertEqual(len(delivered), 8)
+        self.assertEqual(len(set(delivered)), 8)
+        self.assertEqual(dist.stats["duplicates"], 1)
+        self.assertEqual(dist.stats["dropped"], 3)
+        self.assertTrue(dist.finished)
+
+    def test_domino_balancing_reconciles_durable_refs(self):
+        store = SQLiteMetadataStore(os.path.join(self.dir, "domino-resume.sqlite"))
+        self.addCleanup(store.close)
+        original = DataFlowController("run0", metadata_store=store)
+        refs = [_ref("s0"), _ref("s1")]
+        for ref in refs:
+            self.producer.publish(ref)
+        original.commit_samples("old-distributor", refs)
+        original.ack_train_refs("trainer", ["s0"], global_step=1, optimizer_durable=True)
+        self.source.mark_consumed(1)
+        restarted = DataFlowController("run0", metadata_store=store)
+        report = restarted.reconcile_on_restart(self.feature_store)
+        dist = self._distributor(
+            dp_size=1, controller=restarted, skip_ids=report["released"],
+            requeued_ids=report["requeued"], dispatch_policy="domino_balanced",
+        )
+        _pump_until_quiet(dist)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
+        self.producer.close()
+        _pump_until_quiet(dist)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s1"])
+        self.assertEqual(dist.stats["skipped"], 1)
+        self.assertEqual(dist.stats["duplicates"], 1)
+        queue = StreamingRefQueue(
+            StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, 0))
+        )
+        queue.ack(queue.get(1))
+        dist._forward_consumed()
+        _pump_until_quiet(dist)
+        self.assertEqual(self.producer.consumed_remote(), 2)
+
+    def test_cost_balancing_waits_for_full_window_and_settles_tail(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=4,
+            refs_per_rank_batch=2,
+            dispatch_policy="cost_balanced",
+        )
+        for index in range(7):
+            self.producer.publish(_ref(f"s{index}"))
+        _pump_until_quiet(dist)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
+        self.producer.publish(_ref("s7"))
+        self.producer.publish(_ref("s8"))
+        self.producer.publish(_ref("s7"))
+        self.producer.close()
+        _pump_until_quiet(dist)
+        delivered = [_inbox_ids(self.inbox_dir, rank) for rank in range(2)]
+        self.assertEqual([len(batch) for batch in delivered], [4, 4])
+        self.assertEqual(set(sum(delivered, [])), {f"s{index}" for index in range(8)})
+        self.assertEqual(dist.stats["duplicates"], 1)
+        self.assertEqual(dist.stats["dropped"], 1)
+        self.assertTrue(dist.finished)
+
+    def test_cost_balancing_reconciles_sqlite_and_ack_counters(self):
+        original = self._distributor
+        with mock.patch.object(
+            self,
+            "_distributor",
+            side_effect=lambda **kwargs: original(
+                dispatch_policy="cost_balanced", **kwargs
+            ),
+        ):
+            self.test_resume_skips_acked_and_dispatches_reconciled_unacked()
+
+    def test_cost_balancing_skips_durable_refs_on_replay(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=2,
+            refs_per_rank_batch=1,
+            dispatch_policy="cost_balanced",
+            skip_ids={"saved"},
+        )
+        for name in ("saved", "a", "b", "c", "d"):
+            self.producer.publish(_ref(name))
+        self.producer.close()
+        _pump_until_quiet(dist)
+        delivered = sum([_inbox_ids(self.inbox_dir, rank) for rank in range(2)], [])
+        self.assertEqual(set(delivered), {"a", "b", "c", "d"})
+        self.assertEqual(dist.stats["skipped"], 1)
+        self.assertTrue(dist.finished)
 
     def test_round_robin_equal_counts_and_unaligned_tail_closes_cleanly(self):
         dist = self._distributor(dp_size=2)

@@ -375,6 +375,7 @@ class OnlineDFlashModel(nn.Module):
         kl_decay: float = 1.0,
         metric_top_k: int = 16,
         teacher_metrics: bool = True,
+        fused_plain_head: bool = False,
     ):
         super().__init__()
         if metric_top_k <= 0:
@@ -420,6 +421,7 @@ class OnlineDFlashModel(nn.Module):
         self.metric_top_k = int(metric_top_k)
         # Diagnostics-only: compare against target_last_hidden_states when fed.
         self.teacher_metrics = bool(teacher_metrics)
+        self.fused_plain_head = bool(fused_plain_head)
         self._fused_unary_head_requested = (
             os.environ.get(_FUSED_UNARY_HEAD_ENV, "1") != "0"
         )
@@ -881,20 +883,27 @@ class OnlineDFlashModel(nn.Module):
         """Whether the objective can use the fused Triton DFlash2 unary head.
 
         The fused head covers DFlash2's identity unary transform over a frozen
-        BF16 ``nn.Linear`` target head on CUDA. Plain DFlash, transformed or
-        trainable heads, other devices, and ``SPECFORGE_DFLASH_FUSED_HEAD=0``
-        keep the reference PyTorch objective.
+        BF16 ``nn.Linear`` target head on CUDA. Plain DFlash is opt-in and
+        preserves the reference BF16 CE rounding. Unsupported objectives,
+        transformed or trainable heads, other devices, and
+        ``SPECFORGE_DFLASH_FUSED_HEAD=0`` keep the reference objective.
         """
 
         if not self._fused_unary_head_requested or self.block_size <= 1:
             return False
         if getattr(self.draft_model, "candidate_selector", None) is None:
-            return False
-        is_identity = getattr(
-            self.draft_model, "unary_logits_transform_is_identity", None
-        )
-        if is_identity is None or not is_identity():
-            return False
+            if (
+                not self.fused_plain_head
+                or self.loss_type != "dflash"
+                or self.lk_loss_type not in (None, "alpha")
+            ):
+                return False
+        else:
+            is_identity = getattr(
+                self.draft_model, "unary_logits_transform_is_identity", None
+            )
+            if is_identity is None or not is_identity():
+                return False
         head = self.lm_head
         if not isinstance(head, nn.Linear) or head.bias is not None:
             return False
@@ -940,6 +949,7 @@ class OnlineDFlashModel(nn.Module):
                     self.lm_head.weight,
                     target_ids,
                     candidate_selector.top_k if self._selector_objective_enabled else 0,
+                    bf16_ce=candidate_selector is None,
                 )
             )
         else:
@@ -1833,6 +1843,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         loss_decay_gamma: Optional[float] = None,
         objective_chunk_blocks: int = 128,
         shift_label: bool = False,
+        cache_projection: bool = False,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -1847,9 +1858,34 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_type="dflash",
         )
         self.shift_label = shift_label
+        self.cache_projection = cache_projection
         self._use_fused_domino_ce = (
             os.environ.get("SPECFORGE_DOMINO_TRITON_CE", "1") == "1"
         )
+
+    def _projection_checkpoint_contexts(self):
+        from torch.utils.checkpoint import (
+            CheckpointPolicy,
+            create_selective_checkpoint_contexts,
+        )
+
+        head = self.lm_head
+        eligible = isinstance(head, nn.Linear) and not head.weight.requires_grad
+
+        def policy(context, operation, *arguments, **kwargs):
+            if eligible and operation in (
+                torch.ops.aten.mm.default,
+                torch.ops.aten.bmm.default,
+            ):
+                weight = arguments[1]
+                if (
+                    weight.shape[-2:] == (head.in_features, head.out_features)
+                    and not weight.requires_grad
+                ):
+                    return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+
+        return create_selective_checkpoint_contexts(policy)
 
     def _build_domino_head_inputs(
         self,
@@ -2063,6 +2099,9 @@ class OnlineDominoModel(OnlineDFlashModel):
             ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
+            context_fn=(
+                self._projection_checkpoint_contexts if self.cache_projection else None
+            ),
         )
 
         valid_token_count = loss_den + 1e-6

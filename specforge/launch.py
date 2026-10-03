@@ -1553,6 +1553,8 @@ def build_disagg_online_consumer(
     dataloader_num_workers: int = 0,
     profiling_options=None,
     async_ack: Optional[bool] = None,
+    consumer_dispatch: str = "round_robin",
+    dispatch_num_anchors: int = 512,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1724,6 +1726,9 @@ def build_disagg_online_consumer(
                 feature_store=feature_store,
                 refs_per_rank_step=batch_size * accumulation_steps,
                 refs_per_rank_batch=batch_size,
+                dispatch_policy=consumer_dispatch,
+                num_anchors=dispatch_num_anchors,
+                block_size=getattr(draft_model, "block_size", 16),
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,

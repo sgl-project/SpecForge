@@ -32,7 +32,7 @@ __all__ = ["MAX_FUSED_TOP_K", "dflash_unary_head_fused"]
 MAX_FUSED_TOP_K = 64
 
 
-def dflash_unary_head_fused(hidden, weight, targets, top_k):
+def dflash_unary_head_fused(hidden, weight, targets, top_k, *, bf16_ce=False):
     """Return ``(neg_log_q, topk_values, topk_ids, argmax_ids)`` for ``hidden``.
 
     ``hidden`` is ``[..., hidden_size]`` BF16, ``weight`` the frozen
@@ -42,14 +42,19 @@ def dflash_unary_head_fused(hidden, weight, targets, top_k):
     respect to ``hidden``. Candidates hold ``torch.topk``'s set in descending
     value order; up to ``MAX_FUSED_TOP_K`` of them, equal values are ordered
     by ascending id. ``top_k=0`` skips the top-k selection and returns empty
-    candidate tensors.
+    candidate tensors. ``bf16_ce=True`` is the plain-DFlash, top-k-free path:
+    it returns BF16 CE and rounds log probabilities before exponentiation in
+    backward, matching the reference BF16 log-softmax/NLL composition.
     """
+    if bf16_ce and (top_k != 0 or hidden.dtype != torch.bfloat16):
+        raise ValueError("bf16_ce requires BF16 hidden states and top_k=0")
     leading_shape = hidden.shape[:-1]
     neg_log_q, topk_values, topk_ids, argmax_ids = _DFlash2UnaryHead.apply(
         hidden.reshape(-1, hidden.shape[-1]),
         weight,
         targets.reshape(-1),
         int(top_k),
+        bf16_ce,
     )
     return (
         neg_log_q.reshape(leading_shape),
@@ -68,7 +73,7 @@ class _DFlash2UnaryHead(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, hidden, weight, targets, top_k):
+    def forward(ctx, hidden, weight, targets, top_k, bf16_ce):
         logits = F.linear(hidden, weight)
         num_rows, vocab_size = logits.shape
         targets = targets.contiguous()
@@ -96,6 +101,9 @@ class _DFlash2UnaryHead(torch.autograd.Function):
             topk_values, topk_ids = torch.topk(logits, top_k, dim=-1)
             topk_values = topk_values.float()
         neg_log_q = lse - target_logit
+        if bf16_ce:
+            neg_log_q = neg_log_q.to(torch.bfloat16)
+        ctx.bf16_ce = bf16_ce
 
         ctx.save_for_backward(weight, logits, lse, targets, topk_values, topk_ids)
         ctx.mark_non_differentiable(topk_ids, argmax_ids)
@@ -104,7 +112,7 @@ class _DFlash2UnaryHead(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_neg_log_q, grad_topk_values, _grad_topk_ids, _grad_argmax):
         if not ctx.needs_input_grad[0]:
-            return None, None, None, None
+            return None, None, None, None, None
         weight, logits, lse, targets, topk_values, topk_ids = ctx.saved_tensors
         num_rows, vocab_size = logits.shape
         if grad_neg_log_q is None:
@@ -124,6 +132,7 @@ class _DFlash2UnaryHead(torch.autograd.Function):
                 grad_neg_log_q,
                 vocab_size,
                 VOCAB_BLOCK=vocab_block,
+                BF16_CE=ctx.bf16_ce,
                 num_warps=num_warps,
             )
             top_k = topk_ids.shape[-1]
@@ -147,7 +156,7 @@ class _DFlash2UnaryHead(torch.autograd.Function):
             # retained graph fails loudly instead of reusing the gradients.
             torch.autograd.graph.increment_version(grad_logits)
         grad_hidden = torch.matmul(grad_logits, weight)
-        return grad_hidden, None, None, None
+        return grad_hidden, None, None, None, None
 
 
 def _num_warps_for_backend(num_warps):
@@ -456,11 +465,13 @@ def _unary_head_grad_kernel(
     grad_neg_log_q_ptr,
     vocab_size,
     VOCAB_BLOCK: tl.constexpr,
+    BF16_CE: tl.constexpr = False,
 ):
     """Overwrite one logit tile with ``g * (softmax - one_hot(target))``.
 
-    The value is formed in FP32 and rounded to the logit dtype once. Rows with
-    zero upstream gradient write exact zeros.
+    The value is formed in FP32 and rounded to the logit dtype once. BF16_CE
+    additionally rounds log probabilities to match BF16 log-softmax. Rows
+    with zero upstream gradient write exact zeros.
     """
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
@@ -471,7 +482,10 @@ def _unary_head_grad_kernel(
     grad = tl.load(grad_neg_log_q_ptr + row)
     lse = tl.load(lse_ptr + row)
     target = tl.load(targets_ptr + row)
-    logit_grad = grad * tl.exp(logits - lse)
+    log_probability = logits - lse
+    if BF16_CE:
+        log_probability = log_probability.to(tl.bfloat16).to(tl.float32)
+    logit_grad = grad * tl.exp(log_probability)
     logit_grad = tl.where(offsets == target, logit_grad - grad, logit_grad)
     tl.store(pointers, logit_grad.to(logits_ptr.dtype.element_ty), mask=mask)
 

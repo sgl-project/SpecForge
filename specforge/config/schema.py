@@ -471,6 +471,9 @@ class RuntimeConfig(StrictConfigModel):
     """Streaming bounds shared by unified disaggregated producer roles."""
 
     producer_lease: int = Field(default=8, gt=0)
+    consumer_dispatch: Literal["round_robin", "cost_balanced", "domino_balanced"] = (
+        "round_robin"
+    )
     producer_concurrency: int = Field(default=1, gt=0)
     in_flight_high_watermark: int = Field(default=256, gt=0)
     in_flight_low_watermark: int = Field(default=192, ge=0)
@@ -900,6 +903,9 @@ class TrainingConfig(StrictConfigModel):
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
+    dflash_fused_plain_head: bool = False
+    domino_cache_projection: bool = False
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
@@ -1115,6 +1121,22 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+
+        if self.training.domino_cache_projection and self.training.strategy != "domino":
+            raise ValueError("domino_cache_projection requires training.strategy=domino")
+        if self.runtime.consumer_dispatch == "domino_balanced":
+            if self.training.strategy != "domino":
+                raise ValueError("domino_balanced requires training.strategy=domino")
+            window = (
+                self.deployment.trainer.nnodes
+                * self.deployment.trainer.nproc_per_node
+                * self.training.batch_size
+                * self.training.accumulation_steps
+            )
+            if self.runtime.in_flight_high_watermark < 2 * window:
+                raise ValueError(
+                    "domino_balanced requires a high watermark of at least two global batches"
+                )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

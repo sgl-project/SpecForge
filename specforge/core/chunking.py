@@ -18,6 +18,7 @@ def checkpointed_chunk_reduce(
     chunk_size: int,
     dim: int = 0,
     checkpoint: bool = True,
+    context_fn: Optional[Callable] = None,
 ) -> ChunkTerms:
     """Sum additive terms over aligned tensor slices.
 
@@ -82,10 +83,12 @@ def checkpointed_chunk_reduce(
         if should_checkpoint:
             from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
+            checkpoint_options = {"context_fn": context_fn} if context_fn else {}
             chunk_terms = activation_checkpoint(
                 function,
                 *chunk_args,
                 use_reentrant=False,
+                **checkpoint_options,
             )
         else:
             chunk_terms = function(*chunk_args)

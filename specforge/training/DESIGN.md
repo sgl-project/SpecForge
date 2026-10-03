@@ -58,6 +58,9 @@ The training plane is the only tensor-carrying side besides the data plane; it
 consumes `TrainBatch.tensors`. `TrainerCore.train_step` divides the loss by
 `accumulation_steps`, uses `no_sync()` only for non-boundary micro-batches, and
 returns `optimizer_stepped` as the single authoritative boundary signal.
+For DDP, the backend accumulation context encloses both forward and backward;
+wrapping backward alone does not disable DDP gradient synchronization. FSDP
+retains its backward-only deferral.
 `TrainerController` increments `global_step` only at that boundary, commits the
 pending sample acknowledgements, emits metrics, and performs configured
 interval saves. The outer `Trainer` owns topology cleanup and the guarded final
@@ -70,6 +73,35 @@ backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
 gradients or reporting a checkpoint as successful. Queue-mode loaders
 terminally settle and clean a short `drop_last` batch without emitting it;
 fixed offline refs keep normal `drop_last` semantics.
+
+## Domino performance controls
+
+Domino honors `model.use_liger_kernel` through the draft provider and constructor.
+This selects the existing explicit RMSNorm/MLP kernel bundle; it does not patch
+Transformers globally or change DFlash's provider, fused head, or defaults.
+
+`training.domino_cache_projection: true` selectively saves the frozen linear
+vocabulary projection across objective-chunk activation checkpointing. Backward
+recomputes the GRU and CE as before but reuses this projection instead of running
+the large matrix multiplication twice. The loss, gradient normalization, lambda
+schedule, and checkpoint parameter layout are unchanged. The option defaults to
+false, is rejected for other algorithms, and falls back to recomputation for a
+trainable or non-linear target head. With `objective_chunk_blocks: 0`, objective
+checkpointing is disabled and this option has no effect. Saving logits consumes
+additional activation memory proportional to batch size, effective anchors,
+block size, and vocabulary size; validate peak memory at the intended max length.
+
+`runtime.consumer_dispatch: domino_balanced` buffers two complete global
+optimizer batches, sorts by effective anchor count and sequence length, and
+applies the existing cost-balancing assignment within each resulting window.
+It requires a high watermark of at least two global batches. A closed source
+flushes any complete remaining batch and settles only an incomplete tail using
+the existing drop-last rules. Deduplication and durable acknowledgement retain
+their original controller ownership. This policy changes sample order and
+optimizer-batch membership, so it is not a bitwise training-trajectory-preserving
+optimization even though it retains the same samples and objective. Keep
+`cost_balanced` when original window membership must be preserved. Both original
+dispatch policies remain unchanged, and `domino_balanced` is rejected for DFlash.
 
 ## Endpoints
 
