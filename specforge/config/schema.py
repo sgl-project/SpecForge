@@ -892,7 +892,33 @@ class DeploymentConfig(StrictConfigModel):
         return self
 
 
+class TorchTitanConfig(StrictConfigModel):
+    """TorchTitan runtime options, separate from the legacy FSDP backend."""
+
+    dp_replicate: int = Field(default=1, gt=0)
+    dp_shard: int = Field(default=-1, ge=-1)
+    cp_size: int = Field(default=1, gt=0)
+    pp_size: int = Field(default=1, gt=0)
+    pp_schedule: Literal["1F1B", "GPipe", "Interleaved1F1B"] = "1F1B"
+    pp_microbatch_size: int = Field(default=1, gt=0)
+    export_draft: bool = True
+    spmd_backend: Literal["partial_dtensor", "full_dtensor", "spmd_types"] = (
+        "partial_dtensor"
+    )
+    activation_checkpoint: Literal["none", "full", "selective"] = "none"
+    compile: bool = False
+    disable_cuda_graphs: bool = True
+
+    @model_validator(mode="after")
+    def _validate_degrees(self):
+        if self.dp_shard == 0:
+            raise ValueError("training.torchtitan.dp_shard must be -1 or positive")
+        return self
+
+
 class TrainingConfig(StrictConfigModel):
+    backend: Literal["fsdp", "torchtitan"] = "fsdp"
+    torchtitan: TorchTitanConfig = Field(default_factory=TorchTitanConfig)
     strategy: str = "eagle3"
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
@@ -911,8 +937,8 @@ class TrainingConfig(StrictConfigModel):
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
     )
-    #: Trainer tensor parallelism. The unified runtime currently requires one;
-    #: target-model TP belongs to external or managed capture servers.
+    #: Draft-model tensor parallelism for TorchTitan. The FSDP runtime requires
+    #: one; target-model TP belongs to external or managed capture servers.
     tp_size: int = Field(default=1, gt=0)
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
@@ -991,6 +1017,27 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.backend == "fsdp" and self.torchtitan != TorchTitanConfig():
+            raise ValueError("training.torchtitan options require backend=torchtitan")
+        if self.backend == "torchtitan":
+            if self.strategy not in {"dflash", "dspark"}:
+                raise ValueError(
+                    "TorchTitan currently supports DFlash, DFlash2 and DSpark"
+                )
+            if self.attention_backend not in {"eager", "sdpa", "flex_attention"}:
+                raise ValueError("TorchTitan requires eager, sdpa or flex_attention")
+            if self.optimizer_cpu_offload:
+                raise ValueError(
+                    "TorchTitan does not use the BF16Optimizer CPU-offload option"
+                )
+            if self.batch_size % self.torchtitan.pp_microbatch_size:
+                raise ValueError(
+                    "training.batch_size must be divisible by TorchTitan pp_microbatch_size"
+                )
+            if self.torchtitan.pp_size > 1 and not self.torchtitan.disable_cuda_graphs:
+                raise ValueError(
+                    "TorchTitan v0.3 does not support pipeline parallelism with CUDA graphs"
+                )
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:
@@ -1308,7 +1355,11 @@ class Config(StrictConfigModel):
         if self.training.attention_backend == "usp":
             if mode != "offline":
                 raise ValueError("USP attention currently requires offline features")
-        if mode == "offline" and self.training.tp_size != 1:
+        if (
+            mode == "offline"
+            and self.training.backend == "fsdp"
+            and self.training.tp_size != 1
+        ):
             raise ValueError(
                 "offline feature consumers do not implement trainer tensor "
                 "parallelism; keep training.tp_size=1 so every non-SP rank "
@@ -1337,6 +1388,36 @@ class Config(StrictConfigModel):
     def validate_world_size(self, world_size: int) -> None:
         if world_size < 1:
             raise ValueError(f"world_size must be positive, got {world_size}")
+        if self.training.backend == "torchtitan":
+            titan = self.training.torchtitan
+            if self.training.fsdp_sharding == "NO_SHARD":
+                model_degree = self.training.tp_size * titan.cp_size * titan.pp_size
+                if world_size % model_degree:
+                    raise ValueError(
+                        "WORLD_SIZE must be divisible by TorchTitan TP * CP * PP"
+                    )
+                if titan.dp_shard not in (-1, 1) or titan.dp_replicate not in (
+                    1,
+                    world_size // model_degree,
+                ):
+                    raise ValueError("NO_SHARD requires all data ranks replicated")
+                return
+            fixed = (
+                self.training.tp_size
+                * titan.cp_size
+                * titan.pp_size
+                * titan.dp_replicate
+            )
+            if world_size % fixed:
+                raise ValueError(
+                    f"world_size={world_size} must be divisible by TorchTitan "
+                    f"TP * CP * PP * DP replicate = {fixed}"
+                )
+            if titan.dp_shard != -1 and fixed * titan.dp_shard != world_size:
+                raise ValueError(
+                    "TorchTitan parallel degrees must multiply to world_size"
+                )
+            return
         tp_size = self.training.tp_size
         sp_size = self.training.sp_ulysses_size * self.training.sp_ring_size
         if world_size % tp_size:

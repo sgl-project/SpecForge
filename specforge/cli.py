@@ -117,6 +117,15 @@ def _train(resolved) -> int:
     from accelerate.utils import set_seed
 
     cfg = resolved.config
+    if cfg.training.backend == "torchtitan":
+        # The Titan Trainer owns distributed initialization and its mesh. Do
+        # not construct the legacy FSDP/USP groups before entering that runtime.
+        from specforge.application import build_application_run
+
+        _bootstrap_single_process_env()
+        _validate_world_size(cfg, int(os.environ["WORLD_SIZE"]))
+        return build_application_run(resolved).run()
+
     # Make the typed recipe authoritative for the backend's existing FSDP
     # sharding seam in both direct and managed-local worker processes.
     os.environ["FSDP_SHARDING"] = cfg.training.fsdp_sharding

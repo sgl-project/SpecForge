@@ -591,6 +591,11 @@ def build_training_run(
             f"{algorithm.name!r} != {cfg.training.strategy!r}"
         )
 
+    if cfg.training.backend == "torchtitan":
+        from specforge.training.torchtitan.frontend import build_torchtitan_training_run
+
+        return build_torchtitan_training_run(cfg, algorithm=algorithm)
+
     t = cfg.training
     if t.role != "producer":
         import torch.distributed as dist

@@ -141,7 +141,11 @@ def _validate_training_topology(
     mode: FeatureMode,
 ) -> None:
     deployment_mode = cfg.deployment.mode
-    if mode is FeatureMode.OFFLINE and cfg.training.tp_size != 1:
+    if (
+        mode is FeatureMode.OFFLINE
+        and cfg.training.backend == "fsdp"
+        and cfg.training.tp_size != 1
+    ):
         raise ValueError(
             "offline feature consumers do not implement trainer tensor "
             "parallelism; keep training.tp_size=1 so every non-SP rank "
