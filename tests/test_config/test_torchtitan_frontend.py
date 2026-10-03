@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from specforge.training.torchtitan.frontend import (
+    _numerical_resume_contract,
     _online_training_horizon,
     _parallelism_layout,
     _resume_location,
@@ -16,6 +17,80 @@ from tests.test_config.test_torchtitan_runtime import recipe
 
 
 class TorchTitanFrontendTest(unittest.TestCase):
+    def test_numerical_contract_preserves_only_unchanged_eager_policy(self):
+        eager = recipe(backend="torchtitan")
+        compiled = recipe(backend="torchtitan", torchtitan={"compile": True})
+        graph = recipe(
+            backend="torchtitan", torchtitan={"compile": True, "engine": "graph"}
+        )
+        self.assertEqual(_numerical_resume_contract(eager.training.torchtitan), {})
+        self.assertEqual(
+            _numerical_resume_contract(compiled.training.torchtitan),
+            {"compiler_numerics": "bf16-eager-boundaries-v1"},
+        )
+        self.assertEqual(
+            _numerical_resume_contract(graph.training.torchtitan),
+            {
+                "compiler_numerics": "bf16-eager-boundaries-v1",
+                "graph_parameter_materialization": "shared-bf16-per-joint-v1",
+                "graph_inductor": "regional",
+            },
+        )
+
+    def test_graph_compilation_boundaries_are_part_of_resume_contract(self):
+        contracts = {}
+        for mode in ("regional", "full"):
+            cfg = recipe(
+                backend="torchtitan",
+                torchtitan={"compile": True, "engine": "graph", "graph_inductor": mode},
+            )
+            contracts[mode] = _numerical_resume_contract(cfg.training.torchtitan)
+            self.assertEqual(contracts[mode]["graph_inductor"], mode)
+        self.assertNotEqual(contracts["full"], contracts["regional"])
+
+    def test_resume_rejects_missing_or_old_numerical_policy_before_state_changes(self):
+        try:
+            from torchtitan.trainer import Trainer
+        except ImportError:
+            self.skipTest("Requires the optional TorchTitan runtime")
+        from specforge.training.torchtitan.runtime import SpecForgeTitanTrainer
+
+        for engine in ("trainer", "graph"):
+            cfg = recipe(
+                backend="torchtitan", torchtitan={"compile": True, "engine": engine}
+            )
+            expected = _numerical_resume_contract(cfg.training.torchtitan)
+            old_contracts = [{}]
+            for key in expected:
+                old_contracts.extend(
+                    [
+                        {
+                            name: value
+                            for name, value in expected.items()
+                            if name != key
+                        },
+                        {**expected, key: "previous-policy"},
+                    ]
+                )
+            trainer = SpecForgeTitanTrainer.__new__(SpecForgeTitanTrainer)
+            trainer.config = SimpleNamespace(resume_contract=expected)
+            for old in old_contracts:
+                with (
+                    self.subTest(engine=engine, old=old),
+                    mock.patch("torch.distributed.get_world_size", return_value=1),
+                    mock.patch.object(Trainer, "load_state_dict") as native_load,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "training contract changed"
+                    ):
+                        trainer.load_state_dict(
+                            {
+                                "specforge_world_size": 1,
+                                "specforge_resume_contract": old,
+                            }
+                        )
+                    native_load.assert_not_called()
+
     def test_online_assembly_failure_notifies_waiting_producer(self):
         from specforge.training.assembly import build_training_run
 

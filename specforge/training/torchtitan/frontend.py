@@ -19,6 +19,20 @@ from typing import Any
 from urllib.parse import unquote
 
 
+def _numerical_resume_contract(titan) -> dict[str, str]:
+    # Pure eager native training keeps its original arithmetic. Compilation now
+    # preserves eager BF16 cast/division boundaries, and DFlash2 can retain its
+    # fused convolution while compiling. Old compiled checkpoints must not
+    # silently continue under this different numerical policy.
+    if not titan.compile:
+        return {}
+    contract = {"compiler_numerics": "bf16-eager-boundaries-v1"}
+    if titan.engine == "graph":
+        contract["graph_parameter_materialization"] = "shared-bf16-per-joint-v1"
+        contract["graph_inductor"] = titan.graph_inductor
+    return contract
+
+
 def _validate_runtime_versions() -> None:
     from importlib.metadata import PackageNotFoundError, version
 
@@ -679,9 +693,10 @@ def _native_config(
         seed=training.seed,
         parallelism=layout,
     )
-    # Preserve the original BF16 Trainer contract for existing checkpoints;
-    # opting into a different engine must still reject a resume
-    # from incompatible optimizer/model state.
+    # Preserve old pure-eager native checkpoints. Compiled arithmetic and graph
+    # parameter materialization carry explicit revisions so older compiled
+    # runs cannot silently resume across a numerical-policy change.
+    contract.update(_numerical_resume_contract(titan))
     if titan.engine != "trainer":
         contract.update(engine=titan.engine)
     if online_source is not None:

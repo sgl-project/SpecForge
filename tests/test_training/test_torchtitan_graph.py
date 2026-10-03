@@ -1,5 +1,6 @@
 """Fixed graph preparation and native GraphTrainer inheritance contracts."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -108,6 +109,128 @@ def test_graph_replay_cannot_overwrite_accumulated_gradients(monkeypatch):
     for value in (2.0, 3.0, 7.0):
         trainer.forward_backward_step(value=value)
     torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 12.0))
+
+
+@pytest.mark.parametrize("initial_casts", [False, True])
+@pytest.mark.parametrize("initial_division", [False, True])
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_compiler_numerics_restores_previous_policy(
+    initial_casts, initial_division, raise_inside
+):
+    from torch._inductor import config
+
+    from specforge.training.torchtitan.numerics import compiler_numerics
+
+    with config.patch(
+        {
+            "emulate_precision_casts": initial_casts,
+            "eager_numerics.division_rounding": initial_division,
+        }
+    ):
+        outcome = (
+            pytest.raises(RuntimeError, match="numerics restoration sentinel")
+            if raise_inside
+            else nullcontext()
+        )
+        with outcome:
+            with compiler_numerics():
+                assert config.emulate_precision_casts is True
+                assert config.eager_numerics.division_rounding is True
+                if raise_inside:
+                    raise RuntimeError("numerics restoration sentinel")
+        assert config.emulate_precision_casts is initial_casts
+        assert config.eager_numerics.division_rounding is initial_division
+
+
+def test_compiler_numerics_records_bf16_barriers_before_joint_trace():
+    from torch._inductor import config
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from specforge.training.torchtitan.numerics import compiler_numerics
+
+    x = torch.tensor([1.0], dtype=torch.bfloat16, requires_grad=True)
+    delta = torch.tensor([0.004], dtype=torch.bfloat16, requires_grad=True)
+
+    def joint(x, delta):
+        output = ((x + delta) - x) * x
+        return output, *torch.autograd.grad(output.sum(), (x, delta))
+
+    def barriers(graph):
+        return [
+            node
+            for node in graph.graph.nodes
+            if node.meta.get("low_precision_pointwise_barrier")
+        ]
+
+    with config.patch(emulate_precision_casts=False):
+        unprotected = make_fx(joint, tracing_mode="fake")(x, delta)
+        assert not barriers(unprotected)
+        with compiler_numerics():
+            protected = make_fx(joint, tracing_mode="fake")(x, delta)
+        assert barriers(protected)
+        # Applying the policy only after make_fx cannot restore these barriers.
+        with compiler_numerics():
+            assert not barriers(unprotected)
+    expected = joint(x, delta)
+    assert expected[0].item() == 0.0078125
+    assert expected[1].item() == 0.0078125
+    for actual, wanted in zip(protected(x, delta), expected):
+        torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires NVIDIA CUDA")
+def test_compiler_numerics_preserves_bf16_conv_joint_forward_backward():
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from torchtitan.experiments.graph_trainer.inductor_passes import (
+        full_inductor_compilation_pass,
+    )
+
+    from specforge.training.torchtitan.graph import functionalize_fused_kernels
+    from specforge.training.torchtitan.numerics import compiler_numerics
+    from tests.test_modeling.test_dflash2_fused_conv import (
+        _prepare_finish_step,
+        _random_conv,
+    )
+
+    conv = _random_conv(256, 16, 2, 16, device="cuda", dtype=torch.bfloat16, seed=11)
+    torch.manual_seed(72)
+    inputs = torch.randn(1, 512, 256, device="cuda", dtype=torch.bfloat16)
+    mixer = torch.randn_like(inputs)
+    grad_seed = (torch.randn_like(inputs), torch.randn_like(inputs))
+    expected = _prepare_finish_step(conv, inputs, mixer, grad_seed)
+    inputs = inputs.detach().requires_grad_(True)
+    mixer = mixer.detach().requires_grad_(True)
+    conv.zero_grad(set_to_none=True)
+
+    def joint(x, scale):
+        prepared, dynamic = conv.prepare(x)
+        finished = conv.finish(prepared * scale, dynamic)
+        gradients = torch.autograd.grad(
+            (prepared, finished),
+            (x, scale, conv.base_kernel, conv.kernel_projection.weight),
+            grad_seed,
+        )
+        return prepared, finished, *gradients
+
+    with compiler_numerics():
+        traced = make_fx(joint, tracing_mode="fake", _allow_non_fake_inputs=True)(
+            inputs, mixer
+        )
+        transformed = functionalize_fused_kernels(traced, (inputs, mixer))
+        assert any(
+            "triton_kernel_wrapper_functional" in str(node.target)
+            for node in transformed.graph.nodes
+        )
+        assert any(
+            node.meta.get("low_precision_pointwise_barrier")
+            for node in transformed.graph.nodes
+        )
+        transformed.graph.eliminate_dead_code()
+        transformed.recompile()
+        compiled = full_inductor_compilation_pass(transformed, (inputs, mixer))
+        actual = compiled(inputs, mixer)
+    for name, value in zip(expected, actual):
+        torch.testing.assert_close(value, expected[name], rtol=0, atol=0, msg=name)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires NVIDIA CUDA")

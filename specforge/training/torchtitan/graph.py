@@ -13,6 +13,7 @@ from torchtitan.experiments.graph_trainer.registry import register_pass_pipeline
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 
 from .model import SpecForgeTitanModel
+from .parameter_cache import graph_parameter_cache
 from .runtime import SpecForgeTitanTrainer
 
 
@@ -51,6 +52,10 @@ def specforge_graph_passes(traced_result, config, *, parallel_dims=None):
 
 
 class SpecForgeGraphModel(SpecForgeTitanModel):
+    def forward(self, *args, **kwargs):
+        with graph_parameter_cache(self):
+            return super().forward(*args, **kwargs)
+
     @dataclass(kw_only=True, slots=True)
     class Config(SpecForgeTitanModel.Config):
         @property
@@ -98,7 +103,10 @@ class SpecForgeGraphTrainer(SpecForgeTitanTrainer, GraphTrainer):
             if self.gradient_accumulation_steps > 1
             else ()
         )
-        loss = super().forward_backward_step(**kwargs)
+        # Keep repeated parameter reads shared through backward recomputation,
+        # matching eager FSDP2's single unsharded BF16 leaf per parameter.
+        with graph_parameter_cache(self.model_parts[0]):
+            loss = super().forward_backward_step(**kwargs)
         for parameter in unowned:
             if parameter.grad is not None:
                 parameter.grad = parameter.grad.clone()

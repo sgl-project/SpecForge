@@ -7,6 +7,8 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 )
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 
+from .parameter_cache import install_graph_parameter_cache
+
 
 def parallelize_graph_dflash(
     model,
@@ -36,6 +38,7 @@ def parallelize_graph_dflash(
     # Frozen teacher weights remain replicated. SimpleFSDP's parameter wrapping
     # constructs trainable Parameters, so apply it only to the trainable draft.
     apply_simple_fsdp(model.draft_model, parallel_dims=parallel_dims, training=training)
+    install_graph_parameter_cache(model)
     model = apply_compile(
         model,
         compile_config=compile_config,

@@ -12,6 +12,7 @@ import torch.distributed as dist
 from torchtitan.trainer import Trainer
 
 from .metrics import ObjectiveMetricLogger
+from .numerics import compiler_numerics
 from .parallelize import HeterogeneousGradientNorms
 
 
@@ -184,10 +185,11 @@ class SpecForgeTitanTrainer(Trainer):
         # External model heads use a DP-only mesh while TP blocks use DP×TP.
         # Resolve only heterogeneous scalar gradient norms in a thread-local
         # dispatch scope; Titan still owns clipping, accumulation and stepping.
-        if self.parallel_dims.tp_enabled:
-            with HeterogeneousGradientNorms():
-                return super().train_step(data_iterator)
-        return super().train_step(data_iterator)
+        with compiler_numerics():
+            if self.parallel_dims.tp_enabled:
+                with HeterogeneousGradientNorms():
+                    return super().train_step(data_iterator)
+            return super().train_step(data_iterator)
 
     def post_dataloading_process(self, input_dict, labels):
         # partial_dtensor TP operates inside the registered model's parallelize

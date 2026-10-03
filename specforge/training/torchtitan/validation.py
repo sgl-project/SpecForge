@@ -14,6 +14,7 @@ import torch.distributed as dist
 from torchtitan.components.validate import BaseValidator
 from torchtitan.tools.logging import logger
 
+from .numerics import compiler_numerics
 from .runtime import partition_anchor_blocks
 
 
@@ -326,7 +327,7 @@ class SpecForgeValidator(BaseValidator):
                         )
                         for name, value in inputs.items()
                     }
-                    with self.validation_context():
+                    with self.validation_context(), compiler_numerics():
                         _loss, _accuracy, metrics = model(**inputs)
                     totals.add(metrics, context_degree=context_mesh.size())
                 self.last_metrics = totals.reduce(

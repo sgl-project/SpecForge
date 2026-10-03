@@ -122,17 +122,39 @@ resharding policy. It owns activation-memory planning, so the ordinary
 activation-checkpoint setting must remain `none`. Compilation and capture costs
 are separate from steady training speed.
 
-Full-graph compilation can change kernel selection and BF16 numerical behavior.
-The DFlash2 synthetic benchmark showed a different loss trajectory from the
-ordinary Trainer. Treat this engine as experimental and validate convergence
-before adopting it for a training run; successful replay and resume do not
-establish equivalent model quality.
-
 The adapter functionalizes traced Triton buffer writes before graph elimination
 and retains the DFlash2 fused convolution/head. It also gives accumulated
 gradients independent storage so CUDA replay cannot overwrite the previous
-microbatch's gradient. The usual native Trainer and legacy FSDP paths continue
-using their existing eager kernels.
+microbatch's gradient. Repeated reads of a SimpleFSDP parameter share one BF16
+materialization through the joint forward/backward call, including objective
+chunk recomputation. This matches eager FSDP2's accumulation into one unsharded
+parameter instead of separately casting each use's gradient to FP32.
+
+Both native block compilation and GraphTrainer preserve eager BF16 rounding
+boundaries and division rounding. The policy covers initial tracing, compilation,
+replay and evaluation; setting it only during the final Inductor pass would miss
+the rounding barriers. DFlash2 uses the same fused convolution under Dynamo and
+joint tracing, rather than changing to an ATen decomposition only under Dynamo.
+Compiled checkpoints record the numerical policy revision and reject resumes
+from the earlier policy. Pure eager native checkpoints retain their old contract.
+
+These corrections do not make different compilation boundaries bitwise equivalent.
+FP32 reductions inside RMSNorm can round differently before the BF16 output cast;
+block compilation can also group shared-context gradients differently from a
+joint backward graph. In the focused DFlash2 FP32 eager/raw-joint comparison,
+first-step gradient relative L2 error was below `5e-8`, whereas BF16 amplified
+the accumulation difference. Full compilation additionally uses nondeterministic
+indexed reductions for candidate-selector gradients: independent fresh runs can
+differ even with identical seeds. Regional compilation passed exact checkpoint
+continuation and evaluation-isolation checks in the corrected tiny DP2 fixture;
+default full compilation did not pass that bitwise check. Repeating the full
+test with native TorchTitan deterministic debug mode restored exact agreement,
+isolating this difference from checkpoint or evaluation-state corruption.
+
+Treat GraphTrainer as experimental and validate convergence before adopting it
+for a training run. The corrected full-graph DFlash2 synthetic trajectory still
+does not meet a strict native-Trainer loss-agreement gate, so its timing results
+must remain diagnostic rather than evidence of equivalent training quality.
 
 ## Evaluation and online features
 
