@@ -1,43 +1,65 @@
-"""CPU-safe checks of the benchmark's comparison boundaries and statistics."""
+"""CPU-safe tests of the native benchmark workload and measurement contract."""
 
-import importlib.util
+import contextlib
+import io
+import sys
 import unittest
 from pathlib import Path
 
-SCRIPT = (
-    Path(__file__).resolve().parents[2] / "scripts" / "benchmark_training_backends.py"
-)
-spec = importlib.util.spec_from_file_location("training_backend_benchmark", SCRIPT)
-benchmark = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(benchmark)
+SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+try:
+    import benchmark_training_backends as benchmark
+    import training_benchmark_recipes as recipes
+finally:
+    sys.path.pop(0)
 
 
 class BackendBenchmarkContractTest(unittest.TestCase):
-    def test_default_uses_one_model_run_per_process(self):
-        self.assertEqual(benchmark.build_parser().parse_args([]).repeats, 1)
+    def args(self, *extra):
+        return benchmark.parse_args(
+            [
+                "--specforge-root",
+                ".",
+                "--backend",
+                "torchtitan",
+                "--algorithm",
+                "dflash2",
+                "--output",
+                "result.json",
+                *extra,
+            ]
+        )
 
-    @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
-    def test_exact_resume_comparison_accepts_optimizer_metadata(self):
-        import torch
+    def test_default_workload_has_full_length_objective_and_independent_processes(self):
+        args = self.args()
+        self.assertEqual(
+            (args.seq_length, args.num_anchors, args.objective_chunk_blocks),
+            (4096, 512, 128),
+        )
+        self.assertEqual((args.batch_size, args.accumulation_steps), (1, 2))
+        self.assertEqual((args.warmup_steps, args.steps), (10, 20))
+        self.assertEqual(args.attention, "flex_attention")
+        self.assertEqual(args.sharding, "SHARD_GRAD_OP")
+        self.assertFalse(hasattr(args, "repeats"))
+        self.assertFalse(args.compile)
 
-        state = {
-            "lr_scheduler_type": "constant",
-            "offload": False,
-            "optional": None,
-            "masters": [torch.ones(2)],
-        }
-        benchmark._assert_state_equal(state, state)
-        with self.assertRaises(AssertionError):
-            benchmark._assert_state_equal(
-                {**state, "lr_scheduler_type": "cosine"}, state
-            )
-        with self.assertRaises(AssertionError):
-            benchmark._assert_state_equal({**state, "masters": [torch.zeros(2)]}, state)
+    def test_rejects_empty_measurements_and_unsupported_baseline_features(self):
+        cases = (
+            ("--steps", "0"),
+            ("--warmup-steps", "0"),
+            ("--learning-rate", "nan"),
+            ("--learning-rate", "-1"),
+            ("--backend", "fsdp", "--compile"),
+            ("--backend", "fsdp", "--tp-size", "2"),
+        )
+        for args in cases:
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.args(*args)
 
     def test_controlled_recipes_keep_same_full_target_and_backbone_geometry(self):
-        recipes = [
-            benchmark.resolve_config(name)[0] for name in benchmark.ARCHITECTURES
-        ]
+        configs = [recipes.resolve_config(name)[0] for name in recipes.ARCHITECTURES]
         for key in (
             "hidden_size",
             "intermediate_size",
@@ -48,80 +70,50 @@ class BackendBenchmarkContractTest(unittest.TestCase):
             "num_hidden_layers",
             "block_size",
         ):
-            self.assertEqual(len({config[key] for config in recipes}), 1, key)
-        self.assertEqual(recipes[0]["hidden_size"], 2560)
-        self.assertEqual(recipes[0]["vocab_size"], 151936)
-        self.assertEqual(recipes[0]["num_hidden_layers"], 5)
-        self.assertEqual(recipes[1]["architectures"], ["DFlash2DraftModel"])
-        self.assertEqual(recipes[1]["dflash_config"]["selector_rank"], 256)
-        self.assertEqual(recipes[2]["dflash_config"]["markov_rank"], 256)
-        self.assertTrue(recipes[2]["dflash_config"]["enable_confidence_head"])
+            self.assertEqual(len({config[key] for config in configs}), 1, key)
+        self.assertEqual(configs[0]["hidden_size"], 2560)
+        self.assertEqual(configs[0]["vocab_size"], 151936)
+        self.assertEqual(configs[0]["num_hidden_layers"], 5)
+        self.assertEqual(configs[1]["architectures"], ["DFlash2DraftModel"])
+        self.assertEqual(configs[1]["dflash_config"]["selector_rank"], 256)
+        self.assertEqual(configs[2]["dflash_config"]["markov_rank"], 256)
+        self.assertTrue(configs[2]["dflash_config"]["enable_confidence_head"])
 
-    def test_stock_preserves_real_dflash2_vocabulary_and_dspark_block_size(self):
-        dflash2, _ = benchmark.resolve_config("dflash2", "stock")
-        dspark, _ = benchmark.resolve_config("dspark", "stock")
+    def test_stock_recipe_differences_are_not_hidden(self):
+        dflash2, _ = recipes.resolve_config("dflash2", "stock")
+        dspark, _ = recipes.resolve_config("dspark", "stock")
         self.assertEqual(dflash2["vocab_size"], 248320)
         self.assertEqual(dspark["block_size"], 7)
         self.assertNotEqual(dflash2["vocab_size"], dspark["vocab_size"])
 
-    def test_tiny_preserves_actual_architecture_and_head_types(self):
-        for algorithm, architecture in benchmark.ARCHITECTURES.items():
-            config, _ = benchmark.resolve_config(algorithm, tiny=True)
+    def test_tiny_preserves_real_architectures_and_auxiliary_heads(self):
+        for algorithm, architecture in recipes.ARCHITECTURES.items():
+            config, _ = recipes.resolve_config(algorithm, tiny=True)
             self.assertEqual(config["architectures"], [architecture])
             self.assertEqual(config["num_hidden_layers"], 2)
             self.assertEqual(config["vocab_size"], 128)
             self.assertEqual(config["dflash_config"]["target_layer_ids"], [1, 2])
         self.assertEqual(
-            benchmark.resolve_config("dflash2", tiny=True)[0]["dflash_config"][
+            recipes.resolve_config("dflash2", tiny=True)[0]["dflash_config"][
                 "selector_rank"
             ],
             8,
         )
         self.assertEqual(
-            benchmark.resolve_config("dspark", tiny=True)[0]["dflash_config"][
+            recipes.resolve_config("dspark", tiny=True)[0]["dflash_config"][
                 "markov_rank"
             ],
             8,
         )
 
-    def test_throughput_uses_total_time_not_mean_of_step_rates(self):
-        result = benchmark.summarize_times([1.0, 3.0], 100)
+    def test_throughput_divides_total_tokens_by_total_time(self):
+        result = recipes.summarize_times([1.0, 3.0], 100)
         self.assertEqual(result["input_context_tokens_per_second"], 50.0)
         self.assertEqual(result["optimizer_step_seconds_median"], 2.0)
         self.assertEqual(result["optimizer_step_seconds_p95"], 3.0)
         for durations in ([], [0], [-1], [float("nan")]):
             with self.assertRaises(ValueError):
-                benchmark.summarize_times(durations, 100)
-
-    def test_validation_cannot_accidentally_gather_full_size_checkpoints(self):
-        args = benchmark.build_parser().parse_args(
-            ["--backend", "fsdp", "--output", "report.json", "--check-resume"]
-        )
-        with self.assertRaisesRegex(ValueError, "require --tiny"):
-            benchmark.validate_args(args)
-        args.tiny = True
-        benchmark.validate_args(args)
-
-    def test_rejects_incomplete_or_empty_measurements(self):
-        args = benchmark.build_parser().parse_args(
-            ["--backend", "fsdp", "--output", "report.json", "--steps", "0"]
-        )
-        with self.assertRaisesRegex(ValueError, "steps.*positive"):
-            benchmark.validate_args(args)
-
-    def test_rejects_unsupported_torchtitan_precision_before_model_allocation(self):
-        args = benchmark.build_parser().parse_args(
-            [
-                "--backend",
-                "torchtitan",
-                "--output",
-                "report.json",
-                "--precision",
-                "fp32",
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "requires --precision bf16"):
-            benchmark.validate_args(args)
+                recipes.summarize_times(durations, 100)
 
 
 if __name__ == "__main__":

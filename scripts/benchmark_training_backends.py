@@ -1,557 +1,223 @@
 #!/usr/bin/env python3
-"""Benchmark real draft training with deterministic, cached synthetic features.
+"""Compare native TorchTitan Trainer and SpecForge FSDP1 on cached features.
 
-Run each backend in a fresh torchrun process on the same GPUs, for example::
+Run this script from a fresh torchrun process for every trial. --specforge-root
+selects the checkout containing the native integration, independently of this
+benchmark-only checkout. The torchtitan backend executes Trainer.train() and
+its inherited training step, backward, optimizer and scheduler. It does not
+exercise the earlier TorchTitan FSDP helper backend.
 
-    torchrun --standalone --nproc-per-node=2 scripts/benchmark_training_backends.py \
-        --backend fsdp --algorithm dflash2 --output work/fsdp-dflash2.json
-    torchrun --standalone --nproc-per-node=2 scripts/benchmark_training_backends.py \
-        --backend torchtitan --algorithm dflash2 --output work/titan-dflash2.json
+At the same data-parallel degree, both engines use identical initial values,
+frozen target tables, cached random features and CPU-sampled anchors. Changing
+the DP/TP mesh changes the per-DP-rank feature and anchor streams, even when
+accumulation preserves the global batch size. BF16 compute is shared, but native Titan keeps
+FP32 parameters/Adam state and FP32 gradient reductions; the legacy optimizer
+keeps BF16 parameters/reductions and FP32 masters/Adam state. This is a runtime
+comparison, not a claim of bitwise optimizer or convergence equivalence.
 
-The FSDP baseline works with SpecForge main. The optional ``--backend torchtitan``
-mode requires an installed checkout containing the backend from PR #920
-(https://github.com/sgl-project/SpecForge/pull/920) and its optional dependency.
-This benchmark does not add or install the TorchTitan backend.
-
-For reported results, run three independent torchrun launches per backend with
---repeats 1 and distinct output filenames, alternating backend order (A/B then
-B/A). Framework caches or retained allocations may survive a model replacement
-inside one process; in-process repeats are not independent peak-memory trials.
-Repeat with DP4 and algorithms dflash/dspark. The default controlled recipe uses
-the full Qwen3-4B draft geometry and vocabulary for every algorithm. It is a
-custom benchmark recipe, not a released DFlash2 checkpoint. --recipe stock uses
-the repository configs verbatim (DFlash2's Qwen3.5-4B vocabulary is different).
-
-This measures TrainerCore + real forward/backward/optimizer work, with frozen
-random target tables and cached random hidden states. It excludes target model
-inference, feature production/transport, checkpoint I/O, and model construction.
-It does not measure convergence or speculative serving speed. Throughput counts
-input context tokens, not accepted tokens or unique supervised draft positions.
-
-For correctness, use --tiny --precision bf16 --check-resume and --snapshot-dir
-for BOTH backends; then run --compare-snapshots LEFT.pt RIGHT.pt. Validation
-snapshots and resume replay are deliberately restricted to tiny models.
+Timed windows include feature preparation, H2D for token IDs/masks, forward,
+backward and optimizer. Hidden states are already cached on GPU for both paths.
+Metadata hashing, construction, checkpoint/export and trial coordination are
+outside measured windows. First-step and warmup times are recorded separately
+from steady steps, including lazy compilation in those warmup measurements.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import gc
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
-import statistics
-import subprocess
 import sys
 import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-STOCK_CONFIGS = {
-    "dflash": "qwen3-4b-dflash.json",
-    "dflash2": "qwen3.5-4b-dflash2.json",
-    "dspark": "qwen3-4b-dspark.json",
-}
-ARCHITECTURES = {
-    "dflash": "DFlashDraftModel",
-    "dflash2": "DFlash2DraftModel",
-    "dspark": "DSparkDraftModel",
-}
+import training_benchmark_recipes as recipes
 
 
-def resolve_config(algorithm, recipe="controlled", *, tiny=False, config_path=None):
-    """Resolve a fully recorded recipe without importing GPU dependencies."""
-    source = (
-        Path(config_path)
-        if config_path
-        else REPO_ROOT
-        / "configs"
-        / (STOCK_CONFIGS[algorithm] if recipe == "stock" else STOCK_CONFIGS["dflash"])
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--specforge-root", required=True, type=Path)
+    parser.add_argument("--backend", choices=("fsdp", "torchtitan"), required=True)
+    parser.add_argument(
+        "--algorithm", choices=("dflash", "dflash2", "dspark"), required=True
     )
-    config = json.loads(source.read_text())
-    if config_path and config.get("architectures") != [ARCHITECTURES[algorithm]]:
-        raise ValueError("--config architecture does not match --algorithm")
-    if not config_path and recipe == "controlled":
-        config["architectures"] = [ARCHITECTURES[algorithm]]
-        config.pop("auto_map", None)
-        method = config["dflash_config"]
-        if algorithm == "dflash2":
-            method.update(
-                conv_group_size=16,
-                conv_kernel_size=2,
-                selector_rank=256,
-                selector_top_k=16,
-            )
-        elif algorithm == "dspark":
-            method.update(
-                attention_mode="gqa",
-                projector_type="dspark",
-                markov_head_type="vanilla",
-                markov_rank=256,
-                confidence_head_alpha=1.0,
-                enable_confidence_head=True,
-                confidence_head_with_markov=True,
-            )
-    if tiny:
-        config.update(
-            hidden_size=32,
-            intermediate_size=64,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            num_hidden_layers=2,
-            head_dim=8,
-            num_target_layers=4,
-            vocab_size=128,
-            max_position_embeddings=4096,
-            layer_types=["full_attention"] * 2,
-            block_size=4,
-            bos_token_id=1,
-            eos_token_id=2,
-            pad_token_id=0,
-            rope_scaling=None,
-            rope_theta=10000.0,
-        )
-        config.pop("rope_parameters", None)
-        method = config["dflash_config"]
-        method.update(target_layer_ids=[1, 2], mask_token_id=127, block_size=4)
-        if algorithm == "dflash2":
-            method.update(conv_group_size=4, selector_rank=8, selector_top_k=4)
-        if algorithm == "dspark":
-            method["markov_rank"] = 8
-    # Match AutoDraftModelConfig: a draft owns no target embedding/head to tie.
-    config["tie_word_embeddings"] = False
-    return config, str(source.resolve())
-
-
-def summarize_times(seconds, input_tokens_per_window):
-    if not seconds or any(not math.isfinite(x) or x <= 0 for x in seconds):
-        raise ValueError("step durations must be non-empty, finite and positive")
-    ordered = sorted(seconds)
-    return {
-        "optimizer_step_seconds_mean": statistics.mean(seconds),
-        "optimizer_step_seconds_median": statistics.median(seconds),
-        "optimizer_step_seconds_p95": ordered[math.ceil(0.95 * len(ordered)) - 1],
-        "input_context_tokens_per_second": input_tokens_per_window
-        * len(seconds)
-        / sum(seconds),
-    }
-
-
-def build_parser():
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("--backend", choices=("fsdp", "torchtitan"))
-    parser.add_argument("--algorithm", choices=tuple(ARCHITECTURES), default="dflash")
     parser.add_argument(
         "--recipe", choices=("controlled", "stock"), default="controlled"
     )
+    parser.add_argument("--tiny", action="store_true")
     parser.add_argument(
-        "--config", type=Path, help="Explicit draft JSON; overrides recipe selection"
+        "--attention",
+        choices=("eager", "sdpa", "flex_attention"),
+        default="flex_attention",
     )
-    parser.add_argument(
-        "--tiny",
-        action="store_true",
-        help="Small real architecture for correctness, not performance claims",
-    )
-    parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
-    parser.add_argument(
-        "--sharding", choices=("FULL_SHARD", "SHARD_GRAD_OP"), default="FULL_SHARD"
-    )
-    parser.add_argument(
-        "--attention", choices=("sdpa", "flex_attention", "eager"), default="sdpa"
-    )
-    parser.add_argument("--seq-length", type=int, default=1024)
-    parser.add_argument(
-        "--batch-size", type=int, default=1, help="Per-rank microbatch size"
-    )
+    parser.add_argument("--seq-length", type=int, default=4096)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--accumulation-steps", type=int, default=2)
-    parser.add_argument("--num-anchors", type=int, default=64)
-    parser.add_argument("--objective-chunk-blocks", type=int, default=16)
+    parser.add_argument("--num-anchors", type=int, default=512)
+    parser.add_argument("--objective-chunk-blocks", type=int, default=128)
     parser.add_argument("--cache-batches", type=int, default=2)
+    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--compile", action="store_true")
     parser.add_argument(
-        "--warmup-steps",
-        type=int,
-        default=5,
-        help="Optimizer windows, excluded from timing",
-    )
-    parser.add_argument(
-        "--steps", type=int, default=20, help="Measured optimizer windows per repeat"
-    )
-    parser.add_argument(
-        "--repeats",
-        type=int,
-        default=1,
-        help="In-process model resets; use 1 and three independent torchrun launches for reported measurements",
+        "--sharding", choices=("SHARD_GRAD_OP", "FULL_SHARD"), default="SHARD_GRAD_OP"
     )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--activation-checkpointing", action="store_true")
-    parser.add_argument("--detailed-metrics", action="store_true")
-    parser.add_argument(
-        "--feature-file",
-        type=str,
-        help="Local torch tensor-list file; {rank} is substituted. Must contain all four normalized feature tensors.",
-    )
-    parser.add_argument("--output", type=Path)
-    parser.add_argument(
-        "--source-revision", help="Provenance label for source archives without .git"
-    )
-    parser.add_argument(
-        "--check-resume",
-        action="store_true",
-        help="Tiny-only disk save/restore/replay check after measurement",
-    )
-    parser.add_argument(
-        "--snapshot-dir",
-        type=Path,
-        help="Tiny-only rank-0 final draft snapshots for backend parity",
-    )
-    parser.add_argument(
-        "--compare-snapshots", nargs=2, type=Path, metavar=("LEFT", "RIGHT")
-    )
-    parser.add_argument("--rtol", type=float, default=1e-3)
-    parser.add_argument("--atol", type=float, default=1e-5)
-    return parser
-
-
-def validate_args(args):
-    if any(not math.isfinite(x) or x < 0 for x in (args.rtol, args.atol)):
-        raise ValueError("comparison tolerances must be finite and nonnegative")
-    if args.compare_snapshots:
-        return
-    if args.backend is None or args.output is None:
-        raise ValueError("--backend and --output are required for a benchmark")
-    for name in (
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
+    for key in (
         "seq_length",
         "batch_size",
         "accumulation_steps",
         "num_anchors",
         "cache_batches",
         "steps",
-        "repeats",
+        "tp_size",
     ):
-        if getattr(args, name) < 1:
-            raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if args.warmup_steps < 0 or args.objective_chunk_blocks < 0:
-        raise ValueError("warmup steps and objective chunk blocks must be nonnegative")
-    if args.learning_rate <= 0 or not math.isfinite(args.learning_rate):
-        raise ValueError("learning rate must be finite and positive")
-    if (args.check_resume or args.snapshot_dir) and not args.tiny:
-        raise ValueError("resume checks and validation snapshots require --tiny")
-    if args.backend == "torchtitan" and args.precision != "bf16":
-        raise ValueError("TorchTitan backend currently requires --precision bf16")
+        if getattr(args, key) < 1:
+            parser.error(f"{key} must be positive")
+    if args.warmup_steps < 1 or args.objective_chunk_blocks < 0:
+        parser.error(
+            "At least one warmup step and nonnegative objective chunk size are required"
+        )
+    if args.backend == "fsdp" and (args.tp_size != 1 or args.compile):
+        parser.error("The FSDP baseline supports TP1 without compile")
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        parser.error("learning_rate must be finite and positive")
+    args.feature_file = None
+    args.activation_checkpointing = False
+    args.detailed_metrics = False
+    args.precision = "bf16"
+    return args
 
 
-def _tensor_fingerprint(values):
-    """Exact content hash, evaluated outside timing before sharding."""
+class Measurement:
+    def __init__(self, args, device):
+        self.args, self.device = args, device
+        self.seconds, self.losses = [], []
+        self.peak = None
+
+    def start(self, step):
+        import torch
+        import torch.distributed as dist
+
+        dist.barrier()
+        torch.cuda.synchronize()
+        if step == self.args.warmup_steps:
+            torch.cuda.reset_peak_memory_stats()
+            self.baseline = torch.cuda.memory_allocated()
+        return time.perf_counter()
+
+    def finish(
+        self, started, loss, *, local_loss_sum=False, global_mean=False, group=None
+    ):
+        import torch
+        import torch.distributed as dist
+
+        # Stop the clock before reductions used only to record the benchmark.
+        torch.cuda.synchronize()
+        duration = time.perf_counter() - started
+        elapsed = torch.tensor(duration, dtype=torch.float64, device=self.device)
+        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+        self.seconds.append(elapsed.item())
+        if callable(loss):
+            loss = loss()
+        if local_loss_sum:
+            loss = torch.stack(loss).sum()
+            if group is not None:
+                dist.all_reduce(loss, op=dist.ReduceOp.SUM, group=group)
+            loss = loss.item()
+        if global_mean:
+            loss = torch.tensor(float(loss), device=self.device)
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG, group=group)
+            loss = loss.item()
+        if not math.isfinite(float(loss)):
+            raise FloatingPointError("Non-finite benchmark loss")
+        self.losses.append(float(loss))
+
+    def result(self, cache_bytes, data_degree):
+        import torch
+        import torch.distributed as dist
+
+        memory = torch.tensor(
+            [
+                self.baseline,
+                torch.cuda.max_memory_allocated(),
+                torch.cuda.max_memory_reserved(),
+                cache_bytes,
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        dist.all_reduce(memory, op=dist.ReduceOp.MAX)
+        steady = self.seconds[self.args.warmup_steps :]
+        tokens = (
+            self.args.batch_size
+            * self.args.seq_length
+            * self.args.accumulation_steps
+            * data_degree
+        )
+        return {
+            "warmup_step_seconds_max_rank": self.seconds[: self.args.warmup_steps],
+            "first_step_seconds_max_rank": self.seconds[0],
+            "step_seconds_max_rank": steady,
+            "losses_including_warmup": self.losses,
+            "baseline_allocated_bytes_max_rank": memory[0].item(),
+            "peak_allocated_bytes_max_rank": memory[1].item(),
+            "peak_reserved_bytes_max_rank": memory[2].item(),
+            "feature_cache_gpu_bytes_max_rank": memory[3].item(),
+            "input_context_tokens_per_optimizer_window": tokens,
+            **recipes.summarize_times(steady, tokens),
+        }
+
+
+def anchor_plan_hash(model, batches, args, data_rank):
     import torch
 
+    generator = torch.Generator().manual_seed(args.seed + data_rank)
     digest = hashlib.sha256()
-    for name, tensor in sorted(values.items()):
-        tensor = tensor.detach().cpu().contiguous()
-        digest.update(f"{name}:{tuple(tensor.shape)}:{tensor.dtype}".encode())
-        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    for index in range((args.warmup_steps + args.steps) * args.accumulation_steps):
+        mask = batches[index % len(batches)].tensors["loss_mask"]
+        anchors, keep = model._sample_anchor_positions(
+            mask.shape[1], mask, torch.device("cpu"), generator=generator
+        )
+        digest.update(
+            recipes._tensor_fingerprint({"anchors": anchors, "keep": keep}).encode()
+        )
     return digest.hexdigest()
 
 
-def _build_model(args, config, device, dtype):
-    import torch
-    from torch import nn
-    from transformers import Qwen3Config
-
-    from specforge.algorithms.common.dflash_family_model import (
-        OnlineDFlashModel,
-        OnlineDSparkModel,
-    )
-    from specforge.modeling.auto import AutoDraftModel
-
-    old_dtype = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(dtype)
-        torch.manual_seed(args.seed)
-        draft_config = Qwen3Config.from_dict(copy.deepcopy(config))
-        draft_config._attn_implementation = args.attention
-        draft = AutoDraftModel.from_config(draft_config, torch_dtype=dtype)
-        if args.activation_checkpointing:
-            draft.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-        draft_hash = _tensor_fingerprint(draft.state_dict())
-        # Independent seed makes the target identical across algorithms, too.
-        torch.manual_seed(args.seed + 1)
-        embedding = nn.Embedding(config["vocab_size"], config["hidden_size"])
-        head = nn.Linear(config["hidden_size"], config["vocab_size"], bias=False)
-        nn.init.normal_(embedding.weight, std=0.02)
-        nn.init.normal_(head.weight, std=0.02)
-        embedding.requires_grad_(False)
-        head.requires_grad_(False)
-        teacher_hash = _tensor_fingerprint(
-            {"embedding": embedding.weight, "head": head.weight}
-        )
-        kwargs = dict(
-            draft_model=draft,
-            target_lm_head=head,
-            target_embed_tokens=embedding,
-            mask_token_id=config["dflash_config"]["mask_token_id"],
-            block_size=draft.block_size,
-            attention_backend=args.attention,
-            num_anchors=args.num_anchors,
-            objective_chunk_blocks=args.objective_chunk_blocks,
-        )
-        if args.algorithm == "dspark":
-            model = OnlineDSparkModel(**kwargs)
-        else:
-            model = OnlineDFlashModel(**kwargs, teacher_metrics=args.detailed_metrics)
-        counts = {
-            "trainable_parameters": sum(
-                p.numel() for p in model.parameters() if p.requires_grad
-            ),
-            "frozen_parameters": sum(
-                p.numel() for p in model.parameters() if not p.requires_grad
-            ),
-        }
-        return (
-            model.to(device=device, dtype=dtype),
-            draft,
-            counts,
-            draft_hash,
-            teacher_hash,
-        )
-    finally:
-        torch.set_default_dtype(old_dtype)
-
-
-def _make_batches(args, config, rank, device, dtype):
-    import torch
-
-    from specforge.runtime.contracts import TrainBatch
-
-    capture_width = (
-        len(config["dflash_config"]["target_layer_ids"]) * config["hidden_size"]
-    )
-    if args.feature_file:
-        raw_batches = torch.load(
-            args.feature_file.format(rank=rank), map_location="cpu", weights_only=True
-        )
-        if not isinstance(raw_batches, list) or not raw_batches:
-            raise ValueError(
-                "feature file must be a nonempty list of tensor dictionaries"
-            )
-    else:
-        raw_batches = []
-        for index in range(args.cache_batches):
-            generator = torch.Generator().manual_seed(
-                args.seed + 1000 + rank * 10000 + index
-            )
-            shape = (args.batch_size, args.seq_length)
-            mask = torch.ones(shape, dtype=torch.float32)
-            # Vary supervision by rank/cache entry, exercising token weighting.
-            tail = (rank + index) % max(1, args.seq_length // 4)
-            if tail:
-                mask[:, -tail:] = 0
-            raw_batches.append(
-                {
-                    "input_ids": torch.randint(
-                        0, config["vocab_size"], shape, generator=generator
-                    ),
-                    "loss_mask": mask,
-                    "hidden_states": torch.randn(
-                        *shape, capture_width, generator=generator, dtype=dtype
-                    ),
-                    "target_last_hidden_states": torch.randn(
-                        *shape, config["hidden_size"], generator=generator, dtype=dtype
-                    ),
-                }
-            )
-    expected = {
-        "input_ids": (args.batch_size, args.seq_length),
-        "loss_mask": (args.batch_size, args.seq_length),
-        "hidden_states": (args.batch_size, args.seq_length, capture_width),
-        "target_last_hidden_states": (
-            args.batch_size,
-            args.seq_length,
-            config["hidden_size"],
-        ),
-    }
-    batches, fingerprints = [], []
-    cache_bytes = 0
-    for index, tensors in enumerate(raw_batches):
-        if not isinstance(tensors, dict) or any(
-            name not in tensors for name in expected
-        ):
-            raise ValueError(f"batch {index} must contain {sorted(expected)}")
-        for name, shape in expected.items():
-            if (
-                not isinstance(tensors[name], torch.Tensor)
-                or tuple(tensors[name].shape) != shape
-            ):
-                raise ValueError(f"batch {index} {name} must have shape {shape}")
-        if (
-            tensors["input_ids"].min() < 0
-            or tensors["input_ids"].max() >= config["vocab_size"]
-        ):
-            raise ValueError("feature token id outside target vocabulary")
-        normalized = {
-            name: tensor.to(
-                dtype=(
-                    torch.long
-                    if name == "input_ids"
-                    else torch.float32 if name == "loss_mask" else dtype
-                )
-            )
-            for name, tensor in tensors.items()
-            if name in expected
-        }
-        fingerprints.append(_tensor_fingerprint(normalized))
-        # Match prepositioned feature consumers: hidden states on GPU; small
-        # integer/mask inputs on pinned host memory for CPU anchor counting.
-        for name in normalized:
-            if name in ("input_ids", "loss_mask"):
-                normalized[name] = normalized[name].pin_memory()
-            else:
-                normalized[name] = normalized[name].to(device)
-                cache_bytes += (
-                    normalized[name].numel() * normalized[name].element_size()
-                )
-        batches.append(
-            TrainBatch(
-                sample_ids=[
-                    f"rank{rank}-cache{index}-sample{n}" for n in range(args.batch_size)
-                ],
-                strategy="dspark" if args.algorithm == "dspark" else "dflash",
-                tensors=normalized,
-            )
-        )
-    return batches, fingerprints, cache_bytes
-
-
-def _run_window(core, batches, args, step):
-    from specforge.training.strategies.base import StepContext
-
-    for micro in range(args.accumulation_steps):
-        batch = batches[(step * args.accumulation_steps + micro) % len(batches)]
-        result = core.train_step(
-            batch,
-            StepContext(
-                global_step=step,
-                total_steps=100000,
-                collect_detailed_metrics=args.detailed_metrics,
-            ),
-        )
-    if not result.optimizer_stepped or core.accumulation_remainder:
-        raise AssertionError("benchmark window did not end at an optimizer boundary")
-    return result
-
-
-def _cpu_tree(value):
-    import torch
-
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu().clone()
-    if isinstance(value, dict):
-        return {key: _cpu_tree(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_cpu_tree(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_cpu_tree(item) for item in value)
-    return copy.deepcopy(value)
-
-
-def _assert_state_equal(actual, expected, path="state"):
-    """Compare tensor trees including optimizer string/None metadata."""
-    import torch
-
-    if isinstance(expected, torch.Tensor):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=path)
-    elif isinstance(expected, dict):
-        if actual.keys() != expected.keys():
-            raise AssertionError(f"{path}: state keys differ")
-        for key in expected:
-            _assert_state_equal(actual[key], expected[key], f"{path}.{key}")
-    elif isinstance(expected, (tuple, list)):
-        if len(actual) != len(expected):
-            raise AssertionError(f"{path}: state sequence lengths differ")
-        for index, item in enumerate(expected):
-            _assert_state_equal(actual[index], item, f"{path}[{index}]")
-    elif actual != expected:
-        raise AssertionError(f"{path}: {actual!r} != {expected!r}")
-
-
-def _check_resume(backend, core, batches, args, step, directory):
-    """Write backend state, advance, restore from disk and exactly replay."""
+def run_fsdp(args, model, draft, batches, measurement):
     import torch
     import torch.distributed as dist
 
-    from specforge.training.controller import TrainerCore
-
-    rank = dist.get_rank()
-    directory.mkdir(parents=True, exist_ok=True)
-    state = backend.state_dict()
-    if rank == 0:
-        torch.save(state["model"], directory / "model.pt")
-    torch.save(
-        {key: value for key, value in state.items() if key != "model"},
-        directory / f"rank{rank}.pt",
-    )
-    del state
-    dist.barrier()
-    expected_loss = _run_window(core, batches, args, step).loss
-    expected = _cpu_tree(backend.state_dict())
-    restored = torch.load(
-        directory / f"rank{rank}.pt", map_location="cpu", weights_only=False
-    )
-    restored["model"] = torch.load(
-        directory / "model.pt", map_location="cpu", weights_only=True
-    )
-    backend.load_state_dict(restored)
-    replay_core = TrainerCore(
-        core.strategy, backend, accumulation_steps=args.accumulation_steps
-    )
-    actual_loss = _run_window(replay_core, batches, args, step).loss
-    actual = _cpu_tree(backend.state_dict())
-    # Exact same-backend replay checks optimizer masters/moments/scheduler as
-    # well as ordinary full model weights, not merely the reported loss.
-    _assert_state_equal(actual["optimizer"], expected["optimizer"])
-    if rank == 0:
-        torch.testing.assert_close(actual["model"], expected["model"], rtol=0, atol=0)
-    if expected_loss != actual_loss:
-        raise AssertionError(f"resume loss mismatch: {expected_loss} != {actual_loss}")
-    return {"passed": True, "replayed_loss": actual_loss, "directory": str(directory)}
-
-
-def _run_repeat(args, config, repeat):
-    import torch
-    import torch.distributed as dist
-
+    from specforge.distributed import init_distributed
     from specforge.optimizer import BF16Optimizer
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
     from specforge.training.controller import TrainerCore
     from specforge.training.strategies.base import (
         DFlashTrainStrategy,
         DSparkTrainStrategy,
+        StepContext,
     )
 
-    rank, world = dist.get_rank(), dist.get_world_size()
-    device = torch.device("cuda", torch.cuda.current_device())
-    dtype = torch.bfloat16 if args.precision == "bf16" else torch.float32
-    model, draft, counts, draft_hash, teacher_hash = _build_model(
-        args, config, device, dtype
+    init_distributed()
+    model.to(device=measurement.device, dtype=torch.bfloat16)
+    parallel = ParallelConfig.from_distributed(
+        sharding_strategy=args.sharding, param_dtype=torch.bfloat16
     )
-    pc = ParallelConfig.from_distributed(
-        sharding_strategy=args.sharding, param_dtype=dtype
-    )
-    if pc.sharding_strategy != args.sharding:
-        raise ValueError("FSDP_SHARDING environment conflicts with --sharding")
-    backend_type = FSDPTrainingBackend
-    if args.backend == "torchtitan":
-        from specforge.training.torchtitan_backend import TorchTitanTrainingBackend
-
-        backend_type = TorchTitanTrainingBackend
-    backend = backend_type(
-        pc,
+    if parallel.sharding_strategy != args.sharding:
+        raise ValueError("FSDP_SHARDING conflicts with the benchmark sharding argument")
+    backend = FSDPTrainingBackend(
+        parallel,
         optimizer_factory=lambda module: BF16Optimizer(
             module,
             lr=args.learning_rate,
@@ -562,283 +228,380 @@ def _run_repeat(args, config, repeat):
             lr_scheduler="constant",
         ),
     )
+    prepared = {}
+
+    def inject_anchors(module, positional, kwargs):
+        kwargs.update(prepared)
+        return positional, kwargs
+
+    model.register_forward_pre_hook(inject_anchors, with_kwargs=True)
     wrapped = backend.prepare_model(model, optimizer_target=draft)
-    strategy_type = (
-        DSparkTrainStrategy if args.algorithm == "dspark" else DFlashTrainStrategy
+    strategy = (
+        DSparkTrainStrategy(wrapped)
+        if args.algorithm == "dspark"
+        else DFlashTrainStrategy(wrapped)
     )
-    core = TrainerCore(
-        strategy_type(wrapped), backend, accumulation_steps=args.accumulation_steps
-    )
-    batches, fingerprints, cache_bytes = _make_batches(
-        args, config, rank, device, dtype
-    )
-    rank_fingerprints = [None] * world
-    dist.all_gather_object(rank_fingerprints, fingerprints)
-    # Reset AFTER construction/wrapping so backend setup cannot alter anchors.
-    torch.manual_seed(args.seed + 2000 + rank)
-    losses, seconds = [], []
-    for step in range(args.warmup_steps):
-        loss = _run_window(core, batches, args, step).loss
-        if not math.isfinite(loss):
-            raise ValueError(f"non-finite warmup loss: {loss}")
-        losses.append(loss)
-    torch.cuda.synchronize()
-    dist.barrier()
-    torch.cuda.reset_peak_memory_stats()
-    baseline_bytes = torch.cuda.memory_allocated()
-    for step in range(args.warmup_steps, args.warmup_steps + args.steps):
-        dist.barrier()
-        torch.cuda.synchronize()
-        started = time.perf_counter()
-        result = _run_window(core, batches, args, step)
-        torch.cuda.synchronize()
-        local_seconds = time.perf_counter() - started
-        elapsed = torch.tensor(local_seconds, dtype=torch.float64, device=device)
-        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
-        seconds.append(elapsed.item())
-        loss = result.loss
-        if not math.isfinite(loss):
-            raise ValueError(f"non-finite measured loss: {loss}")
-        losses.append(loss)
-    memory = torch.tensor(
-        [
-            baseline_bytes,
-            torch.cuda.max_memory_allocated(),
-            torch.cuda.max_memory_reserved(),
-            cache_bytes,
-        ],
-        dtype=torch.int64,
-        device=device,
-    )
-    dist.all_reduce(memory, op=dist.ReduceOp.MAX)
-    baseline, peak_allocated, peak_reserved, cache_max = memory.tolist()
-    input_tokens = args.batch_size * args.seq_length * args.accumulation_steps * world
-    contract = {
-        "config": config,
-        "algorithm": args.algorithm,
-        "world_size": world,
-        "seed": args.seed,
-        "precision": args.precision,
-        "sharding": args.sharding,
-        "attention": args.attention,
-        "activation_checkpointing": args.activation_checkpointing,
-        "detailed_metrics": args.detailed_metrics,
-        "batch_size": args.batch_size,
-        "seq_length": args.seq_length,
-        "num_anchors": args.num_anchors,
-        "objective_chunk_blocks": args.objective_chunk_blocks,
-        "accumulation_steps": args.accumulation_steps,
-        "warmup_steps": args.warmup_steps,
-        "steps": args.steps,
-        "learning_rate": args.learning_rate,
-        "initial_draft_sha256": draft_hash,
-        "frozen_target_sha256": teacher_hash,
-        "feature_sha256_by_rank": rank_fingerprints,
-    }
-    record = {
-        "repeat": repeat,
-        "backend": args.backend,
-        **counts,
-        "comparison_contract": contract,
-        "step_seconds_max_rank": seconds,
-        "losses_including_warmup": losses,
-        **summarize_times(seconds, input_tokens),
-        "baseline_allocated_bytes_max_rank": baseline,
-        "peak_allocated_bytes_max_rank": peak_allocated,
-        "peak_reserved_bytes_max_rank": peak_reserved,
-        "feature_cache_gpu_bytes_max_rank": cache_max,
-        "input_context_tokens_per_optimizer_window": input_tokens,
-    }
-    if args.snapshot_dir:
-        state = backend.state_dict()
-        if rank == 0:
-            args.snapshot_dir.mkdir(parents=True, exist_ok=True)
-            path = (
-                args.snapshot_dir / f"{args.algorithm}-{args.backend}-repeat{repeat}.pt"
-            )
-            torch.save(
-                {
-                    "comparison_contract": contract,
-                    "backend": args.backend,
-                    "draft_state_dict": _cpu_tree(
-                        core.strategy.checkpoint_state_filter(state["model"])
+    core = TrainerCore(strategy, backend, accumulation_steps=args.accumulation_steps)
+    generator = torch.Generator().manual_seed(args.seed + dist.get_rank())
+
+    def train():
+        for step in range(args.warmup_steps + args.steps):
+            started = measurement.start(step)
+            micro_results = []
+            for micro in range(args.accumulation_steps):
+                batch = batches[(step * args.accumulation_steps + micro) % len(batches)]
+                mask = batch.tensors["loss_mask"]
+                anchors, keep = model._sample_anchor_positions(
+                    mask.shape[1], mask, torch.device("cpu"), generator=generator
+                )
+                prepared.update(
+                    anchor_positions=anchors.to(measurement.device),
+                    block_keep_mask=keep.to(measurement.device),
+                )
+                result = core.train_step(
+                    batch,
+                    StepContext(
+                        global_step=step,
+                        total_steps=100000,
+                        collect_detailed_metrics=step == 0,
                     ),
-                    "losses": losses,
-                },
-                path,
-            )
-            record["validation_snapshot"] = str(path)
-        del state
-    if args.check_resume:
-        directory = args.output.parent / f"{args.output.stem}-resume-repeat{repeat}"
-        record["resume_check"] = _check_resume(
-            backend, core, batches, args, args.warmup_steps + args.steps, directory
-        )
-    return record
-
-
-def compare_snapshots(paths, *, rtol, atol):
-    import torch
-
-    left, right = [
-        torch.load(path, map_location="cpu", weights_only=True) for path in paths
-    ]
-    if left["comparison_contract"] != right["comparison_contract"]:
-        raise ValueError(
-            "snapshots have different initialization, input, or training contracts"
-        )
-    if not left["draft_state_dict"] or not right["draft_state_dict"]:
-        raise ValueError("snapshot has no draft parameters")
-    torch.testing.assert_close(
-        left["draft_state_dict"], right["draft_state_dict"], rtol=rtol, atol=atol
-    )
-    torch.testing.assert_close(
-        torch.tensor(left["losses"]),
-        torch.tensor(right["losses"]),
-        rtol=rtol,
-        atol=atol,
-    )
-    max_error = max(
-        (
-            left["draft_state_dict"][name].float()
-            - right["draft_state_dict"][name].float()
-        )
-        .abs()
-        .max()
-        .item()
-        for name in left["draft_state_dict"]
-    )
-    return {
-        "passed": True,
-        "left_backend": left["backend"],
-        "right_backend": right["backend"],
-        "max_draft_parameter_absolute_error": max_error,
-        "rtol": rtol,
-        "atol": atol,
-    }
-
-
-def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
-        validate_args(args)
-    except ValueError as error:
-        parser.error(str(error))
-    if args.compare_snapshots:
-        print(
-            json.dumps(
-                compare_snapshots(
-                    args.compare_snapshots, rtol=args.rtol, atol=args.atol
+                )
+                micro_results.append(result)
+            if not result.optimizer_stepped or core.accumulation_remainder:
+                raise AssertionError("FSDP optimizer window did not complete")
+            # DFlash reports the pooled window objective; DSpark's existing
+            # strategy reports a logical-microbatch objective. Materialize all
+            # host metrics after stopping the timing window in either case.
+            measurement.finish(
+                started,
+                lambda: (
+                    sum(item.loss for item in micro_results) / args.accumulation_steps
+                    if args.algorithm == "dspark"
+                    else result.loss
                 ),
-                indent=2,
+                global_mean=args.algorithm == "dspark",
             )
-        )
-        return
-    config, source = resolve_config(
-        args.algorithm, args.recipe, tiny=args.tiny, config_path=args.config
+
+    return train, None
+
+
+def run_titan(args, config, model, batches, measurement, directory):
+    import torch
+    from torchtitan.components.checkpoint import CheckpointManager
+    from torchtitan.components.metrics import MetricsProcessor
+    from torchtitan.components.optimizer.optimizer import default_adamw
+    from torchtitan.config import (
+        CompileConfig,
+        DebugConfig,
+        ParallelismConfig,
+        TrainingConfig,
     )
-    block_size = config.get("block_size", config["dflash_config"].get("block_size"))
-    if args.seq_length < block_size + 2:
-        parser.error("--seq-length must be at least block_size + 2")
-    # Ordinary `python script.py --help` remains dependency-light.
-    sys.path.insert(0, str(REPO_ROOT))
+    from torchtitan.protocols.model_spec import ModelSpec
+    from torchtitan.tools.logging import init_logger
+
+    from specforge.training.torchtitan.data import FeatureDataLoader
+    from specforge.training.torchtitan.frontend import (
+        _scheduler_config,
+        _tokenizer_config,
+    )
+    from specforge.training.torchtitan.loss import SpecForgeObjectiveLoss
+    from specforge.training.torchtitan.model import SpecForgeTitanModel
+    from specforge.training.torchtitan.parallelize import (
+        group_optimizer_parameters_by_mesh,
+        parallelize_dflash,
+    )
+    from specforge.training.torchtitan.runtime import SpecForgeTitanTrainer
+
+    teacher_path, draft_path = (
+        Path(directory) / "teacher.pt",
+        Path(directory) / "draft.pt",
+    )
+    torch.save(
+        {
+            "lm_head.weight": model.lm_head.weight,
+            "embed_tokens.weight": model.embed_tokens.weight,
+        },
+        teacher_path,
+    )
+    torch.save(model.draft_model.state_dict(), draft_path)
+    total_steps = args.warmup_steps + args.steps
+    objective = dict(
+        mask_token_id=config["dflash_config"]["mask_token_id"],
+        block_size=model.block_size,
+        attention_backend=args.attention,
+        num_anchors=args.num_anchors,
+        objective_chunk_blocks=args.objective_chunk_blocks,
+    )
+    if args.algorithm != "dspark":
+        objective["teacher_metrics"] = False
+
+    class CachedSource:
+        def __call__(self, **kwargs):
+            expected_rank = int(os.environ["RANK"]) // args.tp_size
+            if (
+                kwargs["dp_rank"] != expected_rank
+                or kwargs["local_batch_size"] != args.batch_size
+            ):
+                raise AssertionError("Unexpected native data mesh")
+            return (
+                batches[index % len(batches)]
+                for index in range(total_steps * args.accumulation_steps)
+            )
+
+    class RecordingLoss:
+        def __init__(self, loss):
+            self.loss, self.values = loss, []
+
+        def __call__(self, *positional, **kwargs):
+            result = self.loss(*positional, **kwargs)
+            self.values.append(result[0].detach())
+            return result
+
+    class TimedTrainer(SpecForgeTitanTrainer):
+        def train_step(self, data_iterator):
+            self.loss_fn.values.clear()
+            started = measurement.start(self.step - 1)
+            super().train_step(data_iterator)
+            group = self.parallel_dims.get_optional_mesh(
+                "batch", include_singleton_axes=True
+            ).get_group()
+            measurement.finish(
+                started, self.loss_fn.values, local_loss_sum=True, group=group
+            )
+
+    native = SpecForgeTitanTrainer.Config(
+        dump_folder=str(Path(directory) / "native"),
+        model_spec=ModelSpec(
+            name="specforge",
+            flavor=args.algorithm,
+            model=SpecForgeTitanModel.Config(
+                draft_config=config,
+                algorithm=args.algorithm,
+                objective=objective,
+                teacher_state_path=str(teacher_path),
+                draft_state_path=str(draft_path),
+                init_seed=args.seed,
+            ),
+            parallelize_fn=parallelize_dflash,
+            pipelining_fn=None,
+            post_optimizer_build_fn=group_optimizer_parameters_by_mesh,
+            state_dict_adapter=None,
+        ),
+        tokenizer=_tokenizer_config(config["vocab_size"]),
+        dataloader=FeatureDataLoader.Config(source_factory=CachedSource(), epochs=1),
+        loss=SpecForgeObjectiveLoss.Config(algorithm=args.algorithm),
+        optimizer=default_adamw(
+            lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
+        ),
+        lr_scheduler=_scheduler_config(
+            SimpleNamespace(
+                training=SimpleNamespace(warmup_ratio=0.0, lr_scheduler="constant")
+            ),
+            100000,
+        ),
+        training=TrainingConfig(
+            local_batch_size=args.batch_size,
+            global_batch_size=args.batch_size
+            * (int(os.environ["WORLD_SIZE"]) // args.tp_size)
+            * args.accumulation_steps,
+            seq_len=args.seq_length,
+            steps=total_steps,
+            max_norm=1.0,
+            dtype="float32",
+            mixed_precision_param="bfloat16",
+            mixed_precision_reduce="float32",
+            disable_cuda_graphs=True,
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=-1,
+            tensor_parallel_degree=args.tp_size,
+            enable_sequence_parallel=False,
+            spmd_backend="partial_dtensor",
+            fsdp_reshard_after_forward=(
+                "always" if args.sharding == "FULL_SHARD" else "never"
+            ),
+        ),
+        activation_checkpoint=None,
+        compile=CompileConfig(enable=args.compile, components=["model"]),
+        checkpoint=CheckpointManager.Config(enable=False),
+        metrics=MetricsProcessor.Config(log_freq=1000000000),
+        debug=DebugConfig(seed=args.seed),
+        schedule_total_steps=100000,
+    )
+    init_logger()
+    trainer = TimedTrainer(native)
+    trainer.loss_fn = RecordingLoss(trainer.loss_fn)
+    return trainer.train, trainer
+
+
+def main():
+    args = parse_args()
+    sys.path.insert(0, str(args.specforge_root.resolve()))
     import torch
     import torch.distributed as dist
 
-    from specforge.distributed import destroy_distributed, init_distributed
+    if "RANK" not in os.environ or not torch.cuda.is_available():
+        raise RuntimeError("Launch this CUDA benchmark with torchrun")
+    rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    if world % args.tp_size:
+        raise ValueError("WORLD_SIZE must be divisible by TP")
+    data_rank, data_degree = rank // args.tp_size, world // args.tp_size
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    device = torch.device("cuda", torch.cuda.current_device())
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    source_files = [
+        "specforge/training/backend.py",
+        "specforge/training/controller.py",
+        "specforge/optimizer.py",
+        "specforge/algorithms/common/dflash_family_model.py",
+        "specforge/training/torchtitan/runtime.py",
+        "specforge/training/torchtitan/frontend.py",
+        "specforge/training/torchtitan/model.py",
+        "specforge/training/torchtitan/parallelize.py",
+        "specforge/training/torchtitan/data.py",
+        "specforge/training/torchtitan/loss.py",
+        "specforge/training/torchtitan/metrics.py",
+    ]
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("this performance harness requires CUDA and torchrun")
-    if "RANK" not in os.environ:
-        raise RuntimeError(
-            "launch with torchrun --standalone --nproc-per-node=2 (or 4)"
-        )
-    os.environ["SPECFORGE_DEVICE"] = "cuda"
-    init_distributed()
-    try:
-        revision = args.source_revision
-        if revision is None:
-            try:
-                revision = subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=REPO_ROOT,
-                    text=True,
-                    stderr=subprocess.DEVNULL,
-                ).strip()
-            except (OSError, subprocess.CalledProcessError):
-                revision = "unavailable (source archive); inspect source_sha256"
-        source_files = (
-            "scripts/benchmark_training_backends.py",
-            "specforge/training/backend.py",
-            "specforge/training/torchtitan_backend.py",
-            "specforge/training/controller.py",
-            "specforge/optimizer.py",
-        )
-        report = {
-            "schema_version": 1,
-            "specforge_revision": revision,
-            "source_sha256": {
-                name: hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest()
-                for name in source_files
-                if (REPO_ROOT / name).is_file()
-            },
-            "torch_version": torch.__version__,
-            "cuda_version": torch.version.cuda,
-            "gpu": torch.cuda.get_device_name(),
-            "world_size": dist.get_world_size(),
-            "algorithm": args.algorithm,
-            "backend": args.backend,
-            "recipe": "custom" if args.config else args.recipe,
-            "tiny": args.tiny,
-            "repeat_isolation": (
-                "fresh process (one model run)"
-                if args.repeats == 1
-                else "in-process model resets; retained allocations may affect memory"
-            ),
-            "source_config": source,
-            "features": (
-                "cached local features"
-                if args.feature_file
-                else "cached synthetic features"
-            ),
-            "frozen_target": "synthetic independently seeded random embedding and LM head",
-            "measurement": "real TrainerCore, max-rank synchronized optimizer-window wall time; no feature production/transport or checkpoint I/O",
-            "stock_recipe_note": "DFlash2 stock uses Qwen3.5-4B vocab 248320; DFlash/DSpark Qwen3-4B use 151936. Compare backends within one algorithm/recipe.",
-            "kernel_environment": {
-                key: value
-                for key, value in os.environ.items()
-                if key.startswith("SPECFORGE_")
-            },
-            "results": [],
+    def source_hashes():
+        return {
+            name: hashlib.sha256((args.specforge_root / name).read_bytes()).hexdigest()
+            for name in source_files
         }
-        for repeat in range(args.repeats):
-            record = _run_repeat(args, config, repeat)
-            report["results"].append(record)
-            if dist.get_rank() == 0:
-                args.output.parent.mkdir(parents=True, exist_ok=True)
-                args.output.write_text(json.dumps(report, indent=2) + "\n")
+
+    source_before = source_hashes()
+    config, source = recipes.resolve_config(args.algorithm, args.recipe, tiny=args.tiny)
+    trainer, failed = None, False
+    started = time.perf_counter()
+    try:
+        with TemporaryDirectory(
+            prefix=".native-benchmark-", dir=args.output.parent
+        ) as directory:
+            model, draft, counts, draft_hash, teacher_hash = recipes._build_model(
+                args, config, "cpu", torch.bfloat16
+            )
+            batches, feature_hashes, cache_bytes = recipes._make_batches(
+                args, config, data_rank, device, torch.bfloat16
+            )
+            anchors_hash = anchor_plan_hash(model, batches, args, data_rank)
+            measurement = Measurement(args, device)
+            if args.backend == "fsdp":
+                train, trainer = run_fsdp(args, model, draft, batches, measurement)
+            else:
+                train, trainer = run_titan(
+                    args, config, model, batches, measurement, directory
+                )
+                del model, draft
+                gc.collect()
+            build_seconds = torch.tensor(
+                time.perf_counter() - started, device=device, dtype=torch.float64
+            )
+            dist.all_reduce(build_seconds, op=dist.ReduceOp.MAX)
+            identity = {
+                "data_rank": data_rank,
+                "features": feature_hashes,
+                "anchors": anchors_hash,
+            }
+            identities = [None] * world
+            dist.all_gather_object(identities, identity)
+            train()
+            result = measurement.result(cache_bytes, data_degree)
+            if source_hashes() != source_before:
+                raise RuntimeError("Benchmark source changed during this trial")
+            payload = {
+                "benchmark": "native-torchtitan-v1",
+                "backend": args.backend,
+                "synthetic_features": True,
+                "trainer_build_seconds_max_rank_including_cpu_init_and_hashes": build_seconds.item(),
+                "recipe_source": source,
+                "counts": counts,
+                "comparison_contract": {
+                    "config": config,
+                    "seed": args.seed,
+                    "world_size": world,
+                    "data_degree": data_degree,
+                    "batch_size": args.batch_size,
+                    "accumulation_steps": args.accumulation_steps,
+                    "seq_length": args.seq_length,
+                    "num_anchors": args.num_anchors,
+                    "objective_chunk_blocks": args.objective_chunk_blocks,
+                    "attention": args.attention,
+                    "sharding": args.sharding,
+                    "learning_rate": args.learning_rate,
+                    "initial_draft_sha256": draft_hash,
+                    "frozen_target_sha256": teacher_hash,
+                    "features_and_anchors_by_rank": identities,
+                    "warmup_steps": args.warmup_steps,
+                    "steps": args.steps,
+                    "feature_residency": "pinned CPU input IDs/loss masks; cached GPU hidden states",
+                },
+                "runtime": {
+                    "tp_size": args.tp_size,
+                    "compile": args.compile,
+                    "cuda_graphs": False,
+                    "parameter_storage": (
+                        "float32"
+                        if args.backend == "torchtitan"
+                        else "bfloat16+float32-master"
+                    ),
+                    "gradient_reduce_dtype": (
+                        "float32" if args.backend == "torchtitan" else "bfloat16"
+                    ),
+                    "compute_dtype": "bfloat16",
+                    "adam_state_dtype": "float32",
+                    "kernel_environment": {
+                        key: os.environ.get(key, "1")
+                        for key in (
+                            "SPECFORGE_DFLASH_FUSED_HEAD",
+                            "SPECFORGE_DFLASH2_FUSED_CONV",
+                        )
+                    },
+                },
+                "versions": {
+                    name: importlib.metadata.version(name)
+                    for name in ("torch", "torchtitan", "transformers", "triton")
+                },
+                "cuda": torch.version.cuda,
+                "device": torch.cuda.get_device_name(),
+                "source_sha256": source_before,
+                "recipe_helpers_sha256": hashlib.sha256(
+                    Path(recipes.__file__).read_bytes()
+                ).hexdigest(),
+                "benchmark_sha256": hashlib.sha256(
+                    Path(__file__).read_bytes()
+                ).hexdigest(),
+                **result,
+            }
+            if rank == 0:
+                args.output.write_text(json.dumps(payload, indent=2) + "\n")
                 print(
                     json.dumps(
                         {
-                            key: record[key]
-                            for key in (
-                                "repeat",
-                                "backend",
-                                "optimizer_step_seconds_median",
-                                "input_context_tokens_per_second",
-                                "peak_allocated_bytes_max_rank",
-                            )
-                        }
+                            "output": str(args.output),
+                            **recipes.summarize_times(
+                                result["step_seconds_max_rank"],
+                                result["input_context_tokens_per_optimizer_window"],
+                            ),
+                        },
+                        indent=2,
                     )
                 )
-            # A function boundary releases all wrapped models/optimizers before
-            # the next repeat. Processes should still be fresh between backends.
-            gc.collect()
-            torch.cuda.empty_cache()
-            dist.barrier()
+    except BaseException:
+        failed = True
+        import traceback
+
+        traceback.print_exc()
+        if dist.is_initialized():
+            abort = getattr(dist.distributed_c10d, "_abort_process_group", None)
+            if abort is not None:
+                abort()
+        raise
     finally:
-        destroy_distributed()
+        if not failed:
+            if trainer is not None:
+                trainer.close()
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
 
 if __name__ == "__main__":
