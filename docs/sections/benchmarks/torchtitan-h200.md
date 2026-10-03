@@ -1,29 +1,208 @@
 # Native TorchTitan Trainer: H200 training measurements
 
-In the final BF16 extension comparison, GraphTrainer full reduced DSpark
-training latency by 26.94%, versus 3.45% for DFlash v1 and 0.38% for DFlash2.
-Native CUDA graphs reduced latency by 1.57–2.42%. DFlash2's GraphTrainer loss
-trajectory differed materially from its reference, so its timing result does
-not establish a matched-quality improvement.
+The current matched-input matrix measures native TorchTitan with compilation
+and CUDA graphs at 224.94 / 204.63 / 413.00 ms per optimizer window for
+DFlash v1 / DFlash2 / DSpark. Relative to the original FSDP1 training path on
+the repository's Torch 2.13 baseline, with common benchmark buffer initialization,
+this is 16.78% / 18.86% / 9.90% lower latency in this controlled workload. Upgrading only the FSDP environment to
+Torch 2.14 changed
+latency by +0.27% to +0.33%.
 
-The initial native TorchTitan versus FSDP1 comparison and the later graph
-comparison use separate source snapshots and matched baselines. Their timings
-are not pooled.
+These are **implementation timings**, not evidence of matched training quality.
+FSDP1 and native TorchTitan have different parameter/gradient precision policies
+and different loss trajectories. Full GraphTrainer is reported separately as a
+diagnostic because every paired trial failed the strict loss gate. FP8 is not
+used or exposed by this benchmark.
 
-In the initial experiment, the native TorchTitan path was 2.6–4.3% slower than
-the existing FSDP1 trainer in this controlled two-GPU workload, while using
-about 0.5–0.6 GiB less peak allocated memory. Enabling compilation for DFlash2
-then measured 215.86 ms per window across three trials. Those historical
-measurements remain below; the extension comparison also compiles the draft
-feature projection and therefore remeasures its baseline.
+This matrix supersedes the historical `c70a5f4` graph measurements and the
+initial uncompiled native comparison retained in the appendices. The intervening
+p4 FSDP comparison is also withdrawn because it rounded RoPE
+buffers differently between engines. All current cases use core
+[`5a35ff35`](https://github.com/yushengsu-thu/SpecForge/commit/5a35ff35b0ba939242f294907892a2d8955a52b9)
+and the same input contracts. Historical timings use other snapshots and
+aggregation methods and are not pooled with these results.
 
-This measures the actual TorchTitan `Trainer.train()` and inherited
-`train_step`: native optimizer, accumulation, backward, clipping and scheduling.
-The initial FSDP1 baseline executes SpecForge's existing `TrainerCore`, `FSDPTrainingBackend`
-and `BF16Optimizer`. It requires the [native engine in PR #920](https://github.com/sgl-project/SpecForge/pull/920);
-this benchmark PR does not provide that engine.
+## Current four-case comparison
 
-## Graph and CUDA graph extension comparison
+All 36 fresh two-rank processes completed successfully on the same two H200
+GPUs, without other GPU jobs during the measurement window. Each algorithm has
+three trials per configuration. The cases rotate order between repetitions.
+Every trial runs 10 warmup and 20 steady optimizer windows; latency is the
+**median of three per-trial means**, with the range of those means in parentheses.
+Each measured window uses the maximum elapsed time across the two ranks.
+
+| Case | Runtime | Training path and compilation |
+| --- | --- | --- |
+| FSDP (Torch 2.13) | Torch 2.13.0, Triton 3.7.1 | Original FSDP1 `TrainerCore` and `BF16Optimizer`, common FP32 benchmark buffers; no model/block compilation |
+| FSDP (Torch 2.14) | Torch 2.14.0, Triton 3.8.0 | Same original FSDP1 training path and options |
+| Native Titan CUDA | Torch 2.14.0, Triton 3.8.0, TorchTitan 0.3.0 | Native `Trainer.train()` and inherited training step, FSDP2, decoder/projection compilation and native CUDA graphs |
+| Graph full, diagnostic | Same 2.14 environment | Native `GraphTrainer`, SimpleFSDP, full joint forward/backward Inductor compilation and CUDA graphs |
+
+Torch 2.13 is the repository's default pinned dependency. The TorchTitan v0.3.0
+integration runs in a separate Torch 2.14/CUDA 13 environment. Both environments
+use Transformers 5.12.1; the original FSDP path does not import TorchTitan.
+FlexAttention's own internal compilation remains active in the FSDP cases.
+This measures complete configurations, including compilation/capture benefits;
+it does not isolate the effect of FSDP1 versus FSDP2 alone. The native engine is
+provided by [PR #920](https://github.com/sgl-project/SpecForge/pull/920).
+
+| Algorithm | Trainable draft | FSDP (Torch 2.13) ms/window | FSDP (Torch 2.14) ms/window | Native Titan CUDA ms/window | Native latency reduction vs FSDP on Torch 2.13 / 2.14 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| DFlash v1 | 537.4M | 270.66 (270.29–271.51) | 271.52 (271.48–272.15) | 224.94 (224.39–225.30) | 16.78% / 17.35% |
+| DFlash2 | 632.4M | 252.24 (252.20–253.24) | 253.07 (252.94–255.03) | 204.63 (204.34–204.87) | 18.86% / 19.26% |
+| DSpark | 615.2M | 458.01 (457.71–458.39) | 459.24 (459.16–459.35) | 413.00 (412.31–413.32) | 9.90% / 10.09% |
+
+Latency reductions are medians of paired per-trial reductions. Equivalent
+paired throughput ratios versus FSDP (Torch 2.13) are 1.2016× / 1.2325× / 1.1099×.
+Exact trainable counts are 537,427,200 / 632,360,192 / 615,221,249; each case also
+has 777,912,320 frozen embedding/head parameters. The controlled geometry is
+five layers, hidden size 2560, intermediate size 9728, vocabulary 151936 and
+block size 16. Each algorithm uses its own architecture and objective. These
+are controlled recipes, not claims about the sizes of every released draft.
+
+Peak allocated memory below is the **maximum across the three trials**, after
+warmup. Captured pools and allocator reservations mean allocated memory alone
+does not measure required GPU capacity; each raw record also includes peak
+reserved memory, construction time and the full warmup timing vector.
+
+| Algorithm | FSDP (Torch 2.13) GiB | FSDP (Torch 2.14) GiB | Native Titan CUDA GiB |
+| --- | ---: | ---: | ---: |
+| DFlash v1 | 16.003 | 15.892 | 6.089 |
+| DFlash2 | 18.464 | 18.354 | 6.910 |
+| DSpark | 22.205 | 22.095 | 6.673 |
+
+### Inputs, precision and numerical boundary
+
+All four cases share DP2, `SHARD_GRAD_OP`, batch 1 per rank, accumulation 2,
+sequence length 4096, 512 anchors, objective chunks of 128 blocks, the default
+fused head/convolution kernels and no separate decoder activation checkpointing.
+The current native and Graph paths both retain the DFlash2 fused-convolution
+route. GraphTrainer's default selective-recomputation passes remain active.
+Initial persistent draft state, nonpersistent buffers, teacher tables, features,
+all 30 windows of sampled anchors and resolved model configurations have
+matching fingerprints or recorded values within each algorithm. Adam uses
+learning rate 1e-4, betas (0.9, 0.999), epsilon
+1e-8, zero weight decay and gradient clipping at 1. Optimizer/scheduler settings
+are verified from pinned source rather than independently fingerprinted at
+runtime. Both runtimes use BF16 forward
+computation and FP32 Adam moments, but their gradient policies differ:
+
+| Policy | Original FSDP1 | Native Titan / GraphTrainer |
+| --- | --- | --- |
+| Parameter storage | BF16 parameters plus FP32 master weights | FP32 parameters |
+| Gradient accumulation/reduction | BF16 | FP32 |
+| Forward computation / Adam moments | BF16 / FP32 | BF16 / FP32 |
+
+The benchmark preserves fresh FP32 `rotary_emb.inv_freq` and
+`original_inv_freq` buffers in both engines, instead of allowing the legacy
+initialization to round them through BF16. This is a benchmark-only
+normalization of model state; production FSDP defaults are unchanged. Thus the
+FSDP rows exercise the original training backend with a controlled common
+buffer reference, not untouched default model initialization. Names, shapes,
+dtypes and contents are hashed separately from persistent `state_dict` entries,
+checked on both ranks after preparation and again after training.
+
+A six-launch full-geometry preflight passed the same first-window loss tolerance
+(`atol=1e-5`, `rtol=1e-4`): first-window FSDP (Torch 2.14)/native differences were
+9.54e-6 / 4.29e-5 / 2.77e-5 for DFlash v1 / DFlash2 / DSpark. Each first-window
+objective pools two accumulation microbatches per rank; this
+check does not compare every individual forward loss. The final 30-window p5
+matrix separately verifies that persistent draft/teacher state and the complete
+cached-feature/anchor contracts match p4; the untracked FSDP buffer discrepancy
+was corrected.
+
+The following observed maximum loss differences span all 30 windows and all
+three repetitions. They are reported without assigning a post-hoc tolerance to
+the FSDP/native comparison. The remaining differences prevent any claim that
+the timing table establishes equivalent training trajectories. Their full cause has not been isolated;
+recording different precision policies does not prove that precision alone
+explains the trajectories.
+
+| Algorithm | FSDP (Torch 2.13) vs FSDP (Torch 2.14) max absolute loss difference | FSDP (Torch 2.14) vs Native Titan CUDA max absolute loss difference |
+| --- | ---: | ---: |
+| DFlash v1 | 0.009086 | 0.100455 |
+| DFlash2 | 0.046537 | 0.141664 |
+| DSpark | 0.001615 | 0.002534 |
+
+The native/Graph comparison uses the same recorded precision policy and a
+strict gate declared before launch:
+`abs(graph_loss - native_loss) <= 1e-5 + 1e-4 * abs(native_loss)` at every one of
+30 windows. All nine pairs failed. The matrix deliberately returns failure
+while retaining the separate FSDP/native timing rows and these Graph diagnostics:
+
+| Algorithm | Graph full diagnostic ms/window (range) | Max absolute loss difference vs native | Failed windows across three trials |
+| --- | ---: | ---: | ---: |
+| DFlash v1 | 220.73 (220.12–220.85) | 0.040533 | 78 / 90 |
+| DFlash2 | 209.95 (209.95–210.04) | 0.042302 | 82 / 90 |
+| DSpark | 297.20 (296.98–297.27) | 0.005556 | 81 / 90 |
+
+These Graph numbers are not matched-quality speedups. Focused probes corrected
+compile-dependent convolution routing and repeated SimpleFSDP parameter reads.
+Separate controls also showed BF16 gradient summation/reduction sensitivity;
+a tiny FP32 full-Graph comparison had first-gradient relative L2 error
+2.95e-7. Those controls do not override the failed BF16 trajectory gate or
+establish real-data convergence. Full-Graph selector gradients can also be
+nondeterministic under the default nondeterministic execution setting.
+
+### Timing scope and reproduction
+
+Every window includes feature preparation, CPU anchor sampling, token/mask H2D
+transfers, forward/backward, clipping and optimizer work. Hidden features are
+already cached on GPU (two synthetic batches per rank). FSDP's existing trainer
+also reduces its normal scalar/ratio diagnostics; Titan uses its native metrics
+path. Construction, hashing, checkpoint/export, evaluation, teacher capture,
+feature transport and speculative serving are outside steady windows.
+Fresh processes share compiler disk caches, so warmup values are observed
+startup costs rather than guaranteed cold-cache compilation costs. Falling loss
+on these reused synthetic features is not a quality evaluation.
+
+The source audit matched all 168 SpecForge Python files to core `5a35ff35` before
+launch. The three executed driver/helper/matrix files are byte-identical to
+benchmark code
+[`8bf59172`](https://github.com/yushengsu-thu/SpecForge/commit/8bf591727ad3b3a2287c777997f8c6da352f28cd).
+Every trial retains its full configuration, runtime versions, parameter and
+buffer fingerprints, timings, losses and memory records. The matrix enforces
+algorithm/runtime identity, matching source/input/buffer contracts and the
+unchanged strict Graph loss tolerance.
+
+Use the final core checkout and isolated Torch 2.13/2.14 environments described
+in the [setup guide](https://github.com/yushengsu-thu/SpecForge/blob/5a35ff35b0ba939242f294907892a2d8955a52b9/docs/sections/basic_usage/torchtitan.md):
+
+```bash
+python scripts/training_backend_matrix.py \
+  --specforge-root /path/to/frozen-core \
+  --driver-root /path/to/frozen-benchmark \
+  --python /path/to/torch214/bin/python \
+  --python213 /path/to/torch213/bin/python \
+  --gpus 4,5 --output /path/to/new-results --execute
+```
+
+Without `--execute`, the runner writes a plan without launching GPU jobs. It
+rejects existing results, mixed inputs/snapshots and mislabeled algorithm or
+runtime records. The [current evidence archive](https://github.com/yushengsu-thu/SpecForge/blob/8256d23f4cb5146cb2ac7cd926ba57f55d7fae99/artifacts/torchtitan-native-benchmark/extensions-p5/README.md) contains all raw trials,
+exact launch commands, frozen drivers, source hashes, preflight results and
+the final identity audit.
+
+[Numerical corrections and independent gradient/lifecycle controls](https://github.com/yushengsu-thu/SpecForge/blob/8256d23f4cb5146cb2ac7cd926ba57f55d7fae99/artifacts/torchtitan-graph-loss-fix/README.md)
+are archived separately from performance claims.
+
+The [superseded p4 archive](https://github.com/yushengsu-thu/SpecForge/tree/e8b17f3b20c79b898712a72998e45ee4ad41792d/artifacts/torchtitan-native-benchmark/extensions-p4)
+retains the buffer-mismatched experiment unchanged. Its state-dict-only hashes
+missed 63 of 64 rounded RoPE frequency entries; the FSDP/native same-model claim
+was withdrawn. Its native/Graph comparison had common buffers and still failed
+the strict loss gate. No p4 timing is pooled with this matrix.
+
+## Historical appendix: earlier source snapshots
+
+The following measurements are retained for provenance. The `c70a5f4` extension
+matrix used a different convolution route and compiler/cache behavior, while
+the initial native experiment used `36eb793`. Their aggregation was the median
+of per-trial **medians**, unlike the current median of means. Their numerical
+boundaries and speed observations apply only to those recorded snapshots.
+Historical FSDP/native contracts lacked the nonpersistent-buffer checks added
+in p5 and must not be read as proof of fully matched runtime model state.
+
+## Historical graph and CUDA graph extension comparison
 
 The extension matrix compares three BF16 configurations on the same two H200
 GPUs, with one fresh two-rank launch per trial and three trials per configuration and
@@ -265,7 +444,7 @@ latency by 28.0%, but the result remained slower than uncompiled DP2. The compil
 DP2 trials reduced median latency by 19.1% relative to native uncompiled DP2 and
 by 15.6% relative to the FSDP1 baseline; these percentages describe this workload only.
 
-## Reproduction and evidence
+## Historical reproduction and evidence
 
 Install the isolated native runtime described by [the core setup guide](https://github.com/yushengsu-thu/SpecForge/blob/36eb793a4fba7fabb441821e9cb7b3f8279bca97/docs/sections/basic_usage/torchtitan.md).
 Run this command from the benchmark checkout, pointing `--specforge-root` at
