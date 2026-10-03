@@ -66,6 +66,13 @@ def parse_args(argv=None):
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--cuda-graphs", action="store_true")
+    parser.add_argument(
+        "--titan-engine", choices=("trainer", "graph"), default="trainer"
+    )
+    parser.add_argument(
+        "--graph-inductor", choices=("regional", "full"), default="regional"
+    )
     parser.add_argument(
         "--sharding", choices=("SHARD_GRAD_OP", "FULL_SHARD"), default="SHARD_GRAD_OP"
     )
@@ -88,8 +95,17 @@ def parse_args(argv=None):
         parser.error(
             "At least one warmup step and nonnegative objective chunk size are required"
         )
-    if args.backend == "fsdp" and (args.tp_size != 1 or args.compile):
+    if args.backend == "fsdp" and (
+        args.tp_size != 1
+        or args.compile
+        or args.cuda_graphs
+        or args.titan_engine != "trainer"
+    ):
         parser.error("The FSDP baseline supports TP1 without compile")
+    if args.titan_engine == "graph" and (not args.compile or args.tp_size != 1):
+        parser.error("GraphTrainer requires --compile and TP1")
+    if args.titan_engine != "graph" and args.graph_inductor != "regional":
+        parser.error("--graph-inductor requires --titan-engine=graph")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         parser.error("learning_rate must be finite and positive")
     args.feature_file = None
@@ -312,6 +328,33 @@ def run_titan(args, config, model, batches, measurement, directory):
     )
     from specforge.training.torchtitan.runtime import SpecForgeTitanTrainer
 
+    trainer_type = SpecForgeTitanTrainer
+    model_config = SpecForgeTitanModel.Config
+    parallelize_fn = parallelize_dflash
+    compile_options = CompileConfig(enable=args.compile, components=["model"])
+    if args.titan_engine == "graph":
+        from torchtitan.experiments.graph_trainer.configs import (
+            GraphTrainerCompileConfig,
+        )
+
+        from specforge.training.torchtitan.graph import (
+            SpecForgeGraphModel,
+            SpecForgeGraphTrainer,
+        )
+        from specforge.training.torchtitan.graph_parallelize import (
+            parallelize_graph_dflash,
+        )
+
+        trainer_type = SpecForgeGraphTrainer
+        model_config = SpecForgeGraphModel.Config
+        parallelize_fn = parallelize_graph_dflash
+        compile_options = GraphTrainerCompileConfig(
+            enable=True,
+            components=["model"],
+            inductor_compilation=args.graph_inductor,
+            disable_passes=[] if args.cuda_graphs else ["cudagraph_pass"],
+        )
+
     teacher_path, draft_path = (
         Path(directory) / "teacher.pt",
         Path(directory) / "draft.pt",
@@ -348,33 +391,32 @@ def run_titan(args, config, model, batches, measurement, directory):
                 for index in range(total_steps * args.accumulation_steps)
             )
 
-    class RecordingLoss:
-        def __init__(self, loss):
-            self.loss, self.values = loss, []
+    class TimedTrainer(trainer_type):
+        def forward_backward_step(self, **kwargs):
+            loss = super().forward_backward_step(**kwargs)
+            # Record outside capture: Python callbacks inside loss_fn do not
+            # execute on replay. Clone because graph output storage is reused
+            # by subsequent accumulation microbatches.
+            self.recorded_losses.append(loss.detach().clone())
+            return loss
 
-        def __call__(self, *positional, **kwargs):
-            result = self.loss(*positional, **kwargs)
-            self.values.append(result[0].detach())
-            return result
-
-    class TimedTrainer(SpecForgeTitanTrainer):
         def train_step(self, data_iterator):
-            self.loss_fn.values.clear()
+            self.recorded_losses = []
             started = measurement.start(self.step - 1)
             super().train_step(data_iterator)
             group = self.parallel_dims.get_optional_mesh(
                 "batch", include_singleton_axes=True
             ).get_group()
             measurement.finish(
-                started, self.loss_fn.values, local_loss_sum=True, group=group
+                started, self.recorded_losses, local_loss_sum=True, group=group
             )
 
-    native = SpecForgeTitanTrainer.Config(
+    native = trainer_type.Config(
         dump_folder=str(Path(directory) / "native"),
         model_spec=ModelSpec(
             name="specforge",
             flavor=args.algorithm,
-            model=SpecForgeTitanModel.Config(
+            model=model_config(
                 draft_config=config,
                 algorithm=args.algorithm,
                 objective=objective,
@@ -382,13 +424,17 @@ def run_titan(args, config, model, batches, measurement, directory):
                 draft_state_path=str(draft_path),
                 init_seed=args.seed,
             ),
-            parallelize_fn=parallelize_dflash,
+            parallelize_fn=parallelize_fn,
             pipelining_fn=None,
             post_optimizer_build_fn=group_optimizer_parameters_by_mesh,
             state_dict_adapter=None,
         ),
         tokenizer=_tokenizer_config(config["vocab_size"]),
-        dataloader=FeatureDataLoader.Config(source_factory=CachedSource(), epochs=1),
+        dataloader=FeatureDataLoader.Config(
+            source_factory=CachedSource(),
+            epochs=1,
+            pad_to_seq_len=args.cuda_graphs or args.titan_engine == "graph",
+        ),
         loss=SpecForgeObjectiveLoss.Config(algorithm=args.algorithm),
         optimizer=default_adamw(
             lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
@@ -410,7 +456,7 @@ def run_titan(args, config, model, batches, measurement, directory):
             dtype="float32",
             mixed_precision_param="bfloat16",
             mixed_precision_reduce="float32",
-            disable_cuda_graphs=True,
+            disable_cuda_graphs=args.titan_engine == "graph" or not args.cuda_graphs,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
@@ -422,7 +468,7 @@ def run_titan(args, config, model, batches, measurement, directory):
             ),
         ),
         activation_checkpoint=None,
-        compile=CompileConfig(enable=args.compile, components=["model"]),
+        compile=compile_options,
         checkpoint=CheckpointManager.Config(enable=False),
         metrics=MetricsProcessor.Config(log_freq=1000000000),
         debug=DebugConfig(seed=args.seed),
@@ -430,7 +476,6 @@ def run_titan(args, config, model, batches, measurement, directory):
     )
     init_logger()
     trainer = TimedTrainer(native)
-    trainer.loss_fn = RecordingLoss(trainer.loss_fn)
     return trainer.train, trainer
 
 
@@ -461,6 +506,8 @@ def main():
         "specforge/training/torchtitan/data.py",
         "specforge/training/torchtitan/loss.py",
         "specforge/training/torchtitan/metrics.py",
+        "specforge/training/torchtitan/graph.py",
+        "specforge/training/torchtitan/graph_parallelize.py",
     ]
 
     def source_hashes():
@@ -538,7 +585,26 @@ def main():
                 "runtime": {
                     "tp_size": args.tp_size,
                     "compile": args.compile,
-                    "cuda_graphs": False,
+                    "cuda_graphs": args.cuda_graphs,
+                    "titan_engine": args.titan_engine,
+                    "distributed_wrapper": (
+                        "SimpleFSDP"
+                        if args.titan_engine == "graph"
+                        else "FSDP2" if args.backend == "torchtitan" else "FSDP1"
+                    ),
+                    "graph_memory_policy": (
+                        trainer.config.compile.memory_policy
+                        if args.titan_engine == "graph"
+                        else None
+                    ),
+                    "fsdp_reshard_after_forward": (
+                        trainer.config.parallelism.fsdp_reshard_after_forward
+                        if trainer is not None
+                        else None
+                    ),
+                    "graph_inductor": (
+                        args.graph_inductor if args.titan_engine == "graph" else None
+                    ),
                     "parameter_storage": (
                         "float32"
                         if args.backend == "torchtitan"

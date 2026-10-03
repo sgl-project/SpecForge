@@ -52,11 +52,23 @@ class BackendBenchmarkContractTest(unittest.TestCase):
             ("--learning-rate", "-1"),
             ("--backend", "fsdp", "--compile"),
             ("--backend", "fsdp", "--tp-size", "2"),
+            ("--backend", "fsdp", "--cuda-graphs"),
+            ("--titan-engine", "graph"),
+            ("--titan-engine", "graph", "--compile", "--tp-size", "2"),
         )
         for args in cases:
             with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     self.args(*args)
+
+    def test_acceleration_flags_keep_explicit_recipe_and_engine(self):
+        args = self.args("--compile", "--cuda-graphs")
+        self.assertTrue(args.cuda_graphs)
+        self.assertEqual(args.titan_engine, "trainer")
+        args = self.args(
+            "--compile", "--titan-engine", "graph", "--graph-inductor", "full"
+        )
+        self.assertEqual(args.graph_inductor, "full")
 
     def test_controlled_recipes_keep_same_full_target_and_backbone_geometry(self):
         configs = [recipes.resolve_config(name)[0] for name in recipes.ARCHITECTURES]
