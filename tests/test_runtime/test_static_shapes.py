@@ -107,6 +107,21 @@ class TestStaticAnchorCount(unittest.TestCase):
                 sorted(dyn_anchors[row][dyn_keep[row]].tolist()),
             )
 
+    def test_static_width_beyond_the_candidate_positions(self):
+        from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+
+        # A 512-token bucket has 511 candidate positions but num_anchors may be 512.
+        model = types.SimpleNamespace(num_anchors=8, static_anchor_count=True)
+        mask = torch.ones(2, 6)
+        torch.manual_seed(0)
+        anchors, keep = OnlineDFlashModel._sample_anchor_positions(
+            model, 6, mask, torch.device("cpu"), max_valid_anchors=5
+        )
+        self.assertEqual(tuple(anchors.shape), (2, 8))
+        self.assertEqual(keep.sum(dim=1).tolist(), [5, 5])
+        self.assertTrue(bool((anchors[~keep] == 0).all()))
+        self.assertEqual(sorted(anchors[0][keep[0]].tolist()), [0, 1, 2, 3, 4])
+
     def test_no_valid_anchor_still_raises(self):
         from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 

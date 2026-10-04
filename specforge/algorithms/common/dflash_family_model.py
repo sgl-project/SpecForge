@@ -479,12 +479,17 @@ class OnlineDFlashModel(nn.Module):
 
         random_values = torch.rand(valid.shape, device=device)
         random_values.masked_fill_(~valid, 2.0)
-        candidates = random_values.argsort(dim=1)[:, :width]
+        sentinel = valid.shape[1]
+        # A static anchor count can exceed the candidate positions of a short
+        # (or short-bucketed) batch; the missing slots are sentinels, masked below.
+        take = min(width, num_candidates)
+        candidates = random_values.argsort(dim=1)[:, :take]
+        if take < width:
+            candidates = torch.nn.functional.pad(candidates, (0, width - take), value=sentinel)
         keep_mask = torch.arange(width, device=device).unsqueeze(
             0
         ) < valid_counts.clamp(max=width).unsqueeze(1)
 
-        sentinel = valid.shape[1]
         anchors = torch.where(
             keep_mask,
             candidates,
