@@ -434,11 +434,16 @@ class Trainer:
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
         )
+        backend_kwargs = {}
+        if backend_options is not None:
+            # Injected backend factories (tests, extensions) keep seeing the
+            # pre-options call signature until options are configured.
+            backend_kwargs["options"] = backend_options
         backend = create_training_backend(
             training_backend,
             parallel,
             optimizer_factory=optimizer_factory,
-            options=backend_options,
+            **backend_kwargs,
         )
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
