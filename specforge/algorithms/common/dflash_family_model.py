@@ -13,6 +13,10 @@ from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+from specforge.modeling.packed_dflash import (
+    PackedDFlashLayout,
+    create_packed_dflash_block_mask,
+)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -252,6 +256,7 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     sliding_window: Optional[int] = None,
+    context_start_positions: Optional[torch.Tensor] = None,
 ):
     """Construct a full or sliding dense boolean DFlash mask."""
 
@@ -274,6 +279,11 @@ def create_dflash_sdpa_mask(
     )
 
     mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+    if context_start_positions is not None:
+        context_starts = context_start_positions.view(B, 1, N, 1).repeat_interleave(
+            block_size, dim=2
+        )
+        mask_context = mask_context & (kv_indices >= context_starts)
     if sliding_window is not None:
         # The current draft token occupies one slot in the window.
         context_lower_bound = anchor_expanded + q_block_offsets - (sliding_window - 1)
@@ -300,6 +310,7 @@ def create_dflash_block_mask(
     device: torch.device,
     flex_block_size=None,
     sliding_window: Optional[int] = None,
+    context_start_positions: Optional[torch.Tensor] = None,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training."""
 
@@ -316,6 +327,10 @@ def create_dflash_block_mask(
         # Strictly less than: matches inference where target_hidden[anchor_pos]
         # is not available as context.
         mask_context = is_context & (kv_idx < anchor_pos)
+        if context_start_positions is not None:
+            mask_context = mask_context & (
+                kv_idx >= context_start_positions[b, safe_q_block_id]
+            )
         if sliding_window is not None:
             # The current draft token occupies one slot in the window.
             context_lower_bound = anchor_pos + q_block_offset - (sliding_window - 1)
@@ -335,6 +350,18 @@ def create_dflash_block_mask(
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
+
+    if context_start_positions is not None:
+        return create_packed_dflash_block_mask(
+            anchor_positions,
+            block_keep_mask,
+            context_start_positions,
+            S,
+            block_size,
+            dflash_mask_mod,
+            block_size=flex_block_size if flex_block_size is not None else 128,
+            sliding_window=sliding_window,
+        )
 
     kwargs = {}
     if flex_block_size is not None:
@@ -552,10 +579,13 @@ class OnlineDFlashModel(nn.Module):
         self,
         target_last_hidden_states: torch.Tensor,
         safe_label_indices: torch.Tensor,
+        minimum_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Gather the frozen target state that predicts each hard label."""
 
         target_pred_indices = (safe_label_indices - 1).clamp(min=0)
+        if minimum_indices is not None:
+            target_pred_indices = torch.maximum(target_pred_indices, minimum_indices)
         batch_size = target_last_hidden_states.shape[0]
         hidden_size = target_last_hidden_states.shape[-1]
         gather_indices = target_pred_indices.reshape(batch_size, -1, 1).expand(
@@ -700,16 +730,42 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        packed_layout: Optional[PackedDFlashLayout] = None,
+        valid_anchor_counts: Optional[Tuple[int, ...]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
+        sampling_mask = (
+            loss_mask
+            if packed_layout is None
+            else packed_layout.padded_loss_mask(loss_mask)
+        )
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len,
-            loss_mask,
+            sampling_mask.shape[1],
+            sampling_mask,
             device,
             max_valid_anchors=max_valid_anchors,
         )
+        local_anchor_positions = anchor_positions
+        if packed_layout is not None:
+            anchor_positions = packed_layout.pack_anchors(anchor_positions)
+            block_keep_mask = block_keep_mask.reshape(1, -1)
+        original_anchor_positions = anchor_positions
+        original_block_keep_mask = block_keep_mask
+        compact_indices = None
+        if packed_layout is not None and valid_anchor_counts is not None:
+            width = local_anchor_positions.shape[1]
+            compact_indices = packed_layout.compact_anchor_indices(
+                valid_anchor_counts, width
+            )
+            if compact_indices.numel() == 0:
+                raise ValueError("DFlash packing requires at least one valid anchor")
+            anchor_positions = anchor_positions.index_select(1, compact_indices)
+            block_keep_mask = block_keep_mask.index_select(1, compact_indices)
+            local_anchor_positions = local_anchor_positions.reshape(1, -1).index_select(
+                1, compact_indices
+            )
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -717,8 +773,12 @@ class OnlineDFlashModel(nn.Module):
 
         context_position_ids = (
             torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            if packed_layout is None
+            else packed_layout.tokens.positions.unsqueeze(0)
         )
-        draft_position_ids = self._create_position_ids(anchor_positions)
+        draft_position_ids = self._create_position_ids(local_anchor_positions).reshape(
+            bsz, -1
+        )
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
         mask_builder = (
@@ -733,6 +793,10 @@ class OnlineDFlashModel(nn.Module):
             "block_size": self.block_size,
             "device": device,
         }
+        if packed_layout is not None:
+            mask_args["context_start_positions"] = packed_layout.anchor_starts(
+                anchor_positions
+            )
         if (
             self.attention_backend == "flex_attention"
             and flex_attention_backend() == "FLASH"
@@ -781,7 +845,17 @@ class OnlineDFlashModel(nn.Module):
             attention_mask=dflash_attn_mask,
             **draft_kwargs,
         )
-        return anchor_positions, block_keep_mask, output_hidden
+        if compact_indices is not None:
+            query_rows = (
+                compact_indices[:, None] * self.block_size
+                + torch.arange(self.block_size, device=device)
+            ).reshape(-1)
+            output_hidden = output_hidden.new_zeros(
+                1,
+                original_anchor_positions.shape[1] * self.block_size,
+                output_hidden.shape[-1],
+            ).index_copy(1, query_rows, output_hidden)
+        return original_anchor_positions, original_block_keep_mask, output_hidden
 
     def _selector_chunk_terms(
         self,
@@ -1495,6 +1569,8 @@ class OnlineDFlashModel(nn.Module):
         max_valid_anchors: Optional[int] = None,
         selector_loss_alpha: Optional[float] = None,
         collect_detailed_metrics: bool = True,
+        sequence_lengths=None,
+        valid_anchor_counts: Optional[Tuple[int, ...]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -1505,11 +1581,38 @@ class OnlineDFlashModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
+        packed_layout = None
+        if sequence_lengths is not None:
+            if self.attention_backend != "flex_attention":
+                raise ValueError(
+                    "DFlash sequence packing currently requires flex_attention"
+                )
+            if (
+                bsz != 1
+                or hidden_states.shape[:2] != input_ids.shape
+                or loss_mask.shape != input_ids.shape
+            ):
+                raise ValueError(
+                    "DFlash sequence packing requires aligned single-row inputs"
+                )
+            packed_layout = PackedDFlashLayout.from_lengths(
+                sequence_lengths, seq_len, device
+            )
+
+        block_kwargs = (
+            {}
+            if packed_layout is None
+            else {
+                "packed_layout": packed_layout,
+                "valid_anchor_counts": valid_anchor_counts,
+            }
+        )
         anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            **block_kwargs,
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
@@ -1517,6 +1620,12 @@ class OnlineDFlashModel(nn.Module):
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
+        if packed_layout is not None:
+            document_ends = packed_layout.anchor_ends(anchor_positions).unsqueeze(-1)
+            valid_label_mask = valid_label_mask & (label_indices < document_ends)
+            # Even masked tail labels and selector predecessors stay inside their
+            # document; none can import a neighboring document's token IDs.
+            safe_label_indices = torch.minimum(safe_label_indices, document_ends - 1)
 
         target_ids = torch.gather(
             input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
@@ -1554,6 +1663,15 @@ class OnlineDFlashModel(nn.Module):
             self._aligned_target_hidden(
                 target_last_hidden_states,
                 safe_label_indices,
+                **(
+                    {
+                        "minimum_indices": packed_layout.anchor_starts(
+                            anchor_positions
+                        ).unsqueeze(-1)
+                    }
+                    if packed_layout is not None
+                    else {}
+                ),
             )
             if (
                 target_last_hidden_states is not None
@@ -1562,6 +1680,27 @@ class OnlineDFlashModel(nn.Module):
             )
             else None
         )
+        if packed_layout is not None:
+            # Preserve the original [documents, anchors, block] reduction axes.
+            # D-PACE normalizes anchors per document; selector and walk metrics
+            # also use these axes. Packing changes only the backbone execution.
+            original_batch = len(packed_layout.lengths)
+            anchors_per_document = anchor_positions.shape[1] // original_batch
+            shape = (original_batch, anchors_per_document, self.block_size)
+            hidden_4d = hidden_4d.reshape(*shape, hidden_4d.shape[-1])
+            target_ids = target_ids.reshape(shape)
+            predecessor_ids = predecessor_ids.reshape(shape)
+            weight_mask = weight_mask.reshape(shape)
+            if aligned_target_hidden is not None:
+                aligned_target_hidden = aligned_target_hidden.reshape(
+                    *shape, aligned_target_hidden.shape[-1]
+                )
+            anchor_positions = packed_layout.tokens.positions[anchor_positions].reshape(
+                original_batch, anchors_per_document
+            )
+            block_keep_mask = block_keep_mask.reshape(
+                original_batch, anchors_per_document
+            )
         sequence_anchor_scale = None
         if self.loss_type in _DPACE_LOSS_TYPES:
             sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)

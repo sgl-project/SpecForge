@@ -549,6 +549,84 @@ a complete checkpoint and points `<run_id>-best` at it, even when
 `training.save_interval` is zero. `<run_id>-latest` continues to identify the
 newest complete checkpoint.
 
+## Sequence packing
+
+Text EAGLE3, DFlash, and DFlash2 can remove context padding across the samples
+of each microbatch, with offline features or online server capture:
+
+```bash
+specforge train \
+  --config examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml \
+  training.batch_size=4 \
+  training.attention_backend=flex_attention \
+  training.sequence_packing=true
+```
+
+Packing defaults to `false`. Add the same two training overrides to an online
+config or a DFlash/DFlash2 config. DFlash2 uses `training.strategy=dflash` with
+a DFlash2 draft-model config. Offline evaluation loaders also honor packing.
+The implementation requires FlexAttention and does not support USP, other
+algorithms, multimodal positions, `compact_teacher`, or `trim_loss_positions`.
+DFlash/DFlash2 LK objectives and D-PACE are supported; EAGLE3 LK is not.
+
+`batch_size` still counts original samples per rank and microbatch. Packing
+concatenates those samples into one row, resets positions at each document,
+isolates attention, and prevents labels from crossing document boundaries.
+It does not change sample order,
+gradient accumulation, reference acknowledgement, or the optimizer schedule.
+`data.max_length` remains the truncation limit for each original sample; a
+packed row can be longer than that limit.
+
+EAGLE3 prevents the initial teacher shift and every subsequent TTT shift from
+crossing document boundaries. Its loss keeps the original
+`batch_size * longest_sample_length` denominator so packing does not implicitly
+increase the learning rate on batches that previously had substantial padding.
+
+DFlash/DFlash2 preserve the original per-document anchor counts and random
+sampling, including invalid anchor slots. Context and proposal positions reset
+for each document; full and sliding attention, block labels, and teacher
+predecessors respect document boundaries. After the backbone, the original
+`[batch, anchors, block]` axes are restored for the loss, D-PACE, selector, and
+metrics. Packing does not reduce the number of sampled proposal tokens.
+When CPU loss masks provide per-document valid-anchor counts, invalid padded
+proposal slots skip the backbone; outputs are restored to the original loss
+layout. This saves computation without discarding valid sampled anchors.
+
+Online packing happens in the consumer after each target capture is fetched.
+The producer still captures individual prompts, and the consumer acknowledges
+the original sample IDs. Target capture, queue order, and the durable cursor
+retain their existing behavior.
+
+For lengths `[2048, 512, 256, 256]`, padded execution processes 8192 rows per TTT
+step and packed execution processes 3072. This removes 62.5% of those rows, but
+does not imply a 2.67x end-to-end speedup: attention mask construction, kernel
+occupancy, feature I/O, and optimizer work still cost time. There is no padding
+to remove at batch size one or when every sample has the same length, and
+packing can be slower in those cases. Compare equal samples and settings using
+effective (unpadded) tokens/s, not packed steps/s. Packing changes training
+execution; it is not a speculative-serving speedup.
+
+The reproducible GPU benchmarks in `scripts/benchmark_sequence_packing.py`
+(EAGLE3) and `scripts/benchmark_dflash_sequence_packing.py` (DFlash/DFlash2)
+check production loss/gradient agreement before measuring training steps.
+See its `--help` for model dimensions and length profiles. Generated features
+measure training compute, not target capture, dataset quality, or a full epoch.
+See the [H200 measurements and validation scope](../benchmarks/eagle3-sequence-packing.md)
+for a controlled EAGLE3 padded-versus-packed comparison, and the
+[DFlash/DFlash2 measurements and online validation](../benchmarks/dflash-sequence-packing.md)
+for those models. The speedup depends on context lengths, valid proposal counts,
+and mask construction; it is not implied by the padding fraction alone.
+
+For a concurrent target-capture and training comparison, use
+`scripts/benchmark_online_sequence_packing.py`. The
+[real Qwen3-4B online benchmark](../benchmarks/online-sequence-packing.md)
+measured 4.1% DFlash and 4.5% DFlash2 pipeline throughput gains on 128 ShareGPT
+conversations; it reports final checkpoint time separately.
+The subsequent [256-step full-model comparison](../benchmarks/full-model-sequence-packing.md)
+adds periodic diagnostics/checkpoints and four runs per mode: DFlash/DFlash2
+training steps improved 1.044×/1.052×, with full completion including both
+checkpoints improving 1.037×/1.033× on that workload.
+
 ## Compact offline teacher
 
 Offline text EAGLE3 can project teacher targets in exact vocabulary chunks

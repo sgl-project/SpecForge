@@ -178,6 +178,47 @@ def build_collator():
     )
 
 
+def build_packed_collator():
+    """Pack DFlash/DFlash2 context features after each capture is materialized."""
+    return PackedHiddenStatesCollator()
+
+
+class PackedHiddenStatesCollator:
+    def __call__(self, features):
+        import torch
+
+        if not features:
+            raise ValueError("cannot pack an empty feature batch")
+        required = ("input_ids", "loss_mask", "hidden_states")
+        keys = list(required)
+        teacher_key = "target_last_hidden_states"
+        present = [teacher_key in feature for feature in features]
+        if any(present) and not all(present):
+            raise KeyError(
+                f"optional feature {teacher_key!r} must be present in every sample or none"
+            )
+        if all(present):
+            keys.append(teacher_key)
+        lengths = []
+        for feature in features:
+            missing = set(keys) - feature.keys()
+            if missing:
+                raise KeyError(f"packed sample is missing features: {sorted(missing)}")
+            ids = feature["input_ids"]
+            if ids.ndim != 2 or ids.shape[0] != 1 or ids.shape[1] == 0:
+                raise ValueError("packing requires nonempty [1, length] input_ids")
+            length = ids.shape[1]
+            for key in keys:
+                tensor = feature[key]
+                ndim = 2 if key in ("input_ids", "loss_mask") else 3
+                if tensor.ndim != ndim or tensor.shape[:2] != (1, length):
+                    raise ValueError(f"packing requires aligned unbatched {key}")
+            lengths.append(length)
+        batch = {key: torch.cat([f[key] for f in features], dim=1) for key in keys}
+        batch["sequence_lengths"] = torch.tensor(lengths, dtype=torch.long)
+        return batch
+
+
 def build_dspark_collator():
     return _padded_collator(
         ("input_ids", "loss_mask", "hidden_states", "target_last_hidden_states")
@@ -252,6 +293,7 @@ __all__ = [
     "DSPARK_NORMALIZER_ID",
     "MTP_NORMALIZER_ID",
     "NORMALIZER_ID",
+    "PackedHiddenStatesCollator",
     "build_collator",
     "build_dspark_collator",
     "build_dspark_offline_normalizer",
@@ -261,6 +303,7 @@ __all__ = [
     "build_mtp_offline_reader",
     "build_offline_normalizer",
     "build_offline_reader",
+    "build_packed_collator",
     "normalize_dspark_offline_sample",
     "normalize_mtp_offline_sample",
     "normalize_offline_sample",

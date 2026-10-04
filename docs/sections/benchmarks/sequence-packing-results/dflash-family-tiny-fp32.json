@@ -1,0 +1,214 @@
+{
+  "timestamp_utc": "2026-10-02T04:43:26.200384+00:00",
+  "source": {
+    "files_sha256": {
+      "scripts/benchmark_dflash_sequence_packing.py": "0372ddf408fddc99c95138ab448025e37600c51004bceb6fd51d0432afb82e46",
+      "specforge/benchmarks/benchmark_dflash_sequence_packing.py": "00b9ff628d145d3f986eeb8c43f62671183a197f4c4575faf3f432f16ef0641c",
+      "specforge/algorithms/common/dflash_family_model.py": "86be39addbc5c50036f37c5d5282c53aaa8f35ab5ae1f8cfabf33078494e1421",
+      "specforge/algorithms/common/hidden_states_data.py": "fa09c5e5037c31b1165c2f8d1774e2cd4a40fde8b08f1f6deddf87f4f4af7f24",
+      "specforge/modeling/draft/dflash.py": "97af112a6ecf66d4b397aae77f0f97c08a49759c6305a4c70577a4f78b45ca90",
+      "specforge/modeling/draft/dflash2.py": "819c6b3d8d6d8ffc31a843ed40d539ddf635f58b148a01c8c43d0bff1dd02b09",
+      "specforge/modeling/packed_dflash.py": "d763e0ad3c609602323b9e3413968860cc680a8be8c986cc7612a956556ab96e",
+      "specforge/training/strategies/base.py": "276932ad331e95d5b91eddc67cf3acb0b5447ee5973f9bbc757e54093a82939f"
+    },
+    "head": "unavailable (copied snapshot is identified by file hashes)"
+  },
+  "settings": {
+    "preset": "tiny",
+    "algorithm": "both",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "layers": 2,
+    "heads": 4,
+    "kv_heads": 2,
+    "vocab_size": 128,
+    "block_size": 4,
+    "anchors": 8,
+    "capture_layers": 2,
+    "conv_group_size": 4,
+    "conv_kernel_size": 2,
+    "selector_rank": 4,
+    "selector_top_k": 8,
+    "lengths": [
+      [
+        9,
+        17,
+        31,
+        64
+      ],
+      [
+        32,
+        32,
+        32,
+        32
+      ]
+    ],
+    "dtype": "float32",
+    "sliding_window": null,
+    "warmup": 5,
+    "steps": 20,
+    "seed": 1729,
+    "learning_rate": 0.0001,
+    "objective_chunk_blocks": 128,
+    "correctness_only": true,
+    "skip_correctness": false,
+    "atol": 2e-05,
+    "rtol": 0.0002,
+    "output": "artifacts/sequence-packing/dflash-family-tiny-fp32-optimized.json"
+  },
+  "environment": {
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "gpu": "NVIDIA H200",
+    "cuda_visible_devices": "0"
+  },
+  "scope": "Single GPU; synthetic frozen target components and captured features; GPU-resident hidden features plus CPU integer features; production strategy forward/backward/BF16Optimizer; excludes capture, hidden-feature I/O/H2D, distributed training and serving.",
+  "cases": [
+    {
+      "algorithm": "dflash",
+      "lengths": [
+        9,
+        17,
+        31,
+        64
+      ],
+      "padding_fraction": 0.52734375,
+      "useful_tokens": 121,
+      "correctness": {
+        "loss": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0
+        },
+        "loss_terms": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0
+        },
+        "loss_values": [
+          4.920759201049805,
+          4.920759201049805
+        ],
+        "identical_sampled_anchors": true,
+        "sampled_anchor_count": 29,
+        "pass": true,
+        "gradient_summary": {
+          "parameter_tensors": 25,
+          "all_pass": true,
+          "max_abs_diff": 3.725290298461914e-09,
+          "max_relative_l2_diff": 2.936993432616088e-07
+        }
+      }
+    },
+    {
+      "algorithm": "dflash",
+      "lengths": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "padding_fraction": 0.0,
+      "useful_tokens": 128,
+      "correctness": {
+        "loss": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0
+        },
+        "loss_terms": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0
+        },
+        "loss_values": [
+          4.951769828796387,
+          4.951769828796387
+        ],
+        "identical_sampled_anchors": true,
+        "sampled_anchor_count": 32,
+        "pass": true,
+        "gradient_summary": {
+          "parameter_tensors": 25,
+          "all_pass": true,
+          "max_abs_diff": 1.862645149230957e-09,
+          "max_relative_l2_diff": 2.8535136873839174e-07
+        }
+      }
+    },
+    {
+      "algorithm": "dflash2",
+      "lengths": [
+        9,
+        17,
+        31,
+        64
+      ],
+      "padding_fraction": 0.52734375,
+      "useful_tokens": 121,
+      "correctness": {
+        "loss": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0
+        },
+        "loss_terms": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0
+        },
+        "loss_values": [
+          5.123039722442627,
+          5.123039722442627
+        ],
+        "identical_sampled_anchors": true,
+        "sampled_anchor_count": 29,
+        "pass": true,
+        "gradient_summary": {
+          "parameter_tensors": 36,
+          "all_pass": true,
+          "max_abs_diff": 3.725290298461914e-09,
+          "max_relative_l2_diff": 2.952709571251088e-07
+        }
+      }
+    },
+    {
+      "algorithm": "dflash2",
+      "lengths": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "padding_fraction": 0.0,
+      "useful_tokens": 128,
+      "correctness": {
+        "loss": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0
+        },
+        "loss_terms": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0
+        },
+        "loss_values": [
+          5.035518169403076,
+          5.035518169403076
+        ],
+        "identical_sampled_anchors": true,
+        "sampled_anchor_count": 32,
+        "pass": true,
+        "gradient_summary": {
+          "parameter_tensors": 36,
+          "all_pass": true,
+          "max_abs_diff": 9.313225746154785e-10,
+          "max_relative_l2_diff": 2.501790571376381e-07
+        }
+      }
+    }
+  ],
+  "evidence_kind": "Derived summary: per-parameter gradient entries reduced to count, pass flag and maxima; all other fields preserved.",
+  "source_report_sha256": "18a6e3096731c0fbf87e7965ab5473770c6713b0a763821a299cca69b82a9e8f"
+}

@@ -1,0 +1,1107 @@
+{
+  "audit_utc": "2026-10-02T09:08:41.738677+00:00",
+  "source_report_remote": "/scratch/specforge-packing-full-model-20261002/long_v2.json",
+  "source_report_sha256": "f8895e415d1baaef7ddaa74a7f8e322d83d13e008d2f7606b0378fb0b4861179",
+  "dataset_sha256": "f90478e0d3e32f0d3c45c515381b9bc42951cdd6931830ac1a7380f4459f24b1",
+  "all_run_assertions_passed": true,
+  "measured_runs": 16,
+  "warmup_runs": 4,
+  "runs_per_architecture_per_mode": 4,
+  "target_architecture": {
+    "model": "Qwen3-4B",
+    "layers": 36,
+    "hidden_size": 2560,
+    "vocabulary": 151936,
+    "role": "frozen real target forward in separate SGLang producer"
+  },
+  "validated_trainable_counts": {
+    "dflash": {
+      "elements": 537427200,
+      "tensors": 58,
+      "decoder_layers": 5,
+      "optimizer_updates_per_tensor_per_run": 256
+    },
+    "dflash2": {
+      "elements": 558918912,
+      "tensors": 81,
+      "decoder_layers": 5,
+      "optimizer_updates_per_tensor_per_run": 256
+    }
+  },
+  "frozen_tied_target_embedding_head_unique_elements_in_consumer": 388956160,
+  "checks": {
+    "exact_preprocessed_dataset_hash": true,
+    "same_actual_http_inputs_and_masks_per_architecture": true,
+    "exact_capture_publication_consumption_and_ack_order": true,
+    "1024_samples_and_256_optimizer_steps_per_run": true,
+    "all_optimizer_original_parameters_and_fp32_masters_covered": true,
+    "all_trainable_tensors_have_256_adam_updates": true,
+    "all_first_warmup_gradients_present_and_finite_global_norm": true,
+    "no_gradient_observation_hook_in_measured_runs": true,
+    "all_five_decoder_layers_have_nonempty_trainable_names_and_sampled_updates": true,
+    "all_trainable_elements_finite_after_training": true,
+    "frozen_target_parameter_samples_unchanged": true,
+    "logging_at_steps_50_100_150_200_250": true,
+    "checkpoint_events_at_128_and_256": true,
+    "final_checkpoint_step_and_sample_count_match_acks": true,
+    "all_measured_compiler_counter_deltas_empty": true,
+    "continued_live_capture_after_first_optimizer_ack": true,
+    "final_ack_equals_pipeline_endpoint": true,
+    "all_final_losses_finite": true
+  },
+  "summary": {
+    "dflash": {
+      "arms": {
+        "padded": {
+          "runs": 4,
+          "metrics": {
+            "pipeline_seconds": {
+              "median": 135.77420610096306,
+              "min": 135.39080221019685,
+              "max": 136.07322796620429,
+              "values": [
+                136.07322796620429,
+                136.05652987398207,
+                135.49188232794404,
+                135.39080221019685
+              ]
+            },
+            "fit_with_final_checkpoint_seconds": {
+              "median": 145.5256609506905,
+              "min": 144.90472558513284,
+              "max": 145.755035309121,
+              "values": [
+                145.70392679609358,
+                145.755035309121,
+                145.34739510528743,
+                144.90472558513284
+              ]
+            },
+            "checkpoint_total_seconds": {
+              "median": 19.004825842566788,
+              "min": 18.59124900586903,
+              "max": 19.063026294112206,
+              "values": [
+                18.94984213076532,
+                19.059809554368258,
+                19.063026294112206,
+                18.59124900586903
+              ]
+            },
+            "host_train_compute_seconds_per_step": {
+              "median": 0.4527946563698352,
+              "min": 0.4526336301639676,
+              "max": 0.45302082094550133,
+              "values": [
+                0.4526336301639676,
+                0.4528050641492009,
+                0.4527842485904694,
+                0.45302082094550133
+              ]
+            },
+            "host_data_wait_seconds_per_step": {
+              "median": 0.039065446685999636,
+              "min": 0.038275998421013355,
+              "max": 0.04061508445441723,
+              "values": [
+                0.04061508445441723,
+                0.03976557278633118,
+                0.038365320585668085,
+                0.038275998421013355
+              ]
+            },
+            "host_durable_ack_seconds_per_step": {
+              "median": 0.002404910206794739,
+              "min": 0.002309505730867386,
+              "max": 0.002473393775522709,
+              "values": [
+                0.002309505730867386,
+                0.002416390419006348,
+                0.002473393775522709,
+                0.0023934299945831297
+              ]
+            },
+            "loader_wait_producer_seconds": {
+              "median": 0.20019448921084404,
+              "min": 0.20013251528143883,
+              "max": 0.2004451733082533,
+              "values": [
+                0.20013251528143883,
+                0.20024952851235867,
+                0.2004451733082533,
+                0.20013944990932941
+              ]
+            },
+            "loader_wait_fetch_seconds": {
+              "median": 9.73675948008895,
+              "min": 9.515376891940832,
+              "max": 10.09336070343852,
+              "values": [
+                10.09336070343852,
+                9.953005198389292,
+                9.515376891940832,
+                9.520513761788607
+              ]
+            },
+            "final_loss": {
+              "median": 7.263832092285156,
+              "min": 7.263832092285156,
+              "max": 7.263832092285156,
+              "values": [
+                7.263832092285156,
+                7.263832092285156,
+                7.263832092285156,
+                7.263832092285156
+              ]
+            }
+          }
+        },
+        "packed": {
+          "runs": 4,
+          "metrics": {
+            "pipeline_seconds": {
+              "median": 130.65109005570412,
+              "min": 128.88156617432833,
+              "max": 130.91351471282542,
+              "values": [
+                128.88156617432833,
+                130.78667958825827,
+                130.51550052314997,
+                130.91351471282542
+              ]
+            },
+            "fit_with_final_checkpoint_seconds": {
+              "median": 140.37849941663444,
+              "min": 138.3309756219387,
+              "max": 140.5097789634019,
+              "values": [
+                138.3309756219387,
+                140.4588652085513,
+                140.5097789634019,
+                140.2981336247176
+              ]
+            },
+            "checkpoint_total_seconds": {
+              "median": 18.75084599200636,
+              "min": 18.463733648881316,
+              "max": 19.00793844088912,
+              "values": [
+                18.463733648881316,
+                19.00793844088912,
+                18.919086307287216,
+                18.582605676725507
+              ]
+            },
+            "host_train_compute_seconds_per_step": {
+              "median": 0.43363652409240605,
+              "min": 0.43351573960483075,
+              "max": 0.4339526748508215,
+              "values": [
+                0.433688922919333,
+                0.4339526748508215,
+                0.43351573960483075,
+                0.43358412526547907
+              ]
+            },
+            "host_data_wait_seconds_per_step": {
+              "median": 0.03900999794527889,
+              "min": 0.03261461492627859,
+              "max": 0.0398359164968133,
+              "values": [
+                0.03261461492627859,
+                0.038341693453490734,
+                0.039678302437067034,
+                0.0398359164968133
+              ]
+            },
+            "host_durable_ack_seconds_per_step": {
+              "median": 0.002406857404857874,
+              "min": 0.002359313905239105,
+              "max": 0.0024157476499676706,
+              "values": [
+                0.002359313905239105,
+                0.0024157476499676706,
+                0.0024075431749224665,
+                0.0024061716347932817
+              ]
+            },
+            "loader_wait_producer_seconds": {
+              "median": 0.2003897288814187,
+              "min": 0.20013267919421196,
+              "max": 0.30021679401397705,
+              "values": [
+                0.20013267919421196,
+                0.30021679401397705,
+                0.20041996613144875,
+                0.20035949163138866
+              ]
+            },
+            "loader_wait_fetch_seconds": {
+              "median": 9.543545130640268,
+              "min": 8.035708643496037,
+              "max": 9.886001640930772,
+              "values": [
+                8.035708643496037,
+                9.43034845776856,
+                9.656741803511977,
+                9.886001640930772
+              ]
+            },
+            "final_loss": {
+              "median": 7.263965606689453,
+              "min": 7.263965606689453,
+              "max": 7.263965606689453,
+              "values": [
+                7.263965606689453,
+                7.263965606689453,
+                7.263965606689453,
+                7.263965606689453
+              ]
+            }
+          }
+        }
+      },
+      "median_speedups": {
+        "pipeline_seconds": 1.0392121951915951,
+        "fit_with_final_checkpoint_seconds": 1.0366663096944755,
+        "host_train_compute_seconds_per_step": 1.0441801629083869
+      },
+      "matched_chronological_pair_ratios": [
+        {
+          "repeat": 0,
+          "padded_arm": 0,
+          "packed_arm": 1,
+          "ratios": {
+            "pipeline_seconds": 1.055800546232875,
+            "fit_with_final_checkpoint_seconds": 1.0532993506407797,
+            "host_train_compute_seconds_per_step": 1.0436827095262435
+          }
+        },
+        {
+          "repeat": 0,
+          "padded_arm": 3,
+          "packed_arm": 2,
+          "ratios": {
+            "pipeline_seconds": 1.040293478680813,
+            "fit_with_final_checkpoint_seconds": 1.0377062002651527,
+            "host_train_compute_seconds_per_step": 1.0434434222691684
+          }
+        },
+        {
+          "repeat": 1,
+          "padded_arm": 0,
+          "packed_arm": 1,
+          "ratios": {
+            "pipeline_seconds": 1.0381286650615986,
+            "fit_with_final_checkpoint_seconds": 1.0344290353139447,
+            "host_train_compute_seconds_per_step": 1.0444470805216963
+          }
+        },
+        {
+          "repeat": 1,
+          "padded_arm": 3,
+          "packed_arm": 2,
+          "ratios": {
+            "pipeline_seconds": 1.0342003459856144,
+            "fit_with_final_checkpoint_seconds": 1.0328343067822796,
+            "host_train_compute_seconds_per_step": 1.044827968893283
+          }
+        }
+      ]
+    },
+    "dflash2": {
+      "arms": {
+        "padded": {
+          "runs": 4,
+          "metrics": {
+            "pipeline_seconds": {
+              "median": 127.55567608494312,
+              "min": 127.01265624165535,
+              "max": 127.72959364019334,
+              "values": [
+                127.72959364019334,
+                127.55552425421774,
+                127.55582791566849,
+                127.01265624165535
+              ]
+            },
+            "fit_with_final_checkpoint_seconds": {
+              "median": 137.32001544442028,
+              "min": 136.6376235689968,
+              "max": 137.59124981798232,
+              "values": [
+                137.59124981798232,
+                137.353132288903,
+                137.28689859993756,
+                136.6376235689968
+              ]
+            },
+            "checkpoint_total_seconds": {
+              "median": 19.090700599364936,
+              "min": 18.831517465412617,
+              "max": 19.25768494606018,
+              "values": [
+                19.159075815230608,
+                19.25768494606018,
+                19.022325383499265,
+                18.831517465412617
+              ]
+            },
+            "host_train_compute_seconds_per_step": {
+              "median": 0.42698242781683804,
+              "min": 0.4268245469406247,
+              "max": 0.42719867677241563,
+              "values": [
+                0.4269536115154624,
+                0.4268245469406247,
+                0.42719867677241563,
+                0.4270112441182136
+              ]
+            },
+            "host_data_wait_seconds_per_step": {
+              "median": 0.03236039846017957,
+              "min": 0.031001201815903188,
+              "max": 0.03348202735185623,
+              "values": [
+                0.03348202735185623,
+                0.03243206156045198,
+                0.03228873535990715,
+                0.031001201815903188
+              ]
+            },
+            "host_durable_ack_seconds_per_step": {
+              "median": 0.0024311989322304724,
+              "min": 0.002365817494690418,
+              "max": 0.0025716573223471643,
+              "values": [
+                0.0024104075357317925,
+                0.0024519903287291527,
+                0.0025716573223471643,
+                0.002365817494690418
+              ]
+            },
+            "loader_wait_producer_seconds": {
+              "median": 0.20038656052201986,
+              "min": 0.20015659555792809,
+              "max": 0.3005787916481495,
+              "values": [
+                0.20015659555792809,
+                0.2004134152084589,
+                0.20035970583558083,
+                0.3005787916481495
+              ]
+            },
+            "loader_wait_fetch_seconds": {
+              "median": 8.02211464382708,
+              "min": 7.595450304448605,
+              "max": 8.327452383935452,
+              "values": [
+                8.327452383935452,
+                7.998322926461697,
+                8.045906361192465,
+                7.595450304448605
+              ]
+            },
+            "final_loss": {
+              "median": 7.968346118927002,
+              "min": 7.968346118927002,
+              "max": 7.968346118927002,
+              "values": [
+                7.968346118927002,
+                7.968346118927002,
+                7.968346118927002,
+                7.968346118927002
+              ]
+            }
+          }
+        },
+        "packed": {
+          "runs": 4,
+          "metrics": {
+            "pipeline_seconds": {
+              "median": 122.89778250828385,
+              "min": 122.41715203598142,
+              "max": 123.31176270730793,
+              "values": [
+                123.19319461472332,
+                122.41715203598142,
+                122.60237040184438,
+                123.31176270730793
+              ]
+            },
+            "fit_with_final_checkpoint_seconds": {
+              "median": 132.90509969182312,
+              "min": 132.2964224666357,
+              "max": 133.59795146621764,
+              "values": [
+                133.59795146621764,
+                132.60274993814528,
+                132.2964224666357,
+                133.20744944550097
+              ]
+            },
+            "checkpoint_total_seconds": {
+              "median": 19.39351878874004,
+              "min": 19.042769499123096,
+              "max": 19.794485840946436,
+              "values": [
+                19.794485840946436,
+                19.42600578442216,
+                19.042769499123096,
+                19.36103179305792
+              ]
+            },
+            "host_train_compute_seconds_per_step": {
+              "median": 0.4057552154362202,
+              "min": 0.40529941400140523,
+              "max": 0.4060684394985437,
+              "values": [
+                0.40529941400140523,
+                0.40570894527435303,
+                0.4058014855980873,
+                0.4060684394985437
+              ]
+            },
+            "host_data_wait_seconds_per_step": {
+              "median": 0.03559140999987721,
+              "min": 0.03429850439727306,
+              "max": 0.03726461844146252,
+              "values": [
+                0.03726461844146252,
+                0.03429850439727306,
+                0.03459509003907442,
+                0.03658772996068001
+              ]
+            },
+            "host_durable_ack_seconds_per_step": {
+              "median": 0.0024793629013001917,
+              "min": 0.00236849345266819,
+              "max": 0.0025612031146883965,
+              "values": [
+                0.0025612031146883965,
+                0.00236849345266819,
+                0.002535621479153633,
+                0.0024231043234467504
+              ]
+            },
+            "loader_wait_producer_seconds": {
+              "median": 0.3002029359340668,
+              "min": 0.20014070346951485,
+              "max": 0.30046532303094864,
+              "values": [
+                0.20014070346951485,
+                0.300190145149827,
+                0.30046532303094864,
+                0.30021572671830654
+              ]
+            },
+            "loader_wait_fetch_seconds": {
+              "median": 8.65784180443734,
+              "min": 8.398219551891088,
+              "max": 9.154761364683509,
+              "values": [
+                9.154761364683509,
+                8.398219551891088,
+                8.409457132220268,
+                8.90622647665441
+              ]
+            },
+            "final_loss": {
+              "median": 7.968497276306152,
+              "min": 7.968497276306152,
+              "max": 7.968497276306152,
+              "values": [
+                7.968497276306152,
+                7.968497276306152,
+                7.968497276306152,
+                7.968497276306152
+              ]
+            }
+          }
+        }
+      },
+      "median_speedups": {
+        "pipeline_seconds": 1.037900550210052,
+        "fit_with_final_checkpoint_seconds": 1.0332185579246722,
+        "host_train_compute_seconds_per_step": 1.0523153161637044
+      },
+      "matched_chronological_pair_ratios": [
+        {
+          "repeat": 0,
+          "padded_arm": 0,
+          "packed_arm": 1,
+          "ratios": {
+            "pipeline_seconds": 1.0368234547343076,
+            "fit_with_final_checkpoint_seconds": 1.0298904160426026,
+            "host_train_compute_seconds_per_step": 1.0534276556195121
+          }
+        },
+        {
+          "repeat": 0,
+          "padded_arm": 3,
+          "packed_arm": 2,
+          "ratios": {
+            "pipeline_seconds": 1.0419742832828363,
+            "fit_with_final_checkpoint_seconds": 1.035824161663115,
+            "host_train_compute_seconds_per_step": 1.0520461821515734
+          }
+        },
+        {
+          "repeat": 1,
+          "padded_arm": 0,
+          "packed_arm": 1,
+          "ratios": {
+            "pipeline_seconds": 1.0404026243341669,
+            "fit_with_final_checkpoint_seconds": 1.0377219280782928,
+            "host_train_compute_seconds_per_step": 1.0527282228718118
+          }
+        },
+        {
+          "repeat": 1,
+          "padded_arm": 3,
+          "packed_arm": 2,
+          "ratios": {
+            "pipeline_seconds": 1.0300124939672775,
+            "fit_with_final_checkpoint_seconds": 1.0257506178353726,
+            "host_train_compute_seconds_per_step": 1.0515745686750053
+          }
+        }
+      ]
+    }
+  },
+  "per_run_checks": [
+    {
+      "arm": "dflash/warmup/False",
+      "seconds": 157.2685,
+      "fit_seconds": 166.5949,
+      "host_train_compute_mean_s": 0.537832,
+      "checkpoint_seconds": 18.6059,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {
+        "stats": {
+          "calls_captured": 8,
+          "unique_graphs": 4
+        },
+        "frames": {
+          "ok": 4,
+          "total": 4
+        },
+        "aot_autograd": {
+          "autograd_cache_saved": 4,
+          "ok": 4,
+          "total": 4,
+          "autograd_cache_miss": 4
+        },
+        "inductor": {
+          "triton_bundler_save_kernel": 112,
+          "benchmarking.InductorBenchmarker.benchmark_gpu": 3,
+          "benchmarking.InductorBenchmarker.benchmark": 3,
+          "fxgraph_cache_miss": 8,
+          "async_compile_cache_hit": 3,
+          "async_compile_cache_miss": 21,
+          "triton_bundler_save_static_autotuner": 8
+        }
+      },
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 1.0006,
+        "wait_fetch_s": 9.2088
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash/warmup/True",
+      "seconds": 136.9922,
+      "fit_seconds": 146.929,
+      "host_train_compute_mean_s": 0.46024,
+      "checkpoint_seconds": 19.0491,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {
+        "stats": {
+          "calls_captured": 4,
+          "unique_graphs": 2
+        },
+        "frames": {
+          "ok": 2,
+          "total": 2
+        },
+        "inductor": {
+          "async_compile_cache_miss": 12,
+          "triton_bundler_save_static_autotuner": 4,
+          "triton_bundler_save_kernel": 48,
+          "fxgraph_cache_miss": 4,
+          "async_compile_cache_hit": 2
+        },
+        "aot_autograd": {
+          "autograd_cache_saved": 2,
+          "ok": 2,
+          "total": 2,
+          "autograd_cache_miss": 2
+        }
+      },
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2003,
+        "wait_fetch_s": 9.4391
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/warmup/False",
+      "seconds": 129.4135,
+      "fit_seconds": 139.8324,
+      "host_train_compute_mean_s": 0.434597,
+      "checkpoint_seconds": 19.7909,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2006,
+        "wait_fetch_s": 8.0094
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/warmup/True",
+      "seconds": 123.3042,
+      "fit_seconds": 133.2789,
+      "host_train_compute_mean_s": 0.405485,
+      "checkpoint_seconds": 20.058,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2007,
+        "wait_fetch_s": 8.4689
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash/repeat00-arm0/False",
+      "seconds": 136.0732,
+      "fit_seconds": 145.7039,
+      "host_train_compute_mean_s": 0.452634,
+      "checkpoint_seconds": 18.9498,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2001,
+        "wait_fetch_s": 10.0934
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash/repeat00-arm1/True",
+      "seconds": 128.8816,
+      "fit_seconds": 138.331,
+      "host_train_compute_mean_s": 0.433689,
+      "checkpoint_seconds": 18.4637,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2001,
+        "wait_fetch_s": 8.0357
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash/repeat00-arm2/True",
+      "seconds": 130.7867,
+      "fit_seconds": 140.4589,
+      "host_train_compute_mean_s": 0.433953,
+      "checkpoint_seconds": 19.0079,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.3002,
+        "wait_fetch_s": 9.4303
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash/repeat00-arm3/False",
+      "seconds": 136.0565,
+      "fit_seconds": 145.755,
+      "host_train_compute_mean_s": 0.452805,
+      "checkpoint_seconds": 19.0598,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2002,
+        "wait_fetch_s": 9.953
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash/repeat01-arm0/False",
+      "seconds": 135.4919,
+      "fit_seconds": 145.3474,
+      "host_train_compute_mean_s": 0.452784,
+      "checkpoint_seconds": 19.063,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2004,
+        "wait_fetch_s": 9.5154
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash/repeat01-arm1/True",
+      "seconds": 130.5155,
+      "fit_seconds": 140.5098,
+      "host_train_compute_mean_s": 0.433516,
+      "checkpoint_seconds": 18.9191,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2004,
+        "wait_fetch_s": 9.6567
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash/repeat01-arm2/True",
+      "seconds": 130.9135,
+      "fit_seconds": 140.2981,
+      "host_train_compute_mean_s": 0.433584,
+      "checkpoint_seconds": 18.5826,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2004,
+        "wait_fetch_s": 9.886
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash/repeat01-arm3/False",
+      "seconds": 135.3908,
+      "fit_seconds": 144.9047,
+      "host_train_compute_mean_s": 0.453021,
+      "checkpoint_seconds": 18.5912,
+      "layers": 5,
+      "trainable_parameters": 537427200,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2001,
+        "wait_fetch_s": 9.5205
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/repeat00-arm0/False",
+      "seconds": 127.7296,
+      "fit_seconds": 137.5912,
+      "host_train_compute_mean_s": 0.426954,
+      "checkpoint_seconds": 19.1591,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2002,
+        "wait_fetch_s": 8.3275
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/repeat00-arm1/True",
+      "seconds": 123.1932,
+      "fit_seconds": 133.598,
+      "host_train_compute_mean_s": 0.405299,
+      "checkpoint_seconds": 19.7945,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2001,
+        "wait_fetch_s": 9.1548
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/repeat00-arm2/True",
+      "seconds": 122.4172,
+      "fit_seconds": 132.6027,
+      "host_train_compute_mean_s": 0.405709,
+      "checkpoint_seconds": 19.426,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.3002,
+        "wait_fetch_s": 8.3982
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/repeat00-arm3/False",
+      "seconds": 127.5555,
+      "fit_seconds": 137.3531,
+      "host_train_compute_mean_s": 0.426825,
+      "checkpoint_seconds": 19.2577,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2004,
+        "wait_fetch_s": 7.9983
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/repeat01-arm0/False",
+      "seconds": 127.5558,
+      "fit_seconds": 137.2869,
+      "host_train_compute_mean_s": 0.427199,
+      "checkpoint_seconds": 19.0223,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.2004,
+        "wait_fetch_s": 8.0459
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/repeat01-arm1/True",
+      "seconds": 122.6024,
+      "fit_seconds": 132.2964,
+      "host_train_compute_mean_s": 0.405801,
+      "checkpoint_seconds": 19.0428,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.3005,
+        "wait_fetch_s": 8.4095
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/repeat01-arm2/True",
+      "seconds": 123.3118,
+      "fit_seconds": 133.2074,
+      "host_train_compute_mean_s": 0.406068,
+      "checkpoint_seconds": 19.361,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.3002,
+        "wait_fetch_s": 8.9062
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    },
+    {
+      "arm": "dflash2/repeat01-arm3/False",
+      "seconds": 127.0127,
+      "fit_seconds": 136.6376,
+      "host_train_compute_mean_s": 0.427011,
+      "checkpoint_seconds": 18.8315,
+      "layers": 5,
+      "trainable_parameters": 558918912,
+      "all_tensor_adam_steps": 256,
+      "logs": [
+        50,
+        100,
+        150,
+        200,
+        250
+      ],
+      "compiler_delta": {},
+      "capture_after_first_ack": 254,
+      "loader_wait": {
+        "wait_producer_s": 0.3006,
+        "wait_fetch_s": 7.5955
+      },
+      "full_model_and_pipeline_checks": "PASS"
+    }
+  ],
+  "limits": [
+    "Primary pipeline interval is first actual HTTP capture dispatch through final durable ack and CUDA completion; it includes the intermediate step-128 checkpoint.",
+    "Full fit includes the step-256 checkpoint and cleanup. Server/model initialization and data preparation are outside these intervals.",
+    "Host train_compute diagnostic means cover five 50-step windows (250 of 256 steps), including detailed metrics at window ends. They are not CUDA kernel-only timings.",
+    "Frozen target samples and per-layer update hashes are sampled; full finiteness scans and optimizer participation checks cover every trainable tensor.",
+    "Observed timing results from four runs per mode; no claim of convergence, model quality or serving throughput."
+  ]
+}

@@ -645,6 +645,7 @@ def build_training_run(
             max_len=cfg.data.max_length,
             num_epochs=t.num_epochs,
             use_usp_preprocess=(t.attention_backend == "usp"),
+            sequence_packing=t.sequence_packing,
             seed=t.seed,
             resume_from=t.resume_from,
             **_common_launch_kwargs(

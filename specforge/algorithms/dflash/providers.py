@@ -14,6 +14,7 @@ from specforge.algorithms.common.hidden_states_data import (
     build_collator,
     build_offline_normalizer,
     build_offline_reader,
+    build_packed_collator,
 )
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
@@ -209,6 +210,7 @@ def algorithm_spec() -> AlgorithmSpec:
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
             supports_teacher_metrics_opt_out=True,
+            supports_packed_lk_loss=True,
         ),
     )
 
@@ -260,6 +262,7 @@ def algorithm_providers() -> AlgorithmProviders:
                 build_reader=partial(build_offline_reader, ALGORITHM_NAME),
                 build_normalizer=build_offline_normalizer,
                 build_collator=collator,
+                build_packed_collator=build_packed_collator,
             ),
         ),
         server_streaming=(
@@ -270,6 +273,7 @@ def algorithm_providers() -> AlgorithmProviders:
                 layout=SERVER_CAPTURE_LAYOUT,
                 build_collator=collator,
                 select_layout=select_server_capture_layout,
+                build_packed_collator=build_packed_collator,
             ),
         ),
     )

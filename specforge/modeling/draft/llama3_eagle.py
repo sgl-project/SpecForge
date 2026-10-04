@@ -16,6 +16,10 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from specforge.modeling.packed_sequence import (
+    PackedSequenceLayout,
+    generate_packed_eagle3_mask,
+)
 from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
@@ -761,7 +765,12 @@ class LlamaFlexAttention(LlamaAttention):
                 self.rope_scaling["mrope_section"],
             )
         else:
-            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            rope_length = (
+                attention_mask.maximum_length
+                if isinstance(attention_mask, PackedSequenceLayout)
+                else q_len
+            )
+            cos, sin = self.rotary_emb(query_states, seq_len=rope_length + lck)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             # Keep positions ids aligned when padding so the KV cache is unaffected.
             query_states, key_states = apply_rotary_pos_emb(
@@ -780,10 +789,16 @@ class LlamaFlexAttention(LlamaAttention):
             cache_kwargs=cache_kwargs,
         )
 
-        seq_lengths = attention_mask.sum(dim=-1)
-        # Shrink the attention mask to align with the padding to the right.
-        # This is equivalent to the shrinking logic in eagle3.py
-        seq_lengths -= lck
+        if isinstance(attention_mask, PackedSequenceLayout):
+            mask_mod = generate_packed_eagle3_mask(attention_mask, q_len, lck)
+        else:
+            seq_lengths = attention_mask.sum(dim=-1) - lck
+            mask_mod = generate_eagle3_mask(
+                seq_lengths=seq_lengths,
+                Q_LEN=q_len,
+                KV_LEN=key_cache.shape[-2],
+                lck=lck,
+            )
         # TODO: Remove the usage of uncompiled create_block_mask after
         # https://github.com/pytorch/pytorch/issues/160018
         if q_len <= 128:
@@ -794,12 +809,7 @@ class LlamaFlexAttention(LlamaAttention):
             flex_attention_func = compile_friendly_flex_attention
 
         block_mask = create_block_mask_func(
-            mask_mod=generate_eagle3_mask(
-                seq_lengths=seq_lengths,
-                Q_LEN=q_len,
-                KV_LEN=key_cache.shape[-2],
-                lck=lck,
-            ),
+            mask_mod=mask_mod,
             B=bsz,
             H=1,  # Rely on broadcast
             Q_LEN=q_len,

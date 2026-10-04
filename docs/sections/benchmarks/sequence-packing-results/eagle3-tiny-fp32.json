@@ -1,0 +1,175 @@
+{
+  "timestamp_utc": "2026-10-02T04:12:33.131611+00:00",
+  "source": {
+    "files_sha256": {
+      "scripts/benchmark_sequence_packing.py": "0d11416603f81d5b97726abd299244029aa65b12beccb6ff38f9fb82c89dfe47",
+      "specforge/benchmarks/benchmark_sequence_packing.py": "39bf66ed00bee5cd272b6c8f6a562eae54537d98ea7cb41d066ad271eb816d65",
+      "specforge/algorithms/eagle3/data.py": "84d03344c68ba2e3f3a452db12c8b9cef95c931445ab8645b0444ec2580a8fe2",
+      "specforge/algorithms/eagle3/model.py": "aadd395819e3292ab3ccde0f0200fdd6df90f0de1de8a03fb91d6640394ca022",
+      "specforge/modeling/draft/llama3_eagle.py": "1488e38e36f1ff3bb11c0355da776122ef9c779105d38dee404b8e109aa06f4a",
+      "specforge/modeling/packed_sequence.py": "ad057f15c08fb1c5cc80994ac799106536ec0a41c28f88f33d5f1bce34c75670",
+      "specforge/training/strategies/base.py": "a6e3aa2961d9d55f96c816fa2f6ce764672699e02005d89688eddec357120894"
+    },
+    "head": "unavailable (file hashes identify copied snapshot)"
+  },
+  "environment": {
+    "python": "3.12.3",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "gpu": "NVIDIA H200",
+    "cuda_visible_devices": "0",
+    "transformers": "5.12.1"
+  },
+  "settings": {
+    "preset": "tiny",
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "vocab_size": 512,
+    "draft_vocab_size": 256,
+    "target_hidden_size": 128,
+    "lengths": [
+      [
+        8,
+        17,
+        31,
+        64
+      ],
+      [
+        2,
+        3,
+        5,
+        17
+      ],
+      [
+        32,
+        32,
+        32,
+        32
+      ]
+    ],
+    "ttt_length": 7,
+    "dtype": "float32",
+    "warmup": 5,
+    "steps": 20,
+    "seed": 1729,
+    "learning_rate": 0.0001,
+    "prompt_fraction": 0.25,
+    "correctness_only": true,
+    "skip_correctness": false,
+    "atol": 2e-05,
+    "rtol": 0.0002,
+    "output": "artifacts/sequence-packing/tiny-fp32-latest-metadata.json"
+  },
+  "scope": "single-GPU synthetic offline features; resident inputs; production forward/backward/BF16Optimizer; excludes capture, I/O, transfer, distributed communication, and serving",
+  "cases": [
+    {
+      "lengths": [
+        8,
+        17,
+        31,
+        64
+      ],
+      "useful_tokens": 120,
+      "padded_tokens": 256,
+      "padding_fraction": 0.53125,
+      "raw_supervised_tokens": 87,
+      "correctness": {
+        "loss": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0,
+          "reference_l2": 3.5112829208374023
+        },
+        "plosses": {
+          "pass": true,
+          "max_abs_diff": 5.960464477539063e-08,
+          "relative_l2_diff": 4.462841585418779e-08,
+          "reference_l2": 2.3132855892181396
+        },
+        "loss_padded": 3.5112829208374023,
+        "loss_packed": 3.5112829208374023,
+        "pass": true,
+        "gradient_summary": {
+          "parameter_tensors": 13,
+          "all_pass": true,
+          "max_abs_diff": 2.9103830456733704e-10,
+          "max_relative_l2_diff": 3.381816025687098e-07
+        }
+      }
+    },
+    {
+      "lengths": [
+        2,
+        3,
+        5,
+        17
+      ],
+      "useful_tokens": 27,
+      "padded_tokens": 68,
+      "padding_fraction": 0.6029411764705883,
+      "raw_supervised_tokens": 18,
+      "correctness": {
+        "loss": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0,
+          "reference_l2": 1.8310911655426025
+        },
+        "plosses": {
+          "pass": true,
+          "max_abs_diff": 2.9802322387695312e-08,
+          "relative_l2_diff": 4.682924771319063e-08,
+          "reference_l2": 1.1472936868667603
+        },
+        "loss_padded": 1.8310911655426025,
+        "loss_packed": 1.8310911655426025,
+        "pass": true,
+        "gradient_summary": {
+          "parameter_tensors": 13,
+          "all_pass": true,
+          "max_abs_diff": 4.0745362639427185e-10,
+          "max_relative_l2_diff": 4.456337620781133e-07
+        }
+      }
+    },
+    {
+      "lengths": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "useful_tokens": 128,
+      "padded_tokens": 128,
+      "padding_fraction": 0.0,
+      "raw_supervised_tokens": 92,
+      "correctness": {
+        "loss": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0,
+          "reference_l2": 6.87973690032959
+        },
+        "plosses": {
+          "pass": true,
+          "max_abs_diff": 0.0,
+          "relative_l2_diff": 0.0,
+          "reference_l2": 4.606232166290283
+        },
+        "loss_padded": 6.87973690032959,
+        "loss_packed": 6.87973690032959,
+        "pass": true,
+        "gradient_summary": {
+          "parameter_tensors": 13,
+          "all_pass": true,
+          "max_abs_diff": 1.1641532182693481e-10,
+          "max_relative_l2_diff": 1.7126517309899537e-07
+        }
+      }
+    }
+  ],
+  "evidence_kind": "Derived summary: per-parameter gradient entries reduced to count, pass flag and maxima; all other fields preserved.",
+  "source_report_sha256": "86a3ddd7e307768881d6a0ec594a2eb1f18405dae7e387b12fce9edd88d5c702"
+}
