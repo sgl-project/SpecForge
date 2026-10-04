@@ -50,6 +50,9 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--profile", action="store_true", default=True)
     p.add_argument("--compile-blocks", action="store_true")
+    p.add_argument("--fp8-linear", action="store_true")
+    p.add_argument("--shard-frozen-tables", action="store_true")
+    p.add_argument("--measure-checkpoint", action="store_true")
     p.add_argument("--label", default=None, help="result file label; defaults to backend")
     p.add_argument("--no-profile", dest="profile", action="store_false")
     return p.parse_args()
@@ -324,6 +327,53 @@ def _profile_summary(prof):
     }
 
 
+def measure_checkpoint(backend, strategy, workdir, rank):
+    """Time the full-state gather and the on-disk write (sync, and async when
+    this checkout's CheckpointManager supports it)."""
+    import inspect
+    import shutil
+
+    from specforge.training.checkpoint import CheckpointManager
+
+    out = {}
+    supports_async = "async_write" in inspect.signature(CheckpointManager).parameters
+    variants = [("sync", {})] + ([("async", {"async_write": True})] if supports_async else [])
+    for name, kwargs in variants:
+        ckpt_root = os.path.join(workdir, f"ckpt_{name}")
+        os.makedirs(ckpt_root, exist_ok=True)
+        mgr = CheckpointManager(ckpt_root, "bench", **kwargs)
+        timings = []
+        for step in (1, 2):
+            dist.barrier()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            full = backend.state_dict()
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            shared = None
+            if rank == 0:
+                shared = {
+                    "draft_state_dict": strategy.checkpoint_state_filter(full["model"]),
+                    "global_step": step,
+                    "world_size": dist.get_world_size(),
+                }
+            rank_state = {"metadata": full.get("metadata"), "optimizer": full["optimizer"], "rng": full["rng"]}
+            mgr.save(shared, step, rank_state=rank_state)
+            t2 = time.perf_counter()
+            if supports_async:
+                mgr.wait()
+            t3 = time.perf_counter()
+            timings.append({"state_dict_s": t1 - t0, "save_blocking_s": t2 - t1, "save_total_s": t3 - t1})
+            del full, shared, rank_state
+        out[name] = {k: round(sum(t[k] for t in timings) / len(timings), 3) for k in timings[0]}
+        size = 0
+        for root, _, files in os.walk(ckpt_root):
+            size += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+        out[name]["bytes_on_disk_mb"] = round(size / 1024**2, 1)
+        shutil.rmtree(ckpt_root, ignore_errors=True)
+    return out
+
+
 def main():
     args = parse_args()
     if args.draft_config is None:
@@ -385,11 +435,22 @@ def main():
 
         pc = ParallelConfig.from_distributed(sharding_strategy=args.sharding)
         backend_kwargs = {}
-        if args.compile_blocks:
+        requested = {
+            "compile_blocks": bool(args.compile_blocks),
+            "fp8_linear": bool(args.fp8_linear),
+            "shard_frozen_tables": bool(args.shard_frozen_tables),
+        }
+        if any(requested.values()):
+            # Each FSDP2 option lands in its own PR, so only pass the fields
+            # this checkout's BackendOptions actually defines.
             from specforge.training.backend import BackendOptions
 
+            fields = BackendOptions.__dataclass_fields__
+            missing = [k for k, v in requested.items() if v and k not in fields]
+            if missing:
+                raise SystemExit(f"BackendOptions in this checkout lacks {missing}")
             backend_kwargs["options"] = BackendOptions(
-                compile_blocks=True, compile_dynamic=False
+                **{k: v for k, v in requested.items() if k in fields}
             )
         backend = create_training_backend(
             args.backend, pc, optimizer_factory=opt_factory, **backend_kwargs
@@ -467,6 +528,9 @@ def main():
         result["peak_reserved_mb"] = _mb(torch.cuda.max_memory_reserved())
         result["last_loss"] = float(rep.loss) if rep.loss is not None else None
         result["last_grad_norm"] = float(rep.grad_norm) if rep.grad_norm is not None else None
+
+        if args.measure_checkpoint:
+            result["checkpoint"] = measure_checkpoint(backend, strategy, workdir, rank)
 
         if args.profile:
             from torch.profiler import ProfilerActivity, profile
