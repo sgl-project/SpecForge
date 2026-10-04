@@ -72,6 +72,11 @@ interval saves. The outer `Trainer` owns topology cleanup and the guarded final
 save, so CLI, builders, and Python callers cannot select a second loader-based
 training entry. All saves delegate to `CheckpointManager`; the shared draft
 state is written by rank 0 while every rank writes its own optimizer/RNG state.
+With `training.checkpoint_async` the files are written by a background thread:
+the step loop pays only for staging accelerator tensors to the host, and the
+collective outcome check, `{run_id}-latest` repoint and rotation run in
+`wait()` at the next save and at the end of `fit`, so an interrupted write
+never becomes the latest checkpoint.
 
 Natural end-of-stream is accepted only at an optimizer boundary. If the final
 backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
