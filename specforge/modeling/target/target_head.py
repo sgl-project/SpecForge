@@ -7,6 +7,7 @@ from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 from specforge.modeling.target.target_utils import (
     load_target_config,
     target_hidden_size,
+    target_text_config,
     target_vocab_size,
 )
 from specforge.utils import get_local_device, padding
@@ -35,6 +36,7 @@ class TargetHead(nn.Module):
         cls,
         model_path,
         lm_head_key: str = "lm_head.weight",
+        embedding_key: str = "model.embed_tokens.weight",
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = False,
     ) -> "TargetHead":
@@ -46,6 +48,7 @@ class TargetHead(nn.Module):
         target_head.load_weights(
             model_path=model_path,
             lm_head_key=lm_head_key,
+            embedding_key=embedding_key,
             cache_dir=cache_dir,
         )
         target_head.freeze_weights()
@@ -54,13 +57,23 @@ class TargetHead(nn.Module):
         )
         return target_head
 
+    def _ties_word_embeddings(self) -> bool:
+        # Multimodal configs may carry the flag at the top level, on
+        # text_config, or both.
+        return any(
+            getattr(config, "tie_word_embeddings", False)
+            for config in (self.config, target_text_config(self.config))
+        )
+
     @torch.no_grad()
     def load_weights(
         self,
         model_path,
         lm_head_key: str = "lm_head.weight",
+        embedding_key: str = "model.embed_tokens.weight",
         cache_dir: Optional[str] = None,
     ):
+        head_key = lm_head_key
         try:
             tensors = load_checkpoint_tensors(
                 model_path,
@@ -68,13 +81,28 @@ class TargetHead(nn.Module):
                 cache_dir=cache_dir,
             )
         except KeyError as exc:
-            raise RuntimeError(
-                f"Target head key {lm_head_key!r} is missing from {model_path}"
-            ) from exc
-        lm_head = tensors[lm_head_key]
+            if not self._ties_word_embeddings():
+                raise RuntimeError(
+                    f"Target head key {lm_head_key!r} is missing from {model_path}"
+                ) from exc
+            # Tied checkpoints usually store only the input embedding, which
+            # is also the output head.
+            head_key = embedding_key
+            try:
+                tensors = load_checkpoint_tensors(
+                    model_path,
+                    keys=[embedding_key],
+                    cache_dir=cache_dir,
+                )
+            except KeyError as tied_exc:
+                raise RuntimeError(
+                    f"Target head key {lm_head_key!r} and tied embedding key "
+                    f"{embedding_key!r} are both missing from {model_path}"
+                ) from tied_exc
+        lm_head = tensors[head_key]
         if tuple(lm_head.shape) != tuple(self.fc.weight.shape):
             raise RuntimeError(
-                f"Target head {lm_head_key!r} has shape {tuple(lm_head.shape)}, "
+                f"Target head {head_key!r} has shape {tuple(lm_head.shape)}, "
                 f"expected {tuple(self.fc.weight.shape)}"
             )
         self.fc.weight.copy_(lm_head)

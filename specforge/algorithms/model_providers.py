@@ -284,6 +284,7 @@ def build_eagle3_model(
         target_head = TargetHead.from_pretrained(
             cfg.model.target_model_path,
             lm_head_key=cfg.model.lm_head_key,
+            embedding_key=cfg.model.embedding_key,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
         )
@@ -325,6 +326,7 @@ def build_peagle_model(
         target_head = TargetHead.from_pretrained(
             cfg.model.target_model_path,
             lm_head_key=cfg.model.lm_head_key,
+            embedding_key=cfg.model.embedding_key,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
         )
