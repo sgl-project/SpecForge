@@ -9,6 +9,27 @@ from specforge.training.backend import DistributedTrainingBackend
 
 class FSDP2TrainingBackend(DistributedTrainingBackend):
     name = "fsdp2"
+    compiled_blocks: int = 0
+
+    def _prepare_blocks(self, model, block_classes, optimizer_target) -> None:
+        if not self.options.compile_blocks:
+            return
+        targets = self._block_targets(model, block_classes, optimizer_target)
+        if not targets:
+            raise ValueError(
+                "BackendOptions.compile_blocks found no draft blocks to compile: "
+                "the draft advertises no _no_split_modules and has no midlayer"
+            )
+        # ``nn.Module.compile`` compiles in place, so the block keeps its class
+        # (the ``fully_shard`` boundary below still matches ``block_classes``)
+        # and its parameter names (no ``_orig_mod.`` checkpoint prefix). The
+        # FSDP2 hooks registered afterwards run inside the compiled call, but
+        # Dynamo skips them (``torch._dynamo.config.skip_fsdp_hooks``), so they
+        # execute eagerly around the compiled block body. Dynamo starts static
+        # and marks shapes dynamic only after a recompilation.
+        for module in targets:
+            module.compile()
+        self.compiled_blocks = len(targets)
 
     def _shard_model(self, model, block_classes, ignored_frozen_modules):
         pc = self.parallel_config
