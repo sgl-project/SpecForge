@@ -149,12 +149,14 @@ class TestLaunchStaticCollators(unittest.TestCase):
 
 
 class TestStaticShapesConfig(unittest.TestCase):
-    def test_compile_blocks_requires_static_shapes(self):
+    def test_compile_blocks_without_static_shapes_warns(self):
         from specforge.config.schema import TrainingConfig
 
         self.assertFalse(TrainingConfig().static_shapes)
-        with self.assertRaisesRegex(ValueError, "static_shapes"):
-            TrainingConfig(backend="fsdp2", compile_blocks=True)
+        with self.assertWarnsRegex(UserWarning, "static_shapes"):
+            cfg = TrainingConfig(backend="fsdp2", compile_blocks=True)
+        self.assertTrue(cfg.compile_blocks)
+        self.assertFalse(cfg.static_shapes)
         cfg = TrainingConfig(backend="fsdp2", compile_blocks=True, static_shapes=True)
         self.assertTrue(cfg.static_shapes)
         # static_shapes alone is allowed on either backend.

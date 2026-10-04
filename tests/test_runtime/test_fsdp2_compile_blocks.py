@@ -28,12 +28,12 @@ class TestCompileBlocksSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "compile_blocks"):
             backend.prepare_model(TinyComposite(), optimizer_target=None)
 
-    def test_config_requires_fsdp2_and_static_shapes(self):
+    def test_config_requires_fsdp2_and_recommends_static_shapes(self):
         from specforge.config.schema import TrainingConfig
 
         with self.assertRaisesRegex(ValueError, "compile_blocks"):
             TrainingConfig(compile_blocks=True, static_shapes=True)
-        with self.assertRaisesRegex(ValueError, "static_shapes"):
+        with self.assertWarnsRegex(UserWarning, "static_shapes"):
             TrainingConfig(backend="fsdp2", compile_blocks=True)
         cfg = TrainingConfig(backend="fsdp2", compile_blocks=True, static_shapes=True)
         self.assertTrue(cfg.compile_blocks)
