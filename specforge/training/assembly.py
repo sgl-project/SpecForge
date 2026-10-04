@@ -536,6 +536,11 @@ def _profiling_options(cfg: Config):
     )
 
 
+def _backend_options(cfg: Config) -> BackendOptions:
+    """``training.*`` -> typed backend options, shared by every launch path."""
+    return BackendOptions(compile_blocks=cfg.training.compile_blocks)
+
+
 def _common_launch_kwargs(
     cfg: Config,
     bundle: ModelBundle,
@@ -556,7 +561,7 @@ def _common_launch_kwargs(
         optimizer_factory=_optimizer_factory(cfg),
         training_backend=t.backend,
         fsdp_sharding=t.fsdp_sharding,
-        backend_options=BackendOptions(compile_blocks=t.compile_blocks),
+        backend_options=_backend_options(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=t.batch_size,
