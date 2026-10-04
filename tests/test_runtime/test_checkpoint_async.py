@@ -5,7 +5,9 @@ import json
 import os
 import socket
 import tempfile
+import types
 import unittest
+from unittest import mock
 from datetime import timedelta
 
 import torch
@@ -138,6 +140,97 @@ class TestDistributedAsyncSave(unittest.TestCase):
             self.assertEqual(res["backend_rank"], r)
             self.assertEqual(res["global_step"], 4)
             self.assertEqual(res["steps_on_disk"], [3, 4])
+
+
+class TestDisaggregatedLaunchForwardsCheckpointAsync(unittest.TestCase):
+    """The disaggregated runtime builds its trainers through its own call sites
+    (offline consumer and online consumer); ``training.checkpoint_async`` must
+    reach them exactly like the single-process path."""
+
+    @staticmethod
+    def _training():
+        return {
+            "strategy": "dflash",
+            "role": "consumer",
+            "max_steps": 1,
+            "backend": "fsdp2",
+            "checkpoint_async": True,
+        }
+
+    def test_online_consumer_receives_the_option(self):
+        from specforge.algorithms.builtin import builtin_algorithm_registry
+        from specforge.config import Config
+        from specforge.training.disaggregated import _build_online
+
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"prompts_path": "prompts.jsonl"},
+                "training": self._training(),
+                "deployment": {
+                    "mode": "disaggregated",
+                    "disaggregated": {
+                        "control_dir": "/shared/checkpoint_async",
+                        "backend": "mooncake",
+                        "server_urls": ["http://capture:30000"],
+                    },
+                },
+            }
+        )
+        bundle = types.SimpleNamespace(model=object(), target_head=None, strategy_kwargs={})
+        with (
+            mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": "/shared/refs"}),
+            mock.patch("specforge.runtime.data_plane.streaming_ref_channel.StreamingRefChannel"),
+            mock.patch("specforge.training.disaggregated._mooncake_store", return_value=mock.Mock()),
+            mock.patch("specforge.launch.build_disagg_online_consumer", return_value=_FakeFitTrainer()) as build,
+        ):
+            _build_online(
+                cfg,
+                algorithm=builtin_algorithm_registry().resolve("dflash"),
+                build_model_bundle=lambda _cfg: bundle,
+                prepare_prompts=mock.Mock(),
+                optimizer_factory=mock.Mock(),
+                logger=None,
+            )
+        self.assertIs(build.call_args.kwargs["checkpoint_async"], True)
+
+    def test_offline_consumer_receives_the_option(self):
+        from specforge.algorithms.builtin import builtin_algorithm_registry
+        from specforge.config import Config
+        from specforge.training.disaggregated import _build_offline
+
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"hidden_states_path": "features"},
+                "training": self._training(),
+                "deployment": {
+                    "mode": "disaggregated",
+                    "disaggregated": {"control_dir": "/shared/checkpoint_async", "backend": "mooncake"},
+                },
+            }
+        )
+        bundle = types.SimpleNamespace(model=object(), target_head=None, strategy_kwargs={})
+        with (
+            mock.patch.dict(os.environ, {"DISAGG_MANIFEST": "/shared/manifest.json"}),
+            mock.patch("specforge.training.disaggregated._wait_for"),
+            mock.patch("specforge.training.disaggregated._offline_store", return_value=mock.Mock()),
+            mock.patch("specforge.runtime.data_plane.disagg_ingest.read_ref_manifest", return_value=[]),
+            mock.patch("specforge.launch.build_disagg_offline_runtime", return_value=_FakeFitTrainer()) as build,
+        ):
+            _build_offline(
+                cfg,
+                algorithm=builtin_algorithm_registry().resolve("dflash"),
+                build_model_bundle=lambda _cfg: bundle,
+                optimizer_factory=mock.Mock(),
+                logger=None,
+            )
+        self.assertIs(build.call_args.kwargs["checkpoint_async"], True)
+
+
+class _FakeFitTrainer:
+    def fit(self):
+        return 1
 
 
 if __name__ == "__main__":
