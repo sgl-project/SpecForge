@@ -7,6 +7,26 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from specforge.training.backend import DistributedTrainingBackend
 
 
+def _configure_bucketed_compile(buckets: int) -> None:
+    """Let Dynamo hold one static graph per length bucket.
+
+    Each block is traced twice per bucket (the first block's input does not
+    require grad, the others' does), so the per-frame recompile limit must be at
+    least ``2 * buckets``; past the limit Dynamo would silently fall back to
+    eager for new shapes. Both the current and the pre-2.7 config names are set.
+    """
+    import torch._dynamo
+
+    cfg = torch._dynamo.config
+    needed = 2 * int(buckets) + 4
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(cfg, name) and int(getattr(cfg, name)) < needed:
+            setattr(cfg, name, needed)
+    for name in ("accumulated_recompile_limit", "accumulated_cache_size_limit"):
+        if hasattr(cfg, name) and int(getattr(cfg, name)) < 32 * needed:
+            setattr(cfg, name, 32 * needed)
+
+
 class FSDP2TrainingBackend(DistributedTrainingBackend):
     name = "fsdp2"
     compiled_blocks: int = 0
@@ -26,9 +46,16 @@ class FSDP2TrainingBackend(DistributedTrainingBackend):
         # FSDP2 hooks registered afterwards run inside the compiled call, but
         # Dynamo skips them (``torch._dynamo.config.skip_fsdp_hooks``), so they
         # execute eagerly around the compiled block body. Dynamo starts static
-        # and marks shapes dynamic only after a recompilation.
+        # and marks shapes dynamic only after a recompilation; with length
+        # buckets every bucket must stay a static graph instead.
+        buckets = int(getattr(self.options, "compile_shape_buckets", 0) or 0)
+        if buckets > 1:
+            _configure_bucketed_compile(buckets)
         for module in targets:
-            module.compile()
+            if buckets > 1:
+                module.compile(dynamic=False)
+            else:
+                module.compile()
         self.compiled_blocks = len(targets)
 
     def _shard_model(self, model, block_classes, ignored_frozen_modules):

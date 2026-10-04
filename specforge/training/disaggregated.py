@@ -441,6 +441,7 @@ def _build_offline(
         _backend_options,
         _dataloader_num_workers,
         _profiling_options,
+        shape_buckets,
     )
 
     manifest = _env("DISAGG_MANIFEST")
@@ -543,6 +544,7 @@ def _build_offline(
         fsdp_sharding=cfg.training.fsdp_sharding,
         backend_options=_backend_options(cfg),
         static_shapes=cfg.training.static_shapes,
+        static_shape_buckets=shape_buckets(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         ttt_length=cfg.training.ttt_length,
@@ -611,6 +613,7 @@ def _build_online(
         _dataloader_num_workers,
         _load_input_tools,
         _profiling_options,
+        shape_buckets,
     )
 
     modality = cfg.model.input_modality
@@ -827,6 +830,7 @@ def _build_online(
         fsdp_sharding=cfg.training.fsdp_sharding,
         backend_options=_backend_options(cfg),
         static_shapes=cfg.training.static_shapes,
+        static_shape_buckets=shape_buckets(cfg),
         max_len=cfg.data.max_length,
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,

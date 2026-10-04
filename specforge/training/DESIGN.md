@@ -29,7 +29,7 @@ state. `FSDPTrainingBackend` and `FSDP2TrainingBackend` own their sharding and
 model-state APIs; FSDP2 also implements accumulation with
 `set_requires_gradient_sync`. `training.backend` selects the implementation,
 defaulting to the original `fsdp` backend. `BackendOptions` carries opt-in
-behaviors; `training.static_shapes` pads every micro-batch to `data.max_length` and every DFlash-family anchor set to `num_anchors`, so compiled graphs see one input shape (torch 2.13's Inductor cannot lower `flex_attention` with a symbolic context length); `training.compile_blocks` warns without it and compiles each draft block in place before FSDP2 sharding so the composable hooks stay outside Dynamo.
+behaviors; `training.static_shapes` pads every micro-batch to `data.max_length` and every DFlash-family anchor set to `num_anchors`, so compiled graphs see one input shape (torch 2.13's Inductor cannot lower `flex_attention` with a symbolic context length); `training.static_shape_buckets` refines that into a few lengths (multiples of 128, `max_length` last) with one static graph per bucket; `training.compile_blocks` warns without `static_shapes` and compiles each draft block in place before FSDP2 sharding so the composable hooks stay outside Dynamo.
 Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
 state and repositions fixed offline refs through `FeatureDataLoader.seek()`.

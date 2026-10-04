@@ -157,6 +157,10 @@ class BackendOptions:
 
     #: ``torch.compile`` every draft block (or the EAGLE midlayer) in place before FSDP2 sharding.
     compile_blocks: bool = False
+    #: Number of static input lengths the compiled blocks will see (``training.static_shape_buckets``):
+    #: above 1, every block is compiled with ``dynamic=False`` and Dynamo's recompile limit is raised so
+    #: each bucket gets its own static graph instead of a symbolic-shape one.
+    compile_shape_buckets: int = 0
 
 
 class TrainingBackend(abc.ABC):
