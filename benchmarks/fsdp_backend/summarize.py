@@ -30,6 +30,10 @@ def load(out_dir):
     return runs
 
 
+def rank0(ranks):
+    return next((r for r in ranks if r.get("rank") == 0), ranks[0])
+
+
 def agg(ranks, key, fn=max):
     vals = [r[key] for r in ranks if r.get(key) is not None]
     return fn(vals) if vals else None
@@ -91,7 +95,7 @@ def main(out_dir):
         def prow(label, get):
             vals = {}
             for l in labels:
-                prof = cols[l][0].get("profile") or {}
+                prof = rank0(cols[l]).get("profile") or {}
                 try:
                     vals[l] = get(prof) if prof else None
                 except (KeyError, TypeError):
@@ -118,15 +122,22 @@ def main(out_dir):
                 ("state_dict_s", "state_dict gather (s)"),
                 ("save_blocking_s", "save, step-loop blocking (s)"),
                 ("save_total_s", "save, total until complete (s)"),
-                ("bytes_on_disk_mb", "bytes on disk (MB)"),
+                ("bytes_on_disk_mb", "bytes written by rank0 (MB)"),
             ):
-                vals = {l: ((cols[l][0].get("checkpoint") or {}).get(variant) or {}).get(key) for l in labels}
+                vals = {l: ((rank0(cols[l]).get("checkpoint") or {}).get(variant) or {}).get(key) for l in labels}
                 if all(v is None for v in vals.values()):
                     continue
                 base = vals.get(base_label)
                 lines.append(f"| checkpoint {variant}: {label} | " + " | ".join(cell(vals[l], base, 3) for l in labels) + " |")
-        row("loss after warm-up (rank0)", "first_loss", fn=lambda v: v[0], nd=5)
-        row("grad norm after warm-up (rank0)", "first_grad_norm", fn=lambda v: v[0], nd=5)
+        def r0row(label, key, nd):
+            vals = {l: rank0(cols[l]).get(key) for l in labels}
+            if all(v is None for v in vals.values()):
+                return
+            base = vals.get(base_label)
+            lines.append(f"| {label} | " + " | ".join(cell(vals[l], base, nd) for l in labels) + " |")
+
+        r0row("loss after warm-up (rank0)", "first_loss", 5)
+        r0row("grad norm after warm-up (rank0)", "first_grad_norm", 5)
     text = "\n".join(lines)
     print(text)
     with open(os.path.join(out_dir, "summary.md"), "w") as f:
