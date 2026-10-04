@@ -897,6 +897,8 @@ class TrainingConfig(StrictConfigModel):
     backend: Literal["fsdp", "fsdp2"] = "fsdp"
     #: ``torch.compile`` every draft block (or the EAGLE midlayer) in place before FSDP2 sharding. Requires ``backend: fsdp2``.
     compile_blocks: bool = False
+    #: Pad every micro-batch to ``data.max_length`` and every DFlash-family anchor set to ``num_anchors`` so the draft blocks see one input shape per run. Required by ``compile_blocks``.
+    static_shapes: bool = False
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
@@ -1005,6 +1007,11 @@ class TrainingConfig(StrictConfigModel):
             )
         if self.compile_blocks and self.backend != "fsdp2":
             raise ValueError("training.compile_blocks requires training.backend=fsdp2")
+        if self.compile_blocks and not self.static_shapes:
+            raise ValueError(
+                "training.compile_blocks requires training.static_shapes=true: "
+                "compiled draft blocks need one input shape per run"
+            )
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
             if self.batch_size != 1:

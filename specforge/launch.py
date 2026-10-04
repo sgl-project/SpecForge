@@ -169,14 +169,29 @@ def _offline_io(
     *,
     ttt_length: int,
     use_usp_preprocess: bool,
+    static_shapes: bool = False,
 ):
     """Resolve the algorithm-owned normalizer and collator for one modality."""
     provider = algorithm.providers.offline_for(modality)
-    return provider.build_collator(), provider.build_normalizer(
+    collate_fn = _static_or_dynamic_collator(provider.build_collator, max_len if static_shapes else None)
+    return collate_fn, provider.build_normalizer(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
     )
+
+
+def _static_or_dynamic_collator(build_collator, pad_to):
+    """``training.static_shapes`` asks the algorithm's collator for a fixed length."""
+    if pad_to is None:
+        return build_collator()
+    try:
+        return build_collator(pad_to=int(pad_to))
+    except TypeError as exc:
+        raise ValueError(
+            "training.static_shapes is not supported by this algorithm's collator "
+            f"({build_collator!r} takes no pad_to)"
+        ) from exc
 
 
 def _shard_offline_refs(
@@ -258,6 +273,7 @@ def _make_offline_eval_data_factory(
     ttt_length: int,
     use_usp_preprocess: bool,
     dataloader_num_workers: int,
+    static_shapes: bool = False,
 ):
     """Build a fresh re-iterable eval loader over the offline feature path."""
     provider = algorithm.providers.offline_for(modality)
@@ -267,6 +283,7 @@ def _make_offline_eval_data_factory(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        static_shapes=static_shapes,
     )
     eval_run_id = f"{run_id}-eval"
     refs = provider.build_reader(
@@ -295,15 +312,27 @@ def _make_offline_eval_data_factory(
     return build_loader
 
 
+def _static_pad_length(static_shapes: bool, max_len) -> Optional[int]:
+    if not static_shapes:
+        return None
+    if max_len is None:
+        raise ValueError("static_shapes needs max_len (data.max_length) to pad to")
+    return int(max_len)
+
+
 def _streaming_collate(
     algorithm: AlgorithmRegistration,
     modality: str,
     collate_fn,
+    *,
+    pad_to=None,
 ):
     """Resolve an algorithm-owned server-streaming collator."""
     if collate_fn is not None:
         return collate_fn
-    return algorithm.providers.server_streaming_for(modality).build_collator()
+    return _static_or_dynamic_collator(
+        algorithm.providers.server_streaming_for(modality).build_collator, pad_to
+    )
 
 
 def _resolve_metadata_store(
@@ -559,6 +588,7 @@ def build_offline_runtime(
     output_dir: str,
     ttt_length: int = 7,
     max_len: int = 2048,
+    static_shapes: bool = False,
     batch_size: int = 1,
     accumulation_steps: int = 1,
     num_epochs: int = 1,
@@ -595,6 +625,7 @@ def build_offline_runtime(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        static_shapes=static_shapes,
     )
     controller = DataFlowController(
         run_id,
@@ -630,6 +661,7 @@ def build_offline_runtime(
             ttt_length=ttt_length,
             use_usp_preprocess=use_usp_preprocess,
             dataloader_num_workers=dataloader_num_workers,
+            static_shapes=static_shapes,
         )
     return _assemble_trainer(
         algorithm=algorithm,
@@ -691,6 +723,7 @@ def build_disagg_offline_runtime(
     output_dir: str,
     ttt_length: int = 7,
     max_len: int = 2048,
+    static_shapes: bool = False,
     batch_size: int = 1,
     accumulation_steps: int = 1,
     num_epochs: int = 1,
@@ -726,6 +759,7 @@ def build_disagg_offline_runtime(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        static_shapes=static_shapes,
     )
     source_refs = list(refs)
 
@@ -758,6 +792,7 @@ def build_disagg_offline_runtime(
             ttt_length=ttt_length,
             use_usp_preprocess=use_usp_preprocess,
             dataloader_num_workers=dataloader_num_workers,
+            static_shapes=static_shapes,
         )
     return _assemble_trainer(
         algorithm=algorithm,
@@ -1557,6 +1592,8 @@ def build_disagg_online_consumer(
     eval_interval: int = 0,
     eval_data_factory=None,
     collate_fn=None,
+    static_shapes: bool = False,
+    max_len: Optional[int] = None,
     idle_timeout_s: Optional[float] = None,
     metadata_store: Optional[MetadataStore] = None,
     metadata_db_path: Optional[str] = None,
@@ -1912,7 +1949,12 @@ def build_disagg_online_consumer(
             eval_data_factory=eval_data_factory,
             logger=logger,
             log_interval=log_interval,
-            collate_fn=_streaming_collate(algorithm, modality, collate_fn),
+            collate_fn=_streaming_collate(
+                algorithm,
+                modality,
+                collate_fn,
+                pad_to=_static_pad_length(static_shapes, max_len),
+            ),
             strategy_kwargs=strategy_kwargs,
             per_sample_transform=None,
             max_checkpoints=max_checkpoints,

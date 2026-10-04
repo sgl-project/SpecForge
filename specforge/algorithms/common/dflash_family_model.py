@@ -362,6 +362,7 @@ class OnlineDFlashModel(nn.Module):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
+        static_anchor_count: bool = False,
         loss_decay_gamma: Optional[float] = None,
         objective_chunk_blocks: int = 128,
         loss_type: str = "dflash",
@@ -405,6 +406,10 @@ class OnlineDFlashModel(nn.Module):
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
+        # ``training.static_shapes``: always sample ``num_anchors`` slots so the
+        # draft-block input keeps one shape; slots beyond the valid anchors of a
+        # row are masked exactly like today's short rows.
+        self.static_anchor_count = bool(static_anchor_count)
         self.loss_decay_gamma = loss_decay_gamma
         self.objective_chunk_blocks = int(objective_chunk_blocks)
         self.loss_type = loss_type
@@ -461,11 +466,16 @@ class OnlineDFlashModel(nn.Module):
             # Training strategies pass the CPU-computed value and avoid this
             # synchronizing fallback on CUDA.
             max_valid_anchors = int(valid_counts.max().item())
-        width = min(self.num_anchors, max(0, int(max_valid_anchors)))
-        if width == 0:
+        max_valid = max(0, int(max_valid_anchors))
+        if max_valid == 0:
             raise ValueError(
                 "DFlash-family training requires two consecutive supervised tokens"
             )
+        # ``getattr``: unit tests drive this sampler with bare stand-ins.
+        if getattr(self, "static_anchor_count", False):
+            width = self.num_anchors
+        else:
+            width = min(self.num_anchors, max_valid)
 
         random_values = torch.rand(valid.shape, device=device)
         random_values.masked_fill_(~valid, 2.0)
@@ -1830,6 +1840,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
+        static_anchor_count: bool = False,
         loss_decay_gamma: Optional[float] = None,
         objective_chunk_blocks: int = 128,
         shift_label: bool = False,
@@ -1842,6 +1853,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             block_size=block_size,
             attention_backend=attention_backend,
             num_anchors=num_anchors,
+            static_anchor_count=static_anchor_count,
             loss_decay_gamma=loss_decay_gamma,
             objective_chunk_blocks=objective_chunk_blocks,
             loss_type="dflash",
@@ -2117,6 +2129,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
+        static_anchor_count: bool = False,
         loss_decay_gamma: Optional[float] = None,
         dspark_ce_loss_alpha: float = 0.1,
         dspark_l1_loss_alpha: float = 0.9,
@@ -2131,6 +2144,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             block_size=block_size,
             attention_backend=attention_backend,
             num_anchors=num_anchors,
+            static_anchor_count=static_anchor_count,
             loss_decay_gamma=loss_decay_gamma,
             objective_chunk_blocks=objective_chunk_blocks,
             loss_type="dflash",

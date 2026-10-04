@@ -562,6 +562,7 @@ def _common_launch_kwargs(
         training_backend=t.backend,
         fsdp_sharding=t.fsdp_sharding,
         backend_options=_backend_options(cfg),
+        static_shapes=t.static_shapes,
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=t.batch_size,

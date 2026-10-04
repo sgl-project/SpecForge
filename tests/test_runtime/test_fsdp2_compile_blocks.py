@@ -28,13 +28,16 @@ class TestCompileBlocksSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "compile_blocks"):
             backend.prepare_model(TinyComposite(), optimizer_target=None)
 
-    def test_config_requires_fsdp2(self):
+    def test_config_requires_fsdp2_and_static_shapes(self):
         from specforge.config.schema import TrainingConfig
 
         with self.assertRaisesRegex(ValueError, "compile_blocks"):
-            TrainingConfig(compile_blocks=True)
-        cfg = TrainingConfig(backend="fsdp2", compile_blocks=True)
+            TrainingConfig(compile_blocks=True, static_shapes=True)
+        with self.assertRaisesRegex(ValueError, "static_shapes"):
+            TrainingConfig(backend="fsdp2", compile_blocks=True)
+        cfg = TrainingConfig(backend="fsdp2", compile_blocks=True, static_shapes=True)
         self.assertTrue(cfg.compile_blocks)
+        self.assertTrue(cfg.static_shapes)
 
     def test_block_targets_fall_back_to_midlayer(self):
         from specforge.training.backend import DistributedTrainingBackend
@@ -120,6 +123,7 @@ class TestDisaggregatedLaunchForwardsCompileBlocks(unittest.TestCase):
             "max_steps": 1,
             "backend": "fsdp2",
             "compile_blocks": True,
+            "static_shapes": True,
         }
 
     def test_online_consumer_receives_the_option(self):
@@ -160,6 +164,8 @@ class TestDisaggregatedLaunchForwardsCompileBlocks(unittest.TestCase):
         options = build.call_args.kwargs["backend_options"]
         self.assertIsInstance(options, BackendOptions)
         self.assertTrue(options.compile_blocks)
+        self.assertIs(build.call_args.kwargs["static_shapes"], True)
+        self.assertEqual(build.call_args.kwargs["max_len"], 2048)
 
     def test_offline_consumer_receives_the_option(self):
         from specforge.algorithms.builtin import builtin_algorithm_registry
@@ -195,6 +201,7 @@ class TestDisaggregatedLaunchForwardsCompileBlocks(unittest.TestCase):
         options = build.call_args.kwargs["backend_options"]
         self.assertIsInstance(options, BackendOptions)
         self.assertTrue(options.compile_blocks)
+        self.assertIs(build.call_args.kwargs["static_shapes"], True)
 
 
 class _FakeFitTrainer:
