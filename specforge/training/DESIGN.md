@@ -28,7 +28,8 @@ optimizer lifecycle, replicated DDP path, local gradient scaling, and RNG
 state. `FSDPTrainingBackend` and `FSDP2TrainingBackend` own their sharding and
 model-state APIs; FSDP2 also implements accumulation with
 `set_requires_gradient_sync`. `training.backend` selects the implementation,
-defaulting to the original `fsdp` backend.
+defaulting to the original `fsdp` backend. `BackendOptions` carries opt-in
+behaviors; `training.fp8_linear` swaps the trainable block linears for torchao `Float8Linear` with float8 all-gather and precomputes the next step's scales after every optimizer step.
 Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
 state and repositions fixed offline refs through `FeatureDataLoader.seek()`.

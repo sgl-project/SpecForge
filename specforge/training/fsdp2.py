@@ -1,6 +1,7 @@
 """Composable FSDP2 backend with the same training contract as FSDP1."""
 
 import torch
+import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
@@ -9,6 +10,28 @@ from specforge.training.backend import DistributedTrainingBackend
 
 class FSDP2TrainingBackend(DistributedTrainingBackend):
     name = "fsdp2"
+    fp8_linear_modules: int = 0
+
+    def _prepare_blocks(self, model, block_classes, optimizer_target) -> None:
+        if not self.options.fp8_linear:
+            return
+        targets = self._block_targets(model, block_classes, optimizer_target)
+        if not targets:
+            raise ValueError(
+                "BackendOptions.fp8_linear found no draft blocks: the draft "
+                "advertises no _no_split_modules and has no midlayer"
+            )
+        # Float8 swap before sharding (torchtitan's order): Float8Linear's
+        # fsdp_pre_all_gather hook only exists under FSDP2.
+        self.fp8_linear_modules = _convert_blocks_to_float8(targets)
+
+    def _after_optimizer_step(self) -> None:
+        if self.fp8_linear_modules and self._wrapper_kind == "fsdp2":
+            from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+
+            # One all-reduce computes next step's float8 weight scales for
+            # the fp8 all-gather instead of a per-parameter amax reduction.
+            precompute_float8_dynamic_scale_for_fsdp(self.module)
 
     def _shard_model(self, model, block_classes, ignored_frozen_modules):
         pc = self.parallel_config
@@ -99,3 +122,38 @@ class FSDP2TrainingBackend(DistributedTrainingBackend):
             model_state,
             options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
         )
+
+
+def _float8_linear_filter(module: nn.Module, fqn: str) -> bool:
+    """Trainable linears whose shapes satisfy the float8 GEMM constraints."""
+    return (
+        type(module) is nn.Linear
+        and module.weight.requires_grad
+        and module.in_features % 16 == 0
+        and module.out_features % 16 == 0
+    )
+
+
+def _convert_blocks_to_float8(blocks) -> int:
+    try:
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "BackendOptions.fp8_linear requires torchao (pip install torchao)"
+        ) from exc
+
+    config = Float8LinearConfig(enable_fsdp_float8_all_gather=True)
+    converted = 0
+    for block in blocks:
+        convert_to_float8_training(
+            block, config=config, module_filter_fn=_float8_linear_filter
+        )
+        converted += sum(
+            type(module).__name__ == "Float8Linear" for module in block.modules()
+        )
+    if converted == 0:
+        raise ValueError(
+            "BackendOptions.fp8_linear converted no nn.Linear: every trainable "
+            "linear in the draft blocks has a dimension not divisible by 16"
+        )
+    return converted

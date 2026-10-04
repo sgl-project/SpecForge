@@ -895,6 +895,8 @@ class DeploymentConfig(StrictConfigModel):
 class TrainingConfig(StrictConfigModel):
     strategy: str = "eagle3"
     backend: Literal["fsdp", "fsdp2"] = "fsdp"
+    #: Run the trainable linears inside the draft blocks as torchao ``Float8Linear`` with float8 FSDP2 all-gather. Requires ``backend: fsdp2``.
+    fp8_linear: bool = False
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
@@ -1001,6 +1003,8 @@ class TrainingConfig(StrictConfigModel):
                 "training.down_sample_ratio_min must be in "
                 "(0, training.down_sample_ratio]"
             )
+        if self.fp8_linear and self.backend != "fsdp2":
+            raise ValueError("training.fp8_linear requires training.backend=fsdp2")
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
             if self.batch_size != 1:

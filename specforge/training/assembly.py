@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.training.backend import BackendOptions
 from specforge.training.provenance import (
     model_resume_provenance as _model_resume_provenance,
 )
@@ -555,6 +556,7 @@ def _common_launch_kwargs(
         optimizer_factory=_optimizer_factory(cfg),
         training_backend=t.backend,
         fsdp_sharding=t.fsdp_sharding,
+        backend_options=BackendOptions(fp8_linear=t.fp8_linear),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=t.batch_size,
