@@ -538,7 +538,10 @@ def _profiling_options(cfg: Config):
 
 def _backend_options(cfg: Config) -> BackendOptions:
     """``training.*`` -> typed backend options, shared by every launch path."""
-    return BackendOptions(compile_blocks=cfg.training.compile_blocks)
+    return BackendOptions(
+        compile_blocks=cfg.training.compile_blocks,
+        fp8_linear=cfg.training.fp8_linear,
+    )
 
 
 def _common_launch_kwargs(

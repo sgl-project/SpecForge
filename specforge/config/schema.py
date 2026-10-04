@@ -900,6 +900,8 @@ class TrainingConfig(StrictConfigModel):
     compile_blocks: bool = False
     #: Pad every micro-batch to ``data.max_length`` and every DFlash-family anchor set to ``num_anchors`` so the draft blocks see one input shape per run. Recommended with ``compile_blocks`` (a warning without it).
     static_shapes: bool = False
+    #: Run the trainable linears inside the draft blocks as torchao ``Float8Linear`` with float8 FSDP2 all-gather. Requires ``backend: fsdp2``.
+    fp8_linear: bool = False
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
@@ -1017,6 +1019,17 @@ class TrainingConfig(StrictConfigModel):
                 "unless your batches are already fixed-shape.",
                 stacklevel=2,
             )
+        if self.fp8_linear and self.backend != "fsdp2":
+            raise ValueError("training.fp8_linear requires training.backend=fsdp2")
+        if self.fp8_linear and not self.static_shapes:
+            warnings.warn(
+                "training.fp8_linear without training.static_shapes needs every "
+                "micro-batch's token count to be a multiple of 16 (float8 GEMMs) and a "
+                "fixed shape for compile_blocks; with pad-to-longest batches it fails at "
+                "the first step. Set training.static_shapes=true unless your batches are "
+                "already fixed-shape.",
+                stacklevel=2,
+            )
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
             if self.batch_size != 1:
@@ -1130,6 +1143,11 @@ class Config(StrictConfigModel):
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
         mode = self.mode
+        if self.training.fp8_linear and self.training.static_shapes and self.data.max_length % 16:
+            raise ValueError(
+                "training.fp8_linear with training.static_shapes needs data.max_length "
+                "to be a multiple of 16 (float8 GEMMs over the padded context positions)"
+            )
         deployment = self.deployment.mode
         role = self.training.role
 

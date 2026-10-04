@@ -157,6 +157,8 @@ class BackendOptions:
 
     #: ``torch.compile`` every draft block (or the EAGLE midlayer) in place before FSDP2 sharding.
     compile_blocks: bool = False
+    #: Run the trainable linears inside the draft blocks as torchao ``Float8Linear`` with float8 FSDP2 all-gather.
+    fp8_linear: bool = False
 
 
 class TrainingBackend(abc.ABC):
