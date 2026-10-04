@@ -26,6 +26,19 @@ MINIMAL = {
 
 
 class ConsumerOptimizationConfigTest(unittest.TestCase):
+    def test_dspine_dispatch_requires_matching_strategy_and_two_windows(self):
+        payload = _online_payload("dspine")
+        payload["runtime"] = {"consumer_dispatch": "dspine_balanced"}
+        self.assertEqual(Config(**payload).runtime.consumer_dispatch, "dspine_balanced")
+        payload["training"]["strategy"] = "dflash"
+        with self.assertRaisesRegex(ValidationError, "requires training.strategy=dspine"):
+            Config(**payload)
+        payload["training"]["strategy"] = "dspine"
+        payload["training"]["batch_size"] = 128
+        payload["training"]["accumulation_steps"] = 2
+        with self.assertRaisesRegex(ValidationError, "at least two global batches"):
+            Config(**payload)
+
     def test_opt_in_fields_and_validation(self):
         from specforge.config.schema import RuntimeConfig, TrainingConfig
 

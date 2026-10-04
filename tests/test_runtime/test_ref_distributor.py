@@ -3,6 +3,7 @@
 single-authority dispatch/book-keeping path (CPU only, no torch.distributed)."""
 
 import os
+import random
 import sqlite3
 import tempfile
 import unittest
@@ -133,14 +134,56 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(dist.stats["dispatched"], 8)
         self.assertEqual(dist._window_dispatched, 0)
 
-    def test_domino_balancing_uses_two_windows_without_losing_samples(self):
+    def test_dspine_balancing_uses_two_windows_without_losing_samples(self):
+        self.test_domino_balancing_uses_two_windows_without_losing_samples(
+            "dspine_balanced"
+        )
+
+    def test_dspine_joint_balancing_improves_estimated_critical_path(self):
+        dist = self._distributor(
+            dp_size=32,
+            refs_per_rank_step=4,
+            refs_per_rank_batch=2,
+            dispatch_policy="dspine_balanced",
+            num_anchors=512,
+            block_size=16,
+        )
+        rng = random.Random(42)
+        refs = [
+            replace(
+                _ref(str(index)), num_tokens=600, strategy="dspine",
+                metadata={
+                    "valid_anchor_count": min(512, max(1, int(rng.expovariate(1 / 400))))
+                },
+            )
+            for index in range(256)
+        ]
+        baseline = [
+            dist._balanced_batches(refs[start : start + 128]) for start in (0, 128)
+        ]
+        actual = dist._dspine_windows(refs)
+
+        def critical(windows):
+            return sum(max(dist._rank_cost(rank) for rank in window) for window in windows)
+
+        self.assertLess(critical(actual), critical(baseline) * 0.95)
+        delivered = [
+            ref.sample_id for window in actual for rank in window for ref in rank
+        ]
+        self.assertEqual(len(delivered), 256)
+        self.assertEqual(set(delivered), {str(index) for index in range(256)})
+        self.assertTrue(all(len(rank) == 4 for window in actual for rank in window))
+
+    def test_domino_balancing_uses_two_windows_without_losing_samples(
+        self, policy="domino_balanced"
+    ):
         dist = self._distributor(
             dp_size=2, refs_per_rank_step=2, refs_per_rank_batch=1,
-            dispatch_policy="domino_balanced",
+            dispatch_policy=policy,
         )
         for index, anchors in enumerate((512, 4, 400, 8, 500, 3, 450, 9)):
             self.producer.publish(replace(
-                _ref(f"s{index}"), strategy="domino", num_tokens=600,
+                _ref(f"s{index}"), strategy=policy.removesuffix("_balanced"), num_tokens=600,
                 metadata={"valid_anchor_count": anchors},
             ))
             if index == 3:
@@ -150,12 +193,20 @@ class TestRefDistributor(unittest.TestCase):
         delivered = [_inbox_ids(self.inbox_dir, rank) for rank in range(2)]
         self.assertEqual([len(items) for items in delivered], [4, 4])
         self.assertEqual(set(sum(delivered, [])), {f"s{index}" for index in range(8)})
-        self.assertEqual(set(delivered[0][:2] + delivered[1][:2]), {"s0", "s2", "s4", "s6"})
+        if policy == "domino_balanced":
+            self.assertEqual(set(delivered[0][:2] + delivered[1][:2]), {"s0", "s2", "s4", "s6"})
 
-    def test_domino_balancing_flushes_one_closed_window_and_drops_only_tail(self):
+    def test_dspine_balancing_flushes_one_closed_window_and_drops_only_tail(self):
+        self.test_domino_balancing_flushes_one_closed_window_and_drops_only_tail(
+            "dspine_balanced"
+        )
+
+    def test_domino_balancing_flushes_one_closed_window_and_drops_only_tail(
+        self, policy="domino_balanced"
+    ):
         dist = self._distributor(
             dp_size=2, refs_per_rank_step=4, refs_per_rank_batch=2,
-            dispatch_policy="domino_balanced",
+            dispatch_policy=policy,
         )
         for index in range(11):
             self.producer.publish(replace(_ref(f"s{index}"), strategy="domino"))
@@ -169,7 +220,10 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual(dist.stats["dropped"], 3)
         self.assertTrue(dist.finished)
 
-    def test_domino_balancing_reconciles_durable_refs(self):
+    def test_dspine_balancing_reconciles_durable_refs(self):
+        self.test_domino_balancing_reconciles_durable_refs("dspine_balanced")
+
+    def test_domino_balancing_reconciles_durable_refs(self, policy="domino_balanced"):
         store = SQLiteMetadataStore(os.path.join(self.dir, "domino-resume.sqlite"))
         self.addCleanup(store.close)
         original = DataFlowController("run0", metadata_store=store)
@@ -183,7 +237,7 @@ class TestRefDistributor(unittest.TestCase):
         report = restarted.reconcile_on_restart(self.feature_store)
         dist = self._distributor(
             dp_size=1, controller=restarted, skip_ids=report["released"],
-            requeued_ids=report["requeued"], dispatch_policy="domino_balanced",
+            requeued_ids=report["requeued"], dispatch_policy=policy,
         )
         _pump_until_quiet(dist)
         self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])

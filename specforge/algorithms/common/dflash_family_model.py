@@ -252,6 +252,7 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     sliding_window: Optional[int] = None,
+    causal_block: bool = False,
 ):
     """Construct a full or sliding dense boolean DFlash mask."""
 
@@ -282,7 +283,7 @@ def create_dflash_sdpa_mask(
     is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
-    if sliding_window is not None:
+    if causal_block or sliding_window is not None:
         kv_block_offsets = (kv_indices - S) % block_size
         mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
 
@@ -300,6 +301,7 @@ def create_dflash_block_mask(
     device: torch.device,
     flex_block_size=None,
     sliding_window: Optional[int] = None,
+    causal_block: bool = False,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training."""
 
@@ -324,7 +326,7 @@ def create_dflash_block_mask(
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
-        if sliding_window is not None:
+        if causal_block or sliding_window is not None:
             kv_block_offset = (kv_idx - S) % block_size
             mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
 

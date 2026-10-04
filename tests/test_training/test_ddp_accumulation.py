@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -31,6 +32,17 @@ class _Optimizer(torch.optim.SGD):
         self.zero_grad(set_to_none=True)
 
 
+class _ReplayStrategy(_Strategy):
+    def forward_loss(self, batch, ctx=None):
+        with torch.no_grad():
+            output = super().forward_loss(batch, ctx)
+
+        def replay_loss(window_ratios):
+            return _Strategy.forward_loss(self, batch, ctx)
+
+        return replace(output, replay_loss=replay_loss)
+
+
 def _count_allreduce(state, bucket):
     state["calls"] += 1
     buffer = bucket.buffer()
@@ -47,7 +59,7 @@ def _input(rank, micro_step):
     )
 
 
-def _worker(rank, directory):
+def _worker(rank, directory, replay=False):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -68,7 +80,8 @@ def _worker(rank, directory):
         wrapped = backend.prepare_model(model)
         state = {"calls": 0}
         wrapped.register_comm_hook(state, _count_allreduce)
-        core = TrainerCore(_Strategy(wrapped), backend, accumulation_steps=2)
+        strategy = _ReplayStrategy(wrapped) if replay else _Strategy(wrapped)
+        core = TrainerCore(strategy, backend, accumulation_steps=2)
         reference_optimizer = _Optimizer(reference.parameters(), lr=0.01)
         counts, differences = [], []
         for micro_step in range(4):
@@ -108,8 +121,16 @@ def _worker(rank, directory):
 
 class DDPAccumulationTest(unittest.TestCase):
     def test_reduces_only_at_optimizer_boundaries(self):
+        self._check_accumulation(False)
+
+    def test_replay_reduces_only_at_optimizer_boundaries(self):
+        self._check_accumulation(True)
+
+    def _check_accumulation(self, replay):
         with tempfile.TemporaryDirectory() as directory:
-            multiprocessing.spawn(_worker, args=(directory,), nprocs=2, join=True)
+            multiprocessing.spawn(
+                _worker, args=(directory, replay), nprocs=2, join=True
+            )
             for rank in range(2):
                 result = json.loads(Path(directory, f"rank{rank}.json").read_text())
                 with self.subTest(rank=rank):

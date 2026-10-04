@@ -471,9 +471,9 @@ class RuntimeConfig(StrictConfigModel):
     """Streaming bounds shared by unified disaggregated producer roles."""
 
     producer_lease: int = Field(default=8, gt=0)
-    consumer_dispatch: Literal["round_robin", "cost_balanced", "domino_balanced"] = (
-        "round_robin"
-    )
+    consumer_dispatch: Literal[
+        "round_robin", "cost_balanced", "domino_balanced", "dspine_balanced"
+    ] = "round_robin"
     producer_concurrency: int = Field(default=1, gt=0)
     in_flight_high_watermark: int = Field(default=256, gt=0)
     in_flight_low_watermark: int = Field(default=192, ge=0)
@@ -1124,9 +1124,11 @@ class Config(StrictConfigModel):
 
         if self.training.domino_cache_projection and self.training.strategy != "domino":
             raise ValueError("domino_cache_projection requires training.strategy=domino")
-        if self.runtime.consumer_dispatch == "domino_balanced":
-            if self.training.strategy != "domino":
-                raise ValueError("domino_balanced requires training.strategy=domino")
+        if self.runtime.consumer_dispatch in ("domino_balanced", "dspine_balanced"):
+            dispatch = self.runtime.consumer_dispatch
+            strategy = dispatch.removesuffix("_balanced")
+            if self.training.strategy != strategy:
+                raise ValueError(f"{dispatch} requires training.strategy={strategy}")
             window = (
                 self.deployment.trainer.nnodes
                 * self.deployment.trainer.nproc_per_node
@@ -1135,7 +1137,7 @@ class Config(StrictConfigModel):
             )
             if self.runtime.in_flight_high_watermark < 2 * window:
                 raise ValueError(
-                    "domino_balanced requires a high watermark of at least two global batches"
+                    f"{dispatch} requires a high watermark of at least two global batches"
                 )
 
         if mode == "online" and deployment != "disaggregated":

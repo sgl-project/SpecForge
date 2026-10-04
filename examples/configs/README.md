@@ -203,7 +203,7 @@ should make their training strategy and topology explicit.
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
-| `model.use_liger_kernel` | `false` | Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash training. Requires the `specforge[liger]` extra. |
+| `model.use_liger_kernel` | `false` | Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash, Domino, or DSpine training. DSpine keeps its CE/L1, alignment and refinement objectives unchanged. Requires the `specforge[liger]` extra. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
@@ -465,7 +465,7 @@ unless tuning throughput or memory pressure.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `runtime.producer_lease` | `8` | Prompts leased to a rollout worker at once. |
-| `runtime.consumer_dispatch` | `round_robin` | Online consumer distribution: `round_robin` or experimental `cost_balanced`. Balances padded anchor/context costs within each complete optimizer window, preserving its sample set, per-rank batch count, durable acknowledgements and tail handling. Server capture includes valid-anchor counts; older refs fall back to token length. |
+| `runtime.consumer_dispatch` | `round_robin` | Online consumer distribution: `round_robin` or experimental `cost_balanced`. The latter balances padded anchor/context costs within each complete optimizer window. Strategy-specific `domino_balanced` buckets across two windows; `dspine_balanced` jointly balances two windows and falls back to single-window balancing unless the estimated total critical path improves. Both can change sample grouping and require a high watermark of at least two global batches. All preserve per-rank batch counts, durable acknowledgements and tail handling. Server capture includes valid-anchor counts; older refs fall back to token length. |
 | `runtime.producer_concurrency` | `1` | Concurrent capture calls maintained by each server's logical producer. Increase to keep ingress full without duplicating producers. |
 | `runtime.in_flight_high_watermark` | `256` | Pause production at this many committed, unacknowledged refs. |
 | `runtime.in_flight_low_watermark` | `192` | Resume production at or below this count; it cannot exceed the high watermark. |
