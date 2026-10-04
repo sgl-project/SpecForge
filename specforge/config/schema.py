@@ -894,6 +894,9 @@ class DeploymentConfig(StrictConfigModel):
 
 class TrainingConfig(StrictConfigModel):
     strategy: str = "eagle3"
+    backend: Literal["fsdp", "fsdp2"] = "fsdp"
+    #: Shard the frozen target ``lm_head`` / ``embed_tokens`` tables in the FSDP2 root group instead of replicating them on every rank. Requires ``backend: fsdp2``.
+    shard_frozen_tables: bool = False
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
@@ -1000,6 +1003,8 @@ class TrainingConfig(StrictConfigModel):
                 "training.down_sample_ratio_min must be in "
                 "(0, training.down_sample_ratio]"
             )
+        if self.shard_frozen_tables and self.backend != "fsdp2":
+            raise ValueError("training.shard_frozen_tables requires training.backend=fsdp2")
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
             if self.batch_size != 1:
