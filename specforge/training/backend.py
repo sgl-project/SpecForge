@@ -145,6 +145,20 @@ class ParallelConfig:
         )
 
 
+@dataclass(frozen=True)
+class BackendOptions:
+    """Opt-in backend behaviors selected by ``training.*`` config fields.
+
+    Options act on the draft blocks (the ``_no_split_modules`` classes, or the
+    EAGLE ``midlayer`` when a draft advertises none) before sharding. FSDP1
+    wraps blocks in ``FullyShardedDataParallel`` modules and supports none of
+    them; the FSDP2 backend applies them in ``_prepare_blocks``.
+    """
+
+    #: Shard the frozen target ``lm_head`` / ``embed_tokens`` tables in the FSDP2 root group instead of replicating them on every rank.
+    shard_frozen_tables: bool = False
+
+
 class TrainingBackend(abc.ABC):
     name: str
     #: Whether ``step(loss_denominator=...)`` validates the global loss
@@ -187,9 +201,11 @@ class DistributedTrainingBackend(TrainingBackend):
         parallel_config: ParallelConfig,
         *,
         optimizer_factory=None,
+        options: Optional[BackendOptions] = None,
     ) -> None:
         self.parallel_config = parallel_config
         self._optimizer_factory = optimizer_factory
+        self.options = options or BackendOptions()
         self.module: Optional[nn.Module] = None
         self.optimizer = None
         self._wrapped = False
@@ -255,6 +271,7 @@ class DistributedTrainingBackend(TrainingBackend):
                 for module in model.modules()
                 if type(module).__name__ in block_names
             }
+            self._prepare_blocks(model, block_classes, optimizer_target)
             if pc.sharding_strategy == "NO_SHARD":
                 # PyTorch deprecated FSDP's NO_SHARD mode in favor of DDP.
                 # DDP gives this small draft model replicated-param execution
@@ -293,6 +310,37 @@ class DistributedTrainingBackend(TrainingBackend):
 
     @abc.abstractmethod
     def _shard_model(self, model, block_classes, ignored_frozen_modules): ...
+
+    @staticmethod
+    def _block_targets(
+        model: nn.Module, block_classes, optimizer_target: Optional[nn.Module]
+    ) -> List[nn.Module]:
+        """Draft blocks that ``BackendOptions`` transforms act on.
+
+        DFlash-family drafts advertise their decoder block class; EAGLE drafts
+        expose a single ``midlayer``. Working at this granularity keeps the
+        per-block FSDP boundaries and the custom head kernels untouched.
+        """
+        targets = [m for m in model.modules() if type(m) in block_classes]
+        if not targets:
+            midlayer = getattr(optimizer_target, "midlayer", None)
+            if isinstance(midlayer, nn.Module):
+                targets = [midlayer]
+        return targets
+
+    def _prepare_blocks(
+        self, model: nn.Module, block_classes, optimizer_target: Optional[nn.Module]
+    ) -> None:
+        """Hook for pre-sharding block transforms; FSDP1 supports none."""
+        for option in BackendOptions.__dataclass_fields__:
+            if getattr(self.options, option):
+                raise ValueError(
+                    f"BackendOptions.{option} is not supported by the "
+                    f"{self.name!r} backend; use training.backend=fsdp2"
+                )
+
+    def _after_optimizer_step(self) -> None:
+        """Hook run after every optimizer step."""
 
     def set_optimizer(self, optimizer) -> None:
         self.optimizer = optimizer
@@ -351,8 +399,11 @@ class DistributedTrainingBackend(TrainingBackend):
                 f"{type(self).__name__}.step called before optimizer is set"
             )
         if loss_denominator is None:
-            return self.optimizer.step()
-        return self.optimizer.step(loss_denominator=loss_denominator)
+            grad_norm = self.optimizer.step()
+        else:
+            grad_norm = self.optimizer.step(loss_denominator=loss_denominator)
+        self._after_optimizer_step()
+        return grad_norm
 
     def state_dict(self) -> dict:
         """Model, optimizer, RNG and sharding metadata for resume.
@@ -531,6 +582,7 @@ def create_training_backend(name: str, parallel_config: ParallelConfig, **kwargs
 
 
 __all__ = [
+    "BackendOptions",
     "ParallelConfig",
     "TrainingBackend",
     "DistributedTrainingBackend",

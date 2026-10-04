@@ -10,6 +10,12 @@ from specforge.training.backend import DistributedTrainingBackend
 class FSDP2TrainingBackend(DistributedTrainingBackend):
     name = "fsdp2"
 
+    def _prepare_blocks(self, model, block_classes, optimizer_target) -> None:
+        # ``shard_frozen_tables`` is applied by ``_shard_model`` below; FSDP2
+        # supports every BackendOptions field, so the FSDP1 rejection does not
+        # apply here.
+        return None
+
     def _shard_model(self, model, block_classes, ignored_frozen_modules):
         pc = self.parallel_config
         if pc.sharding_strategy not in ("FULL_SHARD", "SHARD_GRAD_OP"):
@@ -21,6 +27,15 @@ class FSDP2TrainingBackend(DistributedTrainingBackend):
             pc.fsdp_process_group or torch.distributed.group.WORLD,
             device_type=device.type,
         )
+        if self.options.shard_frozen_tables:
+            # Keep the frozen target tables in the root FSDP2 group instead of
+            # replicating them: they are sharded at rest and all-gathered once
+            # per accumulation window together with the root parameters, so
+            # the DFlash fused head still sees ordinary unsharded tensors
+            # inside forward. Peak memory is unchanged (the tables must be
+            # resident for the vocabulary objective); memory at rest drops by
+            # (1 - 1/world_size) of the tables.
+            ignored_frozen_modules = ()
         ignored_params = {
             p for module in ignored_frozen_modules for p in module.parameters()
         }

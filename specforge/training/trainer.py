@@ -89,6 +89,7 @@ class Trainer:
         optimizer_factory,
         training_backend: str = "fsdp",
         fsdp_sharding: Optional[str] = None,
+        backend_options=None,
         run_id: str,
         output_dir: str,
         batch_size: int,
@@ -434,7 +435,10 @@ class Trainer:
             sp_ring_size=sp_ring_size,
         )
         backend = create_training_backend(
-            training_backend, parallel, optimizer_factory=optimizer_factory
+            training_backend,
+            parallel,
+            optimizer_factory=optimizer_factory,
+            options=backend_options,
         )
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
