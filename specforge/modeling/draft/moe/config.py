@@ -9,7 +9,9 @@ Two kinds of keys, deliberately kept apart:
   weights a checkpoint carries and how serving must route, so a draft JSON can
   be assembled by copying them from the target's ``config.json``. A
   ``moe_preset`` supplies the defaults for one target family; explicit keys
-  override the preset for ablations.
+  override the preset for ablations. The routed-expert count accepts both
+  spellings used by target checkpoints: DeepSeek's ``n_routed_experts`` and
+  Qwen's ``num_experts``.
 - **Training-only keys** live under ``dflash_config`` with an ``moe_`` prefix
   (``moe_bias_update_rate``, ``moe_aux_loss_coeff``, ``moe_dispatch``). They
   never change the checkpoint and are invisible to serving.
@@ -23,6 +25,11 @@ from typing import Any, Dict, Mapping, Optional
 from ._registry import Registry
 
 _MISSING = object()
+
+#: Draft-JSON spellings of the routed-expert count, all resolving to
+#: ``MoEConfig.n_routed_experts``: DeepSeek checkpoints say ``n_routed_experts``,
+#: Qwen checkpoints say ``num_experts``.
+ROUTED_EXPERTS_KEYS = ("n_routed_experts", "num_experts")
 
 #: Draft-JSON top-level keys that describe the MoE architecture.
 ARCHITECTURE_KEYS = (
@@ -195,10 +202,28 @@ def _get(config: Any, key: str, default: Any = _MISSING) -> Any:
     return getattr(config, key, default)
 
 
+def routed_expert_count(config: Any) -> int:
+    """The draft config's routed-expert count under either spelling (0 = dense).
+
+    ``n_routed_experts`` (DeepSeek) and ``num_experts`` (Qwen) are the same
+    quantity; a config that states both must agree.
+    """
+    stated = {}
+    for key in ROUTED_EXPERTS_KEYS:
+        value = _get(config, key, None)
+        if value is not None:
+            stated[key] = int(value)
+    if len(set(stated.values())) > 1:
+        raise ValueError(
+            "the draft config states conflicting routed-expert counts: "
+            + ", ".join(f"{key}={value}" for key, value in stated.items())
+        )
+    return next(iter(stated.values()), 0)
+
+
 def is_moe_config(config: Any) -> bool:
-    """True when a draft config asks for an MoE FFN (``n_routed_experts > 0``)."""
-    value = _get(config, "n_routed_experts", 0)
-    return int(value or 0) > 0
+    """True when a draft config asks for an MoE FFN (a positive expert count)."""
+    return routed_expert_count(config) > 0
 
 
 def resolve_moe_config(config: Any) -> Optional[MoEConfig]:
@@ -221,6 +246,9 @@ def resolve_moe_config(config: Any) -> Optional[MoEConfig]:
         explicit = _get(config, key, _MISSING)
         if explicit is not _MISSING and explicit is not None:
             values[key] = explicit
+    # Either spelling of the expert count; ``is_moe_config`` already proved
+    # that one is present and positive and that they agree.
+    values["n_routed_experts"] = routed_expert_count(config)
     dflash_config = _get(config, "dflash_config", None) or {}
     unknown = sorted(
         key

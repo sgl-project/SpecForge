@@ -105,6 +105,12 @@ Qwen3.8-27B. Their
 server/trainer splits, Mooncake lease, in-flight watermarks and throughput
 measured on B300 and H200 nodes, and the two-node launcher that starts eight
 capture servers.
+`qwen3.8-27b-dflash2-moe-4server-dp4-disaggregated.yaml` is the MoE-FFN arm of
+the Qwen3.8-27B drafter-architecture ablation: the one-node recipe with
+`configs/qwen3.8-27b-dflash2-moe.json`, whose `moe_preset: qwen3` swaps each
+layer's dense MLP for 16 routed experts of width 4352, top-4 (Qwen3 routing:
+softmax scores, renormalized top-k, no shared expert); see the runbook's
+MoE section.
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
@@ -177,6 +183,7 @@ assume the command runs from the repository root.
 | EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
 | DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
 | DFlash 2 online, managed-local stack | [`online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`](online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml) |
+| DFlash 2 online, managed-local stack, MoE-FFN draft | [`online/disaggregated/managed-local/qwen3.8-27b-dflash2-moe-4server-dp4-disaggregated.yaml`](online/disaggregated/managed-local/qwen3.8-27b-dflash2-moe-4server-dp4-disaggregated.yaml) |
 | DFlash 2 online, external services on two nodes | [`online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml`](online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml) |
 | Domino online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
 

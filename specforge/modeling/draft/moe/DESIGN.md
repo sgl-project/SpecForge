@@ -68,6 +68,9 @@ grouped_experts.py "grouped" experts: stacked [E, out, in] w1/w2/w3, sorted-segm
 swiglu_shared.py   "swiglu" ungated shared expert (shared_experts.w1/w2/w3).
 presets.py         "deepseek_v4": sqrtsoftplus + noaux_tc + renorm x1.5 + one
                    ungated shared expert + SwiGLU clamp 10.
+                   "qwen3": softmax + noaux_tc + renorm x1.0, no shared expert,
+                   plain SwiGLU (Qwen3-MoE; the draft JSON may spell the expert
+                   count ``num_experts`` as Qwen checkpoints do).
 ```
 
 ## Contracts that matter
