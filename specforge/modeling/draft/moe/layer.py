@@ -4,6 +4,11 @@
 Attribute names follow the official DeepSeek-style checkpoint layout
 (``gate``, ``experts``, ``shared_experts``) so that per-implementation
 converters only need to handle their own internals.
+
+Under expert parallelism (:meth:`MoELayer.apply_expert_parallel`) the layer
+all-gathers its tokens over the EP group, routes and computes the locally owned
+experts on all of them, and reduce-scatters the partial outputs back. The
+shared expert and everything outside the layer stay data-parallel.
 """
 
 from __future__ import annotations
@@ -12,9 +17,11 @@ from typing import Callable, Dict, Optional
 
 import torch
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from .balance import MetricValue, build_balance_controller
 from .config import MoEConfig, resolve_moe_config
+from .expert_parallel import ExpertParallelLayout, gather_tokens, scatter_outputs
 from .experts import build_routed_experts
 from .router import RoutingResult, build_router
 from .shared import build_shared_expert
@@ -35,6 +42,8 @@ class MoELayer(nn.Module):
         self.shared_experts: Optional[nn.Module] = (
             build_shared_expert(cfg, hidden_size) if cfg.n_shared_experts else None
         )
+        #: Expert-parallel layout once :meth:`apply_expert_parallel` ran.
+        self.ep: Optional[ExpertParallelLayout] = None
         # Detached per-expert counts of the last training forward, for metrics.
         self.last_counts: Optional[torch.Tensor] = None
 
@@ -42,14 +51,36 @@ class MoELayer(nn.Module):
     def balance(self):
         return self.gate.balance
 
+    def apply_expert_parallel(self, ep_mesh: DeviceMesh) -> ExpertParallelLayout:
+        """Slice the routed experts over ``ep_mesh`` (a 1-D mesh of the EP group).
+
+        The router, balance controller and shared expert stay replicated; the
+        experts backend decides how its weights are sliced.
+        """
+        apply = getattr(self.experts, "apply_expert_parallel", None)
+        if apply is None:
+            raise NotImplementedError(
+                f"{type(self.experts).__name__} does not support expert parallelism"
+            )
+        self.ep = apply(ep_mesh)
+        return self.ep
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.hidden_size)
-        routing: RoutingResult = self.gate(x)
+        ep = self.ep
+        # Under EP every rank routes and computes its experts for the whole
+        # group's tokens; the replicated router sees identical inputs on every
+        # rank of the group, so no routing has to be exchanged.
+        routed_in = gather_tokens(x, ep) if ep is not None else x
+        routing: RoutingResult = self.gate(routed_in)
         if self.training:
             self.last_counts = routing.counts.detach()
             self.balance.observe(routing)
-        y = self.experts(x, routing)
+        y = self.experts(routed_in, routing)
+        if ep is not None:
+            # fp32 partial sums from every expert owner -> this rank's tokens.
+            y = scatter_outputs(y, ep).to(x.dtype)
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
         return y.view(shape)

@@ -917,6 +917,11 @@ class TrainingConfig(StrictConfigModel):
     tp_size: int = Field(default=1, gt=0)
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
+    #: Expert parallelism for MoE drafts on the FSDP2 backend: each MoE layer's
+    #: routed experts are sliced across this many consecutive ranks and FSDP2
+    #: shards the slice over the remaining ranks. Requires a MoE draft JSON,
+    #: ``backend: fsdp2`` and a sharded ``fsdp_sharding``.
+    expert_parallel_size: int = Field(default=1, gt=0)
     dist_timeout: int = Field(default=10, gt=0)
     #: Acceptance-aware token objective. DFlash-family hard targets make
     #: ``alpha`` equivalent to CE; ``lambda`` mixes CE and TV.
@@ -1016,6 +1021,22 @@ class TrainingConfig(StrictConfigModel):
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
             )
+        if self.expert_parallel_size > 1:
+            if self.backend != "fsdp2":
+                raise ValueError(
+                    "training.expert_parallel_size > 1 requires training.backend=fsdp2"
+                )
+            if self.fsdp_sharding == "NO_SHARD":
+                raise ValueError(
+                    "training.expert_parallel_size > 1 requires a sharded "
+                    "training.fsdp_sharding (SHARD_GRAD_OP or FULL_SHARD), "
+                    "not NO_SHARD"
+                )
+            if self.tp_size != 1 or sp_size != 1:
+                raise ValueError(
+                    "training.expert_parallel_size > 1 currently requires "
+                    "training.tp_size=1 and no sequence parallelism"
+                )
         return self
 
 
@@ -1350,6 +1371,12 @@ class Config(StrictConfigModel):
                 f"world_size={world_size} must be divisible by draft sequence "
                 f"parallel size {sp_size} "
                 "(sp_ulysses_size * sp_ring_size)"
+            )
+        ep_size = self.training.expert_parallel_size
+        if world_size % ep_size:
+            raise ValueError(
+                f"world_size={world_size} must be divisible by "
+                f"training.expert_parallel_size={ep_size}"
             )
 
     @classmethod

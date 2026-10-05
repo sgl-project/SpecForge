@@ -52,6 +52,8 @@ hooks.py       apply_pending_balance_updates / collect_moe_aux_loss /
                collect_moe_metrics over any module tree.
 state_dict.py  to/from_checkpoint_state_dict: module layout <-> official names.
 init.py        WarmStartPlan: which target experts seed which draft experts.
+expert_parallel.py  EP layout, DTensor expert slicing, differentiable token
+               all-gather / output reduce-scatter seams used by MoELayer.
 ```
 
 Implementations register into these registries at import time (imported at
@@ -96,6 +98,19 @@ differently and raise `CheckpointError`.
 `moe/load_max_ratio`, `moe/load_min_ratio`, `moe/experts_unused_frac` plus
 controller metrics; the DFlash/DSpark strategies add them to `StepOutput.metrics`,
 and the trainer DP-averages and logs them like any other scalar.
+
+**Expert parallelism is a layout, not a different layer.** After
+`MoELayer.apply_expert_parallel(ep_mesh)` the experts backend holds its
+`[E/ep, ...]` slice as a `DTensor` (`Shard(0)` over `ep`) and the layer wraps the
+forward in `gather_tokens` / `scatter_outputs`: the replicated router runs on
+the group's gathered tokens, each rank computes its own experts for all of
+them, and the fp32 partial outputs are reduce-scattered. The FSDP2 backend
+applies this before wrapping and shards the slice further over `efsdp` through
+a per-parameter placement; `get_model_state_dict(full_state_dict=True)` gathers
+the full tensors, so the checkpoint boundary above is untouched. A rank whose
+experts receive no token keeps the gathered input, the combine weights and its
+expert parameters on the graph through zero-valued terms, so every rank issues
+the same collectives and FSDP2 sees the same gradient set.
 
 **Aux losses are collected, not yet consumed.** `collect_moe_aux_loss` sums
 scaled layer losses; wiring it into an objective is done with the first preset

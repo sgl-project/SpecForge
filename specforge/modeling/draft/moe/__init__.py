@@ -24,6 +24,7 @@ Modules:
 - :mod:`.hooks`       model-level plumbing: balance updates, aux loss, metrics
 - :mod:`.state_dict`  module layout <-> official checkpoint naming boundary
 - :mod:`.init`        warm-start plans from a target model's experts
+- :mod:`.expert_parallel` expert slicing + token gather/scatter seams for EP
 
 Implementations register into the registries from their own modules
 (:mod:`.topk_router`, :mod:`.noaux_tc`, :mod:`.grouped_experts`,
@@ -53,6 +54,7 @@ from .config import (
     register_moe_preset,
     resolve_moe_config,
 )
+from .expert_parallel import ExpertParallelLayout
 from .experts import (
     EXPERTS_BACKENDS,
     RoutedExperts,
@@ -60,6 +62,7 @@ from .experts import (
     register_experts_backend,
 )
 from .hooks import (
+    apply_expert_parallel,
     apply_pending_balance_updates,
     collect_moe_aux_loss,
     collect_moe_metrics,
@@ -95,6 +98,8 @@ from .state_dict import (
 )
 
 __all__ = [
+    "ExpertParallelLayout",
+    "apply_expert_parallel",
     "BALANCE_CONTROLLERS",
     "BalanceController",
     "EXPERTS_BACKENDS",

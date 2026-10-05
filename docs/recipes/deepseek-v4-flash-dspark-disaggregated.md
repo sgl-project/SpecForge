@@ -127,6 +127,17 @@ per-expert naming (`layers.N.mlp.experts.{i}.w{1,2,3}.weight`,
 `layers.N.mlp.gate.bias`, `layers.N.mlp.shared_experts.w{1,2,3}.weight`), so
 exports load into SGLang's DeepSeek-V4 MoE unchanged.
 
+To train the experts instead of freezing warm-started ones, use the
+expert-parallel variant
+`examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark-moe-ep4-disaggregated.yaml`
+(`training.backend: fsdp2`, `training.expert_parallel_size: 4`). With the
+experts sharded as plain FSDP parameters, every micro-batch re-gathers all 64
+experts of every layer; under EP each of the four trainer ranks owns 16 experts
+per layer, the group exchanges its anchor tokens (fixed-size all-gather and
+reduce-scatter per MoE layer) and the expert weights never move. Checkpoints,
+`moe/*` metrics, warm start and exports are unchanged. See the expert
+parallelism notes in `docs/sections/advanced_features/customization.md`.
+
 ## Fresh attempts
 
 Delete the run's `outputs/` directory and, whenever a capture server was

@@ -62,6 +62,8 @@ class ParallelConfig:
     tp_size: int = 1
     sp_ulysses_size: int = 1
     sp_ring_size: int = 1
+    #: MoE experts sliced across this many consecutive ranks (FSDP2 only).
+    expert_parallel_size: int = 1
     sharding_strategy: str = "SHARD_GRAD_OP"
     param_dtype: torch.dtype = torch.bfloat16
     fsdp_process_group: Any = None
@@ -71,6 +73,8 @@ class ParallelConfig:
     sp_ulysses_group: Any = None
     sp_ring_group: Any = None
     draft_sp_group: Any = None
+    #: 2-D ``(efsdp, ep)`` mesh from init_distributed when expert_parallel_size > 1.
+    draft_ep_mesh: Any = None
     device_mesh: Any = None
     tp_device_mesh: Any = None
     extra: dict = field(default_factory=dict)
@@ -114,6 +118,7 @@ class ParallelConfig:
                 ("sp_ulysses_group", "get_sp_ulysses_group"),
                 ("sp_ring_group", "get_sp_ring_group"),
                 ("draft_sp_group", "get_draft_sp_group"),
+                ("draft_ep_mesh", "get_draft_ep_mesh"),
                 ("device_mesh", "get_device_mesh"),
                 ("tp_device_mesh", "get_tp_device_mesh"),
             ):
@@ -133,11 +138,14 @@ class ParallelConfig:
                 "ParallelConfig.from_distributed: distributed handles unavailable: %s",
                 exc,
             )
+        ep_mesh = handles.get("draft_ep_mesh")
+        expert_parallel_size = int(ep_mesh["ep"].size()) if ep_mesh is not None else 1
         return cls(
             world_size=dist.get_world_size(),
             tp_size=tp_size,
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
+            expert_parallel_size=expert_parallel_size,
             sharding_strategy=sharding_strategy,
             param_dtype=param_dtype,
             fsdp_process_group=dist.group.WORLD,
@@ -265,6 +273,11 @@ class DistributedTrainingBackend(TrainingBackend):
                 for module in model.modules()
                 if type(module).__name__ in block_names
             }
+            if pc.expert_parallel_size > 1 and pc.sharding_strategy == "NO_SHARD":
+                raise ValueError(
+                    "expert parallelism requires a sharded fsdp_sharding "
+                    "(SHARD_GRAD_OP or FULL_SHARD), not NO_SHARD"
+                )
             if pc.sharding_strategy == "NO_SHARD":
                 # PyTorch deprecated FSDP's NO_SHARD mode in favor of DDP.
                 # DDP gives this small draft model replicated-param execution
@@ -488,6 +501,10 @@ class FSDPTrainingBackend(DistributedTrainingBackend):
     name = "fsdp"
 
     def _shard_model(self, model, block_classes, ignored_frozen_modules):
+        if self.parallel_config.expert_parallel_size > 1:
+            raise ValueError(
+                "training.expert_parallel_size > 1 requires training.backend=fsdp2"
+            )
         import functools
 
         from torch.distributed.fsdp import BackwardPrefetch

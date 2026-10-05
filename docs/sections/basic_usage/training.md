@@ -511,6 +511,15 @@ foundation for future DTensor-based parallelism. Throughput and peak memory
 still depend on the model and sharding policy; selecting FSDP2 alone does not
 guarantee a speedup or enable tensor parallelism.
 
+MoE drafts can add expert parallelism on FSDP2 with
+`training.expert_parallel_size`: each MoE layer's routed experts are sliced
+across that many consecutive ranks, the group exchanges its tokens around the
+expert computation, and FSDP2 shards the slice over the ranks that own the same
+experts while dense parameters stay on the full mesh. It requires a sharded
+`fsdp_sharding`, `tp_size: 1`, no sequence parallelism, and a world size and
+`n_routed_experts` divisible by it; see the MoE section of the customization
+guide.
+
 The launcher creates every process group from the typed run config:
 
 - Online target TP/EP belongs to each external SGLang capture server, not the

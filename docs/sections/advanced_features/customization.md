@@ -164,6 +164,34 @@ preset registration plus whichever components it needs (score function,
 balance controller, experts backend, shared expert); each registers by name
 from its own module.
 
+### Expert parallelism
+
+Experts that are trained (not `moe_freeze_experts`) can be sliced across ranks
+on the FSDP2 backend:
+
+```yaml
+training:
+  backend: fsdp2
+  expert_parallel_size: 4
+```
+
+Each MoE layer's routed experts are split across `expert_parallel_size`
+consecutive ranks (the EP group). Inside the layer the group all-gathers its
+tokens, every rank routes them with the replicated router and computes only the
+experts it owns, and a reduce-scatter returns each rank its own tokens summed
+over all owners. The expert slices are `DTensor`s over the `ep` mesh axis and
+FSDP2 shards them again over the ranks that hold the same slice (`efsdp`);
+everything else stays on the full data-parallel mesh. The EP axis is carved out
+of data parallelism, so ranks keep distinct data and the dense part of the draft
+is not computed twice. Checkpoints still gather to the full `[E, ...]` tensors
+and keep the official naming; the balance controller, warm start and exports
+are unchanged. Requirements: a MoE draft JSON, `backend: fsdp2`, a sharded
+`fsdp_sharding`, `tp_size: 1`, no sequence parallelism, and `n_routed_experts`
+divisible by `expert_parallel_size`. Expert parallelism adds one host sync per
+MoE layer (this rank's slot bounds in the sorted routing) and two fixed-size
+collectives; it pays off when the gathered expert weights, not the tokens,
+dominate the step.
+
 ## Draft architectures
 
 Draft classes register through `@register_draft`. The key defaults to the

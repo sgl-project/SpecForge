@@ -10,6 +10,9 @@ DSpark share them:
 - :func:`collect_moe_aux_loss` to add to the objective when a balance policy
   emits one;
 - :func:`collect_moe_metrics` for per-step diagnostics (``moe/...``).
+
+The training backend uses :func:`apply_expert_parallel` to slice every layer's
+experts over the expert-parallel mesh before it wraps the model.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from typing import Dict, Iterator, Optional
 
 import torch
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from .balance import MetricValue
 from .layer import MoELayer
@@ -32,6 +36,15 @@ def iter_moe_layers(module: nn.Module) -> Iterator[MoELayer]:
 def apply_pending_balance_updates(module: nn.Module) -> None:
     for layer in iter_moe_layers(module):
         layer.apply_pending_balance_update()
+
+
+def apply_expert_parallel(module: nn.Module, ep_mesh: DeviceMesh) -> int:
+    """Shard every MoE layer's experts over ``ep_mesh``; returns the layer count."""
+    count = 0
+    for layer in iter_moe_layers(module):
+        layer.apply_expert_parallel(ep_mesh)
+        count += 1
+    return count
 
 
 def collect_moe_aux_loss(module: nn.Module) -> Optional[torch.Tensor]:
