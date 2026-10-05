@@ -88,6 +88,11 @@ servers. Its
 [runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
+`deepseek-v4-flash-dspark-moe-disaggregated.yaml` is the MoE-FFN arm of the
+drafter-architecture ablation: the same recipe with
+`configs/deepseek-v4-flash-dspark-moe.json`, whose `moe_preset: deepseek_v4`
+swaps the dense MLP for the target's routing (64 routed + 1 shared experts,
+top-6, width 2048); see the runbook's MoE section.
 
 `qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
 its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
