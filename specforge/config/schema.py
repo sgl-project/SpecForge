@@ -894,6 +894,7 @@ class DeploymentConfig(StrictConfigModel):
 
 class TrainingConfig(StrictConfigModel):
     strategy: str = "eagle3"
+    backend: Literal["fsdp", "fsdp2"] = "fsdp"
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
