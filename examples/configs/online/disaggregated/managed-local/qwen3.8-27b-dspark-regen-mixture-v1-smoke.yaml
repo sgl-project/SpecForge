@@ -1,0 +1,106 @@
+# Smoke-test variant of qwen3.8-27b-dspark-regen-mixture-v1-6ep.yaml: 1,140
+# conversations (60 per source shard), one epoch, global batch 32. Validates the
+# capture servers, Mooncake transport, trainer and W&B reporting end to end.
+model:
+  # NVFP4 body (matches the regen backend) with the source BF16 lm_head so the
+  # trainer can load the frozen target head/embedding directly.
+  target_model_path: RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
+  draft_model_config: configs/qwen3.8-27b-dspark.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  torch_dtype: bfloat16
+  # Same id as the official Qwen3.5/3.6/3.8 drafters. In the Qwen3.8 tokenizer
+  # this is <|audio_start|>, which never occurs in text-only training data.
+  mask_token_id: 248070
+  # Hybrid GDN targets on Blackwell accept only triton, trtllm_mha or fa4.
+  sglang_attention_backend: triton
+  sglang_mem_fraction_static: 0.85
+  sglang_max_running_requests: 8
+
+data:
+  train_data_path: cache/dataset/qwen38_regen_mixture_v1_smoke.jsonl
+  max_length: 8192
+  chat_template: qwen3.5
+  cache_dir: cache/qwen3.8-27b-regen-mixture-v1-smoke
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 8
+
+training:
+  strategy: dspark
+  num_epochs: 1
+  # 4 ranks x 128 microbatches -> global batch 512 (14,874 optimizer steps).
+  batch_size: 1
+  accumulation_steps: 8
+  learning_rate: 0.0005
+  lr_scheduler: constant
+  # 250 warmup steps of 14,874.
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 20
+  max_checkpoints: 3
+  log_interval: 1
+  dist_timeout: 60
+  seed: 42
+  prompt_seed: 42
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-qwen38-ablation
+  wandb_name: qwen3.8-27b-dspark-regen-mixture-v1-smoke-b200-dp4
+  wandb_dir: outputs/qwen3.8-27b-dspark-regen-mixture-v1-smoke/wandb
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 16
+  # ~0.42 GiB of aux features per 8k sample (5 layers x 5120 x bf16); keep two
+  # 128-sample optimizer quanta in flight.
+  in_flight_high_watermark: 64
+  in_flight_low_watermark: 32
+  resident_high_watermark_bytes: 137438953472
+  resident_low_watermark_bytes: 103079215104
+  feature_store_max_resident_bytes: 171798691840
+
+run_id: qwen3.8-27b-dspark-regen-mixture-v1-smoke
+output_dir: outputs/qwen3.8-27b-dspark-regen-mixture-v1-smoke
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/qwen3.8-27b-dspark-regen-mixture-v1-smoke/control
+    consumer_state_dir: outputs/qwen3.8-27b-dspark-regen-mixture-v1-smoke/consumer-state
+    backend: mooncake
+    client_buffer_size: 1073741824
+    managed_local:
+      trainer_cuda_visible_devices: ["4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        # Each capture server mounts this much host memory (4 x 100 GiB).
+        global_segment_size_bytes: 42949672960
+        local_buffer_size_bytes: 1073741824
+        # Multi-hundred-MB feature objects need a long lease (5 min).
+        default_kv_lease_ttl_ms: 300000
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+        - port: 30001
+          cuda_visible_devices: ["1"]
+          tp_size: 1
+        - port: 30002
+          cuda_visible_devices: ["2"]
+          tp_size: 1
+        - port: 30003
+          cuda_visible_devices: ["3"]
+          tp_size: 1
