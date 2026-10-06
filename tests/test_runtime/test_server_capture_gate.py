@@ -76,6 +76,15 @@ def _mooncake_available() -> bool:
     return importlib.util.find_spec("mooncake.store") is not None
 
 
+def _log_tail(path, lines=80):
+    """Last lines of a subprocess log, so CI shows why the process died."""
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+    except OSError as exc:
+        return f"<could not read {path}: {exc}>"
+
+
 @unittest.skipUnless(
     CUDA and ENABLED,
     "server-capture gate: set SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1 (GPU)",
@@ -183,7 +192,9 @@ class TestServerCaptureGate(unittest.TestCase):
                 break
             time.sleep(5)
         raise RuntimeError(
-            f"sglang server did not become healthy; see {cls.workdir}/server.log"
+            "sglang server did not become healthy "
+            f"(exit code {cls.server.poll()}); tail of {cls.workdir}/server.log:\n"
+            + _log_tail(os.path.join(cls.workdir, "server.log"))
         )
 
     @classmethod
