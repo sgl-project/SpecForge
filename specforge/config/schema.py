@@ -541,6 +541,23 @@ class TrainerDeploymentConfig(StrictConfigModel):
         return self
 
 
+def validate_receive_buffers(receive_buffers: str, protocol: str) -> None:
+    """Device receive buffers need a transport that writes device memory.
+
+    NVLink reads only into device memory, so it also requires them.
+    """
+    if receive_buffers == "cuda" and protocol not in ("rdma", "nvlink"):
+        raise ValueError(
+            "deployment.disaggregated.receive_buffers=cuda needs an RDMA or NVLink "
+            f"Mooncake transport; the effective MOONCAKE_PROTOCOL is {protocol!r}"
+        )
+    if protocol == "nvlink" and receive_buffers != "cuda":
+        raise ValueError(
+            "MOONCAKE_PROTOCOL=nvlink reads into device memory; set "
+            "deployment.disaggregated.receive_buffers=cuda"
+        )
+
+
 def _validate_cuda_devices(devices: List[str], *, field_name: str) -> None:
     for device in devices:
         if not device or device.strip() != device or "," in device:
@@ -559,7 +576,10 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metadata_port: int = Field(default=35880, gt=0, le=65535)
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
-    protocol: Literal["tcp", "rdma"] = "tcp"
+    #: ``nvlink`` (multi-node NVLink) keeps each capture server's objects in a
+    #: ``global_segment_size_bytes`` fabric-memory arena on its GPU; reserve it
+    #: below ``mem_fraction_static``.
+    protocol: Literal["tcp", "rdma", "nvlink"] = "tcp"
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
@@ -709,12 +729,19 @@ class ManagedLocalStackConfig(StrictConfigModel):
         if len(set(capture_ports)) != len(capture_ports):
             raise ValueError("managed_local capture server ports must be unique")
         if any(server.gpu_put for server in self.capture_servers) and (
-            self.mooncake.protocol != "rdma"
+            self.mooncake.protocol not in ("rdma", "nvlink")
         ):
             raise ValueError(
                 "managed_local capture_servers[].gpu_put needs mooncake.protocol "
-                f"'rdma'; the {self.mooncake.protocol!r} transport cannot read "
-                "device memory"
+                f"'rdma' or 'nvlink'; the {self.mooncake.protocol!r} transport "
+                "cannot read device memory"
+            )
+        if self.mooncake.protocol == "nvlink" and any(
+            server.gpu_put is False for server in self.capture_servers
+        ):
+            raise ValueError(
+                "managed_local mooncake.protocol 'nvlink' publishes device "
+                "memory; capture_servers[].gpu_put cannot be false"
             )
         overlap = mooncake_ports.intersection(capture_ports)
         if overlap:
@@ -801,16 +828,12 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     def _validate_store(self):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
-        if self.receive_buffers == "cuda" and self.managed_local is not None:
+        if self.managed_local is not None:
             # External deployments resolve environment overrides in the launch
             # plan. Managed-local transport is authoritative over the environment.
-            if self.managed_local.mooncake.protocol != "rdma":
-                raise ValueError(
-                    "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
-                    "Mooncake transport (mooncake_protocol or "
-                    "managed_local.mooncake.protocol = rdma); the TCP transport "
-                    "cannot write into device memory"
-                )
+            validate_receive_buffers(
+                self.receive_buffers, self.managed_local.mooncake.protocol
+            )
         if self.consumer_state_dir is not None and (
             not self.consumer_state_dir
             or self.consumer_state_dir.strip() != self.consumer_state_dir

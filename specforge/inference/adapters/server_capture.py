@@ -303,7 +303,7 @@ class SGLangServerCaptureAdapter:
         num_tokens = int(task.metadata.get("num_tokens", 0)) or len(
             task.payload["input_ids"]
         )
-        return SampleRef(
+        ref = SampleRef(
             sample_id=sample_id,
             run_id=self.run_id,
             source_task_id=task.task_id,
@@ -327,6 +327,18 @@ class SGLangServerCaptureAdapter:
                 "generation": gen,  # the zero-copy get() locator
             },
         )
+        if "nvlink" in result:
+            # MOONCAKE_PROTOCOL=nvlink: the objects stay on the server GPU.
+            from specforge.runtime.data_plane.mooncake_nvlink import REF_METADATA_KEY
+
+            ref.metadata[REF_METADATA_KEY] = {
+                "session": str(result["nvlink"]["session"]),
+                "control": str(result["nvlink"]["control"]),
+                "addresses": {
+                    name: int(meta["address"]) for name, meta in feats.items()
+                },
+            }
+        return ref
 
     # -- the RefSource entry point ----------------------------------------------
     def produce_refs(

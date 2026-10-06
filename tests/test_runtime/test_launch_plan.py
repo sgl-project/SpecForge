@@ -250,6 +250,46 @@ class LaunchPlanTest(unittest.TestCase):
         for command in plan.commands:
             self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "rdma")
 
+    def test_managed_nvlink_needs_device_publication_and_receives(self):
+        raw = _managed_config("/shared/attempt-nvlink").model_dump()
+        deployment = raw["deployment"]["disaggregated"]
+        deployment["managed_local"]["mooncake"]["protocol"] = "nvlink"
+        with self.assertRaisesRegex(ValidationError, "receive_buffers=cuda"):
+            Config.model_validate(raw)
+        deployment["receive_buffers"] = "cuda"
+        deployment["managed_local"]["capture_servers"][0]["gpu_put"] = False
+        with self.assertRaisesRegex(ValidationError, "gpu_put cannot be false"):
+            Config.model_validate(raw)
+        deployment["managed_local"]["capture_servers"][0]["gpu_put"] = None
+        with mock.patch(
+            "specforge.training.capture_contract.resolve_server_capture_contract",
+            return_value=CAPTURE_CONTRACT,
+        ):
+            plan = build_launch_plan(
+                Config.model_validate(raw), config_path="run.yaml", env={}
+            )
+        envs = [command.env for command in plan.commands]
+        envs.append(
+            next(
+                s for s in plan.services if s.command.label == "capture-server-0"
+            ).command.env
+        )
+        for env in envs:
+            self.assertEqual(env["MOONCAKE_PROTOCOL"], "nvlink")
+            self.assertEqual(env["MC_FORCE_MNNVL"], "1")
+
+    def test_external_nvlink_needs_no_mooncake_store_endpoints(self):
+        raw = _config(mode="disaggregated").model_dump()
+        raw["deployment"]["disaggregated"].update(
+            receive_buffers="cuda", mooncake_protocol="nvlink"
+        )
+        plan = build_launch_plan(
+            Config.model_validate(raw), config_path="run.yaml", env={}
+        )
+        for command in plan.commands:
+            self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "nvlink")
+            self.assertEqual(command.env["MC_FORCE_MNNVL"], "1")
+
     def test_disaggregated_receives_default_to_pinned_and_allow_override(self):
         for requested, expected in ((None, "pinned"), ("pageable", "pageable")):
             with self.subTest(requested=requested):

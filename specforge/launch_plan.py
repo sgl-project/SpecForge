@@ -24,6 +24,7 @@ from specforge.config.schema import (
     SGLANG_PASSTHROUGH_FIELDS,
     SGLANG_SECRET_FLAGS,
     sglang_field_flag,
+    validate_receive_buffers,
 )
 
 if TYPE_CHECKING:
@@ -374,15 +375,15 @@ def _disaggregated_env(
             values[name] = str(value)
 
     if deployment.backend == "mooncake":
-        if (
-            deployment.receive_buffers == "cuda"
-            and values.get("MOONCAKE_PROTOCOL", "tcp") != "rdma"
-        ):
-            raise ValueError(
-                "receive_buffers=cuda needs an RDMA Mooncake transport; "
-                "the effective MOONCAKE_PROTOCOL must be rdma"
-            )
-        required = ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
+        protocol = values.get("MOONCAKE_PROTOCOL", "tcp")
+        validate_receive_buffers(deployment.receive_buffers, protocol)
+        values.update(_mooncake_transport_env(protocol))
+        # NVLink objects stay on the capture servers; no store endpoints.
+        required = (
+            ()
+            if protocol == "nvlink"
+            else ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
+        )
         missing = [
             name for name in required if not values.get(name) and not base_env.get(name)
         ]
@@ -413,7 +414,13 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
     }
     if mooncake.rdma_devices:
         values["MOONCAKE_RDMA_DEVICES"] = mooncake.rdma_devices
+    values.update(_mooncake_transport_env(mooncake.protocol))
     return values
+
+
+def _mooncake_transport_env(protocol: str) -> dict[str, str]:
+    # Mooncake picks NVLink over present RDMA NICs only when this is set.
+    return {"MC_FORCE_MNNVL": "1"} if protocol == "nvlink" else {}
 
 
 def _device_visibility_env_var() -> str:
