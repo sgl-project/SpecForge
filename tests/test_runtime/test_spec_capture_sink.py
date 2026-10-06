@@ -241,6 +241,13 @@ class SpecCaptureSinkTest(unittest.TestCase):
         forward.synchronize()
         self.assertTrue(torch.all(logits.spec_capture_aux_gpu == 7).item())
 
+    def test_nvlink_arena_size_is_required(self):
+        with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"
+            ):
+                self.module.NvlinkArena(torch.device("cpu"))
+
     def test_nvlink_always_publishes_device_memory(self):
         with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
             self.assertTrue(self.module.gpu_put_enabled())
@@ -261,7 +268,7 @@ class SpecCaptureSinkTest(unittest.TestCase):
         env = {
             "MOONCAKE_PROTOCOL": "nvlink",
             "MOONCAKE_LOCAL_HOSTNAME": "127.0.0.1",
-            "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(backing.numel()),
+            "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES": str(backing.numel()),
         }
         spec = dict(self._request("nv").spec_capture)
         spec["features"] = {"aux": "hidden_states", "last_hidden": "target"}

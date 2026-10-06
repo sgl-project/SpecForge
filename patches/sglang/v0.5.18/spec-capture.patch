@@ -892,10 +892,10 @@ index 5c4f3ff44a..c40bcc6c42 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000..12ce3b7
+index 0000000..f58d046
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,687 @@
+@@ -0,0 +1,695 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -972,6 +972,8 @@ index 0000000..12ce3b7
 +
 +
 +_NVLINK = "nvlink"
++#: HBM the writer GPU reserves for NVLink capture objects (required for nvlink).
++_ARENA_BYTES_ENV = "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"
 +
 +
 +def nvlink_enabled() -> bool:
@@ -1019,12 +1021,12 @@ index 0000000..12ce3b7
 +
 +    Mooncake's NVLink transport can only export memory allocated with a fabric
 +    handle, and the Mooncake store cannot place objects there. The arena is one
-+    ``MOONCAKE_GLOBAL_SEGMENT_SIZE``-byte allocation from the TransferEngine.
-+    Objects keep the store's keys and, like hard-pinned store objects, live
-+    until a client frees them by writing a JSON list of keys, one per line, to
-+    the ``control`` TCP endpoint. Only the writer thread touches the arena and
-+    it reads those frees before allocating, so no server thread competes with
-+    the scheduler for the GIL.
++    ``SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES``-byte allocation from the
++    TransferEngine. Objects keep the store's keys and, like hard-pinned store
++    objects, live until a client frees them by writing a JSON list of keys, one
++    per line, to the ``control`` TCP endpoint. Only the writer thread touches
++    the arena and it reads those frees before allocating, so no server thread
++    competes with the scheduler for the GIL.
 +    """
 +
 +    _ALIGNMENT = 512
@@ -1032,10 +1034,16 @@ index 0000000..12ce3b7
 +    _WAIT_S = 30.0
 +
 +    def __init__(self, device: torch.device) -> None:
++        capacity = os.environ.get(_ARENA_BYTES_ENV)
++        if not capacity:
++            raise ValueError(
++                f"MOONCAKE_PROTOCOL=nvlink needs {_ARENA_BYTES_ENV}, the HBM the "
++                "writer GPU reserves for capture objects"
++            )
 +        from mooncake.engine import TransferEngine
 +
 +        host = os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost")
-+        self.capacity = int(os.environ.get("MOONCAKE_GLOBAL_SEGMENT_SIZE", 1 << 30))
++        self.capacity = int(capacity)
 +        self._engine = TransferEngine()
 +        rc = self._engine.initialize(host, "P2PHANDSHAKE", _NVLINK, "")
 +        if int(rc) != 0:
@@ -1045,7 +1053,7 @@ index 0000000..12ce3b7
 +        if not self._base:
 +            raise MemoryError(
 +                f"spec-capture could not allocate a {self.capacity}-byte NVLink "
-+                "arena; leave room for MOONCAKE_GLOBAL_SEGMENT_SIZE below "
++                f"arena; leave room for {_ARENA_BYTES_ENV} below "
 +                "--mem-fraction-static"
 +            )
 +        self._bytes = torch.as_tensor(
@@ -1155,7 +1163,7 @@ index 0000000..12ce3b7
 +            if remaining <= 0:
 +                raise MemoryError(
 +                    f"spec-capture NVLink arena ({self.capacity} bytes) has no "
-+                    f"room for {nbytes} bytes; raise MOONCAKE_GLOBAL_SEGMENT_SIZE "
++                    f"room for {nbytes} bytes; raise {_ARENA_BYTES_ENV} "
 +                    "or lower the producer's runtime.resident_high_watermark_bytes"
 +                )
 +            self.receive_frees(timeout=remaining)
