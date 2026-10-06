@@ -6,18 +6,19 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Mooncake object API over multi-node NVLink for server-owned captures.
+"""Mooncake object API for captures kept in a capture server's arena.
 
-With ``MOONCAKE_PROTOCOL=nvlink`` the patched capture server keeps every
-feature object in a fabric-memory arena on its writer GPU, because Mooncake's
-NVLink transport can only export such memory and the Mooncake store cannot
-place objects there. The server returns each object's device address, which
-:class:`SGLangServerCaptureAdapter` stores in ``SampleRef.metadata``.
+A capture server can keep feature objects in an arena it owns instead of the
+Mooncake store. Currently only online NVLink capture (``MOONCAKE_PROTOCOL=
+nvlink``) uses the arena: Mooncake's NVLink transport can only export fabric
+memory, and the store cannot place objects there. The server returns each
+object's address, which :class:`SGLangServerCaptureAdapter` stores in
+``SampleRef.metadata``.
 
-:class:`NvlinkObjectClient` implements the part of the Mooncake store API that
+:class:`ArenaObjectClient` implements the part of the Mooncake store API that
 :class:`MooncakeFeatureStore` uses, so the store's lifecycle (generations,
 leases, removal retries) is unchanged: ``get_into`` reads straight from the
-server GPU with ``TransferEngine.transfer_sync_read`` and ``remove`` frees the
+server with ``TransferEngine.transfer_sync_read`` and ``remove`` frees the
 object by writing its key to the server's control connection. Frees are one-way
 messages the server applies before it next allocates, so the durable ack never
 waits on the capture server. Objects are located per ref via
@@ -35,12 +36,12 @@ from typing import Any, Dict, List, Set, Tuple
 from specforge.runtime.data_plane.mooncake_store import MOONCAKE_OBJECT_NOT_FOUND
 
 #: ``SampleRef.metadata`` entry holding ``{"session", "control", "addresses"}``.
-REF_METADATA_KEY = "mooncake_nvlink"
+REF_METADATA_KEY = "mooncake_arena"
 _CONNECT_TIMEOUT_S = 30.0
 
 
-class NvlinkObjectClient:
-    """Mooncake store API backed by MNNVL reads and server-side frees."""
+class ArenaObjectClient:
+    """Mooncake store API backed by reads from capture-server arenas."""
 
     def __init__(self, *, local_hostname: str) -> None:
         self._local_hostname = local_hostname
@@ -105,9 +106,7 @@ class NvlinkObjectClient:
         return 0
 
     def put_from(self, key: str, ptr: int, nbytes: int, config: Any = None) -> int:
-        raise RuntimeError(
-            "MOONCAKE_PROTOCOL=nvlink objects are written by the capture server"
-        )
+        raise RuntimeError("arena objects are written by the capture server")
 
     def register_buffer(self, ptr: int, nbytes: int) -> int:
         return 0  # NVLink reads into ordinary device memory
@@ -122,6 +121,7 @@ class NvlinkObjectClient:
     def _transfer_engine(self):
         with self._lock:
             if self._engine is None:
+                # Currently only online NVLink capture uses the arena.
                 from mooncake import engine as mooncake_engine
 
                 if not getattr(mooncake_engine, "SUPPORT_MNNVL", False):

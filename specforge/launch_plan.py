@@ -381,10 +381,11 @@ def _disaggregated_env(
             raise ValueError(
                 "MOONCAKE_PROTOCOL=nvlink keeps objects in capture-server HBM; set "
                 "runtime.resident_high_watermark_bytes at or below the servers' "
-                "summed SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"
+                "summed SGLANG_SPEC_CAPTURE_ARENA_BYTES"
             )
         values.update(_mooncake_transport_env(protocol))
-        # NVLink objects stay on the capture servers; no store endpoints.
+        # Arena objects stay on the capture servers, so there are no store
+        # endpoints; currently only online NVLink capture uses the arena.
         required = (
             ()
             if protocol == "nvlink"
@@ -613,12 +614,8 @@ def _managed_local_services(
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
             **(
-                {
-                    "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES": str(
-                        mooncake.nvlink_arena_bytes
-                    )
-                }
-                if mooncake.nvlink_arena_bytes is not None
+                {"SGLANG_SPEC_CAPTURE_ARENA_BYTES": str(mooncake.arena_bytes)}
+                if mooncake.arena_bytes is not None
                 else {}
             ),
         }

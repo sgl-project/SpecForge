@@ -1093,7 +1093,7 @@ class MooncakeFeatureStore(FeatureStore):
     def _locate(self, sample_ref: SampleRef) -> None:
         """Pass server-owned object locations to backends that need them.
 
-        The NVLink backend (``mooncake_nvlink.NvlinkObjectClient``) has no
+        The arena backend (``mooncake_arena.ArenaObjectClient``) has no
         master to resolve keys; the capture server's addresses ride on the ref.
         """
         locate = getattr(self._store, "locate_ref_objects", None)

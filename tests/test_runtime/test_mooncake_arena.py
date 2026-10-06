@@ -1,9 +1,10 @@
-"""MOONCAKE_PROTOCOL=nvlink: server-owned objects read over MNNVL (no GPU).
+"""Arena placement: captures read from capture-server arenas (no GPU).
 
-A stub capture server returns the sink's NVLink result rows (object addresses
-plus the control endpoint) and a fake TransferEngine reads those addresses, so
-the real client stack runs end to end: adapter -> ref metadata ->
-``MooncakeFeatureStore`` -> ``NvlinkObjectClient`` reads and frees.
+Currently only online NVLink capture (MOONCAKE_PROTOCOL=nvlink) uses the
+arena. A stub capture server returns the sink's arena result rows (object
+addresses plus the control endpoint) and a fake TransferEngine reads those
+addresses, so the real client stack runs end to end: adapter -> ref metadata ->
+``MooncakeFeatureStore`` -> ``ArenaObjectClient`` reads and frees.
 """
 
 import ctypes
@@ -18,9 +19,9 @@ import torch
 
 from specforge.config import Config
 from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
-from specforge.runtime.data_plane.mooncake_nvlink import (
+from specforge.runtime.data_plane.mooncake_arena import (
     REF_METADATA_KEY,
-    NvlinkObjectClient,
+    ArenaObjectClient,
 )
 from specforge.runtime.data_plane.mooncake_store import (
     MOONCAKE_OBJECT_NOT_FOUND,
@@ -75,15 +76,15 @@ class _ServerArena:
         return 0
 
 
-class _NvlinkCaptureServer(_StubCaptureServer):
-    """Adds what the sink returns under MOONCAKE_PROTOCOL=nvlink."""
+class _ArenaCaptureServer(_StubCaptureServer):
+    """Adds what the sink returns when it publishes into its arena."""
 
     def __call__(self, url, json_body, timeout):
         rows = super().__call__(url, json_body, timeout)
         for row in rows:
             result = row["meta_info"]["spec_capture"]
             prefix = f"{result['store_id']}/{result['sample_id']}/g{result['gen']}"
-            result["nvlink"] = {"session": SESSION, "control": self.backend.control}
+            result["arena"] = {"session": SESSION, "control": self.backend.control}
             for name, meta in result["features"].items():
                 meta["address"] = self.backend.objects[f"{prefix}/{name}"].data_ptr()
         return rows
@@ -99,15 +100,15 @@ class _FakeTransferEngine:
         return 0
 
 
-class NvlinkObjectClientTest(unittest.TestCase):
+class ArenaObjectClientTest(unittest.TestCase):
     def setUp(self):
         self.arena = _ServerArena()
         self.addCleanup(self.arena.close)
-        self.server = _NvlinkCaptureServer(self.arena)
-        self.client = NvlinkObjectClient(local_hostname="127.0.0.1")
+        self.server = _ArenaCaptureServer(self.arena)
+        self.client = ArenaObjectClient(local_hostname="127.0.0.1")
         self.engine = _FakeTransferEngine()
         patcher = mock.patch.object(
-            NvlinkObjectClient, "_transfer_engine", return_value=self.engine
+            ArenaObjectClient, "_transfer_engine", return_value=self.engine
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -154,7 +155,7 @@ class NvlinkObjectClientTest(unittest.TestCase):
     def test_failed_free_stays_pending_until_a_retry_succeeds(self):
         (ref,) = self._refs(5)
         with mock.patch.object(
-            NvlinkObjectClient, "_send_free", side_effect=ConnectionResetError
+            ArenaObjectClient, "_send_free", side_effect=ConnectionResetError
         ):
             self.store.abort(ref.sample_id, reason="optimizer-boundary-durable-ack")
         self.assertEqual(self.store.health()["release_pending"], 1)
@@ -170,7 +171,7 @@ class NvlinkObjectClientTest(unittest.TestCase):
             self.client.put_from("key", 0, 1)
 
 
-class NvlinkStoreFactoryTest(unittest.TestCase):
+class ArenaStoreFactoryTest(unittest.TestCase):
     def _cfg(self, receive_buffers):
         return Config.model_validate(
             {
@@ -192,7 +193,7 @@ class NvlinkStoreFactoryTest(unittest.TestCase):
         env = {"MOONCAKE_PROTOCOL": "nvlink", "MOONCAKE_LOCAL_HOSTNAME": "10.0.0.2"}
         with mock.patch.dict("os.environ", env, clear=True):
             store = _mooncake_store(self._cfg("cuda"))
-            self.assertIsInstance(store._store, NvlinkObjectClient)
+            self.assertIsInstance(store._store, ArenaObjectClient)
             self.assertEqual(store.receive_buffers, "cuda")
             with self.assertRaisesRegex(ValueError, "receive_buffers=cuda"):
                 _mooncake_store(self._cfg("pinned"))

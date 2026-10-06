@@ -327,13 +327,14 @@ class SGLangServerCaptureAdapter:
                 "generation": gen,  # the zero-copy get() locator
             },
         )
-        if "nvlink" in result:
-            # MOONCAKE_PROTOCOL=nvlink: the objects stay on the server GPU.
-            from specforge.runtime.data_plane.mooncake_nvlink import REF_METADATA_KEY
+        if "arena" in result:
+            # Arena objects stay on the capture server; currently only online
+            # NVLink capture uses the arena.
+            from specforge.runtime.data_plane.mooncake_arena import REF_METADATA_KEY
 
             ref.metadata[REF_METADATA_KEY] = {
-                "session": str(result["nvlink"]["session"]),
-                "control": str(result["nvlink"]["control"]),
+                "session": str(result["arena"]["session"]),
+                "control": str(result["arena"]["control"]),
                 "addresses": {
                     name: int(meta["address"]) for name, meta in feats.items()
                 },

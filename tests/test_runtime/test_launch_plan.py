@@ -255,9 +255,9 @@ class LaunchPlanTest(unittest.TestCase):
         deployment = raw["deployment"]["disaggregated"]
         mooncake = deployment["managed_local"]["mooncake"]
         mooncake["protocol"] = "nvlink"
-        with self.assertRaisesRegex(ValidationError, "nvlink_arena_bytes is required"):
+        with self.assertRaisesRegex(ValidationError, "arena_bytes is required"):
             Config.model_validate(raw)
-        mooncake["nvlink_arena_bytes"] = 8192
+        mooncake["arena_bytes"] = 8192
         with self.assertRaisesRegex(ValidationError, "receive_buffers=cuda"):
             Config.model_validate(raw)
         deployment["receive_buffers"] = "cuda"
@@ -278,19 +278,17 @@ class LaunchPlanTest(unittest.TestCase):
                 Config.model_validate(raw), config_path="run.yaml", env={}
             )
         server = next(s for s in plan.services if s.command.label == "capture-server-0")
-        self.assertEqual(
-            server.command.env["SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"], "8192"
-        )
+        self.assertEqual(server.command.env["SGLANG_SPEC_CAPTURE_ARENA_BYTES"], "8192")
         for env in [command.env for command in plan.commands] + [server.command.env]:
             self.assertEqual(env["MOONCAKE_PROTOCOL"], "nvlink")
             self.assertEqual(env["MC_FORCE_MNNVL"], "1")
 
-    def test_nvlink_arena_size_only_applies_to_nvlink(self):
+    def test_arena_size_only_applies_to_nvlink(self):
         raw = _managed_config("/shared/attempt-rdma").model_dump()
         raw["deployment"]["disaggregated"]["managed_local"]["mooncake"].update(
-            protocol="rdma", nvlink_arena_bytes=8192
+            protocol="rdma", arena_bytes=8192
         )
-        with self.assertRaisesRegex(ValidationError, "only applies to it"):
+        with self.assertRaisesRegex(ValidationError, "applies only to it"):
             Config.model_validate(raw)
 
     def test_external_nvlink_needs_a_watermark_but_no_store_endpoints(self):

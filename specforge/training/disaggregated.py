@@ -141,11 +141,12 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
         receive_kwargs["receive_buffers"] = os.environ["DISAGG_RECEIVE_BUFFERS"]
     validate_receive_buffers(receive_kwargs["receive_buffers"], protocol)
     if protocol == "nvlink":
-        # Server-owned objects are read over MNNVL; there is no store to join.
-        from specforge.runtime.data_plane.mooncake_nvlink import NvlinkObjectClient
+        # Currently only online NVLink capture uses the arena: objects stay on
+        # the capture servers and there is no store to join.
+        from specforge.runtime.data_plane.mooncake_arena import ArenaObjectClient
 
         store_kwargs: Dict[str, Any] = {
-            "store": NvlinkObjectClient(local_hostname=local_hostname)
+            "store": ArenaObjectClient(local_hostname=local_hostname)
         }
     else:
         setup_kwargs = {
