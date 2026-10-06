@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import sys
 import textwrap
+import threading
 import types
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -238,6 +242,67 @@ class SpecCaptureSinkTest(unittest.TestCase):
         forward.synchronize()
         self.assertTrue(torch.all(logits.spec_capture_aux_gpu == 7).item())
 
+    def test_nvlink_always_publishes_device_memory(self):
+        with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
+            self.assertTrue(self.module.gpu_put_enabled())
+            with mock.patch.dict("os.environ", {"SGLANG_SPEC_CAPTURE_GPU_PUT": "0"}):
+                with self.assertRaisesRegex(ValueError, "conflicts"):
+                    self.module.gpu_put_enabled()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_nvlink_publishes_addresses_into_the_arena(self):
+        backing = torch.zeros(1 << 20, dtype=torch.uint8, device="cuda")
+        engine = types.SimpleNamespace(
+            initialize=lambda *args: 0,
+            get_rpc_port=lambda: 15459,
+            allocate_managed_buffer=lambda size: backing.data_ptr(),
+        )
+        mooncake = types.ModuleType("mooncake.engine")
+        mooncake.TransferEngine = lambda: engine
+        env = {
+            "MOONCAKE_PROTOCOL": "nvlink",
+            "MOONCAKE_LOCAL_HOSTNAME": "127.0.0.1",
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(backing.numel()),
+        }
+        spec = dict(self._request("nv").spec_capture)
+        spec["features"] = {"aux": "hidden_states", "last_hidden": "target"}
+        spec["passthrough"] = [
+            {"name": "input_ids", "data": [3, 1, 2], "shape": [1, 3], "dtype": "int64"}
+        ]
+        aux = torch.randn(3, 8, device="cuda", dtype=torch.bfloat16)
+        last = torch.randn(3, 4, device="cuda")
+        with (
+            mock.patch.dict("os.environ", env, clear=True),
+            mock.patch.dict(sys.modules, {"mooncake.engine": mooncake}),
+        ):
+            (result,) = self.sink.put_samples([(spec, aux, last)])
+        self.assertEqual(result["nvlink"]["session"], "127.0.0.1:15459")
+        expected = {
+            "hidden_states": aux.unsqueeze(0),
+            "target": last.unsqueeze(0),
+            "input_ids": torch.tensor([[3, 1, 2]], device="cuda"),
+        }
+        for name, tensor in expected.items():
+            offset = result["features"][name]["address"] - backing.data_ptr()
+            nbytes = tensor.numel() * tensor.element_size()
+            self.assertTrue(
+                torch.equal(
+                    backing[offset : offset + nbytes],
+                    tensor.reshape(-1).view(torch.uint8),
+                ),
+                name,
+            )
+        arena = self.sink._nvlink
+        self.addCleanup(arena._http.shutdown)
+        request = urllib.request.Request(
+            result["nvlink"]["control"] + "/free",
+            data=json.dumps({"keys": ["test/nv/g1/target", "missing"]}).encode(),
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(json.load(response), {"freed": 1})
+        self.assertEqual(arena.health()["objects"], 2)
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_gpu_registration_failure_prevents_publication(self):
         store = self.sink._store = _BufferStore(device=True, register_status=-600)
@@ -254,3 +319,51 @@ class SpecCaptureSinkTest(unittest.TestCase):
                 )
         self.assertEqual(store.values, {})
         self.assertEqual(store.unregistered, [])
+
+
+class NvlinkArenaTest(unittest.TestCase):
+    """Allocation and the control endpoint, without CUDA or Mooncake."""
+
+    def setUp(self):
+        self.arena = object.__new__(_load_sink().NvlinkArena)
+        self.arena.capacity = 4096
+        self.arena._spans = [(0, 4096)]
+        self.arena._objects = {}
+        self.arena._cond = threading.Condition()
+
+    def test_freed_space_is_reused_and_coalesced(self):
+        sizes = (("a", 100), ("b", 1000), ("c", 1))
+        offsets = [self.arena._allocate(key, n) for key, n in sizes]
+        self.assertEqual(offsets, [0, 512, 1536])
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            self.arena._allocate("a", 1)
+        self.assertEqual(self.arena.free(["a", "c", "missing"]), 2)
+        self.assertEqual(self.arena._allocate("d", 512), 0)
+        self.assertEqual(self.arena.free(["b", "d"]), 2)
+        self.assertEqual(self.arena._spans, [(0, 4096)])
+
+    def test_a_full_arena_waits_for_frees_then_fails(self):
+        self.arena._allocate("all", 4096)
+        threading.Timer(0.1, self.arena.free, args=(["all"],)).start()
+        self.assertEqual(self.arena._allocate("next", 4096), 0)
+        self.arena._WAIT_S = 0.05
+        with self.assertRaisesRegex(MemoryError, "no room"):
+            self.arena._allocate("more", 1)
+
+    def test_control_endpoint_frees_and_reports(self):
+        self.arena._allocate("k1", 10)
+        url = self.arena._serve("127.0.0.1")
+        self.addCleanup(self.arena._http.shutdown)
+        request = urllib.request.Request(
+            url + "/free",
+            data=json.dumps({"keys": ["k1", "k2"]}).encode(),
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(json.load(response), {"freed": 1})
+        with urllib.request.urlopen(url + "/health", timeout=5) as response:
+            health = json.load(response)
+        self.assertEqual((health["objects"], health["free_bytes"]), (0, 4096))
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(url + "/unknown", timeout=5)
+        self.assertEqual(raised.exception.code, 404)
