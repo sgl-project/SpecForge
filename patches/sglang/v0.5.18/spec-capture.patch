@@ -892,10 +892,10 @@ index 5c4f3ff44a..c40bcc6c42 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000..f58d046
+index 0000000..9b3817e
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,698 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -927,9 +927,9 @@ index 0000000..f58d046
 +default. ``SGLANG_SPEC_CAPTURE_GPU_PUT=0`` selects host publication; ``1``
 +explicitly enables device publication and requires RDMA.
 +
-+``MOONCAKE_PROTOCOL=nvlink`` (multi-node NVLink) keeps objects in an
-+:class:`NvlinkArena` on the writer GPU instead of the store. Each result then
-+also carries ``"nvlink": {"session", "control"}`` and every feature its
++``MOONCAKE_PROTOCOL=nvlink`` (multi-node NVLink) keeps objects in a
++:class:`CaptureArena` on the writer GPU instead of the store. Each result then
++also carries ``"arena": {"session", "control"}`` and every feature its
 +``"address"``; the trainer reads objects over MNNVL and frees them by writing
 +JSON key lists to the ``control`` TCP endpoint.
 +"""
@@ -972,11 +972,13 @@ index 0000000..f58d046
 +
 +
 +_NVLINK = "nvlink"
-+#: HBM the writer GPU reserves for NVLink capture objects (required for nvlink).
-+_ARENA_BYTES_ENV = "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"
++#: Memory the writer GPU reserves for arena objects (required with the arena).
++_ARENA_BYTES_ENV = "SGLANG_SPEC_CAPTURE_ARENA_BYTES"
 +
 +
-+def nvlink_enabled() -> bool:
++def arena_enabled() -> bool:
++    # Currently only online NVLink capture uses the arena; TCP and RDMA keep
++    # the Mooncake store.
 +    return os.environ.get("MOONCAKE_PROTOCOL", "tcp") == _NVLINK
 +
 +
@@ -1016,17 +1018,18 @@ index 0000000..f58d046
 +        }
 +
 +
-+class NvlinkArena:
-+    """Capture objects kept in fabric memory on the writer GPU, read over MNNVL.
++class CaptureArena:
++    """Capture objects kept in memory the capture server owns, read by address.
 +
-+    Mooncake's NVLink transport can only export memory allocated with a fabric
-+    handle, and the Mooncake store cannot place objects there. The arena is one
-+    ``SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES``-byte allocation from the
-+    TransferEngine. Objects keep the store's keys and, like hard-pinned store
-+    objects, live until a client frees them by writing a JSON list of keys, one
-+    per line, to the ``control`` TCP endpoint. Only the writer thread touches
-+    the arena and it reads those frees before allocating, so no server thread
-+    competes with the scheduler for the GIL.
++    Currently only online NVLink capture uses the arena: Mooncake's NVLink
++    transport can only export memory allocated with a fabric handle, and the
++    Mooncake store cannot place objects there. The arena is one
++    ``SGLANG_SPEC_CAPTURE_ARENA_BYTES``-byte fabric allocation from the
++    TransferEngine on the writer GPU. Objects keep the store's keys and, like
++    hard-pinned store objects, live until a client frees them by writing a JSON
++    list of keys, one per line, to the ``control`` TCP endpoint. Only the
++    writer thread touches the arena and it reads those frees before allocating,
++    so no server thread competes with the scheduler for the GIL.
 +    """
 +
 +    _ALIGNMENT = 512
@@ -1047,12 +1050,12 @@ index 0000000..f58d046
 +        self._engine = TransferEngine()
 +        rc = self._engine.initialize(host, "P2PHANDSHAKE", _NVLINK, "")
 +        if int(rc) != 0:
-+            raise RuntimeError(f"spec-capture NVLink transfer engine failed ({rc})")
++            raise RuntimeError(f"spec-capture arena transfer engine failed ({rc})")
 +        with torch.cuda.device(device):
 +            self._base = int(self._engine.allocate_managed_buffer(self.capacity))
 +        if not self._base:
 +            raise MemoryError(
-+                f"spec-capture could not allocate a {self.capacity}-byte NVLink "
++                f"spec-capture could not allocate a {self.capacity}-byte "
 +                f"arena; leave room for {_ARENA_BYTES_ENV} below "
 +                "--mem-fraction-static"
 +            )
@@ -1069,7 +1072,7 @@ index 0000000..f58d046
 +        self.session = f"{host}:{self._engine.get_rpc_port()}"
 +        self.control = f"{host}:{self._listener.getsockname()[1]}"
 +        logger.info(
-+            "spec-capture NVLink arena: %d bytes, session %s, control %s",
++            "spec-capture arena: %d bytes, session %s, control %s",
 +            self.capacity,
 +            self.session,
 +            self.control,
@@ -1162,7 +1165,7 @@ index 0000000..f58d046
 +            remaining = deadline - time.monotonic()
 +            if remaining <= 0:
 +                raise MemoryError(
-+                    f"spec-capture NVLink arena ({self.capacity} bytes) has no "
++                    f"spec-capture arena ({self.capacity} bytes) has no "
 +                    f"room for {nbytes} bytes; raise {_ARENA_BYTES_ENV} "
 +                    "or lower the producer's runtime.resident_high_watermark_bytes"
 +                )
@@ -1186,7 +1189,7 @@ index 0000000..f58d046
 +        self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids else None
 +        self._store = None
 +        self._put_config = None
-+        self._nvlink: Optional[NvlinkArena] = None
++        self._capture_arena: Optional[CaptureArena] = None
 +        self._lock = threading.Lock()
 +        # One store writer is sufficient: Mooncake already stripes a batched
 +        # transfer internally.  The executor decouples that host transfer from
@@ -1242,12 +1245,12 @@ index 0000000..f58d046
 +            logger.info("spec-capture mooncake sink connected")
 +            return store
 +
-+    def _arena(self, device: torch.device) -> NvlinkArena:
++    def _arena(self, device: torch.device) -> CaptureArena:
 +        # Lazy like _connect(): only the writer rank allocates, on first capture.
 +        with self._lock:
-+            if self._nvlink is None:
-+                self._nvlink = NvlinkArena(device)
-+            return self._nvlink
++            if self._capture_arena is None:
++                self._capture_arena = CaptureArena(device)
++            return self._capture_arena
 +
 +    # -- key/put primitives (pinned to MooncakeFeatureStore's layout) --------
 +    @staticmethod
@@ -1320,7 +1323,7 @@ index 0000000..f58d046
 +        if not samples:
 +            return []
 +
-+        store = None if nvlink_enabled() else self._connect()
++        store = None if arena_enabled() else self._connect()
 +        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
 +        gpu_put = gpu_put_enabled()
 +        started = time.perf_counter()
@@ -1434,7 +1437,7 @@ index 0000000..f58d046
 +            torch.cuda.current_stream(device).synchronize()
 +        materialize_ms = (time.perf_counter() - started) * 1000.0
 +        if store is None:
-+            return self._publish_nvlink(
++            return self._publish_arena(
 +                results, keys, tensors, replace_keys, feature_meta, started
 +            )
 +        self._remove_many_quiet(replace_keys)
@@ -1526,23 +1529,23 @@ index 0000000..f58d046
 +            )
 +        return results
 +
-+    def _publish_nvlink(
++    def _publish_arena(
 +        self, results, keys, tensors, replace_keys, feature_meta, started
 +    ) -> List[Dict[str, Any]]:
 +        # The writer thread's current device is not the scheduler's; use the
 +        # capture tensors' device.
 +        device = next((t.device for t in tensors if t.is_cuda), None)
 +        if device is None:
-+            raise RuntimeError("NVLink capture publication needs CUDA captures")
++            raise RuntimeError("arena publication needs CUDA captures")
 +        arena = self._arena(device)
 +        addresses = arena.publish(keys, tensors, replace_keys)
 +        for meta, address in zip(feature_meta, addresses):
 +            meta["address"] = address
 +        for result in results:
-+            result["nvlink"] = {"session": arena.session, "control": arena.control}
++            result["arena"] = {"session": arena.session, "control": arena.control}
 +        if os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1":
 +            logger.info(
-+                "[spec-capture-timing] nvlink_sink samples=%d objects=%d "
++                "[spec-capture-timing] arena_sink samples=%d objects=%d "
 +                "bytes=%d total_ms=%.3f",
 +                len(results),
 +                len(keys),

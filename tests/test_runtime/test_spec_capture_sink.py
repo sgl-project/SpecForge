@@ -241,12 +241,10 @@ class SpecCaptureSinkTest(unittest.TestCase):
         forward.synchronize()
         self.assertTrue(torch.all(logits.spec_capture_aux_gpu == 7).item())
 
-    def test_nvlink_arena_size_is_required(self):
+    def test_arena_size_is_required(self):
         with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
-            with self.assertRaisesRegex(
-                ValueError, "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"
-            ):
-                self.module.NvlinkArena(torch.device("cpu"))
+            with self.assertRaisesRegex(ValueError, "SGLANG_SPEC_CAPTURE_ARENA_BYTES"):
+                self.module.CaptureArena(torch.device("cpu"))
 
     def test_nvlink_always_publishes_device_memory(self):
         with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
@@ -268,7 +266,7 @@ class SpecCaptureSinkTest(unittest.TestCase):
         env = {
             "MOONCAKE_PROTOCOL": "nvlink",
             "MOONCAKE_LOCAL_HOSTNAME": "127.0.0.1",
-            "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES": str(backing.numel()),
+            "SGLANG_SPEC_CAPTURE_ARENA_BYTES": str(backing.numel()),
         }
         spec = dict(self._request("nv").spec_capture)
         spec["features"] = {"aux": "hidden_states", "last_hidden": "target"}
@@ -282,7 +280,7 @@ class SpecCaptureSinkTest(unittest.TestCase):
             mock.patch.dict(sys.modules, {"mooncake.engine": mooncake}),
         ):
             (result,) = self.sink.put_samples([(spec, aux, last)])
-        self.assertEqual(result["nvlink"]["session"], "127.0.0.1:15459")
+        self.assertEqual(result["arena"]["session"], "127.0.0.1:15459")
         expected = {
             "hidden_states": aux.unsqueeze(0),
             "target": last.unsqueeze(0),
@@ -298,9 +296,9 @@ class SpecCaptureSinkTest(unittest.TestCase):
                 ),
                 name,
             )
-        arena = self.sink._nvlink
+        arena = self.sink._capture_arena
         self.addCleanup(arena._listener.close)
-        host, port = result["nvlink"]["control"].rsplit(":", 1)
+        host, port = result["arena"]["control"].rsplit(":", 1)
         with socket.create_connection((host, int(port)), timeout=5) as client:
             client.sendall(b'["test/nv/g1/target", "missing"]\n')
             self.assertEqual(_receive_frees(arena, 1), 1)
@@ -332,11 +330,11 @@ def _receive_frees(arena, expected, timeout=5.0):
     return freed
 
 
-class NvlinkArenaTest(unittest.TestCase):
+class CaptureArenaTest(unittest.TestCase):
     """Allocation and the free protocol, without CUDA or Mooncake."""
 
     def setUp(self):
-        self.arena = object.__new__(_load_sink().NvlinkArena)
+        self.arena = object.__new__(_load_sink().CaptureArena)
         self.arena.capacity = 4096
         self.arena._spans = [(0, 4096)]
         self.arena._objects = {}
