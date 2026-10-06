@@ -67,6 +67,40 @@ Marlin reduction fallback when the token dimension exceeds CUDA grid.y's
 65,535 limit. The server-capture unit and GPU gates must pass before updating
 either supported source revision.
 
+## Online: spec-capture plugin
+
+SGLang builds that ship three generic extension points run the same capture as
+a plugin instead of a source patch:
+
+- aux hidden-state capture on a target without a draft
+  (`--aux-hidden-state-capture`, `--aux-hidden-state-layer-ids`);
+- `ModelRunner.forward_observer`;
+- `DeferredOutputSource`.
+
+The plugin is
+[`plugins/sglang-spec-capture`](../../plugins/sglang-spec-capture). Install it
+into the server's environment with `pip install --no-deps`, then select it
+with `deployment.disaggregated.server_capture: plugin`.
+
+Managed-local capture servers are then launched with `SPECFORGE_SPEC_CAPTURE=1`
+and the flags `--aux-hidden-state-capture <method>`,
+`--aux-hidden-state-layer-ids ...`, `--return-hidden-states-mode full` and
+`--chunked-prefill-size -1`. The producer sends each spec as a JSON string in
+`sampling_params.custom_params["spec_capture"]` instead of the patch's
+top-level `spec_capture` field.
+
+The plugin keeps the patch's contract:
+
+- the Mooncake key layout;
+- a response only after every object is published;
+- background batch publication bounded by
+  `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`;
+- `SGLANG_SPEC_CAPTURE_GPU_PUT` / `SGLANG_SPEC_CAPTURE_TIMING`;
+- the `logits_mup_width_multiplier` restoration.
+
+Its scheduler refuses to start without the required flags. The capture server
+does not need a patched SGLang.
+
 ## Offline: dedicated local capture
 
 [`../offline_capture`](../offline_capture) is used exclusively by

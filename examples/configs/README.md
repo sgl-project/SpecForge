@@ -344,6 +344,7 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.store_root` | `null` | Shared feature directory; required when `backend: shared_dir`. |
 | `deployment.disaggregated.store_id` | `null` | Feature-store namespace; defaults to `run_id`. |
 | `deployment.disaggregated.server_urls` | `[]` | External patched SGLang capture endpoints. One rollout worker is created per entry. Do not set with `managed_local`. |
+| `deployment.disaggregated.server_capture` | `patch` | How the capture servers implement spec capture: `patch` is the source patch under `patches/sglang`; `plugin` is the `specforge-sglang-capture` plugin (`plugins/sglang-spec-capture`) on an SGLang build with forward observers, deferred outputs and `--aux-hidden-state-capture`. Managed-local servers are launched to match; external servers must already run that backend. |
 | `deployment.disaggregated.mooncake_metadata_server` | `null` | External Mooncake metadata URL. |
 | `deployment.disaggregated.mooncake_master_server_addr` | `null` | External Mooncake RPC `host:port`. |
 | `deployment.disaggregated.mooncake_local_hostname` | `null` | Node-local Mooncake transfer hostname; usually supplied through the environment. |

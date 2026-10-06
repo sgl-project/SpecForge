@@ -21,11 +21,13 @@ What is pinned here:
   ``extra_key`` namespace.
 
 The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
-GPU, sglang patched with
+GPU, the ``mooncake`` package, a reachable/spawnable ``mooncake_master``, and a
+capture-capable SGLang: either patched with
 ``patches/sglang/v0.5.18/spec-capture.patch`` (see
-``scripts/apply_sglang_spec_capture_patch.sh``), the ``mooncake`` package, and
-a reachable/spawnable ``mooncake_master``; opt in locally with
-``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
+``scripts/apply_sglang_spec_capture_patch.sh``) or a build with the forward
+observer extension points plus the installed ``specforge-sglang-capture``
+plugin. ``SPECFORGE_SERVER_CAPTURE=patch|plugin`` selects one; otherwise the
+installed one is used. Opt in locally with ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
 """
 
 import importlib.util
@@ -72,6 +74,44 @@ def _patched_sglang() -> bool:
     return importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
 
 
+def _capture_plugin() -> bool:
+    return all(
+        importlib.util.find_spec(name) is not None
+        for name in (
+            "specforge_sglang_capture",
+            "sglang.srt.model_executor.forward_observer",
+        )
+    )
+
+
+def _server_capture_backend():
+    requested = os.environ.get("SPECFORGE_SERVER_CAPTURE")
+    if requested:
+        return requested
+    if _patched_sglang():
+        return "patch"
+    if _capture_plugin():
+        return "plugin"
+    return None
+
+
+SERVER_CAPTURE = _server_capture_backend()
+
+
+def _capture_server_flags():
+    layer_ids = [str(i) for i in AUX_LAYER_IDS]
+    if SERVER_CAPTURE == "plugin":
+        return [
+            "--aux-hidden-state-capture",
+            "eagle3",
+            "--aux-hidden-state-layer-ids",
+            *layer_ids,
+            "--return-hidden-states-mode",
+            "full",
+        ]
+    return ["--enable-spec-capture", "--spec-capture-aux-layer-ids", *layer_ids]
+
+
 def _mooncake_available() -> bool:
     return importlib.util.find_spec("mooncake.store") is not None
 
@@ -88,11 +128,13 @@ class TestServerCaptureGate(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not _patched_sglang():
+        if SERVER_CAPTURE is None:
             raise unittest.SkipTest(
-                "installed sglang lacks spec_capture_sink — apply "
+                "installed sglang has no spec capture — apply "
                 "patches/sglang/v0.5.18/spec-capture.patch "
-                "(scripts/apply_sglang_spec_capture_patch.sh)"
+                "(scripts/apply_sglang_spec_capture_patch.sh) or install the "
+                "specforge-sglang-capture plugin on an SGLang build with "
+                "forward observers"
             )
         if not _mooncake_available():
             raise unittest.SkipTest("mooncake package not installed")
@@ -145,6 +187,8 @@ class TestServerCaptureGate(unittest.TestCase):
                 "MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"
             ),
         )
+        if SERVER_CAPTURE == "plugin":
+            env["SPECFORGE_SPEC_CAPTURE"] = "1"
         cls.server = subprocess.Popen(
             [
                 sys.executable,
@@ -159,9 +203,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 "0.3",
                 "--chunked-prefill-size",
                 "-1",
-                "--enable-spec-capture",
-                "--spec-capture-aux-layer-ids",
-                *[str(i) for i in AUX_LAYER_IDS],
+                *_capture_server_flags(),
                 "--port",
                 str(PORT),
             ],
@@ -298,6 +340,7 @@ class TestServerCaptureGate(unittest.TestCase):
             run_id="gate0",
             algorithm="eagle3",
             schema=_capture_schema("eagle3"),
+            server_capture=SERVER_CAPTURE,
         )
         contract = CaptureConfig.from_strategy(
             required_features={
@@ -415,6 +458,7 @@ class TestServerCaptureGate(unittest.TestCase):
             run_id="gate1",
             algorithm="dflash",
             schema=_capture_schema("dflash"),
+            server_capture=SERVER_CAPTURE,
         )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},
@@ -457,6 +501,7 @@ class TestServerCaptureGate(unittest.TestCase):
             run_id="gate2",
             algorithm="dflash",
             schema=_capture_schema("dflash", teacher_metrics=False),
+            server_capture=SERVER_CAPTURE,
         )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},
