@@ -10,6 +10,8 @@ class ChatTemplate(BaseModel):
 
     Args:
         assistant_header(str): The header for the assistant.
+        assistant_header_alternates(List[str]): Alternate assistant headers emitted
+            by the tokenizer for earlier turns.
         user_header(str): The header for the user.
         system_prompt(str): The system prompt.
         end_of_turn_token(str): The end token of a turn of conversation.
@@ -17,6 +19,7 @@ class ChatTemplate(BaseModel):
     """
 
     assistant_header: Optional[str] = None
+    assistant_header_alternates: Optional[List[str]] = None
     user_header: Optional[str] = None
     system_prompt: Optional[str] = None
     end_of_turn_token: Optional[str] = None
@@ -220,6 +223,7 @@ TEMPLATE_REGISTRY.register(
     name="qwen3-next-thinking",
     template=ChatTemplate(
         assistant_header="<|im_start|>assistant\n<think>\n",
+        assistant_header_alternates=["<|im_start|>assistant\n"],
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
@@ -411,6 +415,7 @@ TEMPLATE_REGISTRY.register(
     name="qwen3.5",
     template=ChatTemplate(
         assistant_header="<|im_start|>assistant\n<think>\n",
+        assistant_header_alternates=["<|im_start|>assistant\n"],
         user_header="<|im_start|>user\n",
         system_prompt="",
         end_of_turn_token="<|im_end|>\n",

@@ -157,6 +157,21 @@ class GeneralParser(Parser):
         return {"role": "system", "content": message["content"]}
 
     def set_assistant_pattern(self, chat_template: ChatTemplate):
+        assistant_headers = [
+            self.assistant_message_separator,
+            *(chat_template.assistant_header_alternates or []),
+        ]
+        assistant_header_pattern = (
+            "(?:"
+            + "|".join(
+                re.escape(header)
+                for header in sorted(
+                    dict.fromkeys(assistant_headers), key=len, reverse=True
+                )
+            )
+            + ")"
+        )
+
         if chat_template.assistant_pattern_type == "longcat":
             self.assistant_pattern = (
                 re.escape(self.assistant_message_separator)
@@ -191,7 +206,7 @@ class GeneralParser(Parser):
             )
         else:
             self.assistant_pattern = (
-                re.escape(self.assistant_message_separator)
+                assistant_header_pattern
                 + r"([\s\S]*?(?:"
                 + re.escape(self.chat_template.end_of_turn_token)
                 + "|$))"
