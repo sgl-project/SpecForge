@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import ctypes
-import json
+import socket
 import sys
 import textwrap
 import threading
+import time
 import types
 import unittest
-import urllib.error
-import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -293,14 +292,11 @@ class SpecCaptureSinkTest(unittest.TestCase):
                 name,
             )
         arena = self.sink._nvlink
-        self.addCleanup(arena._http.shutdown)
-        request = urllib.request.Request(
-            result["nvlink"]["control"] + "/free",
-            data=json.dumps({"keys": ["test/nv/g1/target", "missing"]}).encode(),
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            self.assertEqual(json.load(response), {"freed": 1})
+        self.addCleanup(arena._listener.close)
+        host, port = result["nvlink"]["control"].rsplit(":", 1)
+        with socket.create_connection((host, int(port)), timeout=5) as client:
+            client.sendall(b'["test/nv/g1/target", "missing"]\n')
+            self.assertEqual(_receive_frees(arena, 1), 1)
         self.assertEqual(arena.health()["objects"], 2)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -321,15 +317,27 @@ class SpecCaptureSinkTest(unittest.TestCase):
         self.assertEqual(store.unregistered, [])
 
 
+def _receive_frees(arena, expected, timeout=5.0):
+    """Drain the arena's control connections until ``expected`` frees land."""
+    freed, deadline = 0, time.monotonic() + timeout
+    while freed < expected and time.monotonic() < deadline:
+        freed += arena.receive_frees(timeout=0.1)
+    return freed
+
+
 class NvlinkArenaTest(unittest.TestCase):
-    """Allocation and the control endpoint, without CUDA or Mooncake."""
+    """Allocation and the free protocol, without CUDA or Mooncake."""
 
     def setUp(self):
         self.arena = object.__new__(_load_sink().NvlinkArena)
         self.arena.capacity = 4096
         self.arena._spans = [(0, 4096)]
         self.arena._objects = {}
-        self.arena._cond = threading.Condition()
+        self.arena._listener = socket.create_server(("127.0.0.1", 0))
+        self.arena._listener.setblocking(False)
+        self.arena._peers = {}
+        self.addCleanup(self.arena._listener.close)
+        self.control = self.arena._listener.getsockname()
 
     def test_freed_space_is_reused_and_coalesced(self):
         sizes = (("a", 100), ("b", 1000), ("c", 1))
@@ -344,26 +352,26 @@ class NvlinkArenaTest(unittest.TestCase):
 
     def test_a_full_arena_waits_for_frees_then_fails(self):
         self.arena._allocate("all", 4096)
-        threading.Timer(0.1, self.arena.free, args=(["all"],)).start()
+
+        def free_later():
+            with socket.create_connection(self.control, timeout=5) as client:
+                time.sleep(0.1)
+                client.sendall(b'["all"]\n')
+
+        threading.Thread(target=free_later, daemon=True).start()
         self.assertEqual(self.arena._allocate("next", 4096), 0)
         self.arena._WAIT_S = 0.05
         with self.assertRaisesRegex(MemoryError, "no room"):
             self.arena._allocate("more", 1)
 
-    def test_control_endpoint_frees_and_reports(self):
-        self.arena._allocate("k1", 10)
-        url = self.arena._serve("127.0.0.1")
-        self.addCleanup(self.arena._http.shutdown)
-        request = urllib.request.Request(
-            url + "/free",
-            data=json.dumps({"keys": ["k1", "k2"]}).encode(),
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            self.assertEqual(json.load(response), {"freed": 1})
-        with urllib.request.urlopen(url + "/health", timeout=5) as response:
-            health = json.load(response)
-        self.assertEqual((health["objects"], health["free_bytes"]), (0, 4096))
-        with self.assertRaises(urllib.error.HTTPError) as raised:
-            urllib.request.urlopen(url + "/unknown", timeout=5)
-        self.assertEqual(raised.exception.code, 404)
+    def test_frees_arrive_as_json_lines_across_reads(self):
+        for key in ("k1", "k2", "k3"):
+            self.arena._allocate(key, 10)
+        with socket.create_connection(self.control, timeout=5) as client:
+            client.sendall(b'["k1", "unknown"]\n["k')
+            self.assertEqual(_receive_frees(self.arena, 1), 1)
+            client.sendall(b'2"]\n')
+            self.assertEqual(_receive_frees(self.arena, 1), 1)
+        self.assertEqual(set(self.arena._objects), {"k3"})
+        self.arena.receive_frees(timeout=0.1)  # the closed connection is dropped
+        self.assertEqual(self.arena._peers, {})

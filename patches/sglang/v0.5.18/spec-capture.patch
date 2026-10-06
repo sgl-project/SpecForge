@@ -892,10 +892,10 @@ index 5c4f3ff44a..c40bcc6c42 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000..b43f315
+index 0000000..12ce3b7
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,694 @@
+@@ -0,0 +1,687 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -930,17 +930,18 @@ index 0000000..b43f315
 +``MOONCAKE_PROTOCOL=nvlink`` (multi-node NVLink) keeps objects in an
 +:class:`NvlinkArena` on the writer GPU instead of the store. Each result then
 +also carries ``"nvlink": {"session", "control"}`` and every feature its
-+``"address"``; the trainer reads objects over MNNVL and frees them with
-+``POST {control}/free``.
++``"address"``; the trainer reads objects over MNNVL and frees them by writing
++JSON key lists to the ``control`` TCP endpoint.
 +"""
 +
 +from __future__ import annotations
 +
 +import bisect
-+import http.server
 +import json
 +import logging
 +import os
++import select
++import socket
 +import threading
 +import time
 +from concurrent.futures import Future, ThreadPoolExecutor
@@ -1020,7 +1021,10 @@ index 0000000..b43f315
 +    handle, and the Mooncake store cannot place objects there. The arena is one
 +    ``MOONCAKE_GLOBAL_SEGMENT_SIZE``-byte allocation from the TransferEngine.
 +    Objects keep the store's keys and, like hard-pinned store objects, live
-+    until a client frees them through ``POST /free`` on the control endpoint.
++    until a client frees them by writing a JSON list of keys, one per line, to
++    the ``control`` TCP endpoint. Only the writer thread touches the arena and
++    it reads those frees before allocating, so no server thread competes with
++    the scheduler for the GIL.
 +    """
 +
 +    _ALIGNMENT = 512
@@ -1050,9 +1054,12 @@ index 0000000..b43f315
 +        self._stream = torch.cuda.Stream(device)
 +        self._spans = [(0, self.capacity)]  # free (offset, size), sorted, coalesced
 +        self._objects: Dict[str, Tuple[int, int]] = {}  # key -> (offset, size)
-+        self._cond = threading.Condition()
++        port = int(os.environ.get("SGLANG_SPEC_CAPTURE_CONTROL_PORT", "0"))
++        self._listener = socket.create_server(("", port))
++        self._listener.setblocking(False)
++        self._peers: Dict[socket.socket, bytes] = {}  # connection -> partial line
 +        self.session = f"{host}:{self._engine.get_rpc_port()}"
-+        self.control = self._serve(host)
++        self.control = f"{host}:{self._listener.getsockname()[1]}"
 +        logger.info(
 +            "spec-capture NVLink arena: %d bytes, session %s, control %s",
 +            self.capacity,
@@ -1064,6 +1071,7 @@ index 0000000..b43f315
 +        self, keys: List[str], tensors: List[torch.Tensor], replace_keys: List[str]
 +    ) -> List[int]:
 +        """Copy each tensor into its own object; return the device addresses."""
++        self.receive_frees()
 +        self.free(replace_keys)
 +        placed: List[str] = []
 +        try:
@@ -1081,54 +1089,76 @@ index 0000000..b43f315
 +            self._stream.synchronize()
 +            self.free(placed)
 +            raise
-+        with self._cond:
-+            return [self._base + self._objects[key][0] for key in keys]
++        return [self._base + self._objects[key][0] for key in keys]
 +
 +    def free(self, keys: List[str]) -> int:
 +        freed = 0
-+        with self._cond:
-+            for key in keys:
-+                entry = self._objects.pop(key, None)
-+                if entry is not None:
-+                    self._release(*entry)
-+                    freed += 1
-+            if freed:
-+                self._cond.notify_all()
++        for key in keys:
++            entry = self._objects.pop(key, None)
++            if entry is not None:
++                self._release(*entry)
++                freed += 1
++        return freed
++
++    def receive_frees(self, timeout: float = 0.0) -> int:
++        """Apply frees clients have sent, waiting up to ``timeout`` for one."""
++        freed = 0
++        readable, _, _ = select.select([self._listener, *self._peers], [], [], timeout)
++        for sock in readable:
++            if sock is self._listener:
++                try:
++                    peer, _ = sock.accept()
++                except BlockingIOError:
++                    continue
++                peer.setblocking(False)
++                self._peers[peer] = b""
++                continue
++            try:
++                chunk = sock.recv(1 << 20)
++            except BlockingIOError:
++                continue
++            except OSError:
++                chunk = b""
++            if not chunk:
++                del self._peers[sock]
++                sock.close()
++                continue
++            *lines, self._peers[sock] = (self._peers[sock] + chunk).split(b"\n")
++            for line in lines:
++                if line:
++                    freed += self.free(json.loads(line))
 +        return freed
 +
 +    def health(self) -> Dict[str, int]:
-+        with self._cond:
-+            return {
-+                "objects": len(self._objects),
-+                "capacity": self.capacity,
-+                "free_bytes": sum(size for _, size in self._spans),
-+                "largest_free_bytes": max((size for _, size in self._spans), default=0),
-+            }
++        return {
++            "objects": len(self._objects),
++            "capacity": self.capacity,
++            "free_bytes": sum(size for _, size in self._spans),
++            "largest_free_bytes": max((size for _, size in self._spans), default=0),
++        }
 +
 +    def _allocate(self, key: str, nbytes: int) -> int:
++        if key in self._objects:
++            raise RuntimeError(f"spec-capture object {key} already exists")
 +        size = -(-max(nbytes, 1) // self._ALIGNMENT) * self._ALIGNMENT
 +        deadline = time.monotonic() + self._WAIT_S
-+        with self._cond:
-+            if key in self._objects:
-+                raise RuntimeError(f"spec-capture object {key} already exists")
-+            while True:
-+                for index, (offset, span) in enumerate(self._spans):
-+                    if span >= size:
-+                        if span == size:
-+                            del self._spans[index]
-+                        else:
-+                            self._spans[index] = (offset + size, span - size)
-+                        self._objects[key] = (offset, size)
-+                        return offset
-+                remaining = deadline - time.monotonic()
-+                if remaining <= 0:
-+                    raise MemoryError(
-+                        f"spec-capture NVLink arena ({self.capacity} bytes) has "
-+                        f"no room for {nbytes} bytes; raise "
-+                        "MOONCAKE_GLOBAL_SEGMENT_SIZE or lower the producer's "
-+                        "runtime.resident_high_watermark_bytes"
-+                    )
-+                self._cond.wait(remaining)
++        while True:
++            for index, (offset, span) in enumerate(self._spans):
++                if span >= size:
++                    if span == size:
++                        del self._spans[index]
++                    else:
++                        self._spans[index] = (offset + size, span - size)
++                    self._objects[key] = (offset, size)
++                    return offset
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise MemoryError(
++                    f"spec-capture NVLink arena ({self.capacity} bytes) has no "
++                    f"room for {nbytes} bytes; raise MOONCAKE_GLOBAL_SEGMENT_SIZE "
++                    "or lower the producer's runtime.resident_high_watermark_bytes"
++                )
++            self.receive_frees(timeout=remaining)
 +
 +    def _release(self, offset: int, size: int) -> None:
 +        index = bisect.bisect_left(self._spans, (offset, 0))
@@ -1139,43 +1169,6 @@ index 0000000..b43f315
 +            offset, prior = self._spans.pop(index)
 +            size += prior
 +        self._spans.insert(index, (offset, size))
-+
-+    def _serve(self, host: str) -> str:
-+        arena = self
-+
-+        class Handler(http.server.BaseHTTPRequestHandler):
-+            protocol_version = "HTTP/1.1"
-+
-+            def do_POST(self):
-+                length = int(self.headers.get("Content-Length") or 0)
-+                body = json.loads(self.rfile.read(length) or b"{}")
-+                if self.path != "/free":
-+                    return self._reply(404, {"error": f"unknown path {self.path}"})
-+                self._reply(200, {"freed": arena.free(list(body.get("keys", ())))})
-+
-+            def do_GET(self):
-+                if self.path != "/health":
-+                    return self._reply(404, {"error": f"unknown path {self.path}"})
-+                self._reply(200, arena.health())
-+
-+            def _reply(self, status: int, payload: Dict[str, Any]) -> None:
-+                data = json.dumps(payload).encode()
-+                self.send_response(status)
-+                self.send_header("Content-Type", "application/json")
-+                self.send_header("Content-Length", str(len(data)))
-+                self.end_headers()
-+                self.wfile.write(data)
-+
-+            def log_message(self, *args) -> None:
-+                pass
-+
-+        port = int(os.environ.get("SGLANG_SPEC_CAPTURE_CONTROL_PORT", "0"))
-+        self._http = http.server.ThreadingHTTPServer(("", port), Handler)
-+        self._http.daemon_threads = True
-+        threading.Thread(
-+            target=self._http.serve_forever, name="spec-capture-control", daemon=True
-+        ).start()
-+        return f"http://{host}:{self._http.server_address[1]}"
 +
 +
 +class SpecCaptureSink:
