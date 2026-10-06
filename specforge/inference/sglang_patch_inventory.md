@@ -43,11 +43,13 @@ sink copies captures into one `MOONCAKE_GLOBAL_SEGMENT_SIZE`-byte arena that
 the TransferEngine allocates on the writer GPU. Responses carry each object's
 device address. Trainers read with `transfer_sync_read` into
 `receive_buffers: cuda` and free objects wherever they would remove store
-objects, through the sink's `POST /free` endpoint (port
-`SGLANG_SPEC_CAPTURE_CONTROL_PORT`, ephemeral by default). Reserve the arena
-below `--mem-fraction-static` and keep `runtime.resident_high_watermark_bytes`
-under the summed arena size. Requires a Mooncake build with `USE_MNNVL` (the
-aarch64 CUDA wheels) and an IMEX channel in every container.
+objects, by writing the keys to the sink's control connection (port
+`SGLANG_SPEC_CAPTURE_CONTROL_PORT`, ephemeral by default). Frees are one-way;
+the writer thread applies them before it allocates, so no extra thread
+competes with the scheduler. Reserve the arena below `--mem-fraction-static`
+and keep `runtime.resident_high_watermark_bytes` under the summed arena size.
+Requires a Mooncake build with `USE_MNNVL` (the aarch64 CUDA wheels) and an
+IMEX channel in every container.
 
 The client boundary is
 [`adapters/server_capture.py`](adapters/server_capture.py). Algorithm-owned

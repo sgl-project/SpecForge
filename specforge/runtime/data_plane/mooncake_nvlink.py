@@ -18,21 +18,25 @@ place objects there. The server returns each object's device address, which
 :class:`MooncakeFeatureStore` uses, so the store's lifecycle (generations,
 leases, removal retries) is unchanged: ``get_into`` reads straight from the
 server GPU with ``TransferEngine.transfer_sync_read`` and ``remove`` frees the
-object through the server's control endpoint. Objects are located per ref via
+object by writing its key to the server's control connection. Frees are one-way
+messages the server applies before it next allocates, so the durable ack never
+waits on the capture server. Objects are located per ref via
 :meth:`locate_ref_objects`, which the feature store calls on ``adopt``/``get``.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import socket
 import threading
-from typing import Any, Dict, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from specforge.runtime.data_plane.mooncake_store import MOONCAKE_OBJECT_NOT_FOUND
 
 #: ``SampleRef.metadata`` entry holding ``{"session", "control", "addresses"}``.
 REF_METADATA_KEY = "mooncake_nvlink"
-_FREE_TIMEOUT_S = 30.0
+_CONNECT_TIMEOUT_S = 30.0
 
 
 class NvlinkObjectClient:
@@ -41,12 +45,12 @@ class NvlinkObjectClient:
     def __init__(self, *, local_hostname: str) -> None:
         self._local_hostname = local_hostname
         self._engine = None
-        self._http = None
         # key -> (transfer-engine session, device address, control endpoint)
         self._objects: Dict[str, Tuple[str, int, str]] = {}
         self._controls: Set[str] = set()
+        self._connections: Dict[str, socket.socket] = {}
         self._lock = threading.Lock()
-        self._http_lock = threading.Lock()
+        self._send_lock = threading.Lock()
 
     def locate_ref_objects(
         self, keys: Dict[str, str], metadata: Dict[str, Any]
@@ -92,8 +96,8 @@ class NvlinkObjectClient:
             controls = [entry[2]] if entry is not None else sorted(self._controls)
         try:
             for control in controls:
-                self._post(f"{control}/free", {"keys": [key]})
-        except Exception:
+                self._send_free(control, [key])
+        except OSError:
             if entry is not None:
                 with self._lock:
                     self._objects.setdefault(key, entry)
@@ -139,12 +143,19 @@ class NvlinkObjectClient:
                 self._engine = engine
             return self._engine
 
-    def _post(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        import requests
-
-        with self._http_lock:
-            if self._http is None:
-                self._http = requests.Session()
-            response = self._http.post(url, json=payload, timeout=_FREE_TIMEOUT_S)
-        response.raise_for_status()
-        return response.json()
+    def _send_free(self, control: str, keys: List[str]) -> None:
+        line = (json.dumps(keys) + "\n").encode()
+        with self._send_lock:
+            connection = self._connections.get(control)
+            if connection is None:
+                host, port = control.rsplit(":", 1)
+                connection = socket.create_connection(
+                    (host, int(port)), timeout=_CONNECT_TIMEOUT_S
+                )
+                self._connections[control] = connection
+            try:
+                connection.sendall(line)
+            except OSError:
+                # Reconnect on the next free; the caller retries this one.
+                self._connections.pop(control).close()
+                raise
