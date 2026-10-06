@@ -323,7 +323,12 @@ class FSDPTrainingBackend(TrainingBackend):
         Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
         the boundary backward reduces the accumulated sum once.
         """
-        if is_boundary or not self._wrapped:
+        # SPECFORGE_FSDP_SHARDED_GRAD_ACCUM=1: reduce-scatter every micro-step and
+        # accumulate the *sharded* gradient instead of FSDP's no_sync() path, which
+        # holds the full unsharded gradient on every rank between boundaries
+        # (41.6 GB for the 20B MoE drafter). Costs one reduce-scatter per micro-step.
+        sharded_accum = os.environ.get("SPECFORGE_FSDP_SHARDED_GRAD_ACCUM", "0") == "1"
+        if is_boundary or not self._wrapped or sharded_accum:
             loss.backward()
         else:
             with self.module.no_sync():
