@@ -40,13 +40,16 @@ every earlier comparison (2026-09-08 and 09-09).
 
 | what | path | size |
 |---|---|---|
-| final training checkpoint (overall step 14,874; run-local step 4416) | `/personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-cont2ep-restart-step5500-b/…-step4416` (`…-latest` symlink points here) | 272 GB |
-| earlier restart checkpoints (run-local 3500, 4000) | same directory | 272 GB each |
-| phase B checkpoints (run-local 5000, 5500; 5500 is the phase C warm-start source) | `…/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-cont2ep-from-1ep-v3/` | 272 GB each |
-| phase A checkpoints (4500, 4958 = the 1-epoch model) | `…/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3/` | 272 GB each |
-| **servable export, 3 epochs** | `/personal/SpecForge-qwen38-moe/exports/qwen38-dspark-moe-3ep-cont-step9916` | 39 GB |
-| servable export, 1 epoch | `/personal/SpecForge-qwen38-moe/exports/qwen38-dspark-moe-1ep-v3` | 39 GB |
-| W&B | project `specforge-qwen38-ablation` (https://wandb.ai/yisun0618-nvidia/specforge-qwen38-ablation), runs `…-1ep-v3-b200-dp4`, `…-cont2ep-from-1ep-v3-b200-dp4`, `…-cont2ep-restart-step5500-b-b200-dp4` | |
+| **final training checkpoint, MoE 3 ep** (overall step 14,874; run-local step 4416) | `/personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-cont2ep-restart-step5500-b/qwen3.8-27b-dspark-moe-regen-mixture-v1-cont2ep-restart-step5500-b-step4416` (the `…-latest` symlink in the same directory points here) | 272 GB |
+| earlier restart checkpoints (run-local 3500, 4000) | `/personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-cont2ep-restart-step5500-b/qwen3.8-27b-dspark-moe-regen-mixture-v1-cont2ep-restart-step5500-b-step{3500,4000}` | 272 GB each |
+| phase B checkpoints (run-local 5000, 5500; 5500 is the phase C warm-start source) | `/personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-cont2ep-from-1ep-v3/qwen3.8-27b-dspark-moe-regen-mixture-v1-cont2ep-from-1ep-v3-step{5000,5500}` | 272 GB each |
+| phase A checkpoints (4500, 4958 = the 1-epoch MoE model) | `/personal/SpecForge-qwen38-moe/outputs/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3/qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3-step{4500,4958}` | 272 GB each |
+| **servable export, MoE 3 ep** | `/personal/SpecForge-qwen38-moe/exports/qwen38-dspark-moe-3ep-cont-step9916` | 39 GB |
+| servable export, MoE 1 ep | `/personal/SpecForge-qwen38-moe/exports/qwen38-dspark-moe-1ep-v3` | 39 GB |
+| **final training checkpoint, dense 1 ep baseline** (step 2500 of the paused 3ep run; branch `kan/qwen38-dspark-ablation`) | `/personal/SpecForge-qwen38/outputs/qwen3.8-27b-dspark-regen-mixture-v1-3ep/qwen3.8-27b-dspark-regen-mixture-v1-3ep-step2500` (earlier: `…-step1500`, `…-step2000` in the same directory) | 25 GB each |
+| **servable export, dense 1 ep** | `/personal/SpecForge-qwen38/exports/qwen38-dspark-dense-ep1-step2500` | 3.5 GB |
+| official v1 baseline | Hugging Face `RadixArk/Qwen3.8-27B-DSpark`, revision b9a5dbdf | |
+| W&B | project `specforge-qwen38-ablation` (https://wandb.ai/yisun0618-nvidia/specforge-qwen38-ablation): MoE runs `…-1ep-v3-b200-dp4`, `…-cont2ep-from-1ep-v3-b200-dp4`, `…-cont2ep-restart-step5500-b-b200-dp4`; dense run `9xmclyf8` | |
 
 A checkpoint directory holds `training_state.pt` (41.6 GB: the full unsharded bf16 draft state dict plus run metadata;
 the only file the exporter reads) and `training_state_rank{0-3}.pt` (62.5 GB each: per-rank RNG and CPU-offloaded AdamW
