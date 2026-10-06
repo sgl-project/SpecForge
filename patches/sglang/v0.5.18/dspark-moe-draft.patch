@@ -1,0 +1,475 @@
+diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
+index 75aaddf..45280a4 100644
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -42,6 +42,27 @@ if _is_npu:
+     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+ logger = logging.getLogger(__name__)
+ 
++# Checkpoint entries a DFlash-family draft never owns: the target's vocabulary
++# modules (shared at serving time) and HF rotary caches.
++_IGNORABLE_DRAFT_WEIGHT_PREFIXES = (
++    "embed_tokens.",
++    "lm_head.",
++    "model.embed_tokens.",
++    "model.lm_head.",
++    "rotary_emb.",
++)
++# Parameters DFlashDraftModel.load_weights itself must fill; a checkpoint that
++# leaves any of them untouched is rejected instead of served uninitialised.
++_STRICT_BACKBONE_PREFIXES = ("layers.", "norm.", "fc.", "hidden_norm.")
++
++
++def _is_ignorable_draft_weight(name: str) -> bool:
++    return (
++        name.startswith(_IGNORABLE_DRAFT_WEIGHT_PREFIXES)
++        or ".rotary_emb." in name
++        or name.endswith("inv_freq")
++    )
++
+ 
+ def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
+     """Honor explicit causality while preserving legacy layer defaults."""
+@@ -500,6 +521,8 @@ class DFlashDraftModel(nn.Module):
+                 return aliased_name
+             return None
+ 
++        loaded_names = set()
++        unexpected_names = []
+         for name, loaded_weight in weights:
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+                 if f".{weight_name}." not in name:
+@@ -511,11 +534,13 @@ class DFlashDraftModel(nn.Module):
+                 param = params_dict[resolved_name]
+                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                 weight_loader(param, loaded_weight, shard_id)
++                loaded_names.add(resolved_name)
+                 break
+             else:
+                 resolved_name = resolve_param_name(name)
+                 if resolved_name is None:
+-                    # Ignore unexpected weights (e.g., HF rotary caches).
++                    if not _is_ignorable_draft_weight(name):
++                        unexpected_names.append(name)
+                     continue
+                 param = params_dict[resolved_name]
+                 if resolved_name.endswith("fc.weight") and tuple(
+@@ -530,6 +555,35 @@ class DFlashDraftModel(nn.Module):
+                     )
+                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                 weight_loader(param, loaded_weight)
++                loaded_names.add(resolved_name)
++
++        # A draft whose checkpoint and architecture disagree must fail here, not
++        # at serving time as a silently random sub-module (e.g. an MoE export
++        # loaded into a dense-MLP class leaves every MLP uninitialised).
++        if unexpected_names:
++            shown = ", ".join(sorted(unexpected_names)[:12])
++            raise ValueError(
++                f"{type(self).__name__}: {len(unexpected_names)} checkpoint weight(s) "
++                f"do not map to any parameter of this architecture: {shown}"
++                f"{' ...' if len(unexpected_names) > 12 else ''}. Check that "
++                "config.json's `architectures` matches the export (an MoE drafter "
++                "needs an MoE-capable draft class)."
++            )
++        # Only the backbone this method owns is checked; subclasses load their
++        # own heads afterwards (DSpark markov/confidence) and verify them there.
++        missing_names = sorted(
++            name
++            for name in params_dict
++            if name not in loaded_names
++            and name.startswith(_STRICT_BACKBONE_PREFIXES)
++        )
++        if missing_names:
++            shown = ", ".join(missing_names[:12])
++            raise ValueError(
++                f"{type(self).__name__}: {len(missing_names)} parameter(s) were not "
++                f"loaded from the checkpoint and would serve uninitialised: {shown}"
++                f"{' ...' if len(missing_names) > 12 else ''}."
++            )
+ 
+ 
+ class DFlashLagunaAttention(DFlashAttention):
+diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
+index 4116f52..90cf072 100644
+--- a/python/sglang/srt/models/dspark.py
++++ b/python/sglang/srt/models/dspark.py
+@@ -435,6 +435,7 @@ class DSparkDraftMixin:
+ 
+         super().load_weights(backbone_weights)
+ 
++        loaded_markov = set()
+         for name, loaded_weight in markov_weights:
+             if name not in params_dict:
+                 raise ValueError(
+@@ -444,6 +445,17 @@ class DSparkDraftMixin:
+             param = params_dict[name]
+             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+             weight_loader(param, loaded_weight)
++            loaded_markov.add(name)
++        missing_markov = sorted(
++            name
++            for name in params_dict
++            if name.startswith("markov_head.") and name not in loaded_markov
++        )
++        if missing_markov:
++            raise ValueError(
++                "DSpark markov head parameters are missing from the checkpoint and "
++                f"would serve uninitialised: {missing_markov}"
++            )
+ 
+         self._load_confidence_weights(
+             confidence_weights=confidence_weights, params_dict=params_dict
+diff --git a/python/sglang/srt/models/dspark_moe.py b/python/sglang/srt/models/dspark_moe.py
+new file mode 100644
+index 0000000..54cdc18
+--- /dev/null
++++ b/python/sglang/srt/models/dspark_moe.py
+@@ -0,0 +1,347 @@
++"""DSpark drafters whose FFN is a DeepSeek-style MoE (SpecForge ``moe_preset``).
++
++SpecForge's MoE-FFN drafters keep the Qwen3-style GQA decoder of ``DSparkDraftModel``
++and replace each layer's dense MLP with ``n_routed_experts`` routed experts plus one
++ungated shared expert, routed the DeepSeek-V3/V4 way (score function, aux-loss-free
++selection bias, renormalized combine weights times ``routed_scaling_factor``). The
++export keeps the official DeepSeek checkpoint naming::
++
++    layers.N.mlp.gate.weight                     [E, hidden]
++    layers.N.mlp.gate.bias                       [E]  (fp32 selection bias, noaux_tc)
++    layers.N.mlp.experts.{i}.w1.weight           [inter, hidden]   (gate_proj)
++    layers.N.mlp.experts.{i}.w2.weight           [hidden, inter]   (down_proj)
++    layers.N.mlp.experts.{i}.w3.weight           [inter, hidden]   (up_proj)
++    layers.N.mlp.shared_experts.w{1,2,3}.weight
++
++and ``config.json`` carries the routing recipe in the DeepSeek HF vocabulary
++(``n_routed_experts``, ``num_experts_per_tok``, ``moe_intermediate_size``,
++``n_shared_experts``, ``scoring_func``, ``norm_topk_prob``, ``routed_scaling_factor``,
++``n_group``, ``topk_group``, ``topk_method``, ``swiglu_limit``).
++
++The math below mirrors SpecForge ``specforge/modeling/draft/moe`` (``TopKRouter``,
++``NoAuxTCController``, ``GroupedExperts``, ``SwiGLUSharedExpert``) so serving routes
++exactly as training did: routing in fp32, experts in the model dtype through
++``torch._grouped_mm`` with on-device offsets (no host sync, CUDA-graph safe).
++
++The draft is replicated (TP1 draft worker); expert parallelism is not implemented.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++from typing import Callable, Dict, Iterable, List, Optional, Tuple
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++from sglang.srt.layers.layernorm import RMSNorm
++from sglang.srt.models.dflash import DFlashDecoderLayer
++from sglang.srt.models.dspark import DSparkDraftModel
++
++logger = logging.getLogger(__name__)
++
++SCORE_FUNCTIONS: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
++    "softmax": lambda logits: logits.softmax(dim=-1),
++    "sigmoid": torch.sigmoid,
++    # DeepSeek-V4 scoring.
++    "sqrtsoftplus": lambda logits: F.softplus(logits).sqrt(),
++}
++
++# Preset defaults, used only for keys the export config does not state.
++_PRESET_DEFAULTS: Dict[str, Dict[str, object]] = {
++    "deepseek_v4": dict(
++        scoring_func="sqrtsoftplus",
++        norm_topk_prob=True,
++        routed_scaling_factor=1.5,
++        n_shared_experts=1,
++        swiglu_limit=10.0,
++        topk_method="noaux_tc",
++    ),
++}
++
++
++def _cfg(config, key: str, default):
++    value = getattr(config, key, None)
++    return default if value is None else value
++
++
++def swiglu_clamped(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
++    """SwiGLU in fp32 with the DeepSeek-V4 activation clamp (``limit`` 0 = off)."""
++    gate = gate.float()
++    up = up.float()
++    if limit > 0:
++        up = torch.clamp(up, min=-limit, max=limit)
++        gate = torch.clamp(gate, max=limit)
++    return F.silu(gate) * up
++
++
++def group_limited_mask(
++    selection: torch.Tensor, n_group: int, topk_group: int
++) -> torch.Tensor:
++    tokens, n_experts = selection.shape
++    grouped = selection.view(tokens, n_group, n_experts // n_group)
++    group_scores = grouped.topk(min(2, grouped.shape[-1]), dim=-1).values.sum(-1)
++    keep = group_scores.topk(topk_group, dim=-1).indices
++    mask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(1, keep, True)
++    return grouped.masked_fill(~mask.unsqueeze(-1), float("-inf")).view(
++        tokens, n_experts
++    )
++
++
++class DraftMoEGate(nn.Module):
++    """Router projection plus the aux-loss-free selection bias (``gate.bias``)."""
++
++    def __init__(self, n_experts: int, hidden_size: int, use_bias: bool) -> None:
++        super().__init__()
++        self.weight = nn.Parameter(torch.empty(n_experts, hidden_size))
++        if use_bias:
++            # Selection-only bias; kept fp32 like the trainer's controller buffer.
++            self.bias = nn.Parameter(
++                torch.zeros(n_experts, dtype=torch.float32), requires_grad=False
++            )
++        else:
++            self.bias = None
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return F.linear(x.float(), self.weight.float())
++
++
++class DraftRoutedExperts(nn.Module):
++    """All routed experts as three stacked parameters (``w1``/``w3`` gate/up
++    ``[E, inter, hidden]``, ``w2`` down ``[E, hidden, inter]``)."""
++
++    def __init__(self, n_experts: int, hidden_size: int, intermediate_size: int):
++        super().__init__()
++        e, d, i = n_experts, hidden_size, intermediate_size
++        self.w1 = nn.Parameter(torch.empty(e, i, d))
++        self.w2 = nn.Parameter(torch.empty(e, d, i))
++        self.w3 = nn.Parameter(torch.empty(e, i, d))
++
++
++class DraftSharedExpert(nn.Module):
++    """Ungated SwiGLU shared expert (DeepSeek ``shared_experts.w{1,2,3}``)."""
++
++    def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float):
++        super().__init__()
++        self.swiglu_limit = float(swiglu_limit)
++        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
++        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
++        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        h = swiglu_clamped(self.w1(x), self.w3(x), self.swiglu_limit)
++        return self.w2(h.to(x.dtype))
++
++
++class DraftMoEFFN(nn.Module):
++    """``y = experts(x, gate(x)) + shared_experts(x)`` for one draft layer."""
++
++    def __init__(self, config) -> None:
++        super().__init__()
++        preset = _PRESET_DEFAULTS.get(str(_cfg(config, "moe_preset", "")), {})
++
++        def get(key, default):
++            return _cfg(config, key, preset.get(key, default))
++
++        self.hidden_size = int(config.hidden_size)
++        self.n_experts = int(_cfg(config, "n_routed_experts", 0))
++        self.topk = int(_cfg(config, "num_experts_per_tok", 0))
++        self.intermediate_size = int(_cfg(config, "moe_intermediate_size", 0))
++        if self.n_experts <= 0 or self.topk <= 0 or self.intermediate_size <= 0:
++            raise ValueError(
++                "MoE draft config needs n_routed_experts, num_experts_per_tok and "
++                f"moe_intermediate_size; got {self.n_experts}, {self.topk}, "
++                f"{self.intermediate_size}."
++            )
++        if self.topk > self.n_experts:
++            raise ValueError("num_experts_per_tok must not exceed n_routed_experts")
++        if _cfg(config, "hidden_act", "silu") != "silu":
++            raise ValueError("MoE draft experts support only silu (SwiGLU)")
++
++        self.scoring_func = str(get("scoring_func", "softmax"))
++        if self.scoring_func not in SCORE_FUNCTIONS:
++            raise ValueError(
++                f"unknown scoring_func {self.scoring_func!r}; "
++                f"known: {sorted(SCORE_FUNCTIONS)}"
++            )
++        self.score_fn = SCORE_FUNCTIONS[self.scoring_func]
++        self.norm_topk_prob = bool(get("norm_topk_prob", True))
++        self.routed_scaling_factor = float(get("routed_scaling_factor", 1.0))
++        self.n_group = int(get("n_group", 1))
++        self.topk_group = int(get("topk_group", 1))
++        if self.n_group <= 0 or self.n_experts % self.n_group:
++            raise ValueError("n_group must divide n_routed_experts")
++        if not 0 < self.topk_group <= self.n_group:
++            raise ValueError("topk_group must be in [1, n_group]")
++        self.swiglu_limit = float(get("swiglu_limit", 0.0))
++        use_bias = str(get("topk_method", "greedy")) == "noaux_tc"
++
++        self.gate = DraftMoEGate(self.n_experts, self.hidden_size, use_bias)
++        # ``experts.w{1,2,3}`` stacked [E, out, in]; the loader stacks the
++        # per-expert checkpoint tensors ``experts.{i}.w{1,2,3}.weight``.
++        self.experts = DraftRoutedExperts(
++            self.n_experts, self.hidden_size, self.intermediate_size
++        )
++
++        n_shared = int(get("n_shared_experts", 0) or 0)
++        if n_shared not in (0, 1):
++            raise ValueError("n_shared_experts must be 0 or 1 for MoE drafts")
++        shared_width = int(
++            _cfg(config, "shared_expert_intermediate_size", self.intermediate_size)
++        )
++        self.shared_experts: Optional[DraftSharedExpert] = (
++            DraftSharedExpert(self.hidden_size, shared_width, self.swiglu_limit)
++            if n_shared
++            else None
++        )
++        if not hasattr(torch, "_grouped_mm"):
++            logger.warning(
++                "torch._grouped_mm is unavailable; MoE draft experts fall back to a "
++                "per-expert loop with a host sync (not CUDA-graph safe)."
++            )
++
++    def route(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Return (weights [T,k] fp32, indices [T,k] long, counts [E] long)."""
++        scores = self.score_fn(self.gate(x))
++        selection = scores if self.gate.bias is None else scores + self.gate.bias
++        if self.topk_group < self.n_group:
++            selection = group_limited_mask(selection, self.n_group, self.topk_group)
++        indices = selection.topk(self.topk, dim=-1).indices
++        weights = scores.gather(1, indices)
++        if self.norm_topk_prob:
++            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
++        weights = weights * self.routed_scaling_factor
++        flat = indices.flatten()
++        counts = torch.zeros(
++            self.n_experts, dtype=torch.long, device=x.device
++        ).scatter_add_(0, flat, torch.ones_like(flat))
++        return weights, indices, counts
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        shape = x.shape
++        x = x.reshape(-1, self.hidden_size)
++        weights, indices, counts = self.route(x)
++        flat_expert = indices.flatten()
++        order = flat_expert.argsort(stable=True)
++        token_of = order // self.topk
++        x_sorted = x.index_select(0, token_of)
++        w_sorted = weights.reshape(-1, 1).index_select(0, order).float()
++        w1, w2, w3 = self.experts.w1, self.experts.w2, self.experts.w3
++        if x.is_cuda and hasattr(torch, "_grouped_mm"):
++            offs = counts.cumsum(0).to(torch.int32)
++            gate = torch._grouped_mm(x_sorted, w1.transpose(-1, -2), offs=offs)
++            up = torch._grouped_mm(x_sorted, w3.transpose(-1, -2), offs=offs)
++            h = w_sorted * swiglu_clamped(gate, up, self.swiglu_limit)
++            y_routed = torch._grouped_mm(
++                h.to(x.dtype), w2.transpose(-1, -2), offs=offs
++            )
++        else:
++            counts_list = counts.tolist()
++            parts = []
++            offset = 0
++            for i, n in enumerate(counts_list):
++                if n == 0:
++                    continue
++                seg = x_sorted[offset : offset + n]
++                h = w_sorted[offset : offset + n] * swiglu_clamped(
++                    F.linear(seg, w1[i]),
++                    F.linear(seg, w3[i]),
++                    self.swiglu_limit,
++                )
++                parts.append(F.linear(h.to(seg.dtype), w2[i]))
++                offset += n
++            y_routed = (
++                torch.cat(parts, dim=0)
++                if parts
++                else torch.zeros(0, self.hidden_size, dtype=x.dtype, device=x.device)
++            )
++        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
++        y = y.index_add(0, token_of, y_routed.float()).to(x.dtype)
++        if self.shared_experts is not None:
++            y = y + self.shared_experts(x)
++        return y.view(shape)
++
++
++class DFlashMoEDecoderLayer(DFlashDecoderLayer):
++    """``DFlashDecoderLayer`` with the dense MLP replaced by :class:`DraftMoEFFN`."""
++
++    def __init__(self, config, layer_id: int, quant_config=None) -> None:
++        # Build the attention half exactly like the base layer, without
++        # allocating the dense MLP the export does not carry.
++        nn.Module.__init__(self)
++        hidden_size = int(config.hidden_size)
++        rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
++        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
++        self.self_attn = self.attention_cls(
++            config=config, layer_id=layer_id, quant_config=quant_config
++        )
++        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
++        self.mlp = DraftMoEFFN(config)
++
++
++_PER_EXPERT_KEY = re.compile(
++    r"^(?P<base>(?:.*\.)?experts)\.(?P<idx>\d+)\.(?P<w>w[123])\.weight$"
++)
++
++
++def stack_expert_weights(
++    weights: Iterable[Tuple[str, torch.Tensor]],
++) -> List[Tuple[str, torch.Tensor]]:
++    """Turn ``experts.{i}.w{1,2,3}.weight`` entries into stacked ``experts.w{1,2,3}``.
++
++    Every other entry passes through unchanged. Raises if an expert index is
++    missing, so a truncated export cannot load half of a layer silently.
++    """
++    passthrough: List[Tuple[str, torch.Tensor]] = []
++    groups: Dict[Tuple[str, str], Dict[int, torch.Tensor]] = {}
++    for name, tensor in weights:
++        m = _PER_EXPERT_KEY.match(name)
++        if m is None:
++            passthrough.append((name, tensor))
++            continue
++        groups.setdefault((m["base"], m["w"]), {})[int(m["idx"])] = tensor
++    for (base, w), members in groups.items():
++        n = max(members) + 1
++        if sorted(members) != list(range(n)):
++            raise ValueError(
++                f"{base}.*.{w}.weight is missing expert indices: have {sorted(members)}"
++            )
++        passthrough.append((f"{base}.{w}", torch.stack([members[i] for i in range(n)])))
++    return passthrough
++
++
++class Qwen3MoEDSparkModel(DSparkDraftModel):
++    """DSpark draft with Qwen3-style attention and a DeepSeek-style MoE FFN."""
++
++    decoder_layer_cls = DFlashMoEDecoderLayer
++
++    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
++        if int(getattr(config, "n_routed_experts", 0) or 0) <= 0:
++            raise ValueError(
++                "Qwen3MoEDSparkModel requires n_routed_experts > 0 in the draft "
++                "config; use Qwen3DSparkModel for dense drafts."
++            )
++        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
++        ffn = self.layers[0].mlp
++        logger.info(
++            "MoE DSpark draft: %d routed experts, top-%d, width %d, shared=%s, "
++            "scoring=%s, bias=%s, scale=%.2f, swiglu_limit=%.1f",
++            ffn.n_experts,
++            ffn.topk,
++            ffn.intermediate_size,
++            ffn.shared_experts is not None,
++            ffn.scoring_func,
++            ffn.gate.bias is not None,
++            ffn.routed_scaling_factor,
++            ffn.swiglu_limit,
++        )
++
++    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
++        # Per-expert checkpoint tensors -> stacked module parameters. The
++        # (strict) base loader then rejects anything unexpected or missing.
++        super().load_weights(stack_expert_weights(weights))
++
++
++EntryClass = [Qwen3MoEDSparkModel]

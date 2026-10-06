@@ -282,6 +282,55 @@ class TestNormalizeDFlashExport(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "expected 16"):
                 self.module.normalize_export(str(path), 16)
 
+    def test_moe_dspark_export_names_the_moe_serving_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "block_size": 16,
+                        "model_type": "qwen3",
+                        "n_routed_experts": 64,
+                        "num_experts_per_tok": 6,
+                        "moe_intermediate_size": 2048,
+                        "dflash_config": {
+                            "projector_type": "dspark",
+                            "markov_rank": 256,
+                            "markov_head_type": "vanilla",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            normalized = self.module.normalize_export(str(path), 16)
+
+            self.assertEqual(normalized["architectures"], ["Qwen3MoEDSparkModel"])
+            self.assertEqual(normalized["n_routed_experts"], 64)
+
+    def test_rejects_moe_exports_without_a_moe_serving_class(self):
+        # DFlash and DFlash2 exports both carry projector_type "dflash"; the
+        # architecture name tells them apart. Neither has an MoE serving class.
+        for architectures in (None, ["DFlash2DraftModel"]):
+            with (
+                self.subTest(architectures=architectures),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                path = Path(tmp) / "config.json"
+                config = {
+                    "block_size": 16,
+                    "n_routed_experts": 16,
+                    "dflash_config": {"projector_type": "dflash"},
+                }
+                if architectures:
+                    config["architectures"] = architectures
+                path.write_text(json.dumps(config), encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "n_routed_experts=16"):
+                    self.module.normalize_export(str(path), 16)
+
+                self.assertEqual(json.loads(path.read_text()), config)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

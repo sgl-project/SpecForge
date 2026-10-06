@@ -124,8 +124,25 @@ sync; `sorted_loop` is the portable fallback). The trainer logs `moe/*` load
 metrics (max/min load ratios, unused-expert fraction, balancing-bias
 magnitude) alongside the usual scalars. Checkpoints keep the official
 per-expert naming (`layers.N.mlp.experts.{i}.w{1,2,3}.weight`,
-`layers.N.mlp.gate.bias`, `layers.N.mlp.shared_experts.w{1,2,3}.weight`), so
-exports load into SGLang's DeepSeek-V4 MoE unchanged.
+`layers.N.mlp.gate.bias`, `layers.N.mlp.shared_experts.w{1,2,3}.weight`).
+
+Serving the MoE arm needs an MoE-capable draft class on the SGLang side:
+the stock `Qwen3DSparkModel` has a dense MLP and silently drops every expert
+weight (the server starts, but the drafter is random and acceptance length
+sits at ~1.0). Until that class is upstream, apply
+`patches/sglang/v0.5.18/dspark-moe-draft.patch` on top of the spec-capture
+patch (`cd <sglang checkout or site-packages parent> && git apply
+<SpecForge>/patches/sglang/v0.5.18/dspark-moe-draft.patch`). It adds
+`sglang/srt/models/dspark_moe.py` (`Qwen3MoEDSparkModel`: the DSpark decoder
+with the dense MLP replaced by the DeepSeek-V4 routing above, experts loaded
+as stacked grouped-GEMM weights) and makes the DFlash-family loaders reject a
+checkpoint whose weights do not match the class, instead of serving
+uninitialised modules. `scripts/gates/normalize_dflash_export.py` writes
+`architectures: ["Qwen3MoEDSparkModel"]` for an export with
+`n_routed_experts > 0` and refuses MoE DFlash/DFlash2 exports, which have no
+serving class yet. `scripts/gates/check_dspark_moe_sglang_equivalence.py`
+checks the serving FFN against SpecForge's `MoELayer` bit-for-bit on the real
+64-expert sizes (grouped_mm and loop paths).
 
 ## Fresh attempts
 
