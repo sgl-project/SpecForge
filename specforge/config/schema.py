@@ -150,6 +150,7 @@ _OWNED_SERVER_ENV = {
     "HIP_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "ROCR_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "SGLANG_SPEC_CAPTURE_GPU_PUT": "capture_servers[].gpu_put",
+    "SGLANG_SPEC_CAPTURE_ARENA_BYTES": "mooncake.arena_bytes",
     "FLASHINFER_DISABLE_VERSION_CHECK": "the capture launcher",
 }
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -541,6 +542,23 @@ class TrainerDeploymentConfig(StrictConfigModel):
         return self
 
 
+def validate_receive_buffers(receive_buffers: str, protocol: str) -> None:
+    """Device receive buffers need a transport that writes device memory.
+
+    NVLink reads only into device memory, so it also requires them.
+    """
+    if receive_buffers == "cuda" and protocol not in ("rdma", "nvlink"):
+        raise ValueError(
+            "deployment.disaggregated.receive_buffers=cuda needs an RDMA or NVLink "
+            f"Mooncake transport; the effective MOONCAKE_PROTOCOL is {protocol!r}"
+        )
+    if protocol == "nvlink" and receive_buffers != "cuda":
+        raise ValueError(
+            "MOONCAKE_PROTOCOL=nvlink reads into device memory; set "
+            "deployment.disaggregated.receive_buffers=cuda"
+        )
+
+
 def _validate_cuda_devices(devices: List[str], *, field_name: str) -> None:
     for device in devices:
         if not device or device.strip() != device or "," in device:
@@ -559,9 +577,15 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metadata_port: int = Field(default=35880, gt=0, le=65535)
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
-    protocol: Literal["tcp", "rdma"] = "tcp"
+    #: ``nvlink`` (multi-node NVLink) keeps each capture server's objects in
+    #: an arena on its GPU instead of in the store; currently only online
+    #: NVLink capture uses the arena. See ``arena_bytes``.
+    protocol: Literal["tcp", "rdma", "nvlink"] = "tcp"
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
+    #: Arena size: HBM each capture server reserves for capture objects.
+    #: Required with ``nvlink``. Leave room for it below ``mem_fraction_static``.
+    arena_bytes: Optional[int] = Field(default=None, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
     #: Budget for one readiness probe, capped by the remaining startup timeout.
@@ -578,6 +602,13 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
         ports = (self.rpc_port, self.metadata_port, self.metrics_port)
         if len(set(ports)) != len(ports):
             raise ValueError("managed_local Mooncake ports must be unique")
+        # Currently only online NVLink capture uses the arena.
+        if (self.protocol == "nvlink") != (self.arena_bytes is not None):
+            raise ValueError(
+                "managed_local.mooncake.arena_bytes is required with protocol "
+                "'nvlink', the only protocol that uses the arena, and applies "
+                "only to it"
+            )
         if (
             not self.local_hostname
             or self.local_hostname.strip() != self.local_hostname
@@ -709,12 +740,19 @@ class ManagedLocalStackConfig(StrictConfigModel):
         if len(set(capture_ports)) != len(capture_ports):
             raise ValueError("managed_local capture server ports must be unique")
         if any(server.gpu_put for server in self.capture_servers) and (
-            self.mooncake.protocol != "rdma"
+            self.mooncake.protocol not in ("rdma", "nvlink")
         ):
             raise ValueError(
                 "managed_local capture_servers[].gpu_put needs mooncake.protocol "
-                f"'rdma'; the {self.mooncake.protocol!r} transport cannot read "
-                "device memory"
+                f"'rdma' or 'nvlink'; the {self.mooncake.protocol!r} transport "
+                "cannot read device memory"
+            )
+        if self.mooncake.protocol == "nvlink" and any(
+            server.gpu_put is False for server in self.capture_servers
+        ):
+            raise ValueError(
+                "managed_local mooncake.protocol 'nvlink' publishes device "
+                "memory; capture_servers[].gpu_put cannot be false"
             )
         overlap = mooncake_ports.intersection(capture_ports)
         if overlap:
@@ -801,16 +839,12 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     def _validate_store(self):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
-        if self.receive_buffers == "cuda" and self.managed_local is not None:
+        if self.managed_local is not None:
             # External deployments resolve environment overrides in the launch
             # plan. Managed-local transport is authoritative over the environment.
-            if self.managed_local.mooncake.protocol != "rdma":
-                raise ValueError(
-                    "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
-                    "Mooncake transport (mooncake_protocol or "
-                    "managed_local.mooncake.protocol = rdma); the TCP transport "
-                    "cannot write into device memory"
-                )
+            validate_receive_buffers(
+                self.receive_buffers, self.managed_local.mooncake.protocol
+            )
         if self.consumer_state_dir is not None and (
             not self.consumer_state_dir
             or self.consumer_state_dir.strip() != self.consumer_state_dir
@@ -1238,6 +1272,16 @@ class Config(StrictConfigModel):
                 )
             if self.training.resume_from is not None:
                 raise ValueError("managed_local does not support resume")
+            mooncake = managed_local.mooncake
+            if mooncake.protocol == "nvlink":
+                arenas = mooncake.arena_bytes * len(managed_local.capture_servers)
+                watermark = self.runtime.resident_high_watermark_bytes
+                if watermark is None or watermark > arenas:
+                    raise ValueError(
+                        f"NVLink capture keeps objects in {arenas} bytes of "
+                        "capture-server HBM (arena_bytes per server); set "
+                        "runtime.resident_high_watermark_bytes no higher"
+                    )
             minimum_context_length = (
                 self.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
             )

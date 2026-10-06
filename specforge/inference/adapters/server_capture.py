@@ -303,7 +303,7 @@ class SGLangServerCaptureAdapter:
         num_tokens = int(task.metadata.get("num_tokens", 0)) or len(
             task.payload["input_ids"]
         )
-        return SampleRef(
+        ref = SampleRef(
             sample_id=sample_id,
             run_id=self.run_id,
             source_task_id=task.task_id,
@@ -327,6 +327,19 @@ class SGLangServerCaptureAdapter:
                 "generation": gen,  # the zero-copy get() locator
             },
         )
+        if "arena" in result:
+            # Arena objects stay on the capture server; currently only online
+            # NVLink capture uses the arena.
+            from specforge.runtime.data_plane.mooncake_arena import REF_METADATA_KEY
+
+            ref.metadata[REF_METADATA_KEY] = {
+                "session": str(result["arena"]["session"]),
+                "control": str(result["arena"]["control"]),
+                "addresses": {
+                    name: int(meta["address"]) for name, meta in feats.items()
+                },
+            }
+        return ref
 
     # -- the RefSource entry point ----------------------------------------------
     def produce_refs(

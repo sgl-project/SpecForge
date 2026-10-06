@@ -126,46 +126,52 @@ def _env(name: str) -> str:
 
 
 def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
+    from specforge.config.schema import validate_receive_buffers
     from specforge.runtime.data_plane.disaggregated import AuthPolicy
     from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 
     token = os.environ.get("DISAGG_AUTH_TOKEN") or None
-    setup_kwargs = {
-        "local_hostname": os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"),
-        "metadata_server": _env("MOONCAKE_METADATA_SERVER"),
-        "master_server_addr": _env("MOONCAKE_MASTER_SERVER_ADDR"),
-        "protocol": os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
-        "rdma_devices": os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
-    }
-    for env_name, key in (
-        ("MOONCAKE_GLOBAL_SEGMENT_SIZE", "global_segment_size"),
-        ("DISAGG_CLIENT_SEGMENT_SIZE", "global_segment_size"),
-        ("MOONCAKE_LOCAL_BUFFER_SIZE", "local_buffer_size"),
-        ("DISAGG_CLIENT_BUFFER_SIZE", "local_buffer_size"),
-    ):
-        if os.environ.get(env_name):
-            setup_kwargs[key] = int(os.environ[env_name])
+    local_hostname = os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1")
+    protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp")
     deployment = cfg.deployment.disaggregated
     receive_kwargs: Dict[str, Any] = {
         "receive_buffers": deployment.receive_buffers if deployment else "pinned"
     }
     if os.environ.get("DISAGG_RECEIVE_BUFFERS"):
         receive_kwargs["receive_buffers"] = os.environ["DISAGG_RECEIVE_BUFFERS"]
-        if (
-            receive_kwargs["receive_buffers"] == "cuda"
-            and setup_kwargs["protocol"] != "rdma"
+    validate_receive_buffers(receive_kwargs["receive_buffers"], protocol)
+    if protocol == "nvlink":
+        # Currently only online NVLink capture uses the arena: objects stay on
+        # the capture servers and there is no store to join.
+        from specforge.runtime.data_plane.mooncake_arena import ArenaObjectClient
+
+        store_kwargs: Dict[str, Any] = {
+            "store": ArenaObjectClient(local_hostname=local_hostname)
+        }
+    else:
+        setup_kwargs = {
+            "local_hostname": local_hostname,
+            "metadata_server": _env("MOONCAKE_METADATA_SERVER"),
+            "master_server_addr": _env("MOONCAKE_MASTER_SERVER_ADDR"),
+            "protocol": protocol,
+            "rdma_devices": os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
+        }
+        for env_name, key in (
+            ("MOONCAKE_GLOBAL_SEGMENT_SIZE", "global_segment_size"),
+            ("DISAGG_CLIENT_SEGMENT_SIZE", "global_segment_size"),
+            ("MOONCAKE_LOCAL_BUFFER_SIZE", "local_buffer_size"),
+            ("DISAGG_CLIENT_BUFFER_SIZE", "local_buffer_size"),
         ):
-            raise ValueError(
-                "DISAGG_RECEIVE_BUFFERS=cuda needs MOONCAKE_PROTOCOL=rdma; the "
-                f"{setup_kwargs['protocol']!r} transport cannot write into device memory"
-            )
+            if os.environ.get(env_name):
+                setup_kwargs[key] = int(os.environ[env_name])
+        store_kwargs = {"setup_kwargs": setup_kwargs}
     if os.environ.get("DISAGG_RECEIVE_POOL_BYTES"):
         receive_kwargs["receive_pool_bytes"] = int(
             os.environ["DISAGG_RECEIVE_POOL_BYTES"]
         )
     return MooncakeFeatureStore(
         store_id=os.environ.get("DISAGG_STORE_ID", cfg.run_id),
-        setup_kwargs=setup_kwargs,
+        **store_kwargs,
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
