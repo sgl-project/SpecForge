@@ -6,7 +6,6 @@ import torch
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
-from transformers.integrations.flex_attention import compile_friendly_flex_attention
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
@@ -26,6 +25,7 @@ from .dflash_mask import (
     create_dflash_sdpa_mask,
     resolve_dflash_is_causal,
 )
+from .flex_attention import compile_friendly_flex_attention
 from .flex_attention_backend import flex_attention_backend
 from .registry import register_draft
 

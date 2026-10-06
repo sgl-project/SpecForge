@@ -4,11 +4,6 @@ from typing import Optional
 
 import torch
 
-try:
-    from torch.nn.attention.flex_attention import create_block_mask
-except ImportError:
-    create_block_mask = None
-
 
 def resolve_dflash_is_causal(is_causal: Optional[bool], layer_type: str) -> bool:
     """Resolve in-block causality the way SGLang's DFlash model does.
@@ -134,10 +129,14 @@ def create_dflash_block_mask(
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
 
+    # Imported lazily: the compiled wrapper pulls in torch._dynamo, which the
+    # dense-mask-only callers (and their sys.modules-patching tests) never need.
+    from .flex_attention import compile_friendly_create_block_mask
+
     kwargs = {}
     if flex_block_size is not None:
         kwargs["BLOCK_SIZE"] = flex_block_size
-    return create_block_mask(
+    return compile_friendly_create_block_mask(
         dflash_mask_mod,
         B=B,
         H=None,
