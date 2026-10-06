@@ -39,8 +39,9 @@ materialize/register/put timings and queue-to-stream latency.
 On multi-node NVLink systems (GB200/GB300 NVL72), `MOONCAKE_PROTOCOL=nvlink`
 moves captures GPU to GPU without the store. Mooncake's NVLink transport only
 exports fabric memory, where the store cannot place objects, so the v0.5.18
-sink copies captures into one `MOONCAKE_GLOBAL_SEGMENT_SIZE`-byte arena that
-the TransferEngine allocates on the writer GPU. Responses carry each object's
+sink copies captures into one `SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES`-byte
+arena (`managed_local.mooncake.nvlink_arena_bytes`) that the TransferEngine
+allocates on the writer GPU. Responses carry each object's
 device address. Trainers read with `transfer_sync_read` into
 `receive_buffers: cuda` and free objects wherever they would remove store
 objects, by writing the keys to the sink's control connection (port

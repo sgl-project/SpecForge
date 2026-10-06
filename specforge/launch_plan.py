@@ -377,6 +377,12 @@ def _disaggregated_env(
     if deployment.backend == "mooncake":
         protocol = values.get("MOONCAKE_PROTOCOL", "tcp")
         validate_receive_buffers(deployment.receive_buffers, protocol)
+        if protocol == "nvlink" and cfg.runtime.resident_high_watermark_bytes is None:
+            raise ValueError(
+                "MOONCAKE_PROTOCOL=nvlink keeps objects in capture-server HBM; set "
+                "runtime.resident_high_watermark_bytes at or below the servers' "
+                "summed SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"
+            )
         values.update(_mooncake_transport_env(protocol))
         # NVLink objects stay on the capture servers; no store endpoints.
         required = (
@@ -606,6 +612,15 @@ def _managed_local_services(
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
+            **(
+                {
+                    "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES": str(
+                        mooncake.nvlink_arena_bytes
+                    )
+                }
+                if mooncake.nvlink_arena_bytes is not None
+                else {}
+            ),
         }
         capture_services.append(
             ServiceSpec(

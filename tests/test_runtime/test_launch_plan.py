@@ -250,10 +250,14 @@ class LaunchPlanTest(unittest.TestCase):
         for command in plan.commands:
             self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "rdma")
 
-    def test_managed_nvlink_needs_device_publication_and_receives(self):
+    def test_managed_nvlink_needs_device_receives_and_bounded_arenas(self):
         raw = _managed_config("/shared/attempt-nvlink").model_dump()
         deployment = raw["deployment"]["disaggregated"]
-        deployment["managed_local"]["mooncake"]["protocol"] = "nvlink"
+        mooncake = deployment["managed_local"]["mooncake"]
+        mooncake["protocol"] = "nvlink"
+        with self.assertRaisesRegex(ValidationError, "nvlink_arena_bytes is required"):
+            Config.model_validate(raw)
+        mooncake["nvlink_arena_bytes"] = 8192
         with self.assertRaisesRegex(ValidationError, "receive_buffers=cuda"):
             Config.model_validate(raw)
         deployment["receive_buffers"] = "cuda"
@@ -261,6 +265,11 @@ class LaunchPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "gpu_put cannot be false"):
             Config.model_validate(raw)
         deployment["managed_local"]["capture_servers"][0]["gpu_put"] = None
+        for watermark in (None, 8193):
+            raw["runtime"]["resident_high_watermark_bytes"] = watermark
+            with self.assertRaisesRegex(ValidationError, "8192 bytes of"):
+                Config.model_validate(raw)
+        raw["runtime"]["resident_high_watermark_bytes"] = 8192
         with mock.patch(
             "specforge.training.capture_contract.resolve_server_capture_contract",
             return_value=CAPTURE_CONTRACT,
@@ -268,21 +277,32 @@ class LaunchPlanTest(unittest.TestCase):
             plan = build_launch_plan(
                 Config.model_validate(raw), config_path="run.yaml", env={}
             )
-        envs = [command.env for command in plan.commands]
-        envs.append(
-            next(
-                s for s in plan.services if s.command.label == "capture-server-0"
-            ).command.env
+        server = next(s for s in plan.services if s.command.label == "capture-server-0")
+        self.assertEqual(
+            server.command.env["SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"], "8192"
         )
-        for env in envs:
+        for env in [command.env for command in plan.commands] + [server.command.env]:
             self.assertEqual(env["MOONCAKE_PROTOCOL"], "nvlink")
             self.assertEqual(env["MC_FORCE_MNNVL"], "1")
 
-    def test_external_nvlink_needs_no_mooncake_store_endpoints(self):
+    def test_nvlink_arena_size_only_applies_to_nvlink(self):
+        raw = _managed_config("/shared/attempt-rdma").model_dump()
+        raw["deployment"]["disaggregated"]["managed_local"]["mooncake"].update(
+            protocol="rdma", nvlink_arena_bytes=8192
+        )
+        with self.assertRaisesRegex(ValidationError, "only applies to it"):
+            Config.model_validate(raw)
+
+    def test_external_nvlink_needs_a_watermark_but_no_store_endpoints(self):
         raw = _config(mode="disaggregated").model_dump()
         raw["deployment"]["disaggregated"].update(
             receive_buffers="cuda", mooncake_protocol="nvlink"
         )
+        with self.assertRaisesRegex(ValueError, "resident_high_watermark_bytes"):
+            build_launch_plan(
+                Config.model_validate(raw), config_path="run.yaml", env={}
+            )
+        raw["runtime"]["resident_high_watermark_bytes"] = 1 << 30
         plan = build_launch_plan(
             Config.model_validate(raw), config_path="run.yaml", env={}
         )

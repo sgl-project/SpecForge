@@ -150,6 +150,7 @@ _OWNED_SERVER_ENV = {
     "HIP_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "ROCR_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "SGLANG_SPEC_CAPTURE_GPU_PUT": "capture_servers[].gpu_put",
+    "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES": "mooncake.nvlink_arena_bytes",
     "FLASHINFER_DISABLE_VERSION_CHECK": "the capture launcher",
 }
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -576,12 +577,14 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metadata_port: int = Field(default=35880, gt=0, le=65535)
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
-    #: ``nvlink`` (multi-node NVLink) keeps each capture server's objects in a
-    #: ``global_segment_size_bytes`` fabric-memory arena on its GPU; reserve it
-    #: below ``mem_fraction_static``.
+    #: ``nvlink`` (multi-node NVLink) keeps each capture server's objects on
+    #: its GPU instead of in the store; see ``nvlink_arena_bytes``.
     protocol: Literal["tcp", "rdma", "nvlink"] = "tcp"
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
+    #: Required with ``nvlink``: HBM each capture server reserves for capture
+    #: objects. Leave room for it below ``mem_fraction_static``.
+    nvlink_arena_bytes: Optional[int] = Field(default=None, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
     #: Budget for one readiness probe, capped by the remaining startup timeout.
@@ -598,6 +601,11 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
         ports = (self.rpc_port, self.metadata_port, self.metrics_port)
         if len(set(ports)) != len(ports):
             raise ValueError("managed_local Mooncake ports must be unique")
+        if (self.protocol == "nvlink") != (self.nvlink_arena_bytes is not None):
+            raise ValueError(
+                "managed_local.mooncake.nvlink_arena_bytes is required with "
+                "protocol 'nvlink' and only applies to it"
+            )
         if (
             not self.local_hostname
             or self.local_hostname.strip() != self.local_hostname
@@ -1261,6 +1269,18 @@ class Config(StrictConfigModel):
                 )
             if self.training.resume_from is not None:
                 raise ValueError("managed_local does not support resume")
+            mooncake = managed_local.mooncake
+            if mooncake.protocol == "nvlink":
+                arenas = mooncake.nvlink_arena_bytes * len(
+                    managed_local.capture_servers
+                )
+                watermark = self.runtime.resident_high_watermark_bytes
+                if watermark is None or watermark > arenas:
+                    raise ValueError(
+                        f"NVLink capture keeps objects in {arenas} bytes of "
+                        "capture-server HBM (nvlink_arena_bytes per server); set "
+                        "runtime.resident_high_watermark_bytes no higher"
+                    )
             minimum_context_length = (
                 self.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
             )
