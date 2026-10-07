@@ -137,6 +137,7 @@ def _train(resolved) -> int:
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
+        expert_parallel_size=cfg.training.expert_parallel_size,
     )
     failed = True
     try:

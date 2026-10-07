@@ -128,6 +128,70 @@ drafts currently implements the GQA/MHA layout only, so plan benchmarks
 accordingly. DFlash2 otherwise follows the same mode selection; its convolution
 and selector do not change the attention projection contract.
 
+## MoE FFN for DFlash-family drafts
+
+Any DFlash-family draft (DFlash, DFlash2, DSpark) swaps its dense MLP for a
+sparse MoE FFN when the draft JSON sets `n_routed_experts > 0`. The MoE is one
+configurable layer (`specforge/modeling/draft/moe/`, see its `DESIGN.md`):
+a `moe_preset` names a target family's routing recipe, and the architecture
+keys use the target checkpoints' native HF names so they can be copied from
+the target's `config.json`:
+
+```json
+{
+  "moe_preset": "deepseek_v4",
+  "n_routed_experts": 64,
+  "num_experts_per_tok": 6,
+  "moe_intermediate_size": 2048,
+  "n_shared_experts": 1,
+  "dflash_config": {"moe_bias_update_rate": 0.001, "moe_dispatch": "grouped_mm"}
+}
+```
+
+Top-level keys override the preset (for ablations: `scoring_func`,
+`norm_topk_prob`, `routed_scaling_factor`, `balance`, `shared_expert_gate`,
+`swiglu_limit`, ...). Training-only knobs live under `dflash_config` with an
+`moe_` prefix and never change the checkpoint. Checkpoints, warm starts and
+exports keep the official per-expert naming (`experts.{i}.w{1,2,3}.weight`),
+so an exported drafter loads into SGLang unchanged. Dense drafts are
+unaffected: with no `n_routed_experts` the kernel provider's MLP is used as-is.
+
+`deepseek_v4` is the checked-in preset (DeepSeek-V4 routing:
+`sqrtsoftplus` scores, aux-loss-free `noaux_tc` balancing, combine weights
+renormalized and scaled by 1.5, one ungated shared expert, SwiGLU clamp 10);
+`configs/deepseek-v4-flash-dspark-moe.json` uses it. A new target family is a
+preset registration plus whichever components it needs (score function,
+balance controller, experts backend, shared expert); each registers by name
+from its own module.
+
+### Expert parallelism
+
+Experts that are trained (not `moe_freeze_experts`) can be sliced across ranks
+on the FSDP2 backend:
+
+```yaml
+training:
+  backend: fsdp2
+  expert_parallel_size: 4
+```
+
+Each MoE layer's routed experts are split across `expert_parallel_size`
+consecutive ranks (the EP group). Inside the layer the group all-gathers its
+tokens, every rank routes them with the replicated router and computes only the
+experts it owns, and a reduce-scatter returns each rank its own tokens summed
+over all owners. The expert slices are `DTensor`s over the `ep` mesh axis and
+FSDP2 shards them again over the ranks that hold the same slice (`efsdp`);
+everything else stays on the full data-parallel mesh. The EP axis is carved out
+of data parallelism, so ranks keep distinct data and the dense part of the draft
+is not computed twice. Checkpoints still gather to the full `[E, ...]` tensors
+and keep the official naming; the balance controller, warm start and exports
+are unchanged. Requirements: a MoE draft JSON, `backend: fsdp2`, a sharded
+`fsdp_sharding`, `tp_size: 1`, no sequence parallelism, and `n_routed_experts`
+divisible by `expert_parallel_size`. Expert parallelism adds one host sync per
+MoE layer (this rank's slot bounds in the sorted routing) and two fixed-size
+collectives; it pays off when the gathered expert weights, not the tokens,
+dominate the step.
+
 ## Draft architectures
 
 Draft classes register through `@register_draft`. The key defaults to the

@@ -88,6 +88,16 @@ servers. Its
 [runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
+`deepseek-v4-flash-dspark-moe-disaggregated.yaml` is the MoE-FFN arm of the
+drafter-architecture ablation: the same recipe with
+`configs/deepseek-v4-flash-dspark-moe.json`, whose `moe_preset: deepseek_v4`
+swaps the dense MLP for the target's routing (64 routed + 1 shared experts,
+top-6, width 2048); see the runbook's MoE section.
+`deepseek-v4-flash-dspark-moe-ep4-disaggregated.yaml` is that arm with the
+experts trained under expert parallelism on the FSDP2 backend
+(`training.backend: fsdp2`, `training.expert_parallel_size: 4`): each of the
+four trainer ranks owns 16 of the 64 experts instead of re-gathering all of
+them every micro-batch.
 
 `qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
 its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
@@ -273,6 +283,7 @@ Common fields:
 | Field | Default | What to write |
 | --- | --- | --- |
 | `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, or `dspark`. |
+| `training.backend` | `fsdp` | `fsdp` for FSDP1 or `fsdp2` for composable sharding. Both retain the DDP path for `NO_SHARD`; resume requires the original backend. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
@@ -288,6 +299,7 @@ Common fields:
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
 | `training.sp_ring_size` | `1` | Ring sequence-parallel factor for offline EAGLE3 USP. |
+| `training.expert_parallel_size` | `1` | Expert parallelism for MoE drafts on the FSDP2 backend: each MoE layer's routed experts are sliced across this many consecutive ranks (the group all-gathers its tokens and reduce-scatters the expert outputs) and FSDP2 shards the slice over the remaining ranks. Requires `backend: fsdp2`, a sharded `fsdp_sharding`, `tp_size: 1`, no sequence parallelism, a world size divisible by it, and `n_routed_experts` divisible by it. |
 | `training.dist_timeout` | `10` | Positive distributed-operation timeout in minutes. |
 | `training.save_interval` | `0` | Save every N optimizer steps; 0 disables periodic saves. A final checkpoint is still written. |
 | `training.eval_interval` | `0` | Evaluate every N optimizer steps; 0 disables evaluation. |

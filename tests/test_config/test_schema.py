@@ -856,3 +856,45 @@ class ConfigSchemaTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ExpertParallelSchemaTest(unittest.TestCase):
+    """``training.expert_parallel_size`` is an FSDP2-only, sharded-only knob."""
+
+    def _payload(self, **training):
+        payload = copy.deepcopy(MINIMAL)
+        payload["training"] = dict(training)
+        return payload
+
+    def test_defaults_to_one(self):
+        config = Config.model_validate(self._payload())
+        self.assertEqual(config.training.expert_parallel_size, 1)
+        config.validate_world_size(3)
+
+    def test_requires_the_fsdp2_backend(self):
+        with self.assertRaisesRegex(ValidationError, "expert_parallel_size"):
+            Config.model_validate(self._payload(expert_parallel_size=2))
+        config = Config.model_validate(
+            self._payload(backend="fsdp2", expert_parallel_size=2)
+        )
+        self.assertEqual(config.training.expert_parallel_size, 2)
+
+    def test_rejects_no_shard_and_model_parallel_combinations(self):
+        with self.assertRaisesRegex(ValidationError, "NO_SHARD"):
+            Config.model_validate(
+                self._payload(
+                    backend="fsdp2", expert_parallel_size=2, fsdp_sharding="NO_SHARD"
+                )
+            )
+        with self.assertRaisesRegex(ValidationError, "tp_size=1"):
+            Config.model_validate(
+                self._payload(backend="fsdp2", expert_parallel_size=2, tp_size=2)
+            )
+
+    def test_world_size_must_be_divisible(self):
+        config = Config.model_validate(
+            self._payload(backend="fsdp2", expert_parallel_size=2)
+        )
+        config.validate_world_size(4)
+        with self.assertRaisesRegex(ValueError, "expert_parallel_size"):
+            config.validate_world_size(3)
