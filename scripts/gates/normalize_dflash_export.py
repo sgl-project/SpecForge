@@ -21,13 +21,31 @@ _DFLASH2_FIELDS = (
     "selector_rank",
     "selector_top_k",
 )
+# SGLang draft class that serves a DSpark export whose FFN is a DeepSeek-style
+# MoE (``moe_preset`` drafts); the dense classes silently ignore expert weights.
+_MOE_DSPARK_ARCHITECTURE = "Qwen3MoEDSparkModel"
 
 
 def _positive_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _is_moe_export(config: Dict[str, Any]) -> bool:
+    return _positive_integer(config.get("n_routed_experts"))
+
+
+def _reject_moe_for_dense_architecture(config: Dict[str, Any], arch: str) -> None:
+    if _is_moe_export(config):
+        raise ValueError(
+            f"export carries n_routed_experts={config['n_routed_experts']} but "
+            f"SGLang's {arch} has a dense MLP and no MoE-capable variant; its "
+            "loader would drop the expert weights. Only DSpark MoE exports "
+            f"({_MOE_DSPARK_ARCHITECTURE}) can be served."
+        )
+
+
 def _normalize_dflash2(config: Dict[str, Any], method_config: Dict[str, Any]) -> None:
+    _reject_moe_for_dense_architecture(config, _DFLASH2_ARCHITECTURE)
     for key in _DFLASH2_FIELDS:
         value = method_config.get(key)
         if not _positive_integer(value):
@@ -83,7 +101,11 @@ def _normalize_dspark(config: Dict[str, Any], method_config: Dict[str, Any]) -> 
     # The two required fields may already be top-level rather than nested.
     config["markov_rank"] = markov_rank
     config["markov_head_type"] = markov_head_type.lower()
-    config["architectures"] = ["Qwen3DSparkModel"]
+    # An MoE-FFN export must name an MoE-capable draft class: SGLang's dense
+    # Qwen3DSparkModel would drop every expert weight and serve random MLPs.
+    config["architectures"] = [
+        _MOE_DSPARK_ARCHITECTURE if _is_moe_export(config) else "Qwen3DSparkModel"
+    ]
 
 
 def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, Any]:
@@ -131,6 +153,7 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
     elif _DFLASH2_ARCHITECTURE in (config.get("architectures") or []):
         _normalize_dflash2(config, method_config)
     else:
+        _reject_moe_for_dense_architecture(config, "DFlashDraftModel")
         config["architectures"] = ["DFlashDraftModel"]
     config.pop("auto_map", None)
     with path.open("w", encoding="utf-8") as handle:
