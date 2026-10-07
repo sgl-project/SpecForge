@@ -898,6 +898,9 @@ class TrainingConfig(StrictConfigModel):
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
     batch_size: int = Field(default=1, gt=0)
+    #: Concatenate the samples of each microbatch, retaining document boundaries
+    #: and the original loss normalization. Text EAGLE3/DFlash/DFlash2 + FlexAttention.
+    sequence_packing: bool = False
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
@@ -991,6 +994,14 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.sequence_packing:
+            if self.attention_backend != "flex_attention":
+                raise ValueError("training.sequence_packing requires flex_attention")
+            if self.compact_teacher or self.trim_loss_positions:
+                raise ValueError(
+                    "training.sequence_packing currently requires compact_teacher=false, "
+                    "trim_loss_positions=false"
+                )
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:

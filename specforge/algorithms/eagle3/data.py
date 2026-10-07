@@ -87,17 +87,86 @@ def build_offline_collator():
     return DataCollatorWithPadding()
 
 
+class DataCollatorWithPacking:
+    """Pack one logical microbatch without changing its samples or loss weight.
+
+    Each sample is a normalized, unpadded text feature with batch dimension one.
+    The model uses ``sequence_lengths`` for attention and TTT boundaries. Keeping
+    the original padded denominator makes this an execution optimization, not
+    a change to the EAGLE3 objective or optimizer schedule.
+    """
+
+    def __call__(self, features):
+        import torch
+
+        if not features:
+            raise ValueError("cannot pack an empty feature batch")
+        keys = ("input_ids", "loss_mask", "hidden_state", "target", "attention_mask")
+        lengths = []
+        for feature in features:
+            missing = set(keys) - feature.keys()
+            if missing:
+                raise KeyError(f"packed sample is missing features: {sorted(missing)}")
+            ids = feature["input_ids"]
+            if ids.ndim != 2 or ids.shape[0] != 1 or ids.shape[1] == 0:
+                raise ValueError("packing requires nonempty [1, length] input_ids")
+            length = ids.shape[1]
+            for key in keys:
+                tensor = feature[key]
+                ndim = 3 if key in ("hidden_state", "target") else 2
+                if tensor.ndim != ndim or tensor.shape[:2] != (1, length):
+                    raise ValueError(f"packing requires aligned unbatched {key}")
+            if not bool((feature["attention_mask"] == 1).all()):
+                raise ValueError("packing requires unpadded samples")
+            if "position_ids" in feature:
+                expected = torch.arange(length, device=ids.device).unsqueeze(0)
+                if not torch.equal(feature["position_ids"], expected):
+                    raise ValueError("packing supports standard text position_ids only")
+            lengths.append(length)
+
+        batch = {key: torch.cat([f[key] for f in features], dim=1) for key in keys}
+        batch["position_ids"] = torch.cat(
+            [torch.arange(n, device=batch["input_ids"].device) for n in lengths]
+        ).unsqueeze(0)
+        # These small descriptors stay on the host until the strategy builds
+        # the device layout; no GPU scalar synchronization is needed.
+        batch["sequence_lengths"] = torch.tensor(lengths, dtype=torch.long)
+        batch["loss_denominator"] = torch.tensor(
+            len(lengths) * max(lengths), dtype=torch.long
+        )
+        return batch
+
+
+def build_packed_collator():
+    return DataCollatorWithPacking()
+
+
 def build_server_collator():
     from specforge.algorithms.common.collation import concatenate_features
 
     return concatenate_features
 
 
+def build_padded_server_collator():
+    """Accept ragged, unshifted EAGLE3 features from separate capture requests."""
+    from specforge.algorithms.common.collation import pad_and_concatenate_features
+
+    keys = ("input_ids", "attention_mask", "loss_mask", "hidden_state", "target")
+    return partial(
+        pad_and_concatenate_features,
+        sequence_axes={key: 1 for key in keys},
+        required_keys=keys,
+    )
+
+
 __all__ = [
+    "DataCollatorWithPacking",
     "NORMALIZER_ID",
     "build_offline_collator",
     "build_offline_normalizer",
     "build_offline_reader",
+    "build_packed_collator",
+    "build_padded_server_collator",
     "build_server_collator",
     "normalize_offline_sample",
 ]

@@ -78,6 +78,24 @@ def _validate_algorithm_capabilities(
 ) -> None:
     capabilities = algorithm.spec.capabilities
     training = cfg.training
+    if training.sequence_packing:
+        provider = (
+            algorithm.providers.offline_for(cfg.model.input_modality)
+            if mode is FeatureMode.OFFLINE
+            else algorithm.providers.server_streaming_for(cfg.model.input_modality)
+        )
+        if provider.build_packed_collator is None:
+            raise ValueError(
+                f"algorithm {algorithm.name!r} does not support training.sequence_packing "
+                f"for modality {cfg.model.input_modality!r}"
+            )
+        if (
+            training.lk_loss_type is not None
+            and not capabilities.supports_packed_lk_loss
+        ):
+            raise ValueError(
+                f"algorithm {algorithm.name!r} does not support sequence_packing with lk_loss_type"
+            )
     if training.attention_backend not in capabilities.attention_backends:
         raise ValueError(
             f"algorithm {algorithm.name!r} does not support attention_backend="

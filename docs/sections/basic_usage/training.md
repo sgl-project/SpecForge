@@ -549,6 +549,39 @@ a complete checkpoint and points `<run_id>-best` at it, even when
 `training.save_interval` is zero. `<run_id>-latest` continues to identify the
 newest complete checkpoint.
 
+## Sequence packing
+
+Text EAGLE3, DFlash, and DFlash2 can pack variable-length samples within each
+microbatch for offline training/evaluation and online disaggregated consumers:
+
+```yaml
+training:
+  attention_backend: flex_attention
+  sequence_packing: true
+```
+
+Packing defaults to `false`. DFlash2 uses `training.strategy: dflash` with a
+DFlash2 draft-model config. FlexAttention is required; USP, multimodal inputs,
+other algorithms, `compact_teacher`, and `trim_loss_positions` are unsupported.
+DFlash/DFlash2 LK and D-PACE are supported; EAGLE3 LK is not.
+
+Packing concatenates the existing microbatch, resets positions per document,
+and isolates attention, labels, and teacher shifts. It preserves sample order,
+logical batch size, loss normalization, gradient accumulation, and optimizer
+schedule. `data.max_length` still limits each original sample; the packed row
+can exceed that length.
+
+DFlash/DFlash2 preserve per-document anchor sampling. Invalid padded proposal
+slots skip the backbone when host metadata is available; outputs return to the
+original batch/anchor/block layout for objectives and metrics. Online packing
+happens after the consumer fetches target features, preserving individual
+capture requests and sample-ID acknowledgements.
+
+Gains depend on sequence lengths, valid proposal counts, and pipeline overhead.
+Batch size one or equal-length samples have no inter-sample context padding to
+remove. Compare the same samples, batch size, and accumulation using unpadded
+tokens/s; training gains do not imply faster speculative serving.
+
 ## Compact offline teacher
 
 Offline text EAGLE3 can project teacher targets in exact vocabulary chunks

@@ -22,7 +22,7 @@
 
 """EAGLE3 training model implementation."""
 
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,7 @@ from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspA
 from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
+from specforge.modeling.packed_sequence import PackedSequenceLayout
 from specforge.utils import padding
 
 
@@ -262,6 +263,8 @@ class OnlineEagle3Model(Eagle3Model):
         target_head_weight: Optional[torch.Tensor] = None,
         compact_teacher_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
         trim_loss_positions: bool = False,
+        sequence_lengths: Optional[Union[torch.Tensor, Tuple[int, ...]]] = None,
+        loss_denominator: Optional[Union[torch.Tensor, int]] = None,
     ) -> Tuple[
         List[torch.Tensor],
         List[torch.Tensor],
@@ -285,7 +288,42 @@ class OnlineEagle3Model(Eagle3Model):
                 states in draft-vocab space and ``target`` is ignored.
             trim_loss_positions: compute the teacher, draft logits and loss only at
                 supervised positions when the batch/objective supports it.
+            sequence_lengths: CPU int64 document lengths (or a Python tuple) for a packed single row.
+                The strategy has already shifted input and target fields per document.
+            loss_denominator: optional CPU scalar equal to document count times
+                the longest document, preserving the padded batch's mean loss.
         """
+        packed_layout = None
+        if sequence_lengths is not None:
+            if self.attention_backend != "flex_attention":
+                raise ValueError("sequence packing currently requires flex_attention")
+            if (
+                trim_loss_positions
+                or target_hidden_for_compact is not None
+                or self.lk_loss_type is not None
+            ):
+                raise ValueError(
+                    "sequence packing does not support trim, compact teacher, or LK loss"
+                )
+            if input_ids.shape[0] != 1 or hidden_states.shape[:2] != input_ids.shape:
+                raise ValueError("sequence packing requires one concatenated batch row")
+            packed_layout = PackedSequenceLayout.from_lengths(
+                sequence_lengths, input_ids.shape[1], hidden_states.device
+            )
+            if loss_denominator is not None:
+                if isinstance(loss_denominator, torch.Tensor) and (
+                    loss_denominator.device.type != "cpu"
+                    or loss_denominator.numel() != 1
+                ):
+                    raise ValueError("loss_denominator must be a scalar CPU tensor")
+                if int(loss_denominator) != packed_layout.padded_denominator:
+                    raise ValueError(
+                        "loss_denominator must equal document_count * longest_document"
+                    )
+            if position_ids is None:
+                position_ids = packed_layout.positions.unsqueeze(0)
+        elif loss_denominator is not None:
+            raise ValueError("loss_denominator requires sequence_lengths")
         adapter = self._make_adapter()
         # Step 1: handle vocab size
         if target_hidden_for_compact is not None:
@@ -385,7 +423,9 @@ class OnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
+        if packed_layout is not None:
+            attention_mask = packed_layout
+        elif self.attention_backend == "sdpa":
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
@@ -527,6 +567,16 @@ class OnlineEagle3Model(Eagle3Model):
                     position_mask=state.position_mask,
                     loss_mask=state.loss_mask,
                     adapter=adapter,
+                    loss_scale=(
+                        seq_length / packed_layout.padded_denominator
+                        if packed_layout is not None
+                        else 1.0
+                    ),
+                    full_positions=(
+                        packed_layout.padded_denominator
+                        if packed_layout is not None
+                        else None
+                    ),
                 )
             acces.append(acc)
             acceptance_rates.append(acceptance_rate)
@@ -538,9 +588,14 @@ class OnlineEagle3Model(Eagle3Model):
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
-                global_input_ids = padding(global_input_ids, left=False)
-                position_mask = padding(position_mask, left=False)
-                loss_mask = padding(loss_mask, left=False)
+                if packed_layout is None:
+                    global_input_ids = padding(global_input_ids, left=False)
+                    position_mask = padding(position_mask, left=False)
+                    loss_mask = padding(loss_mask, left=False)
+                else:
+                    global_input_ids = packed_layout.shift_left(global_input_ids)
+                    position_mask = packed_layout.shift_left(position_mask)
+                    loss_mask = packed_layout.shift_left(loss_mask)
                 # Flex attention mask shirnking is handled inside attention module
         return (
             plosses,
