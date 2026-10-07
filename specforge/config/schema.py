@@ -894,6 +894,7 @@ class DeploymentConfig(StrictConfigModel):
 
 class TrainingConfig(StrictConfigModel):
     strategy: str = "eagle3"
+    backend: Literal["fsdp", "fsdp2"] = "fsdp"
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
@@ -974,6 +975,9 @@ class TrainingConfig(StrictConfigModel):
     log_interval: int = Field(default=50, gt=0)
     #: CheckpointManager rotation: keep the newest N checkpoints (0 = keep all).
     max_checkpoints: int = Field(default=0, ge=0)
+    #: Write interval checkpoints on a background thread; the step loop only
+    #: stages tensors to the host. ``fit`` still waits for the final save.
+    checkpoint_async: bool = False
     #: Offline EAGLE3 teacher projection without materializing full-vocab fp32
     #: logits. Exact, but trades additional head passes for lower peak memory.
     compact_teacher: bool = False

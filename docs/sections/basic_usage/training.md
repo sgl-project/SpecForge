@@ -487,6 +487,30 @@ publishes the exact schedule horizon and the consumer trains to EOF.
 
 ## Parallel topologies
 
+`training.backend` selects `fsdp` (the existing FSDP1 implementation, default)
+or `fsdp2` (PyTorch composable `fully_shard`). For example:
+
+```yaml
+training:
+  backend: fsdp2
+  fsdp_sharding: SHARD_GRAD_OP
+```
+
+Both backends retain BF16 compute, FP32 optimizer masters, gradient accumulation,
+and `training.optimizer_cpu_offload`. `SHARD_GRAD_OP` keeps parameters gathered
+through backward and between gradient-accumulation micro-steps, resharding at
+the optimizer boundary. This trades higher live memory between micro-steps for
+fewer all-gathers. `FULL_SHARD` reshards child blocks after forward but keeps the
+root gathered for backward; all units reshard after each backward. Both
+backends use DDP for `NO_SHARD`. Configured sharding takes precedence over the
+legacy `FSDP_SHARDING` environment fallback used by direct Python builders.
+
+FSDP2 uses per-parameter DTensor shards and explicit block-level sharding. Its
+memory management avoids FSDP1's CPU all-gather rate limiter and provides a
+foundation for future DTensor-based parallelism. Throughput and peak memory
+still depend on the model and sharding policy; selecting FSDP2 alone does not
+guarantee a speedup or enable tensor parallelism.
+
 The launcher creates every process group from the typed run config:
 
 - Online target TP/EP belongs to each external SGLang capture server, not the
@@ -657,6 +681,14 @@ checkpoint step, skips acknowledged refs, and requeues the unacknowledged tail.
 The producer itself is not restarted or resumed. Optimizer/FSDP checkpoints
 currently require the same trainer world size; control-plane ref redistribution
 does not imply optimizer-state resharding.
+
+Resume also requires the same training backend and sharding strategy. Old
+checkpoints without backend metadata are treated as FSDP1 checkpoints. FSDP1's
+flat-parameter optimizer shards cannot be loaded into FSDP2's per-parameter
+layout. To switch backends, export the draft and start a new run from its model
+weights; optimizer moments, scheduler position, and FP32 master precision are
+not transferred by that workflow. FSDP2 retains the existing full draft-weight
+checkpoint format, so HF and SGLang export commands remain the same.
 
 Training metrics are printed every `training.log_interval` steps and forwarded
 to the configured tracking backend.
