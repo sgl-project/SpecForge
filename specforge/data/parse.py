@@ -513,8 +513,8 @@ class ThinkingParser(GeneralParser):
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         """Parse conversation, processing all assistant turns for loss mask."""
-        if self.chat_template.enable_thinking:
-            kwargs["enable_thinking"] = True
+        if self.chat_template.enable_thinking is not None:
+            kwargs["enable_thinking"] = self.chat_template.enable_thinking
         return super().parse(
             conversation, max_length, preformatted, train_only_last_turn, tool, **kwargs
         )

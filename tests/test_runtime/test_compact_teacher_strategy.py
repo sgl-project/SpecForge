@@ -3,6 +3,7 @@
 
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -79,7 +80,11 @@ class _TargetHead(torch.nn.Module):
         self.forward_calls = 0
 
     def preprocess(self, input_ids, target, loss_mask):
-        return input_ids[:, 1:], target[:, 1:], loss_mask[:, 1:, None]
+        return (
+            padding(input_ids, left=False),
+            padding(target, left=False),
+            padding(loss_mask, left=False)[..., None],
+        )
 
     def forward(self, hidden):
         self.forward_calls += 1
@@ -161,6 +166,20 @@ class CompactTeacherStrategyTest(unittest.TestCase):
         _assert_teacher_close(
             self, actual, _reference_teacher(full_logits, t2d, loss_mask)
         )
+
+    def test_compact_teacher_projects_each_vocab_row_once(self):
+        hidden, weight, t2d, loss_mask = _numerical_inputs()
+        linear = torch.nn.functional.linear
+
+        with mock.patch(
+            "specforge.core.compact_teacher.F.linear", wraps=linear
+        ) as mock_linear:
+            compute_target_from_hidden(hidden, weight, t2d, loss_mask, chunk_size=7)
+
+        projected_rows = sum(
+            call.args[1].shape[0] for call in mock_linear.call_args_list
+        )
+        self.assertEqual(projected_rows, weight.shape[0])
 
     def test_argmax_tie_across_chunks_uses_lowest_vocab_id(self):
         hidden = torch.ones(1, 1, 4)
@@ -301,10 +320,11 @@ class CompactTeacherStrategyTest(unittest.TestCase):
 
         self.assertEqual(head.forward_calls, 0)
         self.assertIsNone(model.kwargs["target"])
-        self.assertEqual(model.kwargs["target_hidden_for_compact"].shape, (1, 3, 4))
+        self.assertEqual(model.kwargs["target_hidden_for_compact"].shape, (1, 4, 4))
         self.assertIs(model.kwargs["target_head_weight"], head.fc.weight)
         self.assertEqual(model.kwargs["compact_teacher_chunk_size"], 2)
-        self.assertEqual(model.kwargs["loss_mask"].shape, (1, 3, 1))
+        self.assertEqual(model.kwargs["loss_mask"].shape, (1, 4, 1))
+        self.assertEqual(model.kwargs["loss_mask"].squeeze(-1).tolist(), [[1, 1, 1, 0]])
 
     def test_default_path_remains_full_vocab_projection(self):
         model = _Eagle3()
@@ -313,7 +333,7 @@ class CompactTeacherStrategyTest(unittest.TestCase):
         Eagle3TrainStrategy(model, target_head=head).forward_loss(_batch())
 
         self.assertEqual(head.forward_calls, 1)
-        self.assertEqual(model.kwargs["target"].shape, (1, 3, 8))
+        self.assertEqual(model.kwargs["target"].shape, (1, 4, 8))
         self.assertNotIn("target_hidden_for_compact", model.kwargs)
         self.assertFalse(model.kwargs["trim_loss_positions"])
 

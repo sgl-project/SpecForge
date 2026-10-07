@@ -43,54 +43,6 @@ else:
     _std_flash_attn_import_error = None
 
 
-# Copied from transformers.models.bart.modeling_bart._make_causal_mask
-def _make_causal_mask(
-    input_ids_shape: torch.Size,
-    dtype: torch.dtype,
-    device: torch.device,
-    past_key_values_length: int = 0,
-):
-    """
-    Make causal mask used for bi-directional self-attention.
-    """
-    bsz, tgt_len = input_ids_shape
-    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
-    mask_cond = torch.arange(mask.size(-1), device=device)
-    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-    mask = mask.to(dtype)
-
-    if past_key_values_length > 0:
-        mask = torch.cat(
-            [
-                torch.zeros(
-                    tgt_len, past_key_values_length, dtype=dtype, device=device
-                ),
-                mask,
-            ],
-            dim=-1,
-        )
-    return mask[None, None, :, :].expand(
-        bsz, 1, tgt_len, tgt_len + past_key_values_length
-    )
-
-
-# Copied from transformers.models.bart.modeling_bart._expand_mask
-def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
-    """
-    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
-    """
-    bsz, src_len = mask.size()
-    tgt_len = tgt_len if tgt_len is not None else src_len
-
-    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
-
-    inverted_mask = 1.0 - expanded_mask
-
-    return inverted_mask.masked_fill(
-        inverted_mask.to(torch.bool), torch.finfo(dtype).min
-    )
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -185,34 +137,6 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-def prepare_decoder_attention_mask(
-    attention_mask, input_shape, inputs_embeds, past_key_values_length
-):
-    # create causal mask
-    # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-    combined_attention_mask = None
-    if input_shape[-1] > 1:
-        combined_attention_mask = _make_causal_mask(
-            input_shape,
-            inputs_embeds.dtype,
-            device=inputs_embeds.device,
-            past_key_values_length=past_key_values_length,
-        )
-
-    if attention_mask is not None:
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        expanded_attn_mask = _expand_mask(
-            attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
-        ).to(inputs_embeds.device)
-        combined_attention_mask = (
-            expanded_attn_mask
-            if combined_attention_mask is None
-            else expanded_attn_mask + combined_attention_mask
-        )
-
-    return combined_attention_mask
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
@@ -1687,7 +1611,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_output = getattr(config, "norm_output", True)
+        self.norm_output = getattr(config, "norm_output", False)
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
@@ -1734,27 +1658,26 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask = torch.ones(
                 (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
             )
-        attention_mask = prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, 0
+        attention_mask = self.prepare_decoder_attention_mask(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            past_key_values_length=0,
         )
 
         # fc
         hidden_states = self.project_hidden_states(hidden_states)
-        hidden_states = self.midlayer(
-            input_emb=inputs_embeds,
+
+        return self.backbone(
+            input_embeds=inputs_embeds,
             hidden_states=hidden_states,
             cache_hidden=cache_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
-            output_attentions=False,
             use_cache=False,
         )
-
-        # norm
-        hidden_states = self.norm(hidden_states)
-
-        return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1770,11 +1693,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.norm_output:
-            norm_hidden_states = self.norm(hidden_states)
-        else:
-            norm_hidden_states = hidden_states
-        return self.lm_head(norm_hidden_states)
+        return self.lm_head(
+            hidden_states if self.norm_output else self.norm(hidden_states)
+        )
 
     def backbone(
         self,
@@ -1786,7 +1707,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        return self.midlayer(
+        hidden_states = self.midlayer(
             input_emb=input_embeds,
             hidden_states=hidden_states,
             cache_hidden=cache_hidden,
@@ -1796,3 +1717,4 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             output_attentions=False,
             use_cache=False,
         )
+        return self.norm(hidden_states) if self.norm_output else hidden_states

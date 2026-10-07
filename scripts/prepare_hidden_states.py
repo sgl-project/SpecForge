@@ -74,6 +74,8 @@ from specforge.distributed import (
 )
 from specforge.offline_capture import OfflineSGLangCapture, load_offline_capture
 from specforge.utils import (
+    get_device_type,
+    is_xpu,
     load_tokenizer,
     print_args_with_dots,
     print_with_rank,
@@ -632,11 +634,11 @@ class HiddenStatesGenerator:
                     output_path, current_batch_indices
                 )
                 exists_tensor = torch.tensor(
-                    exists_list, dtype=torch.bool, device="cuda"
+                    exists_list, dtype=torch.bool, device=get_device_type()
                 )
             else:
                 exists_tensor = torch.tensor(
-                    [False] * batch_size, dtype=torch.bool, device="cuda"
+                    [False] * batch_size, dtype=torch.bool, device=get_device_type()
                 )
             dist.broadcast(exists_tensor, src=tp_rank_0_global, group=tp_group)
 
@@ -673,7 +675,8 @@ class HiddenStatesGenerator:
                 continue
 
             filtered_batch_gpu = {
-                k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
+                k: v.to(get_device_type(), non_blocking=True)
+                for k, v in filtered_batch.items()
             }
             captured = self.model.capture(
                 **filtered_batch_gpu,
@@ -757,6 +760,8 @@ class HiddenStatesGenerator:
 
 def main():
     args = parse_args()
+    if is_xpu():
+        args.sglang_attention_backend = "triton"
     if args.num_io_threads is None:
         cpu_cores = os.cpu_count() or 1
         args.num_io_threads = max(1, cpu_cores)

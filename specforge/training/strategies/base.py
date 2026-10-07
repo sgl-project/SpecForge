@@ -40,6 +40,9 @@ class StepOutput:
     metrics: Dict[str, Any]
     ratio_metrics: Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
     loss_terms: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Additive telemetry (for example reached/accepted counts), summed across
+    # the optimizer window and data-parallel ranks, never averaged.
+    sum_metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -70,10 +73,12 @@ def linear_lambda_base(
 def _cpu_max_valid_anchors(loss_mask: torch.Tensor) -> Optional[int]:
     """Count the widest valid anchor row without synchronizing the GPU.
 
-    Online/offline loaders hand strategies CPU tensors.  Computing this one
-    scalar before the asynchronous H2D copies lets DFlash-family models size
-    their anchor tensors without a CUDA ``item()`` in the forward critical
-    path.  Direct GPU callers keep the model's existing fallback.
+    Online/offline loaders hand strategies CPU integer features; Mooncake
+    device consumers keep them on the host while hidden states land on the
+    GPU.  Computing this one scalar before the asynchronous H2D copies lets
+    DFlash-family models size their anchor tensors without a CUDA ``item()``
+    in the forward critical path.  Direct GPU callers keep the model's
+    existing fallback.
     """
     if loss_mask.device.type != "cpu":
         return None
@@ -468,22 +473,34 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.dflash_model.parameters()).device
 
+    def _draft_attr(self, name: str, default: float) -> float:
+        """Read a schedule or diagnostics attribute from the draft model.
+
+        Under ``fsdp_sharding: NO_SHARD`` the backend wraps the draft in
+        ``DistributedDataParallel``, which does not forward attribute access
+        to the wrapped module, so ``selector_loss_alpha`` and the warmup and
+        ramp ratios read as their defaults and the selector objective is
+        silently disabled. Look through the wrapper when the attribute is
+        not on the outer module.
+        """
+        model = self.dflash_model
+        if not hasattr(model, name):
+            inner = getattr(model, "module", None)
+            if isinstance(inner, nn.Module):
+                model = inner
+        return float(getattr(model, name, default))
+
     def _selector_loss_alpha(self, ctx: Optional[StepContext]) -> float:
-        target = float(getattr(self.dflash_model, "selector_loss_alpha", 0.0))
+        target = self._draft_attr("selector_loss_alpha", 0.0)
         if target <= 0 or ctx is None or not ctx.total_steps:
             return target
 
         total_steps = int(ctx.total_steps)
-        warmup_steps = int(
-            total_steps
-            * float(getattr(self.dflash_model, "selector_warmup_ratio", 0.0))
-        )
+        warmup_steps = int(total_steps * self._draft_attr("selector_warmup_ratio", 0.0))
         if ctx.global_step < warmup_steps:
             return 0.0
 
-        ramp_steps = int(
-            total_steps * float(getattr(self.dflash_model, "selector_ramp_ratio", 0.0))
-        )
+        ramp_steps = int(total_steps * self._draft_attr("selector_ramp_ratio", 0.0))
         if ramp_steps <= 0:
             return target
         ramp_progress = min(
@@ -513,7 +530,13 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         if ctx is not None:
             model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
         target_last_hidden_states = t.get("target_last_hidden_states")
-        if target_last_hidden_states is not None and collect_detailed_metrics:
+        # Teacher hidden states only feed diagnostics; skip the copy when the
+        # run disabled them (training.dflash_teacher_metrics=false).
+        if (
+            target_last_hidden_states is not None
+            and collect_detailed_metrics
+            and bool(self._draft_attr("teacher_metrics", 1.0))
+        ):
             model_inputs["target_last_hidden_states"] = target_last_hidden_states.to(
                 device, non_blocking=True
             )
@@ -528,6 +551,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             metrics=metrics,
             ratio_metrics=model_metrics.get("ratio_metrics", {}),
             loss_terms=model_metrics.get("loss_terms"),
+            sum_metrics=model_metrics.get("sum_metrics", {}),
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -575,6 +599,9 @@ class DSparkTrainStrategy(DraftTrainStrategy):
                 device, non_blocking=True
             ),
             max_valid_anchors=max_valid_anchors,
+            collect_detailed_metrics=(
+                ctx.collect_detailed_metrics if ctx is not None else True
+            ),
         )
         metrics = {
             "accuracy": accuracy.detach(),
@@ -630,10 +657,12 @@ class MTPTrainStrategy(DraftTrainStrategy):
         device = self._device()
         # OnlineMTPModel performs the next-token shift internally and returns
         # per-position correct/denominator tensors (single-layer: length-1 lists).
+        # Non-blocking like the other strategies: pinned Mooncake receives keep
+        # integer features on the host, and a blocking H2D would sync the GPU.
         loss, corrects, denoms = self.mtp_model(
-            input_ids=t["input_ids"].to(device),
-            hidden_states=t["target_last_hidden_states"].to(device),
-            loss_mask=t["loss_mask"].to(device),
+            input_ids=t["input_ids"].to(device, non_blocking=True),
+            hidden_states=t["target_last_hidden_states"].to(device, non_blocking=True),
+            loss_mask=t["loss_mask"].to(device, non_blocking=True),
         )
         correct_sum = corrects[0].sum()
         denom_sum = denoms[0].sum()
@@ -710,8 +739,12 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
             lambda_base=lambda_base,
             max_valid_anchors=max_valid_anchors,
+            collect_detailed_metrics=(
+                ctx.collect_detailed_metrics if ctx is not None else True
+            ),
         )
         metrics = dict(model_metrics)
+        ratio_metrics = metrics.pop("ratio_metrics", {})
         metrics["accuracy"] = accuracy.detach()
         metrics.setdefault(
             "lambda_base",
@@ -721,6 +754,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss=loss,
             metrics=metrics,
             loss_terms=model_metrics.get("loss_terms"),
+            ratio_metrics=ratio_metrics,
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

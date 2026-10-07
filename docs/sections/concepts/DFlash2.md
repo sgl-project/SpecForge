@@ -63,7 +63,9 @@ whose `config.json` declares `DFlash2DraftModel`.
 The base head keeps the configured DFlash, D-PACE, CE/LK, and TV behavior. The
 selector has a separate categorical cross-entropy objective over the strict
 unary top-k candidate set. Tokens whose gold target is outside that set do not
-contribute selector CE; `selector_coverage` measures how often it is present.
+contribute selector CE; `dflash/hard_label/unary_topK_recall` measures how often it is present.
+See the [training metrics guide](../basic_usage/training.md#reading-the-acceptance-metrics)
+for prefix survival, candidate misses, selector errors, and dashboard migration.
 
 Configure its weight and optimizer-step schedule in the training YAML:
 

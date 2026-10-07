@@ -14,7 +14,7 @@ import { withBase } from 'vitepress'
 declare const __SPECFORGE_VERSION__: string
 const VERSION = __SPECFORGE_VERSION__
 
-type Hardware = 'cuda' | 'rocm' | 'npu'
+type Hardware = 'cuda' | 'rocm' | 'npu' | 'xpu'
 type Version = 'main' | 'release'
 type Installer = 'uv' | 'pip'
 type Extra = 'fa' | 'liger' | 'dev'
@@ -23,6 +23,7 @@ const HARDWARE: { key: Hardware; label: string }[] = [
   { key: 'cuda', label: 'NVIDIA CUDA' },
   { key: 'rocm', label: 'AMD ROCm' },
   { key: 'npu', label: 'Ascend NPU' },
+  { key: 'xpu', label: 'Intel GPU' },
 ]
 const VERSIONS: { key: Version; label: string }[] = [
   { key: 'main', label: 'main (source)' },
@@ -145,22 +146,43 @@ const lines = computed<string[]>(() => {
     // newest interpreter with triton_ascend wheels.
     const spec = ['npu', ...extras.value].join(',')
     const index = '--extra-index-url https://download.pytorch.org/whl/cpu'
-    const pipInstall = useUv ? 'uv pip install' : 'pip install'
-    out.push('# On an Ascend host with CANN, an NPU-enabled SGLang and sgl_kernel_npu installed')
+    const pipInstall = useUv
+      ? 'uv pip install --python "$(command -v python)"'
+      : 'python -m pip install'
+    out.push('# Use the prepared Python 3.11 environment with CANN, NPU SGLang, sgl_kernel_npu and hccl')
     if (fromSource) {
       out.push(
         `git clone ${REPO}`,
         'cd SpecForge',
-        useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
-        'source .venv/bin/activate',
         useUv ? `${pipInstall} -e ".[${spec}]"` : `${pipInstall} -e ".[${spec}]" ${index}`
       )
     } else {
+      out.push(`${pipInstall} "specforge[${spec}]" ${index}`)
+    }
+    return out
+  }
+
+  if (hw === 'xpu') {
+    // Keep the container's XPU SGLang visible and select XPU torch explicitly.
+    // uv source installs route yunchang to Git through pyproject.toml;
+    // pip and published installs need that requirement on the command line.
+    const spec = ['xpu', ...extras.value.filter((e) => e !== 'fa')].join(',')
+    const index = '--extra-index-url https://download.pytorch.org/whl/xpu'
+    const yunchang = '"yunchang @ git+https://github.com/feifeibear/long-context-attention.git"'
+    const pipInstall = useUv
+      ? 'uv pip install --python "$(command -v python)"'
+      : 'python -m pip install'
+    out.push('# Run inside the prepared SGLang XPU release container environment')
+    if (fromSource) {
       out.push(
-        useUv ? 'uv venv -p 3.11 --seed' : 'python -m venv .venv',
-        'source .venv/bin/activate',
-        `${pipInstall} "specforge[${spec}]" ${index}`
+        `git clone ${REPO}`,
+        'cd SpecForge',
+        useUv
+          ? `${pipInstall} -e ".[${spec}]"`
+          : `${pipInstall} -e ".[${spec}]" ${index} ${yunchang}`
       )
+    } else {
+      out.push(`${pipInstall} "specforge[${spec}]" ${index} ${yunchang}`)
     }
     return out
   }
@@ -191,9 +213,15 @@ const note = computed(() => {
         link: '/basic_usage/AMD/amd_rocm',
         label: 'AMD ROCm tutorial',
       }
+    case 'xpu':
+      return {
+        text: 'Use the prepared SGLang XPU container environment. The xpu extra selects Intel PyTorch and Git-sourced yunchang while retaining the container’s XPU SGLang. Hardware extras require a release newer than 0.2.0; until then, install from source.',
+        link: '/get_started/installation#intel-gpu-xpu',
+        label: 'Intel GPU installation',
+      }
     case 'npu':
       return {
-        text: 'The npu extra pins a CPU PyTorch plus torch_npu, triton and triton_ascend from the PyTorch CPU index and PyPI. The NPU build of SGLang, sgl_kernel_npu and hccl come from your CANN stack and must be installed first. The launcher detects the NPU and selects HCCL.',
+        text: 'The npu extra pins a CPU PyTorch plus torch_npu, triton and triton_ascend from the PyTorch CPU index and PyPI. Use the prepared Python 3.11 environment containing the NPU build of SGLang, sgl_kernel_npu and hccl from your CANN stack. The launcher detects the NPU and selects HCCL.',
         link: '/basic_usage/Ascend/ascend_npu',
         label: 'Ascend NPU tutorial',
       }

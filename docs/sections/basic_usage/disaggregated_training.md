@@ -35,6 +35,22 @@ The full model and strategy index is in the
 historical identifiers; the directory and typed YAML fields define the runtime
 semantics.
 
+Mooncake training uses **pinned receive pools by default**, with a lazily allocated
+8 GiB retained-pool budget per trainer rank. On CUDA with loader prefetch enabled,
+the loader copies received hidden states to the GPU before yielding the batch;
+integer features such as `input_ids` and `loss_mask` stay on the host (pinned by
+loader workers) so the strategy sizes DFlash-family anchors without a GPU sync. Returned
+tensors, prefetched batches, and overflow allocations consume additional memory.
+Set `deployment.disaggregated.receive_buffers: pageable` to use fresh CPU receives.
+
+Patched CUDA capture servers automatically publish device tensors when
+`MOONCAKE_PROTOCOL=rdma`. TCP and non-CUDA workers keep host publication.
+Set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` on an external server, or `gpu_put: false`
+on a managed-local capture-server entry, to disable GPU publication explicitly.
+GPU publication needs RDMA-registerable allocations; custom expandable CUDA
+allocations may require `PYTORCH_ALLOC_CONF=expandable_segments:False` on the
+capture server. The trainer's allocator is independent.
+
 ## One config owns the launch topology
 
 Process topology and attempt paths live in the same typed run document as the
@@ -218,7 +234,7 @@ config.
 The Qwen3.8-27B DFlash2 recipe fills one 8-GPU node: four TP=1 capture servers
 on GPUs 0-3 and a DP4 trainer on GPUs 4-7, with the Mooncake lease, segment
 sizes and in-flight watermarks measured for its 277-500 MB feature payloads.
-Its [recipe page](../../recipes/qwen3.8-27b-dflash2-disaggregated.md) explains
+Its [recipe page](/recipes/qwen3.8-27b-dflash2-disaggregated) explains
 how to move servers between the two lists for a different GPU generation and
 records the throughput measured on B300 and H200 nodes:
 
@@ -335,7 +351,7 @@ is set: server `i` owns the `i`-th group of `SERVER_TP` devices from
 producer as `deployment.disaggregated.server_urls`.
 `examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh` uses it for eight
 TP1 Qwen3.8-27B capture servers feeding an eight-rank DFlash2 trainer; see its
-[recipe page](../../recipes/qwen3.8-27b-dflash2-disaggregated.md).
+[recipe page](/recipes/qwen3.8-27b-dflash2-disaggregated).
 
 ## External and managed-local services
 

@@ -540,6 +540,25 @@ class ServerCaptureLayout:
                 )
         object.__setattr__(self, "passthrough", passthrough)
 
+    @property
+    def emitted_features(self) -> FrozenSet[str]:
+        """Return every algorithm-ready feature one captured sample carries."""
+
+        return frozenset(
+            (
+                *(
+                    feature
+                    for feature in (
+                        self.aux_feature,
+                        self.last_hidden_feature,
+                        self.attention_mask_feature,
+                    )
+                    if feature is not None
+                ),
+                *(feature for feature, _payload, _shape in self.passthrough),
+            )
+        )
+
 
 @dataclass(frozen=True)
 class ServerStreamingProvider:
@@ -548,6 +567,11 @@ class ServerStreamingProvider:
     ``build_input_adapter`` is deliberately modality-neutral. Text providers
     can leave it unset; the current runtime does not support VLM registration
     or media requests.
+
+    ``select_layout(config)`` optionally narrows ``layout`` for one run, for
+    example to stop requesting a diagnostics-only artifact.  It may only drop
+    features; :func:`resolve_server_capture_layout` applies it and re-checks
+    the result against the streaming contract.
     """
 
     modality: str
@@ -556,6 +580,7 @@ class ServerStreamingProvider:
     layout: ServerCaptureLayout
     build_collator: Factory
     build_input_adapter: Factory | None = None
+    select_layout: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.modality, field_name="modality")
@@ -573,6 +598,8 @@ class ServerStreamingProvider:
             self.build_input_adapter
         ):
             raise TypeError("build_input_adapter must be callable or None")
+        if self.select_layout is not None and not callable(self.select_layout):
+            raise TypeError("select_layout must be callable or None")
 
     def create_input_adapter(self, config: Any) -> ServerInputAdapter | None:
         """Construct and validate the optional modality-owned input adapter."""
@@ -746,27 +773,74 @@ def make_registration(
                 f"{provider.modality!r}: {provider.target_representation!r} != "
                 f"{contract.default_target_representation!r}"
             )
-        layout = provider.layout
-        emitted = {
-            *(
-                feature
-                for feature in (
-                    layout.aux_feature,
-                    layout.last_hidden_feature,
-                    layout.attention_mask_feature,
-                )
-                if feature is not None
-            ),
-            *(feature for feature, _payload, _shape in layout.passthrough),
-        }
-        missing = contract.required_tensors - emitted
-        if missing:
-            raise ValueError(
-                f"server capture layout for {provider.modality!r} does not emit "
-                f"required tensors: {sorted(missing)}"
-            )
+        _require_contract_tensors(provider.modality, provider.layout, contract)
 
     return AlgorithmRegistration(spec=spec, providers=providers)
+
+
+def _require_contract_tensors(modality: str, layout, contract) -> None:
+    missing = contract.required_tensors - layout.emitted_features
+    if missing:
+        raise ValueError(
+            f"server capture layout for {modality!r} does not emit "
+            f"required tensors: {sorted(missing)}"
+        )
+
+
+def resolve_server_capture_layout(
+    algorithm: AlgorithmRegistration,
+    config: Any,
+    *,
+    modality: str,
+) -> ServerCaptureLayout:
+    """Select one run's server capture layout and check its streaming contract.
+
+    The producer requests exactly these artifacts, so every ``SampleRef`` and
+    consumer fetch carries the same feature set.
+    """
+
+    provider = algorithm.providers.server_streaming_for(modality)
+    layout = provider.layout
+    if provider.select_layout is not None:
+        layout = provider.select_layout(config)
+        if not isinstance(layout, ServerCaptureLayout):
+            raise TypeError("select_layout must return a ServerCaptureLayout")
+        added = layout.emitted_features - provider.layout.emitted_features
+        if added:
+            raise ValueError(
+                f"select_layout for {modality!r} may only drop features of the "
+                f"registered layout; it added {sorted(added)}"
+            )
+        for field_name in (
+            "aux_feature",
+            "last_hidden_feature",
+            "attention_mask_feature",
+        ):
+            selected = getattr(layout, field_name)
+            if selected is not None and selected != getattr(
+                provider.layout, field_name
+            ):
+                raise ValueError(
+                    f"select_layout for {modality!r} may only drop features; "
+                    f"{field_name} must keep its registered mapping or be None"
+                )
+        # Retained entries must preserve their source and trailing shape.
+        # Remove each match so a selector cannot duplicate a registered entry.
+        remaining = list(provider.layout.passthrough)
+        for entry in layout.passthrough:
+            if entry not in remaining:
+                raise ValueError(
+                    f"select_layout for {modality!r} may only drop features; "
+                    "passthrough entries must keep their registered mappings "
+                    "and shapes without adding duplicates"
+                )
+            remaining.remove(entry)
+    _require_contract_tensors(
+        modality,
+        layout,
+        algorithm.spec.feature_contract(FeatureMode.STREAMING, modality),
+    )
+    return layout
 
 
 __all__ = [
@@ -786,4 +860,5 @@ __all__ = [
     "TargetDerivedDraftDefaults",
     "checkpoint_key_fingerprint",
     "make_registration",
+    "resolve_server_capture_layout",
 ]

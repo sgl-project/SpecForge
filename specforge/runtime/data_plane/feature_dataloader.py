@@ -10,8 +10,9 @@
 
 Leases refs (consume-once queue or re-iterable ref list), applies the injected
 per-sample transform and collate, and yields ``TrainBatch``es — no model
-knowledge. clone-on-fetch (default) clones tensors out of the store and releases
-the handle immediately, so prefetch can never race a release.
+knowledge. clone-on-fetch (default unless the store's ``get()`` already returns
+fresh tensors) clones tensors out of the store and releases the handle
+immediately, so prefetch can never race a release.
 """
 
 from __future__ import annotations
@@ -38,6 +39,23 @@ _PREFETCH_POLL_S = 0.1
 _PREFETCH_JOIN_TIMEOUT_S = float(
     os.environ.get("SPECFORGE_LOADER_JOIN_TIMEOUT_S", "5.0")
 )
+
+
+@dataclass
+class _PreparedBatch:
+    batch: TrainBatch
+    ready: Dict[torch.device, torch.cuda.Event]
+
+    def consume(self) -> TrainBatch:
+        # Futures synchronize Python threads, not CUDA work. Hand off both
+        # execution ordering and allocator lifetime to the consumer's streams.
+        for device, event in self.ready.items():
+            stream = torch.cuda.current_stream(device)
+            stream.wait_event(event)
+            for tensor in self.batch.tensors.values():
+                if tensor.device == device:
+                    tensor.record_stream(stream)
+        return self.batch
 
 
 @dataclass
@@ -131,7 +149,7 @@ class FeatureDataLoader:
         collate_fn: Optional[CollateFn] = None,
         per_sample_transform: Optional[PerSampleTransform] = None,
         device: "torch.device | str" = "cpu",
-        clone_on_fetch: bool = True,
+        clone_on_fetch: Optional[bool] = None,
         drop_last: bool = True,
         strategy: str = "eagle3",
         ack: bool = True,
@@ -150,11 +168,17 @@ class FeatureDataLoader:
         self.collate_fn = collate_fn or _default_collate
         self.per_sample_transform = per_sample_transform
         self.device = device
-        # CLONE_ON_FETCH=0 skips the defensive clone; safe for the mooncake
-        # zero-copy path, whose get() already allocates a fresh tensor.
-        if os.environ.get("CLONE_ON_FETCH", "1") == "0":
+        # By default clone unless the store's get() already returns fresh
+        # caller-owned tensors (e.g. Mooncake), where the clone only copies.
+        # CLONE_ON_FETCH=0 skips the defensive clone; =1 forces it.
+        if clone_on_fetch is None:
+            clone_on_fetch = not getattr(store, "get_returns_fresh_tensors", False)
+        clone_env = os.environ.get("CLONE_ON_FETCH")
+        if clone_env == "0":
             clone_on_fetch = False
-        self.clone_on_fetch = clone_on_fetch
+        elif clone_env == "1":
+            clone_on_fetch = True
+        self.clone_on_fetch = bool(clone_on_fetch)
         self.drop_last = drop_last
         self.strategy = strategy
         self.ack = ack
@@ -206,6 +230,16 @@ class FeatureDataLoader:
             fetch_samples=float(len(refs)),
         )
         return batch
+
+    def _prepare_batch(self, refs: List[SampleRef]) -> _PreparedBatch:
+        batch = self._timed_make_batch(refs)
+        ready = {}
+        for tensor in batch.tensors.values():
+            if tensor.is_cuda and tensor.device not in ready:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(tensor.device))
+                ready[tensor.device] = event
+        return _PreparedBatch(batch, ready)
 
     def _maybe_gc(self) -> None:
         if self.gc_interval_s is None:
@@ -361,14 +395,14 @@ class FeatureDataLoader:
                     chunk = next(chunk_iter)
                 except StopIteration:
                     break
-                pending.append(executor.submit(self._make_batch, chunk))
+                pending.append(executor.submit(self._prepare_batch, chunk))
             while pending:
-                yield pending.popleft().result()
+                yield pending.popleft().result().consume()
                 try:
                     chunk = next(chunk_iter)
                 except StopIteration:
                     continue
-                pending.append(executor.submit(self._make_batch, chunk))
+                pending.append(executor.submit(self._prepare_batch, chunk))
 
     def seek(self, num_batches: int) -> None:
         """Skip the first ``num_batches`` of the NEXT iteration (refs mode; one-shot).
@@ -470,17 +504,19 @@ class FeatureDataLoader:
                             state.mark_yielded_or_failed(refs)
                         put_interruptibly(eos)
                         return
-                    future = pool.submit(self._timed_make_batch, refs)
+                    future = pool.submit(self._prepare_batch, refs)
                     state.track_fetch(future, refs)
                     if not put_interruptibly((future, refs)):
                         return
             except BaseException as exc:  # loud failure, never a silent hang
                 put_interruptibly(exc)
             finally:
-                # Never block worker shutdown on in-flight fetches; refs of
-                # unemitted batches stay tracked and are settled by
-                # _shutdown_prefetch like any other never-yielded lease.
-                pool.shutdown(wait=False, cancel_futures=True)
+                # EOF stops submissions, not consumption: futures queued before
+                # eos must still complete and be yielded in order. Do not block
+                # this worker on fetches either. Early-stop cancellation and
+                # bounded waiting belong to _shutdown_prefetch, even if this
+                # worker has already exited after enqueueing eos.
+                pool.shutdown(wait=False, cancel_futures=False)
 
         worker = threading.Thread(
             target=_worker,
@@ -517,7 +553,7 @@ class FeatureDataLoader:
                 fetch_started = time.perf_counter()
                 while not state.stop.is_set():
                     try:
-                        batch = future.result(timeout=_PREFETCH_POLL_S)
+                        batch = future.result(timeout=_PREFETCH_POLL_S).consume()
                         break
                     except futures.TimeoutError:
                         continue
@@ -565,9 +601,18 @@ class FeatureDataLoader:
                         f"is still blocked, outstanding_refs={outstanding_ids}"
                     )
             live = state.live_fetches()
+            # The submitter has stopped, so this snapshot includes every fetch
+            # still owned by the loader. Normal EOF has already consumed them;
+            # early close/error cancels only jobs that have not started.
+            for future in live:
+                future.cancel()
+            # A cancelled Future need not have been dequeued by its executor
+            # yet. Exclude done futures rather than waiting for the executor's
+            # cancellation notification; only running transfers need draining.
+            pending = [future for future in live if not future.done()]
             if (
-                live
-                and futures.wait(list(live), timeout=_PREFETCH_JOIN_TIMEOUT_S).not_done
+                pending
+                and futures.wait(pending, timeout=_PREFETCH_JOIN_TIMEOUT_S).not_done
             ):
                 outstanding_ids = state.outstanding_ids()
                 raise RuntimeError(

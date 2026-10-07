@@ -11,6 +11,7 @@ class DummyTokenizer:
 
     def __init__(self):
         self.messages = None
+        self.template_kwargs = None
 
     def apply_chat_template(
         self,
@@ -21,6 +22,7 @@ class DummyTokenizer:
         **kwargs,
     ):
         self.messages = messages
+        self.template_kwargs = kwargs
         return "".join(
             f"<{message['role']}>{message['content']}</eot>" for message in messages
         )
@@ -82,6 +84,45 @@ class TestParserNormalization(unittest.TestCase):
                 {"role": "assistant", "content": "answer"},
             ],
         )
+
+    def test_thinking_mode_defaults_to_tokenizer_behavior(self):
+        self.assertIsNone(ChatTemplate().enable_thinking)
+
+    def test_thinking_mode_forwarding_and_template_precedence(self):
+        for mode in (None, False, True):
+            for caller_kwargs in (
+                {},
+                {"enable_thinking": False},
+                {"enable_thinking": True},
+            ):
+                with self.subTest(mode=mode, caller_kwargs=caller_kwargs):
+                    tokenizer = DummyTokenizer()
+                    parser = ThinkingParser(
+                        tokenizer,
+                        ChatTemplate(
+                            assistant_header="<assistant>",
+                            end_of_turn_token="</eot>",
+                            parser_type="thinking",
+                            enable_thinking=mode,
+                        ),
+                    )
+                    parser.parse(
+                        [
+                            {"role": "user", "content": "question"},
+                            {"role": "assistant", "content": "answer"},
+                        ],
+                        max_length=512,
+                        **caller_kwargs,
+                    )
+                    if mode is None and not caller_kwargs:
+                        self.assertNotIn("enable_thinking", tokenizer.template_kwargs)
+                    else:
+                        expected = (
+                            caller_kwargs["enable_thinking"] if mode is None else mode
+                        )
+                        self.assertIs(
+                            tokenizer.template_kwargs["enable_thinking"], expected
+                        )
 
     def test_thinking_parser_sanitize_keeps_tool_identity_and_drops_extras(self):
         # Tool-result rendering needs `name`/`tool_call_id` to survive

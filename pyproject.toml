@@ -1,12 +1,12 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "specforge"
 dynamic = ["version"]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 description = "SpecForge: Speculative Decoding Training Framework"
 authors = [{name = "SGLang Team"}]
 urls = {Homepage = "https://github.com/sgl-project/SpecForge"}
@@ -46,6 +46,13 @@ cuda = [
 ]
 rocm = [
     "torch==2.13.0+rocm7.2",
+    "triton-rocm==3.7.1; sys_platform == 'linux' and python_version < '3.15'",
+]
+xpu = [
+    # XPU SGLang comes from the Intel container, not the CUDA PyPI build.
+    "torch==2.13.0+xpu",
+    "triton-xpu==3.7.2",
+    "yunchang",
 ]
 npu = [
     # The NPU build of SGLang, sgl_kernel_npu and hccl are not on PyPI; they
@@ -61,11 +68,29 @@ dev = [
 fa = ["flash-attn", "ninja", "packaging"]
 liger = ["liger-kernel"]
 
+[tool.uv]
+# Each accelerator uses a different PyTorch build and wheel index.
+conflicts = [
+    [
+        { extra = "cuda" },
+        { extra = "rocm" },
+        { extra = "npu" },
+        { extra = "xpu" },
+    ],
+]
+
 [tool.uv.sources]
+yunchang = [
+    { git = "https://github.com/feifeibear/long-context-attention.git", extra = "xpu" },
+]
+# ROCm PyTorch requires Triton wheels from the same vendor index.
+triton-rocm = { index = "pytorch-rocm", extra = "rocm" }
+triton-xpu = { index = "pytorch-xpu", extra = "xpu" }
 torch = [
     { index = "pytorch-rocm", extra = "rocm" },
     { index = "pytorch-cu130", extra = "cuda" },
     { index = "pytorch-cpu", extra = "npu" },
+    { index = "pytorch-xpu", extra = "xpu" },
 ]
 sglang-kernel = [
     { index = "sglang-cu130", extra = "cuda" },
@@ -84,6 +109,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
 explicit = true
 
 [[tool.uv.index]]

@@ -90,9 +90,12 @@ covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
 `qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
-its managed-local sibling `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
-(one node, four capture servers plus a DP4 trainer) train the DFlash2 drafter
-in `configs/qwen3.8-27b-dflash2.json` for Qwen3.8-27B. Their
+its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
+(one node, four capture servers plus a DP4 trainer) and
+`qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml` (one 8x H200 node,
+five FP8 capture servers with FA3 and FlashInfer GDN, a DP3 trainer, RDMA
+loopback) train the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
+Qwen3.8-27B. Their
 [runbook](../../docs/recipes/qwen3.8-27b-dflash2-disaggregated.md) records the
 server/trainer splits, Mooncake lease, in-flight watermarks and throughput
 measured on B300 and H200 nodes, and the two-node launcher that starts eight
@@ -227,11 +230,16 @@ should make their training strategy and topology explicit.
 | `model.sglang_moe_runner_backend` | `null` | Optional SGLang MoE runner backend name. |
 | `model.sglang_page_size` | `null` | Optional positive SGLang KV-cache page size. |
 | `model.sglang_quantization` | `null` | Optional SGLang target quantization mode. |
-| `model.sglang_fp4_gemm_runner_backend` | `null` | Optional SGLang FP4 GEMM runner backend. |
+| `model.sglang_fp4_gemm_runner_backend` | `null` | Optional SGLang FP4 GEMM runner backend, passed as `--fp4-gemm-backend`. |
 | `model.sglang_mamba_radix_cache_strategy` | `null` | Optional hybrid Mamba/radix cache strategy. |
 | `model.sglang_max_mamba_cache_size` | `null` | Optional positive Mamba cache size. |
 | `model.sglang_swa_full_tokens_ratio` | `null` | Optional SGLang sliding-window full-token ratio in `(0, 1]`. |
 | `model.sglang_mamba_full_memory_ratio` | `null` | Optional SGLang Mamba full-memory ratio in `(0, 1]`. |
+| `model.sglang_max_prefill_tokens` | `null` | Optional positive token budget of one SGLang prefill batch (`--max-prefill-tokens`). |
+| `model.sglang_linear_attn_prefill_backend` | `null` | Optional linear-attention (GDN/KDA) prefill kernel backend for hybrid targets (`--linear-attn-prefill-backend`). |
+| `model.sglang_fp8_gemm_backend` | `null` | Optional blockwise FP8 GEMM runner (`--fp8-gemm-backend`). |
+| `model.sglang_disable_cuda_graph` | `false` | Pass `--disable-cuda-graph`, which disables SGLang's decode and prefill CUDA graphs. |
+| `model.sglang_extra_args` | `[]` | Further SGLang CLI tokens appended to every managed-local capture server, one flag or value per list item (`["--prefill-max-requests", "8"]`). The list must start with a `--flag`. Flags the launcher owns (`--model-path`, `--port`, `--host`, `--tp-size`, `--dtype`, `--trust-remote-code`, `--skip-tokenizer-init`, `--chunked-prefill-size`, `--context-length`, the `--spec-capture-*` flags) and flags another `model.sglang_*` field already renders are rejected, including their SGLang aliases and abbreviations; so are `--api-key` (the capture adapter sends no key), `--enable-dp-attention`/`--enable-dp-lm-head` (unsupported by managed-local capture) and `--config`. External servers take their flags from their own launch command. |
 
 ### `data`: choose exactly one training source
 
@@ -289,6 +297,7 @@ Common fields:
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
+| `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
@@ -341,10 +350,13 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.mooncake_protocol` | `null` | External transfer protocol such as `tcp` or `rdma`. |
 | `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection. |
 | `deployment.disaggregated.producer_segment_size` | `null` | Positive allocation owned by an offline Mooncake producer. Online capture is server-owned and forces client segments to zero. |
-| `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. |
+| `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. For `receive_buffers: cuda`, size for the largest concurrently fetched tensors; an 8k-token Qwen3.8-27B feature can exceed this default. Use e.g. `2147483648` and increase with fetch concurrency. |
+| `deployment.disaggregated.receive_buffers` | `pinned` | Consumer receive buffers for feature reads: `pinned` (pooled page-locked host buffers, side-stream device copy), `pageable` (fresh host tensor per feature), or `cuda` (pooled device buffers; Mooncake 0.3.x stages RDMA reads through its client buffer). |
+| `deployment.disaggregated.receive_pool_bytes` | `8589934592` | Retained receive-pool budget per rank (`pinned`/`cuda`), excluding output copies and concurrent overflow. Failed-transfer buffers remain quarantined for the store lifetime. |
 | `deployment.disaggregated.idle_timeout_s` | `null` | Positive consumer idle timeout. |
 | `deployment.disaggregated.peer_wait_timeout_s` | `null` | Optional positive producer/consumer peer-completion timeout. Unset is unbounded; expiration fails the attempt. |
 | `deployment.disaggregated.producer_hold_s` | `null` | Optional positive offline producer retention timeout. Unset is unbounded; expiration fails the attempt. |
+| `deployment.disaggregated.async_ack` | `true` | Online consumer: overlap each optimizer boundary's durable ack (ledger commit, feature removes, DP ack collectives on a dedicated Gloo group) with the next step on a background thread. The durable marker lags by at most one optimizer step and is flushed before every checkpoint, eval, and fit end. Exported as `DISAGG_ASYNC_ACK` (`0` disables; an explicit environment value wins). Multi-node trainers need Gloo TCP reachability between ranks (set `GLOO_SOCKET_IFNAME` when the hostname does not resolve to a routable address); disabling it on any rank keeps every rank's acks synchronous on the default process group and creates no Gloo group. |
 | `deployment.disaggregated.shutdown_grace_s` | `30.0` | SIGTERM-to-SIGKILL window for a plain supervisor teardown; must cover worker cleanup (Mooncake drains, checkpoint flush, failure sentinels). `managed_local` stacks use `managed_local.shutdown_grace_s`. |
 | `deployment.disaggregated.managed_local` | `null` | Optional owned single-node Mooncake + capture-server stack described below. |
 
@@ -400,13 +412,42 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.mooncake.global_segment_size_bytes` | `34359738368` | Owned global segment size. |
 | `deployment.disaggregated.managed_local.mooncake.local_buffer_size_bytes` | `1073741824` | Owned local client buffer. |
 | `deployment.disaggregated.managed_local.mooncake.startup_timeout_s` | `60` | Positive Mooncake readiness timeout. |
+| `deployment.disaggregated.managed_local.mooncake.probe_timeout_s` | `5` | Positive, finite budget for one HTTP + TCP readiness probe, capped by the remaining startup timeout. |
 | `deployment.disaggregated.managed_local.mooncake.default_kv_lease_ttl_ms` | `500` | Master key-lease TTL (ms) forwarded to `mooncake_master --default_kv_lease_ttl`. Kept below the consumer's teardown drain window so managed_local shuts down cleanly; set `null` to inherit Mooncake's stock default. |
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
+| `deployment.disaggregated.managed_local.capture_servers[].gpu_put` | `null` | Automatically publish from CUDA memory when the capture worker uses RDMA. Set `false` to use host publication or `true` to require GPU publication; `true` requires `mooncake.protocol: rdma`. |
 | `deployment.disaggregated.managed_local.capture_servers[].tp_size` | `1` | Target-model tensor parallelism for this server. |
 | `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `null` | Optional SGLang static-memory override in `(0, 1]`; otherwise inherit `model.sglang_mem_fraction_static`. |
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
 | `deployment.disaggregated.managed_local.capture_servers[].startup_timeout_s` | `1800` | Positive server readiness timeout. |
+| `deployment.disaggregated.managed_local.capture_servers[].extra_args` | `[]` | SGLang CLI tokens for this server only, appended after `model.sglang_extra_args` under the same rules. A flag may appear once per command line, so set a per-server flag here and not in the global list. |
+| `deployment.disaggregated.managed_local.capture_servers[].env` | `{}` | Extra environment for this server process, for example the capture patch's `SGLANG_SPEC_CAPTURE_TIMING` or `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`. Keys the launcher sets are rejected: `MOONCAKE_*`, `DISAGG_*`, device-visibility variables, `SGLANG_SPEC_CAPTURE_GPU_PUT` (use `gpu_put`) and `FLASHINFER_DISABLE_VERSION_CHECK`. |
+| `deployment.disaggregated.managed_local.capture_servers[].probe_timeout_s` | `5` | Positive, finite HTTP health-probe timeout, capped by the remaining startup timeout. SGLang's generation-based `/health` waits at least one second; allow headroom instead of setting this to one second. |
+
+`startup_timeout_s` bounds the overall readiness wait; `probe_timeout_s` controls
+each probe within that window. Increasing only the startup timeout cannot fix
+an HTTP probe timeout that is shorter than the server's healthy response time.
+The default probe budget supports SGLang's generation-based health check without
+disabling health-endpoint generation.
+
+Disaggregated Mooncake trainers use pinned receive pools without additional settings.
+With loader prefetch enabled, hidden-state H2D runs in the loader before the batch
+reaches training; integer features stay on the host (pinned by loader workers) for
+the strategy's non-blocking copy.
+Select `receive_buffers: pageable` to restore fresh host receives. The 8 GiB receive-pool
+budget is allocated lazily per rank and excludes returned tensors and overflow buffers.
+
+Patched CUDA capture servers use GPU publication automatically when
+`MOONCAKE_PROTOCOL=rdma`; TCP and non-CUDA workers use host publication. External
+servers can set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` to disable it or `1` to explicitly
+enable it. Managed-local `gpu_put: false` also disables an inherited enable flag.
+
+GPU publication retains a device snapshot until the asynchronous store write completes.
+Use RDMA-registerable CUDA allocations; with PyTorch, set
+`PYTORCH_ALLOC_CONF=expandable_segments:False` for capture servers if VMM allocations
+cannot be registered by the installed Mooncake/driver combination. Registration
+failures are reported before publishing refs.
 
 Managed-local is only for a fresh, single-node, online Mooncake run. It derives
 server URLs and Mooncake endpoints, so do not combine it with explicit external
@@ -552,7 +593,7 @@ specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dfl
 
 The unified launcher provides rank/world/rendezvous variables and the runtime
 selects HCCL when `torch_npu` is active. For AMD GPUs, follow the
-[ROCm installation steps](../../docs/get_started/installation.md#amd-rocm);
+[ROCm installation steps](../../docs/sections/get_started/installation.md#amd-rocm);
 HF + SDPA is the portable ROCm starting point.
 
 Offline colocated and offline disaggregated resume are supported.

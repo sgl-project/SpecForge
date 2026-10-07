@@ -2,7 +2,7 @@
 
 ## Installation
 
-SpecForge needs Python 3.10 or newer. The recommended installer is
+SpecForge needs Python 3.11 or newer. The recommended installer is
 [uv](https://docs.astral.sh/uv/): the hardware extras route `torch` and
 `sglang-kernel` to accelerator-specific wheel indexes through
 `[tool.uv.sources]` in `pyproject.toml`, and uv honours those pins for a
@@ -24,11 +24,12 @@ what the generated command does on each accelerator and what to watch out for.
 | Hardware | Extra | What it pins |
 | --- | --- | --- |
 | NVIDIA GPU (CUDA 13 driver) | `cuda` | `torch==2.13.0` (cu130), `sglang-kernel==0.4.6.post1` (cu130), `mooncake-transfer-engine-cuda13` |
+| Intel GPU (XPU) | `xpu` | `torch==2.13.0+xpu` (PyTorch XPU index), Git-sourced `yunchang`; XPU SGLang comes from the Intel container |
 | AMD Instinct GPU (ROCm) | none, install with `--no-deps` | ROCm PyTorch and SGLang come from the SGLang ROCm container |
-| Ascend NPU | `npu` | `torch==2.13.0+cpu` (PyTorch CPU index), `torch_npu==2.13.0rc1`, `triton==3.5.0`, `triton_ascend==3.2.0` (Python 3.11 or older); the NPU build of SGLang, `sgl_kernel_npu` and `hccl` come from the CANN stack |
+| Ascend NPU | `npu` | `torch==2.13.0+cpu` (PyTorch CPU index), `torch_npu==2.13.0rc1`, `triton==3.5.0`, `triton_ascend==3.2.0` (Python 3.11); the NPU build of SGLang, `sgl_kernel_npu` and `hccl` come from the CANN stack |
 
 SGLang is not a base dependency: the `cuda` extra pins the CUDA build
-(`sglang==0.5.18`), while ROCm and NPU installs use the SGLang build that ships
+(`sglang==0.5.18`), while ROCm, NPU and XPU installs use the SGLang build that ships
 with their vendor stack. Every install shares the same `specforge train` entry
 point; only the compiled wheels differ. Optional extras that stack on top:
 
@@ -131,25 +132,27 @@ pair that the fused loss kernels require.
 
 The CPU torch wheel lives on the PyTorch index, not PyPI. uv reads that
 routing from `[tool.uv.sources]` for a source install; pip does not, so pass
-the index explicitly. Use Python 3.11 or older: `triton_ascend` publishes no
+the index explicitly. Use Python 3.11: `triton_ascend` publishes no
 wheels for 3.12.
+
+Run these commands in the prepared Python 3.11 environment that already
+contains NPU SGLang, `sgl_kernel_npu` and `hccl`. Activate that environment
+first if it is a virtual environment. Do not create a fresh isolated virtual
+environment: it would hide these vendor packages. Both installers below target
+the `python` interpreter on your current `PATH`.
 
 ::: code-group
 
 ```bash [uv]
 git clone https://github.com/sgl-project/SpecForge.git
 cd SpecForge
-uv venv -p 3.11 --seed
-source .venv/bin/activate
-uv pip install -e ".[npu]"
+uv pip install --python "$(command -v python)" -e ".[npu]"
 ```
 
 ```bash [pip]
 git clone https://github.com/sgl-project/SpecForge.git
 cd SpecForge
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[npu]" --extra-index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e ".[npu]" --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 :::
@@ -170,3 +173,37 @@ compatible SGLang/Mooncake service first. The unified launcher detects the NPU
 device, self-launches the process count recorded in YAML, and selects HCCL; see
 the [training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu) and
 the [Ascend NPU Tutorial](../basic_usage/Ascend/ascend_npu.md).
+
+
+### Intel GPU (XPU)
+
+Run inside an official SGLang XPU release container, using its prepared Python
+environment so the XPU build of SGLang remains importable. The `xpu` extra
+selects `torch==2.13.0+xpu` and the Git version of `yunchang` used by the
+upstream XPU setup. All accelerators use the same `pyproject.toml`; select
+the matching hardware extra when installing.
+
+::: code-group
+
+```bash [uv]
+git clone https://github.com/sgl-project/SpecForge.git
+cd SpecForge
+uv pip install --python "$(command -v python)" -e ".[xpu]"
+```
+
+```bash [pip]
+git clone https://github.com/sgl-project/SpecForge.git
+cd SpecForge
+python -m pip install -e ".[xpu]" \
+    --extra-index-url https://download.pytorch.org/whl/xpu \
+    "yunchang @ git+https://github.com/feifeibear/long-context-attention.git"
+```
+
+:::
+
+For source installs, uv reads both the PyTorch index and the Git source from
+`[tool.uv.sources]`. pip needs both on the command line, as shown above; uv
+also needs them when installing a published release. XPU SGLang is supplied
+by the container and is deliberately excluded from the `xpu` extra because
+the PyPI SGLang build pulls CUDA dependencies. FlashAttention's `fa` extra is
+CUDA-only and is disabled for XPU in the selector.

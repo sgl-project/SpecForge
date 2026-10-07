@@ -79,6 +79,7 @@ class WeightedStrategy(FakeStrategy):
                 "acc": (correct, denominator),
             },
             loss_terms=(numerator, denominator),
+            sum_metrics={"correct_count": correct, "sample_count": denominator},
         )
 
 
@@ -370,6 +371,65 @@ class TestTrainerCore(unittest.TestCase):
         self.assertEqual(metrics["acc"], 0.5)
         self.assertEqual(metrics["ce_position_0"], 0.5)
         self.assertEqual(metrics["ce_position_1"], 0.5)
+
+    def test_additive_telemetry_accumulates_and_resets_each_optimizer_window(self):
+        strat = WeightedStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=2)
+        first = core.train_step(_weighted_batch(2, 1, 1))
+        second = core.train_step(_weighted_batch(30, 3, 1))
+        self.assertEqual(first.metrics["sample_count"], 1)
+        self.assertEqual(second.metrics["sample_count"], 4)
+        self.assertEqual(second.metrics["correct_count"], 2)
+        self.assertEqual(second.metrics["acc"], 0.5)
+        core.train_step(_weighted_batch(1, 2, 0))
+        fourth = core.train_step(_weighted_batch(1, 3, 1))
+        self.assertEqual(fourth.metrics["sample_count"], 5)
+        self.assertEqual(fourth.metrics["correct_count"], 1)
+        self.assertAlmostEqual(fourth.metrics["acc"], 0.2)
+
+    def test_prefix_counts_and_ratios_share_one_dp_sum_with_unequal_populations(self):
+        accepted = torch.tensor([2.0, 0.0], requires_grad=True)
+        reached = torch.tensor([3.0, 0.0])
+        remote = torch.tensor([1.0, 0.0, 7.0, 0.0, 1.0, 0.0, 7.0, 0.0])
+
+        def all_reduce(packed, *, group):
+            self.assertEqual(group, "dp")
+            self.assertFalse(packed.requires_grad)
+            packed.add_(remote)
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch(
+                "torch.distributed.all_reduce", side_effect=all_reduce
+            ) as reduce,
+        ):
+            metrics = _reduce_ratio_metrics(
+                {"acceptance": (accepted, reached)},
+                sums={"accepted_count": accepted, "reached_count": reached},
+                device=torch.device("cpu"),
+                process_group="dp",
+                reduce=True,
+            )
+        reduce.assert_called_once()
+        self.assertAlmostEqual(float(metrics["acceptance_0"]), 0.3)
+        self.assertEqual(metrics["accepted_count_0"], 3)
+        self.assertEqual(metrics["reached_count_0"], 10)
+        # Zero is the established empty-ratio convention; count zero explicitly
+        # distinguishes this from an observed 0% acceptance rate.
+        self.assertEqual(metrics["acceptance_1"], 0)
+        self.assertEqual(metrics["reached_count_1"], 0)
+
+    def test_additive_telemetry_without_ratios(self):
+        metrics = _reduce_ratio_metrics(
+            {},
+            sums={"count": torch.tensor(7.0)},
+            device=torch.device("cpu"),
+            process_group=None,
+            reduce=False,
+        )
+        self.assertEqual(metrics["count"], 7)
 
     @staticmethod
     def _eagle_output(

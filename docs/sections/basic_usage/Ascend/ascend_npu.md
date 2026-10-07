@@ -14,21 +14,26 @@ You need an Ascend host with the driver and CANN installed, plus the NPU build
 of SGLang `0.5.18`, `sgl_kernel_npu` and `hccl` from that stack; none of those
 are on PyPI. SpecForge's `npu` extra installs the rest: a CPU `torch==2.13.0`
 from the PyTorch index, `torch_npu==2.13.0rc1`, `triton==3.5.0` and
-`triton_ascend==3.2.0`. Use Python 3.11 or older; `triton_ascend` has no
+`triton_ascend==3.2.0`. Use Python 3.11; `triton_ascend` has no
 3.12 wheels.
+
+Use the prepared Python 3.11 environment containing the vendor packages;
+activate it first if it is a virtual environment. Do not create a fresh isolated
+virtual environment, which would hide NPU SGLang, `sgl_kernel_npu` and `hccl`.
+Both commands target the `python` interpreter on your current `PATH`.
 
 ::: code-group
 
 ```bash [uv]
 git clone https://github.com/sgl-project/SpecForge.git
 cd SpecForge
-uv pip install -e ".[npu]"
+uv pip install --python "$(command -v python)" -e ".[npu]"
 ```
 
 ```bash [pip]
 git clone https://github.com/sgl-project/SpecForge.git
 cd SpecForge
-pip install -e ".[npu]" --extra-index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e ".[npu]" --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 :::

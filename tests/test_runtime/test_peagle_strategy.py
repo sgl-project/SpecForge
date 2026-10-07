@@ -61,7 +61,10 @@ class _FakeTargetHead(nn.Module):
         shifted_target = torch.cat(
             [target[:, 1:], torch.zeros_like(target[:, :1])], dim=1
         )
-        return shifted_ids, shifted_target, loss_mask.unsqueeze(-1)
+        shifted_loss_mask = torch.cat(
+            [loss_mask[:, 1:], torch.zeros_like(loss_mask[:, :1])], dim=1
+        )
+        return shifted_ids, shifted_target, shifted_loss_mask.unsqueeze(-1)
 
     def forward(self, hidden_states):
         return self.projection(hidden_states)
@@ -142,6 +145,9 @@ class TestPEagleStrategy(unittest.TestCase):
         self.assertEqual(model.forward_kwargs["input_ids"].tolist(), [[2, 3, 0, 0]])
         torch.testing.assert_close(model.forward_kwargs["target"], expected_target)
         self.assertEqual(model.forward_kwargs["loss_mask"].shape, (1, 4, 1))
+        self.assertEqual(
+            model.forward_kwargs["loss_mask"].squeeze(-1).tolist(), [[1, 1, 0, 0]]
+        )
         self.assertEqual(model.forward_kwargs["lengths"].tolist(), [2])
 
     def test_hidden_state_target_requires_target_head(self):
