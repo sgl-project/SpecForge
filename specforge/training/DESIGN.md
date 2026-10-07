@@ -23,11 +23,20 @@ Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;
 `TrainerCore` owns one branch-free train step and the accumulation boundary;
 `DraftTrainStrategy` owns model-specific validation, forward/loss, target
-projection, and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
-backward, optimizer steps, distributed gradient norms, and full training state.
+projection, and checkpoint filtering. `DistributedTrainingBackend` shares the
+optimizer lifecycle, replicated DDP path, local gradient scaling, and RNG
+state. `FSDPTrainingBackend` and `FSDP2TrainingBackend` own their sharding and
+model-state APIs; FSDP2 also implements accumulation with
+`set_requires_gradient_sync`. `training.backend` selects the implementation,
+defaulting to the original `fsdp` backend. `BackendOptions` carries opt-in
+behaviors; `training.static_shapes` pads every micro-batch to `data.max_length` and every DFlash-family anchor set to `num_anchors`, so compiled graphs see one input shape (torch 2.13's Inductor cannot lower `flex_attention` with a symbolic context length); `training.compile_blocks` warns without it and compiles each draft block in place before FSDP2 sharding so the composable hooks stay outside Dynamo. `training.fp8_linear` swaps the trainable block linears for torchao `Float8Linear` with float8 all-gather and precomputes the next step's scales after every optimizer step.
 Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
 state and repositions fixed offline refs through `FeatureDataLoader.seek()`.
+Rank-local checkpoint metadata prevents loading optimizer shards with a
+different backend, sharding strategy, or world size. FSDP2's BF16 optimizer
+accesses local DTensor storage at use time, retaining ordinary FP32 master
+tensors (including CPU offload) and exactly one explicit global-norm reduction.
 
 ## Internal mechanics
 

@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.training.backend import BackendOptions
 from specforge.training.provenance import (
     model_resume_provenance as _model_resume_provenance,
 )
@@ -535,6 +536,14 @@ def _profiling_options(cfg: Config):
     )
 
 
+def _backend_options(cfg: Config) -> BackendOptions:
+    """``training.*`` -> typed backend options, shared by every launch path."""
+    return BackendOptions(
+        compile_blocks=cfg.training.compile_blocks,
+        fp8_linear=cfg.training.fp8_linear,
+    )
+
+
 def _common_launch_kwargs(
     cfg: Config,
     bundle: ModelBundle,
@@ -553,6 +562,10 @@ def _common_launch_kwargs(
         algorithm=algorithm,
         modality=cfg.model.input_modality,
         optimizer_factory=_optimizer_factory(cfg),
+        training_backend=t.backend,
+        fsdp_sharding=t.fsdp_sharding,
+        backend_options=_backend_options(cfg),
+        static_shapes=t.static_shapes,
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=t.batch_size,
