@@ -1,3 +1,5 @@
+# 4-rank variant of qwen3-8b-dflash.yaml with one external capture server.
+# Disables experiment reporting (report_to: none).
 model:
   target_model_path: Qwen/Qwen3-8B
   draft_model_config: configs/qwen3-8b-dflash.json

@@ -18,9 +18,9 @@ tuned single-node H200 layout described in
 
 | Recipe | Layout | Services |
 | --- | --- | --- |
-| [`managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml) | one 8-GPU node: four TP1 capture servers on GPUs 0-3, DP4 trainer on GPUs 4-7 | owned by `specforge train` |
-| [`managed-local/qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml) | one 8x H200 node: five TP1 FP8 capture servers on GPUs 0-4, DP3 trainer on GPUs 5-7, RDMA loopback | owned by `specforge train` |
-| [`external/qwen3.8-27b-dflash2-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml) | two 8-GPU nodes: eight TP1 capture servers, the Mooncake master and the producer on the capture node, DP8 trainer on the trainer node | started by [`examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh`](https://github.com/sgl-project/SpecForge/blob/main/examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh) or by hand |
+| [`managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml) | one 8-GPU node: four TP1 capture servers on GPUs 0-3, DP4 trainer on GPUs 4-7 | owned by `specforge train` |
+| [`managed-local/qwen3.8-27b-dflash2-5server-dp3-h200.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-5server-dp3-h200.yaml) | one 8x H200 node: five TP1 FP8 capture servers on GPUs 0-4, DP3 trainer on GPUs 5-7, RDMA loopback | owned by `specforge train` |
+| [`external/qwen3.8-27b-dflash2.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2.yaml) | two 8-GPU nodes: eight TP1 capture servers, the Mooncake master and the producer on the capture node, DP8 trainer on the trainer node | started by [`examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh`](https://github.com/sgl-project/SpecForge/blob/main/examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh) or by hand |
 
 Every number below is a steady-state throughput in samples per second (one
 sample is one conversation of up to 8192 tokens), measured in September 2026
@@ -85,7 +85,7 @@ Every Mooncake and flow-control value below follows from that size.
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml
 ```
 
 Add `--plan` first to validate the schema and print the owned Mooncake,
@@ -129,7 +129,7 @@ then measures 13.96 samples/s at 3.67 captured prompts/s per server on 8x H200
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-5server-dp3-h200.yaml
 ```
 
 This recipe moves the whole single-node H200 stack to the kernels and
@@ -249,7 +249,7 @@ SERVER_URLS=$(for port in $(seq 30000 30007); do
   printf '"http://%s:%s",' "$CAPTURE_IP" "$port"
 done)
 specforge train \
-  -c examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml \
+  -c examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2.yaml \
   --role consumer \
   "deployment.disaggregated.server_urls=[${SERVER_URLS%,}]" \
   "deployment.disaggregated.mooncake_metadata_server=http://$CAPTURE_IP:35880/metadata" \

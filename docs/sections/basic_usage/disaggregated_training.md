@@ -26,9 +26,9 @@ Choose checked-in recipes by directory:
 
 | Workflow | Catalog | Representative config |
 | --- | --- | --- |
-| Offline disaggregated | [`offline/disaggregated/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/offline/disaggregated) | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
-| Online, external services | [`online/disaggregated/external/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/online/disaggregated/external) | [`qwen3-8b-dflash-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml) |
-| Online, managed-local stack | [`online/disaggregated/managed-local/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/online/disaggregated/managed-local) | [`qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+| Offline disaggregated | [`offline/disaggregated/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/offline/disaggregated) | [`qwen3-8b-eagle3.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/disaggregated/qwen3-8b-eagle3.yaml) |
+| Online, external services | [`online/disaggregated/external/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/online/disaggregated/external) | [`qwen3-8b-dflash-1server-dp4.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml) |
+| Online, managed-local stack | [`online/disaggregated/managed-local/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/online/disaggregated/managed-local) | [`qwen3-8b-dflash-1server-dp7.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml) |
 
 The full model and strategy index is in the
 [recipe catalog](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/README.md). Filename suffixes are
@@ -110,7 +110,7 @@ With `deployment.trainer.nnodes: 1`, omitting `--role` starts a supervisor for
 both SpecForge roles:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml
 ```
 
 The checked-in external online recipes use the local demo endpoints shown
@@ -128,7 +128,7 @@ canceling it.
 Inspect the resolved plan without starting processes:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml --plan
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml --plan
 ```
 
 Plan output redacts secret-shaped overrides and credentials embedded in URLs.
@@ -170,7 +170,7 @@ four producer workers against one server while keeping the checked-in YAML as
 the source of every other setting:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-domino-1server-dp4.yaml \
   'deployment.disaggregated.server_urls=["http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000"]'
 ```
 
@@ -190,10 +190,10 @@ TP=1 capture server on GPU 0 and a DP=7 trainer on GPUs 1–7:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml
 
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7.yaml
 ```
 
 The checked-in multi-server Qwen3-8B Domino recipe records two TP=1 capture
@@ -203,7 +203,7 @@ the unified training entry:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml
 ```
 
 The Qwen3.6 DFlash one-server recipe owns a TP=1 server on GPU 0 and a DP=2
@@ -212,10 +212,10 @@ GPUs 0–3 and a DP=2 trainer on GPUs 4–5:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2.yaml
 
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-2server-dp2.yaml
 ```
 
 DFlash2 uses this same DFlash capture topology and feature contract. Its
@@ -224,7 +224,7 @@ and selector settings, and owns one capture process plus one trainer process:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml
 ```
 
 The selector runs only on the consumer; capture servers still use
@@ -240,7 +240,7 @@ records the throughput measured on B300 and H200 nodes:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml
 ```
 
 The launcher starts Mooncake first, waits for its metadata and RPC endpoints,
@@ -271,7 +271,7 @@ the launcher-provided rank to those same two commands:
 
 ```bash
 rcli exec --per-node <job> \
-  'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
+  'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3.yaml bash examples/disagg/run_offline_2node.sh'
 ```
 
 `RCLI_NODE_RANK=0` selects the producer and rank 1 selects the consumer. The

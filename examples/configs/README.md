@@ -35,13 +35,22 @@ examples/configs/
 | `online/disaggregated/managed-local` | Live SGLang capture | Producer + consumer | SpecForge starts local Mooncake and SGLang from `managed_local` |
 
 The directory is the source of truth for mode, topology, and service ownership.
-Some filenames retain historical `-online`, `-offline`, or `-disaggregated`
-labels so existing recipe identities and run names remain recognizable.
+Recipe filenames use `<model>-<draft-type>[-<servers>server-dp<ranks>][-<hardware>].yaml`,
+for example `qwen3.6-27b-dflash-1server-dp2.yaml` or
+`qwen3.8-27b-dflash2-5server-dp3-h200.yaml`. Hardware suffixes such as `npu`,
+`amd`, or `h200` come last; ordinary GPU recipes need no hardware suffix.
+Optional topology suffixes distinguish deployment variants; `dp<ranks>` records
+the number of trainer ranks. An omitted suffix does not imply a default topology;
+refer to `deployment` for the actual server and trainer configuration.
+Filenames omit `online`, `offline`, and `disaggregated` because the directories
+already encode those choices. Different directories may contain the same
+filename, so identify recipes by their relative paths. Run IDs and output
+directories are configured independently of the recipe filename.
 
 Run any recipe through the one public training entry:
 
 ```bash
-specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml
 ```
 
 `model.draft_model_config` may name a local JSON file, a local model directory,
@@ -55,13 +64,13 @@ Every recipe records its audited process count under `deployment.trainer`.
 Multi-process configs self-launch through torch distributed:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.yaml
 ```
 
 The Qwen3-30B-A3B EAGLE3.1 variant uses the same unified entry point:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1.yaml
 ```
 
 Its draft config enables per-layer RMS normalization before the three captured
@@ -76,23 +85,23 @@ more patched SGLang capture servers, and the trainer GPU allocation; the same
 Recipes under `online/disaggregated/external` omit `managed_local`, so Mooncake
 and SGLang remain owned by the user, scheduler, or service platform.
 
-The `kimi-k3-dspark-disaggregated.yaml` recipe is the external
+The `kimi-k3-dspark.yaml` recipe is the external
 two-node migration of the 64K Kimi K3 continual run. Its dedicated
 [runbook](../../docs/recipes/kimi-k3-dspark-disaggregated.md) pins the K3
 SGLang revision and patch target, preserves the old effective global batch and
 prompt order, and documents the TP8 capture plus four-rank trainer topology.
 
-`deepseek-v4-flash-dspark-disaggregated.yaml` trains a DSpark drafter for
+`deepseek-v4-flash-dspark.yaml` trains a DSpark drafter for
 DeepSeek-V4-Flash-0731 from scratch on ShareGPT, with external capture
 servers. Its
 [runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
-`qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
-its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
+`qwen3.8-27b-dflash2.yaml` (external services, two nodes) and
+its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4.yaml`
 (one node, four capture servers plus a DP4 trainer) and
-`qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml` (one 8x H200 node,
+`qwen3.8-27b-dflash2-5server-dp3-h200.yaml` (one 8x H200 node,
 five FP8 capture servers with FA3 and FlashInfer GDN, a DP3 trainer, RDMA
 loopback) train the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
 Qwen3.8-27B. Their
@@ -164,16 +173,16 @@ assume the command runs from the repository root.
 
 | Workflow | Canonical starting point |
 | --- | --- |
-| EAGLE3 offline, colocated | [`offline/colocated/qwen3-8b-eagle3-offline.yaml`](offline/colocated/qwen3-8b-eagle3-offline.yaml) |
-| DFlash offline, colocated | [`offline/colocated/qwen3-8b-dflash-offline.yaml`](offline/colocated/qwen3-8b-dflash-offline.yaml) |
-| Domino offline, colocated | [`offline/colocated/qwen3-8b-domino-offline.yaml`](offline/colocated/qwen3-8b-domino-offline.yaml) |
-| DSpark offline, colocated | [`offline/colocated/qwen3-4b-dspark-offline.yaml`](offline/colocated/qwen3-4b-dspark-offline.yaml) |
-| EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
-| EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
-| DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
-| DFlash 2 online, managed-local stack | [`online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`](online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml) |
-| DFlash 2 online, external services on two nodes | [`online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml`](online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml) |
-| Domino online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
+| EAGLE3 offline, colocated | [`offline/colocated/qwen3-8b-eagle3.yaml`](offline/colocated/qwen3-8b-eagle3.yaml) |
+| DFlash offline, colocated | [`offline/colocated/qwen3-8b-dflash.yaml`](offline/colocated/qwen3-8b-dflash.yaml) |
+| Domino offline, colocated | [`offline/colocated/qwen3-8b-domino.yaml`](offline/colocated/qwen3-8b-domino.yaml) |
+| DSpark offline, colocated | [`offline/colocated/qwen3-4b-dspark.yaml`](offline/colocated/qwen3-4b-dspark.yaml) |
+| EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3.yaml`](offline/disaggregated/qwen3-8b-eagle3.yaml) |
+| EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3.yaml`](online/disaggregated/external/qwen3-8b-eagle3.yaml) |
+| DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml) |
+| DFlash 2 online, managed-local stack | [`online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml`](online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml) |
+| DFlash 2 online, external services on two nodes | [`online/disaggregated/external/qwen3.8-27b-dflash2.yaml`](online/disaggregated/external/qwen3.8-27b-dflash2.yaml) |
+| Domino online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml`](online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml) |
 
 The runtime derives online/offline mode from the selected `data` source and
 reads topology from `deployment.mode`; it does not parse the filename or its
@@ -549,7 +558,7 @@ For deeper lifecycle and recovery semantics, see the
 | DSpark | consumer DP | DP | consumer DP |
 | P-EAGLE | consumer DP, batch size 1 | No | No |
 
-`qwen3-8b-dpace-online.yaml` is the D-PACE recipe. It deliberately uses the
+`qwen3-8b-dpace.yaml` is the D-PACE recipe. It deliberately uses the
 shared DFlash strategy with `training.loss_type: dpace`; D-PACE is an objective
 selection inside the unified trainer, not another training entry.
 
@@ -588,7 +597,7 @@ export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-npu.yaml
 ```
 
 The unified launcher provides rank/world/rendezvous variables and the runtime
@@ -602,13 +611,13 @@ control/data-plane state; capture producers always start a fresh attempt.
 Migration notes:
 
 - The former `run_qwen3_8b_dflash_disagg_1srv_dp7.sh` self-contained topology
-  is retained as `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`: one managed
+  is retained as `qwen3-8b-dflash-1server-dp7.yaml`: one managed
   capture server on GPU 0 and seven DFlash trainer ranks on GPUs 1–7.
 - The former `run_qwen3_8b_domino_disagg_1srv_dp7.sh` self-contained topology
-  is retained as `qwen3-8b-domino-1server-dp7-disaggregated.yaml`: one managed
+  is retained as `qwen3-8b-domino-1server-dp7.yaml`: one managed
   capture server on GPU 0 and seven trainer ranks on GPUs 1–7.
 - The former `run_qwen3.6_27b_dflash_disagg.sh` one-server topology is retained
-  as `qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml`: one managed capture
+  as `qwen3.6-27b-dflash-1server-dp2.yaml`: one managed capture
   server on GPU 0 and two trainer ranks on GPUs 1–2. The external-service YAML
   remains available for scheduler-managed deployments.
 - The latest pre-cleanup `run_qwen3_8b_domino_disagg_multiserver.sh` had been
@@ -617,7 +626,7 @@ Migration notes:
   without restoring the legacy trainer script; the external-service Domino
   recipe also accepts any number of typed `deployment.disaggregated.server_urls`.
 - The former GPT-OSS-120B shell accidentally selected the 20B draft config;
-  `gpt-oss-120b-eagle3-online.yaml` points to the matching 120B config.
+  `gpt-oss-120b-eagle3.yaml` points to the matching 120B config.
 - The former Qwen3-235B shell accidentally launched Qwen3-Next-80B; the two now
   have separate recipes.
 - Qwen3-Next online EAGLE3 retains its batch size of two. P-EAGLE requires

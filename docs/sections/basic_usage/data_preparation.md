@@ -341,7 +341,7 @@ Launch the matching recipe after its `data.hidden_states_path` points at the
 generated directory:
 
 ```bash
-specforge train --config examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml
+specforge train --config examples/configs/offline/colocated/qwen3-8b-dflash.yaml
 ```
 
 See the [Training](training.md) guide for the complete run schema and supported

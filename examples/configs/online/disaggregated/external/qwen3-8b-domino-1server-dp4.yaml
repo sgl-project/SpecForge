@@ -1,3 +1,7 @@
+# 4-rank variant of qwen3-8b-domino.yaml with one external capture server.
+# Uses perfectblend_qwen3-8b_regen.jsonl instead of ShareGPT, enables
+# trust_remote_code, and disables experiment reporting (report_to: none).
+# Saves every 1000 steps and logs every 10, versus 2000 and 50 in the 8-rank recipe.
 model:
   target_model_path: "Qwen/Qwen3-8B"
   draft_model_config: "configs/qwen3-8b-domino.json"
