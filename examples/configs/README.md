@@ -278,6 +278,8 @@ Common fields:
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
+| `training.length_aware_scheduling` | `false` | Online only: reorder each ready optimizer window by length, preserving its sample membership. Supports DFlash/DFlash2 and EAGLE3 with batch size 1. |
+| `training.length_bucket_size` | `0` | Offline DFlash/DFlash2 only: grouping window in global microbatches (`batch_size * data_parallel_size` samples each); 0 disables. First use caches missing file lengths under `output_dir/length-cache`. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |

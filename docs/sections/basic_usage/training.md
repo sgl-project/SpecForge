@@ -85,6 +85,69 @@ specforge train \
 Unknown config fields and unknown override paths are errors. This keeps a
 misspelled or retired option from being silently ignored.
 
+## Length-aware batching
+
+Both policies are opt-in and leave evaluation order unchanged. They group
+independent samples; they do not pack documents into one sequence or change
+attention masks. Neither policy guarantees higher throughput: measure the
+complete run, especially when online capture rather than training is the
+bottleneck.
+
+For online DFlash/DFlash2, or online EAGLE3 with `batch_size: 1`:
+
+```yaml
+training:
+  length_aware_scheduling: true
+```
+
+The rank-zero dispatcher sorts only the samples already available for one
+complete optimizer step. Similar lengths share a DP microbatch round, and
+the longer batches are distributed across ranks. Sample membership, per-rank
+batch counts, accumulation and durable acknowledgement boundaries are retained;
+no extra capture lookahead is required. A window with unknown lengths keeps
+FIFO order. With one microbatch per optimizer step and one sample per rank,
+there is no scheduling benefit. EAGLE3 multi-sample online batches are not
+supported by this option because their collator requires equal lengths and
+their loss normalization depends on padded length.
+
+For offline DFlash/DFlash2 (both colocated and disaggregated):
+
+```yaml
+training:
+  strategy: dflash
+  batch_size: 2
+  length_bucket_size: 32
+```
+
+`length_bucket_size` is the number of **global microbatches** in one grouping
+window; each contains `batch_size * data_parallel_size` samples. Zero disables
+grouping. The sampler applies the usual `seed + epoch` shuffle and DP padding,
+groups similar lengths, then shuffles global microbatches within each window.
+It preserves the epoch's sample multiset, padding duplicates and exact
+incomplete-batch tail. Grouping may change samples within an optimizer step and
+therefore the stochastic training trajectory. Changing the policy, bucket size,
+seed, truncation length, or ordered sample IDs/effective lengths on checkpoint
+resume is rejected. The metadata fingerprint is not a tensor-content checksum.
+Offline EAGLE3 is rejected because
+regrouping would change its current padded-length loss weights.
+
+Legacy offline files do not store lengths separately. On first use, rank zero
+reads missing lengths and writes an atomic cache under
+`output_dir/length-cache/`; other ranks receive the metadata. `.ckpt.gz` files
+require a one-time decompression pass, which is logged and must be included in
+end-to-end first-run timing. Unchanged files reuse the cache; size or timestamp
+changes invalidate their entries. Feature directories are not modified, and
+training tensors remain lazily loaded. Disaggregated refs with lengths need
+no indexing pass.
+
+Benchmark the same effective training data, model, hardware and precision.
+Report useful-token/anchor throughput, padding, optimizer-step time and full
+run time; evaluate a fixed held-out set separately. DFlash2 anchor sampling is
+stochastic, so numerical parity tests must hold the sampled anchors fixed.
+See [`benchmarks/length_aware_training.py`](../../../benchmarks/length_aware_training.py)
+for a reproducible synthetic GPU check; this does not establish convergence or
+serving acceptance on a production dataset.
+
 ## Run config
 
 A run config has seven typed sections (`model`, `data`, `training`, `tracking`,
