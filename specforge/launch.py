@@ -46,6 +46,9 @@ def _assemble_trainer(
     model,
     target_head,
     optimizer_factory,
+    training_backend: str = "fsdp",
+    fsdp_sharding: Optional[str] = None,
+    backend_options=None,
     run_id: str,
     output_dir: str,
     batch_size: int,
@@ -121,6 +124,9 @@ def _assemble_trainer(
         model=model,
         target_head=target_head,
         optimizer_factory=optimizer_factory,
+        training_backend=training_backend,
+        fsdp_sharding=fsdp_sharding,
+        backend_options=backend_options,
         run_id=run_id,
         output_dir=output_dir,
         batch_size=batch_size,
@@ -163,14 +169,32 @@ def _offline_io(
     *,
     ttt_length: int,
     use_usp_preprocess: bool,
+    static_shapes: bool = False,
+    static_shape_buckets=None,
 ):
     """Resolve the algorithm-owned normalizer and collator for one modality."""
     provider = algorithm.providers.offline_for(modality)
-    return provider.build_collator(), provider.build_normalizer(
+    collate_fn = _static_or_dynamic_collator(
+        provider.build_collator, _static_pad_length(static_shapes, max_len, static_shape_buckets)
+    )
+    return collate_fn, provider.build_normalizer(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
     )
+
+
+def _static_or_dynamic_collator(build_collator, pad_to):
+    """``training.static_shapes`` asks the algorithm's collator for a fixed length."""
+    if pad_to is None:
+        return build_collator()
+    try:
+        return build_collator(pad_to=pad_to)
+    except TypeError as exc:
+        raise ValueError(
+            "training.static_shapes is not supported by this algorithm's collator "
+            f"({build_collator!r} takes no pad_to)"
+        ) from exc
 
 
 def _shard_offline_refs(
@@ -252,6 +276,8 @@ def _make_offline_eval_data_factory(
     ttt_length: int,
     use_usp_preprocess: bool,
     dataloader_num_workers: int,
+    static_shapes: bool = False,
+    static_shape_buckets=None,
 ):
     """Build a fresh re-iterable eval loader over the offline feature path."""
     provider = algorithm.providers.offline_for(modality)
@@ -261,6 +287,8 @@ def _make_offline_eval_data_factory(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        static_shapes=static_shapes,
+        static_shape_buckets=static_shape_buckets,
     )
     eval_run_id = f"{run_id}-eval"
     refs = provider.build_reader(
@@ -289,15 +317,33 @@ def _make_offline_eval_data_factory(
     return build_loader
 
 
+def _static_pad_length(static_shapes: bool, max_len, buckets=None):
+    """``None`` (pad to the longest sample), one fixed length, or ascending bucket lengths."""
+    if not static_shapes:
+        return None
+    if max_len is None:
+        raise ValueError("static_shapes needs max_len (data.max_length) to pad to")
+    if buckets:
+        lengths = sorted({int(b) for b in buckets} | {int(max_len)})
+        if lengths[-1] != int(max_len):
+            raise ValueError("static_shape_buckets must not exceed max_len (data.max_length)")
+        return tuple(lengths)
+    return int(max_len)
+
+
 def _streaming_collate(
     algorithm: AlgorithmRegistration,
     modality: str,
     collate_fn,
+    *,
+    pad_to=None,
 ):
     """Resolve an algorithm-owned server-streaming collator."""
     if collate_fn is not None:
         return collate_fn
-    return algorithm.providers.server_streaming_for(modality).build_collator()
+    return _static_or_dynamic_collator(
+        algorithm.providers.server_streaming_for(modality).build_collator, pad_to
+    )
 
 
 def _resolve_metadata_store(
@@ -546,10 +592,15 @@ def build_offline_runtime(
     draft_model,
     target_head,
     optimizer_factory,
+    training_backend: str = "fsdp",
+    fsdp_sharding: Optional[str] = None,
+    backend_options=None,
     run_id: str,
     output_dir: str,
     ttt_length: int = 7,
     max_len: int = 2048,
+    static_shapes: bool = False,
+    static_shape_buckets=None,
     batch_size: int = 1,
     accumulation_steps: int = 1,
     num_epochs: int = 1,
@@ -586,6 +637,8 @@ def build_offline_runtime(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        static_shapes=static_shapes,
+        static_shape_buckets=static_shape_buckets,
     )
     controller = DataFlowController(
         run_id,
@@ -621,6 +674,8 @@ def build_offline_runtime(
             ttt_length=ttt_length,
             use_usp_preprocess=use_usp_preprocess,
             dataloader_num_workers=dataloader_num_workers,
+            static_shapes=static_shapes,
+            static_shape_buckets=static_shape_buckets,
         )
     return _assemble_trainer(
         algorithm=algorithm,
@@ -632,6 +687,9 @@ def build_offline_runtime(
             target_head if algorithm.providers.step.uses_external_target_head else None
         ),
         optimizer_factory=optimizer_factory,
+        training_backend=training_backend,
+        fsdp_sharding=fsdp_sharding,
+        backend_options=backend_options,
         run_id=run_id,
         output_dir=output_dir,
         batch_size=batch_size,
@@ -672,10 +730,15 @@ def build_disagg_offline_runtime(
     draft_model,
     target_head,
     optimizer_factory,
+    training_backend: str = "fsdp",
+    fsdp_sharding: Optional[str] = None,
+    backend_options=None,
     run_id: str,
     output_dir: str,
     ttt_length: int = 7,
     max_len: int = 2048,
+    static_shapes: bool = False,
+    static_shape_buckets=None,
     batch_size: int = 1,
     accumulation_steps: int = 1,
     num_epochs: int = 1,
@@ -711,6 +774,8 @@ def build_disagg_offline_runtime(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        static_shapes=static_shapes,
+        static_shape_buckets=static_shape_buckets,
     )
     source_refs = list(refs)
 
@@ -743,6 +808,8 @@ def build_disagg_offline_runtime(
             ttt_length=ttt_length,
             use_usp_preprocess=use_usp_preprocess,
             dataloader_num_workers=dataloader_num_workers,
+            static_shapes=static_shapes,
+            static_shape_buckets=static_shape_buckets,
         )
     return _assemble_trainer(
         algorithm=algorithm,
@@ -754,6 +821,9 @@ def build_disagg_offline_runtime(
             target_head if algorithm.providers.step.uses_external_target_head else None
         ),
         optimizer_factory=optimizer_factory,
+        training_backend=training_backend,
+        fsdp_sharding=fsdp_sharding,
+        backend_options=backend_options,
         run_id=run_id,
         output_dir=output_dir,
         batch_size=batch_size,
@@ -1525,6 +1595,9 @@ def build_disagg_online_consumer(
     channel,
     draft_model,
     optimizer_factory,
+    training_backend: str = "fsdp",
+    fsdp_sharding: Optional[str] = None,
+    backend_options=None,
     run_id: str,
     output_dir: str,
     target_head=None,
@@ -1536,6 +1609,9 @@ def build_disagg_online_consumer(
     eval_interval: int = 0,
     eval_data_factory=None,
     collate_fn=None,
+    static_shapes: bool = False,
+    static_shape_buckets=None,
+    max_len: Optional[int] = None,
     idle_timeout_s: Optional[float] = None,
     metadata_store: Optional[MetadataStore] = None,
     metadata_db_path: Optional[str] = None,
@@ -1876,6 +1952,9 @@ def build_disagg_online_consumer(
                 else None
             ),
             optimizer_factory=optimizer_factory,
+            training_backend=training_backend,
+            fsdp_sharding=fsdp_sharding,
+            backend_options=backend_options,
             run_id=run_id,
             output_dir=output_dir,
             batch_size=batch_size,
@@ -1888,7 +1967,12 @@ def build_disagg_online_consumer(
             eval_data_factory=eval_data_factory,
             logger=logger,
             log_interval=log_interval,
-            collate_fn=_streaming_collate(algorithm, modality, collate_fn),
+            collate_fn=_streaming_collate(
+                algorithm,
+                modality,
+                collate_fn,
+                pad_to=_static_pad_length(static_shapes, max_len, static_shape_buckets),
+            ),
             strategy_kwargs=strategy_kwargs,
             per_sample_transform=None,
             max_checkpoints=max_checkpoints,

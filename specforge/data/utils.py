@@ -34,7 +34,10 @@ class DataCollatorWithPadding:
     Datacollator that will dynamically pad the inputs for batching.
     """
 
-    def __init__(self):
+    def __init__(self, pad_to=None):
+        # ``pad_to``: fixed batch length (``training.static_shapes``) instead of
+        # the longest sample of each batch.
+        self.pad_to = None if pad_to is None else (int(pad_to) if isinstance(pad_to, int) else tuple(int(b) for b in pad_to))
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
             self.ulysses_degree = torch.distributed.get_world_size(
@@ -120,6 +123,10 @@ class DataCollatorWithPadding:
                 - loss_mask: torch.Tensor of shape (B, N)
         """
         max_length = max(item["input_ids"].shape[1] for item in features)
+        if self.pad_to is not None:
+            from specforge.algorithms.common.collation import resolve_static_length
+
+            max_length = resolve_static_length(max_length, self.pad_to)
 
         # pad for sequence parrel
         max_length = (

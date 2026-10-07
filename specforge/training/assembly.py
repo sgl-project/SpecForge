@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.training.backend import BackendOptions
 from specforge.training.provenance import (
     model_resume_provenance as _model_resume_provenance,
 )
@@ -535,6 +536,24 @@ def _profiling_options(cfg: Config):
     )
 
 
+def shape_buckets(cfg: Config):
+    """Effective ``static_shape_buckets``: the configured lengths plus ``data.max_length`` as the last one."""
+    t = cfg.training
+    if not t.static_shapes or not t.static_shape_buckets:
+        return None
+    return tuple(sorted(set(int(b) for b in t.static_shape_buckets) | {int(cfg.data.max_length)}))
+
+
+def _backend_options(cfg: Config) -> BackendOptions:
+    """``training.*`` -> typed backend options, shared by every launch path."""
+    buckets = shape_buckets(cfg)
+    return BackendOptions(
+        compile_blocks=cfg.training.compile_blocks,
+        # Bucket padding alone is a data-path setting; only compiled blocks need to know the count.
+        compile_shape_buckets=len(buckets) if (buckets and cfg.training.compile_blocks) else 0,
+    )
+
+
 def _common_launch_kwargs(
     cfg: Config,
     bundle: ModelBundle,
@@ -553,6 +572,11 @@ def _common_launch_kwargs(
         algorithm=algorithm,
         modality=cfg.model.input_modality,
         optimizer_factory=_optimizer_factory(cfg),
+        training_backend=t.backend,
+        fsdp_sharding=t.fsdp_sharding,
+        backend_options=_backend_options(cfg),
+        static_shapes=t.static_shapes,
+        static_shape_buckets=shape_buckets(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=t.batch_size,

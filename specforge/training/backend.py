@@ -8,7 +8,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
-FSDP-only for now. ``ParallelConfig`` carries the process groups created by the
+``ParallelConfig`` carries the process groups created by the
 single distributed lifecycle: trainer TP (fixed at one by public builders) plus
 draft DP/USP topology.
 """
@@ -16,7 +16,6 @@ draft DP/USP topology.
 from __future__ import annotations
 
 import abc
-import contextlib
 import logging
 import os
 from dataclasses import dataclass, field
@@ -25,6 +24,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+from specforge.training.params import local_tensor
 
 
 def _foreach_scale_(tensors: List[torch.Tensor], factor: torch.Tensor) -> None:
@@ -85,14 +86,14 @@ class ParallelConfig:
         tp_size: int = 1,
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
-        sharding_strategy: str = "SHARD_GRAD_OP",
+        sharding_strategy: Optional[str] = None,
         param_dtype: torch.dtype = torch.bfloat16,
     ) -> "ParallelConfig":
         """Carry every group built by :func:`specforge.distributed.init_distributed`."""
-        # Env override for the FSDP sharding strategy — e.g. FSDP_SHARDING=NO_SHARD
-        # runs DDP-style (full params replicated, one grad all-reduce, no param
-        # all-gather). Default unchanged when the env var is unset.
-        sharding_strategy = os.environ.get("FSDP_SHARDING", sharding_strategy)
+        # Typed config is authoritative; direct Python callers may still use
+        # the legacy environment fallback, e.g. FSDP_SHARDING=NO_SHARD for DDP.
+        if sharding_strategy is None:
+            sharding_strategy = os.environ.get("FSDP_SHARDING", "SHARD_GRAD_OP")
         if not dist.is_initialized():
             return cls(
                 world_size=1,
@@ -144,6 +145,24 @@ class ParallelConfig:
         )
 
 
+@dataclass(frozen=True)
+class BackendOptions:
+    """Opt-in backend behaviors selected by ``training.*`` config fields.
+
+    Options act on the draft blocks (the ``_no_split_modules`` classes, or the
+    EAGLE ``midlayer`` when a draft advertises none) before sharding. FSDP1
+    wraps blocks in ``FullyShardedDataParallel`` modules and supports none of
+    them; the FSDP2 backend applies them in ``_prepare_blocks``.
+    """
+
+    #: ``torch.compile`` every draft block (or the EAGLE midlayer) in place before FSDP2 sharding.
+    compile_blocks: bool = False
+    #: Number of static input lengths the compiled blocks will see (``training.static_shape_buckets``):
+    #: above 1, every block is compiled with ``dynamic=False`` and Dynamo's recompile limit is raised so
+    #: each bucket gets its own static graph instead of a symbolic-shape one.
+    compile_shape_buckets: int = 0
+
+
 class TrainingBackend(abc.ABC):
     name: str
     #: Whether ``step(loss_denominator=...)`` validates the global loss
@@ -173,21 +192,24 @@ class TrainingBackend(abc.ABC):
     def load_state_dict(self, state: dict) -> None: ...
 
 
-class FSDPTrainingBackend(TrainingBackend):
-    """FSDP1 backend for the canonical SpecForge training math: FSDP with
-    ``use_orig_params=True`` / bf16 mixed precision over the configured process
-    group, optimizer targeting the inner trainable submodule."""
+class DistributedTrainingBackend(TrainingBackend):
+    """Shared model/optimizer lifecycle for the FSDP1 and FSDP2 backends.
 
-    name = "fsdp"
+    Subclasses own parameter sharding and full model state dictionaries.
+    Replicated execution, local-shard gradient scaling, optimizer and RNG state
+    use the same contract for both implementations.
+    """
 
     def __init__(
         self,
         parallel_config: ParallelConfig,
         *,
         optimizer_factory=None,
+        options: Optional[BackendOptions] = None,
     ) -> None:
         self.parallel_config = parallel_config
         self._optimizer_factory = optimizer_factory
+        self.options = options or BackendOptions()
         self.module: Optional[nn.Module] = None
         self.optimizer = None
         self._wrapped = False
@@ -237,8 +259,6 @@ class FSDPTrainingBackend(TrainingBackend):
             self._wrapped = False
             self._wrapper_kind = "none"
         else:
-            import functools
-
             pc = self.parallel_config
             ignored_frozen_modules = self._frozen_target_modules(model)
             # DFlash-family models expose their transformer block class through
@@ -255,6 +275,7 @@ class FSDPTrainingBackend(TrainingBackend):
                 for module in model.modules()
                 if type(module).__name__ in block_names
             }
+            self._prepare_blocks(model, block_classes, optimizer_target)
             if pc.sharding_strategy == "NO_SHARD":
                 # PyTorch deprecated FSDP's NO_SHARD mode in favor of DDP.
                 # DDP gives this small draft model replicated-param execution
@@ -277,38 +298,12 @@ class FSDPTrainingBackend(TrainingBackend):
                 )
                 self._wrapper_kind = "ddp"
             else:
-                from torch.distributed.fsdp import BackwardPrefetch
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-                from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-
-                sharding = getattr(ShardingStrategy, pc.sharding_strategy)
-                fsdp_kwargs = dict(
-                    use_orig_params=True,
-                    mixed_precision=MixedPrecision(
-                        param_dtype=pc.param_dtype, buffer_dtype=torch.float32
-                    ),
-                    sharding_strategy=sharding,
-                    process_group=pc.fsdp_process_group,
-                )
-                if ignored_frozen_modules:
-                    fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
-                if block_classes:
-                    fsdp_kwargs.update(
-                        auto_wrap_policy=functools.partial(
-                            transformer_auto_wrap_policy,
-                            transformer_layer_cls=block_classes,
-                        ),
-                        forward_prefetch=True,
-                        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-                        limit_all_gathers=True,
-                    )
-                model = FSDP(model, **fsdp_kwargs)
-                self._wrapper_kind = "fsdp"
+                model = self._shard_model(model, block_classes, ignored_frozen_modules)
+                self._wrapper_kind = self.name
             self.module = model
             self._wrapped = True
             self.auto_wrap_block_classes = (
-                block_classes if self._wrapper_kind == "fsdp" else set()
+                block_classes if self._wrapper_kind != "ddp" else set()
             )
             self.ignored_frozen_modules = ignored_frozen_modules
         if self._optimizer_factory is not None:
@@ -316,6 +311,40 @@ class FSDPTrainingBackend(TrainingBackend):
             self.optimizer = self._optimizer_factory(target)
             self._configure_optimizer_grad_norm()
         return self.module
+
+    @abc.abstractmethod
+    def _shard_model(self, model, block_classes, ignored_frozen_modules): ...
+
+    @staticmethod
+    def _block_targets(
+        model: nn.Module, block_classes, optimizer_target: Optional[nn.Module]
+    ) -> List[nn.Module]:
+        """Draft blocks that ``BackendOptions`` transforms act on.
+
+        DFlash-family drafts advertise their decoder block class; EAGLE drafts
+        expose a single ``midlayer``. Working at this granularity keeps the
+        per-block FSDP boundaries and the custom head kernels untouched.
+        """
+        targets = [m for m in model.modules() if type(m) in block_classes]
+        if not targets:
+            midlayer = getattr(optimizer_target, "midlayer", None)
+            if isinstance(midlayer, nn.Module):
+                targets = [midlayer]
+        return targets
+
+    def _prepare_blocks(
+        self, model: nn.Module, block_classes, optimizer_target: Optional[nn.Module]
+    ) -> None:
+        """Hook for pre-sharding block transforms; FSDP1 supports none."""
+        for option in BackendOptions.__dataclass_fields__:
+            if getattr(self.options, option):
+                raise ValueError(
+                    f"BackendOptions.{option} is not supported by the "
+                    f"{self.name!r} backend; use training.backend=fsdp2"
+                )
+
+    def _after_optimizer_step(self) -> None:
+        """Hook run after every optimizer step."""
 
     def set_optimizer(self, optimizer) -> None:
         self.optimizer = optimizer
@@ -349,7 +378,11 @@ class FSDPTrainingBackend(TrainingBackend):
             raise RuntimeError("scale_gradients called before prepare_model")
         with torch.no_grad():
             _foreach_scale_(
-                [p.grad for p in self.module.parameters() if p.grad is not None],
+                [
+                    local_tensor(p.grad)
+                    for p in self.module.parameters()
+                    if p.grad is not None
+                ],
                 factor,
             )
 
@@ -367,22 +400,27 @@ class FSDPTrainingBackend(TrainingBackend):
         """
         if self.optimizer is None:
             raise RuntimeError(
-                "FSDPTrainingBackend.step called before optimizer is set"
+                f"{type(self).__name__}.step called before optimizer is set"
             )
         if loss_denominator is None:
-            return self.optimizer.step()
-        return self.optimizer.step(loss_denominator=loss_denominator)
+            grad_norm = self.optimizer.step()
+        else:
+            grad_norm = self.optimizer.step(loss_denominator=loss_denominator)
+        self._after_optimizer_step()
+        return grad_norm
 
     def state_dict(self) -> dict:
-        """Full training state ``{"model", "optimizer", "rng"}`` for resume.
+        """Model, optimizer, RNG and sharding metadata for resume.
 
-        ``model`` is gathered rank0-only (``{}`` on other ranks when wrapped).
+        Sharded model weights are gathered on rank zero; FSDP1 may also return
+        ignored replicated target tables on other ranks.
         FSDP optimizer state is rank-local; DDP optimizer state is replicated.
         RNG state is always rank-local.
         """
         if self.module is None:
             raise RuntimeError("state_dict called before prepare_model")
         return {
+            "metadata": self._checkpoint_metadata(),
             "model": self._module_state_dict(),
             "optimizer": (
                 self.optimizer.state_dict() if self.optimizer is not None else None
@@ -392,6 +430,18 @@ class FSDPTrainingBackend(TrainingBackend):
 
     def load_state_dict(self, state: dict) -> None:
         """Restore whichever of module weights / optimizer / RNG the state carries."""
+        if state.get("optimizer") is not None:
+            metadata = state.get("metadata")
+            if metadata is None:
+                # Checkpoints predating backend selection were written by FSDP1.
+                metadata = {"backend": "fsdp"}
+            for key, current in self._checkpoint_metadata().items():
+                if key in metadata and metadata[key] != current:
+                    raise ValueError(
+                        f"optimizer checkpoint {key}={metadata[key]!r} does not "
+                        f"match this run ({current!r}); resume with the original "
+                        "backend and sharding layout, or load model weights only"
+                    )
         if state.get("model") is not None:
             self._load_module_state_dict(state["model"])
         if self.optimizer is not None and state.get("optimizer") is not None:
@@ -399,39 +449,35 @@ class FSDPTrainingBackend(TrainingBackend):
         if state.get("rng") is not None:
             self._set_rng_state(state["rng"])
 
-    def _full_state_ctx(self, state_dict_config=None):
-        """FULL_STATE_DICT context for a wrapped module; a no-op when unwrapped."""
-        if self._wrapper_kind != "fsdp":
-            return contextlib.nullcontext()
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import StateDictType
-
-        return FSDP.state_dict_type(
-            self.module, StateDictType.FULL_STATE_DICT, state_dict_config
-        )
+    def _checkpoint_metadata(self) -> dict:
+        return {
+            "backend": self.name,
+            "sharding_strategy": self.parallel_config.sharding_strategy,
+            "world_size": self.parallel_config.world_size,
+        }
 
     def _module_state_dict(self) -> dict:
         if self._wrapper_kind == "ddp":
             if dist.is_initialized() and dist.get_rank() != 0:
                 return {}
             return self.module.module.state_dict()
-        if self._wrapper_kind != "fsdp":
+        if not self._wrapped:
             return self.module.state_dict()
-        from torch.distributed.fsdp import FullStateDictConfig
-
-        # gather to rank0 CPU only — materializing the full model on every
-        # rank's GPU is wasted memory when only rank0 writes it.
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with self._full_state_ctx(cfg):
-            return self.module.state_dict()
+        return self._sharded_model_state_dict()
 
     def _load_module_state_dict(self, model_state: dict) -> None:
-        # every rank loads the full state dict read from the shared file.
         if self._wrapper_kind == "ddp":
             self.module.module.load_state_dict(model_state)
-            return
-        with self._full_state_ctx():
+        elif not self._wrapped:
             self.module.load_state_dict(model_state)
+        else:
+            self._load_sharded_model_state_dict(model_state)
+
+    @abc.abstractmethod
+    def _sharded_model_state_dict(self) -> dict: ...
+
+    @abc.abstractmethod
+    def _load_sharded_model_state_dict(self, model_state: dict) -> None: ...
 
     @staticmethod
     def _rng_state() -> dict:
@@ -472,4 +518,78 @@ class FSDPTrainingBackend(TrainingBackend):
         module.set_rng_state(state, module.current_device())
 
 
-__all__ = ["ParallelConfig", "TrainingBackend", "FSDPTrainingBackend"]
+class FSDPTrainingBackend(DistributedTrainingBackend):
+    """Original FSDP1 implementation with BF16 compute and original parameters."""
+
+    name = "fsdp"
+
+    def _shard_model(self, model, block_classes, ignored_frozen_modules):
+        import functools
+
+        from torch.distributed.fsdp import BackwardPrefetch
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+        pc = self.parallel_config
+        fsdp_kwargs = dict(
+            use_orig_params=True,
+            mixed_precision=MixedPrecision(
+                param_dtype=pc.param_dtype, buffer_dtype=torch.float32
+            ),
+            sharding_strategy=getattr(ShardingStrategy, pc.sharding_strategy),
+            process_group=pc.fsdp_process_group,
+        )
+        if ignored_frozen_modules:
+            fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
+        if block_classes:
+            fsdp_kwargs.update(
+                auto_wrap_policy=functools.partial(
+                    transformer_auto_wrap_policy,
+                    transformer_layer_cls=block_classes,
+                ),
+                forward_prefetch=True,
+                backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+                limit_all_gathers=True,
+            )
+        return FSDP(model, **fsdp_kwargs)
+
+    def _full_state_ctx(self, state_dict_config=None):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType
+
+        return FSDP.state_dict_type(
+            self.module, StateDictType.FULL_STATE_DICT, state_dict_config
+        )
+
+    def _sharded_model_state_dict(self) -> dict:
+        from torch.distributed.fsdp import FullStateDictConfig
+
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with self._full_state_ctx(cfg):
+            return self.module.state_dict()
+
+    def _load_sharded_model_state_dict(self, model_state: dict) -> None:
+        with self._full_state_ctx():
+            self.module.load_state_dict(model_state)
+
+
+def create_training_backend(name: str, parallel_config: ParallelConfig, **kwargs):
+    """Select a backend without importing FSDP2 on the default FSDP1 path."""
+    if name == "fsdp":
+        return FSDPTrainingBackend(parallel_config, **kwargs)
+    if name == "fsdp2":
+        from specforge.training.fsdp2 import FSDP2TrainingBackend
+
+        return FSDP2TrainingBackend(parallel_config, **kwargs)
+    raise ValueError(f"unsupported training backend: {name!r}; expected fsdp or fsdp2")
+
+
+__all__ = [
+    "BackendOptions",
+    "ParallelConfig",
+    "TrainingBackend",
+    "DistributedTrainingBackend",
+    "FSDPTrainingBackend",
+    "create_training_backend",
+]
