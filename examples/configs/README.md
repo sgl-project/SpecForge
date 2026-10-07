@@ -39,6 +39,9 @@ Recipe filenames use `<model>-<draft-type>[-<servers>server-dp<ranks>][-<hardwar
 for example `qwen3.6-27b-dflash-1server-dp2.yaml` or
 `qwen3.8-27b-dflash2-5server-dp3-h200.yaml`. Hardware suffixes such as `npu`,
 `amd`, or `h200` come last; ordinary GPU recipes need no hardware suffix.
+Optional topology suffixes distinguish deployment variants; `dp<ranks>` records
+the number of trainer ranks. An omitted suffix does not imply a default topology;
+refer to `deployment` for the actual server and trainer configuration.
 Filenames omit `online`, `offline`, and `disaggregated` because the directories
 already encode those choices. Different directories may contain the same
 filename, so identify recipes by their relative paths. Run IDs and output
