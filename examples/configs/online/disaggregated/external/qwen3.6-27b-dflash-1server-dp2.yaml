@@ -1,3 +1,6 @@
+# 2-rank variant of qwen3.6-27b-dflash.yaml with one external capture server.
+# Uses max_length: 2048 instead of 4096 and save_interval: 1000 instead of 2000
+# in the 8-rank recipe.
 model:
   target_model_path: "Qwen/Qwen3.6-27B"
   draft_model_config: "configs/qwen3.6-27b-dflash.json"
