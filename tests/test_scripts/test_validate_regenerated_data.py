@@ -131,7 +131,7 @@ class TestRegenerationGuards(TestCase):
     def test_missing_openai_client_has_actionable_error(self):
         with (
             patch("scripts.regenerate_train_data.OpenAI", None),
-            self.assertRaisesRegex(ModuleNotFoundError, "specforge\\[data\\]"),
+            self.assertRaisesRegex(ModuleNotFoundError, "pip install openai"),
         ):
             call_sglang(
                 SimpleNamespace(),
