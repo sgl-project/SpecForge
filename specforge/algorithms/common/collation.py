@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
 
 def concatenate_features(features):
@@ -27,11 +27,14 @@ def pad_and_concatenate_features(
     sequence_axes: Mapping[str, int],
     required_keys: Sequence[str],
     optional_keys: Sequence[str] = (),
+    pad_to: Optional[int] = None,
 ):
     """Zero-pad configured tensor axes to the longest input sequence.
 
     ``optional_keys`` are collated when every sample carries them and omitted
-    when none does; a batch that mixes both raises.
+    when none does; a batch that mixes both raises.  With ``pad_to`` every
+    batch is padded to that fixed length instead (``training.static_shapes``),
+    and a longer sample raises.
     """
 
     if not features:
@@ -56,6 +59,12 @@ def pad_and_concatenate_features(
                 "omitted from every sample"
             )
     max_length = max(int(feature["input_ids"].shape[-1]) for feature in features)
+    if pad_to is not None:
+        if max_length > int(pad_to):
+            raise ValueError(
+                f"sample length {max_length} exceeds the static batch length {pad_to}"
+            )
+        max_length = int(pad_to)
 
     import torch
 

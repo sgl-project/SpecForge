@@ -20,6 +20,12 @@ CUDA = torch.cuda.is_available()
 @unittest.skipUnless(CUDA, "cli config build requires CUDA")
 class TestCliConfigBuild(unittest.TestCase):
     def test_config_build_matches_programmatic_and_trains(self):
+        self._check_backend("fsdp")
+
+    def test_config_selects_fsdp2_and_trains(self):
+        self._check_backend("fsdp2")
+
+    def _check_backend(self, training_backend):
         torch.manual_seed(0)
         from tests.test_runtime import _fixtures as fx
 
@@ -52,6 +58,7 @@ class TestCliConfigBuild(unittest.TestCase):
                 "ttt_length": 3,
                 "max_steps": 4,
                 "max_checkpoints": 2,
+                "save_interval": 1,
                 "log_interval": 1,
             },
             "run_id": "cli-gate",
@@ -61,12 +68,24 @@ class TestCliConfigBuild(unittest.TestCase):
         with open(yaml_path, "w") as f:
             yaml.safe_dump(run_config, f)
 
-        cfg = load_config(yaml_path, ["training.max_steps=2"])  # override applies
+        cfg = load_config(
+            yaml_path,
+            [
+                "training.max_steps=2",
+                f"training.backend={training_backend}",
+                "training.fsdp_sharding=FULL_SHARD",
+            ],
+        )
+        construction_rng = torch.get_rng_state()
         run = build_application_run(resolve_run(cfg))
         trainer = run.trainer
 
         # package-level assembly is the single wiring the CLI executes
         self.assertIsInstance(trainer, Trainer)
+        self.assertEqual(trainer.backend.name, training_backend)
+        self.assertEqual(
+            trainer.backend.parallel_config.sharding_strategy, "FULL_SHARD"
+        )
         self.assertEqual(trainer.run_id, "cli-gate")
         self.assertEqual(trainer.max_steps, 2)
         self.assertEqual(trainer.max_checkpoints, 2)
@@ -81,6 +100,32 @@ class TestCliConfigBuild(unittest.TestCase):
         self.assertTrue(
             os.path.islink(os.path.join(run_config["output_dir"], "cli-gate-latest"))
         )
+
+        # Resume through the public config/Trainer/CheckpointManager seam, not
+        # just backend.load_state_dict; require the same final draft weights.
+        from specforge.training.checkpoint import CheckpointManager
+
+        checkpoint = os.path.join(cfg.output_dir, "cli-gate-step1")
+        final = CheckpointManager.read_resume_state(
+            os.path.join(cfg.output_dir, "cli-gate-latest")
+        )
+        self.assertEqual(final["backend"]["metadata"]["backend"], training_backend)
+        resumed_cfg = cfg.model_copy(
+            update={
+                "training": cfg.training.model_copy(update={"resume_from": checkpoint})
+            }
+        )
+        torch.set_rng_state(construction_rng)
+        resumed = build_application_run(resolve_run(resumed_cfg))
+        self.assertEqual(resumed.trainer.global_step, 1)
+        self.assertEqual(resumed.run(), 2)
+        actual = CheckpointManager.read_resume_state(
+            os.path.join(cfg.output_dir, "cli-gate-latest")
+        )
+        for key, expected in final["draft_state_dict"].items():
+            torch.testing.assert_close(
+                actual["draft_state_dict"][key], expected, rtol=0, atol=0
+            )
 
 
 class TestCliDispatch(unittest.TestCase):

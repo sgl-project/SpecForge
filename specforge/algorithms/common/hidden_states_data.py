@@ -153,7 +153,7 @@ def build_dspark_offline_normalizer(max_len, **_topology):
     return partial(normalize_dspark_offline_sample, max_len=max_len)
 
 
-def _padded_collator(required_keys, optional_keys=()):
+def _padded_collator(required_keys, optional_keys=(), pad_to=None):
     """Build a collator that zero-pads every listed key along the sequence axis."""
 
     sequence_axes = {key: 1 for key in (*required_keys, *optional_keys)}
@@ -164,23 +164,26 @@ def _padded_collator(required_keys, optional_keys=()):
             sequence_axes=sequence_axes,
             required_keys=required_keys,
             optional_keys=optional_keys,
+            pad_to=pad_to,
         )
 
     return collate
 
 
-def build_collator():
+def build_collator(pad_to=None):
     # The target's final hidden state rides along when the capture layout
     # carries it; offline v1 DFlash and Domino batches omit it.
     return _padded_collator(
         ("input_ids", "loss_mask", "hidden_states"),
         optional_keys=("target_last_hidden_states",),
+        pad_to=pad_to,
     )
 
 
-def build_dspark_collator():
+def build_dspark_collator(pad_to=None):
     return _padded_collator(
-        ("input_ids", "loss_mask", "hidden_states", "target_last_hidden_states")
+        ("input_ids", "loss_mask", "hidden_states", "target_last_hidden_states"),
+        pad_to=pad_to,
     )
 
 
@@ -244,8 +247,10 @@ def build_mtp_offline_normalizer(max_len, **_topology):
     return partial(normalize_mtp_offline_sample, max_len=max_len)
 
 
-def build_mtp_collator():
-    return _padded_collator(("input_ids", "loss_mask", "target_last_hidden_states"))
+def build_mtp_collator(pad_to=None):
+    return _padded_collator(
+        ("input_ids", "loss_mask", "target_last_hidden_states"), pad_to=pad_to
+    )
 
 
 __all__ = [
