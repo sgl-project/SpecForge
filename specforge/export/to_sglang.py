@@ -28,6 +28,7 @@ from specforge.export.checkpoint_io import (
     materialize_draft,
     resolve_training_state,
 )
+from specforge.modeling.draft.moe import to_checkpoint_state_dict
 
 #: per-architecture trainer-key -> serving-key renames ({} = identity).
 WEIGHT_MAPS: Dict[str, Dict[str, str]] = {
@@ -82,7 +83,11 @@ def export_to_sglang(
         weight_map = WEIGHT_MAPS.get(type(model).__name__, {})
     # the model's state dict includes any refreshed t2d/d2t buffers; drop the
     # embeddings exactly as the trainer-side checkpoint filter does.
-    full = {k: v for k, v in model.state_dict().items() if "embed" not in k.lower()}
+    full = {
+        k: v
+        for k, v in to_checkpoint_state_dict(model.state_dict()).items()
+        if "embed" not in k.lower()
+    }
     model.save_pretrained(output_dir, state_dict=_serving_state(full, weight_map))
     apply_legacy_rope_scaling(output_dir)
     return output_dir
