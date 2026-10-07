@@ -8,7 +8,9 @@ GPU-only. Run on the H200 box via rcli.
 """
 
 import os
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -84,6 +86,59 @@ class TestCliConfigBuild(unittest.TestCase):
 
 
 class TestCliDispatch(unittest.TestCase):
+    def test_titan_producer_does_not_validate_the_consumer_mesh(self):
+        from specforge.application import resolve_run
+        from specforge.cli import _train
+        from specforge.config import Config
+
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"prompts_path": "/prompts.jsonl"},
+                "training": {
+                    "strategy": "dflash",
+                    "backend": "torchtitan",
+                    "role": "producer",
+                    "torchtitan": {"dp_shard": 2},
+                },
+                "deployment": {
+                    "mode": "disaggregated",
+                    "disaggregated": {
+                        "backend": "mooncake",
+                        "control_dir": "/control",
+                        "server_urls": ["http://capture:30000"],
+                    },
+                },
+            }
+        )
+        resolved = resolve_run(cfg)
+        run = mock.Mock()
+        run.run.return_value = 3
+        accelerate_utils = types.ModuleType("accelerate.utils")
+        accelerate_utils.set_seed = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"WORLD_SIZE": "1"}),
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "accelerate.utils": accelerate_utils,
+                    "specforge.distributed": None,
+                    "specforge.training.torchtitan.frontend": None,
+                },
+            ),
+            mock.patch("specforge.cli._bootstrap_single_process_env") as bootstrap,
+            mock.patch("specforge.cli._validate_world_size") as validate,
+            mock.patch(
+                "specforge.application.build_application_run", return_value=run
+            ) as build,
+        ):
+            self.assertEqual(_train(resolved), 3)
+        build.assert_called_once_with(resolved)
+        run.run.assert_called_once_with()
+        accelerate_utils.set_seed.assert_called_once_with(cfg.training.seed)
+        bootstrap.assert_not_called()
+        validate.assert_not_called()
+
     def test_train_command_dispatches_one_resolved_run(self):
         from specforge.application import ResolvedRun
         from specforge.cli import main

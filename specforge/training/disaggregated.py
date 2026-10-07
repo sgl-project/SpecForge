@@ -659,7 +659,9 @@ def _build_online(
             raise ValueError(
                 f"no prompts satisfy {algorithm.name} training eligibility"
             )
-        if cfg.training.total_steps is None and cfg.training.max_steps is None:
+        if cfg.training.backend == "torchtitan" or (
+            cfg.training.total_steps is None and cfg.training.max_steps is None
+        ):
             schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
             _write_control(
                 channel_path + _ONLINE_SCHEDULE_SUFFIX,
