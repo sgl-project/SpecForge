@@ -320,6 +320,36 @@ valid together. On the two-node
 wrapper, `SERVER_EXTRA_ARGS_APPEND` adds flags after the recipe's server
 defaults, and exported variables reach every server.
 
+## MoE-FFN arm (ablation)
+
+[`managed-local/qwen3.8-27b-dflash2-moe-4server-dp4-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-moe-4server-dp4-disaggregated.yaml)
+is the one-node recipe with `configs/qwen3.8-27b-dflash2-moe.json`: the five
+GQA decoder layers keep their attention, convolutions and selector, and each
+layer's dense 17408-wide MLP becomes a sparse MoE with Qwen3 routing
+(`moe_preset: qwen3`: softmax scores, renormalized top-k, no shared expert).
+Sizes are per run: 16 routed experts of width 4352, top-4, so the activated
+FFN width (4 x 4352) equals the dense 17408 at 4x the FFN parameters, about
+5.9B in total. The two YAMLs differ only in the draft JSON and the run names;
+the capture servers, flow control and Mooncake settings are shared unchanged,
+so the A/B diff is the FFN.
+
+The experts are ordinary FSDP-sharded parameters (no expert parallelism);
+under `SHARD_GRAD_OP` the unsharded bf16 draft is about 12 GB per rank during
+a step, within the 4+4 layout's trainer budget on 80 GB-class GPUs.
+Balancing uses the aux-loss-free selection bias (`moe_bias_update_rate`
+0.001, applied once per training forward from all-reduced expert loads); the
+trainer logs `moe/load_max_ratio`, `moe/load_min_ratio`,
+`moe/experts_unused_frac` and `moe/bias_abs_max` with the other scalars. If
+routing collapses onto a few experts early, set
+`dflash_config.moe_aux_loss_coeff` (for example 0.001) in the draft JSON.
+`moe_dispatch: grouped_mm` runs the experts as grouped GEMMs without host
+syncs; `sorted_loop` is the portable fallback. Checkpoints and exports keep
+the per-expert naming (`layers.{l}.mlp.experts.{i}.w{1,2,3}.weight`,
+`layers.{l}.mlp.gate.{weight,bias}`). SGLang's DFlash2 draft path loads dense
+drafters only, so serving the MoE arm needs a MoE-aware draft class on the
+serving side; this recipe measures training-side acceptance through the
+trainer's metrics and `spec_generate`.
+
 ## Known limitations
 
 1. **Resolved: acknowledgement stall on partial removals.**
