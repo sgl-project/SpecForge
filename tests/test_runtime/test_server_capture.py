@@ -406,6 +406,11 @@ class TestServerCaptureAdapter(unittest.TestCase):
             self.assertEqual(ref.strategy, "eagle3")
             self.assertEqual(ref.metadata["generation"], 1)
             self.assertEqual(ref.metadata["transport"], "sglang_server_capture")
+            mask = task.payload["loss_mask"]
+            self.assertEqual(
+                ref.metadata["valid_anchor_count"],
+                sum(left > 0.5 and right > 0.5 for left, right in zip(mask, mask[1:])),
+            )
             length = len(task.payload["input_ids"])
             self.assertEqual(
                 ref.feature_specs["hidden_state"].shape,

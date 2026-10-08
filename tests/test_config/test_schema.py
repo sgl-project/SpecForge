@@ -24,6 +24,40 @@ MINIMAL = {
     "data": {"hidden_states_path": "/features"},
 }
 
+
+class ConsumerOptimizationConfigTest(unittest.TestCase):
+    def test_dspine_dispatch_requires_matching_strategy_and_two_windows(self):
+        payload = _online_payload("dspine")
+        payload["runtime"] = {"consumer_dispatch": "dspine_balanced"}
+        self.assertEqual(Config(**payload).runtime.consumer_dispatch, "dspine_balanced")
+        payload["training"]["strategy"] = "dflash"
+        with self.assertRaisesRegex(
+            ValidationError, "requires training.strategy=dspine"
+        ):
+            Config(**payload)
+        payload["training"]["strategy"] = "dspine"
+        payload["training"]["batch_size"] = 128
+        payload["training"]["accumulation_steps"] = 2
+        with self.assertRaisesRegex(ValidationError, "at least two global batches"):
+            Config(**payload)
+
+    def test_opt_in_fields_and_validation(self):
+        from specforge.config.schema import RuntimeConfig, TrainingConfig
+
+        self.assertEqual(RuntimeConfig().consumer_dispatch, "round_robin")
+        self.assertFalse(TrainingConfig().dflash_fused_plain_head)
+        self.assertIsNone(TrainingConfig().ddp_bucket_cap_mb)
+        self.assertEqual(
+            RuntimeConfig(consumer_dispatch="cost_balanced").consumer_dispatch,
+            "cost_balanced",
+        )
+        self.assertEqual(TrainingConfig(ddp_bucket_cap_mb=128).ddp_bucket_cap_mb, 128)
+        with self.assertRaises(ValidationError):
+            RuntimeConfig(consumer_dispatch="random")
+        with self.assertRaises(ValidationError):
+            TrainingConfig(ddp_bucket_cap_mb=0)
+
+
 ONLINE_DEPLOYMENT = {
     "mode": "disaggregated",
     "disaggregated": {
@@ -502,6 +536,7 @@ class ConfigSchemaTest(unittest.TestCase):
             with self.subTest(dflash_teacher_metrics=enabled):
                 payload = _online_payload("dflash")
                 payload["training"]["dflash_teacher_metrics"] = enabled
+                payload["training"]["dflash_fused_plain_head"] = enabled
                 config = Config.model_validate(payload)
                 # Construction only: the family builder hands the factory its
                 # shared kwargs, and the objective records the config value.
@@ -518,6 +553,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 ):
                     build_training_model(config, None, None, None, None)
                 self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
+                self.assertIs(enabled, model_cls.call_args.kwargs["fused_plain_head"])
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")

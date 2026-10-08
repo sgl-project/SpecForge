@@ -6,6 +6,16 @@ from specforge.data.template import TEMPLATE_REGISTRY
 
 
 class TemplateRegistryTest(unittest.TestCase):
+    def test_qwen3_instruct_has_no_default_system_prompt(self):
+        template = TEMPLATE_REGISTRY.get("qwen3-instruct")
+
+        self.assertEqual(template.system_prompt, "")
+        self.assertEqual(template.ignore_token, ["<think>\n\n</think>\n\n"])
+        self.assertEqual(
+            TEMPLATE_REGISTRY.get("qwen").system_prompt,
+            "You are a helpful assistant.",
+        )
+
     def test_qwen2_vl_is_not_a_builtin_template(self):
         self.assertNotIn("qwen2-vl", TEMPLATE_REGISTRY.get_all_template_names())
 

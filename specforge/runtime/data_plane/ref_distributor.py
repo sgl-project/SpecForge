@@ -101,6 +101,9 @@ class RefDistributor:
         feature_store,
         refs_per_rank_step: int,
         refs_per_rank_batch: Optional[int] = None,
+        dispatch_policy: str = "round_robin",
+        num_anchors: int = 512,
+        block_size: int = 16,
         skip_ids: Optional[Iterable[str]] = None,
         requeued_ids: Optional[Iterable[str]] = None,
         worker_id: str = "ref-distributor",
@@ -132,6 +135,18 @@ class RefDistributor:
         self.feature_store = feature_store
         self.refs_per_rank_step = refs_per_rank_step
         self.refs_per_rank_batch = refs_per_rank_batch
+        if dispatch_policy not in (
+            "round_robin",
+            "cost_balanced",
+            "domino_balanced",
+            "dspine_balanced",
+        ):
+            raise ValueError(f"unknown dispatch_policy: {dispatch_policy!r}")
+        if num_anchors < 1 or block_size < 1:
+            raise ValueError("num_anchors and block_size must be positive")
+        self.dispatch_policy = dispatch_policy
+        self.num_anchors = num_anchors
+        self.block_size = block_size
         self.dispatch_quantum = dp_size * refs_per_rank_step
         self.dispatch_round_quantum = dp_size * refs_per_rank_batch
         self.worker_id = worker_id
@@ -190,6 +205,75 @@ class RefDistributor:
         self._inbox_consumed = consumed
         self.source.mark_consumed(delta)
         return True
+
+    def _sample_cost(self, ref: SampleRef) -> tuple[int, int]:
+        length = max(1, ref.num_tokens)
+        anchors = min(
+            self.num_anchors,
+            max(1, int(ref.metadata.get("valid_anchor_count", length))),
+        )
+        return anchors, length
+
+    def _batch_cost(self, batch: List[SampleRef]) -> float:
+        anchors = max(self._sample_cost(ref)[0] for ref in batch)
+        length = max(self._sample_cost(ref)[1] for ref in batch)
+        return len(batch) * (anchors * self.block_size + length * 0.15)
+
+    def _balanced_batches(
+        self, refs: List[SampleRef], *, dp_size: Optional[int] = None
+    ) -> List[List[SampleRef]]:
+        dp_size = self.dp_size if dp_size is None else dp_size
+        ordered = sorted(refs, key=self._sample_cost, reverse=True)
+        width = self.refs_per_rank_batch
+        batches = [
+            ordered[start : start + width] for start in range(0, len(ordered), width)
+        ]
+
+        batches.sort(key=self._batch_cost, reverse=True)
+        rank_batches = [[] for _ in range(dp_size)]
+        loads = [0.0] * dp_size
+        rounds = self.refs_per_rank_step // width
+        for batch in batches:
+            rank = min(
+                (rank for rank in range(dp_size) if len(rank_batches[rank]) < rounds),
+                key=lambda rank: (loads[rank], rank),
+            )
+            rank_batches[rank].append(batch)
+            loads[rank] += self._batch_cost(batch)
+        return [
+            [ref for batch in batches_for_rank for ref in batch]
+            for batches_for_rank in rank_batches
+        ]
+
+    def _rank_cost(self, refs: List[SampleRef]) -> float:
+        width = self.refs_per_rank_batch
+        return sum(
+            self._batch_cost(refs[start : start + width])
+            for start in range(0, len(refs), width)
+        )
+
+    def _dspine_windows(self, refs: List[SampleRef]) -> List[List[List[SampleRef]]]:
+        baseline = [
+            self._balanced_batches(refs[start : start + self.dispatch_quantum])
+            for start in range(0, len(refs), self.dispatch_quantum)
+        ]
+        if len(baseline) == 1:
+            return baseline
+        joint = self._balanced_batches(refs, dp_size=self.dp_size * len(baseline))
+        joint.sort(key=self._rank_cost, reverse=True)
+        proposed = [
+            joint[start : start + self.dp_size]
+            for start in range(0, len(joint), self.dp_size)
+        ]
+
+        def critical_cost(windows):
+            return sum(
+                max(self._rank_cost(rank) for rank in window) for window in windows
+            )
+
+        return (
+            proposed if critical_cost(proposed) < critical_cost(baseline) else baseline
+        )
 
     def pump(self) -> bool:
         """One non-blocking cycle: ingest + dispatch + counter. True on progress.
@@ -253,6 +337,41 @@ class RefDistributor:
         # durable acknowledgement still happens only after the full window.
         queue = self.controller.sample_queue
         while True:
+            if self.dispatch_policy in ("domino_balanced", "dspine_balanced"):
+                count = 2 * self.dispatch_quantum
+                if source_drained:
+                    count = min(
+                        count,
+                        queue.depth() // self.dispatch_quantum * self.dispatch_quantum,
+                    )
+                if count == 0 or queue.depth() < count:
+                    break
+                refs = queue.get(count, timeout_s=0.0)
+                if self.dispatch_policy == "dspine_balanced":
+                    windows = self._dspine_windows(refs)
+                else:
+                    refs.sort(key=self._sample_cost, reverse=True)
+                    windows = [
+                        self._balanced_batches(
+                            refs[offset : offset + self.dispatch_quantum]
+                        )
+                        for offset in range(0, count, self.dispatch_quantum)
+                    ]
+                for window in windows:
+                    for inbox, batch in zip(self._inboxes, window):
+                        inbox.publish_batch(batch)
+                self.stats["dispatched"] += count
+                progress = True
+                continue
+            if self.dispatch_policy == "cost_balanced":
+                if queue.depth() < self.dispatch_quantum:
+                    break
+                refs = queue.get(self.dispatch_quantum, timeout_s=0.0)
+                for inbox, batch in zip(self._inboxes, self._balanced_batches(refs)):
+                    inbox.publish_batch(batch)
+                self.stats["dispatched"] += self.dispatch_quantum
+                progress = True
+                continue
             if self._window_dispatched == 0:
                 # Open a new optimizer window only when the WHOLE window is
                 # already committed locally. Dispatching the first round

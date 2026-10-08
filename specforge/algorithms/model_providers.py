@@ -399,6 +399,7 @@ def build_dflash_model(
             kl_scale=cfg.training.kl_scale,
             kl_decay=cfg.training.kl_decay,
             teacher_metrics=cfg.training.dflash_teacher_metrics,
+            fused_plain_head=cfg.training.dflash_fused_plain_head,
         ),
     )
 
@@ -419,6 +420,7 @@ def build_domino_model(
         lambda common: OnlineDominoModel(
             **common,
             shift_label=bool(getattr(draft_model, "shift_label", False)),
+            cache_projection=cfg.training.domino_cache_projection,
         ),
     )
 
@@ -441,6 +443,8 @@ def build_dspark_model(
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
             dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
+            flatten_projection=cfg.training.dspark_flatten_projection,
+            cache_projection=cfg.training.dspark_cache_projection,
         ),
     )
 
