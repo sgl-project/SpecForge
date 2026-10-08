@@ -513,9 +513,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         attention_mask[:, :valid_len] = 1
         new_data["attention_mask"] = attention_mask
 
-        # Position ids should align with Ulysses all2all-expanded sequence length.
-        # Within each ring group there are sp_ulysses_size Ulysses peers; each holds a
-        # distinct usp_chunk_size slice, so position IDs must differ by ulysses_rank offset.
+        # RoPE runs on local Q/K before Ulysses all-to-all. Each rank needs
+        # the global positions of its own chunk, excluding rollout overlap.
+        # Preserve both Ring-block and Ulysses-peer offsets.
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
         usp_chunk_size = max(local_len - ttt_length, 0)
         ring_chunk = usp_chunk_size * sp_ulysses_size

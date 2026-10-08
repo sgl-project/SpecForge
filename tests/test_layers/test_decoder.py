@@ -127,9 +127,7 @@ def _assert_adapter_contract(
         global_input_ids=torch.zeros((1, padded_len), dtype=torch.long, device=device),
         attention_mask=torch.ones((1, padded_len), device=device),
         loss_mask=torch.ones((1, padded_len, 1), device=device),
-        position_ids=torch.arange(
-            local_seq_len * sp_ulysses_size, device=device
-        ).unsqueeze(0),
+        position_ids=torch.arange(local_seq_len, device=device).unsqueeze(0),
         hidden_states=torch.zeros((1, padded_len, 8), device=device),
         target_p_padded=torch.zeros((1, padded_len, 8), device=device),
         position_mask=torch.ones((1, padded_len, 1), device=device),
@@ -137,7 +135,7 @@ def _assert_adapter_contract(
     )
     assert state.input_ids.shape[1] == local_seq_len
     assert state.hidden_states.shape[1] == local_seq_len
-    assert state.position_ids.shape[1] == local_seq_len * sp_ulysses_size
+    assert state.position_ids.shape[1] == local_seq_len
 
 
 def _run_decoder_parity(
@@ -223,12 +221,37 @@ def _run_decoder_parity(
                 for step in global_input_steps
             ]
             local_hidden_states = _local_sequence_shard(hidden_states, rank, world_size)
-            if sp_ring_size > 1:
-                local_position_ids = _local_sequence_shard(
-                    position_ids, rank, world_size
-                )
-            else:
-                local_position_ids = position_ids
+            # Exercise production position construction, including collator
+            # padding and adapter slicing. RoPE consumes local positions
+            # before Ulysses exchanges the rotated Q/K.
+            from specforge.algorithms.eagle3.data import (
+                build_offline_collator,
+                build_offline_normalizer,
+            )
+
+            normalize = build_offline_normalizer(
+                seq_len, ttt_length=ttt_length, use_usp_preprocess=True
+            )
+            batch = build_offline_collator()(
+                [
+                    normalize(
+                        {
+                            "input_ids": input_ids.cpu(),
+                            "loss_mask": torch.ones_like(input_ids, device="cpu"),
+                            "aux_hidden_state": hidden_states.cpu(),
+                            "hidden_state": hidden_states.cpu(),
+                        }
+                    )
+                ]
+            )
+            view = UspAdapter(object()).backbone_view(
+                row_count=seq_len // world_size,
+                global_input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                position_ids=batch["position_ids"],
+                hidden_states=batch["hidden_state"],
+            )
+            local_position_ids = view.position_ids.to(device)
 
             with torch.no_grad():
                 usp_output = _run_iterative_pass(

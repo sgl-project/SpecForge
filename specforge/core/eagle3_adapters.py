@@ -159,7 +159,7 @@ class UspAdapter(BackendAdapter):
         return BackboneStepState(
             input_ids=global_input_ids[:, :row_count],
             hidden_states=hidden_states[:, :row_count, :],
-            position_ids=position_ids[:, : row_count * self.sp_ulysses_degree],
+            position_ids=position_ids[:, :row_count],
             attention_mask=attention_mask[:, :row_count],
         )
 
