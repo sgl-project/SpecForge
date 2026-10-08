@@ -1,6 +1,7 @@
+import unittest
+from itertools import product
 from unittest.mock import patch
 
-import pytest
 import torch
 from torch import nn
 from transformers import Qwen3Config
@@ -51,58 +52,73 @@ def build_model(causal=True, backend="sdpa", device="cpu"):
     ).to(device)
 
 
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("backend", ["sdpa", "flex_attention"])
-def test_training_mask_and_future_isolation(causal, backend):
-    if backend == "flex_attention" and not torch.cuda.is_available():
-        pytest.skip("Flex Attention requires CUDA")
-    device = "cuda" if backend == "flex_attention" else "cpu"
-    torch.manual_seed(42)
-    model = build_model(causal, backend, device)
-    tokens = torch.randint(0, 62, (1, 12), device=device)
-    hidden = torch.randn(1, 12, 256, device=device)
-    anchors = torch.tensor([[2, 7]], device=device)
-    keep = torch.ones_like(anchors, dtype=torch.bool)
-    noise = torch.randn(1, 8, 128, device=device)
-    changed = noise.clone()
-    changed[:, 2:] += 10 * torch.randn_like(changed[:, 2:])
-    outputs = []
-    with patch.object(model, "_sample_anchor_positions", return_value=(anchors, keep)):
-        for embeddings in (noise, changed):
-            with patch.object(model, "_create_noise_embed", return_value=embeddings):
-                with torch.no_grad():
-                    outputs.append(
-                        model._forward_draft_blocks(
-                            tokens, hidden, torch.ones_like(tokens)
-                        )[2]
+class DSparkCausalTest(unittest.TestCase):
+
+    def test_training_mask_and_future_isolation(self):
+        for backend, causal in product(["sdpa", "flex_attention"], [False, True]):
+            with self.subTest(backend=backend, causal=causal):
+                if backend == "flex_attention" and (not torch.cuda.is_available()):
+                    self.skipTest("Flex Attention requires CUDA")
+                device = "cuda" if backend == "flex_attention" else "cpu"
+                torch.manual_seed(42)
+                model = build_model(causal, backend, device)
+                tokens = torch.randint(0, 62, (1, 12), device=device)
+                hidden = torch.randn(1, 12, 256, device=device)
+                anchors = torch.tensor([[2, 7]], device=device)
+                keep = torch.ones_like(anchors, dtype=torch.bool)
+                noise = torch.randn(1, 8, 128, device=device)
+                changed = noise.clone()
+                changed[:, 2:] += 10 * torch.randn_like(changed[:, 2:])
+                outputs = []
+                with patch.object(
+                    model, "_sample_anchor_positions", return_value=(anchors, keep)
+                ):
+                    for embeddings in (noise, changed):
+                        with patch.object(
+                            model, "_create_noise_embed", return_value=embeddings
+                        ):
+                            with torch.no_grad():
+                                outputs.append(
+                                    model._forward_draft_blocks(
+                                        tokens, hidden, torch.ones_like(tokens)
+                                    )[2]
+                                )
+                if causal:
+                    torch.testing.assert_close(
+                        outputs[0][:, :2], outputs[1][:, :2], atol=1e-06, rtol=1e-06
                     )
-    if causal:
-        torch.testing.assert_close(
-            outputs[0][:, :2], outputs[1][:, :2], atol=1e-6, rtol=1e-6
+                else:
+                    self.assertFalse(
+                        torch.allclose(outputs[0][:, :2], outputs[1][:, :2])
+                    )
+                self.assertFalse(torch.allclose(outputs[0][:, 2:], outputs[1][:, 2:]))
+
+    def test_no_confidence_parameters_and_markov_backward(self):
+        model = build_model()
+        self.assertIs(model.draft_model.confidence_head, None)
+        self.assertFalse(
+            any(("confidence" in name for (name, _) in model.named_parameters()))
         )
-    else:
-        assert not torch.allclose(outputs[0][:, :2], outputs[1][:, :2])
-    assert not torch.allclose(outputs[0][:, 2:], outputs[1][:, 2:])
+        tokens = torch.randint(0, 62, (2, 12))
+        (loss, accuracy, metrics) = model(
+            tokens,
+            torch.randn(2, 12, 256),
+            torch.ones_like(tokens),
+            target_last_hidden_states=torch.randn(2, 12, 128),
+        )
+        self.assertTrue(torch.isfinite(loss) and torch.isfinite(accuracy))
+        self.assertEqual(metrics["ratio_metrics"]["confidence_loss"][0].item(), 0)
+        loss.backward()
+        for name, parameter in model.draft_model.named_parameters():
+            self.assertIsNot(parameter.grad, None, name)
+            self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+        self.assertGreater(
+            model.draft_model.markov_head.markov_w2.weight.grad.abs().sum(), 0
+        )
+        contract = resume_contract(None, model.draft_model, model)
+        self.assertIs(contract["dspark_causal_block"], True)
+        self.assertIs(model.draft_model.config.to_dict()["is_causal"], True)
 
 
-def test_no_confidence_parameters_and_markov_backward():
-    model = build_model()
-    assert model.draft_model.confidence_head is None
-    assert not any("confidence" in name for name, _ in model.named_parameters())
-    tokens = torch.randint(0, 62, (2, 12))
-    loss, accuracy, metrics = model(
-        tokens,
-        torch.randn(2, 12, 256),
-        torch.ones_like(tokens),
-        target_last_hidden_states=torch.randn(2, 12, 128),
-    )
-    assert torch.isfinite(loss) and torch.isfinite(accuracy)
-    assert metrics["ratio_metrics"]["confidence_loss"][0].item() == 0
-    loss.backward()
-    for name, parameter in model.draft_model.named_parameters():
-        assert parameter.grad is not None, name
-        assert torch.isfinite(parameter.grad).all(), name
-    assert model.draft_model.markov_head.markov_w2.weight.grad.abs().sum() > 0
-    contract = resume_contract(None, model.draft_model, model)
-    assert contract["dspark_causal_block"] is True
-    assert model.draft_model.config.to_dict()["is_causal"] is True
+if __name__ == "__main__":
+    unittest.main()

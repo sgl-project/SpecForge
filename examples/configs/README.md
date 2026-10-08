@@ -44,6 +44,13 @@ Run any recipe through the one public training entry:
 specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
+The `*-rtx-pro5000*.yaml` PerfectBlend recipes target RTX PRO5000 GPUs.
+Run them from the repository root: all filesystem paths are relative to the
+working directory. Point `shared/` on every node at the same shared storage for
+models, datasets, checkpoints, and control files; `cache/` and `runs/` are local
+to each node. Override service addresses for your cluster. These are example
+run identities, not paths to existing training checkpoints.
+
 `model.draft_model_config` may name a local JSON file, a local model directory,
 or a Hugging Face repository. Fresh EAGLE3, P-EAGLE, and DFlash runs may omit it
 and derive the draft architecture from the target; see the
@@ -301,6 +308,7 @@ Common fields:
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
 | `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
 | `training.dspark_flatten_projection` | `false` | DSpark only. Flatten draft and teacher vocabulary projections to 2-D GEMMs, preserving the objective with possible floating-point rounding differences. |
+| `training.domino_cache_projection` | `false` | Domino only. Cache frozen vocabulary projections during objective-chunk recomputation, trading memory for speed without changing the objective. Has no effect when `objective_chunk_blocks: 0`. |
 | `training.dspark_cache_projection` | `false` | DSpark only. Retain frozen-head projection results across objective-chunk recomputation, trading additional memory for speed. CE/L1 weights and gradients remain unchanged; trainable heads retain normal recomputation. Has no effect when `objective_chunk_blocks: 0`. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |

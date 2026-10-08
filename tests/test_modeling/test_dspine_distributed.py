@@ -1,9 +1,10 @@
 """Uneven DSpine supervision must match a globally normalized optimizer step."""
 
+import unittest
 from functools import partial
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -95,34 +96,6 @@ def distributed_step(rank, directory, accumulation_steps):
         dist.destroy_process_group()
 
 
-@pytest.mark.skipif(
-    not dist.is_gloo_available(), reason="CPU distributed test requires Gloo"
-)
-@pytest.mark.parametrize("accumulation_steps", [1, 2, 4])
-def test_uneven_rank_losses_match_one_concatenated_batch(tmp_path, accumulation_steps):
-    model = training_model(chunk_size=1)
-    model._sample_anchor_positions = fixed_anchors
-    loss, _, _ = model(
-        **combined_batch(accumulation_steps), global_step=300, total_steps=600
-    )
-    loss.backward()
-    expected = {
-        name: parameter.grad for name, parameter in model.draft_model.named_parameters()
-    }
-    mp.spawn(
-        distributed_step, args=(str(tmp_path), accumulation_steps), nprocs=2, join=True
-    )
-    for rank in range(2):
-        actual = torch.load(tmp_path / f"gradients-{rank}.pt", weights_only=True)
-        assert actual["communication_counts"] == [0] * (accumulation_steps - 1) + [1]
-        assert actual["sync_restored"]
-        for name, gradient in expected.items():
-            assert gradient is not None and actual["gradients"][name] is not None, name
-            torch.testing.assert_close(
-                actual["gradients"][name], gradient, atol=2e-5, rtol=2e-4
-            )
-
-
 def fsdp_mixed_precision_step(rank, directory):
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -175,6 +148,62 @@ def fsdp_mixed_precision_step(rank, directory):
         dist.destroy_process_group()
 
 
-@pytest.mark.skipif(not dist.is_gloo_available(), reason="CPU FSDP test requires Gloo")
-def test_fsdp_bf16_training_with_fp32_buffers_and_window_replay(tmp_path):
-    mp.spawn(fsdp_mixed_precision_step, args=(str(tmp_path),), nprocs=1, join=True)
+class DSpineDistributedTest(unittest.TestCase):
+
+    @unittest.skipIf(not dist.is_gloo_available(), "CPU distributed test requires Gloo")
+    def test_uneven_rank_losses_match_one_concatenated_batch(self):
+        for accumulation_steps in [1, 2, 4]:
+            with self.subTest(accumulation_steps=accumulation_steps):
+                with TemporaryDirectory() as directory:
+                    tmp_path = Path(directory)
+                    model = training_model(chunk_size=1)
+                    model._sample_anchor_positions = fixed_anchors
+                    (loss, _, _) = model(
+                        **combined_batch(accumulation_steps),
+                        global_step=300,
+                        total_steps=600,
+                    )
+                    loss.backward()
+                    expected = {
+                        name: parameter.grad
+                        for (name, parameter) in model.draft_model.named_parameters()
+                    }
+                    mp.spawn(
+                        distributed_step,
+                        args=(str(tmp_path), accumulation_steps),
+                        nprocs=2,
+                        join=True,
+                    )
+                    for rank in range(2):
+                        actual = torch.load(
+                            tmp_path / f"gradients-{rank}.pt", weights_only=True
+                        )
+                        self.assertEqual(
+                            actual["communication_counts"],
+                            [0] * (accumulation_steps - 1) + [1],
+                        )
+                        self.assertTrue(actual["sync_restored"])
+                        for name, gradient in expected.items():
+                            self.assertTrue(
+                                gradient is not None
+                                and actual["gradients"][name] is not None,
+                                name,
+                            )
+                            torch.testing.assert_close(
+                                actual["gradients"][name],
+                                gradient,
+                                atol=2e-05,
+                                rtol=0.0002,
+                            )
+
+    @unittest.skipIf(not dist.is_gloo_available(), "CPU FSDP test requires Gloo")
+    def test_fsdp_bf16_training_with_fp32_buffers_and_window_replay(self):
+        with TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            mp.spawn(
+                fsdp_mixed_precision_step, args=(str(tmp_path),), nprocs=1, join=True
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

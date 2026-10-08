@@ -38,6 +38,24 @@ def _local_draft_configs():
 
 
 class ExampleDraftConfigWiringTest(unittest.TestCase):
+    def test_rtx_pro5000_recipe_paths_are_relative(self):
+        recipes = list(EXAMPLE_CONFIG_DIR.rglob("*-rtx-pro5000*.yaml"))
+        self.assertTrue(recipes)
+        for recipe in recipes:
+            for field in (
+                "target_model_path",
+                "draft_model_config",
+                "train_data_path",
+                "cache_dir",
+                "output_dir",
+                "control_dir",
+                "consumer_state_dir",
+            ):
+                with self.subTest(recipe=recipe.name, field=field):
+                    value = _yaml_scalar(recipe, field)
+                    self.assertIsNotNone(value)
+                    self.assertFalse(Path(value).is_absolute(), value)
+
     def test_local_draft_architecture_matches_recipe_strategy(self):
         recipes = list(_local_draft_configs())
         self.assertTrue(recipes)
