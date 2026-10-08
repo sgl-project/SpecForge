@@ -599,6 +599,34 @@ class TestMultiServerProducer(unittest.TestCase):
         )
         self.assertTrue(channel.is_closed())
 
+    def test_curriculum_epoch_offset_preserves_global_epoch_identity(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(3),
+            store,
+            channel,
+            lease=2,
+            prompt_epochs=2,
+            prompt_epoch_offset=1,
+            prompt_seed=42,
+        )
+        self.assertEqual(drive(), 6)
+        self.assertEqual(
+            set(_published_sample_ids(channel.path)),
+            {
+                f"run0:epoch{epoch:04d}-prompt{index:012d}"
+                for epoch in (1, 2)
+                for index in range(3)
+            },
+        )
+        # A one-pass continuation must also carry its absolute epoch identity.
+        one = _epoch_online_prompts(_prompts(3), 2, 1, seed=42)
+        self.assertEqual({item["metadata"]["epoch"] for item in one}, {2})
+
     def test_prompt_ingest_chunks_preserve_epoch_ids_and_release_payloads(self):
         backend = _FakeMooncakeStore()
         stub = _StubCaptureServer(backend)
