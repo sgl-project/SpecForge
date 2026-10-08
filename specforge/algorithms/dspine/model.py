@@ -42,19 +42,21 @@ class OnlineDSpineModel(OnlineDFlashModel):
             S=sequence_length,
             block_size=self.block_size,
             device=anchors.device,
-            causal_block=True,
         )
-        return {
-            layer_type: builder(
+        masks = {}
+        for layer_type in set(self.draft_model.layer_types):
+            sliding_window = None
+            causal_block = True
+            if layer_type == "sliding_attention":
+                sliding_window = self.draft_model.sliding_window
+                if self.causal_block is None:
+                    causal_block = None
+            masks[layer_type] = builder(
                 **arguments,
-                sliding_window=(
-                    self.draft_model.sliding_window
-                    if layer_type == "sliding_attention"
-                    else None
-                ),
+                causal_block=causal_block,
+                sliding_window=sliding_window,
             )
-            for layer_type in set(self.draft_model.layer_types)
-        }
+        return masks
 
     def _project_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden.reshape(-1, hidden.shape[-1])).reshape(
@@ -205,10 +207,14 @@ class OnlineDSpineModel(OnlineDFlashModel):
                 chunk_size=self.objective_chunk_blocks,
             )
             count = supervised.sum().float()
-            return ce / denominator.clamp_min(1), correct / count.clamp_min(1), dict(
-                ratio_metrics={"dspine/backbone_ce": (ce, denominator)},
-                accuracy_denom=count,
-                loss_terms=(ce, denominator),
+            return (
+                ce / denominator.clamp_min(1),
+                correct / count.clamp_min(1),
+                dict(
+                    ratio_metrics={"dspine/backbone_ce": (ce, denominator)},
+                    accuracy_denom=count,
+                    loss_terms=(ce, denominator),
+                ),
             )
         target_indices = (safe_indices[..., 1:] - 1).clamp_min(0)
         target_hidden = target_last_hidden_states.detach().gather(

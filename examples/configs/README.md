@@ -300,6 +300,8 @@ Common fields:
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
 | `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
+| `training.dspark_flatten_projection` | `false` | DSpark only. Flatten draft and teacher vocabulary projections to 2-D GEMMs, preserving the objective with possible floating-point rounding differences. |
+| `training.dspark_cache_projection` | `false` | DSpark only. Retain frozen-head projection results across objective-chunk recomputation, trading additional memory for speed. CE/L1 weights and gradients remain unchanged; trainable heads retain normal recomputation. Has no effect when `objective_chunk_blocks: 0`. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |

@@ -155,6 +155,10 @@ class AdjacentInjection(nn.Module):
 @register_draft
 class DSpineDraftModel(DFlashDraftModel):
     def __init__(self, config, **kwargs):
+        if getattr(config, "is_causal", None) is False:
+            raise ValueError(
+                "DSpine requires causal attention; is_causal=false is unsupported"
+            )
         super().__init__(config, **kwargs)
         if self.block_size < 2:
             raise ValueError(

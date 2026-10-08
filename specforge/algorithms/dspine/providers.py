@@ -50,7 +50,10 @@ def populate_target_defaults(payload, target_config, config):
 
 
 def resume_contract(_config, draft_model, training_model):
+    from specforge.modeling.draft.dflash import dflash_attention_resume_contract
+
     return {
+        **dflash_attention_resume_contract(draft_model),
         "dspine_options": tuple(sorted(asdict(draft_model.dspine_config).items())),
         "dspine_block_size": draft_model.block_size,
         "dspine_target_layer_ids": tuple(draft_model.target_layer_ids),

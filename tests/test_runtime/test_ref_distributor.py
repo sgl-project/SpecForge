@@ -151,9 +151,13 @@ class TestRefDistributor(unittest.TestCase):
         rng = random.Random(42)
         refs = [
             replace(
-                _ref(str(index)), num_tokens=600, strategy="dspine",
+                _ref(str(index)),
+                num_tokens=600,
+                strategy="dspine",
                 metadata={
-                    "valid_anchor_count": min(512, max(1, int(rng.expovariate(1 / 400))))
+                    "valid_anchor_count": min(
+                        512, max(1, int(rng.expovariate(1 / 400)))
+                    )
                 },
             )
             for index in range(256)
@@ -164,7 +168,9 @@ class TestRefDistributor(unittest.TestCase):
         actual = dist._dspine_windows(refs)
 
         def critical(windows):
-            return sum(max(dist._rank_cost(rank) for rank in window) for window in windows)
+            return sum(
+                max(dist._rank_cost(rank) for rank in window) for window in windows
+            )
 
         self.assertLess(critical(actual), critical(baseline) * 0.95)
         delivered = [
@@ -178,14 +184,20 @@ class TestRefDistributor(unittest.TestCase):
         self, policy="domino_balanced"
     ):
         dist = self._distributor(
-            dp_size=2, refs_per_rank_step=2, refs_per_rank_batch=1,
+            dp_size=2,
+            refs_per_rank_step=2,
+            refs_per_rank_batch=1,
             dispatch_policy=policy,
         )
         for index, anchors in enumerate((512, 4, 400, 8, 500, 3, 450, 9)):
-            self.producer.publish(replace(
-                _ref(f"s{index}"), strategy=policy.removesuffix("_balanced"), num_tokens=600,
-                metadata={"valid_anchor_count": anchors},
-            ))
+            self.producer.publish(
+                replace(
+                    _ref(f"s{index}"),
+                    strategy=policy.removesuffix("_balanced"),
+                    num_tokens=600,
+                    metadata={"valid_anchor_count": anchors},
+                )
+            )
             if index == 3:
                 _pump_until_quiet(dist)
                 self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
@@ -194,7 +206,9 @@ class TestRefDistributor(unittest.TestCase):
         self.assertEqual([len(items) for items in delivered], [4, 4])
         self.assertEqual(set(sum(delivered, [])), {f"s{index}" for index in range(8)})
         if policy == "domino_balanced":
-            self.assertEqual(set(delivered[0][:2] + delivered[1][:2]), {"s0", "s2", "s4", "s6"})
+            self.assertEqual(
+                set(delivered[0][:2] + delivered[1][:2]), {"s0", "s2", "s4", "s6"}
+            )
 
     def test_dspine_balancing_flushes_one_closed_window_and_drops_only_tail(self):
         self.test_domino_balancing_flushes_one_closed_window_and_drops_only_tail(
@@ -205,7 +219,9 @@ class TestRefDistributor(unittest.TestCase):
         self, policy="domino_balanced"
     ):
         dist = self._distributor(
-            dp_size=2, refs_per_rank_step=4, refs_per_rank_batch=2,
+            dp_size=2,
+            refs_per_rank_step=4,
+            refs_per_rank_batch=2,
             dispatch_policy=policy,
         )
         for index in range(11):
@@ -231,13 +247,18 @@ class TestRefDistributor(unittest.TestCase):
         for ref in refs:
             self.producer.publish(ref)
         original.commit_samples("old-distributor", refs)
-        original.ack_train_refs("trainer", ["s0"], global_step=1, optimizer_durable=True)
+        original.ack_train_refs(
+            "trainer", ["s0"], global_step=1, optimizer_durable=True
+        )
         self.source.mark_consumed(1)
         restarted = DataFlowController("run0", metadata_store=store)
         report = restarted.reconcile_on_restart(self.feature_store)
         dist = self._distributor(
-            dp_size=1, controller=restarted, skip_ids=report["released"],
-            requeued_ids=report["requeued"], dispatch_policy=policy,
+            dp_size=1,
+            controller=restarted,
+            skip_ids=report["released"],
+            requeued_ids=report["requeued"],
+            dispatch_policy=policy,
         )
         _pump_until_quiet(dist)
         self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])

@@ -101,15 +101,17 @@ class DominoConfigurationTest(unittest.TestCase):
 
     def test_projection_flag_rejects_other_algorithms(self):
         for strategy in ("dflash", "dspark", "eagle3"):
-            with self.subTest(strategy=strategy), self.assertRaisesRegex(
-                ValueError, "requires training.strategy=domino"
+            with (
+                self.subTest(strategy=strategy),
+                self.assertRaisesRegex(ValueError, "requires training.strategy=domino"),
             ):
                 Config.model_validate(
                     {
                         "model": {"target_model_path": "unused"},
                         "data": {"hidden_states_path": "unused"},
                         "training": {
-                            "strategy": strategy, "domino_cache_projection": True
+                            "strategy": strategy,
+                            "domino_cache_projection": True,
                         },
                     }
                 )
@@ -119,12 +121,16 @@ class DominoConfigurationTest(unittest.TestCase):
             "model": {"target_model_path": "unused", "target_backend": "sglang"},
             "data": {"train_data_path": "unused"},
             "training": {
-                "strategy": "dflash", "batch_size": 2, "accumulation_steps": 2
+                "strategy": "dflash",
+                "batch_size": 2,
+                "accumulation_steps": 2,
             },
             "deployment": {
                 "mode": "disaggregated",
                 "trainer": {
-                    "nnodes": 4, "nproc_per_node": 8, "master_addr": "localhost"
+                    "nnodes": 4,
+                    "nproc_per_node": 8,
+                    "master_addr": "localhost",
                 },
                 "disaggregated": {
                     "backend": "mooncake",
@@ -198,13 +204,17 @@ class DominoOptimizationParityTest(unittest.TestCase):
             )
             self.assertLess(relative_error, 0.02)
             self.assertGreater(cosine, 0.999)
-            print(json.dumps({
-                "domino_liger_gradient_relative_l2": relative_error,
-                "domino_liger_gradient_cosine": cosine,
-                "loss_absolute_difference": float(
-                    (outputs[0][0] - outputs[1][0]).abs()
-                ),
-            }))
+            print(
+                json.dumps(
+                    {
+                        "domino_liger_gradient_relative_l2": relative_error,
+                        "domino_liger_gradient_cosine": cosine,
+                        "loss_absolute_difference": float(
+                            (outputs[0][0] - outputs[1][0]).abs()
+                        ),
+                    }
+                )
+            )
 
     def test_cached_projection_matches_loss_and_all_gradients(self):
         self.compare(model(), model(cache=True), exact=True)

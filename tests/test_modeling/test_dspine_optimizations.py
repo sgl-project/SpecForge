@@ -12,7 +12,9 @@ from tests.test_modeling.test_dspine import training_inputs, training_model
 
 @pytest.mark.parametrize("chunk_size", [0, 1, 3])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_flattened_projection_preserves_full_objective_and_gradients(chunk_size, device):
+def test_flattened_projection_preserves_full_objective_and_gradients(
+    chunk_size, device
+):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     model = training_model(chunk_size=chunk_size)
@@ -86,7 +88,8 @@ def test_alignment_ce_reduced_once_per_window(accumulation_steps):
     )
     with (
         patch(
-            "specforge.algorithms.dspine.strategy.dist.is_initialized", return_value=True
+            "specforge.algorithms.dspine.strategy.dist.is_initialized",
+            return_value=True,
         ),
         patch("specforge.algorithms.dspine.strategy.dist.all_reduce") as reduce,
     ):

@@ -31,7 +31,9 @@ class ConsumerOptimizationConfigTest(unittest.TestCase):
         payload["runtime"] = {"consumer_dispatch": "dspine_balanced"}
         self.assertEqual(Config(**payload).runtime.consumer_dispatch, "dspine_balanced")
         payload["training"]["strategy"] = "dflash"
-        with self.assertRaisesRegex(ValidationError, "requires training.strategy=dspine"):
+        with self.assertRaisesRegex(
+            ValidationError, "requires training.strategy=dspine"
+        ):
             Config(**payload)
         payload["training"]["strategy"] = "dspine"
         payload["training"]["batch_size"] = 128
@@ -54,6 +56,7 @@ class ConsumerOptimizationConfigTest(unittest.TestCase):
             RuntimeConfig(consumer_dispatch="random")
         with self.assertRaises(ValidationError):
             TrainingConfig(ddp_bucket_cap_mb=0)
+
 
 ONLINE_DEPLOYMENT = {
     "mode": "disaggregated",

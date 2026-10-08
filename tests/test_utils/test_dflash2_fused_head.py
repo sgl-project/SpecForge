@@ -382,7 +382,9 @@ class FusedHeadModelParityTest(unittest.TestCase):
                     )
                     self.assertTrue(fused._use_fused_unary_head(probe))
                     self.assertFalse(reference._use_fused_unary_head(probe))
-                    actual_loss, actual_acc, _, actual_grads = _run_model(fused, batch, 5)
+                    actual_loss, actual_acc, _, actual_grads = _run_model(
+                        fused, batch, 5
+                    )
                     expected_loss, expected_acc, _, expected_grads = _run_model(
                         reference, batch, 5
                     )

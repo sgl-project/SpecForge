@@ -136,7 +136,10 @@ class RefDistributor:
         self.refs_per_rank_step = refs_per_rank_step
         self.refs_per_rank_batch = refs_per_rank_batch
         if dispatch_policy not in (
-            "round_robin", "cost_balanced", "domino_balanced", "dspine_balanced"
+            "round_robin",
+            "cost_balanced",
+            "domino_balanced",
+            "dspine_balanced",
         ):
             raise ValueError(f"unknown dispatch_policy: {dispatch_policy!r}")
         if num_anchors < 1 or block_size < 1:
@@ -232,11 +235,7 @@ class RefDistributor:
         rounds = self.refs_per_rank_step // width
         for batch in batches:
             rank = min(
-                (
-                    rank
-                    for rank in range(dp_size)
-                    if len(rank_batches[rank]) < rounds
-                ),
+                (rank for rank in range(dp_size) if len(rank_batches[rank]) < rounds),
                 key=lambda rank: (loads[rank], rank),
             )
             rank_batches[rank].append(batch)
@@ -272,7 +271,9 @@ class RefDistributor:
                 max(self._rank_cost(rank) for rank in window) for window in windows
             )
 
-        return proposed if critical_cost(proposed) < critical_cost(baseline) else baseline
+        return (
+            proposed if critical_cost(proposed) < critical_cost(baseline) else baseline
+        )
 
     def pump(self) -> bool:
         """One non-blocking cycle: ingest + dispatch + counter. True on progress.
