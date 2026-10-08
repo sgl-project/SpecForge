@@ -38,6 +38,10 @@ def _local_draft_configs():
 
 
 class ExampleDraftConfigWiringTest(unittest.TestCase):
+    def test_dspine_draft_config_declares_causal_attention(self):
+        config = json.loads((DRAFT_CONFIG_DIR / "qwen3-8b-dspine.json").read_text())
+        self.assertIs(config["is_causal"], True)
+
     def test_rtx_pro5000_recipe_paths_are_relative(self):
         recipes = list(EXAMPLE_CONFIG_DIR.rglob("*-rtx-pro5000*.yaml"))
         self.assertTrue(recipes)

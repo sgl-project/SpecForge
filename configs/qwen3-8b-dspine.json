@@ -33,6 +33,7 @@
   "hidden_size": 4096,
   "initializer_range": 0.02,
   "intermediate_size": 12288,
+  "is_causal": true,
   "layer_types": [
     "full_attention",
     "full_attention",
