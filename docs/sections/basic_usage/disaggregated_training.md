@@ -44,12 +44,15 @@ tensors, prefetched batches, and overflow allocations consume additional memory.
 Set `deployment.disaggregated.receive_buffers: pageable` to use fresh CPU receives.
 
 Patched CUDA capture servers automatically publish device tensors when
-`MOONCAKE_PROTOCOL=rdma`. TCP and non-CUDA workers keep host publication.
-Set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` on an external server, or `gpu_put: false`
-on a managed-local capture-server entry, to disable GPU publication explicitly.
-GPU publication needs RDMA-registerable allocations; custom expandable CUDA
-allocations may require `PYTORCH_ALLOC_CONF=expandable_segments:False` on the
-capture server. The trainer's allocator is independent.
+`MOONCAKE_PROTOCOL=rdma`; managed-local servers do so only when
+`mooncake.protocol: rdma` is set explicitly. TCP and non-CUDA workers keep host
+publication. Set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` on an external server, or
+`gpu_put: false` on a managed-local capture-server entry, to disable GPU
+publication explicitly. GPU publication needs GPUDirect RDMA (`nvidia_peermem`
+loaded, or DMA-BUF support) and RDMA-registerable allocations; custom
+expandable CUDA allocations may require
+`PYTORCH_ALLOC_CONF=expandable_segments:False` on the capture server. The
+trainer's allocator is independent.
 
 ## One config owns the launch topology
 
@@ -254,6 +257,34 @@ Managed capture derives SGLang `--context-length` as `data.max_length + 7` to
 reserve the request headroom required by the capture endpoint. An explicit
 `model.sglang_context_length` must be at least that value.
 
+Managed-local stacks move Mooncake traffic over RDMA by default. The launcher
+resolves `managed_local.mooncake.protocol` once, when it builds the plan: unset
+means `rdma`, except on Ascend hosts, which keep `tcp`. Under RDMA it selects
+every usable HCA of one link layer (InfiniBand before RoCE) when `rdma_devices`
+is unset, checks every listed device otherwise, and renders the result into
+every owned process. A device is usable when the one port Mooncake opens
+(`MC_IB_PORT`, default 1) is ACTIVE, with a RoCE v2 GID bound to a network
+interface on RoCE (or a non-zero GID at `MC_GID_INDEX`), when its
+`/dev/infiniband` node is readable and writable, and when `MC_TE_FILTERS`, if
+set, admits it. On the training node `--plan` shows the exact
+`MOONCAKE_PROTOCOL` and `MOONCAKE_RDMA_DEVICES`; on a host without the HCAs it
+still prints the plan, with the reason in `managed_rdma_error` and a warning,
+and a launch there refuses to start. It never falls back to TCP. The launch
+fails with the reason and the fix when no HCA is usable, when a listed device
+is not, when `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` or
+`MC_USE_TEV1` is set, when `MC_TE_FILTERS` excludes a selected device, or when
+`RLIMIT_MEMLOCK` cannot cover the host memory Mooncake registers. A container
+needs `--device /dev/infiniband` and `--ulimit memlock=-1` (or
+`--cap-add IPC_LOCK`). Set `protocol: tcp` to opt out; recipes that already do
+behave as before.
+
+An unset protocol keeps the capture servers on host publication unless an entry
+sets `gpu_put: true`. An explicit `protocol: rdma` also turns on GPU
+publication, whose GPUDirect RDMA requirement no preflight checks: a missing
+`nvidia_peermem` or DMA-BUF support shows only when the first capture fails to
+register GPU memory, after `/health`. Set `gpu_put: false` on the entries to
+keep RDMA with host publication.
+
 ## Split pools and multi-node consumers
 
 The same YAML launches either role explicitly:
@@ -386,6 +417,19 @@ export MOONCAKE_LOCAL_HOSTNAME=this-node-routable-address
 Keep `DISAGG_AUTH_TOKEN`, node-local hostnames, and device visibility out of
 checked-in YAML. `MOONCAKE_PROTOCOL` and `MOONCAKE_RDMA_DEVICES` may also be
 node-local deployment values.
+
+External deployments stay on `tcp` unless `mooncake_protocol` or
+`MOONCAKE_PROTOCOL` selects `rdma`. SpecForge cannot see the servers' protocol,
+and a store whose clients mix TCP and RDMA fails on the first read, so set the
+same value for every server, producer and trainer. Under RDMA a producer or
+trainer checks every device in `MOONCAKE_RDMA_DEVICES`, uses its node's usable
+HCAs when the list is empty, and fails when there is none. A patched capture
+server refuses to start without an explicit `MOONCAKE_RDMA_DEVICES`; the
+two-node wrapper resolves the capture node's HCAs before starting its servers.
+Both reject `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` and
+`MC_USE_TEV1`, which would put Mooncake on TCP or ignore the device list, and a
+producer or trainer also rejects an `MC_TE_FILTERS` that excludes a listed
+device.
 
 The online producer sends prompts to the URLs in
 `deployment.disaggregated.server_urls`. Start a patched SGLang server separately
