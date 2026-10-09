@@ -605,6 +605,7 @@ def build_training_run(
 
     if cfg.deployment.mode == "disaggregated":
         from specforge.training.disaggregated import build_disaggregated_run
+        from specforge.training.model_loading import preflight_draft_kernels
 
         run_logger = _configured_logger(cfg)
         try:
@@ -612,6 +613,9 @@ def build_training_run(
                 cfg,
                 algorithm=algorithm,
                 build_model_bundle=lambda run_cfg: build_model_bundle(
+                    run_cfg, algorithm=algorithm
+                ),
+                preflight_model_bundle=lambda run_cfg: preflight_draft_kernels(
                     run_cfg, algorithm=algorithm
                 ),
                 prepare_prompts=lambda run_cfg, tokenizer, **kwargs: _prepare_prompts(
