@@ -123,6 +123,46 @@ class ApplySglangSpecCapturePatchTest(unittest.TestCase):
         self.assertEqual(self.sink.read_text(encoding="utf-8"), "old sink\n")
         self.assertEqual(self.record.read_text(encoding="utf-8"), old_patch)
 
+    def test_v0520_target_is_version_gated(self) -> None:
+        # The v0.5.20 target checks the installed version prefix like the
+        # default target: a matching install applies silently, any other
+        # version still applies but warns.
+        self.example.write_text("new base\n", encoding="utf-8")
+        self.env["SPECFORGE_SGLANG_VERSION"] = "0.5.20"
+
+        result = self.run_script("--target", "v0.5.20")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("applied at", result.stdout)
+        self.assertNotIn("WARNING: installed sglang is", result.stderr)
+        self.assertEqual(self.example.read_text(encoding="utf-8"), "new patched\n")
+
+        self.env["SPECFORGE_SGLANG_VERSION"] = "0.5.18"
+        result = self.run_script("--target", "v0.5.20")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the patch targets v0.5.20", result.stderr)
+
+    @unittest.skipUnless(
+        os.environ.get("SPECFORGE_SGLANG_V0520_CHECKOUT"),
+        "set SPECFORGE_SGLANG_V0520_CHECKOUT to an sglang checkout at v0.5.20",
+    )
+    def test_v0520_patch_applies_to_the_pinned_checkout(self) -> None:
+        # The checked-in v0.5.20 patch against a real checkout, applied exactly
+        # the way the script does it (from the package parent, -p2, with
+        # repository discovery stopped there).
+        checkout = Path(os.environ["SPECFORGE_SGLANG_V0520_CHECKOUT"])
+        package_parent = checkout / "python"
+        self.assertTrue((package_parent / "sglang").is_dir(), package_parent)
+        patch = ROOT / "patches" / "sglang" / "v0.5.20" / "spec-capture.patch"
+        result = subprocess.run(
+            ["git", "-C", str(package_parent), "apply", "--check", "-p2", str(patch)],
+            check=False,
+            capture_output=True,
+            env={**os.environ, "GIT_CEILING_DIRECTORIES": str(checkout)},
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_removed_v0514_target(self) -> None:
         result = self.run_script("--target", "v0.5.14")
 

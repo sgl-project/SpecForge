@@ -89,6 +89,15 @@ servers. Its
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
+Targets that need a newer SGLang than v0.5.18 (DeepSeek-V4.1) use the same
+capture patch ported to the v0.5.20 release:
+`scripts/apply_sglang_spec_capture_patch.sh --target v0.5.20` applies
+`patches/sglang/v0.5.20/spec-capture.patch` to an install of SGLang v0.5.20
+(2026-09-18), version-gated like the v0.5.18 target. It exposes the same
+`--enable-spec-capture` / `--spec-capture-method` / `--spec-capture-aux-layer-ids`
+flags, now declared in SGLang's arg-group structs. Re-generate the patch
+when moving to a newer release; `git apply --check -p2` is the gate.
+
 `qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
 its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
 (one node, four capture servers plus a DP4 trainer) and
