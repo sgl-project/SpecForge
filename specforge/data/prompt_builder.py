@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from itertools import islice
 from numbers import Integral
 from typing import Any, Callable
 
@@ -42,7 +43,9 @@ def prepare_prompt_tasks(
     lazy random-access sequence so large Arrow datasets are not expanded into
     Python token lists before rollout starts.
 
-    ``max_prompts`` caps accepted prompts; ``None`` and ``0`` mean no cap.
+    ``max_prompts`` caps input records before preprocessing and filtering on
+    both paths. Rejected records count toward the cap and are not replaced,
+    so fewer prompts may be returned. ``None`` and ``0`` mean no cap.
     """
 
     _validate_options(
@@ -74,11 +77,12 @@ def prepare_prompt_tasks(
             (record, f"{path_string}:{line_number}")
             for line_number, record in _iter_records(path_string)
         )
+        if limit is not None:
+            rows = islice(rows, limit)
         return _materialize_prompt_tasks(
             rows,
             max_length=max_length,
             min_loss_tokens=min_loss_tokens,
-            limit=limit,
             loss_mask_filter=loss_mask_filter,
         )
 
@@ -123,7 +127,7 @@ def _prepare_raw_prompts(
     from .preprocessing import build_eagle3_dataset
 
     dataset = load_dataset("json", data_files=path, split="train")
-    if loss_mask_filter is None and limit is not None and limit < len(dataset):
+    if limit is not None and limit < len(dataset):
         dataset = dataset.select(range(limit))
 
     processed_dataset = build_eagle3_dataset(
@@ -190,7 +194,6 @@ def _materialize_prompt_tasks(
     *,
     max_length: int,
     min_loss_tokens: int,
-    limit: int | None,
     loss_mask_filter: Callable[[Sequence[int]], bool] | None,
 ) -> list[PromptTaskDict]:
     prompts: list[PromptTaskDict] = []
@@ -208,8 +211,6 @@ def _materialize_prompt_tasks(
         ):
             continue
         prompts.append(prompt)
-        if limit is not None and len(prompts) >= limit:
-            break
     return prompts
 
 
