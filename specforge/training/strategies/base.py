@@ -584,6 +584,9 @@ class DSparkTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.dspark_model.parameters()).device
 
+    def _conditioning_inputs(self, tensors, device):
+        return {"hidden_states": tensors["hidden_states"].to(device, non_blocking=True)}
+
     def forward_loss(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepOutput:
@@ -593,7 +596,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
         loss, accuracy, model_metrics = self.dspark_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
-            hidden_states=t["hidden_states"].to(device, non_blocking=True),
+            **self._conditioning_inputs(t, device),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
             target_last_hidden_states=t["target_last_hidden_states"].to(
                 device, non_blocking=True
@@ -627,6 +630,24 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
             if "draft_model." in k
+        }
+
+
+class DSparkKVTrainStrategy(DSparkTrainStrategy):
+    """DSpark objectives with KV-only conditioning and final-hidden supervision."""
+
+    name = "dspark_kv"
+    required_features = {
+        "input_ids",
+        "loss_mask",
+        "target_kv",
+        "target_last_hidden_states",
+    }
+
+    def _conditioning_inputs(self, tensors, device):
+        return {
+            "hidden_states": None,
+            "target_kv": tensors["target_kv"].to(device, non_blocking=True),
         }
 
 
