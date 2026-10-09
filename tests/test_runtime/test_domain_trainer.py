@@ -220,7 +220,12 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertIsNone(cap["ctrl_kw"]["ack_fn"])
         self.assertEqual(
             cap["parallel_kw"],
-            {"tp_size": 1, "sp_ulysses_size": 1, "sp_ring_size": 1},
+            {
+                "tp_size": 1,
+                "expert_parallel_size": 1,
+                "sp_ulysses_size": 1,
+                "sp_ring_size": 1,
+            },
         )
 
         # run identity rides the shared checkpoint payload, validated on resume
@@ -233,6 +238,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 "num_epochs": 1,
                 "effective_total_steps": 1,
                 "tp_size": 1,
+                "expert_parallel_size": 1,
                 "sp_ulysses_size": 1,
                 "sp_ring_size": 1,
             },
