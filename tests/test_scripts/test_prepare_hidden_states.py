@@ -11,6 +11,7 @@ from scripts.prepare_hidden_states import (
     HiddenStatesGenerator,
     _generate_shared_vocab_mapping,
     _resolve_draft_vocab_size,
+    _sglang_kwargs,
     build_target_model,
     parse_args,
     resolve_offline_capture_plan,
@@ -52,6 +53,28 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             args = parse_args()
 
         self.assertTrue(args.sglang_disable_radix_cache)
+
+    def test_optional_sglang_engine_knobs_are_forwarded_only_when_set(self):
+        base = [
+            "prepare_hidden_states.py",
+            "--target-model-path",
+            "target",
+            "--data-path",
+            "data.jsonl",
+        ]
+        with mock.patch("sys.argv", base):
+            kwargs = _sglang_kwargs(parse_args())
+        self.assertNotIn("page_size", kwargs)
+        self.assertNotIn("moe_runner_backend", kwargs)
+
+        with mock.patch(
+            "sys.argv",
+            base
+            + ["--sglang-page-size", "64", "--sglang-moe-runner-backend", "triton"],
+        ):
+            kwargs = _sglang_kwargs(parse_args())
+        self.assertEqual(kwargs["page_size"], 64)
+        self.assertEqual(kwargs["moe_runner_backend"], "triton")
 
     def test_cli_accepts_dflash_family_config(self):
         argv = [

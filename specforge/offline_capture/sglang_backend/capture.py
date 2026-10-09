@@ -27,10 +27,15 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 
 from specforge.distributed import get_tp_group
 
+from .compat import (
+    publish_runtime_context,
+    require_mlp_sync,
+    require_mlp_tp_gather,
+    resolve_device,
+)
 from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
 
@@ -113,6 +118,10 @@ class OfflineSGLangCaptureBackend:
             moe_dp_size=server_args.moe_dp_size,
             gpu_id=gpu_id,
         )
+        # sglang main leaves ``device`` unresolved and requires the runtime
+        # context to be published before a ModelRunner exists (see compat.py).
+        resolve_device(server_args)
+        publish_runtime_context(server_args)
         model_config = ModelConfig.from_server_args(server_args)
         model_runner = SGLangRunner(
             model_config=model_config,
