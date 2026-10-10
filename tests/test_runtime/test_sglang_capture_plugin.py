@@ -378,7 +378,7 @@ class TestInstall(unittest.TestCase):
         return_hidden_states_mode="full",
     )
 
-    def _install(self, scheduler=None, **overrides):
+    def _install(self, scheduler=None, env=None, **overrides):
         fields = {**self.FEATURES, **overrides}
         chunked = fields.pop("chunked_prefill_size", -1)
         modules = _fake_sglang_modules(
@@ -387,7 +387,7 @@ class TestInstall(unittest.TestCase):
         scheduler = scheduler or _scheduler()
         with (
             mock.patch.dict(sys.modules, modules),
-            mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "tcp"}),
+            mock.patch.dict(os.environ, env or {"MOONCAKE_PROTOCOL": "tcp"}),
         ):
             return scheduler, capture.install(scheduler)
 
@@ -428,6 +428,29 @@ class TestInstall(unittest.TestCase):
         scheduler.tp_worker.model_runner = SimpleNamespace()
         with self.assertRaisesRegex(RuntimeError, "forward observers"):
             self._install(scheduler)
+
+    def test_nvlink_publishes_device_tensors_into_a_lazy_arena(self):
+        env = {
+            "MOONCAKE_PROTOCOL": "nvlink",
+            "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES": str(1 << 30),
+        }
+        with self.assertLogs(capture.logger, "INFO") as logs:
+            _, runtime = self._install(env=env)
+        self.assertTrue(runtime.gpu_put)
+        self.assertIn("nvlink publication", logs.output[-1])
+        self.assertIsNone(runtime.sink._nvlink)  # allocated on the first capture
+
+    def test_nvlink_rejects_a_missing_arena_size_and_host_publication(self):
+        nvlink = {"MOONCAKE_PROTOCOL": "nvlink"}
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES", None)
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"
+            ):
+                self._install(env=nvlink)
+        nvlink["SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"] = str(1 << 30)
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self._install(env={**nvlink, "SGLANG_SPEC_CAPTURE_GPU_PUT": "0"})
 
 
 class TestRegister(unittest.TestCase):
