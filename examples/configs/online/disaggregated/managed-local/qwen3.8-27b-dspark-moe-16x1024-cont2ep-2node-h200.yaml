@@ -1,0 +1,102 @@
+# Epochs 2-3 of the Qwen3.8-27B DSpark MoE 16 x 1024 top-2 drafter on TWO 8x H200 nodes, as a weights-only warm
+# start from the epoch-1 checkpoint of qwen3.8-27b-dspark-moe-16x1024-3ep-gb300 (step 4958; optimizer moments, step
+# counter and data position start fresh, lr warms up again over 4% of the 9,916 steps, router-centering EMA buffers
+# come from the checkpoint; same protocol as Kan's -cont2ep-from-1ep-v3).
+#   - capture node (CAPTURE_IP): 8 TP1 capture servers, one per GPU, bf16 target Qwen/Qwen3.8-27B (Hopper cannot run
+#     the NVFP4 checkpoint), 4 running requests each, 100 GiB Mooncake segment each (the segments live in the capture
+#     servers and must cover in_flight_high_watermark x ~0.5 GB of captured hidden states).
+#   - trainer node (TRAINER_IP): mooncake_master (metadata bound to 0.0.0.0) + producer + 8-rank FSDP trainer,
+#     batch_size 4 x accumulation 8 x 8 ranks = 256, AdamW on the GPUs.
+# Features cross the node link over Mooncake RDMA (mooncake_protocol: rdma, devices auto-discovered): measured on
+# h200-sci-k8s-1 between two devboxes, a trainer-side client reads 26 GB/s and 8 clients ~97 GB/s aggregate, against
+# 2.2 GB/s over TCP (50 GbE pod network) where the two-node layout is fetch-bound at ~5 samples/s. With RDMA the run is
+# capture-bound: 8 H200 capture servers deliver ~17 samples/s -> ~15 s/step, ~20 h per epoch.
+# Non-managed disaggregated: start the capture servers on CAPTURE_IP (each with MOONCAKE_* pointing at the master on
+# TRAINER_IP, --host 0.0.0.0, --port 30000-30007, --nccl-port 37000-37007), then mooncake_master and
+# `python -m specforge.cli train -c <this file>` on TRAINER_IP; replace CAPTURE_IP / TRAINER_IP with the pod IPs.
+model:
+  target_model_path: /scratch/models/Qwen3.8-27B
+  draft_model_config: /scratch/SpecForge/configs/qwen3.8-27b-dspark-moe-16x1024.json
+  draft_checkpoint_path: /scratch/moe16/warmstart/qwen3.8-27b-dspark-moe-16x1024-3ep-gb300-step4958
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  load_target_embedding: true
+  torch_dtype: bfloat16
+  mask_token_id: 248070
+  sglang_attention_backend: triton
+  sglang_mem_fraction_static: 0.85
+  sglang_disable_radix_cache: true
+  sglang_context_length: 8199
+  sglang_max_running_requests: 4
+  sglang_max_total_tokens: 32768
+data:
+  train_data_path: /scratch/data/qwen38_regen_mixture_v1_train.jsonl
+  max_length: 8192
+  chat_template: qwen3.5
+  cache_dir: /scratch/cache/qwen3.8-27b-regen-mixture-v1
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 8
+training:
+  strategy: dspark
+  num_epochs: 2
+  batch_size: 4
+  accumulation_steps: 8
+  fsdp_sharding: FULL_SHARD
+  optimizer_cpu_offload: false
+  learning_rate: 0.0005
+  lr_scheduler: constant
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 2479
+  max_checkpoints: 3
+  log_interval: 10
+  dist_timeout: 15
+  seed: 42
+  prompt_seed: 42
+tracking:
+  report_to: wandb
+  wandb_project: specforge-qwen38-dspark-moe-16x1024
+  wandb_name: qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200
+  wandb_dir: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200/wandb
+runtime:
+  producer_lease: 8
+  producer_concurrency: 32
+  in_flight_high_watermark: 768
+  in_flight_low_watermark: 512
+  resident_high_watermark_bytes: 412316860416
+  resident_low_watermark_bytes: 274877906944
+  feature_store_max_resident_bytes: 549755813888
+run_id: qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200
+output_dir: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200/control
+    consumer_state_dir: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200/consumer-state
+    backend: mooncake
+    client_buffer_size: 1073741824
+    server_urls:
+    - http://CAPTURE_IP:30000
+    - http://CAPTURE_IP:30001
+    - http://CAPTURE_IP:30002
+    - http://CAPTURE_IP:30003
+    - http://CAPTURE_IP:30004
+    - http://CAPTURE_IP:30005
+    - http://CAPTURE_IP:30006
+    - http://CAPTURE_IP:30007
+    mooncake_metadata_server: http://TRAINER_IP:35880/metadata
+    mooncake_master_server_addr: TRAINER_IP:35551
+    mooncake_local_hostname: TRAINER_IP
+    mooncake_protocol: rdma
