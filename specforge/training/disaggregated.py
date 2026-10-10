@@ -210,6 +210,14 @@ def _server_urls(cfg: Config) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _server_capture(cfg: Config) -> str:
+    """Capture backend of the servers: deployment config, else DISAGG_SERVER_CAPTURE."""
+    deployment = cfg.deployment.disaggregated
+    if deployment is not None:
+        return deployment.server_capture
+    return os.environ.get("DISAGG_SERVER_CAPTURE", "patch")
+
+
 def _consumer_database_path(cfg: Config) -> Optional[str]:
     configured = os.environ.get("DISAGG_DB")
     if configured:
@@ -684,6 +692,7 @@ def _build_online(
                 schema=capture_schema,
                 request_input_adapter=input_adapter,
                 target_model_version=cfg.model.target_model_path,
+                server_capture=_server_capture(cfg),
             )
             for url in _server_urls(cfg)
         ]

@@ -108,19 +108,24 @@ class _StubCaptureServer:
         t = t.detach().cpu().contiguous()
         self.backend.put_from(key, t.data_ptr(), t.element_size() * t.numel())
 
+    def _specs(self, json_body: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return json_body["spec_capture"]
+
+    def _result(self, result: Dict[str, Any]) -> Any:
+        return result
+
     def __call__(self, url: str, json_body: Dict[str, Any], timeout: float):
         assert url.endswith("/generate")
         rows: List[Dict[str, Any]] = []
-        for input_ids, spec in zip(json_body["input_ids"], json_body["spec_capture"]):
+        for input_ids, spec in zip(json_body["input_ids"], self._specs(json_body)):
             sid, gen = spec["sample_id"], int(spec["gen"])
             if sid in self.error_sample_ids:
                 rows.append(
                     {
                         "meta_info": {
-                            "spec_capture": {
-                                "sample_id": sid,
-                                "error": "injected sink error",
-                            }
+                            "spec_capture": self._result(
+                                {"sample_id": sid, "error": "injected sink error"}
+                            )
                         }
                     }
                 )
@@ -157,17 +162,35 @@ class _StubCaptureServer:
             rows.append(
                 {
                     "meta_info": {
-                        "spec_capture": {
-                            "sample_id": sid,
-                            "store_id": spec["store_id"],
-                            "gen": gen,
-                            "aux_layer_ids": self.aux_layer_ids,
-                            "features": feats,
-                        }
+                        "spec_capture": self._result(
+                            {
+                                "sample_id": sid,
+                                "store_id": spec["store_id"],
+                                "gen": gen,
+                                "aux_layer_ids": self.aux_layer_ids,
+                                "features": feats,
+                            }
+                        )
                     }
                 }
             )
         return rows
+
+
+class _PluginStubCaptureServer(_StubCaptureServer):
+    """Emulates the plugin: specs in custom_params, results as customized info."""
+
+    def _specs(self, json_body: Dict[str, Any]) -> List[Dict[str, Any]]:
+        assert "spec_capture" not in json_body
+        params = json_body["sampling_params"]
+        assert isinstance(params, list) and len(params) == len(json_body["input_ids"])
+        for item in params:
+            assert item["max_new_tokens"] == 0 and item["temperature"] == 0.0
+        return [json.loads(item["custom_params"]["spec_capture"]) for item in params]
+
+    def _result(self, result: Dict[str, Any]) -> Any:
+        # The tokenizer manager accumulates customized info into a list.
+        return [result]
 
 
 class _FakeController:
@@ -279,9 +302,16 @@ def _mk(
     backend=None,
     request_input_adapter=None,
     teacher_metrics=True,
+    server_capture="patch",
 ):
     backend = backend or _FakeMooncakeStore()
-    server = server or _StubCaptureServer(backend)
+    if server is None:
+        stub = (
+            _PluginStubCaptureServer
+            if server_capture == "plugin"
+            else _StubCaptureServer
+        )
+        server = stub(backend)
     store = MooncakeFeatureStore(store=backend, store_id="run0")
     adapter = SGLangServerCaptureAdapter(
         "http://server:30000",
@@ -291,6 +321,7 @@ def _mk(
         schema=_capture_schema(algorithm, teacher_metrics=teacher_metrics),
         request_input_adapter=request_input_adapter,
         post_fn=server,
+        server_capture=server_capture,
     )
     return backend, server, store, adapter
 
@@ -807,6 +838,80 @@ class _KeepAliveCaptureHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+class TestServerCapturePluginTransport(unittest.TestCase):
+    """The same client stack against a server running the capture plugin."""
+
+    def test_spec_rides_custom_params_as_one_json_string_per_request(self):
+        posted = []
+        backend = _FakeMooncakeStore()
+        server = _PluginStubCaptureServer(backend)
+
+        def post(url, json_body, timeout):
+            posted.append(json_body)
+            return server(url, json_body, timeout)
+
+        _, _, _, adapter = _mk(server=post, backend=backend, server_capture="plugin")
+        refs = adapter.produce_refs(
+            [_task(0, 4), _task(1, 6)], capture=_eagle3_contract()
+        )
+
+        self.assertTrue(all(isinstance(ref, SampleRef) for ref in refs))
+        (body,) = posted
+        specs = [
+            json.loads(item["custom_params"]["spec_capture"])
+            for item in body["sampling_params"]
+        ]
+        self.assertEqual([spec["sample_id"] for spec in specs], ["run0:t0", "run0:t1"])
+        self.assertEqual(len(body["extra_key"]), 2)
+
+    def test_eagle3_refs_and_zero_copy_roundtrip(self):
+        backend, server, store, adapter = _mk(server_capture="plugin")
+        tasks = [_task(0, 6), _task(1, 9)]
+        refs = adapter.produce_refs(tasks, capture=_eagle3_contract())
+        for task, ref in zip(tasks, refs):
+            self.assertIsInstance(ref, SampleRef)
+            length = len(task.payload["input_ids"])
+            self.assertEqual(
+                ref.feature_specs["hidden_state"].shape,
+                (1, length, len(AUX_LAYERS) * HIDDEN),
+            )
+            out, handle = store.get(ref)
+            for name, expected in server.expected[ref.sample_id].items():
+                self.assertTrue(torch.equal(out[name], expected), name)
+            store.release(handle)
+        self.assertFalse(any(backend._d))
+
+    def test_dspark_refs_carry_the_target_last_hidden(self):
+        _, _, _, adapter = _mk(algorithm="dspark", server_capture="plugin")
+        (ref,) = adapter.produce_refs([_task(0, 5)], capture=_dspark_contract())
+        self.assertIsInstance(ref, SampleRef)
+        self.assertIn("target_last_hidden_states", ref.feature_specs)
+
+    def test_per_task_server_error_becomes_failure_marker(self):
+        backend = _FakeMooncakeStore()
+        server = _PluginStubCaptureServer(backend, error_sample_ids={"run0:t1"})
+        _, _, _, adapter = _mk(server=server, backend=backend, server_capture="plugin")
+        ok, failed = adapter.produce_refs(
+            [_task(0, 4), _task(1, 4)], capture=_eagle3_contract()
+        )
+        self.assertIsInstance(ok, SampleRef)
+        self.assertIsInstance(failed, ServerCaptureFailure)
+        self.assertIn("injected sink error", failed.reason)
+
+    def test_missing_result_names_the_plugin(self):
+        _, _, _, adapter = _mk(
+            server=lambda url, json_body, timeout: [{"meta_info": {}}],
+            server_capture="plugin",
+        )
+        (failure,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        self.assertIsInstance(failure, ServerCaptureFailure)
+        self.assertIn("specforge-sglang-capture plugin", failure.reason)
+
+    def test_unknown_backend_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "server_capture must be one of"):
+            _mk(server_capture="sidecar")
 
 
 class TestDefaultHttpTransport(unittest.TestCase):
