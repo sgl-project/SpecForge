@@ -11,6 +11,8 @@
 # h200-sci-k8s-1 between two devboxes, a trainer-side client reads 26 GB/s and 8 clients ~97 GB/s aggregate, against
 # 2.2 GB/s over TCP (50 GbE pod network) where the two-node layout is fetch-bound at ~5 samples/s. With RDMA the run is
 # capture-bound: 8 H200 capture servers deliver ~17 samples/s -> ~15 s/step, ~20 h per epoch.
+# Feature-store budget on the trainer node: a captured sample projects to ~0.72 GB, so in_flight 512/384 keeps the
+# producer under the 640 GiB hard cap (the 3-step smoke with 768 in flight aborted at projected 551 GB > 512 GiB).
 # Non-managed disaggregated: start the capture servers on CAPTURE_IP (each with MOONCAKE_* pointing at the master on
 # TRAINER_IP, --host 0.0.0.0, --port 30000-30007, --nccl-port 37000-37007), then mooncake_master and
 # `python -m specforge.cli train -c <this file>` on TRAINER_IP; replace CAPTURE_IP / TRAINER_IP with the pod IPs.
@@ -70,11 +72,11 @@ tracking:
 runtime:
   producer_lease: 8
   producer_concurrency: 32
-  in_flight_high_watermark: 768
-  in_flight_low_watermark: 512
-  resident_high_watermark_bytes: 412316860416
-  resident_low_watermark_bytes: 274877906944
-  feature_store_max_resident_bytes: 549755813888
+  in_flight_high_watermark: 512
+  in_flight_low_watermark: 384
+  resident_high_watermark_bytes: 481036337152
+  resident_low_watermark_bytes: 343597383680
+  feature_store_max_resident_bytes: 687194767360
 run_id: qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200
 output_dir: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200
 deployment:
