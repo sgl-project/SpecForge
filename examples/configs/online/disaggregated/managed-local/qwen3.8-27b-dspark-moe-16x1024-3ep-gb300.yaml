@@ -1,0 +1,111 @@
+# Qwen3.8-27B DSpark MoE drafter with FEW, WIDE experts: configs/qwen3.8-27b-dspark-moe-16x1024.json is
+# qwen3.8-27b-dspark-moe-v2.json with n_routed_experts 512 -> 16, moe_intermediate_size 512 -> 1024 and
+# num_experts_per_tok 10 -> 2 (5 layers, 2048-wide sigmoid-gated shared expert, qwen3_5_moe preset, aux 0.001,
+# per-sample router centering, grouped_mm dispatch all unchanged). FFN parameters per layer 283M (1.06x the dense
+# drafter's 267M; Kan's 512 x 512 is 4.06B per layer), 63M active per token (0.24x dense); ~1.94B parameters in
+# all (3.9 GB bf16). A 7-token block x top-2 touches at most 14 of the 16 experts, so the
+# per-step expert bytes are close to the dense FFN: at a pinned accept length of 5.0 the random-expert export
+# serves within 2% of the dense drafter on GB300 (scripts/moe_speed/README.md), where Kan's 512 x 512 top-10
+# shape trails by 9-10% at c >= 8.
+# Trained FROM SCRATCH for THREE epochs (3 x 4,958 = 14,874 steps at global batch 256) on ONE 4x GB300 node:
+# 2 TP1 capture servers (GPUs 0-1, NVFP4 target as in Kan's B200 runs) + 2 FSDP trainer ranks (GPUs 2-3),
+# batch_size 4 x accumulation 32 x 2 ranks = 256, AdamW on the GPUs (optimizer_cpu_offload false). Everything else is
+# Kan's qwen3.8-27b-dspark-moe-regen-mixture-v1-1ep-v3 recipe (lr 5e-4 constant after 4% warm-up, FULL_SHARD,
+# seed/prompt_seed 42). save_interval 2479 = half an epoch, so the epoch ends (steps 4958 / 9916 / 14874) are
+# checkpointed and exported. W&B entity and run id come from the launching shell (WANDB_ENTITY, WANDB_RUN_ID,
+# WANDB_RESUME=allow); the key from WANDB_API_KEY.
+# Host-memory budget (this devbox container is OOM-killed by kubelet at 924 GB, no swap): Mooncake 2 x 100 GB
+# segments (they live inside the capture-server processes and MUST cover the in-flight captured samples, 384 x
+# ~0.5 GB of hidden states), feature store <= 256 GB resident (watermarks 192/128 GB: one optimizer step is 256
+# samples x up to 0.5 GB), in-flight 384/256 samples, 4 loader workers. Capture concurrency 4 prompts per server
+# with producer lease/concurrency 8/8 (the step is capture-bound at ~6.8 samples/s).
+model:
+  target_model_path: /scratch/dsv4/models/Qwen3.8-27B-NVFP4-BF16-LMHead
+  draft_model_config: /scratch/dsv4/SpecForge/configs/qwen3.8-27b-dspark-moe-16x1024.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  load_target_embedding: true
+  torch_dtype: bfloat16
+  mask_token_id: 248070
+  sglang_attention_backend: triton
+  sglang_mem_fraction_static: 0.85
+  sglang_disable_radix_cache: true
+  sglang_context_length: 8199
+  sglang_max_running_requests: 4
+  sglang_max_total_tokens: 32768
+data:
+  train_data_path: /scratch/dsv4/data/qwen38_regen_mixture_v1_train.jsonl
+  max_length: 8192
+  chat_template: qwen3.5
+  cache_dir: /scratch/dsv4/cache/qwen3.8-27b-regen-mixture-v1
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 4
+training:
+  strategy: dspark
+  num_epochs: 3
+  batch_size: 4
+  accumulation_steps: 32
+  fsdp_sharding: FULL_SHARD
+  optimizer_cpu_offload: false
+  learning_rate: 0.0005
+  lr_scheduler: constant
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 2479
+  max_checkpoints: 3
+  log_interval: 10
+  dist_timeout: 15
+  seed: 42
+  prompt_seed: 42
+tracking:
+  report_to: wandb
+  wandb_project: specforge-qwen38-dspark-moe-16x1024
+  wandb_name: qwen3.8-27b-dspark-moe-16x1024-3ep-gb300
+  wandb_dir: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-3ep-gb300/wandb
+runtime:
+  producer_lease: 8
+  producer_concurrency: 8
+  in_flight_high_watermark: 384
+  in_flight_low_watermark: 256
+  resident_high_watermark_bytes: 206158430208
+  resident_low_watermark_bytes: 137438953472
+  feature_store_max_resident_bytes: 274877906944
+run_id: qwen3.8-27b-dspark-moe-16x1024-3ep-gb300
+output_dir: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-3ep-gb300
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 2
+  disaggregated:
+    control_dir: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-3ep-gb300/control
+    consumer_state_dir: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-3ep-gb300/consumer-state
+    backend: mooncake
+    client_buffer_size: 1073741824
+    managed_local:
+      trainer_cuda_visible_devices:
+      - '2'
+      - '3'
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 107374182400
+        local_buffer_size_bytes: 1073741824
+        default_kv_lease_ttl_ms: 300000
+      capture_servers:
+      - port: 30000
+        cuda_visible_devices:
+        - '0'
+        tp_size: 1
+      - port: 30001
+        cuda_visible_devices:
+        - '1'
+        tp_size: 1
