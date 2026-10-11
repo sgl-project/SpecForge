@@ -3,11 +3,22 @@ import math
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from specforge.lr_scheduler import ConstantWarmupLR, CosineAnnealingWarmupLR
 from specforge.utils import print_on_rank0
 
 logger = logging.getLogger(__name__)
+
+
+def _local(tensor):
+    """This rank's shard as a plain tensor; identity for plain tensors (FSDP1 / DDP)."""
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _local_data(param):
+    """Writable plain view of this rank's shard of ``param``."""
+    return param.to_local() if isinstance(param, DTensor) else param.data
 
 
 def _sum_of_squares(tensors):
@@ -57,9 +68,9 @@ class BF16Optimizer:
         self.offload_master = bool(offload_master)
         self.fp32_params = [
             (
-                p.detach().to(device="cpu", dtype=torch.float32).clone()
+                _local(p.detach()).to(device="cpu", dtype=torch.float32).clone()
                 if self.offload_master
-                else p.detach().clone().to(torch.float32)
+                else _local(p.detach()).clone().to(torch.float32)
             )
             for p in self.model_params
         ]
@@ -132,7 +143,9 @@ class BF16Optimizer:
         """Compute the global grad norm from the model params on their own
         device, where NCCL can reduce it safely, without materialising master
         gradients first."""
-        grads = [p.grad.detach() for p in self.model_params if p.grad is not None]
+        grads = [
+            _local(p.grad.detach()) for p in self.model_params if p.grad is not None
+        ]
         if grads:
             total_norm_sq = _sum_of_squares(grads)
         else:
@@ -225,14 +238,14 @@ class BF16Optimizer:
                     mp.grad = None
                     continue
                 if self.offload_master:
-                    master_grad = p.grad.detach().to(
+                    master_grad = _local(p.grad.detach()).to(
                         device=mp.device,
                         dtype=torch.float32,
                     )
                     master_grad.mul_(host_values[1])
                 else:
                     master_grad = torch.empty_like(mp)
-                    model_grads.append(p.grad.detach())
+                    model_grads.append(_local(p.grad.detach()))
                     master_grads.append(master_grad)
                 mp.grad = master_grad
             if master_grads:
@@ -245,10 +258,10 @@ class BF16Optimizer:
         with torch.no_grad():
             if self.offload_master:
                 for p, mp in zip(self.model_params, self.fp32_params):
-                    p.data.copy_(mp.data.to(device=p.device, dtype=p.dtype))
+                    _local_data(p).copy_(mp.data.to(device=p.device, dtype=p.dtype))
             elif self.model_params:
                 torch._foreach_copy_(
-                    [p.data for p in self.model_params],
+                    [_local_data(p) for p in self.model_params],
                     [mp.data for mp in self.fp32_params],
                 )
             for p in self.model_params:
@@ -326,7 +339,7 @@ class BF16Optimizer:
             )
             with torch.no_grad():
                 for p, mp in zip(self.model_params, self.fp32_params):
-                    mp.data.copy_(p.detach().to(device=mp.device, dtype=mp.dtype))
+                    mp.data.copy_(_local(p.detach()).to(device=mp.device, dtype=mp.dtype))
 
     def state_dict(self):
         return {
