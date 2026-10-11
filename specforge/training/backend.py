@@ -8,9 +8,11 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
-FSDP-only for now. ``ParallelConfig`` carries the process groups created by the
-single distributed lifecycle: trainer TP (fixed at one by public builders) plus
-draft DP/USP topology.
+Two sibling implementations of the same lifecycle contract:
+``FSDP1TrainingBackend`` (``FullyShardedDataParallel``, the default) and
+``FSDP2TrainingBackend`` (``fully_shard``, ``training.fsdp_version: 2``).
+``ParallelConfig`` carries the process groups created by the single distributed
+lifecycle: trainer TP (fixed at one by public builders) plus draft DP/USP topology.
 """
 
 from __future__ import annotations
@@ -212,7 +214,7 @@ class FSDP1TrainingBackend(TrainingBackend):
     ``use_orig_params=True`` / bf16 mixed precision over the configured process
     group, optimizer targeting the inner trainable submodule."""
 
-    name = "fsdp"
+    name = "fsdp1"
 
     def __init__(
         self,
@@ -514,4 +516,331 @@ class FSDP1TrainingBackend(TrainingBackend):
         module.set_rng_state(state, module.current_device())
 
 
-__all__ = ["ParallelConfig", "TrainingBackend", "FSDP1TrainingBackend"]
+class FSDP2TrainingBackend(TrainingBackend):
+    """FSDP2 backend: ``fully_shard`` over ``parallel_config.fsdp_process_group``.
+
+    Same decisions as :class:`FSDP1TrainingBackend`, different mechanism: groups are
+    applied IN PLACE (the caller's model becomes the sharded module, parameters are
+    DTensors), ``set_requires_gradient_sync`` replaces ``no_sync()``, ``BF16Optimizer``
+    works on ``to_local()`` shards, ``get/set_model_state_dict`` gathers the model.
+    Checkpoints do not resume across the two implementations (different shard layouts).
+    """
+
+    name = "fsdp2"
+
+    def __init__(
+        self,
+        parallel_config: ParallelConfig,
+        *,
+        optimizer_factory=None,
+    ) -> None:
+        self.parallel_config = parallel_config
+        self._optimizer_factory = optimizer_factory
+        self.module: Optional[nn.Module] = None
+        self.optimizer = None
+        self._wrapped = False
+        self._wrapper_kind = "none"
+        self._reshard_after_forward = False
+        self.auto_wrap_block_classes = set()
+        self.ignored_frozen_modules = tuple()
+
+    @property
+    def optimizer_state_is_replicated(self) -> bool:
+        """Whether every rank owns the same complete optimizer state."""
+        return self._wrapper_kind == "ddp"
+
+    @staticmethod
+    def _frozen_target_modules(model: nn.Module) -> tuple[nn.Module, ...]:
+        """Frozen composite-level target tables that stay replicated (as FSDP1)."""
+        modules = []
+        for name in ("lm_head", "embed_tokens"):
+            module = getattr(model, name, None)
+            if not isinstance(module, nn.Module):
+                continue
+            parameters = tuple(module.parameters())
+            if parameters and not any(
+                parameter.requires_grad for parameter in parameters
+            ):
+                modules.append(module)
+        return tuple(modules)
+
+    def prepare_model(
+        self,
+        model: nn.Module,
+        *,
+        wrap: bool = True,
+        optimizer_target: Optional[nn.Module] = None,
+    ) -> nn.Module:
+        """Register and wrap the module (DDP for NO_SHARD, fully_shard otherwise); optimizer built after the wrap."""
+        if not wrap:
+            self.module = model
+            self._wrapped = False
+            self._wrapper_kind = "none"
+        else:
+            pc = self.parallel_config
+            ignored_frozen_modules = self._frozen_target_modules(model)
+            block_names = set(
+                getattr(optimizer_target, "_no_split_modules", None) or ()
+            )
+            block_classes = {
+                type(module)
+                for module in model.modules()
+                if type(module).__name__ in block_names
+            }
+            if pc.sharding_strategy == "NO_SHARD":
+                model = self._wrap_ddp(model)
+                self._wrapper_kind = "ddp"
+            else:
+                model = self._wrap_fsdp2(
+                    model,
+                    block_classes=block_classes,
+                    replicated_frozen_modules=ignored_frozen_modules,
+                )
+                self._wrapper_kind = "fsdp2"
+            self.module = model
+            self._wrapped = True
+            self.auto_wrap_block_classes = (  # same attribute as FSDP1: the block classes that became groups
+                block_classes if self._wrapper_kind == "fsdp2" else set()
+            )
+            self.ignored_frozen_modules = ignored_frozen_modules
+        if self._optimizer_factory is not None:
+            target = optimizer_target if optimizer_target is not None else self.module
+            self.optimizer = self._optimizer_factory(target)
+            self._configure_optimizer_grad_norm()
+        return self.module
+
+    def _wrap_ddp(self, model: nn.Module) -> nn.Module:
+        # fully_shard has no NO_SHARD either: DDP gives replicated params without all-gathers
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        device_ids = None
+        output_device = None
+        model_device = next(model.parameters()).device
+        if model_device.type in ("cuda", "npu"):
+            device_ids = [model_device.index]
+            output_device = model_device.index
+        return DDP(
+            model,
+            device_ids=device_ids,
+            output_device=output_device,
+            process_group=self.parallel_config.fsdp_process_group,
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+        )
+
+    def _wrap_fsdp2(self, model, *, block_classes, replicated_frozen_modules):
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+        from specforge.utils import get_device_type
+
+        device_type = get_device_type()  # same device set as FSDP1: the bound accelerator's group
+        pc = self.parallel_config
+        # FSDP1's buffer_dtype=fp32 kept floating buffers in fp32; fully_shard has no buffer policy
+        for module in model.modules():
+            for name, buf in list(module.named_buffers(recurse=False)):
+                if buf.is_floating_point() and buf.dtype != torch.float32:
+                    module._buffers[name] = buf.float()
+        # from_group creates no new process group, so setup collectives keep their order
+        mesh = DeviceMesh.from_group(
+            pc.fsdp_process_group, device_type, mesh_dim_names=("fsdp",)
+        )
+        # ignored_params is per call: every group needs the set, not only the root
+        ignored_params = {p for m in replicated_frozen_modules for p in m.parameters()} or None
+        # SHARD_GRAD_OP keeps params after forward, FULL_SHARD re-gathers; unknown modes raise
+        reshard = {"SHARD_GRAD_OP": False, "FULL_SHARD": True}[pc.sharding_strategy]
+        block_policy = MixedPrecisionPolicy(
+            param_dtype=pc.param_dtype, cast_forward_inputs=False
+        )
+        # FSDP1 casts floating forward inputs at the root only
+        root_policy = MixedPrecisionPolicy(
+            param_dtype=pc.param_dtype, cast_forward_inputs=True
+        )
+        blocks = [m for m in model.modules() if type(m) in block_classes]  # pre-order
+        for block in reversed(blocks):  # children before parents: a group skips params a child owns
+            fully_shard(
+                block,
+                mesh=mesh,
+                reshard_after_forward=reshard,
+                mp_policy=block_policy,
+                ignored_params=ignored_params,
+            )
+        for current, following in zip(blocks, blocks[1:]):  # prefetch in execution (pre-)order
+            current.set_modules_to_forward_prefetch([following])
+        fully_shard(  # root keeps its params for the backward that follows, as FSDP1 does
+            model,
+            mesh=mesh,
+            reshard_after_forward=False,
+            mp_policy=root_policy,
+            ignored_params=ignored_params,
+        )
+        self._reshard_after_forward = reshard
+        return model  # in place: same object, now an FSDPModule
+
+    def set_optimizer(self, optimizer) -> None:
+        self.optimizer = optimizer
+        self._configure_optimizer_grad_norm()
+
+    def _configure_optimizer_grad_norm(self) -> None:
+        configure = getattr(self.optimizer, "configure_grad_norm_reduction", None)
+        if configure is not None:
+            configure(
+                process_group=self.parallel_config.fsdp_process_group,
+                enabled=(
+                    self._wrapped
+                    and self.parallel_config.sharding_strategy != "NO_SHARD"
+                ),
+            )
+
+    def micro_step(self, *, is_boundary: bool = True):
+        if is_boundary or self._wrapper_kind != "ddp":
+            return contextlib.nullcontext()
+        return self.module.no_sync()  # must cover the forward: DDP decides there
+
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
+        """Backward one micro-step; non-boundary steps skip the reduction (DDP via micro_step, fully_shard via the sync toggle)."""
+        if is_boundary or not self._wrapped:
+            loss.backward()
+            return
+        if self._wrapper_kind == "ddp":
+            if self.module.require_backward_grad_sync:  # forward ran outside micro_step()
+                raise RuntimeError(
+                    "DDP gradient accumulation needs backend.micro_step(is_boundary=False) "
+                    "around the forward; no_sync() around backward alone still synchronizes"
+                )
+            loss.backward()
+            return
+        module = self.module
+        module.set_requires_gradient_sync(False)
+        module.set_reshard_after_backward(self._reshard_after_forward)
+        try:
+            loss.backward()
+        finally:
+            module.set_requires_gradient_sync(True)
+            module.set_reshard_after_backward(True)
+
+    def scale_gradients(self, factor: torch.Tensor) -> None:
+        if self.module is None:
+            raise RuntimeError("scale_gradients called before prepare_model")
+        from torch.distributed.tensor import DTensor
+
+        with torch.no_grad():
+            grads = [p.grad for p in self.module.parameters() if p.grad is not None]
+            _foreach_scale_(
+                [g.to_local() if isinstance(g, DTensor) else g for g in grads], factor
+            )
+
+    @property
+    def checks_loss_denominator(self) -> bool:
+        return bool(getattr(self.optimizer, "checks_loss_denominator", False))
+
+    def step(
+        self, *, loss_denominator: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        """Run the optimizer step, which clips and returns the global grad norm."""
+        if self.optimizer is None:
+            raise RuntimeError(
+                "FSDP2TrainingBackend.step called before optimizer is set"
+            )
+        if loss_denominator is None:
+            return self.optimizer.step()
+        return self.optimizer.step(loss_denominator=loss_denominator)
+
+    def state_dict(self) -> dict:
+        """Full training state {model, optimizer, rng}: model gathered on rank0, optimizer and RNG rank-local."""
+        if self.module is None:
+            raise RuntimeError("state_dict called before prepare_model")
+        return {
+            "model": self._module_state_dict(),
+            "optimizer": (
+                self.optimizer.state_dict() if self.optimizer is not None else None
+            ),
+            "rng": self._rng_state(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore whichever of module weights / optimizer / RNG the state carries."""
+        if state.get("model") is not None:
+            self._load_module_state_dict(state["model"])
+        if self.optimizer is not None and state.get("optimizer") is not None:
+            self.optimizer.load_state_dict(state["optimizer"])
+        if state.get("rng") is not None:
+            self._set_rng_state(state["rng"])
+
+    def _module_state_dict(self) -> dict:
+        if self._wrapper_kind == "ddp":
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return {}
+            return self.module.module.state_dict()
+        if self._wrapper_kind == "none":
+            return self.module.state_dict()
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_model_state_dict,
+        )
+
+        # collective: gathers to rank0 CPU and returns {} elsewhere, like FSDP1's rank0_only FULL_STATE_DICT
+        return get_model_state_dict(
+            self.module,
+            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+        )
+
+    def _load_module_state_dict(self, model_state: dict) -> None:
+        # every rank loads the full state dict read from the shared file
+        if self._wrapper_kind == "ddp":
+            self.module.module.load_state_dict(model_state)
+            return
+        if self._wrapper_kind == "none":
+            self.module.load_state_dict(model_state)
+            return
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            set_model_state_dict,
+        )
+
+        set_model_state_dict(
+            self.module,
+            model_state,
+            options=StateDictOptions(full_state_dict=True, strict=True),
+        )
+
+    @staticmethod
+    def _rng_state() -> dict:
+        # only the bound accelerator's RNG state, independent of how many devices are visible at load
+        from specforge.utils import get_device_type
+
+        device_type = get_device_type()
+        accelerator_state = None
+        module = getattr(torch, device_type, None)
+        if (
+            device_type in ("cuda", "npu")
+            and module is not None
+            and module.is_available()
+        ):
+            accelerator_state = module.get_rng_state(module.current_device())
+        return {
+            "torch": torch.get_rng_state(),
+            "device_type": device_type,
+            "cuda": accelerator_state if device_type == "cuda" else None,
+            "npu": accelerator_state if device_type == "npu" else None,
+        }
+
+    @staticmethod
+    def _set_rng_state(rng: dict) -> None:
+        torch.set_rng_state(rng["torch"])
+        device_type = rng.get("device_type")
+        if device_type is None:
+            device_type = "cuda" if rng.get("cuda") is not None else None
+        state = rng.get(device_type) if device_type is not None else None
+        module = getattr(torch, device_type, None) if device_type is not None else None
+        if state is None or module is None or not module.is_available():
+            return
+        module.set_rng_state(state, module.current_device())
+
+
+__all__ = [
+    "ParallelConfig",
+    "TrainingBackend",
+    "FSDP1TrainingBackend",
+    "FSDP2TrainingBackend",
+]
