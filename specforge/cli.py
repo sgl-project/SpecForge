@@ -120,6 +120,7 @@ def _train(resolved) -> int:
     # Make the typed recipe authoritative for the backend's existing FSDP
     # sharding seam in both direct and managed-local worker processes.
     os.environ["FSDP_SHARDING"] = cfg.training.fsdp_sharding
+    os.environ["FSDP_VERSION"] = str(cfg.training.fsdp_version)
     set_seed(cfg.training.seed)
     if cfg.training.role == "producer":
         # A server-capture/offline-ingest producer owns no trainer process

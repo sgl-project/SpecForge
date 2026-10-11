@@ -48,6 +48,11 @@ def _foreach_scale_(tensors: List[torch.Tensor], factor: torch.Tensor) -> None:
         torch._foreach_mul_(group, scalar)
 
 
+#: modes both backends translate; HYBRID_SHARD (HSDP) is deferred and rejected, not mapped
+SHARDING_STRATEGIES = ("SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD")
+FSDP_VERSIONS = (1, 2)
+
+
 @dataclass
 class ParallelConfig:
     """Snapshot of the trainer-TP and draft-DP/SP layout.
@@ -62,6 +67,7 @@ class ParallelConfig:
     sp_ulysses_size: int = 1
     sp_ring_size: int = 1
     sharding_strategy: str = "SHARD_GRAD_OP"
+    fsdp_version: int = 1  # 1 = FullyShardedDataParallel, 2 = fully_shard
     param_dtype: torch.dtype = torch.bfloat16
     fsdp_process_group: Any = None
     dp_group: Any = None
@@ -78,6 +84,19 @@ class ParallelConfig:
     def sp_size(self) -> int:
         return self.sp_ulysses_size * self.sp_ring_size
 
+    def __post_init__(self) -> None:
+        # the env seam and direct callers bypass the YAML validator: fail before any backend is built
+        if self.sharding_strategy not in SHARDING_STRATEGIES:
+            raise ValueError(
+                f"sharding_strategy={self.sharding_strategy!r} is not supported; "
+                f"expected one of {SHARDING_STRATEGIES} (HSDP is not supported yet)"
+            )
+        if self.fsdp_version not in FSDP_VERSIONS:
+            raise ValueError(
+                f"fsdp_version={self.fsdp_version!r} is not supported; "
+                f"expected one of {FSDP_VERSIONS}"
+            )
+
     @classmethod
     def from_distributed(
         cls,
@@ -86,6 +105,7 @@ class ParallelConfig:
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
         sharding_strategy: str = "SHARD_GRAD_OP",
+        fsdp_version: int = 1,
         param_dtype: torch.dtype = torch.bfloat16,
     ) -> "ParallelConfig":
         """Carry every group built by :func:`specforge.distributed.init_distributed`."""
@@ -93,6 +113,14 @@ class ParallelConfig:
         # runs DDP-style (full params replicated, one grad all-reduce, no param
         # all-gather). Default unchanged when the env var is unset.
         sharding_strategy = os.environ.get("FSDP_SHARDING", sharding_strategy)
+        raw_version = os.environ.get("FSDP_VERSION")  # same seam: FSDP_VERSION=2 selects fully_shard
+        if raw_version is not None:
+            try:
+                fsdp_version = int(raw_version)
+            except ValueError:
+                raise ValueError(
+                    f"FSDP_VERSION={raw_version!r} is not an integer; expected 1 or 2"
+                ) from None
         if not dist.is_initialized():
             return cls(
                 world_size=1,
@@ -100,6 +128,7 @@ class ParallelConfig:
                 sp_ulysses_size=sp_ulysses_size,
                 sp_ring_size=sp_ring_size,
                 sharding_strategy=sharding_strategy,
+                fsdp_version=fsdp_version,
                 param_dtype=param_dtype,
             )
         handles: Dict[str, Any] = {}
@@ -138,6 +167,7 @@ class ParallelConfig:
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
             sharding_strategy=sharding_strategy,
+            fsdp_version=fsdp_version,
             param_dtype=param_dtype,
             fsdp_process_group=dist.group.WORLD,
             **handles,

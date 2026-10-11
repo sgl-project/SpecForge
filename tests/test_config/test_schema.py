@@ -123,6 +123,23 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Config.model_validate(payload)
 
+    def test_fsdp_version_is_typed(self):
+        self.assertEqual(
+            Config.model_validate(copy.deepcopy(MINIMAL)).training.fsdp_version, 1
+        )
+        payload = copy.deepcopy(MINIMAL)
+        payload["training"] = {"fsdp_version": 2}
+        self.assertEqual(Config.model_validate(payload).training.fsdp_version, 2)
+
+        payload["training"]["fsdp_version"] = 3
+        with self.assertRaises(ValidationError):
+            Config.model_validate(payload)
+        # CLI overrides arrive as strings and must coerce like other scalars
+        overridden = apply_overrides(
+            Config.model_validate(copy.deepcopy(MINIMAL)), ["training.fsdp_version=2"]
+        )
+        self.assertEqual(overridden.training.fsdp_version, 2)
+
     def test_removed_vlm_pixel_knobs_are_rejected(self):
         for field in ("min_pixels", "max_pixels"):
             payload = copy.deepcopy(MINIMAL)

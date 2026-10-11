@@ -900,6 +900,8 @@ class TrainingConfig(StrictConfigModel):
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    #: 1 = FullyShardedDataParallel, 2 = fully_shard; same modes and checkpoint layout, no resume across the two
+    fsdp_version: int = Field(default=1, ge=1, le=2)  # int, not Literal: CLI overrides arrive as str
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
