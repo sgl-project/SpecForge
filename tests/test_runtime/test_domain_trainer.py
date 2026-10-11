@@ -127,7 +127,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
             tr,
             FeatureDataLoader=FakeLoader,
             ParallelConfig=FakeParallel,
-            FSDPTrainingBackend=FakeBackend,
+            FSDP1TrainingBackend=FakeBackend,
             TrainerCore=FakeCore,
             TrainerController=FakeController,
         ):

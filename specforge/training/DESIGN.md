@@ -23,7 +23,7 @@ Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;
 `TrainerCore` owns one branch-free train step and the accumulation boundary;
 `DraftTrainStrategy` owns model-specific validation, forward/loss, target
-projection, and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
+projection, and checkpoint filtering; `FSDP1TrainingBackend` owns wrapping,
 backward, optimizer steps, distributed gradient norms, and full training state.
 Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
@@ -41,7 +41,7 @@ flowchart TD
   FIT -->|for batch in loader| TS[TrainerCore train_step]
   FIT -->|append sample_ids| PA[pending_ack accumulator]
   TS -->|forward_loss| ST[DraftTrainStrategy projection plus loss]
-  TS -->|backward| BK[FSDPTrainingBackend]
+  TS -->|backward| BK[FSDP1TrainingBackend]
   TS -->|step at accum boundary| BK
   TS -->|StepResult optimizer_stepped| FIT
   FIT -->|on boundary global_step plus 1| BND[boundary actions]
@@ -81,5 +81,5 @@ fixed offline refs keep normal `drop_last` semantics.
 | `TrainerController` | `TrainerCore.train_step` | compute |
 | `TrainerController` | `DataFlowController.ack_train_refs` | control |
 | `TrainerCore` | `Eagle3TrainStrategy.forward_loss` | compute |
-| `TrainerCore` | `FSDPTrainingBackend.backward` | compute |
-| `TrainerCore` | `FSDPTrainingBackend.step` | compute |
+| `TrainerCore` | `FSDP1TrainingBackend.backward` | compute |
+| `TrainerCore` | `FSDP1TrainingBackend.step` | compute |

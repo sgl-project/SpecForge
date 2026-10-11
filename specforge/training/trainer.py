@@ -9,7 +9,7 @@
 """Domain ``Trainer``: the caller-facing training object.
 
 Composes (ref source + FeatureStore) -> FeatureDataLoader (the data path) and
-model + an injected step factory -> FSDPTrainingBackend -> TrainerCore ->
+model + an injected step factory -> FSDP1TrainingBackend -> TrainerCore ->
 TrainerController (the trainer seam) behind one object with a ``.fit()``.
 Online / offline / disaggregated is invisible here: it is fully absorbed by the
 ref source + store the Trainer is handed — the loader IS the stream.
@@ -31,7 +31,7 @@ from specforge.algorithms.common.providers import (
     checkpoint_key_fingerprint,
 )
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
-from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 
@@ -430,7 +430,7 @@ class Trainer:
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
         )
-        backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
+        backend = FSDP1TrainingBackend(parallel, optimizer_factory=optimizer_factory)
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).

@@ -30,7 +30,7 @@ def _worker(rank, world_size, workdir, results_dir):
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
     from specforge.modeling.target.target_head import TargetHead
     from specforge.optimizer import BF16Optimizer
-    from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+    from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
     from specforge.training.controller import TrainerCore
     from specforge.training.strategies.base import Eagle3TrainStrategy
 
@@ -78,7 +78,7 @@ def _worker(rank, world_size, workdir, results_dir):
     pc = ParallelConfig.from_distributed()
 
     # Path A: no_sync via TrainerCore accumulation (reduce once, on the boundary).
-    backend_a = FSDPTrainingBackend(pc, optimizer_factory=opt_factory)
+    backend_a = FSDP1TrainingBackend(pc, optimizer_factory=opt_factory)
     backend_a.prepare_model(model_a, wrap=True, optimizer_target=model_a.draft_model)
     # Count deferrals: every NON-boundary micro-step must enter no_sync(), so
     # the boundary backward is the single reduction per optimizer step.
@@ -96,7 +96,7 @@ def _worker(rank, world_size, workdir, results_dir):
         rep_a = core_a.train_step(batch)
 
     # Path B: force the reduction on every micro-step (is_boundary=True), same math.
-    backend_b = FSDPTrainingBackend(pc, optimizer_factory=opt_factory)
+    backend_b = FSDP1TrainingBackend(pc, optimizer_factory=opt_factory)
     backend_b.prepare_model(model_b, wrap=True, optimizer_target=model_b.draft_model)
     strat_b = Eagle3TrainStrategy(backend_b.module, target_head=head)
     for _ in range(ACC):

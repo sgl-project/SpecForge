@@ -3,7 +3,7 @@
 
 One model takes a step through the offline builder and public ``Trainer.fit()``.
 An identically initialized model takes the same step through the canonical
-``TrainerCore``/``FSDPTrainingBackend`` seam.  Loss, gradient norm and updated
+``TrainerCore``/``FSDP1TrainingBackend`` seam.  Loss, gradient norm and updated
 draft weights must agree.
 """
 
@@ -36,7 +36,7 @@ class TestEquivTrainerSplit(unittest.TestCase):
         fx.build_single_rank_distributed(port="29562")
         from specforge.algorithms.builtin import builtin_algorithm_registry
         from specforge.launch import build_offline_runtime
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerCore
 
         algorithm = builtin_algorithm_registry().resolve("eagle3")
@@ -77,7 +77,7 @@ class TestEquivTrainerSplit(unittest.TestCase):
                     log_interval=1,
                 )
 
-                backend = FSDPTrainingBackend(
+                backend = FSDP1TrainingBackend(
                     ParallelConfig.from_distributed(),
                     optimizer_factory=_optimizer_factory,
                 )

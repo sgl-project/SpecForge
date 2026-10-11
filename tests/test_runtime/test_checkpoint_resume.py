@@ -119,14 +119,14 @@ def _fake_seam():
 @contextlib.contextmanager
 def _no_fsdp_wrap():
     """Force the production backend to register without FSDP (CPU, world 1)."""
-    from specforge.training.backend import FSDPTrainingBackend
+    from specforge.training.backend import FSDP1TrainingBackend
 
-    orig = FSDPTrainingBackend.prepare_model
+    orig = FSDP1TrainingBackend.prepare_model
 
     def unwrapped(self, model, *, wrap=True, optimizer_target=None):
         return orig(self, model, wrap=False, optimizer_target=optimizer_target)
 
-    with mock.patch.object(FSDPTrainingBackend, "prepare_model", unwrapped):
+    with mock.patch.object(FSDP1TrainingBackend, "prepare_model", unwrapped):
         yield
 
 
@@ -1073,7 +1073,7 @@ class TestCheckpointResume(unittest.TestCase):
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
 
@@ -1116,7 +1116,7 @@ class TestCheckpointResume(unittest.TestCase):
             warmup_ratio=0.0,
             total_steps=10,
         )
-        backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+        backend = FSDP1TrainingBackend(ParallelConfig.from_distributed())
         backend.prepare_model(model, wrap=False)  # no FSDP at 1 rank
         backend.set_optimizer(opt)
         strategy = Eagle3TrainStrategy(model, target_head=head)
@@ -1202,7 +1202,7 @@ class TestCheckpointResume(unittest.TestCase):
         fx.build_single_rank_distributed(port="29564")
 
         from specforge.optimizer import BF16Optimizer
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
 
@@ -1226,7 +1226,7 @@ class TestCheckpointResume(unittest.TestCase):
             torch.manual_seed(0)
             torch.use_deterministic_algorithms(True, warn_only=True)
             model, head = fx.build_eagle3(workdir, ttt=TTT)
-            backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+            backend = FSDP1TrainingBackend(ParallelConfig.from_distributed())
             backend.prepare_model(model, wrap=False)
             backend.set_optimizer(
                 BF16Optimizer(

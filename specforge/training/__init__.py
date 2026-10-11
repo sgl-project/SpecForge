@@ -10,7 +10,7 @@
 
 ``Trainer`` WRAPS — does not replace — the runtime training seam
 (``TrainerController`` / ``TrainerCore`` / ``DraftTrainStrategy`` /
-``FSDPTrainingBackend``). ``CheckpointManager`` and the learning-rate schedule
+``FSDP1TrainingBackend``). ``CheckpointManager`` and the learning-rate schedule
 live here on top of the same seam.
 
 Import-light: the ``Trainer`` (which imports the GPU/model-heavy runtime backend)

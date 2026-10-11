@@ -173,7 +173,7 @@ class TrainingBackend(abc.ABC):
     def load_state_dict(self, state: dict) -> None: ...
 
 
-class FSDPTrainingBackend(TrainingBackend):
+class FSDP1TrainingBackend(TrainingBackend):
     """FSDP1 backend for the canonical SpecForge training math: FSDP with
     ``use_orig_params=True`` / bf16 mixed precision over the configured process
     group, optimizer targeting the inner trainable submodule."""
@@ -367,7 +367,7 @@ class FSDPTrainingBackend(TrainingBackend):
         """
         if self.optimizer is None:
             raise RuntimeError(
-                "FSDPTrainingBackend.step called before optimizer is set"
+                "FSDP1TrainingBackend.step called before optimizer is set"
             )
         if loss_denominator is None:
             return self.optimizer.step()
@@ -472,4 +472,4 @@ class FSDPTrainingBackend(TrainingBackend):
         module.set_rng_state(state, module.current_device())
 
 
-__all__ = ["ParallelConfig", "TrainingBackend", "FSDPTrainingBackend"]
+__all__ = ["ParallelConfig", "TrainingBackend", "FSDP1TrainingBackend"]
