@@ -119,14 +119,24 @@ def _fake_seam():
 @contextlib.contextmanager
 def _no_fsdp_wrap():
     """Force the production backend to register without FSDP (CPU, world 1)."""
-    from specforge.training.backend import FSDP1TrainingBackend
+    from specforge.training.backend import FSDP1TrainingBackend, FSDP2TrainingBackend
 
-    orig = FSDP1TrainingBackend.prepare_model
+    def unwrapped_for(cls):
+        orig = cls.prepare_model
 
-    def unwrapped(self, model, *, wrap=True, optimizer_target=None):
-        return orig(self, model, wrap=False, optimizer_target=optimizer_target)
+        def unwrapped(self, model, *, wrap=True, optimizer_target=None):
+            return orig(self, model, wrap=False, optimizer_target=optimizer_target)
 
-    with mock.patch.object(FSDP1TrainingBackend, "prepare_model", unwrapped):
+        return unwrapped
+
+    with (
+        mock.patch.object(
+            FSDP1TrainingBackend, "prepare_model", unwrapped_for(FSDP1TrainingBackend)
+        ),
+        mock.patch.object(
+            FSDP2TrainingBackend, "prepare_model", unwrapped_for(FSDP2TrainingBackend)
+        ),
+    ):
         yield
 
 

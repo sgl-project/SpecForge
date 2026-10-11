@@ -124,7 +124,7 @@ class TestEquivTrainerSplit(unittest.TestCase):
                 self.assertEqual(set(fit_state), set(core_state))
                 for name in sorted(fit_state):
                     self.assertTrue(
-                        torch.equal(fit_state[name], core_state[name]),
+                        torch.equal(fit_state[name].cpu(), core_state[name].cpu()),
                         f"draft weight {name!r} changed at the Trainer boundary",
                     )
         finally:

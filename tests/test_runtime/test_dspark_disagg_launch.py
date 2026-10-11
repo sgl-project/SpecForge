@@ -28,6 +28,8 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29579")
 
+        from torch.distributed.fsdp import FSDPModule  # fsdp_version=2 wraps in place
+
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         from specforge.launch import build_disagg_online_consumer
@@ -87,7 +89,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
 
         strategy = trainer.core.strategy
         self.assertIsInstance(strategy, DSparkTrainStrategy)
-        self.assertIsInstance(strategy.trainable_module(), FSDP)
+        self.assertIsInstance(strategy.trainable_module(), (FSDP, FSDPModule))
         self.assertEqual(
             {cls.__name__ for cls in trainer.backend.auto_wrap_block_classes},
             {"Qwen3DFlashDecoderLayer"},

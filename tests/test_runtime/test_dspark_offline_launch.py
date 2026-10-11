@@ -20,6 +20,8 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29580")
 
+        from torch.distributed.fsdp import FSDPModule  # fsdp_version=2 wraps in place
+
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         from specforge.launch import build_offline_runtime
@@ -67,7 +69,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
         strategy = trainer.core.strategy
         self.assertIsInstance(strategy, DSparkTrainStrategy)
         module = strategy.trainable_module()
-        self.assertIsInstance(module, FSDP)
+        self.assertIsInstance(module, (FSDP, FSDPModule))
         self.assertEqual(trainer.fit(), 2)
         self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 
