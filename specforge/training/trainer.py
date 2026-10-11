@@ -9,7 +9,7 @@
 """Domain ``Trainer``: the caller-facing training object.
 
 Composes (ref source + FeatureStore) -> FeatureDataLoader (the data path) and
-model + an injected step factory -> FSDP1TrainingBackend -> TrainerCore ->
+model + an injected step factory -> FSDP1/FSDP2TrainingBackend -> TrainerCore ->
 TrainerController (the trainer seam) behind one object with a ``.fit()``.
 Online / offline / disaggregated is invisible here: it is fully absorbed by the
 ref source + store the Trainer is handed — the loader IS the stream.
@@ -31,11 +31,37 @@ from specforge.algorithms.common.providers import (
     checkpoint_key_fingerprint,
 )
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
-from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
+from specforge.training.backend import (
+    FSDP1TrainingBackend,
+    FSDP2TrainingBackend,
+    ParallelConfig,
+)
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 
 logger = logging.getLogger(__name__)
+
+
+def _backend_class(parallel):
+    """``training.fsdp_version`` picks the FSDP implementation; same lifecycle contract."""
+    version = getattr(parallel, "fsdp_version", 1)
+    if version == 1:
+        return FSDP1TrainingBackend
+    if version == 2:
+        return FSDP2TrainingBackend
+    raise ValueError(f"fsdp_version={version!r} is not supported; expected 1 or 2")
+
+
+def _training_backend_kind(parallel, backend_cls) -> str:
+    """Optimizer-state layout for the resume contract: "ddp" (replicated, resumes anywhere) or the backend name."""
+    if getattr(parallel, "sharding_strategy", "SHARD_GRAD_OP") == "NO_SHARD":
+        return "ddp"
+    return backend_cls.name
+
+
+def _legacy_training_backend(state: Mapping[str, object]) -> str:
+    """Layout of a checkpoint written before ``training_backend`` existed: DDP wrote a replicated optimizer, the rest is fsdp1."""
+    return "ddp" if "replicated_optimizer_state" in state else "fsdp1"
 
 
 def _legacy_scheduler_total_steps(state: Mapping[str, object]) -> Optional[int]:
@@ -256,6 +282,12 @@ class Trainer:
         if configure_schedule is not None:
             configure_schedule(effective_total_steps)
 
+        parallel = ParallelConfig.from_distributed(
+            tp_size=tp_size,
+            sp_ulysses_size=sp_ulysses_size,
+            sp_ring_size=sp_ring_size,
+        )
+        backend_cls = _backend_class(parallel)
         standard_checkpoint_extra = {
             "dataset_size": dataset_size,
             "batch_size": batch_size,
@@ -265,6 +297,8 @@ class Trainer:
             "tp_size": tp_size,
             "sp_ulysses_size": sp_ulysses_size,
             "sp_ring_size": sp_ring_size,
+            # rank-local optimizer shards have implementation-specific layouts
+            "training_backend": _training_backend_kind(parallel, backend_cls),
         }
         explicit_checkpoint_extra = dict(checkpoint_extra or {})
         duplicate_algorithm_keys = (
@@ -327,6 +361,10 @@ class Trainer:
                         persisted,
                         cache_root=output_dir,
                     )
+                if key == "training_backend" and key not in state:
+                    # pre-fsdp2 checkpoints: infer the layout from the format
+                    comparison_persisted = _legacy_training_backend(state)
+                    persisted_available = True
                 if key == "effective_total_steps" and key not in state:
                     persisted = _legacy_scheduler_total_steps(state)
                     comparison_persisted = persisted
@@ -425,12 +463,7 @@ class Trainer:
             # drop the full draft state before the wrap
             del state, saved_weights
 
-        parallel = ParallelConfig.from_distributed(
-            tp_size=tp_size,
-            sp_ulysses_size=sp_ulysses_size,
-            sp_ring_size=sp_ring_size,
-        )
-        backend = FSDP1TrainingBackend(parallel, optimizer_factory=optimizer_factory)
+        backend = backend_cls(parallel, optimizer_factory=optimizer_factory)
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).

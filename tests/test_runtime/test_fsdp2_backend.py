@@ -1,8 +1,10 @@
 # coding=utf-8
-"""FSDP2 backend (``training.fsdp_version: 2``): wrap layout and parity.
+"""FSDP2 backend (``training.fsdp_version: 2``): selection, wrap layout, parity.
 
+CPU: the env seam, bad values, and the trainer's backend selection.
 1 GPU: fully_shard layout for a root-only draft (EAGLE3), a per-block draft
-with replicated frozen tables (DFlash) and nested block matches (children first).
+with replicated frozen tables (DFlash) and nested block matches (children first);
+the launcher path end to end with the checkpoint recording ``training_backend``.
 2 GPUs: fsdp1 vs fsdp2 on DISTINCT per-rank micro-batches (EAGLE3; the other
 algorithms and sharding modes are in ``test_fsdp2_matrix.py``),
 the gradient-sync toggle vs reducing every micro-step (bitwise), and a resume
@@ -15,6 +17,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -24,6 +27,69 @@ WORLD = 2
 BS = 2
 ACC = 2
 STEPS = 4
+
+
+class FSDP2SelectionTest(unittest.TestCase):
+    def test_parallel_config_reads_fsdp_version_from_env(self):
+        from specforge.training.backend import ParallelConfig
+
+        with mock.patch(
+            "specforge.training.backend.dist.is_initialized", return_value=False
+        ):
+            with mock.patch.dict("os.environ", {"FSDP_VERSION": "2"}):
+                self.assertEqual(ParallelConfig.from_distributed().fsdp_version, 2)
+            with mock.patch.dict("os.environ", {"FSDP_VERSION": "1"}):
+                self.assertEqual(ParallelConfig.from_distributed().fsdp_version, 1)
+        self.assertEqual(ParallelConfig().fsdp_version, 1)
+
+    def test_trainer_selects_backend_by_version(self):
+        from specforge.training.backend import (
+            FSDP1TrainingBackend,
+            FSDP2TrainingBackend,
+            ParallelConfig,
+        )
+        from specforge.training.trainer import _backend_class
+
+        self.assertIs(_backend_class(ParallelConfig()), FSDP1TrainingBackend)
+        self.assertIs(_backend_class(ParallelConfig(fsdp_version=2)), FSDP2TrainingBackend)
+        self.assertEqual(FSDP1TrainingBackend.name, "fsdp1")
+        self.assertEqual(FSDP2TrainingBackend.name, "fsdp2")
+
+    def test_invalid_env_values_are_rejected(self):
+        # the env seam bypasses the YAML validator: bad values must fail, never degrade to another mode
+        from types import SimpleNamespace
+
+        from specforge.training.backend import ParallelConfig
+        from specforge.training.trainer import _backend_class
+
+        for env in (
+            {"FSDP_VERSION": "3"},
+            {"FSDP_VERSION": "two"},
+            {"FSDP_VERSION": "2", "FSDP_SHARDING": "FULL_SHRAD"},
+            {"FSDP_VERSION": "1", "FSDP_SHARDING": "HYBRID_SHARD"},
+        ):
+            with mock.patch.dict("os.environ", env):
+                with self.assertRaises(ValueError, msg=env):
+                    ParallelConfig.from_distributed()
+        with self.assertRaises(ValueError):
+            ParallelConfig(sharding_strategy="FULL_SHRAD")
+        with self.assertRaises(ValueError):
+            ParallelConfig(fsdp_version=3)
+        with self.assertRaises(ValueError):
+            _backend_class(SimpleNamespace(fsdp_version=3))
+
+    def test_unwrapped_path_scales_plain_gradients(self):
+        import torch.nn as nn
+
+        from specforge.training.backend import FSDP2TrainingBackend, ParallelConfig
+
+        model = nn.Linear(2, 1, bias=False)
+        backend = FSDP2TrainingBackend(ParallelConfig(fsdp_version=2))
+        backend.prepare_model(model, wrap=False)
+        model.weight.grad = torch.tensor([[4.0, 8.0]])
+        backend.scale_gradients(torch.tensor(0.25))
+        torch.testing.assert_close(model.weight.grad, torch.tensor([[1.0, 2.0]]))
+        self.assertFalse(backend.optimizer_state_is_replicated)
 
 
 def _optimizer_factory(module):
@@ -155,6 +221,50 @@ class FSDP2LayoutTest(unittest.TestCase):
         loss = wrapped(torch.randn(4, 32, device="cuda", dtype=torch.bfloat16))
         loss.backward()
         self.assertTrue(all(p.grad is not None for p in wrapped.parameters()))
+
+
+    def test_launcher_path_records_training_backend(self):
+        from torch.distributed.fsdp import FSDPModule
+
+        from specforge.algorithms.builtin import builtin_algorithm_registry
+        from specforge.launch import build_offline_runtime
+        from tests.test_runtime import _fixtures as fx
+
+        fx.build_single_rank_distributed(port="29592")
+        algorithm = builtin_algorithm_registry().resolve("eagle3")
+        workdir = tempfile.mkdtemp(prefix="fsdp2_launch_")
+        feat_dir = fx.write_offline_files(os.path.join(workdir, "features"), n=8)
+        eagle3_model, target_head = fx.build_eagle3(workdir, ttt=3)
+
+        with mock.patch.dict("os.environ", {"FSDP_VERSION": "2"}):
+            trainer = build_offline_runtime(
+                algorithm=algorithm,
+                hidden_states_path=feat_dir,
+                draft_model=eagle3_model,
+                target_head=target_head,
+                optimizer_factory=_optimizer_factory,
+                run_id="launch-fsdp2",
+                output_dir=os.path.join(workdir, "out"),
+                ttt_length=3,
+                max_len=512,
+                batch_size=1,
+                accumulation_steps=2,
+                num_epochs=3,
+                max_steps=2,
+            )
+            module = trainer.core.strategy.trainable_module()
+            self.assertIsInstance(module, FSDPModule)
+            self.assertEqual(trainer.core.backend.name, "fsdp2")
+            self.assertEqual(trainer.fit(), 2)
+            self.assertEqual(trainer.micro_step, 4)
+            checkpoint = trainer.save_checkpoint()
+        ckpt_dir = checkpoint.checkpoint_uri.removeprefix("file://")
+        state = torch.load(
+            os.path.join(ckpt_dir, "training_state.pt"),
+            map_location="cpu",
+            weights_only=False,
+        )
+        self.assertEqual(state["training_backend"], "fsdp2")
 
 
 def _parity_worker(rank, world_size, workdir, results_dir):

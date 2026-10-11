@@ -130,6 +130,11 @@ def _no_fsdp_wrap():
         yield
 
 
+def _current_backend_kind() -> str:
+    """The ``training_backend`` this process records (sharded modes only)."""
+    return "fsdp2" if os.environ.get("FSDP_VERSION") == "2" else "fsdp1"
+
+
 class TestTrainerResumeEntrypoint(unittest.TestCase):
     """Production resume seam on CPU: ``Trainer(resume_from=...)`` restores
     weights, fp32 masters, scheduler position and data position, and fail-fasts
@@ -306,7 +311,10 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 "run_id": "rz",
                 "world_size": 1,
                 "effective_total_steps": 100,
+                "training_backend": _current_backend_kind(),
             }
+            for key in overrides.pop("__drop__", ()):
+                payload.pop(key, None)
             payload.update(overrides)
             torch.save(payload, os.path.join(d, "training_state.pt"))
             torch.save(
@@ -315,6 +323,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             )
             return d
 
+        current_backend = _current_backend_kind()
+        other_backend = "fsdp1" if current_backend == "fsdp2" else "fsdp2"
         cases = [
             ("strategy", {"strategy": "dflash"}, "was written by strategy"),
             ("dataset", {"dataset_size": 999}, "dataset_size=999 but this run has"),
@@ -336,6 +346,22 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 {"sp_ring_size": 2},
                 "sp_ring_size=2 but this run has",
             ),
+            # rank-local optimizer shards are implementation specific
+            (
+                "backend",
+                {"training_backend": other_backend},
+                f"training_backend={other_backend} but this run has "
+                f"training_backend={current_backend}",
+            ),
+            # a pre-fsdp2 DDP checkpoint: replicated optimizer in the shared payload, layout inferred
+            (
+                "legacy_ddp",
+                {
+                    "__drop__": ["training_backend"],
+                    "replicated_optimizer_state": {"optimizer_state_dict": {}},
+                },
+                f"training_backend=ddp but this run has training_backend={current_backend}",
+            ),
             (
                 "weights",
                 {"draft_state_dict": {"bogus.weight": torch.zeros(1)}},
@@ -351,6 +377,19 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                         max_steps=4,
                         resume_from=write_ckpt(name, **overrides),
                     )
+
+        # a pre-fsdp2 sharded checkpoint (no key, rank-local optimizer) is fsdp1 and must not load into fsdp2
+        with mock.patch.dict("os.environ", {"FSDP_VERSION": "2"}):
+            with self.assertRaisesRegex(
+                ValueError,
+                "training_backend=fsdp1 but this run has training_backend=fsdp2",
+            ):
+                self._make_trainer(
+                    os.path.join(workdir, "out_legacy_fsdp1"),
+                    feat_dir=feat_dir,
+                    max_steps=4,
+                    resume_from=write_ckpt("legacy_fsdp1", __drop__=["training_backend"]),
+                )
 
         peagle_semantics = (
             ("peagle_num_draft_layers", 2, 4),
