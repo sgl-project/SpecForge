@@ -163,6 +163,10 @@ class TrainingBackend(abc.ABC):
             f"{type(self).__name__} does not implement gradient scaling"
         )
 
+    def micro_step(self, *, is_boundary: bool = True):
+        """Context around one micro-step's forward and backward; DDP must see the forward inside it."""
+        return contextlib.nullcontext()
+
     @abc.abstractmethod
     def step(self) -> Optional[torch.Tensor]: ...
 
@@ -332,16 +336,24 @@ class FSDP1TrainingBackend(TrainingBackend):
                 ),
             )
 
-    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
-        """Backward one micro-step with one gradient collective per window.
+    def micro_step(self, *, is_boundary: bool = True):
+        if is_boundary or self._wrapper_kind != "ddp":
+            return contextlib.nullcontext()
+        return self.module.no_sync()  # must cover the forward: DDP decides there
 
-        Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
-        the boundary backward reduces the accumulated sum once.
-        """
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
+        """Backward one micro-step; non-boundary steps skip the reduction (FSDP via no_sync here, DDP via micro_step)."""
         if is_boundary or not self._wrapped:
             loss.backward()
+        elif self._wrapper_kind == "ddp":
+            if self.module.require_backward_grad_sync:  # forward ran outside micro_step()
+                raise RuntimeError(
+                    "DDP gradient accumulation needs backend.micro_step(is_boundary=False) "
+                    "around the forward; no_sync() around backward alone still synchronizes"
+                )
+            loss.backward()
         else:
-            with self.module.no_sync():
+            with self.module.no_sync():  # FSDP reads the flag in its backward hook
                 loss.backward()
 
     def scale_gradients(self, factor: torch.Tensor) -> None:

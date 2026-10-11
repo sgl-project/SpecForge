@@ -56,7 +56,8 @@ flowchart TD
 
 The training plane is the only tensor-carrying side besides the data plane; it
 consumes `TrainBatch.tensors`. `TrainerCore.train_step` divides the loss by
-`accumulation_steps`, uses `no_sync()` only for non-boundary micro-batches, and
+`accumulation_steps`, runs every non-boundary micro-batch inside the backend's
+`micro_step()` context (the backend skips the gradient collective there), and
 returns `optimizer_stepped` as the single authoritative boundary signal.
 `TrainerController` increments `global_step` only at that boundary, commits the
 pending sample acknowledgements, emits metrics, and performs configured
@@ -66,10 +67,10 @@ training entry. All saves delegate to `CheckpointManager`; the shared draft
 state is written by rank 0 while every rank writes its own optimizer/RNG state.
 
 Natural end-of-stream is accepted only at an optimizer boundary. If the final
-backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
-gradients or reporting a checkpoint as successful. Queue-mode loaders
-terminally settle and clean a short `drop_last` batch without emitting it;
-fixed offline refs keep normal `drop_last` semantics.
+backward is a non-boundary micro-step (gradients not yet reduced), `fit` fails
+instead of stepping unreduced gradients or reporting a checkpoint as
+successful. Queue-mode loaders terminally settle and clean a short `drop_last`
+batch without emitting it; fixed offline refs keep normal `drop_last` semantics.
 
 ## Endpoints
 
