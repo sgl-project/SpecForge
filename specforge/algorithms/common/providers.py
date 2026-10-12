@@ -581,6 +581,7 @@ class ServerStreamingProvider:
     build_collator: Factory
     build_input_adapter: Factory | None = None
     select_layout: Factory | None = None
+    capture_options: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.modality, field_name="modality")
@@ -594,6 +595,8 @@ class ServerStreamingProvider:
             raise TypeError("layout must be a ServerCaptureLayout")
         if not callable(self.build_collator):
             raise TypeError("build_collator must be callable")
+        if self.capture_options is not None and not callable(self.capture_options):
+            raise TypeError("capture_options must be callable or None")
         if self.build_input_adapter is not None and not callable(
             self.build_input_adapter
         ):

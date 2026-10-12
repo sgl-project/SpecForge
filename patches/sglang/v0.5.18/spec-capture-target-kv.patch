@@ -1,0 +1,39 @@
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -390,6 +390,8 @@
+                     self.spec_aux_config.eagle_aux_hidden_state_layer_ids = (
+                         server_args.spec_capture_aux_layer_ids
+                     )
++            elif capture_method == "dspark_kv":
++                pass
+             else:
+                 raise ValueError(
+                     "--spec-capture-method must be one of: eagle3, dflash, dspark; "
+@@ -1150,5 +1152,10 @@
+         self.loader = loaded.loader
+         self.model = loaded.model
++        if self.server_args.enable_spec_capture and self.server_args.spec_capture_method == "dspark_kv":
++            from sglang.srt.target_kv_capture import install_target_kv_capture
++
++            install_target_kv_capture(self.model, self.server_args)
++
+         self.startup_weight_load = loaded.startup_weight_load
+         if loaded.remote_instance_weight_info is not None:
+             self.remote_instance_weight_transporter.weight_info = (
+--- a/python/sglang/srt/spec_capture_sink.py
++++ b/python/sglang/srt/spec_capture_sink.py
+@@ -255,4 +255,7 @@
+         for spec, aux, last_hidden in samples:
++            from sglang.srt.target_kv_capture import capture_metadata
++
++            kv_metadata = capture_metadata(spec)
+             store_id = str(spec["store_id"])
+             sample_id = str(spec["sample_id"])
+             gen = int(spec.get("gen", 1))
+@@ -323,5 +326,6 @@
+             results.append(
+                 {
++                    **kv_metadata,
+                     "sample_id": sample_id,
+                     "store_id": store_id,
+                     "gen": gen,

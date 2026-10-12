@@ -145,7 +145,7 @@ class TargetKVTest(unittest.TestCase):
             ("head_dim", 8),
             ("num_key_value_heads", 1),
             ("layer_types", ["linear_attention"] * 3),
-            ("model_type", "qwen3"),
+            ("model_type", "llama"),
             ("hidden_size", 32),
             ("rope_parameters", {"rope_type": "linear", "rope_theta": 1e7}),
             ("rope_parameters", {"rope_type": "default", "rope_theta": 1e4}),

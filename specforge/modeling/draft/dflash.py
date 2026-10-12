@@ -28,6 +28,46 @@ from .target_kv import inverse_target_kv_rope, target_kv_config
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
 _VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
+_ATTENTION_MASK_SEMANTICS_VERSION = 2
+_LEGACY_CAUSAL_ARCHITECTURES = {"DSparkDraftModel", "DSpineDraftModel"}
+
+
+def resolve_dflash_causal_block(config) -> Optional[bool]:
+    """Read the direction override; None preserves the legacy per-layout defaults."""
+
+    value = getattr(config, "is_causal", None)
+    if value is not None and not isinstance(value, bool):
+        raise ValueError("DFlash config.is_causal must be a boolean or null")
+    return value
+
+
+def dflash_attention_resume_contract(draft_model) -> dict:
+    """Version only settings whose interpretation differs from legacy checkpoints.
+
+    Global bidirectional attention is unchanged. DSpark and DSpine already
+    supported global causal attention before independent window directions.
+    """
+
+    is_causal = resolve_dflash_causal_block(draft_model.config)
+    if is_causal is None:
+        return {}
+
+    sliding_window = getattr(draft_model, "sliding_window", None)
+    if sliding_window is None:
+        if not is_causal:
+            return {}
+        architectures = getattr(draft_model.config, "architectures", None) or []
+        if _LEGACY_CAUSAL_ARCHITECTURES.intersection(architectures):
+            return {}
+
+    return {
+        "draft_attention_mask_semantics": (
+            _ATTENTION_MASK_SEMANTICS_VERSION,
+            tuple(draft_model.layer_types),
+            sliding_window,
+            is_causal,
+        )
+    }
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -244,6 +284,7 @@ class Qwen3DFlashAttentionBase(nn.Module):
                 config.attention_dropout == 0.0
             ), "DFlash FlexAttention requires attention_dropout=0.0"
         self.is_causal = False
+        self.causal_block = resolve_dflash_causal_block(config)
         self.sliding_window = (
             config.sliding_window
             if config.layer_types[layer_idx] == SLIDING_ATTENTION
@@ -265,6 +306,33 @@ class Qwen3DFlashAttentionBase(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         raise NotImplementedError
+
+    def _build_inference_mask(
+        self, query_length: int, key_length: int, device: torch.device
+    ) -> torch.Tensor:
+        """Mask one draft block aligned with the end of the cached key sequence."""
+
+        if self.config._attn_implementation not in {"eager", "sdpa"}:
+            raise ValueError(
+                "Unmasked DFlash inference with an explicit direction or window "
+                "requires eager/sdpa; Flex Attention requires an explicit BlockMask"
+            )
+
+        query_positions = torch.arange(
+            key_length - query_length, key_length, device=device
+        ).view(-1, 1)
+        key_positions = torch.arange(key_length, device=device).view(1, -1)
+        distance = query_positions - key_positions
+        visible = torch.ones_like(distance, dtype=torch.bool)
+
+        is_causal = self.causal_block
+        if is_causal is None:
+            is_causal = self.sliding_window is not None
+        if is_causal:
+            visible = visible & (distance >= 0)
+        if self.sliding_window is not None:
+            visible = visible & (distance.abs() < self.sliding_window)
+        return visible[None, None]
 
     def forward(
         self,
@@ -295,6 +363,11 @@ class Qwen3DFlashAttentionBase(nn.Module):
             cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        if attention_mask is None and (
+            self.causal_block is True or self.sliding_window is not None
+        ):
+            attention_mask = self._build_inference_mask(q_len, k.shape[-2], q.device)
+            kwargs["is_causal"] = False
         valid_queries = None
         if self.config._attn_implementation == "flex_attention":
             kernel_options = dict(kwargs.pop("kernel_options", None) or {})
@@ -744,6 +817,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> None:
         super().__init__(config)
         self.config = config
+        resolve_dflash_causal_block(config)
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
         self.attention_mode = validate_dflash_attention_config(config)
         self.target_kv_config = target_kv_config(config)

@@ -1,13 +1,18 @@
-# Offline DSpark with Target KV Conditioning
+# DSpark with Target KV Conditioning
 
-This path trains a DSpark draft from Qwen3.5 text-attention K/V caches instead
-of concatenated intermediate hidden states. It supports offline features and
-GQA/MHA draft attention. The existing `dspark` hidden-state recipe is unchanged.
-Streaming capture, MLA, multimodal positions, and speculative serving are not
-implemented by this recipe. Stock SGLang does not automatically support this
-new conditioning interface; deployment requires a compatible KV-aware consumer.
+This path trains a DSpark draft from target-attention K/V caches instead
+of concatenated intermediate hidden states. It supports offline Qwen3/Qwen3.5
+features, online Qwen3 capture, and GQA/MHA draft attention. The existing
+`dspark` hidden-state recipe is unchanged. MLA, multimodal positions, and
+speculative serving are not implemented by this recipe. Stock SGLang does not
+automatically support this conditioning interface; online training requires
+the versioned target-KV capture patch and a compatible KV-aware consumer.
 The legacy `spec_generate` helper rejects KV drafts rather than capturing the
 wrong features.
+
+For Qwen3-8B online training with optional convolution and either DPaCE or
+D-PARD, see [the combined recipes](../../recipes/dspark-kv-conv-objectives.md).
+The offline workflow and positional controls below remain available.
 
 ## Positional Re-encoding
 

@@ -55,6 +55,7 @@ class ServerCaptureSchema:
     last_hidden_feature: Optional[str]
     passthrough: Tuple[Tuple[str, str, Tuple[int, ...]], ...]
     attention_mask_feature: Optional[str] = None
+    target_kv_geometry: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -275,6 +276,11 @@ class SGLangServerCaptureAdapter:
             "replace": int(task.attempt) > 0,
             "features": features,
             "passthrough": passthrough,
+            **(
+                {"target_kv_geometry": self.schema.target_kv_geometry}
+                if self.schema.target_kv_geometry is not None
+                else {}
+            ),
         }
 
     # -- ref construction ------------------------------------------------------
@@ -447,6 +453,27 @@ class SGLangServerCaptureAdapter:
                 )
                 continue
             try:
+                geometry = self.schema.target_kv_geometry
+                if geometry is not None:
+                    expected_shape = (
+                        1,
+                        expected_len,
+                        len(geometry["layer_ids"]),
+                        2,
+                        geometry["heads"],
+                        geometry["head_dim"],
+                    )
+                    kv_spec = ref.feature_specs.get(self.schema.aux_feature)
+                    if (
+                        result.get("target_kv_geometry") != geometry
+                        or result.get("target_kv_state") != "post_qk_norm_post_rope"
+                        or kv_spec is None
+                        or kv_spec.shape != expected_shape
+                        or kv_spec.dtype not in ("bfloat16", "float16", "float32")
+                    ):
+                        raise CaptureMismatchError(
+                            f"[{ref.sample_id}] target-KV geometry/state/shape mismatch"
+                        )
                 recorded_aux_layer_ids = result.get("aux_layer_ids")
                 if (
                     capture.aux_hidden_state_layer_ids
@@ -466,7 +493,11 @@ class SGLangServerCaptureAdapter:
                         if recorded_aux_layer_ids is not None
                         else None
                     ),
-                    aux_feature_name=self.schema.aux_feature or "hidden_state",
+                    aux_feature_name=(
+                        "__no_hidden_aux__"
+                        if geometry is not None
+                        else self.schema.aux_feature or "hidden_state"
+                    ),
                     target_feature_name=self.schema.last_hidden_feature or "target",
                 )
             except CaptureMismatchError as exc:
