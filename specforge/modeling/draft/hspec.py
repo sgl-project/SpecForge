@@ -10,6 +10,7 @@ before introducing a fused parallel-scan kernel; ``hspec_config``
 
 from __future__ import annotations
 
+import math
 import os
 import warnings
 from typing import Optional, Tuple
@@ -152,7 +153,8 @@ class HSpecMamba2Reference(nn.Module):
         state_c = state_c.view(
             batch_size, sequence_length, self.n_groups, self.state_size
         )
-        dt = F.softplus(dt + self.dt_bias)
+        # softplus in fp32 to match the serving-side mixer numerics.
+        dt = F.softplus(dt.float() + self.dt_bias.float())
         decay = torch.exp(-dt[..., None] * torch.exp(self.A_log)[..., None])
         group_heads = self.num_heads // self.n_groups
         state_b = state_b.repeat_interleave(group_heads, dim=2)
@@ -586,42 +588,31 @@ class HSpecTargetKVAttention(nn.Module):
         return self.o_proj(output.transpose(1, 2).reshape(batch_size, query_length, -1))
 
 
-class HSpecDecoderLayer(nn.Module):
-    """Mamba -> target-KV attention -> MLP hybrid layer."""
+class HSpecMambaSubLayer(nn.Module):
+    """Residual Mamba sub-layer: ``h + Mamba(norm(h), seed)``.
 
-    def __init__(
-        self,
-        config: Qwen3Config,
-        layer_idx: int,
-        kernels: DFlashKernels,
-    ) -> None:
+    Matches the serving-side ``HSpecMambaSubLayer``: pre-norm (``ssm_norm``),
+    per-draft-block recurrence seeded from the block anchor's fused latent,
+    residual add. Serving checkpoint keys: ``layers.{i}.ssm.*`` and
+    ``layers.{i}.ssm_norm.weight``.
+    """
+
+    def __init__(self, config: Qwen3Config, kernels: DFlashKernels) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
-        self.hidden_size = int(config.hidden_size)
-        self.mamba = HSpecMamba2Reference(config)
-        self.self_attn = HSpecTargetKVAttention(config, layer_idx, kernels)
-        self.mlp = kernels.make_mlp(config)
-        self.input_layernorm = kernels.make_rms_norm(
-            self.hidden_size, config.rms_norm_eps
-        )
-        self.post_attention_layernorm = kernels.make_rms_norm(
-            self.hidden_size, config.rms_norm_eps
+        self.ssm = HSpecMamba2Reference(config)
+        self.ssm_norm = kernels.make_rms_norm(
+            int(config.hidden_size), config.rms_norm_eps
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         *,
-        target_key: torch.Tensor,
-        target_value: torch.Tensor,
         initial_state: Optional[torch.Tensor],
-        prefix_mask: Optional[torch.Tensor],
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        block_mask: Optional[torch.Tensor] = None,
         block_size: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
-        normalized = self.input_layernorm(hidden_states)
+        normalized = self.ssm_norm(hidden_states)
         batch_size, sequence_length, _ = normalized.shape
         if block_size is not None and sequence_length % block_size == 0:
             # Draft blocks are independent decode steps in serving: each block
@@ -631,13 +622,45 @@ class HSpecDecoderLayer(nn.Module):
             per_block = normalized.reshape(
                 batch_size * (sequence_length // block_size), block_size, -1
             )
-            mamba_output, final_state = self.mamba(per_block, initial_state)
+            mamba_output, final_state = self.ssm(per_block, initial_state)
             mamba_output = mamba_output.reshape(batch_size, sequence_length, -1)
         else:
-            mamba_output, final_state = self.mamba(normalized, initial_state)
-        hidden_states = residual + mamba_output
+            mamba_output, final_state = self.ssm(normalized, initial_state)
+        return residual + mamba_output, final_state
+
+
+class HSpecAttentionSubLayer(nn.Module):
+    """Residual target-KV attention sub-layer (``h + Attn(norm(h), kv)``).
+
+    Matches the serving-side ``HSpecAttentionSubLayer`` naming:
+    ``layers.{i}.self_attn.*`` and ``layers.{i}.input_layernorm.weight``.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        kernels: DFlashKernels,
+    ) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.self_attn = HSpecTargetKVAttention(config, layer_idx, kernels)
+        self.input_layernorm = kernels.make_rms_norm(
+            int(config.hidden_size), config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        target_key: torch.Tensor,
+        target_value: torch.Tensor,
+        prefix_mask: Optional[torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        block_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states,
             target_key=target_key,
@@ -646,16 +669,28 @@ class HSpecDecoderLayer(nn.Module):
             prefix_mask=prefix_mask,
             block_mask=block_mask,
         )
-        hidden_states = residual + hidden_states
-        hidden_states = hidden_states + self.mlp(hidden_states)
-        return hidden_states, final_state
+        return residual + hidden_states
+
+
+class HSpecMLPSubLayer(nn.Module):
+    """Residual MLP sub-layer: ``h + MLP(mlp_norm(h))`` (serving-aligned)."""
+
+    def __init__(self, config: Qwen3Config, kernels: DFlashKernels) -> None:
+        super().__init__()
+        self.mlp_norm = kernels.make_rms_norm(
+            int(config.hidden_size), config.rms_norm_eps
+        )
+        self.mlp = kernels.make_mlp(config)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states + self.mlp(self.mlp_norm(hidden_states))
 
 
 @register_draft
 class HSpecDraftModel(DSparkDraftModel):
     """Hybrid Mamba-attention parallel drafter (SpecForge first integration)."""
 
-    _no_split_modules = ["HSpecDecoderLayer"]
+    _no_split_modules = ["HSpecMambaSubLayer", "HSpecAttentionSubLayer"]
 
     def __init__(self, config) -> None:
         method = getattr(config, "hspec_config", None)
@@ -668,20 +703,18 @@ class HSpecDraftModel(DSparkDraftModel):
             )
         super().__init__(config)
         # The base class builds a uniform decoder stack that H-Spec never
-        # runs (the hybrid/partial stacks below replace it); keeping it
+        # runs (the pattern-driven stack below replaces it); keeping it
         # would add dead parameters that break DDP with
         # find_unused_parameters=False.
         del self.layers
-        self.num_hybrid_layers = int(method.get("num_hybrid_layers", 3))
-        self.num_partial_layers = int(method.get("num_partial_layers", 1))
         if "block_pattern" in method:
             block_pattern = method["block_pattern"]
         else:
-            block_pattern = []
-            for _ in range(self.num_hybrid_layers):
+            # Official topology: a leading mamba+mlp pair followed by
+            # mamba+attention+mlp hybrid blocks.
+            block_pattern = ["mamba", "mlp"]
+            for _ in range(int(method.get("num_hybrid_layers", 3))):
                 block_pattern.extend(["mamba", "attention", "mlp"])
-            for _ in range(self.num_partial_layers):
-                block_pattern.extend(["mamba", "mlp"])
         if not isinstance(block_pattern, list) or not block_pattern:
             raise ValueError("hspec_config.block_pattern must be a non-empty list")
         if len(block_pattern) != config.num_hidden_layers:
@@ -704,40 +737,31 @@ class HSpecDraftModel(DSparkDraftModel):
                 "a final checkpoint",
                 stacklevel=2,
             )
-        self.hybrid_layers = nn.ModuleList(
-            [
-                HSpecDecoderLayer(config, layer_idx, DEFAULT_DFLASH_KERNELS)
-                for layer_idx, token in enumerate(self.block_pattern)
-                if token == "mamba"
-                and layer_idx + 1 < len(self.block_pattern)
-                and self.block_pattern[layer_idx + 1] == "attention"
-            ]
-        )
-        self.partial_layers = nn.ModuleList(
-            [
-                HSpecMamba2Reference(config)
-                for layer_idx, token in enumerate(self.block_pattern)
-                if token == "mamba"
-                and (
-                    layer_idx + 1 == len(self.block_pattern)
-                    or self.block_pattern[layer_idx + 1] != "attention"
-                )
-            ]
-        )
-        self.partial_norms = nn.ModuleList(
-            [
-                DEFAULT_DFLASH_KERNELS.make_rms_norm(
-                    config.hidden_size, config.rms_norm_eps
-                )
-                for _ in self.partial_layers
-            ]
-        )
+        # Build sub-layers in block_pattern order, mirroring the serving-side
+        # MambaAttnHybridDraftModel execution graph (and its checkpoint key
+        # layout: layers.{i}.ssm/self_attn/mlp + *_norm) one-to-one.
+        kernels = DEFAULT_DFLASH_KERNELS
+        layers: list[nn.Module] = []
+        self._mamba_positions: list[int] = []
+        self._attention_positions: list[int] = []
+        attn_index = 0
+        for pos, token in enumerate(self.block_pattern):
+            if token == "mamba":
+                layers.append(HSpecMambaSubLayer(config, kernels))
+                self._mamba_positions.append(pos)
+            elif token == "attention":
+                layers.append(HSpecAttentionSubLayer(config, attn_index, kernels))
+                self._attention_positions.append(pos)
+                attn_index += 1
+            else:
+                layers.append(HSpecMLPSubLayer(config, kernels))
+        self.layers = nn.ModuleList(layers)
         self.target_kv_layer_ids = tuple(
             int(layer_id) for layer_id in method.get("target_kv_layer_ids", [])
         )
-        if len(self.target_kv_layer_ids) != len(self.hybrid_layers):
+        if len(self.target_kv_layer_ids) != len(self._attention_positions):
             raise ValueError(
-                "H-Spec requires one target KV layer per mamba+attention block"
+                "H-Spec requires one target KV layer per attention sub-layer"
             )
         self.attn_kv_layer_ids = self.target_kv_layer_ids
         self.latent_fusion_layer_ids = tuple(
@@ -758,15 +782,13 @@ class HSpecDraftModel(DSparkDraftModel):
                 "hspec_config.mamba_seed_mode must be 'per_layer' or 'shared', "
                 f"got {self.mamba_seed_mode!r}"
             )
-        self.mamba_layers = [layer.mamba for layer in self.hybrid_layers] + list(
-            self.partial_layers
-        )
+        self.mamba_layers = [self.layers[pos].ssm for pos in self._mamba_positions]
         num_seed_projs = (
             len(self.mamba_layers) if self.mamba_seed_mode == "per_layer" else 1
         )
         if not self.mamba_layers:
             raise ValueError("H-Spec block_pattern must contain mamba layers")
-        seed_out = int(torch.tensor(self.mamba_layers[0].state_shape).prod())
+        seed_out = math.prod(self.mamba_layers[0].state_shape)
         self.seed_projs = nn.ModuleList(
             [
                 nn.Linear(config.hidden_size, seed_out, bias=False)
@@ -963,36 +985,41 @@ class HSpecDraftModel(DSparkDraftModel):
         hidden_states = noise_embedding
         target_kv_width = self.target_kv_width
         mamba_index = 0
-        for layer_index, hybrid_layer in enumerate(self.hybrid_layers):
-            start = layer_index * target_kv_width
-            end = start + target_kv_width
-            layer_key = target_keys[..., start:end]
-            layer_value = target_values[..., start:end]
-            hidden_states, _ = hybrid_layer(
-                hidden_states,
-                target_key=layer_key,
-                target_value=layer_value,
-                initial_state=seed_states[mamba_index],
-                prefix_mask=(
-                    per_query_prefix if per_query_prefix is not None else prefix_masks
-                ),
-                position_embeddings=(cos, sin),
-                block_mask=block_mask,
-                block_size=self.block_size,
-            )
-            mamba_index += 1
-        for partial_norm, partial_layer in zip(self.partial_norms, self.partial_layers):
-            batch_size, sequence_length, _ = hidden_states.shape
-            normalized = partial_norm(hidden_states).reshape(
-                batch_size * num_blocks, self.block_size, -1
-            )
-            partial_output, _ = partial_layer(
-                normalized,
-                initial_state=seed_states[mamba_index],
-            )
-            hidden_states = partial_output.reshape(batch_size, sequence_length, -1)
-            mamba_index += 1
+        attn_index = 0
+        for pos, layer in enumerate(self.layers):
+            token = self.block_pattern[pos]
+            if token == "mamba":
+                hidden_states, _ = layer(
+                    hidden_states,
+                    initial_state=seed_states[mamba_index],
+                    block_size=self.block_size,
+                )
+                mamba_index += 1
+            elif token == "attention":
+                start = attn_index * target_kv_width
+                end = start + target_kv_width
+                hidden_states = layer(
+                    hidden_states,
+                    target_key=target_keys[..., start:end],
+                    target_value=target_values[..., start:end],
+                    prefix_mask=(
+                        per_query_prefix
+                        if per_query_prefix is not None
+                        else prefix_masks
+                    ),
+                    position_embeddings=(cos, sin),
+                    block_mask=block_mask,
+                )
+                attn_index += 1
+            else:
+                hidden_states = layer(hidden_states)
         return self.norm(hidden_states)
 
 
-__all__ = ["HSpecDraftModel", "HSpecDecoderLayer", "HSpecMamba2Reference"]
+__all__ = [
+    "HSpecDraftModel",
+    "HSpecMambaSubLayer",
+    "HSpecAttentionSubLayer",
+    "HSpecMLPSubLayer",
+    "HSpecMamba2Reference",
+]

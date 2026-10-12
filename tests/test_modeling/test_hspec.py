@@ -8,9 +8,11 @@ from transformers import Qwen3Config
 
 from specforge.modeling.draft.hspec import (
     DEFAULT_DFLASH_KERNELS,
-    HSpecDecoderLayer,
+    HSpecAttentionSubLayer,
     HSpecDraftModel,
     HSpecMamba2Reference,
+    HSpecMambaSubLayer,
+    HSpecMLPSubLayer,
     HSpecTargetKVAttention,
 )
 
@@ -22,8 +24,6 @@ def _config(**overrides) -> Qwen3Config:
         "mamba_state_size": 2,
         "mamba_groups": 2,
         "mamba_conv_kernel": 4,
-        "num_hybrid_layers": 1,
-        "num_partial_layers": 1,
         "target_kv_layer_ids": [17],
         "block_pattern": ["mamba", "attention", "mlp", "mlp"],
     }
@@ -178,8 +178,21 @@ class HSpecDraftModelTest(unittest.TestCase):
         model = HSpecDraftModel(_config())
         self.assertEqual(model.target_layer_ids, [1, 9, 17, 25, 33])
         self.assertEqual(
-            [layer.mamba.state_shape for layer in model.hybrid_layers],
-            [(4, 2, 2)] * 1,
+            [
+                layer.ssm.state_shape
+                for layer in model.layers
+                if isinstance(layer, HSpecMambaSubLayer)
+            ],
+            [(4, 2, 2)],
+        )
+        self.assertEqual(
+            [type(layer).__name__ for layer in model.layers],
+            [
+                "HSpecMambaSubLayer",
+                "HSpecAttentionSubLayer",
+                "HSpecMLPSubLayer",
+                "HSpecMLPSubLayer",
+            ],
         )
 
     def test_forward_requires_selected_target_kv(self):
@@ -345,9 +358,14 @@ class HSpecSplitSourceAttentionTest(unittest.TestCase):
         torch.manual_seed(16)
         config = _config()
         config._attn_implementation = "eager"
-        layer = HSpecDecoderLayer(config, 0, DEFAULT_DFLASH_KERNELS)
-        layer = layer.to("npu")
-        layer.train()
+        sublayers = nn.ModuleList(
+            [
+                HSpecMambaSubLayer(config, DEFAULT_DFLASH_KERNELS),
+                HSpecAttentionSubLayer(config, 0, DEFAULT_DFLASH_KERNELS),
+                HSpecMLPSubLayer(config, DEFAULT_DFLASH_KERNELS),
+            ]
+        ).to("npu")
+        sublayers.train()
 
         hidden = torch.randn(2, 3, 8, device="npu", requires_grad=True)
         target_key = torch.randn(2, 5, 4, device="npu")
@@ -357,20 +375,21 @@ class HSpecSplitSourceAttentionTest(unittest.TestCase):
             torch.ones(1, 3, 2, device="npu"),
             torch.zeros(1, 3, 2, device="npu"),
         )
-        output, state = layer(
-            hidden,
+        h, _state = sublayers[0](hidden, initial_state=None)
+        h = sublayers[1](
+            h,
             target_key=target_key,
             target_value=target_value,
-            initial_state=None,
             prefix_mask=prefix_mask,
             position_embeddings=position_embeddings,
         )
+        output = sublayers[2](h)
         self.assertEqual(output.shape, (2, 3, 8))
         self.assertTrue(torch.isfinite(output).all())
         output.float().sum().backward()
         self.assertIsNotNone(hidden.grad)
         self.assertTrue(torch.isfinite(hidden.grad).all())
-        for name, parameter in layer.named_parameters():
+        for name, parameter in sublayers.named_parameters():
             self.assertIsNotNone(parameter.grad, f"no gradient for {name}")
 
 
