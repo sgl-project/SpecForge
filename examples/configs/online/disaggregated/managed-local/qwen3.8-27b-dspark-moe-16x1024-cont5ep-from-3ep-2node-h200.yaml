@@ -8,7 +8,7 @@
 model:
   target_model_path: /scratch/models/Qwen3.8-27B
   draft_model_config: /scratch/SpecForge/configs/qwen3.8-27b-dspark-moe-16x1024.json
-  draft_checkpoint_path: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-cont5ep-from-3ep-2node-h200/qwen3.8-27b-dspark-moe-16x1024-cont5ep-from-3ep-2node-h200-step9916
+  draft_checkpoint_path: /scratch/moe16/outputs/qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200/qwen3.8-27b-dspark-moe-16x1024-cont2ep-from-1ep-2node-h200-step9916
   target_backend: sglang
   trust_remote_code: true
   embedding_key: model.language_model.embed_tokens.weight
