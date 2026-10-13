@@ -154,6 +154,7 @@ export default defineConfig({
           text: 'Advanced Features',
           items: [
             { text: 'Customize a Training Run', link: '/advanced_features/customization' },
+            { text: 'Cost-Aware Scheduling', link: '/advanced_features/cost_aware_scheduling' },
           ],
         },
         {
