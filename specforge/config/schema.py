@@ -904,6 +904,8 @@ class TrainingConfig(StrictConfigModel):
     cost_aware_scheduling: bool = False
     #: ``length``, ``anchors`` (DFlash family) or ``auto`` (the algorithm's key).
     cost_aware_key: Literal["auto", "length", "anchors"] = "auto"
+    #: Offline only: rounds per planning window; 0 = one optimizer step.
+    cost_aware_window: int = Field(default=0, ge=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
@@ -1143,9 +1145,21 @@ class Config(StrictConfigModel):
             )
 
         training = self.training
-        if not training.cost_aware_scheduling and training.cost_aware_key != "auto":
+        if not training.cost_aware_scheduling:
+            if training.cost_aware_key != "auto":
+                raise ValueError(
+                    "training.cost_aware_key requires "
+                    "training.cost_aware_scheduling=true"
+                )
+            if training.cost_aware_window:
+                raise ValueError(
+                    "training.cost_aware_window requires "
+                    "training.cost_aware_scheduling=true"
+                )
+        elif mode == "online" and training.cost_aware_window:
             raise ValueError(
-                "training.cost_aware_key requires training.cost_aware_scheduling=true"
+                "training.cost_aware_window applies to offline features; the "
+                "online dispatcher always plans one optimizer window"
             )
         if (
             self.model.draft_checkpoint_path is not None

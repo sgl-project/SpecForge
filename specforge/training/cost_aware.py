@@ -34,7 +34,7 @@ def resolve_scheduling_policy(training, algorithm) -> Optional[SchedulingPolicy]
     return SchedulingPolicy(
         key=key,
         num_anchors=int(training.num_anchors),
-        window_rounds=int(getattr(training, "cost_aware_window", 0)),
+        window_rounds=int(training.cost_aware_window),
     )
 
 

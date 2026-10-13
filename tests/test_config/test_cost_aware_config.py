@@ -50,16 +50,31 @@ class CostAwareSchemaTest(unittest.TestCase):
         cfg = _offline({})
         self.assertFalse(cfg.training.cost_aware_scheduling)
         self.assertEqual(cfg.training.cost_aware_key, "auto")
+        self.assertEqual(cfg.training.cost_aware_window, 0)
         with self.assertRaises(ValidationError):
             _offline({"cost_aware_scheduling": True, "cost_aware_key": "cost"})
 
-    def test_key_requires_the_switch(self):
+    def test_key_and_window_require_the_switch(self):
         with self.assertRaisesRegex(
             ValidationError, "requires training.cost_aware_scheduling"
         ):
             _offline({"cost_aware_key": "anchors"})
-        cfg = _offline({"cost_aware_scheduling": True, "cost_aware_key": "length"})
+        with self.assertRaisesRegex(
+            ValidationError, "requires training.cost_aware_scheduling"
+        ):
+            _offline({"cost_aware_window": 8})
+        cfg = _offline(
+            {
+                "cost_aware_scheduling": True,
+                "cost_aware_key": "length",
+                "cost_aware_window": 8,
+            }
+        )
         self.assertEqual(cfg.training.cost_aware_key, "length")
+
+    def test_online_rejects_a_bucket_window(self):
+        with self.assertRaisesRegex(ValidationError, "offline features"):
+            _online({"cost_aware_scheduling": True, "cost_aware_window": 4})
         cfg = _online({"cost_aware_scheduling": True})
         self.assertTrue(cfg.training.cost_aware_scheduling)
 
@@ -139,13 +154,14 @@ class CostAwarePlanningTest(unittest.TestCase):
                     "strategy": "dspark",
                     "cost_aware_scheduling": True,
                     "cost_aware_key": "length",
+                    "cost_aware_window": 64,
                 }
             ).training,
             dspark,
         )
         self.assertEqual(
             explicit.contract(),
-            {"key": "length", "num_anchors": 512, "window_rounds": 0},
+            {"key": "length", "num_anchors": 512, "window_rounds": 64},
         )
 
     def test_every_builtin_algorithm_declares_a_key_or_rejects_the_switch(self):
