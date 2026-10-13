@@ -83,12 +83,30 @@ def ingest_offline_features(
                 "max_len": max_len,
                 "num_tokens": int(input_ids.numel()),
                 "file_index": index,
+                **_scheduling_metadata(raw, max_len),
             },
         )
         refs.append(ref)
         if on_ref is not None:
             on_ref(ref)
     return refs
+
+
+def _scheduling_metadata(raw, max_len: int) -> dict:
+    """Valid-anchor count for cost-aware scheduling (needs the loss mask)."""
+    loss_mask = raw.get("loss_mask")
+    if loss_mask is None or not hasattr(loss_mask, "reshape"):
+        return {}
+    from specforge.runtime.data_plane.window_plan import (
+        VALID_ANCHORS_METADATA_KEY,
+        count_valid_anchors,
+    )
+
+    return {
+        VALID_ANCHORS_METADATA_KEY: count_valid_anchors(
+            loss_mask.reshape(-1)[: int(max_len)]
+        )
+    }
 
 
 def write_ref_manifest(refs: List[SampleRef], path: str) -> None:
