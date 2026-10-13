@@ -38,7 +38,10 @@ from specforge.training.controller import TrainerController, TrainerCore
 logger = logging.getLogger(__name__)
 
 #: Contract keys older checkpoints lack; missing means the default.
-_OPTIONAL_CONTRACT_DEFAULTS = {"dspark_loss_normalization": "round"}
+_OPTIONAL_CONTRACT_DEFAULTS = {
+    "cost_aware_scheduling": None,
+    "dspark_loss_normalization": "round",
+}
 
 
 def _legacy_scheduler_total_steps(state: Mapping[str, object]) -> Optional[int]:

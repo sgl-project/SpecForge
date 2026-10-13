@@ -417,6 +417,30 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 checkpoint_extra={"dspark_loss_normalization": "step"},
             )
 
+        # A checkpoint from before cost-aware scheduling resumes with it off and
+        # refuses it on.
+        with self.assertRaisesRegex(ValueError, "do not match this model"):
+            self._make_trainer(
+                os.path.join(workdir, "out_cost_aware_legacy_off"),
+                feat_dir=feat_dir,
+                max_steps=4,
+                resume_from=write_ckpt(
+                    "cost_aware_legacy_off",
+                    draft_state_dict={"bogus.weight": torch.zeros(1)},
+                ),
+                checkpoint_extra={"cost_aware_scheduling": None},
+            )
+        with self.assertRaisesRegex(
+            ValueError, "cost_aware_scheduling=None but this run has"
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "out_cost_aware_legacy_on"),
+                feat_dir=feat_dir,
+                max_steps=4,
+                resume_from=write_ckpt("cost_aware_legacy_on"),
+                checkpoint_extra={"cost_aware_scheduling": {"key": "anchors"}},
+            )
+
     def test_resume_rejects_a_changed_implicit_schedule_horizon(self):
         workdir = tempfile.mkdtemp(prefix="trainer_resume_horizon_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
