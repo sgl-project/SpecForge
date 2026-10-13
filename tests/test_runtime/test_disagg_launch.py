@@ -84,6 +84,8 @@ class TestDisaggDataEquivalence(unittest.TestCase):
             os.path.join(self.work, "store2"), store_id="st2"
         )
         refs = _ingest(shared, self.feat_dir, run_id="run7")
+        for ref in refs:  # all-ones loss mask: cost-aware scheduling input
+            self.assertEqual(ref.metadata["valid_anchors"], ref.num_tokens - 1)
         manifest = os.path.join(self.work, "refs.json")
         write_ref_manifest(refs, manifest)  # asserts no-tensor internally
 
