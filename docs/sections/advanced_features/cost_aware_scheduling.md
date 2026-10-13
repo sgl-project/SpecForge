@@ -25,6 +25,7 @@ round, and each rank takes a contiguous slice of similar keys.
 training:
   cost_aware_scheduling: true   # default: false
   cost_aware_key: auto          # auto | length | anchors
+  cost_aware_window: 0         # offline only; 0 = one optimizer step
 ```
 
 | Key | Cost of a sample | Use with |
@@ -52,6 +53,23 @@ mask. A window whose refs lack the anchor count (an older producer) is
 scheduled by length, and a window without any usable cost keeps arrival order;
 `stats` of the distributor count `planned_windows`, `length_fallback_windows`
 and `fifo_windows`.
+
+## Offline runs
+
+The sampler keeps its seeded per-epoch permutation and DP padding, then
+regroups each window of `cost_aware_window` micro-batch rounds (default: one
+optimizer step) before striding the order over the DP ranks. Windows follow the
+global micro-batch count: gradient accumulation spans epochs, so the first
+window of an epoch is shortened to end on the trainer's step boundary, and
+the trailing partial micro-batch each rank drops (`drop_last`) keeps its
+original position so the same samples are dropped as without scheduling. Costs of
+`file://` features are read once from `input_ids` and `loss_mask` and cached
+in `<output_dir>/cost_aware_index.json`, keyed by the file list with sizes
+and mtimes and by `max_length` (delete the file to force a rescan);
+disaggregated offline refs carry `num_tokens` and `valid_anchors` from the
+producer and need no scan. A window wider than one optimizer step gains
+little (about one more percent in the benchmark below) and changes which
+samples share a step, so the default keeps the step membership intact.
 
 ## What stays the same
 
@@ -81,20 +99,31 @@ EAGLE3 and P-EAGLE normalize per padded micro-batch, which keeps the
 per-token weights unchanged only at `training.batch_size=1`; larger batch
 sizes are rejected with scheduling on.
 
-Checkpoints record the policy; a resume must use the same settings.
+Checkpoints record the policy and, offline, the window, `max_length` and a
+digest of the per-sample costs, the inputs that decide the order; a resume
+whose costs would differ (another `max_length`, rewritten loss masks,
+different ref metadata, key or `num_anchors`) is rejected.
 
 ## Measured effect
 
-Dense 5-layer DSpark draft (`num_anchors=512`), Qwen3-8B target, 2 capture
-servers + DP2, batch 2 x 32, 4x H200, `SHARD_GRAD_OP`, profiler off, mean of
-the steady windows (steps 11-30):
+Dense 5-layer DSpark drafts (`num_anchors=512`), 4x H200, `SHARD_GRAD_OP`,
+profiler off, mean of the steady windows (steps 11-30); scheduling rows use
+`auto`, under which DSpark normalizes per optimizer step.
 
 | Run | samples/s |
 | --- | ---: |
-| defaults | 19.1 |
-| `cost_aware_scheduling: true` (`auto` = anchors) | 29.2 |
-| `cost_aware_key: length` | 26.4 |
+| offline, Qwen3.5-27B target, DP4, batch 2 x 32, defaults (`round`) | 17.0 |
+| offline, DSpark per-step normalization alone (no regrouping) | 17.5 |
+| offline, `cost_aware_scheduling: true` (`auto` = anchors) | 19.2 |
+| offline, `cost_aware_key: length` | 19.3 |
+| online, Qwen3-8B target, 2 capture servers + DP2, batch 2 x 32, defaults (`round`) | 19.1 |
+| online, DSpark per-step normalization alone (no regrouping) | 21.6 |
+| online, `cost_aware_scheduling: true` (`auto` = anchors) | 29.2 |
+| online, `cost_aware_key: length` | 26.4 |
 
-Part of the gain is DSpark's per-step normalization (no per-micro-batch
-all-reduce; 21.6 on its own); the rest comes from rounds that no longer mix
-long and short captures.
+`step` alone is faster because the per-micro-batch all-reduce of the DSpark
+denominator disappears. The scheduling gain on top of it is the cross-rank
+imbalance of anchor slots per round (1.12x the useful work before, 1.01x
+after) plus, online, the arrival-order mix of long and short captures.
+Within-micro-batch sequence packing does not address it and measured below
+the baseline on this corpus.
