@@ -298,6 +298,8 @@ Common fields:
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
 | `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
+| `training.cost_aware_scheduling` | `false` | Regroup every optimizer window so each DP micro-batch round holds samples of similar cost (online dispatcher and offline sampler). A step still trains on the same samples; only the round/rank assignment changes. See `docs/sections/advanced_features/cost_aware_scheduling.md`. |
+| `training.cost_aware_key` | `auto` | Cost key for cost-aware scheduling: `length` (sequence length), `anchors` (DFlash-family anchor budget `min(num_anchors, valid anchors)`), or `auto` (the key the algorithm declares). |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
