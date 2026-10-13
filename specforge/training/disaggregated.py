@@ -804,6 +804,7 @@ def _build_online(
         return TrainingRun(execute=produce)
 
     from specforge.launch import build_disagg_online_consumer
+    from specforge.training.cost_aware import resolve_scheduling_policy
 
     total_steps = cfg.training.total_steps
     if total_steps is None and cfg.training.max_steps is None:
@@ -838,6 +839,7 @@ def _build_online(
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
         async_ack=_consumer_async_ack(cfg),
+        scheduling=resolve_scheduling_policy(cfg.training, algorithm),
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

@@ -53,6 +53,13 @@ from typing import Iterable, List, Optional
 
 from specforge.runtime.contracts import SampleRef
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+from specforge.runtime.data_plane.window_plan import (
+    VALID_ANCHORS_METADATA_KEY,
+    SchedulingPolicy,
+    plan_window,
+    ref_cost,
+    round_robin_rounds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +96,11 @@ class InboxChannel(StreamingRefChannel):
 
 
 class RefDistributor:
-    """Single-authority push dispatcher: source channel -> per-rank inboxes."""
+    """Single-authority push dispatcher: source channel -> per-rank inboxes.
+
+    With ``scheduling`` each secured window is sorted into cost-balanced rounds
+    before publishing; sample sets and ack/backpressure accounting are unchanged.
+    """
 
     def __init__(
         self,
@@ -106,6 +117,7 @@ class RefDistributor:
         worker_id: str = "ref-distributor",
         poll_s: float = 0.05,
         idle_timeout_s: Optional[float] = None,
+        scheduling: Optional[SchedulingPolicy] = None,
         clock=time.monotonic,
         sleep=time.sleep,
     ) -> None:
@@ -137,6 +149,8 @@ class RefDistributor:
         self.worker_id = worker_id
         self.poll_s = poll_s
         self.idle_timeout_s = idle_timeout_s
+        self.scheduling = scheduling
+        self._fallback_warned = False
         self._clock = clock
         self._sleep = sleep
         self._skip = set(skip_ids or ())
@@ -175,6 +189,9 @@ class RefDistributor:
             "skipped": 0,
             "duplicates": 0,
             "dropped": 0,
+            "planned_windows": 0,
+            "length_fallback_windows": 0,
+            "fifo_windows": 0,
         }
 
     @staticmethod
@@ -263,6 +280,16 @@ class RefDistributor:
                 # Once secured, the window completes within this same loop.
                 if len(self._window) + queue.depth() < self.dispatch_quantum:
                     break
+                if self.scheduling is not None:
+                    # Scheduling plans the whole (secured) window at once.
+                    need = self.dispatch_quantum - len(self._window)
+                    if need:
+                        self._window.extend(queue.get(need, timeout_s=0.0))
+                    if len(self._window) < self.dispatch_quantum:
+                        break
+                    self._dispatch_planned_window()
+                    progress = True
+                    continue
             need = self.dispatch_round_quantum - len(self._window)
             if need:
                 self._window.extend(queue.get(need, timeout_s=0.0))
@@ -286,6 +313,53 @@ class RefDistributor:
         if source_drained:
             self._finish()
         return progress
+
+    def _dispatch_planned_window(self) -> None:
+        """Plan one secured window and publish its rounds in order.
+
+        Falls back to the length key, then to arrival order, when refs lack costs.
+        """
+        refs = self._window
+        self._window = []
+        policy = self.scheduling
+        costs = [ref_cost(policy, ref) for ref in refs]
+        if policy.key != "length" and any(cost is None for cost in costs):
+            policy = policy.with_key("length")
+            costs = [ref_cost(policy, ref) for ref in refs]
+            if all(cost is not None for cost in costs):
+                self.stats["length_fallback_windows"] += 1
+                if not self._fallback_warned:
+                    self._fallback_warned = True
+                    logger.warning(
+                        "ref-distributor: refs carry no %r metadata (older "
+                        "producer?); scheduling by length instead of %r",
+                        VALID_ANCHORS_METADATA_KEY,
+                        self.scheduling.key,
+                    )
+        if all(cost is not None for cost in costs):
+            rounds = plan_window(
+                costs,
+                self.dp_size,
+                self.refs_per_rank_batch,
+                tiebreak=[ref.sample_id for ref in refs],
+            )
+            self.stats["planned_windows"] += 1
+        else:
+            rounds = round_robin_rounds(
+                len(refs), self.dp_size, self.refs_per_rank_batch
+            )
+            self.stats["fifo_windows"] += 1
+            if not self._fallback_warned:
+                self._fallback_warned = True
+                logger.warning(
+                    "ref-distributor: refs carry no token length; dispatching "
+                    "this window in arrival order"
+                )
+        for rnd in rounds:
+            for inbox, members in zip(self._inboxes, rnd):
+                inbox.publish_batch([refs[index] for index in members])
+            self.stats["dispatched"] += self.dispatch_round_quantum
+        self._window_dispatched = 0
 
     def _finish(self) -> None:
         # The dispatch loop only opens an optimizer window once its whole
