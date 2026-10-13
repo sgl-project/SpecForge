@@ -141,6 +141,7 @@ def algorithm_spec() -> AlgorithmSpec:
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
+            scheduling_key="anchors",
         ),
     )
 

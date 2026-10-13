@@ -899,6 +899,11 @@ class TrainingConfig(StrictConfigModel):
     total_steps: Optional[int] = Field(default=None, gt=0)
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
+    #: Regroup each optimizer window into cost-balanced DP rounds (same samples
+    #: per step); see docs/sections/advanced_features/cost_aware_scheduling.md.
+    cost_aware_scheduling: bool = False
+    #: ``length``, ``anchors`` (DFlash family) or ``auto`` (the algorithm's key).
+    cost_aware_key: Literal["auto", "length", "anchors"] = "auto"
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
@@ -1137,6 +1142,11 @@ class Config(StrictConfigModel):
                 "training.role=auto, producer, or consumer"
             )
 
+        training = self.training
+        if not training.cost_aware_scheduling and training.cost_aware_key != "auto":
+            raise ValueError(
+                "training.cost_aware_key requires training.cost_aware_scheduling=true"
+            )
         if (
             self.model.draft_checkpoint_path is not None
             and self.training.resume_from is not None

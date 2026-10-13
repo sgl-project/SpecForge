@@ -209,6 +209,7 @@ def algorithm_spec() -> AlgorithmSpec:
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
             supports_teacher_metrics_opt_out=True,
+            scheduling_key="anchors",
         ),
     )
 
