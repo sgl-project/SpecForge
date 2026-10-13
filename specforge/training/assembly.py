@@ -542,6 +542,8 @@ def _common_launch_kwargs(
     *,
     logger=_logger,
 ) -> Dict[str, Any]:
+    from specforge.training.cost_aware import resolve_scheduling_policy
+
     t = cfg.training
     # USP shards one logical sample over ``sp_size`` ranks.  Preserve the
     # legacy optimizer-window semantics: one user accumulation unit represents
@@ -570,6 +572,7 @@ def _common_launch_kwargs(
         sp_ring_size=t.sp_ring_size,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
+        scheduling=resolve_scheduling_policy(t, algorithm),
     )
 
 

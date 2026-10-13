@@ -300,6 +300,7 @@ Common fields:
 | `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
 | `training.cost_aware_scheduling` | `false` | Regroup every optimizer window so each DP micro-batch round holds samples of similar cost (online dispatcher and offline sampler). A step still trains on the same samples; only the round/rank assignment changes. See `docs/sections/advanced_features/cost_aware_scheduling.md`. |
 | `training.cost_aware_key` | `auto` | Cost key for cost-aware scheduling: `length` (sequence length), `anchors` (DFlash-family anchor budget `min(num_anchors, valid anchors)`), or `auto` (the key the algorithm declares). |
+| `training.cost_aware_window` | `0` | Offline only: micro-batch rounds per planning window; `0` plans one optimizer step. Larger windows regroup across steps and change which samples share a step. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
