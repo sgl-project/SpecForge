@@ -11,7 +11,10 @@ import torch.nn.functional as F
 
 from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core.chunking import checkpointed_chunk_reduce
-from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.dflash import (
+    DFlashDraftModel,
+    resolve_dflash_causal_block,
+)
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 try:
@@ -245,6 +248,38 @@ def compute_walk_accepted_length_terms(
     return accepted.new_tensor((accepted_total, visited_count)).unbind()
 
 
+def _resolve_draft_mask_limits(
+    causal_block: Optional[bool], sliding_window: Optional[int]
+) -> Tuple[bool, Optional[int]]:
+    """Resolve direction and the window applied within each draft block.
+
+    Legacy mode (None) makes sliding layers causal but does not window their
+    draft prefix. Explicit booleans apply the window to both context and draft.
+    """
+
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError("sliding_window must be > 0")
+    if causal_block is None:
+        return sliding_window is not None, None
+    return causal_block, sliding_window
+
+
+def _apply_draft_mask_limits(
+    visible: torch.Tensor,
+    query_offsets: torch.Tensor,
+    key_offsets: torch.Tensor,
+    is_causal: bool,
+    draft_window: Optional[int],
+) -> torch.Tensor:
+    """Shared elementwise visibility rules for dense and Flex Attention masks."""
+
+    if is_causal:
+        visible = visible & (key_offsets <= query_offsets)
+    if draft_window is not None:
+        visible = visible & ((key_offsets - query_offsets).abs() < draft_window)
+    return visible
+
+
 def create_dflash_sdpa_mask(
     anchor_positions,
     block_keep_mask,
@@ -252,11 +287,11 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     sliding_window: Optional[int] = None,
+    causal_block: Optional[bool] = None,
 ):
     """Construct a full or sliding dense boolean DFlash mask."""
 
-    if sliding_window is not None and sliding_window <= 0:
-        raise ValueError("sliding_window must be > 0")
+    is_causal, draft_window = _resolve_draft_mask_limits(causal_block, sliding_window)
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
@@ -282,9 +317,11 @@ def create_dflash_sdpa_mask(
     is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
-    if sliding_window is not None:
+    if is_causal or draft_window is not None:
         kv_block_offsets = (kv_indices - S) % block_size
-        mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
+        mask_draft = _apply_draft_mask_limits(
+            mask_draft, q_block_offsets, kv_block_offsets, is_causal, draft_window
+        )
 
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
@@ -300,11 +337,11 @@ def create_dflash_block_mask(
     device: torch.device,
     flex_block_size=None,
     sliding_window: Optional[int] = None,
+    causal_block: Optional[bool] = None,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training."""
 
-    if sliding_window is not None and sliding_window <= 0:
-        raise ValueError("sliding_window must be > 0")
+    is_causal, draft_window = _resolve_draft_mask_limits(causal_block, sliding_window)
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
@@ -324,9 +361,11 @@ def create_dflash_block_mask(
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
-        if sliding_window is not None:
+        if is_causal or draft_window is not None:
             kv_block_offset = (kv_idx - S) % block_size
-            mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
+            mask_draft = _apply_draft_mask_limits(
+                mask_draft, q_block_offset, kv_block_offset, is_causal, draft_window
+            )
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < N
@@ -404,6 +443,9 @@ class OnlineDFlashModel(nn.Module):
         self.block_size = block_size
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
+        self.causal_block = resolve_dflash_causal_block(
+            getattr(draft_model, "config", None)
+        )
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.objective_chunk_blocks = int(objective_chunk_blocks)
@@ -732,6 +774,7 @@ class OnlineDFlashModel(nn.Module):
             "S": seq_len,
             "block_size": self.block_size,
             "device": device,
+            "causal_block": self.causal_block,
         }
         if (
             self.attention_backend == "flex_attention"
