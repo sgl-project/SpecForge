@@ -61,7 +61,7 @@ class OnlineKVTest(unittest.TestCase):
             self.assertTrue(draft["is_causal"])
             self.assertEqual(draft["dflash_config"]["conv_kernel_size"], 2)
 
-    def test_online_recipe_retains_checkpoints(self):
+    def test_online_recipe_retains_checkpoints_and_dspark_optimizations(self):
         from specforge.config import load_config
 
         root = Path(__file__).resolve().parents[2]
@@ -73,6 +73,8 @@ class OnlineKVTest(unittest.TestCase):
         )
         self.assertEqual(config.training.max_checkpoints, 0)
         self.assertEqual(config.training.strategy, "dspark_kv")
+        self.assertTrue(config.training.dspark_flatten_projection)
+        self.assertTrue(config.training.dspark_cache_projection)
 
     def test_qwen3_geometry_from_dict_and_rope_scaling_rejection(self):
         target = Qwen3Config(

@@ -29,6 +29,8 @@ class DSparkConvDPaceTest(unittest.TestCase):
                 )
                 model = wrapper(DSparkDraftModel(draft_config))
                 model.dspark_confidence_head_alpha = 0.0
+                model.flatten_projection = True
+                model.cache_projection = True
                 if objective == "dpard":
                     model.dspark_objective = "dpard"
                 else:
@@ -182,7 +184,7 @@ class DSparkConvDPaceTest(unittest.TestCase):
             actual_gradient, expected_gradient, rtol=2e-5, atol=1e-7
         )
 
-    def test_dpace_chunking_and_accumulation_equivalence(self):
+    def test_dpace_chunking_cache_and_accumulation_equivalence(self):
         torch.manual_seed(3)
         baseline = build_model().double()
         baseline.loss_type = "dpace"
@@ -216,6 +218,8 @@ class DSparkConvDPaceTest(unittest.TestCase):
                 model = copy.deepcopy(baseline)
                 model.zero_grad(set_to_none=True)
                 model.objective_chunk_blocks = chunk
+                model.cache_projection = True
+                model.flatten_projection = True
                 losses = (
                     [evaluate(model, slice(index, index + 1)) / 2 for index in range(2)]
                     if microbatch

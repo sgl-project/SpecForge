@@ -31,6 +31,8 @@ training:
   dspark_ce_loss_alpha: 0.1
   dspark_l1_loss_alpha: 0.9
   dspark_confidence_head_alpha: 0.0
+  dspark_flatten_projection: true
+  dspark_cache_projection: true
   save_interval: 3000
   log_interval: 10
   seed: 42

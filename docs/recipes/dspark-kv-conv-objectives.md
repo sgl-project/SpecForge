@@ -11,3 +11,7 @@ Run `python -m unittest tests.test_modeling.test_dspark_conv_dpace -v` for ident
 ## D-PARD alternative
 
 Use `examples/configs/online/disaggregated/external/qwen3-8b-dspark-kv-conv-dpard-online.yaml` for detached overlap-credit-weighted Renyi-half divergence instead of CE/L1. D-PARD and DPaCE are mutually exclusive. See [D-PARD](dspark-dpard.md) for the formula, valid-token normalization, resume contract and validation.
+
+## Optional projection optimizations
+
+The external recipes enable `dspark_flatten_projection` and `dspark_cache_projection`. Both default off and preserve the objective; caching retains frozen-head projections during checkpoint recomputation. `dspark_compile_objective` optionally compiles supported CUDA token terms and also defaults off. Validate with `tests.test_modeling.test_dspark_optimizations` and `tests.test_modeling.test_dspark_compiled_objective`; CUDA cases require a GPU.
