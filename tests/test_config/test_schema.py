@@ -510,6 +510,7 @@ class ConfigSchemaTest(unittest.TestCase):
             with self.subTest(dflash_teacher_metrics=enabled):
                 payload = _online_payload("dflash")
                 payload["training"]["dflash_teacher_metrics"] = enabled
+                payload["training"]["dflash_fused_plain_head"] = enabled
                 config = Config.model_validate(payload)
                 # Construction only: the family builder hands the factory its
                 # shared kwargs, and the objective records the config value.
@@ -526,6 +527,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 ):
                     build_training_model(config, None, None, None, None)
                 self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
+                self.assertIs(enabled, model_cls.call_args.kwargs["fused_plain_head"])
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
