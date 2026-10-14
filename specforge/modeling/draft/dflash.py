@@ -23,6 +23,7 @@ from typing_extensions import Tuple, Unpack
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .flex_attention_backend import flex_attention_backend
 from .registry import register_draft
+from .target_kv import inverse_target_kv_rope, target_kv_config
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
@@ -273,10 +274,23 @@ class Qwen3DFlashAttentionBase(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        target_kv: Optional[torch.Tensor] = None,
+        target_position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
-        q, k, v = self._compute_qkv(hidden_states, target_hidden, position_embeddings)
+        if target_kv is None:
+            q, k, v = self._compute_qkv(
+                hidden_states, target_hidden, position_embeddings
+            )
+        else:
+            q, k, v = self._compute_qkv(
+                hidden_states,
+                target_hidden,
+                position_embeddings,
+                target_kv=target_kv,
+                target_position_embeddings=target_position_embeddings,
+            )
         if past_key_values is not None:
             cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -363,14 +377,64 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
         )
         self.q_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
         self.k_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.target_kv_config = target_kv_config(config)
+        if self.target_kv_config is not None:
+            kv = self.target_kv_config
+            width = len(kv["layer_ids"]) * kv["heads"] * kv["head_dim"]
+            self.target_k_proj = nn.Linear(
+                width, config.num_key_value_heads * self.head_dim, bias=False
+            )
+            self.target_v_proj = nn.Linear(
+                width, config.num_key_value_heads * self.head_dim, bias=False
+            )
 
     def _compute_qkv(
         self,
         hidden_states: torch.Tensor,
         target_hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        *,
+        target_kv: Optional[torch.Tensor] = None,
+        target_position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, q_len = hidden_states.shape[:-1]
+        if target_kv is not None:
+            ctx_len = target_kv.shape[1]
+            q = self.q_norm(
+                self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+            ).transpose(1, 2)
+            k_noise = self.k_norm(
+                self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+            ).transpose(1, 2)
+            v_noise = (
+                self.v_proj(hidden_states)
+                .view(bsz, q_len, -1, self.head_dim)
+                .transpose(1, 2)
+            )
+            q, k_noise = apply_rotary_pos_emb(q, k_noise, *position_embeddings)
+            k_ctx = self.target_k_proj(target_kv[:, :, :, 0].flatten(2)).view(
+                bsz, ctx_len, -1, self.head_dim
+            )
+            v_ctx = (
+                self.target_v_proj(target_kv[:, :, :, 1].flatten(2))
+                .view(bsz, ctx_len, -1, self.head_dim)
+                .transpose(1, 2)
+            )
+            if self.target_kv_config["context_key_norm"]:
+                k_ctx = self.k_norm(k_ctx)
+            k_ctx = k_ctx.transpose(1, 2)
+            if self.target_kv_config["position_mode"] == "derope_reproject":
+                if target_position_embeddings is None:
+                    raise ValueError(
+                        "re-encoded target KV requires context rotary embeddings"
+                    )
+                cos, sin = target_position_embeddings
+                k_ctx = k_ctx * cos.unsqueeze(1) + rotate_half(k_ctx) * sin.unsqueeze(1)
+            return (
+                q,
+                torch.cat((k_ctx, k_noise), dim=2),
+                torch.cat((v_ctx, v_noise), dim=2),
+            )
         ctx_len = target_hidden.shape[1]
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
@@ -682,6 +746,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.config = config
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
         self.attention_mode = validate_dflash_attention_config(config)
+        self.target_kv_config = target_kv_config(config)
+        if self.target_kv_config is not None and (
+            self.attention_mode == "mla"
+            or getattr(self, "expected_projector_type", None) != "dspark"
+        ):
+            raise ValueError("target_kv conditioning currently requires DSpark GQA/MHA")
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         dflash_config = getattr(config, "dflash_config", {}) or {}
         block_size = getattr(config, "block_size", None)
@@ -707,14 +777,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(
             _rope_config(config, self.attention_mode)
         )
-        self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.hidden_size,
-            config.hidden_size,
-            bias=False,
-        )
-        self.hidden_norm = kernels.make_rms_norm(
-            config.hidden_size, config.rms_norm_eps
-        )
+        if self.target_kv_config is None:
+            self.fc = nn.Linear(
+                len(self.target_layer_ids) * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+            )
+            self.hidden_norm = kernels.make_rms_norm(
+                config.hidden_size, config.rms_norm_eps
+            )
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
@@ -793,11 +864,51 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        target_kv: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        if self.target_kv_config is None:
+            if target_kv is not None:
+                raise ValueError("hidden conditioning does not accept target_kv")
+            target_hidden = self.hidden_norm(self.fc(target_hidden))
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        else:
+            kv = self.target_kv_config
+            if target_hidden is not None or target_kv is None:
+                raise ValueError(
+                    "target_kv conditioning requires KV and forbids target_hidden"
+                )
+            tail = (len(kv["layer_ids"]), 2, kv["heads"], kv["head_dim"])
+            if (
+                target_kv.ndim != 6
+                or tuple(target_kv.shape[2:]) != tail
+                or target_kv.shape[0] != hidden_states.shape[0]
+            ):
+                raise ValueError(f"target_kv must have shape [batch, sequence, {tail}]")
+            context_len = target_kv.shape[1]
+            if position_ids.shape != (
+                hidden_states.shape[0],
+                context_len + hidden_states.shape[1],
+            ):
+                raise ValueError(
+                    "position_ids must contain context then draft positions for every batch row"
+                )
+            context_positions = position_ids[:, :context_len]
+            position_embeddings = self.rotary_emb(
+                hidden_states, position_ids[:, context_len:]
+            )
+            if kv["position_mode"] == "derope_reproject":
+                target_kv = inverse_target_kv_rope(
+                    target_kv,
+                    context_positions,
+                    rope_theta=kv["rope_theta"],
+                    rotary_dim=kv["rotary_dim"],
+                )
+                kwargs["target_position_embeddings"] = self.rotary_emb(
+                    hidden_states, context_positions
+                )
+            kwargs["target_kv"] = target_kv
         for layer_type, layer in zip(self.layer_types, self.layers):
             layer_attention_mask = (
                 attention_mask[layer_type]
@@ -825,6 +936,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         stop_token_ids: list[int],
         temperature: float,
     ):
+        if self.target_kv_config is not None:
+            raise NotImplementedError(
+                "target_kv drafts require a KV-aware inference consumer; spec_generate captures hidden states"
+            )
         self.eval()
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens

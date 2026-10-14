@@ -24,7 +24,7 @@ from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "dspark_kv", "eagle3", "mtp", "peagle")
 
 
 def _teacher_metrics_config(enabled: bool):
@@ -99,7 +99,10 @@ class BuiltinProviderContractTest(unittest.TestCase):
         for registration in self.registry:
             with self.subTest(algorithm=registration.name):
                 providers = registration.providers
-                self.assertGreaterEqual(len(providers.server_streaming), 1)
+                if registration.name == "dspark_kv":
+                    self.assertEqual(providers.server_streaming, ())
+                else:
+                    self.assertGreaterEqual(len(providers.server_streaming), 1)
                 self.assertFalse(hasattr(providers, "colocated"))
                 self.assertFalse(hasattr(providers, "target_backend"))
                 self.assertFalse(hasattr(providers, "deployment"))
@@ -179,7 +182,15 @@ class BuiltinProviderContractTest(unittest.TestCase):
         )
         config = SimpleNamespace(training=training)
         draft = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=2),
+            config=SimpleNamespace(
+                num_hidden_layers=2,
+                dflash_config={
+                    "conditioning_source": "target_kv",
+                    "target_layer_ids": [3, 7],
+                    "target_kv_heads": 2,
+                    "target_kv_head_dim": 4,
+                },
+            ),
             layers=[object(), object()],
             norm_before_residual=True,
             target_layer_ids=[3, 7],
@@ -218,6 +229,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "dflash": dflash_family,
             "domino": dflash_family,
             "dspark": dflash_family,
+            "dspark_kv": dflash_family,
             "mtp": SimpleNamespace(),
         }
         expected_keys = {
@@ -256,6 +268,12 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
+            },
+            "dspark_kv": {
+                "dspark_kv_block_size",
+                "dspark_kv_conditioning_source",
+                "dspark_kv_geometry",
+                "dspark_kv_state",
             },
             "mtp": {
                 "mtp_draft_num_hidden_layers",
@@ -573,7 +591,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==6; "
+            "r=builtin_algorithm_registry(); assert len(r)==7; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )
