@@ -258,7 +258,10 @@ class TestPreparePromptTasks(unittest.TestCase):
         self.assertIs(
             build_calls[0]["loss_mask_filter"], has_consecutive_supervised_tokens
         )
-        # Only the first of the two input records is passed to preprocessing.
+        # `max_prompts=1` caps the *input* records before preprocessing, so only the
+        # first of the two `raw_rows` above reaches the preprocessor. The length is 1
+        # for that reason, not because a row was filtered out; the assertion below
+        # covers the post-filter count.
         self.assertEqual(len(build_calls[0]["dataset"]), 1)
         self.assertEqual(len(prompts), 1)
 
