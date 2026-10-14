@@ -74,6 +74,39 @@ gradients or reporting a checkpoint as successful. Queue-mode loaders
 terminally settle and clean a short `drop_last` batch without emitting it;
 fixed offline refs keep normal `drop_last` semantics.
 
+## Consumer dispatch
+
+`runtime.consumer_dispatch: two_window_joint_balanced` jointly assigns two optimizer
+windows to virtual rank slots, then groups similar-cost slots into real windows.
+It accepts this assignment only if the estimated sum of per-window maximum rank
+costs improves over `cost_balanced`; otherwise it uses the original grouping.
+The high watermark must cover two global batches. This preserves sample
+coverage, complete accumulation windows and durable acknowledgements, but may
+change optimizer-window membership and therefore the exact training trajectory.
+The cost estimate is a scheduling heuristic, not a guarantee of wall-clock gain.
+The dispatch default remains `round_robin`. Both two-window policies are independent
+of the training strategy and use the same anchor/context cost estimate.
+
+`runtime.consumer_dispatch: two_window_bucketed` buffers two complete global
+optimizer batches, sorts by effective anchor count and sequence length, and
+applies the existing cost-balancing assignment within each resulting window.
+It requires a high watermark of at least two global batches. A closed source
+flushes any complete remaining batch and settles only an incomplete tail using
+the existing drop-last rules. Deduplication and durable acknowledgement retain
+their original controller ownership. This policy changes sample order and
+optimizer-batch membership, so it is not a bitwise training-trajectory-preserving
+optimization even though it retains the same samples and objective. Keep
+`cost_balanced` when original window membership must be preserved. Both original
+dispatch policies remain unchanged. Two is the fixed lookahead: the minimum that
+allows cross-window regrouping while bounding buffering and waiting. It is not
+an empirically established optimum or a configurable window count.
+
+Cross-window regrouping can still reduce the estimated sum of per-step maximum
+rank costs with `accumulation_steps: 1`. With per-rank batch size 1, balancing a
+single window only permutes samples across ranks and cannot lower that window's
+maximum cost; regrouping two windows can. This remains a cost estimate rather
+than a measured throughput improvement.
+
 ## Endpoints
 
 ### What this plane calls into
