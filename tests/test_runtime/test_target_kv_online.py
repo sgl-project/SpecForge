@@ -34,6 +34,29 @@ GEOMETRY = {
 
 
 class OnlineKVTest(unittest.TestCase):
+    def test_conv_objective_recipes_are_distinct_and_keep_all_checkpoints(self):
+        import json
+
+        from specforge.config import load_config
+
+        root = Path(__file__).resolve().parents[2]
+        for objective in ("dpace",):
+            path = root / "examples/configs/online/disaggregated/external"
+            recipe = load_config(
+                str(path / f"qwen3-8b-dspark-kv-conv-{objective}-online.yaml")
+            )
+            self.assertEqual(recipe.training.max_checkpoints, 0)
+            self.assertEqual(recipe.training.dspark_confidence_head_alpha, 0)
+            self.assertEqual(recipe.training.strategy, "dspark_kv")
+            self.assertEqual(
+                recipe.training.loss_type,
+                "dflash" if objective == "dpard" else "dpace",
+            )
+            self.assertFalse(Path(recipe.model.target_model_path).is_absolute())
+            draft = json.loads((root / recipe.model.draft_model_config).read_text())
+            self.assertTrue(draft["is_causal"])
+            self.assertEqual(draft["dflash_config"]["conv_kernel_size"], 2)
+
     def test_online_recipe_retains_checkpoints(self):
         from specforge.config import load_config
 
