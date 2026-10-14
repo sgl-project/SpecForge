@@ -76,6 +76,14 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_ddp_bucket_limit_is_optional_and_positive(self):
+        from specforge.config.schema import TrainingConfig
+
+        self.assertIsNone(TrainingConfig().ddp_bucket_cap_mb)
+        self.assertEqual(TrainingConfig(ddp_bucket_cap_mb=128).ddp_bucket_cap_mb, 128)
+        with self.assertRaises(ValidationError):
+            TrainingConfig(ddp_bucket_cap_mb=0)
+
     def test_liger_kernel_flag_is_typed_and_defaults_off(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertFalse(default.model.use_liger_kernel)
