@@ -1,11 +1,12 @@
-# Offline DSpark with Target KV Conditioning
+# DSpark with Target KV Conditioning
 
-This path trains a DSpark draft from Qwen3.5 text-attention K/V caches instead
-of concatenated intermediate hidden states. It supports offline features and
-GQA/MHA draft attention. The existing `dspark` hidden-state recipe is unchanged.
-Streaming capture, MLA, multimodal positions, and speculative serving are not
-implemented by this recipe. Stock SGLang does not automatically support this
-new conditioning interface; deployment requires a compatible KV-aware consumer.
+This path trains a DSpark draft from target-attention K/V caches instead
+of concatenated intermediate hidden states. It supports offline Qwen3/Qwen3.5
+features, online Qwen3 capture, and GQA/MHA draft attention. The existing
+`dspark` hidden-state recipe is unchanged. MLA, multimodal positions, and
+speculative serving are not implemented by this recipe. Stock SGLang does not
+automatically support this conditioning interface; online training requires
+the versioned target-KV capture patch and a compatible KV-aware consumer.
 The legacy `spec_generate` helper rejects KV drafts rather than capturing the
 wrong features.
 
@@ -83,3 +84,7 @@ The normalizer/collator pad only the sequence axis; the existing DSpark packed
 prefix mask prevents reading target features at or after each anchor. CE, L1,
 confidence, Markov-head behavior, and label alignment use the existing DSpark
 implementation. The target is frozen and only the draft is optimized.
+
+## Online Qwen3 capture
+
+Apply the base SpecForge capture patch, then `bash scripts/apply_sglang_target_kv_patch.sh` to a compatible SGLang 0.5.18 environment. Configure paths and external capture/Mooncake endpoints in `examples/configs/online/disaggregated/external/qwen3-8b-dspark-kv-online.yaml`. Capture validates target geometry and post-QK-normalization/post-RoPE state. The patch enables training capture only; speculative serving needs a compatible KV consumer.

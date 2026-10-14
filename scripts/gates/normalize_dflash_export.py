@@ -83,7 +83,13 @@ def _normalize_dspark(config: Dict[str, Any], method_config: Dict[str, Any]) -> 
     # The two required fields may already be top-level rather than nested.
     config["markov_rank"] = markov_rank
     config["markov_head_type"] = markov_head_type.lower()
-    config["architectures"] = ["Qwen3DSparkModel"]
+    config["architectures"] = [
+        (
+            "Qwen3DSparkKVModel"
+            if method_config.get("conditioning_source") == "target_kv"
+            else "Qwen3DSparkModel"
+        )
+    ]
 
 
 def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, Any]:

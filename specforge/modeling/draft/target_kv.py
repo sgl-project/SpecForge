@@ -1,12 +1,15 @@
 """Geometry and positional transforms for captured target-attention K/V."""
 
 import math
+from types import SimpleNamespace
 
 import torch
 
 
 def target_kv_config(config):
     """Resolve the opt-in KV path without changing hidden-state defaults."""
+    if isinstance(config, dict):
+        config = SimpleNamespace(**config)
     options = getattr(config, "dflash_config", None) or {}
     source = options.get("conditioning_source", "hidden")
     if source not in ("hidden", "target_kv"):
@@ -59,16 +62,21 @@ def target_kv_config(config):
 
 def validate_target_kv_config(config, target_config):
     """Fail closed on incompatible capture geometry or unsupported target RoPE."""
+    if isinstance(config, dict):
+        config = SimpleNamespace(**config)
     kv = target_kv_config(config)
     if kv is None:
         raise ValueError("dspark_kv requires conditioning_source='target_kv'")
     target = getattr(target_config, "text_config", target_config)
-    if getattr(target, "model_type", None) != "qwen3_5_text":
-        raise ValueError("target_kv currently supports Qwen3.5 text attention only")
+    if getattr(target, "model_type", None) not in ("qwen3", "qwen3_5_text"):
+        raise ValueError("target_kv supports Qwen3 and Qwen3.5 text attention only")
     expected = (target.num_key_value_heads, target.head_dim)
     if (kv["heads"], kv["head_dim"]) != expected:
         raise ValueError("target_kv head geometry disagrees with the target model")
-    layer_types = target.layer_types
+    layer_types = (
+        getattr(target, "layer_types", None)
+        or ["full_attention"] * target.num_hidden_layers
+    )
     if any(
         i >= len(layer_types) or layer_types[i] != "full_attention"
         for i in kv["layer_ids"]
@@ -82,7 +90,11 @@ def validate_target_kv_config(config, target_config):
             "draft hidden_size/vocab_size must match the frozen target head"
         )
     if kv["position_mode"] == "derope_reproject":
-        rope = getattr(target, "rope_parameters", None) or {}
+        rope = (
+            getattr(target, "rope_parameters", None)
+            or getattr(target, "rope_scaling", None)
+            or {}
+        )
         if rope.get("rope_type", "default") != "default":
             raise ValueError("target_kv re-encoding supports only default target RoPE")
         theta = rope.get("rope_theta", getattr(target, "rope_theta", None))
@@ -103,7 +115,11 @@ def capture_geometry(config, target_config):
     """Capture semantics independent of the draft's ablation settings."""
     kv = validate_target_kv_config(config, target_config)
     target = getattr(target_config, "text_config", target_config)
-    rope = getattr(target, "rope_parameters", None) or {}
+    rope = (
+        getattr(target, "rope_parameters", None)
+        or getattr(target, "rope_scaling", None)
+        or {}
+    )
     if rope.get("rope_type", "default") != "default":
         raise ValueError("offline KV capture currently requires default target RoPE")
     theta = rope.get("rope_theta", getattr(target, "rope_theta", None))

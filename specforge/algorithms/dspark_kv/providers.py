@@ -1,8 +1,13 @@
-"""Offline-only KV conditioning; reuse the existing DSpark objectives."""
+"""Captured target-KV conditioning with the existing DSpark objectives."""
 
 from dataclasses import replace
 
-from specforge.algorithms.common.providers import OfflineDataProvider, make_registration
+from specforge.algorithms.common.providers import (
+    OfflineDataProvider,
+    ServerCaptureLayout,
+    ServerStreamingProvider,
+    make_registration,
+)
 from specforge.algorithms.contracts import (
     FeatureContract,
     FeatureMode,
@@ -30,6 +35,24 @@ def resolve_capture_layers(config, draft_config, target_config):
 
     validate_target_kv_config(draft_config, target_config)
     return dspark.resolve_capture_layers(config, draft_config, target_config)
+
+
+def capture_options(config):
+    from specforge.modeling.draft.target_kv import capture_geometry
+    from specforge.modeling.target.target_utils import load_target_config
+    from specforge.training.model_loading import draft_config_dict
+
+    target = load_target_config(
+        config.model.target_model_path,
+        cache_dir=config.model.cache_dir,
+        trust_remote_code=config.model.trust_remote_code,
+    )
+    if getattr(target, "model_type", None) != "qwen3":
+        raise ValueError("online target-KV capture currently supports Qwen3 only")
+    draft = draft_config_dict(
+        config, provider=dspark.algorithm_providers().model.draft_config
+    )
+    return {"target_kv_geometry": capture_geometry(draft, target)}
 
 
 def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
@@ -70,6 +93,13 @@ def create_registration():
         name="dspark_kv",
         feature_contracts=(
             FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="text",
+                required_tensors=set(data.FEATURES),
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
+            ),
+            FeatureContract(
                 mode=FeatureMode.OFFLINE,
                 modality="text",
                 required_tensors=set(data.FEATURES),
@@ -105,6 +135,22 @@ def create_registration():
                 build_collator=data.build_collator,
             ),
         ),
-        server_streaming=(),
+        server_streaming=(
+            ServerStreamingProvider(
+                modality="text",
+                capture_method="dspark_kv",
+                target_representation="hidden_state",
+                layout=ServerCaptureLayout(
+                    aux_feature="target_kv",
+                    last_hidden_feature="target_last_hidden_states",
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                ),
+                build_collator=data.build_collator,
+                capture_options=capture_options,
+            ),
+        ),
     )
     return make_registration(spec, providers)
