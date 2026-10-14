@@ -838,6 +838,8 @@ def _build_online(
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
         async_ack=_consumer_async_ack(cfg),
+        consumer_dispatch=cfg.runtime.consumer_dispatch,
+        dispatch_num_anchors=cfg.training.num_anchors,
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

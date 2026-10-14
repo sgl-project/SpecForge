@@ -471,6 +471,12 @@ class RuntimeConfig(StrictConfigModel):
     """Streaming bounds shared by unified disaggregated producer roles."""
 
     producer_lease: int = Field(default=8, gt=0)
+    consumer_dispatch: Literal[
+        "round_robin",
+        "cost_balanced",
+        "two_window_bucketed",
+        "two_window_joint_balanced",
+    ] = "round_robin"
     producer_concurrency: int = Field(default=1, gt=0)
     in_flight_high_watermark: int = Field(default=256, gt=0)
     in_flight_low_watermark: int = Field(default=192, ge=0)
@@ -1134,6 +1140,22 @@ class Config(StrictConfigModel):
                 "Vocabulary projection optimizations require training.strategy "
                 "to be domino or dspark"
             )
+        if self.runtime.consumer_dispatch in (
+            "two_window_bucketed",
+            "two_window_joint_balanced",
+        ):
+            dispatch = self.runtime.consumer_dispatch
+            window = (
+                self.deployment.trainer.nnodes
+                * self.deployment.trainer.nproc_per_node
+                * self.training.batch_size
+                * self.training.accumulation_steps
+            )
+            if self.runtime.in_flight_high_watermark < 2 * window:
+                raise ValueError(
+                    f"{dispatch} requires a high watermark of at least two global batches"
+                )
+
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
                 "online training requires deployment.mode=disaggregated; "

@@ -76,6 +76,51 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_consumer_dispatch_defaults_and_validation(self):
+        from specforge.config.schema import RuntimeConfig
+
+        self.assertEqual(RuntimeConfig().consumer_dispatch, "round_robin")
+        self.assertEqual(
+            RuntimeConfig(consumer_dispatch="cost_balanced").consumer_dispatch,
+            "cost_balanced",
+        )
+        with self.assertRaises(ValidationError):
+            RuntimeConfig(consumer_dispatch="random")
+
+    def test_two_window_dispatch_is_independent_of_training_strategy(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            for strategy in ("dflash", "domino", "dspark", "dspine", "eagle3"):
+                with self.subTest(policy=policy, strategy=strategy):
+                    payload = _online_payload(strategy)
+                    payload["runtime"] = {"consumer_dispatch": policy}
+                    self.assertEqual(
+                        Config.model_validate(payload).runtime.consumer_dispatch, policy
+                    )
+
+    def test_two_window_dispatch_checks_global_window_capacity(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            with self.subTest(policy=policy):
+                payload = _online_payload("dflash")
+                payload["training"].update(batch_size=2, accumulation_steps=2)
+                payload["deployment"]["disaggregated"][
+                    "consumer_state_dir"
+                ] = "/tmp/consumer-state"
+                payload["deployment"]["trainer"] = {
+                    "nnodes": 4,
+                    "nproc_per_node": 8,
+                    "master_addr": "localhost",
+                }
+                payload["runtime"] = {
+                    "consumer_dispatch": policy,
+                    "in_flight_high_watermark": 255,
+                }
+                with self.assertRaisesRegex(ValueError, "at least two global batches"):
+                    Config.model_validate(payload)
+                payload["runtime"]["in_flight_high_watermark"] = 256
+                self.assertEqual(
+                    Config.model_validate(payload).runtime.consumer_dispatch, policy
+                )
+
     def test_ddp_bucket_limit_is_optional_and_positive(self):
         from specforge.config.schema import TrainingConfig
 
