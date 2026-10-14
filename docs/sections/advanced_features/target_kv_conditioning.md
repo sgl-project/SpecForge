@@ -10,6 +10,10 @@ the versioned target-KV capture patch and a compatible KV-aware consumer.
 The legacy `spec_generate` helper rejects KV drafts rather than capturing the
 wrong features.
 
+For Qwen3-8B online training with optional convolution and either DPaCE or
+D-PARD, see [the combined recipes](../../recipes/dspark-kv-conv-objectives.md).
+The offline workflow and positional controls below remain available.
+
 ## Positional Re-encoding
 
 For each context token at absolute position `p`, the target cache contains
@@ -84,7 +88,3 @@ The normalizer/collator pad only the sequence axis; the existing DSpark packed
 prefix mask prevents reading target features at or after each anchor. CE, L1,
 confidence, Markov-head behavior, and label alignment use the existing DSpark
 implementation. The target is frozen and only the draft is optimized.
-
-## Online Qwen3 capture
-
-Apply the base SpecForge capture patch, then `bash scripts/apply_sglang_target_kv_patch.sh` to a compatible SGLang 0.5.18 environment. Configure paths and external capture/Mooncake endpoints in `examples/configs/online/disaggregated/external/qwen3-8b-dspark-kv-online.yaml`. Capture validates target geometry and post-QK-normalization/post-RoPE state. The patch enables training capture only; speculative serving needs a compatible KV consumer.
