@@ -486,6 +486,16 @@ class OnlineDFlashModel(nn.Module):
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
+    def _project_vocab_logits(
+        self, hidden: torch.Tensor, *, flatten: bool = False
+    ) -> torch.Tensor:
+        """Project tokens independently, preserving custom heads' input layout."""
+        if flatten and isinstance(self.lm_head, nn.Linear):
+            return self.lm_head(hidden.reshape(-1, hidden.shape[-1])).reshape(
+                *hidden.shape[:-1], -1
+            )
+        return self.lm_head(hidden)
+
     def _projection_checkpoint_contexts(self):
         from torch.utils.checkpoint import (
             CheckpointPolicy,
@@ -1910,6 +1920,8 @@ class OnlineDominoModel(OnlineDFlashModel):
         loss_decay_gamma: Optional[float] = None,
         objective_chunk_blocks: int = 128,
         shift_label: bool = False,
+        cache_vocab_projection: bool = False,
+        flatten_vocab_projection: bool = False,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -1924,6 +1936,8 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_type="dflash",
         )
         self.shift_label = shift_label
+        self.cache_vocab_projection = bool(cache_vocab_projection)
+        self.flatten_vocab_projection = bool(flatten_vocab_projection)
         self._use_fused_domino_ce = (
             os.environ.get("SPECFORGE_DOMINO_TRITON_CE", "1") == "1"
         )
@@ -1969,8 +1983,9 @@ class OnlineDominoModel(OnlineDFlashModel):
         from specforge.core.domino_loss import domino_weighted_cross_entropy
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
-        base_logits = self.lm_head(
-            hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
+        base_logits = self._project_vocab_logits(
+            hidden.reshape(batch_size, num_blocks * block_size, hidden_size),
+            flatten=self.flatten_vocab_projection,
         ).reshape(batch_size, num_blocks, block_size, -1)
         head_token_ids = prev_ids if self.shift_label else target_ids
         head_token_embeddings = self.embed_tokens(head_token_ids)
@@ -2140,6 +2155,11 @@ class OnlineDominoModel(OnlineDFlashModel):
             ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
+            context_fn=(
+                self._projection_checkpoint_contexts
+                if self.cache_vocab_projection
+                else None
+            ),
         )
 
         valid_token_count = loss_den + 1e-6
@@ -2199,6 +2219,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
         objective_chunk_blocks: int = 128,
+        flatten_vocab_projection: bool = False,
+        cache_vocab_projection: bool = False,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -2222,6 +2244,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        self.flatten_vocab_projection = bool(flatten_vocab_projection)
+        self.cache_vocab_projection = bool(cache_vocab_projection)
 
     def _build_dspark_labels_and_mask(
         self,
@@ -2306,8 +2330,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         """Return additive loss and telemetry numerators for one block slice."""
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
-        base_logits = self.lm_head(
-            hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
+        base_logits = self._project_vocab_logits(
+            hidden.reshape(batch_size, num_blocks * block_size, hidden_size),
+            flatten=self.flatten_vocab_projection,
         ).reshape(batch_size, num_blocks, block_size, -1)
         draft_logits = self.draft_model.apply_logits_head(
             base_logits,
@@ -2337,12 +2362,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
         teacher_ids = None
         if aligned_target_hidden is not None:
             with torch.no_grad():
-                target_logits = self.lm_head(
+                target_logits = self._project_vocab_logits(
                     aligned_target_hidden.reshape(
                         batch_size,
                         num_blocks * block_size,
                         hidden_size,
-                    )
+                    ),
+                    flatten=self.flatten_vocab_projection,
                 ).reshape_as(draft_logits)
                 target_probabilities = torch.softmax(target_logits.float(), dim=-1)
                 teacher_ids = target_logits.argmax(dim=-1)
@@ -2474,6 +2500,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
             ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
+            context_fn=(
+                self._projection_checkpoint_contexts
+                if self.cache_vocab_projection
+                else None
+            ),
         )
 
         (

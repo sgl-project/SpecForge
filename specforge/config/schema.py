@@ -902,6 +902,14 @@ class TrainingConfig(StrictConfigModel):
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
     dflash_fused_plain_head: bool = False
+    cache_vocab_projection: bool = Field(
+        default=False,
+        description="Domino/DSpark: cache frozen vocabulary projections during chunk recomputation.",
+    )
+    flatten_vocab_projection: bool = Field(
+        default=False,
+        description="Domino/DSpark: flatten linear vocabulary projections into 2-D GEMMs.",
+    )
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
@@ -1118,6 +1126,14 @@ class Config(StrictConfigModel):
         deployment = self.deployment.mode
         role = self.training.role
 
+        if (
+            self.training.cache_vocab_projection
+            or self.training.flatten_vocab_projection
+        ) and self.training.strategy not in ("domino", "dspark"):
+            raise ValueError(
+                "Vocabulary projection optimizations require training.strategy "
+                "to be domino or dspark"
+            )
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
                 "online training requires deployment.mode=disaggregated; "
