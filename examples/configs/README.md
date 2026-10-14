@@ -44,6 +44,13 @@ Run any recipe through the one public training entry:
 specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
 ```
 
+The `*-rtx-pro5000*.yaml` PerfectBlend recipes target RTX PRO5000 GPUs.
+Run them from the repository root: all filesystem paths are relative to the
+working directory. Point `shared/` on every node at the same shared storage for
+models, datasets, checkpoints, and control files; `cache/` and `runs/` are local
+to each node. Override service addresses for your cluster. These are example
+run identities, not paths to existing training checkpoints.
+
 `model.draft_model_config` may name a local JSON file, a local model directory,
 or a Hugging Face repository. Fresh EAGLE3, P-EAGLE, and DFlash runs may omit it
 and derive the draft architecture from the target; see the
