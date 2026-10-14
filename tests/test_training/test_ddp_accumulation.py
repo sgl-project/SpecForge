@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -29,6 +30,17 @@ class _Optimizer(torch.optim.SGD):
     def step(self):
         super().step()
         self.zero_grad(set_to_none=True)
+
+
+class _ReplayStrategy(_Strategy):
+    def forward_loss(self, batch, ctx=None):
+        with torch.no_grad():
+            output = super().forward_loss(batch, ctx)
+
+        def replay_loss(window_ratios):
+            return _Strategy.forward_loss(self, batch, ctx)
+
+        return replace(output, replay_loss=replay_loss)
 
 
 def _count_allreduce(state, bucket):
@@ -68,7 +80,7 @@ def _worker(rank, directory, replay=False):
         wrapped = backend.prepare_model(model)
         state = {"calls": 0}
         wrapped.register_comm_hook(state, _count_allreduce)
-        strategy = _Strategy(wrapped)
+        strategy = _ReplayStrategy(wrapped) if replay else _Strategy(wrapped)
         core = TrainerCore(strategy, backend, accumulation_steps=2)
         reference_optimizer = _Optimizer(reference.parameters(), lr=0.01)
         counts, differences = [], []
@@ -110,6 +122,9 @@ def _worker(rank, directory, replay=False):
 class DDPAccumulationTest(unittest.TestCase):
     def test_reduces_only_at_optimizer_boundaries(self):
         self._check_accumulation(False)
+
+    def test_replay_reduces_only_at_optimizer_boundaries(self):
+        self._check_accumulation(True)
 
     def _check_accumulation(self, replay):
         with tempfile.TemporaryDirectory() as directory:

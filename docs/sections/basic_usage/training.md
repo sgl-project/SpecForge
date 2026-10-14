@@ -214,7 +214,8 @@ with the window applied to context and the whole causal draft prefix retained.
 Set a boolean explicitly for the independent, strictly windowed semantics.
 The new window semantics are recorded in checkpoints; old window checkpoints
 cannot silently resume under the new interpretation. Existing DSpark global
-causal checkpoints remain compatible.
+causal checkpoints remain compatible. DSpine requires causal attention by
+design and rejects `is_causal: false`.
 
 Explicit training masks work with eager, SDPA, and Flex Attention. Native
 draft inference without a supplied mask supports these settings through
