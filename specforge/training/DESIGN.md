@@ -74,6 +74,23 @@ gradients or reporting a checkpoint as successful. Queue-mode loaders
 terminally settle and clean a short `drop_last` batch without emitting it;
 fixed offline refs keep normal `drop_last` semantics.
 
+## Domino performance controls
+
+Domino honors `model.use_liger_kernel` through the draft provider and constructor.
+This selects the existing explicit RMSNorm/MLP kernel bundle; it does not patch
+Transformers globally or change DFlash's provider, fused head, or defaults.
+
+`training.domino_cache_projection: true` selectively saves the frozen linear
+vocabulary projection across objective-chunk activation checkpointing. Backward
+recomputes the GRU and CE as before but reuses this projection instead of running
+the large matrix multiplication twice. The loss, gradient normalization, lambda
+schedule, and checkpoint parameter layout are unchanged. The option defaults to
+false, is rejected for other algorithms, and falls back to recomputation for a
+trainable or non-linear target head. With `objective_chunk_blocks: 0`, objective
+checkpointing is disabled and this option has no effect. Saving logits consumes
+additional activation memory proportional to batch size, effective anchors,
+block size, and vocabulary size; validate peak memory at the intended max length.
+
 ## Endpoints
 
 ### What this plane calls into

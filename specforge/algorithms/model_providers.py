@@ -420,6 +420,7 @@ def build_domino_model(
         lambda common: OnlineDominoModel(
             **common,
             shift_label=bool(getattr(draft_model, "shift_label", False)),
+            cache_projection=cfg.training.domino_cache_projection,
         ),
     )
 

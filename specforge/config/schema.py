@@ -902,6 +902,7 @@ class TrainingConfig(StrictConfigModel):
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
     dflash_fused_plain_head: bool = False
+    domino_cache_projection: bool = False
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
@@ -1118,6 +1119,10 @@ class Config(StrictConfigModel):
         deployment = self.deployment.mode
         role = self.training.role
 
+        if self.training.domino_cache_projection and self.training.strategy != "domino":
+            raise ValueError(
+                "domino_cache_projection requires training.strategy=domino"
+            )
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
                 "online training requires deployment.mode=disaggregated; "

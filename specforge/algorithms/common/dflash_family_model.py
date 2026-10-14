@@ -1910,6 +1910,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         loss_decay_gamma: Optional[float] = None,
         objective_chunk_blocks: int = 128,
         shift_label: bool = False,
+        cache_projection: bool = False,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -1924,6 +1925,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_type="dflash",
         )
         self.shift_label = shift_label
+        self.cache_projection = cache_projection
         self._use_fused_domino_ce = (
             os.environ.get("SPECFORGE_DOMINO_TRITON_CE", "1") == "1"
         )
@@ -2140,6 +2142,9 @@ class OnlineDominoModel(OnlineDFlashModel):
             ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
+            context_fn=(
+                self._projection_checkpoint_contexts if self.cache_projection else None
+            ),
         )
 
         valid_token_count = loss_den + 1e-6
