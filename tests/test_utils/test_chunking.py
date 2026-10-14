@@ -10,6 +10,44 @@ from specforge.core.chunking import checkpointed_chunk_reduce
 
 
 class CheckpointedChunkReduceTest(unittest.TestCase):
+    def test_selective_context_reuses_frozen_projection_and_preserves_gradients(self):
+        from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+
+        for trainable in (False, True):
+            with self.subTest(trainable=trainable):
+                torch.manual_seed(42)
+                head = torch.nn.Linear(4, 7, bias=False).double()
+                head.requires_grad_(trainable)
+                # Exercise the shared policy without constructing an algorithm.
+                owner = type("ProjectionOwner", (), {"lm_head": head})()
+                values = torch.randn(6, 4, dtype=torch.double, requires_grad=True)
+                reference = values.detach().clone().requires_grad_()
+                expected = head(reference).sin().square().sum()
+                expected.backward()
+                expected_head_grad = (
+                    None if head.weight.grad is None else head.weight.grad.clone()
+                )
+                head.zero_grad(set_to_none=True)
+                contexts = []
+
+                def context_fn():
+                    pair = OnlineDFlashModel._projection_checkpoint_contexts(owner)
+                    contexts.append(pair)
+                    return pair
+
+                (actual,) = checkpointed_chunk_reduce(
+                    lambda x: (head(x).sin().square().sum(),),
+                    values,
+                    chunk_size=2,
+                    context_fn=context_fn,
+                )
+                actual.backward()
+                self.assertEqual(len(contexts), 3)
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(values.grad, reference.grad)
+                if trainable:
+                    torch.testing.assert_close(head.weight.grad, expected_head_grad)
+
     def test_sums_additive_terms_and_preserves_gradients(self):
         values = torch.arange(12, dtype=torch.double).reshape(2, 6)
         values.requires_grad_()
