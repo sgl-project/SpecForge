@@ -414,6 +414,7 @@ class OnlineDFlashModel(nn.Module):
         kl_decay: float = 1.0,
         metric_top_k: int = 16,
         teacher_metrics: bool = True,
+        fused_plain_head: bool = False,
     ):
         super().__init__()
         if metric_top_k <= 0:
@@ -462,6 +463,7 @@ class OnlineDFlashModel(nn.Module):
         self.metric_top_k = int(metric_top_k)
         # Diagnostics-only: compare against target_last_hidden_states when fed.
         self.teacher_metrics = bool(teacher_metrics)
+        self.fused_plain_head = bool(fused_plain_head)
         self._fused_unary_head_requested = (
             os.environ.get(_FUSED_UNARY_HEAD_ENV, "1") != "0"
         )
@@ -924,20 +926,27 @@ class OnlineDFlashModel(nn.Module):
         """Whether the objective can use the fused Triton DFlash2 unary head.
 
         The fused head covers DFlash2's identity unary transform over a frozen
-        BF16 ``nn.Linear`` target head on CUDA. Plain DFlash, transformed or
-        trainable heads, other devices, and ``SPECFORGE_DFLASH_FUSED_HEAD=0``
-        keep the reference PyTorch objective.
+        BF16 ``nn.Linear`` target head on CUDA. Plain DFlash is opt-in and
+        preserves the reference BF16 CE rounding. Unsupported objectives,
+        transformed or trainable heads, other devices, and
+        ``SPECFORGE_DFLASH_FUSED_HEAD=0`` keep the reference objective.
         """
 
         if not self._fused_unary_head_requested or self.block_size <= 1:
             return False
         if getattr(self.draft_model, "candidate_selector", None) is None:
-            return False
-        is_identity = getattr(
-            self.draft_model, "unary_logits_transform_is_identity", None
-        )
-        if is_identity is None or not is_identity():
-            return False
+            if (
+                not self.fused_plain_head
+                or self.loss_type != "dflash"
+                or self.lk_loss_type not in (None, "alpha")
+            ):
+                return False
+        else:
+            is_identity = getattr(
+                self.draft_model, "unary_logits_transform_is_identity", None
+            )
+            if is_identity is None or not is_identity():
+                return False
         head = self.lm_head
         if not isinstance(head, nn.Linear) or head.bias is not None:
             return False
@@ -983,6 +992,7 @@ class OnlineDFlashModel(nn.Module):
                     self.lm_head.weight,
                     target_ids,
                     candidate_selector.top_k if self._selector_objective_enabled else 0,
+                    bf16_ce=candidate_selector is None,
                 )
             )
         else:
