@@ -966,6 +966,14 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+    dspark_flatten_projection: bool = Field(
+        default=False,
+        description="DSpark: flatten vocabulary projections into 2-D GEMMs.",
+    )
+    dspark_cache_projection: bool = Field(
+        default=False,
+        description="DSpark: cache frozen vocabulary projections during chunk recomputation.",
+    )
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8
@@ -1122,6 +1130,13 @@ class Config(StrictConfigModel):
         if self.training.domino_cache_projection and self.training.strategy != "domino":
             raise ValueError(
                 "domino_cache_projection requires training.strategy=domino"
+            )
+        if (
+            self.training.dspark_flatten_projection
+            or self.training.dspark_cache_projection
+        ) and self.training.strategy != "dspark":
+            raise ValueError(
+                "DSpark projection optimizations require training.strategy=dspark"
             )
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

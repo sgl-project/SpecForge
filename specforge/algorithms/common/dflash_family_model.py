@@ -2204,6 +2204,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
         objective_chunk_blocks: int = 128,
+        flatten_projection: bool = False,
+        cache_projection: bool = False,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -2227,6 +2229,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        self.flatten_projection = bool(flatten_projection)
+        self.cache_projection = bool(cache_projection)
+
+    def _project_dspark_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.flatten_projection:
+            return self.lm_head(hidden.reshape(-1, hidden.shape[-1])).reshape(
+                *hidden.shape[:-1], -1
+            )
+        return self.lm_head(hidden)
 
     def _build_dspark_labels_and_mask(
         self,
@@ -2311,7 +2322,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         """Return additive loss and telemetry numerators for one block slice."""
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
-        base_logits = self.lm_head(
+        base_logits = self._project_dspark_logits(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
         draft_logits = self.draft_model.apply_logits_head(
@@ -2342,7 +2353,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         teacher_ids = None
         if aligned_target_hidden is not None:
             with torch.no_grad():
-                target_logits = self.lm_head(
+                target_logits = self._project_dspark_logits(
                     aligned_target_hidden.reshape(
                         batch_size,
                         num_blocks * block_size,
@@ -2479,6 +2490,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
             ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
+            context_fn=(
+                self._projection_checkpoint_contexts if self.cache_projection else None
+            ),
         )
 
         (
