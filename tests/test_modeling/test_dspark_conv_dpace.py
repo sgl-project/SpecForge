@@ -16,8 +16,8 @@ from tests.test_modeling.test_dspark_target_kv import config, wrapper
 
 
 class DSparkConvDPaceTest(unittest.TestCase):
-    def test_kv_conv_dpace_full_backward(self):
-        for objective in ("dpace",):
+    def test_kv_conv_dpace_and_dpard_full_backward(self):
+        for objective in ("dpace", "dpard"):
             with self.subTest(objective=objective):
                 torch.manual_seed(42)
                 draft_config = config()
@@ -29,7 +29,10 @@ class DSparkConvDPaceTest(unittest.TestCase):
                 )
                 model = wrapper(DSparkDraftModel(draft_config))
                 model.dspark_confidence_head_alpha = 0.0
-                model.loss_type = "dpace"
+                if objective == "dpard":
+                    model.dspark_objective = "dpard"
+                else:
+                    model.loss_type = "dpace"
                 tokens = torch.randint(0, 30, (2, 16))
                 loss, _accuracy, _metrics = model(
                     input_ids=tokens,

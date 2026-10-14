@@ -309,6 +309,13 @@ Strategy-specific fields should be written only when tuning that objective:
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
 | DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
+
+DSpark and DSpark-KV share these additional objective options:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `training.dspark_objective` | `ce_l1` | `ce_l1` uses the CE/L1 coefficients and supports DPaCE weighting. `dpard` replaces that draft loss with detached TV-credit-weighted Renyi-half divergence; CE/L1 remain diagnostics. D-PARD cannot be combined with `loss_type: dpace` or LK. |
+| `training.dspark_dpard_rho` | `0.5` | D-PARD survival smoothing in `[0, 1]`. It does not scale the confidence auxiliary objective. |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 | MTP | `training.mtp_objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
 

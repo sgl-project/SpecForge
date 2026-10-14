@@ -2173,6 +2173,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
         objective_chunk_blocks: int = 128,
+        dspark_objective: str = "ce_l1",
+        dspark_dpard_rho: float = 0.5,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
     ):
@@ -2199,6 +2201,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        if dspark_objective not in ("ce_l1", "dpard"):
+            raise ValueError("dspark_objective must be 'ce_l1' or 'dpard'")
+        if not 0.0 <= dspark_dpard_rho <= 1.0:
+            raise ValueError("dspark_dpard_rho must be in [0, 1]")
+        if dspark_objective == "dpard" and loss_type != "dflash":
+            raise ValueError("D-PARD cannot be combined with DPaCE objectives")
+        self.dspark_objective = dspark_objective
+        self.dspark_dpard_rho = float(dspark_dpard_rho)
 
     def _build_dspark_labels_and_mask(
         self,
@@ -2343,6 +2353,17 @@ class OnlineDSparkModel(OnlineDFlashModel):
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
 
+        dpard_num = zero
+        if self.dspark_objective == "dpard":
+            from specforge.core.dpard import dpard_token_terms
+
+            if aligned_target_hidden is None:
+                raise ValueError("D-PARD requires target_last_hidden_states")
+            renyi, credit = dpard_token_terms(
+                draft_logits, target_logits, eval_mask, self.dspark_dpard_rho
+            )
+            dpard_num = (renyi * credit).sum()
+
         confidence_pred = self.draft_model.predict_confidence(
             hidden,
             prev_token_ids=prev_token_ids,
@@ -2406,6 +2427,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             tau_num,
             tau_den,
             walk_accepted,
+            dpard_num,
         )
 
     def _compute_dspark_loss(
@@ -2434,15 +2456,19 @@ class OnlineDSparkModel(OnlineDFlashModel):
             local_loss_den = eval_mask.any(dim=-1).any(dim=-1).float().sum()
         else:
             local_loss_den = loss_weights.sum()
-        need_target = self.dspark_l1_loss_alpha > 0 or (
-            self.dspark_confidence_head_alpha > 0
-            and getattr(self.draft_model, "confidence_head", None) is not None
+        need_target = (
+            self.dspark_objective == "dpard"
+            or self.dspark_l1_loss_alpha > 0
+            or (
+                self.dspark_confidence_head_alpha > 0
+                and getattr(self.draft_model, "confidence_head", None) is not None
+            )
         )
         aligned_target_hidden = None
         if need_target:
             if target_last_hidden_states is None:
                 raise ValueError(
-                    "DSpark L1/confidence loss requires target_last_hidden_states"
+                    "DSpark L1/confidence/D-PARD loss requires target_last_hidden_states"
                 )
             aligned_target_hidden = self._aligned_target_hidden(
                 target_last_hidden_states,
@@ -2482,6 +2508,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             tau_num,
             tau_den,
             walk_accepted,
+            dpard_num,
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
@@ -2508,6 +2535,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
             / global_loss_den
         )
 
+        if self.dspark_objective == "dpard":
+            global_dpard_den = eval_den.detach().clone()
+            if world_size > 1:
+                dist.all_reduce(global_dpard_den, op=dist.ReduceOp.SUM)
+            loss = world_size * (
+                dpard_num / global_dpard_den.clamp_min(1.0)
+                + self.dspark_confidence_head_alpha * confidence_num / global_loss_den
+            )
+
         ratio_metrics = {
             "acc": (correct_num, eval_den),
             "ce_loss": (ce_num.detach(), local_loss_den.detach()),
@@ -2523,6 +2559,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             "ce_position": (ce_position_num, position_den),
             "accuracy_position": (correct_position_num, position_den),
         }
+        if self.dspark_objective == "dpard":
+            ratio_metrics["dpard_loss"] = (dpard_num.detach(), eval_den)
         if aligned_target_hidden is not None:
             ratio_metrics.update(
                 {

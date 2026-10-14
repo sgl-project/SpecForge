@@ -69,6 +69,12 @@ def resume_contract(_config, draft_model, training_model):
         ),
     }
     contract.update(dflash_attention_resume_contract(draft_model))
+    if getattr(training_model, "dspark_objective", "ce_l1") == "dpard":
+        contract.update(
+            dspark_objective="dpard",
+            dspark_dpard_rho=training_model.dspark_dpard_rho,
+            dspark_dpard_normalization="valid_token_mean",
+        )
     if getattr(training_model, "causal_block", False):
         contract["dspark_causal_block"] = True
     if getattr(training_model, "loss_type", "dspark") != "dspark":

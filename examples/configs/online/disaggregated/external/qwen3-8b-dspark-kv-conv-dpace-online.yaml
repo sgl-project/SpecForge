@@ -14,6 +14,7 @@ data:
   cache_dir: cache/qwen3-8b-dspark-kv-conv-dpace
 training:
   strategy: dspark_kv
+  dspark_objective: ce_l1
   loss_type: dpace
   dpace_alpha: 0.5
   num_epochs: 6

@@ -40,7 +40,7 @@ class OnlineKVTest(unittest.TestCase):
         from specforge.config import load_config
 
         root = Path(__file__).resolve().parents[2]
-        for objective in ("dpace",):
+        for objective in ("dpace", "dpard"):
             path = root / "examples/configs/online/disaggregated/external"
             recipe = load_config(
                 str(path / f"qwen3-8b-dspark-kv-conv-{objective}-online.yaml")
@@ -48,6 +48,10 @@ class OnlineKVTest(unittest.TestCase):
             self.assertEqual(recipe.training.max_checkpoints, 0)
             self.assertEqual(recipe.training.dspark_confidence_head_alpha, 0)
             self.assertEqual(recipe.training.strategy, "dspark_kv")
+            self.assertEqual(
+                recipe.training.dspark_objective,
+                "dpard" if objective == "dpard" else "ce_l1",
+            )
             self.assertEqual(
                 recipe.training.loss_type,
                 "dflash" if objective == "dpard" else "dpace",
