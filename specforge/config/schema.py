@@ -262,6 +262,8 @@ class StrictConfigModel(BaseModel):
 
 class ModelConfig(StrictConfigModel):
     target_model_path: str
+    #: Draft context input; teacher supervision is configured independently.
+    conditioning_source: Literal["hidden", "kv"] = "hidden"
     #: Draft config as a local JSON file, a directory containing config.json,
     #: or a Hugging Face repository. EAGLE3, P-EAGLE, and DFlash can derive it
     #: from the target when omitted.

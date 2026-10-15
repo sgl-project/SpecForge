@@ -821,11 +821,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
         self.attention_mode = validate_dflash_attention_config(config)
         self.target_kv_config = target_kv_config(config)
-        if self.target_kv_config is not None and (
-            self.attention_mode == "mla"
-            or getattr(self, "expected_projector_type", None) != "dspark"
-        ):
-            raise ValueError("target_kv conditioning currently requires DSpark GQA/MHA")
+        if self.target_kv_config is not None and self.attention_mode == "mla":
+            raise ValueError("target_kv conditioning currently requires GQA/MHA")
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         dflash_config = getattr(config, "dflash_config", {}) or {}
         block_size = getattr(config, "block_size", None)

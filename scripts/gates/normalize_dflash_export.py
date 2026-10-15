@@ -86,7 +86,10 @@ def _normalize_dspark(config: Dict[str, Any], method_config: Dict[str, Any]) -> 
     config["architectures"] = [
         (
             "Qwen3DSparkKVModel"
-            if method_config.get("conditioning_source") == "target_kv"
+            if config.get(
+                "conditioning_source", method_config.get("conditioning_source")
+            )
+            in ("kv", "target_kv")
             else "Qwen3DSparkModel"
         )
     ]
@@ -125,6 +128,14 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
             f"exported block_size={block_size!r}, expected {expected_block_size}"
         )
     projector_type = method_config.get("projector_type", "dflash")
+    if (
+        config.get("conditioning_source", method_config.get("conditioning_source"))
+        in ("kv", "target_kv")
+        and projector_type != "dspark"
+    ):
+        raise ValueError(
+            "KV-conditioned DFlash/DFlash2/Domino requires a KV-aware serving consumer; this gate does not provide one"
+        )
     if projector_type not in {"dflash", "domino", "dspark"}:
         raise ValueError(
             "export is not DFlash-family: "

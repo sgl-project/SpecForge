@@ -15,7 +15,8 @@ RECIPE = (
 class DSparkKVManagedRecipeTest(unittest.TestCase):
     def test_objective_architecture_and_retention(self):
         config = load_config(str(RECIPE))
-        self.assertEqual(config.training.strategy, "dspark_kv")
+        self.assertEqual(config.training.strategy, "dspark")
+        self.assertEqual(config.model.conditioning_source, "kv")
         self.assertEqual(config.training.dspark_objective, "dpard")
         self.assertEqual(config.training.dspark_dpard_rho, 0.5)
         self.assertEqual(config.training.dspark_confidence_head_alpha, 0)

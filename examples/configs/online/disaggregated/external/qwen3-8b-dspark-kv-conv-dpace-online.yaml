@@ -1,4 +1,5 @@
 model:
+  conditioning_source: kv
   target_model_path: shared/checkpoint/Qwen3-8B
   draft_model_config: configs/qwen3-8b-dspark-kv-conv-causal-noconf-b16.json
   target_backend: sglang
@@ -13,7 +14,7 @@ data:
   dataloader_num_workers: 8
   cache_dir: cache/qwen3-8b-dspark-kv-conv-dpace
 training:
-  strategy: dspark_kv
+  strategy: dspark
   dspark_objective: ce_l1
   loss_type: dpace
   dpace_alpha: 0.5

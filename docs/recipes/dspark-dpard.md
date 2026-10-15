@@ -7,8 +7,10 @@ conditioning source, Markov head, or serving format. Existing recipes retain CE+
 Add these fields to an existing DSpark or DSpark-KV recipe:
 
 ```yaml
+model:
+  conditioning_source: kv
 training:
-  strategy: dspark_kv
+  strategy: dspark
   dspark_objective: dpard
   dspark_dpard_rho: 0.5
   loss_type: dflash
@@ -16,7 +18,7 @@ training:
   dspark_confidence_head_alpha: 0.0
 ```
 
-Use `strategy: dspark` for hidden-state conditioning. To match the previous
+Use `model.conditioning_source: hidden` (the default) for hidden-state conditioning. To match the previous
 no-confidence experiments, also keep `enable_confidence_head: false` in the draft
 model config. This objective does not enable convolution or change causal attention.
 Keep other recipe settings unchanged and omit `max_checkpoints` to retain exports.

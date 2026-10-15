@@ -11,14 +11,10 @@ def target_kv_config(config):
     if isinstance(config, dict):
         config = SimpleNamespace(**config)
     options = getattr(config, "dflash_config", None) or {}
-    source = options.get("conditioning_source", "hidden")
-    if source not in ("hidden", "target_kv"):
-        raise ValueError("conditioning_source must be 'hidden' or 'target_kv'")
+    source = conditioning_source(config)
     if source == "hidden":
         if any(name.startswith("target_kv_") for name in options):
-            raise ValueError(
-                "target_kv options require conditioning_source='target_kv'"
-            )
+            raise ValueError("target_kv options require conditioning_source='kv'")
         return None
     layers = options.get("target_layer_ids")
     if not isinstance(layers, (list, tuple)) or not layers:
@@ -60,17 +56,97 @@ def target_kv_config(config):
     return resolved
 
 
+def conditioning_source(config):
+    """Read the saved setting, accepting the original DSpark config spelling."""
+    if isinstance(config, dict):
+        config = SimpleNamespace(**config)
+    options = getattr(config, "dflash_config", None) or {}
+    legacy = options.get("conditioning_source")
+    source = getattr(config, "conditioning_source", None)
+
+    def normalize(value):
+        return "kv" if value == "target_kv" else value
+
+    if (
+        source is not None
+        and legacy is not None
+        and normalize(source) != normalize(legacy)
+    ):
+        raise ValueError("conflicting draft conditioning_source settings")
+    source = normalize(source if source is not None else legacy or "hidden")
+    if source not in ("hidden", "kv"):
+        raise ValueError("conditioning_source must be 'hidden' or 'kv'")
+    return source
+
+
+def resolve_target_kv_config(config, target_config):
+    """Derive target geometry once and persist it for standalone draft loading.
+
+    Layer selection, positional transform and context-key normalization remain
+    draft choices. Saved/explicit geometry is checked, never silently replaced.
+    """
+    conditioning_source(config)
+    target = getattr(target_config, "text_config", target_config)
+    if getattr(target, "model_type", None) not in ("qwen3", "qwen3_5_text"):
+        raise ValueError("target_kv supports Qwen3 and Qwen3.5 text attention only")
+    options = dict(getattr(config, "dflash_config", None) or {})
+    rope = (
+        getattr(target, "rope_parameters", None)
+        or getattr(target, "rope_scaling", None)
+        or {}
+    )
+    if rope.get("rope_type", "default") != "default":
+        raise ValueError("target_kv capture supports only default target RoPE")
+    head_dim = _target_head_dim(target)
+    factor = rope.get(
+        "partial_rotary_factor", getattr(target, "partial_rotary_factor", 1.0)
+    )
+    geometry = {
+        "target_kv_heads": target.num_key_value_heads,
+        "target_kv_head_dim": head_dim,
+        "target_kv_rope_theta": rope.get(
+            "rope_theta", getattr(target, "rope_theta", None)
+        ),
+        "target_kv_rotary_dim": int(head_dim * factor),
+        "target_kv_rope_layout": "neox",
+    }
+    for name, value in geometry.items():
+        if name in options and (
+            isinstance(options[name], bool) or options[name] != value
+        ):
+            raise ValueError(f"saved/explicit {name} disagrees with the target model")
+        options[name] = value
+    options.pop("conditioning_source", None)
+    candidate = SimpleNamespace(
+        conditioning_source="kv",
+        dflash_config=options,
+        hidden_size=config.hidden_size,
+        vocab_size=config.vocab_size,
+    )
+    validate_target_kv_config(candidate, target_config)
+    config.conditioning_source = "kv"
+    config.dflash_config = options
+    return config
+
+
+def _target_head_dim(target):
+    return (
+        getattr(target, "head_dim", None)
+        or target.hidden_size // target.num_attention_heads
+    )
+
+
 def validate_target_kv_config(config, target_config):
     """Fail closed on incompatible capture geometry or unsupported target RoPE."""
     if isinstance(config, dict):
         config = SimpleNamespace(**config)
     kv = target_kv_config(config)
     if kv is None:
-        raise ValueError("dspark_kv requires conditioning_source='target_kv'")
+        raise ValueError("target KV validation requires conditioning_source='kv'")
     target = getattr(target_config, "text_config", target_config)
     if getattr(target, "model_type", None) not in ("qwen3", "qwen3_5_text"):
         raise ValueError("target_kv supports Qwen3 and Qwen3.5 text attention only")
-    expected = (target.num_key_value_heads, target.head_dim)
+    expected = (target.num_key_value_heads, _target_head_dim(target))
     if (kv["heads"], kv["head_dim"]) != expected:
         raise ValueError("target_kv head geometry disagrees with the target model")
     layer_types = (
@@ -103,7 +179,7 @@ def validate_target_kv_config(config, target_config):
         )
         if (
             theta != kv["rope_theta"]
-            or int(target.head_dim * factor) != kv["rotary_dim"]
+            or int(_target_head_dim(target) * factor) != kv["rotary_dim"]
         ):
             raise ValueError(
                 "target_kv rotary geometry disagrees with the target model"
@@ -131,7 +207,7 @@ def capture_geometry(config, target_config):
         "heads": kv["heads"],
         "head_dim": kv["head_dim"],
         "rope_theta": theta,
-        "rotary_dim": int(target.head_dim * factor),
+        "rotary_dim": int(_target_head_dim(target) * factor),
         "rope_layout": "neox",
     }
 

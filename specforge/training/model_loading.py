@@ -298,6 +298,27 @@ def resolve_draft_config(
             f"architecture in {sorted(compatible)!r}, got {architectures!r}"
         )
     _apply_draft_overrides(cfg, draft_config, provider)
+    # KV geometry belongs to the target, but is persisted in the resolved draft
+    # config so a saved draft can be instantiated without the target repository.
+    if cfg.model.conditioning_source == "kv":
+        from specforge.modeling.draft.target_kv import resolve_target_kv_config
+        from specforge.modeling.target.target_utils import load_target_config
+
+        target = load_target_config(
+            cfg.model.target_model_path,
+            cache_dir=cfg.model.cache_dir,
+            trust_remote_code=cfg.model.trust_remote_code,
+        )
+        resolve_target_kv_config(draft_config, target)
+    elif cfg.training.strategy != "dspark_kv":
+        method = getattr(draft_config, "dflash_config", None) or {}
+        source = getattr(
+            draft_config,
+            "conditioning_source",
+            method.get("conditioning_source", "hidden"),
+        )
+        if source in ("kv", "target_kv"):
+            raise ValueError("KV draft config requires model.conditioning_source=kv")
     return draft_config
 
 

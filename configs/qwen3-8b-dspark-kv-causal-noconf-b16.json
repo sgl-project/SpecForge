@@ -32,14 +32,8 @@
     "enable_confidence_head": false,
     "confidence_head_with_markov": false,
     "confidence_head_alpha": 0.0,
-    "conditioning_source": "target_kv",
     "target_layer_ids": [1, 9, 17, 25, 33],
-    "target_kv_heads": 8,
-    "target_kv_head_dim": 128,
     "target_kv_position_mode": "derope_reproject",
-    "target_kv_context_key_norm": true,
-    "target_kv_rope_theta": 1000000,
-    "target_kv_rotary_dim": 128,
-    "target_kv_rope_layout": "neox"
+    "target_kv_context_key_norm": true
   }
 }

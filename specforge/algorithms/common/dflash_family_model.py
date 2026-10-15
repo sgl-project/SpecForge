@@ -1570,6 +1570,7 @@ class OnlineDFlashModel(nn.Module):
         max_valid_anchors: Optional[int] = None,
         selector_loss_alpha: Optional[float] = None,
         collect_detailed_metrics: bool = True,
+        target_kv: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -1585,6 +1586,7 @@ class OnlineDFlashModel(nn.Module):
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            **({"target_kv": target_kv} if target_kv is not None else {}),
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
@@ -2049,6 +2051,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         lambda_base: float = 0.0,
         max_valid_anchors: Optional[int] = None,
         collect_detailed_metrics: bool = True,
+        target_kv: Optional[torch.Tensor] = None,
     ):
         """Parallel Domino training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -2063,6 +2066,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            **({"target_kv": target_kv} if target_kv is not None else {}),
         )
 
         label_start = 1 if self.shift_label else 0

@@ -12,8 +12,11 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig, Qwen3_5ForConditionalGeneration, Qwen3Config
 
-from specforge.algorithms.dspark_kv.data import normalize_sample
-from specforge.modeling.draft.target_kv import capture_geometry
+from specforge.algorithms.common.target_kv_data import NORMALIZER_ID, normalize_sample
+from specforge.modeling.draft.target_kv import (
+    capture_geometry,
+    resolve_target_kv_config,
+)
 
 
 @torch.inference_mode()
@@ -79,6 +82,7 @@ def main():
     target_config = AutoConfig.from_pretrained(
         args.target_model, revision=args.revision
     )
+    resolve_target_kv_config(draft, target_config)
     geometry = capture_geometry(draft, target_config)
     model = (
         Qwen3_5ForConditionalGeneration.from_pretrained(
@@ -126,7 +130,7 @@ def main():
     if count == 0:
         raise ValueError("input-jsonl contains no samples")
     manifest = {
-        "format": "dspark_target_kv_v1",
+        "format": NORMALIZER_ID,
         "samples": count,
         "target_model": args.target_model,
         "target_revision": getattr(target_config, "_commit_hash", args.revision),

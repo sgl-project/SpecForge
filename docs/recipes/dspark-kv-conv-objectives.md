@@ -5,6 +5,8 @@ The DSpark-KV training path supports two separate convolutional recipes:
 - `examples/configs/online/disaggregated/external/qwen3-8b-dspark-kv-conv-dpace-online.yaml`
 - `examples/configs/online/disaggregated/external/qwen3-8b-dspark-kv-conv-dpard-online.yaml`
 
+Both use `training.strategy: dspark` and `model.conditioning_source: kv`.
+Target KV geometry is inferred from the target and saved in the exported draft config.
 Both use `configs/qwen3-8b-dspark-kv-conv-causal-noconf-b16.json`: causal attention, target-KV conditioning, de-RoPE/reprojection, context key normalization, a two-tap grouped convolution around attention and MLP, and no confidence head. Convolution starts as an identity mapping. Existing models without convolution settings retain their original layers.
 
 DPaCE uses `dspark_objective: ce_l1` and `loss_type: dpace`. Detached credit is derived from the draft probability of the hard-label continuation and weights the CE and L1 terms. D-PARD instead uses `dspark_objective: dpard` and `loss_type: dflash`; its detached credit comes from target/draft distribution overlap and weights a Renyi-half divergence. These are alternatives, not simultaneously enabled objectives. See `dspark-dpard.md` for the D-PARD formula and normalization.

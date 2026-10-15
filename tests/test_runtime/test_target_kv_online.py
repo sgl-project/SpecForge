@@ -47,7 +47,8 @@ class OnlineKVTest(unittest.TestCase):
             )
             self.assertEqual(recipe.training.max_checkpoints, 0)
             self.assertEqual(recipe.training.dspark_confidence_head_alpha, 0)
-            self.assertEqual(recipe.training.strategy, "dspark_kv")
+            self.assertEqual(recipe.training.strategy, "dspark")
+            self.assertEqual(recipe.model.conditioning_source, "kv")
             self.assertEqual(
                 recipe.training.dspark_objective,
                 "dpard" if objective == "dpard" else "ce_l1",
@@ -72,7 +73,8 @@ class OnlineKVTest(unittest.TestCase):
             )
         )
         self.assertEqual(config.training.max_checkpoints, 0)
-        self.assertEqual(config.training.strategy, "dspark_kv")
+        self.assertEqual(config.training.strategy, "dspark")
+        self.assertEqual(config.model.conditioning_source, "kv")
         self.assertTrue(config.training.dspark_flatten_projection)
         self.assertTrue(config.training.dspark_cache_projection)
 
