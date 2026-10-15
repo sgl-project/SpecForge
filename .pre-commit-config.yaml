@@ -12,9 +12,11 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
-        exclude: \.patch$  # stripping context-line whitespace breaks git apply
+        # Patches: stripping context-line whitespace breaks git apply.
+        # Vendored chat templates: tests pin them byte for byte to the release.
+        exclude: \.patch$|^tests/test_data/data/.*\.jinja$
       - id: end-of-file-fixer
-        exclude: \.patch$
+        exclude: \.patch$|^tests/test_data/data/.*\.jinja$
       - id: check-yaml
         args: [--allow-multiple-documents]
       - id: check-toml
