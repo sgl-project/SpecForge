@@ -128,6 +128,54 @@ drafts currently implements the GQA/MHA layout only, so plan benchmarks
 accordingly. DFlash2 otherwise follows the same mode selection; its convolution
 and selector do not change the attention projection contract.
 
+## MoE FFN for DFlash-family drafts
+
+Any DFlash-family draft (DFlash, DFlash2, DSpark) swaps its dense MLP for a
+sparse MoE FFN when the draft JSON sets a positive routed-expert count
+(`n_routed_experts`, or Qwen's spelling `num_experts`). The MoE is one
+configurable layer (`specforge/modeling/draft/moe/`, see its `DESIGN.md`):
+a `moe_preset` names a target family's routing recipe, and the architecture
+keys use the target checkpoints' native HF names so they can be copied from
+the target's `config.json`:
+
+```json
+{
+  "moe_preset": "deepseek_v4",
+  "n_routed_experts": 64,
+  "num_experts_per_tok": 6,
+  "moe_intermediate_size": 2048,
+  "n_shared_experts": 1,
+  "dflash_config": {"moe_bias_update_rate": 0.001, "moe_dispatch": "grouped_mm"}
+}
+```
+
+Top-level keys override the preset (for ablations: `scoring_func`,
+`norm_topk_prob`, `routed_scaling_factor`, `balance`, `shared_expert_gate`,
+`swiglu_limit`, ...). Training-only knobs live under `dflash_config` with an
+`moe_` prefix and never change the checkpoint. Checkpoints, warm starts and
+exports keep the official per-expert naming (`experts.{i}.w{1,2,3}.weight`),
+so an exported drafter loads into SGLang unchanged. Dense drafts are
+unaffected: with no `n_routed_experts` the kernel provider's MLP is used as-is.
+
+`deepseek_v4` is the checked-in preset (DeepSeek-V4 routing:
+`sqrtsoftplus` scores, aux-loss-free `noaux_tc` balancing, combine weights
+renormalized and scaled by 1.5, one ungated shared expert, SwiGLU clamp 10);
+`configs/deepseek-v4-flash-dspark-moe.json` uses it.
+
+`qwen3` is the Qwen3-MoE preset (`softmax` scores over all experts, top-k
+combine weights renormalized, no scaling, no shared expert, plain SwiGLU).
+`configs/qwen3.8-27b-dflash2-moe.json` uses it for the MoE arm of the
+Qwen3.8-27B DFlash2 ablation, with the Qwen key names
+(`num_experts: 16`, `num_experts_per_tok: 4`, `moe_intermediate_size: 4352`,
+so the activated width equals the dense 17408). Balancing is the same
+aux-loss-free `noaux_tc` selection bias as `deepseek_v4`;
+`dflash_config.moe_aux_loss_coeff` adds the complementary balance loss when a
+from-scratch run collapses onto a few experts.
+
+A new target family is a preset registration plus whichever components it
+needs (score function, balance controller, experts backend, shared expert);
+each registers by name from its own module.
+
 ## Draft architectures
 
 Draft classes register through `@register_draft`. The key defaults to the
