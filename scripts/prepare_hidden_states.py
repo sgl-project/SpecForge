@@ -163,6 +163,16 @@ def parse_args():
         help="Max number of pending I/O futures.",
     )
     others_group.add_argument(
+        "--hidden-state-transfer",
+        choices=("async", "sync"),
+        default="async",
+        help=(
+            "Hidden-state D2H transfer (default: async). Async uses pinned CPU "
+            "buffers and a CUDA copy stream; use sync or reduce --io-queue-size "
+            "if transfer memory is insufficient."
+        ),
+    )
+    others_group.add_argument(
         "--file-group-size",
         type=int,
         default=2000,
@@ -387,6 +397,7 @@ class HiddenStatesGenerator:
         file_group_size: int = 2000,
         compress: bool = False,
         compression_level: int = 6,
+        hidden_state_transfer: str = "async",
     ):
         """
         Args:
@@ -395,7 +406,16 @@ class HiddenStatesGenerator:
             num_io_threads: Number of threads for async I/O.
             io_queue_size: Max number of pending I/O futures before cleanup.
             file_group_size: Number of files per subdirectory.
+            hidden_state_transfer: Async CUDA copies into pinned CPU buffers,
+                or legacy synchronous copies. In-flight records are bounded by
+                io_queue_size; pinned allocator caches may retain freed buffers.
         """
+        if hidden_state_transfer not in ("async", "sync"):
+            raise ValueError("hidden_state_transfer must be 'async' or 'sync'")
+        if io_queue_size < 1:
+            raise ValueError("io_queue_size must be positive")
+        self.hidden_state_transfer = hidden_state_transfer
+        self._copy_streams = {}
         self.model = target_model
         self.capture_layout = capture_layout or OfflineCaptureLayout(
             capture_method="eagle3",
@@ -434,12 +454,95 @@ class HiddenStatesGenerator:
         if is_tp_rank_0() and self.io_executor is not None:
             if self.show_progress:
                 print("\nWaiting for all async I/O operations to complete...")
-            self._wait_all_saves()
-            self.io_executor.shutdown(wait=True)
-            self.io_executor = None  # Reset for safety
+            try:
+                self._wait_all_saves()
+            finally:
+                self.io_executor.shutdown(wait=True)
+                self.io_executor = None
+                self.pending_futures.clear()
+                for stream in self._copy_streams.values():
+                    stream.synchronize()
+                self._copy_streams.clear()
 
-        # Final barrier to ensure all processes exit generate() cleanly
-        dist.barrier()
+        if exc_type is None:
+            dist.barrier()
+
+    @staticmethod
+    def _add_transfer_memory_hint(exc):
+        hint = (
+            "Reduce --io-queue-size or use --hidden-state-transfer sync to "
+            "reduce in-flight transfer memory."
+        )
+        exc.args = (f"{exc}\n{hint}", *exc.args[1:])
+
+    def _stage_hidden_states(self, *tensors):
+        staged = []
+        streams = set()
+        try:
+            for tensor in tensors:
+                if tensor is None:
+                    staged.append(None)
+                elif (
+                    self.hidden_state_transfer == "sync" or tensor.device.type != "cuda"
+                ):
+                    staged.append(tensor.cpu().clone().unsqueeze(0))
+                else:
+                    device = tensor.device
+                    if device not in self._copy_streams:
+                        self._copy_streams[device] = torch.cuda.Stream(device=device)
+                    stream = self._copy_streams[device]
+                    try:
+                        host = torch.empty(
+                            tensor.shape,
+                            dtype=tensor.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                    except (RuntimeError, MemoryError) as exc:
+                        if isinstance(exc, MemoryError) or any(
+                            text in str(exc).lower()
+                            for text in (
+                                "out of memory",
+                                "cannot allocate memory",
+                                "can't allocate memory",
+                                "not enough memory",
+                            )
+                        ):
+                            self._add_transfer_memory_hint(exc)
+                        raise
+                    stream.wait_stream(torch.cuda.current_stream(device))
+                    with torch.cuda.stream(stream):
+                        host.copy_(tensor, non_blocking=True)
+                        # The producer may release its source before D2H finishes.
+                        tensor.record_stream(stream)
+                    streams.add(stream)
+                    staged.append(host.unsqueeze(0))
+        except torch.cuda.OutOfMemoryError as exc:
+            if "--hidden-state-transfer sync" not in str(exc):
+                self._add_transfer_memory_hint(exc)
+            raise
+        events = []
+        for stream in streams:
+            event = torch.cuda.Event()
+            event.record(stream)
+            events.append(event)
+        return staged, events
+
+    def _save_after_transfer(self, record, output_file, ready_events):
+        for event in ready_events:
+            event.synchronize()
+        self._save_tensor_sync(record, output_file)
+
+    def _wait_for_io_slot(self):
+        pending = []
+        for future in self.pending_futures:
+            if future.done():
+                future.result()  # Do not discard failed writes during cleanup.
+            else:
+                pending.append(future)
+        self.pending_futures = pending
+        if len(self.pending_futures) >= self.io_queue_size:
+            self.pending_futures.pop(0).result()
 
     def _save_tensor_sync(
         self,
@@ -481,6 +584,7 @@ class HiddenStatesGenerator:
         self,
         record: Mapping[str, torch.Tensor],
         output_file: str,
+        ready_events=(),
     ) -> None:
         """
         Submit a job to the io_executor to save the data point asynchronously.
@@ -490,17 +594,10 @@ class HiddenStatesGenerator:
             output_file (str): The path to the output file.
         """
         assert is_tp_rank_0(), "Only tp_rank=0 should call _save_tensor_async"
-        # If the queue of pending save operations is full, we must wait.
-        if len(self.pending_futures) >= self.io_queue_size:
-            # First, try to clear any futures that have already finished without waiting.
-            self.pending_futures = [f for f in self.pending_futures if not f.done()]
-            # If the queue is *still* full, it means all I/O threads are busy and we have
-            # a backlog. We must now block the main generation loop and wait for the
-            # oldest I/O operation to complete before proceeding.
-            if len(self.pending_futures) >= self.io_queue_size:
-                self.pending_futures.pop(0).result()
-
-        future = self.io_executor.submit(self._save_tensor_sync, record, output_file)
+        self._wait_for_io_slot()
+        future = self.io_executor.submit(
+            self._save_after_transfer, record, output_file, ready_events
+        )
         self.pending_futures.append(future)
 
     def _wait_all_saves(self):
@@ -600,10 +697,10 @@ class HiddenStatesGenerator:
         samples_per_dp: int = 0,
     ):
         """
-        This version prioritizes minimal CPU RAM usage above all else, even at the cost of performance.
-        - It processes samples one-by-one within the tp_rank_0 process.
-        - It avoids batching GPU-to-CPU transfers.
-        - It ensures only one sample's data is in RAM for I/O at any given time.
+        CUDA states are copied into pinned CPU buffers on a separate stream by
+        default. Writer threads wait for copy events before checking or saving
+        tensors. The I/O queue applies backpressure before staging another record.
+        Use hidden_state_transfer="sync" for the legacy low-memory transfer path.
         """
         self._prepare_output_dirs(output_path, start_idx, samples_per_dp)
 
@@ -678,9 +775,12 @@ class HiddenStatesGenerator:
                 k: v.to(get_device_type(), non_blocking=True)
                 for k, v in filtered_batch.items()
             }
-            captured = self.model.capture(
-                **filtered_batch_gpu,
-            )
+            try:
+                captured = self.model.capture(**filtered_batch_gpu)
+            except torch.cuda.OutOfMemoryError as exc:
+                if self.hidden_state_transfer == "async":
+                    self._add_transfer_memory_hint(exc)
+                raise
             aux_hidden_states_list = captured.hidden_states
             last_hidden_states_list = captured.last_hidden_states
             if aux_hidden_states_list is None:
@@ -703,17 +803,9 @@ class HiddenStatesGenerator:
                     )
                 ):
 
-                    # Process ONE sample at a time to minimize CPU RAM footprint
-                    # 1. Transfer only the required slice for one sample to CPU
-                    aux_hidden_states = (
-                        aux_hidden_states.cpu().clone().unsqueeze(0)
-                        if aux_hidden_states is not None
-                        else None
-                    )
-                    last_hidden_states = (
-                        last_hidden_states.cpu().clone().unsqueeze(0)
-                        if last_hidden_states is not None
-                        else None
+                    self._wait_for_io_slot()
+                    (aux_hidden_states, last_hidden_states), ready_events = (
+                        self._stage_hidden_states(aux_hidden_states, last_hidden_states)
                     )
                     record = self.capture_layout.materialize(
                         {
@@ -726,7 +818,7 @@ class HiddenStatesGenerator:
 
                     # 3. Save asynchronously (the backpressure logic is still crucial)
                     output_file = self._get_file_path(output_path, current_global_idx)
-                    self._save_tensor_async(record, output_file)
+                    self._save_tensor_async(record, output_file, ready_events)
 
                     # 4. Immediately clean up the single-sample CPU tensors
                     del last_hidden_states, aux_hidden_states
@@ -736,7 +828,7 @@ class HiddenStatesGenerator:
             # Clean up the large GPU and CPU batch data
             del aux_hidden_states_list, last_hidden_states_list, filtered_batch
 
-            if batch_idx % 5 == 0:  # Make GC and cache clearing more frequent
+            if self.hidden_state_transfer == "sync" and batch_idx % 5 == 0:
                 torch.cuda.empty_cache()
                 gc.collect()
 
@@ -917,6 +1009,7 @@ def main():
             file_group_size=args.file_group_size,
             compress=args.compress,
             compression_level=args.compression_level,
+            hidden_state_transfer=args.hidden_state_transfer,
             # Other params like io_queue_size can also be added to argparse
         ) as hidden_states_generator:
 
