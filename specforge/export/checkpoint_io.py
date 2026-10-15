@@ -159,7 +159,12 @@ def materialize_draft(
 
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
     model = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
-    missing, unexpected = model.load_state_dict(state["draft_state_dict"], strict=False)
+    from specforge.modeling.draft.moe import from_checkpoint_state_dict
+
+    # Files use the official naming; modules may use a native MoE layout.
+    missing, unexpected = model.load_state_dict(
+        from_checkpoint_state_dict(state["draft_state_dict"]), strict=False
+    )
     if unexpected:
         raise ValueError(
             f"checkpoint carries weights the {type(model).__name__} architecture "

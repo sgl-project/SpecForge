@@ -1,0 +1,97 @@
+# MoE-FFN arm of the DSpark drafter-architecture ablation for
+# DeepSeek-V4-Flash. Identical to deepseek-v4-flash-dspark-disaggregated.yaml
+# (the dense arm) except the draft JSON and the run/store names, so the A/B
+# diff is the FFN: 64 routed experts + 1 shared, top-6, moe_intermediate 2048
+# (activated width 6x2048 + 2048 ~= the dense 12288) with DeepSeek-V4 routing.
+# If a from-scratch MoE run destabilizes at the shared hparams, lower the LR
+# and clip on BOTH arms rather than on this file alone.
+model:
+  target_model_path: deepseek-ai/DeepSeek-V4-Flash-0731
+  draft_model_config: configs/deepseek-v4-flash-dspark-moe.json
+  target_backend: sglang
+  trust_remote_code: true
+  # DeepSeek-V4 checkpoints use the native inference weight layout.
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_mem_fraction_static: 0.85
+  # data.max_length plus headroom: capture rejects inputs at exactly context length.
+  sglang_context_length: 8704
+  sglang_max_running_requests: 8
+  # Routed experts are fp4; the default MoE path cannot run them on B200.
+  sglang_moe_runner_backend: flashinfer_mxfp4
+
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 8192
+  chat_template: deepseek-v4
+  cache_dir: cache
+  build_dataset_num_proc: 64
+  # Async prefetch: overlaps per-sample Mooncake feature fetches with compute.
+  dataloader_num_workers: 8
+
+training:
+  strategy: dspark
+  num_epochs: 2
+  # 4 ranks x 32 microbatches -> global batch 128.
+  batch_size: 1
+  accumulation_steps: 32
+  learning_rate: 0.0006
+  lr_scheduler: constant
+  warmup_ratio: 0
+  max_grad_norm: 1
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 128
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge
+  wandb_name: deepseek-v4-flash-dspark-moe-disaggregated
+  wandb_dir: outputs/deepseek-v4-flash-dspark-moe-disaggregated/wandb
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 8
+  # Keep two 128-sample optimizer quanta in flight (~0.4 GiB features/sample);
+  # the low watermark is one full quantum so complete windows always dispatch.
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 128
+  resident_high_watermark_bytes: 137438953472
+  resident_low_watermark_bytes: 103079215104
+  feature_store_max_resident_bytes: 171798691840
+
+run_id: deepseek-v4-flash-dspark-moe-disaggregated
+output_dir: outputs/deepseek-v4-flash-dspark-moe-disaggregated
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/deepseek-v4-flash-dspark-moe-disaggregated/control
+    consumer_state_dir: outputs/deepseek-v4-flash-dspark-moe-disaggregated/consumer-state
+    backend: mooncake
+    store_id: deepseek-v4-flash-dspark-moe-disaggregated
+    # Two TP2 servers out-produce one TP4 server (TP prefill scaling is sublinear).
+    server_urls:
+      - http://127.0.0.1:30000
+      - http://127.0.0.1:30001
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_local_hostname: 127.0.0.1
+    mooncake_protocol: tcp
+    client_buffer_size: 1073741824
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200
