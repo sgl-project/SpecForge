@@ -72,6 +72,7 @@ from specforge.distributed import (
     init_distributed,
     is_tp_rank_0,
 )
+from specforge.modeling.target.target_utils import load_target_config
 from specforge.offline_capture import OfflineSGLangCapture, load_offline_capture
 from specforge.utils import (
     get_device_type,
@@ -138,13 +139,15 @@ def parse_args():
     inference_group.add_argument("--tp-size", type=int, default=1)
     inference_group.add_argument(
         "--target-backend",
-        choices=("sglang", "hf"),
+        choices=("sglang", "hf", "vllm"),
         default="sglang",
         help=(
             "Engine that runs the target. 'hf' runs the Transformers reference "
             "model in one process across every visible accelerator (launch "
             "with one process per node); it exists for targets with no local "
-            "serving engine, currently Qwen3.8-Flash-Next (qwen4_exp)."
+            "serving engine, currently Qwen3.8-Flash-Next (qwen4_exp). 'vllm' "
+            "asks a running vLLM / vLLM-Ascend server started with the "
+            "extract_hidden_states method and ExampleHiddenStatesConnector."
         ),
     )
     inference_group.add_argument(
@@ -158,6 +161,44 @@ def parse_args():
         choices=("sdpa", "eager"),
         default="sdpa",
         help="Transformers attention implementation for the 'hf' backend.",
+    )
+    inference_group.add_argument(
+        "--vllm-url",
+        default="http://127.0.0.1:8000",
+        help="Base URL of the 'vllm' backend's server.",
+    )
+    inference_group.add_argument(
+        "--vllm-served-model-name",
+        default=None,
+        help="The server's --served-model-name (default: --target-model-path).",
+    )
+    inference_group.add_argument(
+        "--vllm-concurrency",
+        type=int,
+        default=4,
+        help=(
+            "Requests in flight for the 'vllm' backend; keep it at or below the "
+            "server's --max-num-seqs and use it as --batch-size."
+        ),
+    )
+    inference_group.add_argument(
+        "--vllm-timeout",
+        type=float,
+        default=600.0,
+        help="Seconds to wait for one 'vllm' capture request.",
+    )
+    inference_group.add_argument(
+        "--vllm-path-map",
+        default=None,
+        help=(
+            "SERVER_PREFIX=LOCAL_PREFIX when the server writes its capture files "
+            "under a path this process sees elsewhere (another container)."
+        ),
+    )
+    inference_group.add_argument(
+        "--vllm-keep-captures",
+        action="store_true",
+        help="Keep the server's capture files after converting them (debugging).",
     )
     inference_group.add_argument("--batch-size", type=int, default=32)
 
@@ -381,14 +422,25 @@ def build_target_model(
             "num_devices": getattr(args, "hf_num_devices", None),
             "attn_implementation": getattr(args, "hf_attn_implementation", "sdpa"),
         }
+    elif target_backend == "vllm":
+        backend_kwargs = {
+            "backend": "vllm",
+            "url": args.vllm_url,
+            "served_model_name": args.vllm_served_model_name,
+            "concurrency": args.vllm_concurrency,
+            "timeout": args.vllm_timeout,
+            "keep_captures": args.vllm_keep_captures,
+            "path_map": args.vllm_path_map,
+        }
     else:
         backend_kwargs = _sglang_kwargs(args)
     target_model = load_offline_capture(
         args.target_model_path,
+        # A raw config.json (see load_target_config) may carry either name,
+        # or neither.
         torch_dtype=(
-            model_config.dtype
-            if hasattr(model_config, "dtype")
-            else model_config.torch_dtype
+            getattr(model_config, "dtype", None)
+            or getattr(model_config, "torch_dtype", None)
         ),
         trust_remote_code=args.trust_remote_code,
         **backend_kwargs,
@@ -818,7 +870,10 @@ def main():
             Path(__file__).parent.parent, "cache", "hidden_states"
         )
 
-    target_model_config = AutoConfig.from_pretrained(
+    # Falls back to the raw config.json when this Transformers does not know
+    # the model type, as training does: the vllm backend loads no model, so its
+    # client need not run a Transformers release that does.
+    target_model_config = load_target_config(
         args.target_model_path,
         cache_dir=args.cache_dir,
         trust_remote_code=args.trust_remote_code,
@@ -830,6 +885,11 @@ def main():
         raise ValueError(
             "--target-backend hf runs the whole target in one process; use "
             "--tp-size 1 and one process per node"
+        )
+    if args.target_backend == "vllm" and args.tp_size != 1:
+        raise ValueError(
+            "--target-backend vllm only sends requests; the server owns the "
+            "parallelism, so use --tp-size 1"
         )
     # Initialize distributed environment (TP + DP)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)

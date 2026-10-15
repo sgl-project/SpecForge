@@ -102,7 +102,8 @@ def load_offline_capture(
     """Load the local target for offline hidden-state preparation.
 
     ``backend="hf"`` runs the Transformers reference model instead of SGLang;
-    the wrapper and the captured layout are the same either way.
+    ``backend="vllm"`` asks a running vLLM hidden-state server. The wrapper and
+    the captured layout are the same either way.
     """
 
     if backend == "hf":
@@ -115,6 +116,12 @@ def load_offline_capture(
                 trust_remote_code=trust_remote_code,
                 **kwargs,
             )
+        )
+    if backend == "vllm":
+        from .vllm_backend import OfflineVLLMCaptureBackend
+
+        return OfflineSGLangCapture(
+            OfflineVLLMCaptureBackend.build(pretrained_model_name_or_path, **kwargs)
         )
     if backend != "sglang":
         raise ValueError(f"unknown offline capture backend {backend!r}")
