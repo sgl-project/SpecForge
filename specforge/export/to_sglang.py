@@ -21,6 +21,8 @@ buffers) are exactly what SGLang's EAGLE3 draft loader reads.
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from typing import Dict, Optional
 
 from specforge.export.checkpoint_io import (
@@ -54,6 +56,34 @@ def _serving_state(state_dict, weight_map: Dict[str, str]):
     return out
 
 
+def _export_deepseek_v4_to_sglang(model, output_dir):
+    # Preserve native mtp.* names; SGLang translates them when loading.
+    model.save_pretrained(output_dir)
+    config = model.config
+    payload = config.to_dict()
+    dc = config.dflash_config
+    payload.update(
+        architectures=["DeepseekV4ForCausalLMDSpark"],
+        model_type="deepseek_v4",
+        num_hidden_layers=config.num_target_layers,
+        num_nextn_predict_layers=config.num_hidden_layers,
+        num_hash_layers=0,
+        n_hash_layers=0,
+        compress_ratios=[0] * (config.num_target_layers + config.num_hidden_layers),
+        dspark_block_size=config.block_size,
+        dspark_noise_token_id=dc["mask_token_id"],
+        dspark_target_layer_ids=list(dc["target_layer_ids"]),
+        dspark_markov_rank=dc["markov_rank"],
+        sample_from_anchor=True,
+        quantization_config=None,
+        expert_dtype="bf16",
+        torch_dtype="bfloat16",
+    )
+    payload.pop("auto_map", None)
+    (Path(output_dir) / "config.json").write_text(json.dumps(payload, indent=2) + "\n")
+    return output_dir
+
+
 def export_to_sglang(
     checkpoint_path: str,
     draft_config_path: str,
@@ -69,6 +99,12 @@ def export_to_sglang(
     checkpoint predates them.
     """
     state = resolve_training_state(checkpoint_path)
+    if state.get("strategy") == "dspark":
+        with open(draft_config_path, encoding="utf-8") as handle:
+            architecture = json.load(handle).get("architectures")
+        if architecture == ["DeepseekV4DSparkDraftModel"]:
+            model = materialize_draft(state, draft_config_path)
+            return _export_deepseek_v4_to_sglang(model, output_dir)
     if state.get("strategy") != "eagle3":
         raise ValueError(
             "the specialized SGLang exporter currently supports EAGLE3 "

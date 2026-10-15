@@ -726,6 +726,9 @@ class OnlineDFlashModel(nn.Module):
             if self.attention_backend == "flex_attention"
             else create_dflash_sdpa_mask
         )
+        mask_builder = getattr(
+            self.draft_model, "build_training_attention_mask", mask_builder
+        )
         mask_args = {
             "anchor_positions": anchor_positions,
             "block_keep_mask": block_keep_mask,
@@ -2229,8 +2232,16 @@ class OnlineDSparkModel(OnlineDFlashModel):
         """Return additive loss and telemetry numerators for one block slice."""
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
+        prepare_lm_head_hidden = getattr(
+            self.draft_model, "prepare_lm_head_hidden", None
+        )
+        lm_hidden = (
+            prepare_lm_head_hidden(hidden)
+            if prepare_lm_head_hidden is not None
+            else hidden
+        )
         base_logits = self.lm_head(
-            hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
+            lm_hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
         draft_logits = self.draft_model.apply_logits_head(
             base_logits,
