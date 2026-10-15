@@ -261,16 +261,8 @@ Offline EAGLE3, DFlash, DFlash2, Domino, and DSpark runs consume
 target features created by `scripts/prepare_hidden_states.py`. Select the same
 strategy and draft
 configuration that the later training recipe uses; these values determine both
-the target layers captured and the checkpoint schema.
-
-CUDA hidden states are transferred asynchronously by default, using pinned CPU
-buffers and a separate copy stream. Writers wait for transfer completion before
-checking and saving tensors. `--io-queue-size` bounds in-flight records; pinned
-allocator caches can retain freed buffers. If memory is insufficient, reduce
-`--io-queue-size` or pass `--hidden-state-transfer sync` for the legacy transfer
-path. Async mode also omits the per-five-batch CUDA cache clearing and forced GC.
-
-For example, prepare the checked-in Qwen3-8B DFlash recipe with:
+the target layers captured and the checkpoint schema. For example, prepare the
+checked-in Qwen3-8B DFlash recipe with:
 
 ```bash
 torchrun --nproc_per_node=8 \
