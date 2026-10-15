@@ -774,6 +774,17 @@ class OnlineDFlashModel(nn.Module):
                 draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
             else:
                 draft_kwargs["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}
+        moe_blocks = getattr(self.draft_model, "moe_blocks", None)
+        if moe_blocks is not None and moe_blocks():
+            # Drop terms nobody consumed: a checkpointed recompute's from the
+            # last backward, or every term under a strategy that adds no
+            # balance loss. Each holds a graph, so they must not accumulate.
+            self.draft_model.pop_moe_aux_loss()
+            # Padded blocks are excluded from the objective; keep them out of
+            # the router's balance term and load telemetry as well.
+            draft_kwargs["moe_balance_mask"] = block_keep_mask.repeat_interleave(
+                self.block_size, dim=1
+            )
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
@@ -2528,4 +2539,23 @@ class OnlineDSparkModel(OnlineDFlashModel):
             collect_detailed_metrics=collect_detailed_metrics,
         )
         accuracy = metrics.pop("accuracy")
+        pop_moe_aux_loss = getattr(self.draft_model, "pop_moe_aux_loss", None)
+        if pop_moe_aux_loss is not None:
+            loss = self._add_moe_balance_loss(loss, pop_moe_aux_loss(), metrics)
         return loss, accuracy, metrics
+
+    def _add_moe_balance_loss(self, loss, aux_loss, metrics):
+        """Add an MoE drafter's router balance loss and its load telemetry."""
+
+        if aux_loss is None:
+            return loss
+        block = self.draft_model.moe_blocks()[0]
+        # DDP's mean over draft replicas, which see different tokens, is the
+        # intended mean of their balance losses.
+        loss = loss + block.aux_loss_coef * aux_loss
+        one = aux_loss.new_ones(())
+        ratio_metrics = metrics.setdefault("ratio_metrics", {})
+        ratio_metrics["moe_aux_loss"] = (aux_loss.detach(), one)
+        for name, value in self.draft_model.moe_load_metrics().items():
+            ratio_metrics[name] = (one.new_tensor(value), one)
+        return loss
