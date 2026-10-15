@@ -111,19 +111,54 @@ class TargetEmbeddingsAndHeadLoadingTest(unittest.TestCase):
                     tmp, self.embed_key, self.head_key, tie_weights=False
                 )
 
-    def test_tied_checkpoint_requires_only_embeddings(self):
-        module = self._module()
-        embedding = torch.full_like(module.embed_tokens.weight, 5.0)
+    def test_tied_checkpoint_resolves_available_weights(self):
+        logger = "specforge.modeling.target.target_utils"
+        for embed_value, head_value, dtype, tied in (
+            (5.0, None, torch.float32, True),
+            (None, 7.0, torch.float32, True),
+            (5.0, 5.0, torch.float32, True),
+            (5.0, 7.0, torch.float32, False),
+            (1.0, 1.001, torch.float32, False),
+            (1.0, 1.001, torch.bfloat16, True),
+        ):
+            with (
+                self.subTest(embed=embed_value, head=head_value, dtype=dtype),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                module = self._module().to(dtype=dtype)
+                tensors = {
+                    key: torch.full((4, 3), value)
+                    for key, value in (
+                        (self.embed_key, embed_value),
+                        (self.head_key, head_value),
+                    )
+                    if value is not None
+                }
+                self._single_file_checkpoint(tmp, tensors)
+                log_check = (
+                    self.assertNoLogs(logger, level="WARNING")
+                    if tied
+                    else self.assertLogs(logger, level="WARNING")
+                )
+                with log_check:
+                    loaded = module._load_weights(
+                        tmp, self.embed_key, self.head_key, tie_weights=True
+                    )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            self._single_file_checkpoint(tmp, {self.embed_key: embedding})
-            loaded = module._load_weights(
-                tmp, self.embed_key, self.head_key, tie_weights=True
-            )
-
-        self.assertEqual({self.embed_key}, loaded)
-        self.assertIs(module.lm_head.weight, module.embed_tokens.weight)
-        torch.testing.assert_close(module.lm_head.weight, embedding)
+                self.assertEqual(set(tensors), loaded)
+                self.assertEqual(
+                    module.lm_head.weight is module.embed_tokens.weight, tied
+                )
+                expected_embed = embed_value if embed_value is not None else head_value
+                expected_head = head_value if head_value is not None else embed_value
+                torch.testing.assert_close(
+                    module.embed_tokens.weight,
+                    torch.full((4, 3), expected_embed, dtype=dtype),
+                )
+                torch.testing.assert_close(
+                    module.lm_head.weight,
+                    torch.full((4, 3), expected_head, dtype=dtype),
+                )
 
     def test_tied_checkpoint_accepts_same_embedding_and_head_key(self):
         module = self._module()
@@ -213,37 +248,54 @@ class TargetEmbeddingsAndHeadLoadingTest(unittest.TestCase):
             ),
         )
 
-        def load_weights(instance, *_args, **_kwargs):
-            instance.embed_tokens.weight.data.fill_(2.0)
-            instance.lm_head.weight.data.fill_(8.0)
-            return {self.embed_key, self.head_key}
+        logger = "specforge.modeling.target.target_utils"
+        for tie_weights in (False, True):
+            with (
+                self.subTest(tie_weights=tie_weights),
+                tempfile.TemporaryDirectory() as tmp,
+                patch(
+                    "specforge.modeling.target.target_utils.load_target_config",
+                    return_value=config,
+                ),
+            ):
+                config.tie_word_embeddings = tie_weights
+                self._single_file_checkpoint(
+                    tmp,
+                    {
+                        self.embed_key: torch.full((6, 3), 2.0),
+                        self.head_key: torch.full((6, 3), 8.0),
+                    },
+                )
+                log_check = (
+                    self.assertLogs(logger, level="WARNING")
+                    if tie_weights
+                    else self.assertNoLogs(logger, level="WARNING")
+                )
+                with log_check:
+                    module = TargetEmbeddingsAndHead.from_pretrained(
+                        tmp, device="cpu", dtype=torch.float32
+                    )
 
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            patch(
-                "specforge.modeling.target.target_utils.load_target_config",
-                return_value=config,
-            ),
-            patch.object(TargetEmbeddingsAndHead, "_load_weights", load_weights),
-        ):
-            module = TargetEmbeddingsAndHead.from_pretrained(
-                tmp,
-                embed_key=self.embed_key,
-                lm_head_key=self.head_key,
-                device="cpu",
-                dtype=torch.float32,
-            )
+                torch.testing.assert_close(
+                    module.embed_tokens.weight, torch.full((6, 3), 2.0)
+                )
+                torch.testing.assert_close(
+                    module.lm_head.weight, torch.full((6, 3), 2.0)
+                )
+                self.assertIsNot(module.lm_head.weight, module.embed_tokens.weight)
+                self.assertEqual(module.lm_head_mup_folded, 4.0)
+                self.assertFalse(module.lm_head.weight.requires_grad)
+                self.assertFalse(module.embed_tokens.weight.requires_grad)
+                self.assertFalse(module.training)
 
-        torch.testing.assert_close(
-            module.embed_tokens.weight,
-            torch.full_like(module.embed_tokens.weight, 2.0),
-        )
-        torch.testing.assert_close(
-            module.lm_head.weight,
-            torch.full_like(module.lm_head.weight, 2.0),
-        )
-        self.assertEqual(module.lm_head_mup_folded, 4.0)
-        self.assertFalse(module.lm_head.weight.requires_grad)
+                if tie_weights:
+                    self._single_file_checkpoint(
+                        tmp, {self.embed_key: torch.full((6, 3), 2.0)}
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "cannot fold"):
+                        TargetEmbeddingsAndHead.from_pretrained(
+                            tmp, device="cpu", dtype=torch.float32
+                        )
 
 
 if __name__ == "__main__":

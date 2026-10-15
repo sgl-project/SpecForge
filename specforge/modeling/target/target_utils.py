@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from typing import Optional
 
@@ -8,6 +9,8 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoConfig
 
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
+
+logger = logging.getLogger(__name__)
 
 
 class _RawConfigShim:
@@ -122,7 +125,7 @@ class TargetEmbeddingsAndHead(nn.Module):
             cache_dir=cache_dir,
             trust_remote_code=trust_remote_code,
         )
-        instance = cls(config)
+        instance = cls(config).to(dtype=dtype)
 
         if embed_key is None:
             embed_key = "model.embed_tokens.weight"
@@ -148,7 +151,7 @@ class TargetEmbeddingsAndHead(nn.Module):
             getattr(config, "logits_mup_width_multiplier", None),
         )
         if mup_multiplier:
-            if tie_weights:
+            if instance.lm_head.weight is instance.embed_tokens.weight:
                 raise RuntimeError(
                     "cannot fold logits_mup_width_multiplier into a tied "
                     "embedding/LM head"
@@ -172,38 +175,54 @@ class TargetEmbeddingsAndHead(nn.Module):
         tie_weights: bool,
         cache_dir: Optional[str] = None,
     ) -> set[str]:
-        destinations = [(embed_key, self.embed_tokens.weight)]
-        if not tie_weights:
-            destinations.append((lm_head_key, self.lm_head.weight))
-        required_keys = [key for key, _destination in destinations]
-
+        keys = {embed_key, lm_head_key}
         try:
-            tensors = load_checkpoint_tensors(
-                model_path,
-                keys=required_keys,
-                cache_dir=cache_dir,
-            )
+            if tie_weights:
+                tensors = load_checkpoint_tensors(
+                    model_path, key_filter=keys.__contains__, cache_dir=cache_dir
+                )
+                if not tensors:
+                    raise KeyError(f"Checkpoint is missing tied tensors: {sorted(keys)}")
+            else:
+                tensors = load_checkpoint_tensors(
+                    model_path, keys=keys, cache_dir=cache_dir
+                )
         except KeyError as exc:
             raise RuntimeError(
                 f"Required target weight tensors were not loaded: {exc}"
             ) from exc
 
-        for key, destination in destinations:
-            tensor = tensors[key]
-            if tensor.shape != destination.shape:
+        for key, tensor in tensors.items():
+            if tensor.shape != self.embed_tokens.weight.shape:
                 raise RuntimeError(
-                    f"Shape mismatch for {key}. Expected {destination.shape}, "
+                    f"Shape mismatch for {key}. Expected {self.embed_tokens.weight.shape}, "
                     f"got {tensor.shape}"
                 )
-            destination.copy_(tensor)
+            tensors[key] = tensor.to(dtype=self.embed_tokens.weight.dtype)
 
-        if tie_weights:
-            print(
-                "Weight tying detected: Sharing weights between Embeddings and LM Head."
+        if tie_weights and len(tensors) > 1:
+            tie_weights = torch.equal(tensors[embed_key], tensors[lm_head_key])
+            if not tie_weights:
+                logger.warning(
+                    "The config requests tying %s and %s, but the checkpoint contains "
+                    "different values. Keeping the weights separate.",
+                    embed_key,
+                    lm_head_key,
+                )
+        embedding = tensors[embed_key] if embed_key in tensors else tensors[lm_head_key]
+        lm_head = tensors[lm_head_key] if lm_head_key in tensors else embedding
+        if not tie_weights and self.lm_head.weight is self.embed_tokens.weight:
+            self.lm_head.weight = nn.Parameter(
+                self.lm_head.weight.clone(),
+                requires_grad=self.lm_head.weight.requires_grad,
             )
+        self.embed_tokens.weight.copy_(embedding)
+        if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
+        else:
+            self.lm_head.weight.copy_(lm_head)
 
-        return set(required_keys)
+        return set(tensors)
 
 
 __all__ = [

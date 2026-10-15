@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 import torch
@@ -11,6 +12,8 @@ from specforge.modeling.target.target_utils import (
     target_vocab_size,
 )
 from specforge.utils import get_local_device, padding
+
+logger = logging.getLogger(__name__)
 
 
 class TargetHead(nn.Module):
@@ -39,7 +42,7 @@ class TargetHead(nn.Module):
             cache_dir=cache_dir,
         )
 
-        instance = cls(config)
+        instance = cls(config).to(dtype=dtype)
 
         tie_weights = target_ties_word_embeddings(config)
 
@@ -63,27 +66,46 @@ class TargetHead(nn.Module):
         tie_weights: bool = False,
         cache_dir: Optional[str] = None,
     ):
-        head_key = embedding_key if tie_weights else lm_head_key
-
+        keys = {lm_head_key}
+        if tie_weights:
+            keys.add(embedding_key)
         try:
-            tensors = load_checkpoint_tensors(
-                model_path,
-                keys=[head_key],
-                cache_dir=cache_dir,
-            )
+            if tie_weights:
+                tensors = load_checkpoint_tensors(
+                    model_path, key_filter=keys.__contains__, cache_dir=cache_dir
+                )
+                if not tensors:
+                    raise KeyError(f"Checkpoint is missing tied tensors: {sorted(keys)}")
+            else:
+                tensors = load_checkpoint_tensors(
+                    model_path, keys=keys, cache_dir=cache_dir
+                )
         except KeyError as exc:
             raise RuntimeError(
                 f"Required target weight tensors were not loaded: {exc}"
             ) from exc
 
-        lm_head = tensors[head_key]
+        for key, tensor in tensors.items():
+            if tensor.shape != self.fc.weight.shape:
+                raise RuntimeError(
+                    f"Shape mismatch for {key}. Expected {self.fc.weight.shape}, "
+                    f"got {tensor.shape}"
+                )
+            tensors[key] = tensor.to(dtype=self.fc.weight.dtype)
 
-        if tuple(lm_head.shape) != tuple(self.fc.weight.shape):
-            raise RuntimeError(
-                f"Target head {head_key!r} has shape {tuple(lm_head.shape)}, "
-                f"expected {tuple(self.fc.weight.shape)}"
-            )
-        self.fc.weight.copy_(lm_head)
+        if tie_weights and len(tensors) > 1:
+            tie_weights = torch.equal(tensors[embedding_key], tensors[lm_head_key])
+            if not tie_weights:
+                logger.warning(
+                    "The config requests tying %s and %s, but the checkpoint contains "
+                    "different values. Keeping the weights separate.",
+                    embedding_key,
+                    lm_head_key,
+                )
+        head_key = (
+            embedding_key if tie_weights and embedding_key in tensors else lm_head_key
+        )
+        self.fc.weight.copy_(tensors[head_key])
 
     def freeze_weights(self):
         for param in self.fc.parameters():

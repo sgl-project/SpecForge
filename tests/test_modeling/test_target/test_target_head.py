@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -90,28 +91,56 @@ class TargetHeadLoadingTest(unittest.TestCase):
 
         torch.testing.assert_close(head.fc.weight, lm_head)
 
-    def test_tied_checkpoint_without_lm_head_uses_embedding(self):
-        embedding = torch.full((4, 3), 5.0)
-        with tempfile.TemporaryDirectory() as tmp:
-            self._checkpoint(tmp, {self.embed_key: embedding}, tie_word_embeddings=True)
-            head = TargetHead(load_target_config(tmp))
-            head._load_weights(tmp, embedding_key=self.embed_key)
+    def test_tied_checkpoint_uses_available_weight(self):
+        weight = torch.full((4, 3), 5.0)
+        for key in (self.embed_key, self.head_key):
+            with (
+                self.subTest(key=key),
+                tempfile.TemporaryDirectory() as tmp,
+                patch(
+                    "specforge.modeling.target.target_head.get_local_device",
+                    return_value="cpu",
+                ),
+            ):
+                self._checkpoint(tmp, {key: weight}, tie_word_embeddings=True)
+                head = TargetHead.from_pretrained(tmp, dtype=torch.bfloat16)
+                torch.testing.assert_close(head.fc.weight, weight.to(torch.bfloat16))
+                self.assertFalse(head.training)
+                self.assertFalse(head.fc.weight.requires_grad)
 
-        torch.testing.assert_close(head.fc.weight, embedding)
-
-    def test_tied_checkpoint_prefers_embedding_over_stored_lm_head(self):
+    def test_tied_checkpoint_preserves_stored_lm_head(self):
         embedding = torch.ones(4, 3)
-        lm_head = torch.full((4, 3), 7.0)
-        with tempfile.TemporaryDirectory() as tmp:
-            self._checkpoint(
-                tmp,
-                {self.embed_key: embedding, self.head_key: lm_head},
-                tie_word_embeddings=True,
-            )
-            head = TargetHead(load_target_config(tmp))
-            head._load_weights(tmp)
-
-        torch.testing.assert_close(head.fc.weight, embedding)
+        logger = "specforge.modeling.target.target_head"
+        for dtype, value, tied in (
+            (torch.float32, 1.0, True),
+            (torch.float32, 7.0, False),
+            (torch.float32, 1.001, False),
+            (torch.bfloat16, 1.001, True),
+        ):
+            with (
+                self.subTest(dtype=dtype, value=value),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                lm_head = torch.full((4, 3), value)
+                self._checkpoint(
+                    tmp,
+                    {self.embed_key: embedding, self.head_key: lm_head},
+                    tie_word_embeddings=True,
+                )
+                log_check = (
+                    self.assertNoLogs(logger, level="WARNING")
+                    if tied
+                    else self.assertLogs(logger, level="WARNING")
+                )
+                with (
+                    patch(
+                        "specforge.modeling.target.target_head.get_local_device",
+                        return_value="cpu",
+                    ),
+                    log_check,
+                ):
+                    head = TargetHead.from_pretrained(tmp, dtype=dtype)
+                torch.testing.assert_close(head.fc.weight, lm_head.to(dtype))
 
     def test_untied_checkpoint_without_lm_head_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -129,7 +158,7 @@ class TargetHeadLoadingTest(unittest.TestCase):
             )
             head = TargetHead(load_target_config(tmp))
             with self.assertRaisesRegex(RuntimeError, self.embed_key):
-                head._load_weights(tmp)
+                head._load_weights(tmp, tie_weights=True)
 
 
 if __name__ == "__main__":
