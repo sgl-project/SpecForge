@@ -101,6 +101,15 @@ server/trainer splits, Mooncake lease, in-flight watermarks and throughput
 measured on B300 and H200 nodes, and the two-node launcher that starts eight
 capture servers.
 
+`offline/colocated/qwen3.8-flash-next-dspark-offline-npu.yaml` trains an MoE
+DSpark drafter for Qwen3.8-Flash-Next on one 8-card Ascend node from offline
+features. The drafter mirrors the target's MTP layer (gated attention, partial
+RoPE, Qwen3-Next routing with a Switch balance loss) in a 64-expert arm, which
+the recipe trains with DDP, and a 512-expert arm that needs expert parallelism.
+Its features come from the `hf` or `vllm` capture backend and it can start
+from the target's MTP layer; see
+[data preparation](../../docs/sections/basic_usage/data_preparation.md#targets-without-a-local-sglang-engine).
+
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
 intentionally record their GPU allocation and loopback services. External
