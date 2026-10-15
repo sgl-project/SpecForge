@@ -661,8 +661,9 @@ class TestPackageArchitecture(unittest.TestCase):
 
     def test_data_regeneration_dependency_is_explicit(self):
         with open(REPO_ROOT / "pyproject.toml", "rb") as project_file:
-            extras = tomllib.load(project_file)["project"]["optional-dependencies"]
-        self.assertEqual(["openai"], extras["data"])
+            project = tomllib.load(project_file)["project"]
+        self.assertIn("openai", project["dependencies"])
+        self.assertNotIn("data", project["optional-dependencies"])
 
     def test_launch_builders_use_generic_draft_model_parameter(self):
         functions = {

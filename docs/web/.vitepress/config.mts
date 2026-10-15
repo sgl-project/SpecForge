@@ -82,6 +82,8 @@ export default defineConfig({
   vite: {
     // Static assets live next to the app rather than under docs/public.
     publicDir: fileURLToPath(new URL('../public', import.meta.url)),
+    // Expose the SpecForge release number to components (install selector).
+    define: { __SPECFORGE_VERSION__: JSON.stringify(version) },
     resolve: {
       // Pages under docs/sections have no node_modules of their own, so make
       // the compiled Markdown modules resolve `vue` from this app's copy.
