@@ -41,6 +41,13 @@ jobs:
     container:
       image: lmsysorg/sglang:v0.5.18-cu130 # we lock to this version to avoid repeated docker pull
       options: --gpus all --shm-size=2g --rm -v /dev/shm --privileged --pid=host
+    # The self-hosted runner exports HTTP(S)_PROXY into the container but no
+    # longer a NO_PROXY, so local requests (sglang's own warmup to 127.0.0.1)
+    # went through the proxy and got 502. Keep loopback off the proxy here
+    # instead of relying on the runner's environment. (Actions env keys are
+    # case-insensitive, so no separate no_proxy; Python reads either case.)
+    env:
+      NO_PROXY: localhost,127.0.0.1,::1
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

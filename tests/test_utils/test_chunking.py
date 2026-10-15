@@ -2,6 +2,7 @@
 """Tests for reusable memory-bounded objective reductions."""
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -51,6 +52,27 @@ class CheckpointedChunkReduceTest(unittest.TestCase):
 
         self.assertEqual(calls, [(5,)])
         self.assertEqual(total.item(), 10)
+
+    def test_checkpoint_false_keeps_chunks_without_recompute(self):
+        calls = []
+        values = torch.arange(6, dtype=torch.double).requires_grad_()
+
+        def terms(chunk):
+            calls.append(tuple(chunk.shape))
+            return (chunk.square().sum(),)
+
+        with mock.patch("torch.utils.checkpoint.checkpoint") as checkpoint:
+            (total,) = checkpointed_chunk_reduce(
+                terms,
+                values,
+                chunk_size=4,
+                checkpoint=False,
+            )
+            total.backward()
+
+        checkpoint.assert_not_called()
+        self.assertEqual(calls, [(4,), (2,)])
+        torch.testing.assert_close(values.grad, 2 * values.detach())
 
     def test_rejects_misaligned_inputs(self):
         with self.assertRaisesRegex(ValueError, "must be aligned"):

@@ -38,9 +38,14 @@ export MOONCAKE_LOCAL_BUFFER_SIZE="${MOONCAKE_LOCAL_BUFFER_SIZE:-$((4 << 30))}"
 
 export APPLY_SGLANG_CAPTURE_PATCH="${APPLY_SGLANG_CAPTURE_PATCH:-1}"
 
-# Same server settings as the recipe's model.sglang_* fields.
+# Same server settings as the recipe's model.sglang_* fields. Setting
+# SERVER_EXTRA_ARGS replaces them; SERVER_EXTRA_ARGS_APPEND adds flags after
+# them, like model.sglang_extra_args on the managed-local recipe (for example
+# "--max-prefill-tokens 65536 --fp8-gemm-backend deep_gemm").
 DEFAULT_SERVER_EXTRA_ARGS="--dtype bfloat16 --attention-backend triton"
 DEFAULT_SERVER_EXTRA_ARGS+=" --disable-radix-cache --context-length 8199"
-export SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-$DEFAULT_SERVER_EXTRA_ARGS}"
+SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-$DEFAULT_SERVER_EXTRA_ARGS}"
+SERVER_EXTRA_ARGS+="${SERVER_EXTRA_ARGS_APPEND:+ $SERVER_EXTRA_ARGS_APPEND}"
+export SERVER_EXTRA_ARGS
 
 exec "$SCRIPT_DIR/run_qwen3_8b_dflash_disagg_2node.sh" "$@"

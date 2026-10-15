@@ -239,6 +239,29 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
         self.assertIsNone(model.target_last_hidden_states)
         self.assertEqual(out.sum_metrics, {})
 
+    def test_dflash_strategy_drops_teacher_hidden_when_teacher_metrics_are_off(self):
+        # A consumer with training.dflash_teacher_metrics=false never forwards
+        # the teacher, even when an older producer still captured it.
+        model = _FakeDFlashModel()
+        model.teacher_metrics = False
+        strategy = DFlashTrainStrategy(model)
+        tensors = {
+            "input_ids": torch.zeros(1, 4, dtype=torch.long),
+            "hidden_states": torch.randn(1, 4, 8),
+            "loss_mask": torch.ones(1, 4, dtype=torch.long),
+        }
+        for extra in ({}, {"target_last_hidden_states": torch.randn(1, 4, 8)}):
+            with self.subTest(teacher_fetched=bool(extra)):
+                batch = TrainBatch(
+                    sample_ids=["s0"],
+                    strategy="dflash",
+                    tensors={**tensors, **extra},
+                    metadata={},
+                )
+                out = strategy.forward_loss(batch, ctx=StepContext())
+                self.assertIsNone(model.target_last_hidden_states)
+                self.assertEqual(out.sum_metrics["dflash/hard_label/block_count"], 2)
+
     def test_dflash_validate_batch_rejects_missing(self):
         strat = DFlashTrainStrategy(_FakeDFlashModel())
         bad = TrainBatch(

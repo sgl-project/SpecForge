@@ -421,6 +421,27 @@ class LaunchPlanTest(unittest.TestCase):
                 "/local/attempt-state/inboxes",
             )
 
+    def test_online_consumer_async_ack_is_exported_and_env_overridable(self):
+        cases = {
+            "default": (None, {}, "1"),
+            "config off": (False, {}, "0"),
+            "env wins": (True, {"DISAGG_ASYNC_ACK": "0"}, "0"),
+        }
+        for name, (configured, env, expected) in cases.items():
+            with self.subTest(case=name):
+                raw = _config(mode="disaggregated", nproc=2).model_dump()
+                if configured is not None:
+                    raw["deployment"]["disaggregated"]["async_ack"] = configured
+                plan = build_launch_plan(
+                    Config.model_validate(raw),
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env={**MOONCAKE_ENV, **env},
+                )
+                for command in plan.commands:
+                    self.assertEqual(command.env["DISAGG_ASYNC_ACK"], expected)
+
     def test_consumer_state_dir_rejects_unsupported_modes_and_whitespace(self):
         cfg = _config(mode="disaggregated")
         invalid_cases = {
@@ -802,7 +823,8 @@ class LaunchPlanTest(unittest.TestCase):
                 ("--moe-runner-backend", "triton"),
                 ("--page-size", "64"),
                 ("--quantization", "fp8"),
-                ("--fp4-gemm-runner-backend", "cutlass"),
+                # SGLang v0.5.18 spells this option --fp4-gemm-backend.
+                ("--fp4-gemm-backend", "cutlass"),
                 ("--mamba-radix-cache-strategy", "lru"),
                 ("--max-mamba-cache-size", "1024"),
                 ("--swa-full-tokens-ratio", "0.5"),
@@ -810,6 +832,14 @@ class LaunchPlanTest(unittest.TestCase):
             ):
                 self.assertEqual(argv[argv.index(flag) + 1], expected)
             self.assertEqual(argv[argv.index("--context-length") + 1], "2055")
+            self.assertNotIn("--fp4-gemm-runner-backend", argv)
+            for flag in (
+                "--max-prefill-tokens",
+                "--linear-attn-prefill-backend",
+                "--fp8-gemm-backend",
+                "--disable-cuda-graph",
+            ):
+                self.assertNotIn(flag, argv)
         producer, consumer = plan.commands
         expected_urls = "http://127.0.0.1:30000,http://127.0.0.1:30001"
         self.assertEqual(producer.env["DISAGG_SERVER_URLS"], expected_urls)
@@ -818,6 +848,395 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(consumer.env["MOONCAKE_MASTER_SERVER_ADDR"], "127.0.0.1:35551")
         rendered = json.loads(plan.render())
         self.assertEqual(len(rendered["services"]), 3)
+
+    def test_managed_local_plan_renders_server_knobs_and_passthrough(self):
+        servers = [
+            {
+                "port": 30000,
+                "cuda_visible_devices": ["0"],
+                "tp_size": 1,
+                "extra_args": ["--prefill-max-requests", 4],
+                "env": {
+                    "SGLANG_SPEC_CAPTURE_TIMING": 1,
+                    "SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES": "2",
+                },
+            },
+            {"port": 30001, "cuda_visible_devices": ["1"], "tp_size": 1},
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"), servers=servers)
+            raw = cfg.model_dump()
+            raw["model"].update(
+                sglang_max_prefill_tokens=65536,
+                sglang_linear_attn_prefill_backend="triton",
+                sglang_fp8_gemm_backend="deep_gemm",
+                sglang_disable_cuda_graph=True,
+                sglang_extra_args=["--enable-metrics", "--admin-api-key", "top-secret"],
+            )
+            cfg = Config.model_validate(raw)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                plan = build_launch_plan(cfg, config_path="run.yaml", env={})
+
+        first, second = (service.command for service in plan.services[1:])
+        for command in (first, second):
+            argv = command.argv
+            for flag, expected in (
+                ("--max-prefill-tokens", "65536"),
+                ("--linear-attn-prefill-backend", "triton"),
+                ("--fp8-gemm-backend", "deep_gemm"),
+            ):
+                self.assertEqual(argv[argv.index(flag) + 1], expected)
+            self.assertIn("--disable-cuda-graph", argv)
+            self.assertNotIn("--extra-args", argv)
+        # Global passthrough closes every command; per-server tokens follow it.
+        self.assertEqual(
+            first.argv[-5:],
+            (
+                "--enable-metrics",
+                "--admin-api-key",
+                "top-secret",
+                "--prefill-max-requests",
+                "4",
+            ),
+        )
+        self.assertEqual(
+            second.argv[-3:], ("--enable-metrics", "--admin-api-key", "top-secret")
+        )
+        self.assertEqual(first.env["SGLANG_SPEC_CAPTURE_TIMING"], "1")
+        self.assertEqual(first.env["SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES"], "2")
+        self.assertEqual(first.env["CUDA_VISIBLE_DEVICES"], "0")
+        self.assertNotIn("SGLANG_SPEC_CAPTURE_TIMING", second.env)
+
+        rendered = plan.render()
+        self.assertNotIn("top-secret", rendered)
+        services = json.loads(rendered)["services"]
+        self.assertEqual(
+            services[1]["command"]["argv"][-5:],
+            [
+                "--enable-metrics",
+                "--admin-api-key",
+                "<redacted>",
+                "--prefill-max-requests",
+                "4",
+            ],
+        )
+        self.assertEqual(
+            services[1]["command"]["env"]["SGLANG_SPEC_CAPTURE_TIMING"], "1"
+        )
+
+    def test_managed_local_passthrough_rejects_owned_and_repeated_settings(self):
+        cfg = _managed_config("/fresh/managed-attempt")
+
+        def server(**values):
+            def mutate(raw):
+                raw["deployment"]["disaggregated"]["managed_local"]["capture_servers"][
+                    0
+                ].update(values)
+
+            return mutate
+
+        def model(**values):
+            return lambda raw: raw["model"].update(values)
+
+        invalid_cases = {
+            "launcher-owned flag": (
+                model(sglang_extra_args=["--chunked-prefill-size", "8192"]),
+                "--chunked-prefill-size; it is rendered from the capture launcher",
+            ),
+            "owned flag alias": (
+                model(sglang_extra_args=["--tensor-parallel-size", "2"]),
+                r"--tensor-parallel-size; it is rendered from capture_servers\[\]",
+            ),
+            "owned flag with inline value": (
+                model(sglang_extra_args=["--context-length=4096"]),
+                "--context-length; it is rendered from model.sglang_context_length",
+            ),
+            "flag rendered from a typed field": (
+                model(sglang_extra_args=["--mem-fraction-static", "0.5"]),
+                "rendered from model.sglang_mem_fraction_static",
+            ),
+            "flag rendered from a convenience field": (
+                model(
+                    sglang_max_prefill_tokens=8192,
+                    sglang_extra_args=["--max-prefill-tokens", "4096"],
+                ),
+                "rendered from model.sglang_max_prefill_tokens",
+            ),
+            "cache dir": (
+                model(cache_dir="/models", sglang_extra_args=["--download-dir", "x"]),
+                "rendered from model.cache_dir",
+            ),
+            "leading value": (
+                model(sglang_extra_args=["65536"]),
+                "must start with a --flag",
+            ),
+            "flag and value in one item": (
+                model(sglang_extra_args=["--max-prefill-tokens 65536"]),
+                "list each flag and each value as its own item",
+            ),
+            "repeated flag": (
+                model(sglang_extra_args=["--enable-metrics", "--enable-metrics"]),
+                "repeats --enable-metrics",
+            ),
+            "boolean token": (
+                model(sglang_extra_args=["--enable-metrics", True]),
+                "quote boolean-looking values",
+            ),
+            # /health stays open under --api-key; every capture call would 401.
+            "api key": (
+                model(sglang_extra_args=["--api-key", "x"]),
+                "must not set --api-key; the capture adapter sends no API key",
+            ),
+            # The typed sglang_enable_dp_* fields are rejected for managed_local.
+            "dp attention": (
+                model(sglang_extra_args=["--enable-dp-attention"]),
+                "must not set --enable-dp-attention; managed_local capture "
+                "servers do not support SGLang DP options",
+            ),
+            "server dp lm head": (
+                server(extra_args=["--enable-dp-lm-head"]),
+                "must not set --enable-dp-lm-head",
+            ),
+            "sglang config file": (
+                model(sglang_extra_args=["--config", "server.yaml"]),
+                "must not set --config",
+            ),
+            # SGLang's argparse expands unambiguous prefixes.
+            "abbreviated owned flag": (
+                model(sglang_extra_args=["--context-len=4096"]),
+                "--context-len is a prefix of --context-length",
+            ),
+            "server abbreviates a rendered field": (
+                server(extra_args=["--mem-fraction", "0.5"]),
+                "--mem-fraction is a prefix of --mem-fraction-static",
+            ),
+            "abbreviated unsupported flag": (
+                model(sglang_extra_args=["--enable-dp-att"]),
+                "is a prefix of --enable-dp-attention",
+            ),
+            "server owned flag": (
+                server(extra_args=["--port", "30005"]),
+                r"--port; it is rendered from capture_servers\[\].port",
+            ),
+            "server repeats a rendered field": (
+                server(extra_args=["--attention-backend", "fa3"]),
+                r"capture_servers\[0\].extra_args must not set --attention-backend",
+            ),
+            "server repeats a global passthrough flag": (
+                lambda raw: (
+                    model(sglang_extra_args=["--dp-size", "2"])(raw),
+                    server(extra_args=["--data-parallel-size", "2"])(raw),
+                ),
+                "rendered from model.sglang_extra_args",
+            ),
+            "mooncake env": (
+                server(env={"MOONCAKE_PROTOCOL": "rdma"}),
+                "must not set MOONCAKE_PROTOCOL",
+            ),
+            "transport env": (
+                server(env={"DISAGG_SERVER_URLS": "http://x:1"}),
+                "must not set DISAGG_SERVER_URLS",
+            ),
+            "device env": (
+                server(env={"CUDA_VISIBLE_DEVICES": "3"}),
+                r"set from capture_servers\[\].cuda_visible_devices",
+            ),
+            "gpu put env": (
+                server(env={"SGLANG_SPEC_CAPTURE_GPU_PUT": "1"}),
+                r"set from capture_servers\[\].gpu_put",
+            ),
+            "invalid env name": (
+                server(env={"NOT-A-NAME": "1"}),
+                "environment variable names",
+            ),
+        }
+        for name, (mutate, message) in invalid_cases.items():
+            with self.subTest(case=name):
+                raw = cfg.model_dump()
+                mutate(raw)
+                with self.assertRaisesRegex(ValidationError, message):
+                    Config.model_validate(raw)
+
+        # Distinct flags that merely share a prefix with another stay valid.
+        raw = cfg.model_dump()
+        model(
+            sglang_extra_args=[
+                "--enable-metrics-for-all-schedulers",
+                "--disable-cuda-graph-padding",
+                "--admin-api-key",
+                "k",
+            ]
+        )(raw)
+        server(extra_args=["--enable-metrics"])(raw)
+        valid = Config.model_validate(raw)
+        self.assertEqual(
+            valid.deployment.disaggregated.managed_local.capture_servers[0].extra_args,
+            ["--enable-metrics"],
+        )
+
+    def test_passthrough_rejects_abbreviated_duplicates_in_either_order(self):
+        # Include a passthrough-only option: this must not depend on whether
+        # ModelConfig has a typed field for the full spelling.
+        for full, short in (
+            ("--max-prefill-tokens", "--max-prefill-token"),
+            ("--prefill-max-requests", "--prefill-max-request"),
+        ):
+            for first, second in ((full, short), (short, full)):
+                for placement in ("global", "server", "both"):
+                    with self.subTest(first=first, second=second, placement=placement):
+                        raw = _managed_config("/fresh/managed-attempt").model_dump()
+                        server = raw["deployment"]["disaggregated"]["managed_local"][
+                            "capture_servers"
+                        ][0]
+                        if placement == "global":
+                            raw["model"]["sglang_extra_args"] = [
+                                first,
+                                "8",
+                                second,
+                                "4",
+                            ]
+                        elif placement == "server":
+                            server["extra_args"] = [first, "8", second, "4"]
+                        else:
+                            raw["model"]["sglang_extra_args"] = [first, "8"]
+                            server["extra_args"] = [f"{second}=4"]
+                        with self.assertRaisesRegex(
+                            ValidationError, "spell out the full flag"
+                        ):
+                            Config.model_validate(raw)
+
+    def test_passthrough_rejects_aliases_of_the_same_option(self):
+        pairs = (
+            (
+                ("--smg-http-sidecar-port", "31000"),
+                ("--grpc-http-sidecar-port", "32000"),
+            ),
+            (("--pp-size", "1"), ("--pipeline-parallel-size", "2")),
+            (
+                ("--speculative-draft-model-path", "a"),
+                ("--speculative-draft-model", "b"),
+            ),
+            (("--lora-strict-loading",), ("--no-lora-strict-loading",)),
+        )
+        for pair in pairs:
+            for first, second in (pair, pair[::-1]):
+                for inline in (False, True):
+                    args = [
+                        (
+                            [f"{tokens[0]}={tokens[1]}"]
+                            if inline and len(tokens) == 2
+                            else list(tokens)
+                        )
+                        for tokens in (first, second)
+                    ]
+                    for placement in ("global", "server", "both"):
+                        with self.subTest(
+                            first=first, inline=inline, placement=placement
+                        ):
+                            raw = _managed_config("/fresh/managed-attempt").model_dump()
+                            server = raw["deployment"]["disaggregated"][
+                                "managed_local"
+                            ]["capture_servers"][0]
+                            if placement == "global":
+                                raw["model"]["sglang_extra_args"] = args[0] + args[1]
+                            elif placement == "server":
+                                server["extra_args"] = args[0] + args[1]
+                            else:
+                                raw["model"]["sglang_extra_args"] = args[0]
+                                server["extra_args"] = args[1]
+                            with self.assertRaisesRegex(
+                                ValidationError, "repeats|rendered from"
+                            ):
+                                Config.model_validate(raw)
+
+    def test_secret_abbreviations_are_rejected_and_redacted(self):
+        secret = "example-secret-value"
+        for flag in ("--admin", "--admin-api-k", "--admin-api-ke"):
+            for args in ([flag, secret], [f"{flag}={secret}"]):
+                with self.subTest(args=args):
+                    # Rendering is defensive even before config validation.
+                    command = CommandSpec("capture", tuple(args))
+                    self.assertNotIn(secret, json.dumps(command.as_dict()))
+                    self.assertIn("<redacted>", json.dumps(command.as_dict()))
+                    self.assertEqual(command.argv, tuple(args))
+                    for placement in ("global", "server"):
+                        raw = _managed_config("/fresh/managed-attempt").model_dump()
+                        if placement == "global":
+                            raw["model"]["sglang_extra_args"] = args
+                        else:
+                            raw["deployment"]["disaggregated"]["managed_local"][
+                                "capture_servers"
+                            ][0]["extra_args"] = args
+                        with self.assertRaisesRegex(
+                            ValidationError, "spell out the full flag"
+                        ):
+                            Config.model_validate(raw)
+
+    def test_distinct_full_passthrough_flags_with_shared_prefix_remain_valid(self):
+        for short, full in (
+            ("--enable-metrics", "--enable-metrics-for-all-schedulers"),
+            ("--disable-cuda-graph", "--disable-cuda-graph-padding"),
+        ):
+            for first, second in ((short, full), (full, short)):
+                for placement in ("global", "server", "both"):
+                    with self.subTest(first=first, second=second, placement=placement):
+                        raw = _managed_config("/fresh/managed-attempt").model_dump()
+                        server = raw["deployment"]["disaggregated"]["managed_local"][
+                            "capture_servers"
+                        ][0]
+                        if placement == "global":
+                            raw["model"]["sglang_extra_args"] = [first, second]
+                        elif placement == "server":
+                            server["extra_args"] = [first, second]
+                        else:
+                            raw["model"]["sglang_extra_args"] = [first]
+                            server["extra_args"] = [second]
+                        Config.model_validate(raw)
+
+    def test_flag_tables_match_the_pinned_sglang_parser(self):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        from specforge.config.schema import (
+            _SGLANG_EXACT_PREFIX_FLAGS,
+            _SGLANG_FLAG_ALIASES,
+        )
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        flags = {
+            flag
+            for action in parser._actions
+            for flag in action.option_strings
+            if flag.startswith("--")
+        }
+        prefixes = {
+            flag
+            for flag in flags
+            if any(other != flag and other.startswith(flag) for other in flags)
+        }
+        self.assertEqual(_SGLANG_EXACT_PREFIX_FLAGS, prefixes)
+
+        # Deprecated aliases may be separate actions with the same dest.
+        # BooleanOptionalAction's positive/negative spellings also write one
+        # setting and must not bypass the no-overrides rule.
+        by_dest = {}
+        for action in parser._actions:
+            by_dest.setdefault(action.dest, set()).update(
+                flag for flag in action.option_strings if flag.startswith("--")
+            )
+        actual_groups = {
+            frozenset(group) for group in by_dest.values() if len(group) > 1
+        }
+        configured_groups = {
+            frozenset((flag, *aliases))
+            for flag, aliases in _SGLANG_FLAG_ALIASES.items()
+        }
+        self.assertEqual(configured_groups, actual_groups)
 
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (

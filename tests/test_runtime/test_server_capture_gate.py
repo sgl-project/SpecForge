@@ -13,7 +13,9 @@ What is pinned here:
   layers, and ``lm_head(last_hidden)`` matches the HF logits (norm-placement
   agnostic), within the documented bf16 tolerance;
 - strategy-agnosticism: the same server serves eagle3 (aux + last_hidden) and
-  dflash (aux only) requests, named per strategy by the client schema.
+  dflash (aux + last_hidden, or aux only with
+  ``training.dflash_teacher_metrics=false``) requests, named per strategy by
+  the client schema; an unrequested artifact is never written.
 - cache isolation: radix cache stays enabled and sequential identical prompts
   still capture every token because each request attempt has a fresh
   ``extra_key`` namespace.
@@ -46,12 +48,18 @@ AUX_LAYER_IDS = [1, 3, 4]
 H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
 
 
-def _capture_schema(algorithm: str):
+def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
+    from types import SimpleNamespace
+
     from specforge.algorithms.builtin import builtin_algorithm_registry
+    from specforge.algorithms.common.providers import resolve_server_capture_layout
     from specforge.inference.adapters.server_capture import ServerCaptureSchema
 
     registration = builtin_algorithm_registry().resolve(algorithm)
-    layout = registration.providers.server_streaming_for("text").layout
+    config = SimpleNamespace(
+        training=SimpleNamespace(dflash_teacher_metrics=teacher_metrics)
+    )
+    layout = resolve_server_capture_layout(registration, config, modality="text")
     return ServerCaptureSchema(
         aux_feature=layout.aux_feature,
         last_hidden_feature=layout.last_hidden_feature,
@@ -66,6 +74,15 @@ def _patched_sglang() -> bool:
 
 def _mooncake_available() -> bool:
     return importlib.util.find_spec("mooncake.store") is not None
+
+
+def _log_tail(path, lines=80):
+    """Last lines of a subprocess log, so CI shows why the process died."""
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+    except OSError as exc:
+        return f"<could not read {path}: {exc}>"
 
 
 @unittest.skipUnless(
@@ -159,7 +176,9 @@ class TestServerCaptureGate(unittest.TestCase):
                 break
             time.sleep(5)
         raise RuntimeError(
-            f"sglang server did not become healthy; see {cls.workdir}/server.log"
+            "sglang server did not become healthy "
+            f"(exit code {cls.server.poll()}); tail of {cls.workdir}/server.log:\n"
+            + _log_tail(os.path.join(cls.workdir, "server.log"))
         )
 
     @classmethod
@@ -417,6 +436,54 @@ class TestServerCaptureGate(unittest.TestCase):
             out["hidden_states"].float(), aux_ref[0].float(), rtol=TOL, atol=TOL
         )
         store.release(handle)
+
+    def test_dflash_capture_without_teacher_metrics_skips_last_hidden(self):
+        from specforge.inference.adapters.server_capture import (
+            SGLangServerCaptureAdapter,
+        )
+        from specforge.inference.capture import CaptureConfig
+        from specforge.runtime.contracts import SampleRef
+
+        rows = [[3, 1, 4, 1, 5], [2, 7, 1, 8, 2, 8]]
+        store = self._store("gate-dflash-noteacher")
+        adapter = SGLangServerCaptureAdapter(
+            f"http://localhost:{PORT}",
+            store,
+            run_id="gate2",
+            algorithm="dflash",
+            schema=_capture_schema("dflash", teacher_metrics=False),
+        )
+        contract = CaptureConfig.from_strategy(
+            required_features={"input_ids", "hidden_states", "loss_mask"},
+            aux_hidden_state_layer_ids=tuple(AUX_LAYER_IDS),
+            target_repr="hidden_state",
+            target_hidden_size=H,
+        )
+        refs = adapter.produce_refs(self._tasks(rows), capture=contract)
+        aux_ref, _ = self._hf_reference(rows)
+        for i, ref in enumerate(refs):
+            self.assertIsInstance(ref, SampleRef, f"expected a ref, got: {ref}")
+            self.assertEqual(
+                ["hidden_states", "input_ids", "loss_mask"], sorted(ref.feature_specs)
+            )
+            # The sink wrote no object under the teacher feature's key.
+            generation = int(ref.metadata["generation"])
+            self.assertFalse(
+                store._store_exists(
+                    store._tkey(ref.sample_id, generation, "target_last_hidden_states")
+                )
+            )
+            self.assertTrue(
+                store._store_exists(
+                    store._tkey(ref.sample_id, generation, "hidden_states")
+                )
+            )
+            out, handle = store.get(ref)
+            self.assertEqual(["hidden_states", "input_ids", "loss_mask"], sorted(out))
+            torch.testing.assert_close(
+                out["hidden_states"].float(), aux_ref[i].float(), rtol=TOL, atol=TOL
+            )
+            store.release(handle)
 
 
 if __name__ == "__main__":
