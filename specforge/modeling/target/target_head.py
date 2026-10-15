@@ -75,7 +75,9 @@ class TargetHead(nn.Module):
                     model_path, key_filter=keys.__contains__, cache_dir=cache_dir
                 )
                 if not tensors:
-                    raise KeyError(f"Checkpoint is missing tied tensors: {sorted(keys)}")
+                    raise KeyError(
+                        f"Checkpoint is missing tied tensors: {sorted(keys)}"
+                    )
             else:
                 tensors = load_checkpoint_tensors(
                     model_path, keys=keys, cache_dir=cache_dir
