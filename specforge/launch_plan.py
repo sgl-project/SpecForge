@@ -488,7 +488,7 @@ def _capture_flags(server_capture: str, contract) -> tuple[str, ...]:
         return (
             "--aux-hidden-state-capture",
             contract.method,
-            "--aux-hidden-state-layer-ids",
+            "--return-aux-hidden-state-layer-ids",
             *layer_ids,
             "--return-hidden-states-mode",
             "full",

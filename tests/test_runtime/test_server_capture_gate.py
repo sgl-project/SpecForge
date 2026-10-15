@@ -104,7 +104,7 @@ def _capture_server_flags():
         return [
             "--aux-hidden-state-capture",
             "eagle3",
-            "--aux-hidden-state-layer-ids",
+            "--return-aux-hidden-state-layer-ids",
             *layer_ids,
             "--return-hidden-states-mode",
             "full",

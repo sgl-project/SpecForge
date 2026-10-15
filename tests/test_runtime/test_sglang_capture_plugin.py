@@ -374,7 +374,7 @@ def _scheduler():
 class TestInstall(unittest.TestCase):
     FEATURES = dict(
         aux_hidden_state_capture="dflash",
-        aux_hidden_state_layer_ids=[1, 3],
+        return_aux_hidden_state_layer_ids=[1, 3],
         return_hidden_states_mode="full",
     )
 

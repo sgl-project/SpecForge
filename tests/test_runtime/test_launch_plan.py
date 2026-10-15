@@ -744,7 +744,7 @@ class LaunchPlanTest(unittest.TestCase):
         ):
             self.assertNotIn(flag, argv)
         self.assertEqual(argv[argv.index("--aux-hidden-state-capture") + 1], "dflash")
-        layers = argv.index("--aux-hidden-state-layer-ids")
+        layers = argv.index("--return-aux-hidden-state-layer-ids")
         self.assertEqual(argv[layers + 1 : layers + 6], ("1", "9", "17", "25", "33"))
         self.assertEqual(argv[argv.index("--return-hidden-states-mode") + 1], "full")
         self.assertEqual(argv[argv.index("--chunked-prefill-size") + 1], "-1")

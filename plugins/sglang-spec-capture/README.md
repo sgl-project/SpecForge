@@ -5,7 +5,7 @@ into Mooncake for SpecForge's disaggregated training. It replaces the
 versioned source patch under `patches/sglang/` on SGLang builds that ship the
 generic extension points it uses:
 
-- `--aux-hidden-state-capture` / `--aux-hidden-state-layer-ids`: aux
+- `--aux-hidden-state-capture` / `--return-aux-hidden-state-layer-ids`: aux
   hidden-state capture on a target without a draft. The post-norm last hidden
   states are kept next to the aux concatenation.
 - `ModelRunner.forward_observer`: reads each prefill's hidden states and hands
@@ -33,7 +33,7 @@ MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:50051 \
 MOONCAKE_METADATA_SERVER=http://127.0.0.1:8080/metadata \
 python -m sglang.launch_server --model-path <target> --skip-tokenizer-init \
   --chunked-prefill-size -1 \
-  --aux-hidden-state-capture dflash --aux-hidden-state-layer-ids 1 16 31 46 61 \
+  --aux-hidden-state-capture dflash --return-aux-hidden-state-layer-ids 1 16 31 46 61 \
   --return-hidden-states-mode full
 ```
 

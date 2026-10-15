@@ -44,7 +44,7 @@ SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
     "--spec-capture-method": "the algorithm's capture contract",
     "--spec-capture-aux-layer-ids": "the algorithm's capture contract",
     "--aux-hidden-state-capture": "the algorithm's capture contract",
-    "--aux-hidden-state-layer-ids": "the algorithm's capture contract",
+    "--return-aux-hidden-state-layer-ids": "the algorithm's capture contract",
     "--return-hidden-states-mode": "the capture launcher (full prefill capture)",
     "--enable-return-hidden-states": "the capture launcher (full prefill capture)",
     "--host": "the capture launcher (loopback)",

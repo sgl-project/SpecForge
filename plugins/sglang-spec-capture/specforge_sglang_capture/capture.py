@@ -438,7 +438,7 @@ def install(scheduler) -> CaptureRuntime:
         )
 
     runtime = CaptureRuntime(
-        sink=SpecCaptureSink(features.aux_hidden_state_layer_ids),
+        sink=SpecCaptureSink(features.return_aux_hidden_state_layer_ids),
         is_writer=get_parallel().attn_tp_rank == 0,
         gpu_put=gpu_put_enabled(),
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
