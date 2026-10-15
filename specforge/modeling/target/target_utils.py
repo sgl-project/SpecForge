@@ -66,6 +66,13 @@ def target_text_config(config):
     return getattr(config, "text_config", config)
 
 
+def target_ties_word_embeddings(config) -> bool:
+    return any(
+        getattr(candidate, "tie_word_embeddings", False)
+        for candidate in (config, target_text_config(config))
+    )
+
+
 def target_vocab_size(config) -> int:
     text_config = target_text_config(config)
     return int(
@@ -123,7 +130,7 @@ class TargetEmbeddingsAndHead(nn.Module):
             lm_head_key = "lm_head.weight"
 
         # 2. Handle Weight Tying
-        tie_weights = getattr(config, "tie_word_embeddings", False)
+        tie_weights = target_ties_word_embeddings(config)
 
         # 3. Load Weights
         instance._load_weights(
@@ -203,5 +210,6 @@ __all__ = [
     "TargetEmbeddingsAndHead",
     "load_target_config",
     "target_text_config",
+    "target_ties_word_embeddings",
     "target_vocab_size",
 ]

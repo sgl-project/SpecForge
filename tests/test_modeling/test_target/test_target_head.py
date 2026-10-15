@@ -7,6 +7,7 @@ from safetensors.torch import save_file
 from transformers import Qwen2Config
 
 from specforge.modeling.target.target_head import TargetHead
+from specforge.modeling.target.target_utils import load_target_config
 
 
 class TargetHeadPreprocessTest(unittest.TestCase):
@@ -84,8 +85,8 @@ class TargetHeadLoadingTest(unittest.TestCase):
                 {self.embed_key: torch.ones(4, 3), self.head_key: lm_head},
                 tie_word_embeddings=False,
             )
-            head = TargetHead(tmp)
-            head.load_weights(tmp)
+            head = TargetHead(load_target_config(tmp))
+            head._load_weights(tmp)
 
         torch.testing.assert_close(head.fc.weight, lm_head)
 
@@ -93,41 +94,42 @@ class TargetHeadLoadingTest(unittest.TestCase):
         embedding = torch.full((4, 3), 5.0)
         with tempfile.TemporaryDirectory() as tmp:
             self._checkpoint(tmp, {self.embed_key: embedding}, tie_word_embeddings=True)
-            head = TargetHead(tmp)
-            head.load_weights(tmp, embedding_key=self.embed_key)
+            head = TargetHead(load_target_config(tmp))
+            head._load_weights(tmp, embedding_key=self.embed_key)
 
         torch.testing.assert_close(head.fc.weight, embedding)
 
-    def test_tied_checkpoint_prefers_stored_lm_head(self):
+    def test_tied_checkpoint_prefers_embedding_over_stored_lm_head(self):
+        embedding = torch.ones(4, 3)
         lm_head = torch.full((4, 3), 7.0)
         with tempfile.TemporaryDirectory() as tmp:
             self._checkpoint(
                 tmp,
-                {self.embed_key: torch.ones(4, 3), self.head_key: lm_head},
+                {self.embed_key: embedding, self.head_key: lm_head},
                 tie_word_embeddings=True,
             )
-            head = TargetHead(tmp)
-            head.load_weights(tmp)
+            head = TargetHead(load_target_config(tmp))
+            head._load_weights(tmp)
 
-        torch.testing.assert_close(head.fc.weight, lm_head)
+        torch.testing.assert_close(head.fc.weight, embedding)
 
     def test_untied_checkpoint_without_lm_head_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._checkpoint(
                 tmp, {self.embed_key: torch.ones(4, 3)}, tie_word_embeddings=False
             )
-            head = TargetHead(tmp)
+            head = TargetHead(load_target_config(tmp))
             with self.assertRaisesRegex(RuntimeError, "lm_head.weight"):
-                head.load_weights(tmp)
+                head._load_weights(tmp)
 
     def test_tied_checkpoint_missing_both_keys_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._checkpoint(
                 tmp, {"other.weight": torch.ones(4, 3)}, tie_word_embeddings=True
             )
-            head = TargetHead(tmp)
-            with self.assertRaisesRegex(RuntimeError, "both missing"):
-                head.load_weights(tmp)
+            head = TargetHead(load_target_config(tmp))
+            with self.assertRaisesRegex(RuntimeError, self.embed_key):
+                head._load_weights(tmp)
 
 
 if __name__ == "__main__":

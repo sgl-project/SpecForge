@@ -7,25 +7,16 @@ from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 from specforge.modeling.target.target_utils import (
     load_target_config,
     target_hidden_size,
-    target_text_config,
+    target_ties_word_embeddings,
     target_vocab_size,
 )
 from specforge.utils import get_local_device, padding
 
 
 class TargetHead(nn.Module):
-    def __init__(
-        self,
-        model_path,
-        trust_remote_code: bool = False,
-        cache_dir: Optional[str] = None,
-    ):
+    def __init__(self, config):
         super().__init__()
-        self.config = load_target_config(
-            model_path,
-            trust_remote_code=trust_remote_code,
-            cache_dir=cache_dir,
-        )
+        self.config = config
         self.hidden_size = target_hidden_size(self.config)
         self.vocab_size = target_vocab_size(self.config)
 
@@ -38,68 +29,55 @@ class TargetHead(nn.Module):
         lm_head_key: str = "lm_head.weight",
         embedding_key: str = "model.embed_tokens.weight",
         cache_dir: Optional[str] = None,
+        dtype: torch.dtype = torch.bfloat16,
         trust_remote_code: bool = False,
     ) -> "TargetHead":
-        target_head = cls(
+
+        config = load_target_config(
             model_path,
             trust_remote_code=trust_remote_code,
             cache_dir=cache_dir,
         )
-        target_head.load_weights(
+
+        instance = cls(config)
+
+        tie_weights = target_ties_word_embeddings(config)
+
+        instance._load_weights(
             model_path=model_path,
             lm_head_key=lm_head_key,
             embedding_key=embedding_key,
+            tie_weights=tie_weights,
             cache_dir=cache_dir,
         )
-        target_head.freeze_weights()
-        target_head = target_head.eval().to(
-            device=get_local_device(), dtype=torch.bfloat16
-        )
-        return target_head
-
-    def _ties_word_embeddings(self) -> bool:
-        # Multimodal configs may carry the flag at the top level, on
-        # text_config, or both.
-        return any(
-            getattr(config, "tie_word_embeddings", False)
-            for config in (self.config, target_text_config(self.config))
-        )
+        instance.freeze_weights()
+        instance = instance.eval().to(device=get_local_device(), dtype=dtype)
+        return instance
 
     @torch.no_grad()
-    def load_weights(
+    def _load_weights(
         self,
         model_path,
         lm_head_key: str = "lm_head.weight",
         embedding_key: str = "model.embed_tokens.weight",
+        tie_weights: bool = False,
         cache_dir: Optional[str] = None,
     ):
-        head_key = lm_head_key
+        head_key = embedding_key if tie_weights else lm_head_key
+
         try:
             tensors = load_checkpoint_tensors(
                 model_path,
-                keys=[lm_head_key],
+                keys=[head_key],
                 cache_dir=cache_dir,
             )
         except KeyError as exc:
-            if not self._ties_word_embeddings():
-                raise RuntimeError(
-                    f"Target head key {lm_head_key!r} is missing from {model_path}"
-                ) from exc
-            # Tied checkpoints usually store only the input embedding, which
-            # is also the output head.
-            head_key = embedding_key
-            try:
-                tensors = load_checkpoint_tensors(
-                    model_path,
-                    keys=[embedding_key],
-                    cache_dir=cache_dir,
-                )
-            except KeyError as tied_exc:
-                raise RuntimeError(
-                    f"Target head key {lm_head_key!r} and tied embedding key "
-                    f"{embedding_key!r} are both missing from {model_path}"
-                ) from tied_exc
+            raise RuntimeError(
+                f"Required target weight tensors were not loaded: {exc}"
+            ) from exc
+
         lm_head = tensors[head_key]
+
         if tuple(lm_head.shape) != tuple(self.fc.weight.shape):
             raise RuntimeError(
                 f"Target head {head_key!r} has shape {tuple(lm_head.shape)}, "
