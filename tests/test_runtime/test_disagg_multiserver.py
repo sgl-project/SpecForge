@@ -153,6 +153,7 @@ class TestMultiServerProducer(unittest.TestCase):
         server_lock = threading.Lock()
         first_call_started = threading.Event()
         release_first_call = threading.Event()
+        release_refilled_call = threading.Event()
         refilled_while_first_active = threading.Event()
         calls = 0
         active_calls = 0
@@ -170,8 +171,11 @@ class TestMultiServerProducer(unittest.TestCase):
                     first_call_started.set()
                     if not release_first_call.wait(5):
                         raise TimeoutError("test did not release first capture call")
-                elif call_index >= 2:
+                elif call_index == 2:
                     refilled_while_first_active.set()
+                    # Keep the refilled slot occupied until health is sampled.
+                    if not release_refilled_call.wait(5):
+                        raise TimeoutError("test did not release refilled capture call")
                 # The fake sink uses process-global torch RNG state; serialize
                 # only that test implementation, not the request lifecycle.
                 with server_lock:
@@ -208,7 +212,8 @@ class TestMultiServerProducer(unittest.TestCase):
             self.assertEqual(workers[0].health()["in_flight"], 2)
         finally:
             release_first_call.set()
-        thread.join(10)
+            release_refilled_call.set()
+            thread.join(10)
 
         self.assertFalse(thread.is_alive())
         self.assertNotIn("error", outcome)
