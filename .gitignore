@@ -202,3 +202,6 @@ wandb/
 
 # macOS
 .DS_Store
+
+.deployment/
+.codex-remote/

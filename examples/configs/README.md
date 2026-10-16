@@ -76,6 +76,13 @@ more patched SGLang capture servers, and the trainer GPU allocation; the same
 Recipes under `online/disaggregated/external` omit `managed_local`, so Mooncake
 and SGLang remain owned by the user, scheduler, or service platform.
 
+For Qwen3-8B DSpark-KV with causal convolution and D-PARD, use
+`online/disaggregated/managed-local/qwen3-8b-dspark-kv-conv-dpard-managed.yaml`.
+It allocates one capture GPU and one trainer GPU. The
+[KV+conv runbook](../../docs/recipes/dspark-kv-conv-objectives.md#start-a-local-d-pard-training-run)
+lists the SGLang capture patches, dependencies, path overrides, launch command,
+TensorBoard command, and the distinction between training and serving support.
+
 The `kimi-k3-dspark-disaggregated.yaml` recipe is the external
 two-node migration of the 64K Kimi K3 continual run. Its dedicated
 [runbook](../../docs/recipes/kimi-k3-dspark-disaggregated.md) pins the K3
@@ -272,7 +279,7 @@ Common fields:
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, or `dspark`. |
+| `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, `dspark`, or `dspark_kv`. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
@@ -309,6 +316,16 @@ Strategy-specific fields should be written only when tuning that objective:
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
 | DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
+
+DSpark and DSpark-KV share these additional objective and performance options:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `training.dspark_objective` | `ce_l1` | `ce_l1` uses the CE/L1 coefficients and supports DPaCE weighting. `dpard` replaces that draft loss with detached TV-credit-weighted Renyi-half divergence; CE/L1 remain diagnostics. D-PARD cannot be combined with `loss_type: dpace` or LK. |
+| `training.dspark_dpard_rho` | `0.5` | D-PARD survival smoothing in `[0, 1]`. It does not scale the confidence auxiliary objective. |
+| `training.dspark_flatten_projection` | `false` | Flatten token dimensions into a 2D frozen LM-head projection without changing the objective. |
+| `training.dspark_cache_projection` | `false` | Selectively retain frozen-head projections during objective checkpoint recomputation, trading memory for compute. |
+| `training.dspark_compile_objective` | `false` | Compile the supported CE/L1 probability and metric operations. D-PARD uses the reference path instead. |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 | MTP | `training.mtp_objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
 

@@ -9,6 +9,8 @@ import torch
 from torch import nn
 
 from .dflash import DFlashDraftModel, resolve_dflash_attention_mode
+from .dflash2 import DFlashGroupedConv, Qwen3DFlash2DecoderLayer
+from .dflash_kernels import DFlashKernels
 from .registry import register_draft
 
 
@@ -284,8 +286,40 @@ class DSparkDraftModel(DFlashDraftModel):
     """DFlash backbone with DSpark Markov/confidence heads."""
 
     expected_projector_type = "dspark"
+    _no_split_modules = ["Qwen3DFlashDecoderLayer", "Qwen3DFlash2DecoderLayer"]
 
-    def __init__(self, config) -> None:
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module) -> None:
+        super()._init_weights(module)
+        if isinstance(module, DFlashGroupedConv):
+            nn.init.zeros_(module.kernel_projection.weight)
+
+    def _build_decoder_layer(self, config, layer_idx, kernels):
+        method = dict(getattr(config, "dflash_config", None) or {})
+        fields = ("conv_kernel_size", "conv_group_size")
+        if not any(name in method for name in fields):
+            return super()._build_decoder_layer(config, layer_idx, kernels)
+        for name in fields:
+            if not isinstance(method.get(name), int) or isinstance(method[name], bool):
+                raise ValueError(f"DSpark convolution requires integer {name}")
+
+        def convolution():
+            return DFlashGroupedConv(
+                hidden_size=config.hidden_size,
+                block_size=self.block_size,
+                taps=method["conv_kernel_size"],
+                group_size=method["conv_group_size"],
+            )
+
+        return Qwen3DFlash2DecoderLayer(
+            config,
+            layer_idx,
+            kernels,
+            attention_conv=convolution(),
+            mlp_conv=convolution(),
+        )
+
+    def __init__(self, config, dflash_kernels: Optional[DFlashKernels] = None) -> None:
         dflash_config = dict(getattr(config, "dflash_config", None) or {})
         attention_mode = resolve_dflash_attention_mode(config)
         num_heads = int(config.num_attention_heads)
@@ -315,7 +349,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 "DSparkDraftModel requires " "dflash_config.projector_type='dspark'."
             )
         config.dflash_config = dflash_config
-        super().__init__(config)
+        super().__init__(config, dflash_kernels=dflash_kernels)
 
     def _sample_draft_tokens(
         self,

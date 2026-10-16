@@ -1,0 +1,33 @@
+model:
+  target_model_path: Qwen/Qwen3.5-4B
+  draft_model_config: configs/qwen3.5-4b-dspark-kv.json
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/dspark-kv/train
+  max_length: 8192
+
+training:
+  strategy: dspark_kv
+  num_epochs: 3
+  batch_size: 1
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  objective_chunk_blocks: 128
+  save_interval: 1000
+  log_interval: 50
+  seed: 42
+
+run_id: qwen3.5-4b-dspark-kv-offline
+output_dir: ./outputs/qwen3.5-4b-dspark-kv-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

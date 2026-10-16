@@ -50,7 +50,9 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
-    return {
+    from specforge.modeling.draft.dflash import dflash_attention_resume_contract
+
+    contract = {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -66,11 +68,33 @@ def resume_contract(_config, draft_model, training_model):
             training_model.dspark_confidence_head_alpha
         ),
     }
+    contract.update(dflash_attention_resume_contract(draft_model))
+    if getattr(training_model, "dspark_objective", "ce_l1") == "dpard":
+        contract.update(
+            dspark_objective="dpard",
+            dspark_dpard_rho=training_model.dspark_dpard_rho,
+            dspark_dpard_normalization="valid_token_mean",
+        )
+    if getattr(training_model, "causal_block", False):
+        contract["dspark_causal_block"] = True
+    if getattr(training_model, "loss_type", "dspark") != "dspark":
+        contract["dspark_loss_type"] = training_model.loss_type
+        contract["dspark_dpace_alpha"] = training_model.dpace_alpha
+    method = getattr(draft_model.config, "dflash_config", None) or {}
+    if "conv_kernel_size" in method:
+        contract["dspark_conv_kernel_size"] = method["conv_kernel_size"]
+        contract["dspark_conv_group_size"] = method["conv_group_size"]
+    return contract
 
 
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
+    if config.model.use_liger_kernel:
+        from specforge.algorithms.model_providers import build_dflash_draft
+        from specforge.modeling.draft.dflash_kernels import load_liger_dflash_kernels
+
+        return build_dflash_draft(config, draft_config, load_liger_dflash_kernels())
     return build_registered_draft(config, draft_config)
 
 

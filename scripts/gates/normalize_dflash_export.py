@@ -83,7 +83,13 @@ def _normalize_dspark(config: Dict[str, Any], method_config: Dict[str, Any]) -> 
     # The two required fields may already be top-level rather than nested.
     config["markov_rank"] = markov_rank
     config["markov_head_type"] = markov_head_type.lower()
-    config["architectures"] = ["Qwen3DSparkModel"]
+    config["architectures"] = [
+        (
+            "Qwen3DSparkKVModel"
+            if method_config.get("conditioning_source") == "target_kv"
+            else "Qwen3DSparkModel"
+        )
+    ]
 
 
 def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, Any]:
@@ -92,6 +98,14 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
         config = json.load(handle)
 
     method_config = config.get("dflash_config") or {}
+    is_causal = config.get("is_causal")
+    if is_causal is not None and not isinstance(is_causal, bool):
+        raise ValueError("is_causal must be a boolean or null")
+    if is_causal is False and "sliding_attention" in (config.get("layer_types") or []):
+        raise ValueError(
+            "Bidirectional sliding-window serving has not been validated by this "
+            "SGLang gate; use the SpecForge eager/sdpa inference path instead"
+        )
     top_level_block_size = config.get("block_size")
     nested_block_size = method_config.get("block_size")
     if (

@@ -33,7 +33,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a hard torch depende
 SCHEMA_VERSION = 1
 
 RunMode = Literal["online", "offline"]
-DraftStrategyName = Literal["eagle3", "dflash", "domino", "dspark", "peagle", "mtp"]
+DraftStrategyName = Literal[
+    "eagle3", "dflash", "domino", "dspark", "dspark_kv", "peagle", "mtp"
+]
 # Tagged union for the EAGLE3 target feature. The *strategy* owns the
 # projection so the trainer core stays branch-free:
 #   - pruned_logits: rollout applied the t2d vocab map; stored (seq, draft_vocab)
