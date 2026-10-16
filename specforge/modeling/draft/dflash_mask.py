@@ -87,11 +87,14 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
-    flex_block_size=None,
     sliding_window: Optional[int] = None,
     is_causal: Optional[bool] = None,
+    **kwargs,
 ):
-    """Construct a full or sliding Flex Attention mask for DFlash."""
+    """Construct a full or sliding Flex Attention mask for DFlash.
+
+    Extra keyword arguments (e.g. ``BLOCK_SIZE``) go to ``create_block_mask``.
+    """
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
@@ -134,9 +137,6 @@ def create_dflash_block_mask(
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
 
-    kwargs = {}
-    if flex_block_size is not None:
-        kwargs["BLOCK_SIZE"] = flex_block_size
     return create_block_mask(
         dflash_mask_mod,
         B=B,

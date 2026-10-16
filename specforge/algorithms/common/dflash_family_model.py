@@ -639,7 +639,7 @@ class OnlineDFlashModel(nn.Module):
             and flex_attention_backend() == "FLASH"
         ):
             # FLASH requires a minimum of this block size.
-            mask_args["flex_block_size"] = (256, 128)
+            mask_args["BLOCK_SIZE"] = (256, 128)
         sliding_window = self.draft_model.sliding_window
         if sliding_window is None:
             dflash_attn_mask = mask_builder(**mask_args)

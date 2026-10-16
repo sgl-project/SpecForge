@@ -841,7 +841,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             mask_builder = create_dflash_block_mask
             if flex_attention_backend() == "FLASH":
                 # FLASH requires a minimum of this block size.
-                mask_args["flex_block_size"] = (256, 128)
+                mask_args["BLOCK_SIZE"] = (256, 128)
         else:
             mask_builder = create_dflash_sdpa_mask
 

@@ -284,9 +284,9 @@ class TestDFlashGenerationMasks(unittest.TestCase):
                 self.assertEqual(builder.call_count, 2)
                 for call in builder.call_args_list:
                     if backend == "FLASH":
-                        self.assertEqual(call.kwargs["flex_block_size"], (256, 128))
+                        self.assertEqual(call.kwargs["BLOCK_SIZE"], (256, 128))
                     else:
-                        self.assertNotIn("flex_block_size", call.kwargs)
+                        self.assertNotIn("BLOCK_SIZE", call.kwargs)
 
     def test_bidirectional_full_attention_remains_unmasked(self):
         model, layers = _capture_model(["full_attention"])
