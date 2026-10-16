@@ -97,7 +97,10 @@ class OfflineKVTest(unittest.TestCase):
 
     def test_offline_contract_and_sequence_padding(self):
         registration = kv_registration()
-        self.assertFalse(registration.spec.supports_online)
+        self.assertTrue(registration.spec.supports_online)
+        self.assertEqual(
+            registration.providers.server_streaming[0].capture_method, "dspark_kv"
+        )
         collated = build_collator()([normalize_sample(sample(n), 8) for n in (4, 7)])
         self.assertEqual(collated["target_kv"].shape, (2, 7, 2, 2, 2, 4))
         self.assertEqual(collated["loss_mask"][0, 4:].count_nonzero(), 0)

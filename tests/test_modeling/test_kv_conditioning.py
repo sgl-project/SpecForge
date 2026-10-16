@@ -14,6 +14,7 @@ from specforge.algorithms.common.dflash_family_model import (
     OnlineDominoModel,
     OnlineDSparkModel,
 )
+from specforge.algorithms.common.providers import resolve_server_capture_layout
 from specforge.algorithms.common.target_kv_data import CAPTURE_FORMAT
 from specforge.application.composition import resolve_run
 from specforge.config import Config
@@ -383,6 +384,47 @@ class KVConditioningTest(unittest.TestCase):
         target.layer_types = ["linear_attention"] * 3
         with self.assertRaisesRegex(ValueError, "full-attention"):
             resolve_target_kv_config(raw, target)
+
+    def test_capture_options_use_resolved_target_and_can_drop_teacher_metrics(self):
+        for algorithm, draft_cls, _ in VARIANTS:
+            with self.subTest(model=draft_cls.__name__):
+                cfg = run_config(algorithm, conditioning_source="kv")
+                raw = draft_config(algorithm, draft_cls.__name__)
+                registration = resolve_run(cfg).algorithm
+                streaming = registration.providers.server_streaming_for("text")
+                with (
+                    patch(
+                        "specforge.modeling.target.target_utils.load_target_config",
+                        return_value=target_config(),
+                    ),
+                    patch(
+                        "specforge.training.model_loading.load_draft_config_source",
+                        return_value=raw,
+                    ),
+                ):
+                    options = streaming.capture_options(cfg)
+                self.assertEqual(options["target_kv_geometry"]["layer_ids"], [0, 2])
+                self.assertEqual(options["target_kv_geometry"]["heads"], 2)
+                self.assertEqual(streaming.layout.aux_feature, "target_kv")
+                self.assertEqual(
+                    resolve_server_capture_layout(
+                        registration, cfg, modality="text"
+                    ).aux_feature,
+                    "target_kv",
+                )
+                self.assertNotIn("hidden_states", streaming.layout.emitted_features)
+        cfg = run_config("dflash", conditioning_source="kv")
+        cfg.training.dflash_teacher_metrics = False
+        resolved = resolve_run(cfg).algorithm
+        self.assertNotIn(
+            "target_last_hidden_states",
+            resolved.spec.feature_contract("offline", "text").required_tensors,
+        )
+        self.assertIsNone(
+            resolve_server_capture_layout(
+                resolved, cfg, modality="text"
+            ).last_hidden_feature
+        )
 
     def test_export_gate_does_not_mislabel_kv_models_as_hidden_consumers(self):
         from scripts.gates.normalize_dflash_export import normalize_export
