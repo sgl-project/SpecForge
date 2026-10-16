@@ -72,6 +72,13 @@ def resume_contract(_config, draft_model, training_model):
     contract.update(dflash_attention_resume_contract(draft_model))
     if getattr(training_model, "causal_block", False):
         contract["dspark_causal_block"] = True
+    if getattr(training_model, "loss_type", "dspark") != "dspark":
+        contract["dspark_loss_type"] = training_model.loss_type
+        contract["dspark_dpace_alpha"] = training_model.dpace_alpha
+    method = getattr(draft_model.config, "dflash_config", None) or {}
+    if "conv_kernel_size" in method:
+        contract["dspark_conv_kernel_size"] = method["conv_kernel_size"]
+        contract["dspark_conv_group_size"] = method["conv_group_size"]
     return contract
 
 

@@ -31,6 +31,10 @@ the versioned target-KV capture patch and a compatible KV-aware consumer.
 The legacy `spec_generate` helper rejects KV drafts rather than capturing the
 wrong features.
 
+For Qwen3-8B online training with optional convolution and either DPaCE or
+D-PARD, see [the combined recipes](../../recipes/dspark-kv-conv-objectives.md).
+The offline workflow and positional controls below remain available.
+
 ## Target metadata and draft choices
 
 Training resolves KV heads, head dimension, RoPE theta, rotary dimension and
