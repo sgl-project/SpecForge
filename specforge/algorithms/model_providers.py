@@ -389,8 +389,6 @@ def build_dflash_model(
         tokenizer,
         lambda common: OnlineDFlashModel(
             **common,
-            loss_type=cfg.training.loss_type,
-            dpace_alpha=cfg.training.dpace_alpha,
             selector_loss_alpha=cfg.training.dflash2_selector_loss_alpha,
             selector_warmup_ratio=cfg.training.dflash2_selector_warmup_ratio,
             selector_ramp_ratio=cfg.training.dflash2_selector_ramp_ratio,

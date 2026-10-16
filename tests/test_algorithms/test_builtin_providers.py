@@ -99,10 +99,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         for registration in self.registry:
             with self.subTest(algorithm=registration.name):
                 providers = registration.providers
-                if registration.name == "dspark_kv":
-                    self.assertEqual(providers.server_streaming, ())
-                else:
-                    self.assertGreaterEqual(len(providers.server_streaming), 1)
+                self.assertGreaterEqual(len(providers.server_streaming), 1)
                 self.assertFalse(hasattr(providers, "colocated"))
                 self.assertFalse(hasattr(providers, "target_backend"))
                 self.assertFalse(hasattr(providers, "deployment"))

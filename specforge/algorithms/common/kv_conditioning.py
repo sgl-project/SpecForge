@@ -43,6 +43,22 @@ def _build_training_model(
     return original(config, draft_model, draft_config, target_config, tokenizer)
 
 
+def _capture_options(draft_provider, config):
+    from specforge.modeling.draft.target_kv import capture_geometry
+    from specforge.modeling.target.target_utils import load_target_config
+    from specforge.training.model_loading import draft_config_dict
+
+    target = load_target_config(
+        config.model.target_model_path,
+        cache_dir=config.model.cache_dir,
+        trust_remote_code=config.model.trust_remote_code,
+    )
+    if getattr(target, "model_type", None) != "qwen3":
+        raise ValueError("online target-KV capture currently supports Qwen3 only")
+    draft = draft_config_dict(config, provider=draft_provider)
+    return {"target_kv_geometry": capture_geometry(draft, target)}
+
+
 def configure_kv_conditioning(config, algorithm):
     """Return a new registration; preserve the immutable hidden-input catalog."""
     if config.model.input_modality != "text":
@@ -54,11 +70,16 @@ def configure_kv_conditioning(config, algorithm):
     include_teacher = layout.last_hidden_feature is not None
     required = set(data.feature_names(include_teacher=include_teacher))
     collator = partial(data.build_collator, include_teacher=include_teacher)
-    contract = algorithm.spec.feature_contract(FeatureMode.OFFLINE, "text")
-    storage = replace(
-        contract.storage, format=data.CAPTURE_FORMAT, required_tensors=required
-    )
-    contracts = (replace(contract, required_tensors=required, storage=storage),)
+    contracts = []
+    for contract in algorithm.spec.feature_contracts:
+        storage = None
+        if contract.mode == FeatureMode.OFFLINE:
+            storage = replace(
+                contract.storage,
+                format=data.CAPTURE_FORMAT,
+                required_tensors=required,
+            )
+        contracts.append(replace(contract, required_tensors=required, storage=storage))
 
     # Retain the algorithm's provider identity; conditioning only changes its
     # feature format and executable adapters. No normalizer-ID dispatch is used.
@@ -76,6 +97,15 @@ def configure_kv_conditioning(config, algorithm):
         build_collator=collator,
         capture_layout=None,  # KV uses the dedicated capture preparation script.
     )
+    streaming = replace(
+        streaming,
+        # Existing versioned SGLang extension uses this wire protocol name.
+        capture_method="dspark_kv",
+        layout=replace(layout, aux_feature="target_kv"),
+        select_layout=None,  # Teacher selection is already resolved above.
+        build_collator=collator,
+        capture_options=partial(_capture_options, base.model.draft_config),
+    )
     providers = replace(
         base,
         step=replace(
@@ -90,7 +120,7 @@ def configure_kv_conditioning(config, algorithm):
             ),
         ),
         offline=(offline,),
-        server_streaming=(),
+        server_streaming=(streaming,),
     )
     return make_registration(
         replace(algorithm.spec, feature_contracts=tuple(contracts)), providers

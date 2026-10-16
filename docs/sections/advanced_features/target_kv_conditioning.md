@@ -23,9 +23,11 @@ name is not registered as an algorithm. The old draft-config spelling
 `target_kv` remains readable. Old strategy-specific checkpoint resume contracts
 are not migrated; use a weight-only warm start when moving those runs.
 
-This supports offline Qwen3/Qwen3.5 features and GQA/MHA
+This supports offline Qwen3/Qwen3.5 features, online Qwen3 capture, and GQA/MHA
 draft attention. DSpine, EAGLE/P-EAGLE, MTP, MLA, multimodal positions, and
-speculative serving are not implemented by this recipe. Online KV capture is added by a subsequent stack layer.
+speculative serving are not implemented by this recipe. Stock SGLang does not
+automatically support this conditioning interface; online training requires
+the versioned target-KV capture patch and a compatible KV-aware consumer.
 The legacy `spec_generate` helper rejects KV drafts rather than capturing the
 wrong features.
 
@@ -56,6 +58,11 @@ teacher diagnostics are enabled; Domino's KV context path does not require them.
 Hidden and KV models have different input projections, so switching the setting
 is not an exact optimizer-state resume. The KV geometry and transform choices
 are part of the resume contract.
+
+The current online capture extension requires Qwen3, TP=1, PP=1, disabled CUDA
+graphs and radix cache, and `--chunked-prefill-size -1`. Its wire capture method
+is still named `dspark_kv`, while feature records retain the actual training
+strategy (`dflash`, `domino`, or `dspark`). Apply the versioned patch explicitly.
 
 ## Positional Re-encoding
 
