@@ -283,7 +283,14 @@ Common fields:
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
-| `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
+| `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. Not supported with `optimizer: muon`. |
+| `training.optimizer` | `adamw` | `adamw`, or `muon`: Muon on every 2-D `nn.Linear` weight inside the draft's decoder layers (`layers.<i>.` or `midlayer.`), AdamW at `learning_rate` on every other tensor; one global clip and one schedule multiplier for both groups. See [Hybrid Muon optimizer](../../docs/sections/basic_usage/training.md#hybrid-muon-optimizer). |
+| `training.muon_learning_rate` | `null` | Muon peak learning rate; required with, and only valid with, `optimizer: muon`. |
+| `training.muon_momentum` | `0.95` | Muon momentum in `[0, 1)` (`buf = momentum * buf + (1 - momentum) * grad`). |
+| `training.muon_nesterov` | `true` | Orthogonalize `grad.lerp(buf, momentum)` instead of `buf`. |
+| `training.muon_ns_steps` | `5` | Newton-Schulz iterations in `[1, 99]`. |
+| `training.muon_weight_decay` | `0.0` | Decoupled weight decay of the Muon matrices (`W *= 1 - lr_t * wd`). |
+| `training.muon_adjust_lr_fn` | `original` | Shape-aware Muon step: `original` (`lr * sqrt(max(1, rows / cols))`) or `match_rms_adamw` (`lr * 0.2 * sqrt(max(rows, cols))`, rates on AdamW's scale). |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
