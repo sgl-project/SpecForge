@@ -98,19 +98,15 @@ def _init_from_native_mtp(cfg, draft_model) -> None:
         )
         return
 
-    from specforge.modeling.target.checkpoint import (
-        load_selected_tensors,
-        resolve_checkpoint_dir,
-    )
+    from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
     target_path = cfg.model.target_model_path
     prefix = draft_model.NATIVE_KEY_PREFIX
     try:
-        checkpoint_dir = resolve_checkpoint_dir(
-            target_path, cache_dir=cfg.model.cache_dir
-        )
-        native_mtp = load_selected_tensors(
-            checkpoint_dir, lambda key: key.startswith(prefix)
+        native_mtp = load_checkpoint_tensors(
+            target_path,
+            key_filter=lambda key: key.startswith(prefix),
+            cache_dir=cfg.model.cache_dir,
         )
         scan_error = None
     except Exception as exc:  # pragma: no cover - depends on target checkpoint
