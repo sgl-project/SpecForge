@@ -317,6 +317,12 @@ DFlash, DFlash2, Domino and DSpark select context inputs with
 and saved in the resolved draft config. See the
 [conditioning guide](../../docs/sections/advanced_features/target_kv_conditioning.md).
 
+DSpark with either input source supports these additional objective options:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `training.dspark_objective` | `ce_l1` | `ce_l1` uses the CE/L1 coefficients and supports DPaCE weighting. `dpard` replaces that draft loss with detached TV-credit-weighted Renyi-half divergence; CE/L1 remain diagnostics. D-PARD cannot be combined with `loss_type: dpace` or LK. |
+| `training.dspark_dpard_rho` | `0.5` | D-PARD survival smoothing in `[0, 1]`. It does not scale the confidence auxiliary objective. |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 | MTP | `training.mtp_objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
 
