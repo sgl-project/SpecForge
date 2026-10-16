@@ -438,6 +438,8 @@ def build_dspark_model(
         tokenizer,
         lambda common: OnlineDSparkModel(
             **common,
+            dspark_objective=cfg.training.dspark_objective,
+            dspark_dpard_rho=cfg.training.dspark_dpard_rho,
             loss_type=cfg.training.loss_type,
             dpace_alpha=cfg.training.dpace_alpha,
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
