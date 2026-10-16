@@ -11,6 +11,7 @@ from specforge.algorithms.common.hidden_states_data import (
     build_offline_normalizer,
     build_offline_reader,
 )
+from specforge.algorithms.common.kv_conditioning import configure_kv_conditioning
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -152,6 +153,7 @@ def algorithm_providers() -> AlgorithmProviders:
     collator = build_collator
     return AlgorithmProviders(
         algorithm_name=ALGORITHM_NAME,
+        configure_conditioning=configure_kv_conditioning,
         step=StepProvider(
             build=build_step,
             options=step_options,

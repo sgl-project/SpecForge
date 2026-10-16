@@ -452,7 +452,37 @@ class PEagleTrainStrategy(DraftTrainStrategy):
         }
 
 
-class DFlashTrainStrategy(DraftTrainStrategy):
+class DFlashConditioningStrategy(DraftTrainStrategy):
+    """Shared context input selection; each objective keeps its supervision."""
+
+    conditioning_source = "hidden"
+
+    def configure_conditioning(self, source):
+        if source not in ("hidden", "kv"):
+            raise ValueError("conditioning_source must be hidden or kv")
+        self.conditioning_source = source
+        self.required_features = set(self.required_features)
+        if source == "kv":
+            self.required_features.discard("hidden_states")
+            self.required_features.add("target_kv")
+        else:
+            self.required_features.discard("target_kv")
+            self.required_features.add("hidden_states")
+
+    def _conditioning_inputs(self, tensors, device):
+        if self.conditioning_source == "kv":
+            if "hidden_states" in tensors:
+                raise ValueError("kv conditioning forbids hidden_states inputs")
+            return {
+                "hidden_states": None,
+                "target_kv": tensors["target_kv"].to(device, non_blocking=True),
+            }
+        if "target_kv" in tensors:
+            raise ValueError("hidden conditioning does not accept target_kv")
+        return {"hidden_states": tensors["hidden_states"].to(device, non_blocking=True)}
+
+
+class DFlashTrainStrategy(DFlashConditioningStrategy):
     """DFlash block-parallel strategy wrapping the existing ``OnlineDFlashModel``.
 
     Shares the trainer/backend/loader/checkpoint spine with EAGLE3; only the
@@ -522,7 +552,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         )
         model_inputs = {
             "input_ids": t["input_ids"].to(device, non_blocking=True),
-            "hidden_states": t["hidden_states"].to(device, non_blocking=True),
+            **self._conditioning_inputs(t, device),
             "loss_mask": t["loss_mask"].to(device, non_blocking=True),
             "max_valid_anchors": max_valid_anchors,
             "selector_loss_alpha": selector_loss_alpha,
@@ -564,7 +594,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         }
 
 
-class DSparkTrainStrategy(DraftTrainStrategy):
+class DSparkTrainStrategy(DFlashConditioningStrategy):
     """DSpark strategy over DFlash with target hidden-state supervision."""
 
     name = "dspark"
@@ -593,7 +623,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
         loss, accuracy, model_metrics = self.dspark_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
-            hidden_states=t["hidden_states"].to(device, non_blocking=True),
+            **self._conditioning_inputs(t, device),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
             target_last_hidden_states=t["target_last_hidden_states"].to(
                 device, non_blocking=True
@@ -689,7 +719,7 @@ class MTPTrainStrategy(DraftTrainStrategy):
         }
 
 
-class DominoTrainStrategy(DraftTrainStrategy):
+class DominoTrainStrategy(DFlashConditioningStrategy):
     """Domino block-parallel strategy wrapping ``OnlineDominoModel``.
 
     Shares the trainer/backend/loader/checkpoint spine and feature schema with
@@ -735,7 +765,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
         loss, accuracy, model_metrics = self.domino_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
-            hidden_states=t["hidden_states"].to(device, non_blocking=True),
+            **self._conditioning_inputs(t, device),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
             lambda_base=lambda_base,
             max_valid_anchors=max_valid_anchors,

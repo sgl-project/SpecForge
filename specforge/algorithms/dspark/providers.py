@@ -14,6 +14,7 @@ from specforge.algorithms.common.hidden_states_data import (
     build_dspark_offline_normalizer,
     build_dspark_offline_reader,
 )
+from specforge.algorithms.common.kv_conditioning import configure_kv_conditioning
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -147,6 +148,7 @@ def algorithm_spec() -> AlgorithmSpec:
 def algorithm_providers() -> AlgorithmProviders:
     return AlgorithmProviders(
         algorithm_name=ALGORITHM_NAME,
+        configure_conditioning=configure_kv_conditioning,
         step=StepProvider(
             build=build_step,
             options=empty_options,

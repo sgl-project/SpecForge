@@ -262,6 +262,8 @@ class StrictConfigModel(BaseModel):
 
 class ModelConfig(StrictConfigModel):
     target_model_path: str
+    #: Draft context input; teacher supervision is configured independently.
+    conditioning_source: Literal["hidden", "kv"] = "hidden"
     #: Draft config as a local JSON file, a directory containing config.json,
     #: or a Hugging Face repository. EAGLE3, P-EAGLE, and DFlash can derive it
     #: from the target when omitted.
@@ -1104,6 +1106,15 @@ class Config(StrictConfigModel):
         raw = dict(values)
         deployment = dict(raw.get("deployment") or {})
         training = dict(raw.get("training") or {})
+        # Migrate the pre-release spelling before typed strategy validation.
+        # KV is a DSpark input choice, not a separately registered algorithm.
+        if training.get("strategy") == "dspark_kv":
+            model = dict(raw.get("model") or {})
+            if model.get("conditioning_source", "kv") != "kv":
+                raise ValueError("legacy dspark_kv requires conditioning_source=kv")
+            training["strategy"] = "dspark"
+            model["conditioning_source"] = "kv"
+            raw["model"] = model
         mode = deployment.get("mode", "local_colocated")
         training.setdefault("role", "auto" if mode == "disaggregated" else "all")
         raw["training"] = training

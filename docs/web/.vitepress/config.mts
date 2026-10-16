@@ -154,6 +154,7 @@ export default defineConfig({
           text: 'Advanced Features',
           items: [
             { text: 'Customize a Training Run', link: '/advanced_features/customization' },
+            { text: 'DSpark Target KV Conditioning', link: '/advanced_features/target_kv_conditioning' },
           ],
         },
         {

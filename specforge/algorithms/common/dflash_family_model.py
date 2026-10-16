@@ -700,6 +700,7 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        target_kv: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -774,10 +775,17 @@ class OnlineDFlashModel(nn.Module):
                 draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
             else:
                 draft_kwargs["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}
+        if target_kv is None:
+            draft_kwargs["target_hidden"] = hidden_states
+        else:
+            if hidden_states is not None:
+                raise ValueError(
+                    "target_kv conditioning forbids hidden-state conditioning"
+                )
+            draft_kwargs["target_kv"] = target_kv.detach()
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
-            target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
             **draft_kwargs,
         )
@@ -1495,6 +1503,7 @@ class OnlineDFlashModel(nn.Module):
         max_valid_anchors: Optional[int] = None,
         selector_loss_alpha: Optional[float] = None,
         collect_detailed_metrics: bool = True,
+        target_kv: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -1510,6 +1519,7 @@ class OnlineDFlashModel(nn.Module):
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            **({"target_kv": target_kv} if target_kv is not None else {}),
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
@@ -1974,6 +1984,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         lambda_base: float = 0.0,
         max_valid_anchors: Optional[int] = None,
         collect_detailed_metrics: bool = True,
+        target_kv: Optional[torch.Tensor] = None,
     ):
         """Parallel Domino training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -1988,6 +1999,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            **({"target_kv": target_kv} if target_kv is not None else {}),
         )
 
         label_start = 1 if self.shift_label else 0
@@ -2489,6 +2501,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         target_last_hidden_states: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
         collect_detailed_metrics: bool = True,
+        target_kv: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -2500,6 +2513,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            target_kv=target_kv,
         )
 
         (

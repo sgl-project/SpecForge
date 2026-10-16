@@ -243,11 +243,18 @@ def _dspark_contract() -> CaptureConfig:
     )
 
 
-def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
+def _capture_schema(
+    algorithm: str, *, teacher_metrics: bool = True, conditioning_source="hidden"
+):
     registration = builtin_algorithm_registry().resolve(algorithm)
     config = SimpleNamespace(
-        training=SimpleNamespace(dflash_teacher_metrics=teacher_metrics)
+        training=SimpleNamespace(dflash_teacher_metrics=teacher_metrics),
+        model=SimpleNamespace(input_modality="text"),
     )
+    if conditioning_source == "kv":
+        registration = registration.providers.configure_conditioning(
+            config, registration
+        )
     layout = resolve_server_capture_layout(registration, config, modality="text")
     return ServerCaptureSchema(
         aux_feature=layout.aux_feature,
