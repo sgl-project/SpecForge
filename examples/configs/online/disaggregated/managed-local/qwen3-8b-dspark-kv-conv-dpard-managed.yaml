@@ -1,0 +1,74 @@
+model:
+  conditioning_source: kv
+  target_model_path: shared/checkpoint/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-dspark-kv-conv-causal-noconf-b16.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  use_liger_kernel: true
+  sglang_context_length: 8200
+  sglang_attention_backend: triton
+  sglang_disable_cuda_graph: true
+  sglang_disable_radix_cache: true
+data:
+  train_data_path: shared/datasets/perfectblend/qwen3-8b/perfectblend_train_regen_temperature0_no_think_1.jsonl
+  max_length: 8192
+  chat_template: qwen3-instruct
+  build_dataset_num_proc: 8
+  dataloader_num_workers: 0
+  cache_dir: cache/qwen3-8b-dspark-kv-conv-dpard-managed
+training:
+  strategy: dspark
+  dspark_objective: dpard
+  dspark_dpard_rho: 0.5
+  loss_type: dflash
+  dspark_confidence_head_alpha: 0.0
+  dspark_flatten_projection: true
+  dspark_cache_projection: true
+  num_epochs: 6
+  batch_size: 2
+  accumulation_steps: 2
+  fsdp_sharding: NO_SHARD
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  objective_chunk_blocks: 128
+  save_interval: 3000
+  eval_interval: 0
+  log_interval: 10
+  seed: 42
+tracking:
+  report_to: tensorboard
+runtime:
+  producer_lease: 1
+  producer_concurrency: 1
+  in_flight_high_watermark: 8
+  in_flight_low_watermark: 4
+run_id: qwen3-8b-dspark-kv-conv-dpard-managed
+output_dir: outputs/qwen3-8b-dspark-kv-conv-dpard-managed/consumer
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+    master_port: 29587
+  disaggregated:
+    control_dir: outputs/qwen3-8b-dspark-kv-conv-dpard-managed/control
+    consumer_state_dir: outputs/qwen3-8b-dspark-kv-conv-dpard-managed/consumer-state
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices: ["1"]
+      mooncake:
+        protocol: tcp
+        rpc_port: 37551
+        metadata_port: 37880
+        metrics_port: 37903
+        global_segment_size_bytes: 4294967296
+        local_buffer_size_bytes: 536870912
+      capture_servers:
+        - port: 32000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.5
