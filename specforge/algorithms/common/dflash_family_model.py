@@ -484,6 +484,30 @@ class OnlineDFlashModel(nn.Module):
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
+    def _projection_checkpoint_contexts(self):
+        from torch.utils.checkpoint import (
+            CheckpointPolicy,
+            create_selective_checkpoint_contexts,
+        )
+
+        head = self.lm_head
+        eligible = isinstance(head, nn.Linear) and not head.weight.requires_grad
+
+        def policy(context, operation, *arguments, **kwargs):
+            if eligible and operation in (
+                torch.ops.aten.mm.default,
+                torch.ops.aten.bmm.default,
+            ):
+                weight = arguments[1]
+                if (
+                    weight.shape[-2:] == (head.in_features, head.out_features)
+                    and not weight.requires_grad
+                ):
+                    return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+
+        return create_selective_checkpoint_contexts(policy)
+
     def _sample_anchor_positions(
         self,
         seq_len: int,
@@ -2179,6 +2203,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         objective_chunk_blocks: int = 128,
         dspark_objective: str = "ce_l1",
         dspark_dpard_rho: float = 0.5,
+        flatten_projection: bool = False,
+        cache_projection: bool = False,
+        compile_objective: bool = False,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
     ):
@@ -2213,6 +2240,16 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError("D-PARD cannot be combined with DPaCE objectives")
         self.dspark_objective = dspark_objective
         self.dspark_dpard_rho = float(dspark_dpard_rho)
+        self.flatten_projection = bool(flatten_projection)
+        self.cache_projection = bool(cache_projection)
+        self.compile_objective = bool(compile_objective)
+
+    def _project_dspark_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.flatten_projection:
+            return self.lm_head(hidden.reshape(-1, hidden.shape[-1])).reshape(
+                *hidden.shape[:-1], -1
+            )
+        return self.lm_head(hidden)
 
     def _build_dspark_labels_and_mask(
         self,
@@ -2300,7 +2337,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         """Return additive loss and telemetry numerators for one block slice."""
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
-        base_logits = self.lm_head(
+        base_logits = self._project_dspark_logits(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
         draft_logits = self.draft_model.apply_logits_head(
@@ -2323,6 +2360,22 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     self.loss_type,
                 )
             loss_weights = loss_weights * credit
+        compiled_terms = None
+        if (
+            self.compile_objective
+            and draft_logits.is_cuda
+            and draft_logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and aligned_target_hidden is not None
+        ):
+            from specforge.core.dspark_objective import compiled_dspark_token_terms
+
+            with torch.no_grad():
+                target_logits = self._project_dspark_logits(
+                    aligned_target_hidden.reshape(
+                        batch_size, num_blocks * block_size, hidden_size
+                    )
+                ).reshape_as(draft_logits)
+            compiled_terms = compiled_dspark_token_terms(draft_logits, target_logits)
         ce_num = (cross_entropy * loss_weights).sum()
 
         zero = ce_num.new_zeros(())
@@ -2338,9 +2391,16 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         draft_probabilities = None
         teacher_ids = None
-        if aligned_target_hidden is not None:
+        if compiled_terms is not None:
+            l1_per_token, predicted_ids, teacher_ids, draft_top1, teacher_top1 = (
+                compiled_terms
+            )
+            accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+            if self.dspark_l1_loss_alpha > 0:
+                l1_num = (l1_per_token * loss_weights).sum()
+        elif aligned_target_hidden is not None:
             with torch.no_grad():
-                target_logits = self.lm_head(
+                target_logits = self._project_dspark_logits(
                     aligned_target_hidden.reshape(
                         batch_size,
                         num_blocks * block_size,
@@ -2389,7 +2449,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             ).sum()
 
         with torch.no_grad():
-            predicted_ids = draft_logits.argmax(dim=-1)
+            if compiled_terms is None:
+                predicted_ids = draft_logits.argmax(dim=-1)
             correct = ((predicted_ids == target_ids) & eval_mask).float()
             correct_num = correct.sum()
             eval_den = eval_mask.float().sum()
@@ -2400,9 +2461,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 predicted_ids, target_ids, eval_mask, block_index, total_blocks
             )
             if aligned_target_hidden is not None:
-                assert draft_probabilities is not None and teacher_ids is not None
-                teacher_top1 = target_probabilities.max(dim=-1).values
-                draft_top1 = draft_probabilities.max(dim=-1).values
+                if compiled_terms is None:
+                    assert draft_probabilities is not None and teacher_ids is not None
+                    teacher_top1 = target_probabilities.max(dim=-1).values
+                    draft_top1 = draft_probabilities.max(dim=-1).values
                 teacher_agreement_num = (
                     (predicted_ids == teacher_ids).float() * eval_mask
                 ).sum()
@@ -2494,6 +2556,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
             ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
+            context_fn=(
+                self._projection_checkpoint_contexts if self.cache_projection else None
+            ),
         )
 
         (
