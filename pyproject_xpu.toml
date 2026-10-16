@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specforge"
+dynamic = ["version"]
+readme = "README.md"
+requires-python = ">=3.10"
+description = "SpecForge: Speculative Decoding Training Framework"
+authors = [{name = "SGLang Team"}]
+urls = {Homepage = "https://github.com/sgl-project/SpecForge"}
+dependencies = [
+    "torch==2.13.0+xpu",
+    "transformers==5.12.1",
+    "datasets",
+    "tqdm",
+    "accelerate",
+    "click>=8.0",
+    "huggingface-hub",
+    "numpy",
+    "openai-harmony",
+    "pydantic",
+    "psutil",
+    "pyyaml",
+    "safetensors",
+    #"sglang==0.5.18", # commented due to CUDA dependencies
+    "requests",
+    "tensorboard",
+    "typing-extensions",
+    "wandb",
+    "yunchang @ git+https://github.com/feifeibear/long-context-attention.git",
+]
+
+[project.scripts]
+specforge = "specforge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["specforge*"]
+
+[project.optional-dependencies]
+data = ["openai"]
+dev = [
+    "pre-commit",
+]
+fa = ["flash-attn", "ninja", "packaging"]
+liger = ["liger-kernel"]
+
+[tool.setuptools.dynamic]
+version = {file = "version.txt"}

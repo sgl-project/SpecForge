@@ -1,32 +1,27 @@
-import glob
-import json
-import os
+import logging
 from typing import Optional
 
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
-from transformers import AutoConfig
 
+from specforge.modeling.target.checkpoint import load_checkpoint_tensors
+from specforge.modeling.target.target_utils import (
+    load_target_config,
+    target_hidden_size,
+    target_ties_word_embeddings,
+    target_vocab_size,
+)
 from specforge.utils import get_local_device, padding
+
+logger = logging.getLogger(__name__)
 
 
 class TargetHead(nn.Module):
-    def __init__(
-        self,
-        model_path,
-        trust_remote_code: bool = False,
-        cache_dir: Optional[str] = None,
-    ):
+    def __init__(self, config):
         super().__init__()
-        self.config = AutoConfig.from_pretrained(
-            model_path,
-            trust_remote_code=trust_remote_code,
-            cache_dir=cache_dir,
-        )
-        self.hidden_size = self.config.hidden_size
-        self.vocab_size = self.config.vocab_size
+        self.config = config
+        self.hidden_size = target_hidden_size(self.config)
+        self.vocab_size = target_vocab_size(self.config)
 
         self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
 
@@ -35,63 +30,84 @@ class TargetHead(nn.Module):
         cls,
         model_path,
         lm_head_key: str = "lm_head.weight",
+        embedding_key: str = "model.embed_tokens.weight",
         cache_dir: Optional[str] = None,
+        dtype: torch.dtype = torch.bfloat16,
         trust_remote_code: bool = False,
     ) -> "TargetHead":
-        target_head = cls(
+
+        config = load_target_config(
             model_path,
             trust_remote_code=trust_remote_code,
             cache_dir=cache_dir,
         )
-        target_head.load_weights(
+
+        instance = cls(config).to(dtype=dtype)
+
+        tie_weights = target_ties_word_embeddings(config)
+
+        instance._load_weights(
             model_path=model_path,
             lm_head_key=lm_head_key,
+            embedding_key=embedding_key,
+            tie_weights=tie_weights,
             cache_dir=cache_dir,
         )
-        target_head.freeze_weights()
-        target_head = target_head.eval().to(
-            device=get_local_device(), dtype=torch.bfloat16
-        )
-        return target_head
+        instance.freeze_weights()
+        instance = instance.eval().to(device=get_local_device(), dtype=dtype)
+        return instance
 
     @torch.no_grad()
-    def load_weights(
+    def _load_weights(
         self,
         model_path,
         lm_head_key: str = "lm_head.weight",
+        embedding_key: str = "model.embed_tokens.weight",
+        tie_weights: bool = False,
         cache_dir: Optional[str] = None,
     ):
-        if os.path.exists(model_path):
-            self.model_path = model_path
-        else:
-            self.model_path = snapshot_download(repo_id=model_path, cache_dir=cache_dir)
+        keys = {lm_head_key}
+        if tie_weights:
+            keys.add(embedding_key)
+        try:
+            if tie_weights:
+                tensors = load_checkpoint_tensors(
+                    model_path, key_filter=keys.__contains__, cache_dir=cache_dir
+                )
+                if not tensors:
+                    raise KeyError(
+                        f"Checkpoint is missing tied tensors: {sorted(keys)}"
+                    )
+            else:
+                tensors = load_checkpoint_tensors(
+                    model_path, keys=keys, cache_dir=cache_dir
+                )
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Required target weight tensors were not loaded: {exc}"
+            ) from exc
 
-        # model_path is a local directory
-        # check if there is file ending with index.json
-        glob_path = os.path.join(self.model_path, "*.index.json")
-        index_json_path = glob.glob(glob_path)
+        for key, tensor in tensors.items():
+            if tensor.shape != self.fc.weight.shape:
+                raise RuntimeError(
+                    f"Shape mismatch for {key}. Expected {self.fc.weight.shape}, "
+                    f"got {tensor.shape}"
+                )
+            tensors[key] = tensor.to(dtype=self.fc.weight.dtype)
 
-        if len(index_json_path) == 0:
-            raise FileNotFoundError(f"No index.json file found in {self.model_path}")
-        if len(index_json_path) > 1:
-            raise FileNotFoundError(
-                f"Multiple index.json files found in {self.model_path}"
-            )
-        index_json_path = index_json_path[0]
-
-        with open(index_json_path, "r") as f:
-            index_json = json.load(f)
-        ckpt_file = index_json["weight_map"][lm_head_key]
-
-        if ckpt_file.endswith(".safetensors"):
-            with safe_open(
-                os.path.join(self.model_path, ckpt_file), framework="pt"
-            ) as f:
-                lm_head = f.get_tensor(lm_head_key)
-        else:
-            state_dict = torch.load(os.path.join(self.model_path, ckpt_file))
-            lm_head = state_dict[lm_head_key]
-        self.fc.weight.copy_(lm_head)
+        if tie_weights and len(tensors) > 1:
+            tie_weights = torch.equal(tensors[embedding_key], tensors[lm_head_key])
+            if not tie_weights:
+                logger.warning(
+                    "The config requests tying %s and %s, but the checkpoint contains "
+                    "different values. Keeping the weights separate.",
+                    embedding_key,
+                    lm_head_key,
+                )
+        head_key = (
+            embedding_key if tie_weights and embedding_key in tensors else lm_head_key
+        )
+        self.fc.weight.copy_(tensors[head_key])
 
     def freeze_weights(self):
         for param in self.fc.parameters():
@@ -101,8 +117,9 @@ class TargetHead(nn.Module):
         return self.fc(hidden_states)
 
     def preprocess(self, input_ids, target, loss_mask):
-        # apply pading
+        # Shift loss_mask with input_ids and final target states; auxiliary hidden
+        # states remain unshifted because the draft model consumes them at row p.
         target = padding(target, left=False)
         input_ids = padding(input_ids, left=False)
-        loss_mask = loss_mask[..., None]
+        loss_mask = padding(loss_mask, left=False)[..., None]
         return input_ids, target, loss_mask

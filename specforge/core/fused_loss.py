@@ -37,7 +37,7 @@ from __future__ import annotations
 import torch
 
 __all__ = [
-    # Fused Triton losses (require Triton plus a CUDA or Ascend NPU accelerator)
+    # Fused Triton losses (require a compatible Triton backend)
     "fused_kl_div_loss",
     "fused_reverse_kl_div_loss",
     "fused_js_div_loss",
@@ -301,8 +301,8 @@ def _require_triton():
     except ImportError as exc:
         raise RuntimeError(
             "The fused losses in specforge.core.fused_loss require Triton "
-            "(CUDA) or triton-ascend (NPU), which is not importable on this "
-            "host. Use the eager reference losses in this module instead."
+            "with a compatible backend, which is not importable on this host. "
+            "Use the eager reference losses in this module instead."
         ) from exc
     module_globals = globals()
     # Publish what the kernel bodies resolve from module globals at compile
