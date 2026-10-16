@@ -227,10 +227,13 @@ class TestEvaluatorAggregation(unittest.TestCase):
         )
         self.assertAlmostEqual(m["eval/acceptance_rate_0"], 0.72, places=6)
         self.assertAlmostEqual(m["eval/acceptance_rate_1"], 0.52, places=6)
+        self.assertAlmostEqual(m["eval/expected_acceptance_0"], 0.72, places=6)
+        self.assertAlmostEqual(m["eval/expected_acceptance_1"], 0.52, places=6)
         self.assertAlmostEqual(m["eval/ploss_0"], 1.4, places=6)
         self.assertAlmostEqual(m["eval/ploss_1"], 2.4, places=6)
         m2 = self._run([_step_output(1.0, corrects=[1], denoms=[2])])
         self.assertNotIn("eval/acceptance_rate_0", m2)
+        self.assertNotIn("eval/expected_acceptance_0", m2)
         self.assertNotIn("eval/ploss_0", m2)
 
 

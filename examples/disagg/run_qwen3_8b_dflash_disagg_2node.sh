@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Two physical nodes, one canonical SpecForge training entry:
-#   rank 0: Mooncake + patched SGLang + CPU producer
+#   rank 0: Mooncake + one or more patched SGLang capture servers + CPU producer
 #   rank 1: GPU consumer/trainer
 #
 # Launch the same command on both nodes (for example with `rcli exec --per-node`).
@@ -20,6 +20,10 @@ CONSUMER_STATE_DIR="${DISAGG_CONSUMER_STATE_DIR:-${LOCAL_SCRATCH:-/tmp}/specforg
 CONFIG="${CONFIG:-$ROOT_DIR/examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml}"
 RUN_LABEL="${RUN_LABEL:-qwen3-8b-dflash-2node}"
 
+# SERVER_COUNT capture servers share rank 0. Server i owns the i-th group of
+# SERVER_TP devices from SERVER_GPUS and listens on SERVER_PORT + i; every
+# server is passed to the producer through deployment.disaggregated.server_urls.
+SERVER_COUNT="${SERVER_COUNT:-1}"
 SERVER_GPUS="${SERVER_GPUS:-0}"
 SERVER_TP="${SERVER_TP:-1}"
 SERVER_PORT="${SERVER_PORT:-30000}"
@@ -42,8 +46,17 @@ MOONCAKE_RPC_PORT="${MOONCAKE_RPC_PORT:-35551}"
 MOONCAKE_HTTP_PORT="${MOONCAKE_HTTP_PORT:-35880}"
 MOONCAKE_METRICS_PORT="${MOONCAKE_METRICS_PORT:-35903}"
 MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-tcp}"
+# Optional master read-lease TTL forwarded as `--default_kv_lease_ttl`
+# (milliseconds). Unset keeps the mooncake_master default. Large feature
+# payloads fetched by several trainer ranks need a lease that outlives one
+# transfer; the Qwen3.8-27B recipe sets 10000.
+MOONCAKE_DEFAULT_KV_LEASE_TTL="${MOONCAKE_DEFAULT_KV_LEASE_TTL:-}"
 START_TIMEOUT_S="${START_TIMEOUT_S:-1800}"
 PEER_TIMEOUT_S="${PEER_TIMEOUT_S:-1800}"
+
+# Filled by export_common_environment once the identity is validated.
+SERVER_URLS=()
+COMMON_OVERRIDES=()
 
 log() {
     printf '[%s][rank=%s] %s\n' "$RUN_LABEL" "${NODE_RANK:-?}" "$*"
@@ -88,6 +101,34 @@ count_devices() {
     awk -F, '{print NF}' <<< "$devices"
 }
 
+server_gpus() {
+    # Comma-separated devices of capture server $1: the $1-th SERVER_TP-sized
+    # group of SERVER_GPUS.
+    local index="$1"
+    awk -F, -v start="$((index * SERVER_TP + 1))" -v width="$SERVER_TP" '{
+        out = ""
+        for (i = start; i < start + width; i++) {
+            out = out (out == "" ? "" : ",") $i
+        }
+        print out
+    }' <<< "$SERVER_GPUS"
+}
+
+server_port() {
+    printf '%d\n' "$((SERVER_PORT + $1))"
+}
+
+join_by() {
+    local separator="$1"
+    shift
+    local joined=""
+    local item
+    for item in "$@"; do
+        joined+="${joined:+$separator}$item"
+    done
+    printf '%s\n' "$joined"
+}
+
 kill_group() {
     local pid="${1:-}"
     [[ -n "$pid" ]] || return 0
@@ -127,14 +168,19 @@ validate_identity() {
     [[ -n "$CONSUMER_STATE_DIR" && "$CONSUMER_STATE_DIR" != "/" ]] || \
         fail "set a non-root node-local DISAGG_CONSUMER_STATE_DIR"
     [[ -f "$CONFIG" ]] || fail "config does not exist: $CONFIG"
+    [[ "$SERVER_COUNT" =~ ^[1-9][0-9]*$ ]] || fail "SERVER_COUNT must be positive"
     [[ "$SERVER_TP" =~ ^[1-9][0-9]*$ ]] || fail "SERVER_TP must be positive"
+    [[ "$SERVER_PORT" =~ ^[1-9][0-9]*$ ]] || fail "SERVER_PORT must be positive"
     [[ "$TRAINER_NPROC" =~ ^[1-9][0-9]*$ ]] || \
         fail "TRAINER_NPROC must be positive"
+    [[ -z "$MOONCAKE_DEFAULT_KV_LEASE_TTL" || \
+        "$MOONCAKE_DEFAULT_KV_LEASE_TTL" =~ ^[1-9][0-9]*$ ]] || \
+        fail "MOONCAKE_DEFAULT_KV_LEASE_TTL must be a positive number of milliseconds"
     [[ "$APPLY_SGLANG_CAPTURE_PATCH" == "0" || \
         "$APPLY_SGLANG_CAPTURE_PATCH" == "1" ]] || \
         fail "APPLY_SGLANG_CAPTURE_PATCH must be 0 or 1"
-    [[ "$(count_devices "$SERVER_GPUS")" == "$SERVER_TP" ]] || \
-        fail "SERVER_GPUS must contain exactly SERVER_TP=$SERVER_TP devices"
+    [[ "$(count_devices "$SERVER_GPUS")" == "$((SERVER_COUNT * SERVER_TP))" ]] || \
+        fail "SERVER_GPUS must contain exactly SERVER_COUNT*SERVER_TP=$((SERVER_COUNT * SERVER_TP)) devices"
     [[ "$(count_devices "$TRAINER_GPUS")" == "$TRAINER_NPROC" ]] || \
         fail "TRAINER_GPUS must contain exactly TRAINER_NPROC=$TRAINER_NPROC devices"
 }
@@ -146,56 +192,104 @@ export_common_environment() {
     export MOONCAKE_METADATA_SERVER="http://$HEAD_IP:$MOONCAKE_HTTP_PORT/metadata"
     export MOONCAKE_PROTOCOL
     export DISAGG_CLIENT_SEGMENT_SIZE=0
-    export DISAGG_SERVER_URLS="http://$HEAD_IP:$SERVER_PORT"
+
+    local index
+    SERVER_URLS=()
+    for (( index = 0; index < SERVER_COUNT; index++ )); do
+        SERVER_URLS+=("http://$HEAD_IP:$(server_port "$index")")
+    done
+    export DISAGG_SERVER_URLS
+    DISAGG_SERVER_URLS="$(join_by , "${SERVER_URLS[@]}")"
+
+    local -a quoted_urls=()
+    local url
+    for url in "${SERVER_URLS[@]}"; do
+        quoted_urls+=("\"$url\"")
+    done
+    COMMON_OVERRIDES=(
+        "model.target_model_path=$TARGET_MODEL_PATH"
+        "run_id=$RUN_ID"
+        "output_dir=$RUN_ROOT/output"
+        "deployment.trainer.nnodes=1"
+        "deployment.trainer.nproc_per_node=$TRAINER_NPROC"
+        "deployment.disaggregated.control_dir=$RUN_ROOT/control"
+        "deployment.disaggregated.consumer_state_dir=$CONSUMER_STATE_DIR"
+        "deployment.disaggregated.store_id=$RUN_ID"
+        "deployment.disaggregated.server_urls=[$(join_by , "${quoted_urls[@]}")]"
+        "deployment.disaggregated.mooncake_metadata_server=http://$HEAD_IP:$MOONCAKE_HTTP_PORT/metadata"
+        "deployment.disaggregated.mooncake_master_server_addr=$HEAD_IP:$MOONCAKE_RPC_PORT"
+        "deployment.disaggregated.mooncake_protocol=$MOONCAKE_PROTOCOL"
+        "deployment.disaggregated.idle_timeout_s=$PEER_TIMEOUT_S"
+        "deployment.disaggregated.peer_wait_timeout_s=$PEER_TIMEOUT_S"
+    )
 }
 
-COMMON_OVERRIDES=(
-    "model.target_model_path=$TARGET_MODEL_PATH"
-    "run_id=$RUN_ID"
-    "output_dir=$RUN_ROOT/output"
-    "deployment.trainer.nnodes=1"
-    "deployment.trainer.nproc_per_node=$TRAINER_NPROC"
-    "deployment.disaggregated.control_dir=$RUN_ROOT/control"
-    "deployment.disaggregated.consumer_state_dir=$CONSUMER_STATE_DIR"
-    "deployment.disaggregated.store_id=$RUN_ID"
-    "deployment.disaggregated.server_urls=[\"http://$HEAD_IP:$SERVER_PORT\"]"
-    "deployment.disaggregated.mooncake_metadata_server=http://$HEAD_IP:$MOONCAKE_HTTP_PORT/metadata"
-    "deployment.disaggregated.mooncake_master_server_addr=$HEAD_IP:$MOONCAKE_RPC_PORT"
-    "deployment.disaggregated.mooncake_protocol=$MOONCAKE_PROTOCOL"
-    "deployment.disaggregated.idle_timeout_s=$PEER_TIMEOUT_S"
-    "deployment.disaggregated.peer_wait_timeout_s=$PEER_TIMEOUT_S"
-)
+export_mooncake_bind_address() {
+    # Mooncake's transfer engine advertises the first active interface unless
+    # told otherwise; on multi-interface or containerized hosts that can be a
+    # bridge address the peer node cannot reach, and remote get_into then
+    # fails with TRANSFER_FAIL (-800). Bind to the routable hostname we already
+    # publish unless the caller pinned another address.
+    export MC_TCP_BIND_ADDRESS="${MC_TCP_BIND_ADDRESS:-$MOONCAKE_LOCAL_HOSTNAME}"
+}
+
+SERVER_COMMAND=()
+build_server_command() {
+    # Fills SERVER_COMMAND with the SGLang launch command of capture server $1.
+    local index="$1"
+    local -a capture_layers
+    read -r -a capture_layers <<< "$CAPTURE_LAYER_IDS"
+    SERVER_COMMAND=(
+        python -m sglang.launch_server
+        --host 0.0.0.0
+        --model-path "$TARGET_MODEL_PATH"
+        --trust-remote-code
+        --skip-tokenizer-init
+        --tp-size "$SERVER_TP"
+        --mem-fraction-static "$SERVER_MEM_FRACTION"
+        --chunked-prefill-size -1
+        --enable-spec-capture
+        --spec-capture-method dflash
+        --spec-capture-aux-layer-ids "${capture_layers[@]}"
+        --port "$(server_port "$index")"
+    )
+    if [[ -n "$SERVER_EXTRA_ARGS" ]]; then
+        SERVER_COMMAND+=("${SERVER_EXTRA_ARGV[@]}")
+    fi
+}
+
+MASTER_COMMAND=()
+build_master_command() {
+    MASTER_COMMAND=(
+        mooncake_master
+        --enable_http_metadata_server=true
+        --http_metadata_server_host=0.0.0.0
+        --rpc_port="$MOONCAKE_RPC_PORT"
+        --http_metadata_server_port="$MOONCAKE_HTTP_PORT"
+        --metrics_port="$MOONCAKE_METRICS_PORT"
+    )
+    if [[ -n "$MOONCAKE_DEFAULT_KV_LEASE_TTL" ]]; then
+        MASTER_COMMAND+=(--default_kv_lease_ttl="$MOONCAKE_DEFAULT_KV_LEASE_TTL")
+    fi
+}
 
 run_inference_node() {
     local master_pid=""
-    local server_pid=""
+    local -a server_pids=()
     local producer_pid=""
     local result=1
     local producer_result=1
+    local index
+
+    build_master_command
 
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
-        local -a dry_run_server_command=(
-            python -m sglang.launch_server --host 0.0.0.0
-            --model-path "$TARGET_MODEL_PATH"
-            --trust-remote-code
-            --skip-tokenizer-init
-            --tp-size "$SERVER_TP"
-            --mem-fraction-static "$SERVER_MEM_FRACTION"
-            --chunked-prefill-size -1
-            --enable-spec-capture --spec-capture-method dflash
-            --spec-capture-aux-layer-ids $CAPTURE_LAYER_IDS
-            --port "$SERVER_PORT"
-        )
-        if [[ -n "$SERVER_EXTRA_ARGS" ]]; then
-            dry_run_server_command+=("${SERVER_EXTRA_ARGV[@]}")
-        fi
-        print_command mooncake_master --enable_http_metadata_server=true \
-            --http_metadata_server_host=0.0.0.0 \
-            --rpc_port="$MOONCAKE_RPC_PORT" \
-            --http_metadata_server_port="$MOONCAKE_HTTP_PORT" \
-            --metrics_port="$MOONCAKE_METRICS_PORT"
-        print_command env "CUDA_VISIBLE_DEVICES=$SERVER_GPUS" \
-            "${dry_run_server_command[@]}"
+        print_command "${MASTER_COMMAND[@]}"
+        for (( index = 0; index < SERVER_COUNT; index++ )); do
+            build_server_command "$index"
+            print_command env "CUDA_VISIBLE_DEVICES=$(server_gpus "$index")" \
+                "${SERVER_COMMAND[@]}"
+        done
         print_command env CUDA_VISIBLE_DEVICES= specforge train -c "$CONFIG" \
             --role producer "${COMMON_OVERRIDES[@]}" "$@"
         result=0
@@ -207,8 +301,11 @@ run_inference_node() {
         fail "run root already exists; choose a fresh DISAGG_STORE_ID/RUN_ROOT"
 
     cleanup() {
+        local pid
         kill_group "$producer_pid"
-        kill_group "$server_pid"
+        for pid in ${server_pids[@]+"${server_pids[@]}"}; do
+            kill_group "$pid"
+        done
         kill_group "$master_pid"
         write_status "$RUN_ROOT/inference.done" "$result"
     }
@@ -223,15 +320,13 @@ run_inference_node() {
         "$ROOT_DIR/scripts/apply_sglang_spec_capture_patch.sh"
     fi
     export MOONCAKE_LOCAL_HOSTNAME="${INFERENCE_NODE_IP:-$HEAD_IP}"
+    export_mooncake_bind_address
+    # Store capacity is contributed by every capture server; size the segment
+    # for the in-flight feature payload divided by SERVER_COUNT.
     export MOONCAKE_GLOBAL_SEGMENT_SIZE="${MOONCAKE_GLOBAL_SEGMENT_SIZE:-$((32 << 30))}"
     export MOONCAKE_LOCAL_BUFFER_SIZE="${MOONCAKE_LOCAL_BUFFER_SIZE:-$((1 << 30))}"
 
-    setsid mooncake_master \
-        --enable_http_metadata_server=true \
-        --http_metadata_server_host=0.0.0.0 \
-        --rpc_port="$MOONCAKE_RPC_PORT" \
-        --http_metadata_server_port="$MOONCAKE_HTTP_PORT" \
-        --metrics_port="$MOONCAKE_METRICS_PORT" \
+    setsid "${MASTER_COMMAND[@]}" \
         > "$RUN_ROOT/mooncake.log" 2>&1 &
     master_pid="$!"
 
@@ -252,36 +347,23 @@ run_inference_node() {
         sleep 1
     done
 
-    read -r -a capture_layers <<< "$CAPTURE_LAYER_IDS"
-    local -a server_command=(
-        python -m sglang.launch_server
-        --host 0.0.0.0
-        --model-path "$TARGET_MODEL_PATH"
-        --trust-remote-code
-        --skip-tokenizer-init
-        --tp-size "$SERVER_TP"
-        --mem-fraction-static "$SERVER_MEM_FRACTION"
-        --chunked-prefill-size -1
-        --enable-spec-capture
-        --spec-capture-method dflash
-        --spec-capture-aux-layer-ids "${capture_layers[@]}"
-        --port "$SERVER_PORT"
-    )
-    if [[ -n "$SERVER_EXTRA_ARGS" ]]; then
-        server_command+=("${SERVER_EXTRA_ARGV[@]}")
-    fi
-    setsid env CUDA_VISIBLE_DEVICES="$SERVER_GPUS" \
-        "${server_command[@]}" \
-        > "$RUN_ROOT/sglang-server.log" 2>&1 &
-    server_pid="$!"
+    for (( index = 0; index < SERVER_COUNT; index++ )); do
+        build_server_command "$index"
+        setsid env CUDA_VISIBLE_DEVICES="$(server_gpus "$index")" \
+            "${SERVER_COMMAND[@]}" \
+            > "$RUN_ROOT/sglang-server-$index.log" 2>&1 &
+        server_pids+=("$!")
+    done
 
     started="$(date +%s)"
-    until curl -fsS "http://$HEAD_IP:$SERVER_PORT/health" >/dev/null; do
-        kill -0 "$server_pid" 2>/dev/null || \
-            fail "SGLang exited; see $RUN_ROOT/sglang-server.log"
-        (( $(date +%s) - started < START_TIMEOUT_S )) || \
-            fail "SGLang readiness timed out"
-        sleep 5
+    for (( index = 0; index < SERVER_COUNT; index++ )); do
+        until curl -fsS "http://$HEAD_IP:$(server_port "$index")/health" >/dev/null; do
+            kill -0 "${server_pids[$index]}" 2>/dev/null || \
+                fail "SGLang server $index exited; see $RUN_ROOT/sglang-server-$index.log"
+            (( $(date +%s) - started < START_TIMEOUT_S )) || \
+                fail "SGLang server $index readiness timed out"
+            sleep 5
+        done
     done
     touch "$RUN_ROOT/inference.ready"
 
@@ -324,6 +406,7 @@ run_training_node() {
     wait_for_file "$RUN_ROOT/inference.ready" "inference readiness" \
         "$RUN_ROOT/inference.done"
     export MOONCAKE_LOCAL_HOSTNAME="${TRAINER_NODE_IP:-$(local_ip)}"
+    export_mooncake_bind_address
 
     finish() {
         kill_group "$consumer_pid"

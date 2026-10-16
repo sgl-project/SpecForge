@@ -33,7 +33,7 @@ class TemplateRegistryTest(unittest.TestCase):
         )
         self.assertEqual(template.end_of_turn_token, "<|end_of_msg|>")
         self.assertEqual(template.parser_type, "thinking")
-        self.assertFalse(template.enable_thinking)
+        self.assertIsNone(template.enable_thinking)
         self.assertEqual(template.ignore_token, ["<|end_of_msg|>"])
 
 

@@ -17,6 +17,7 @@ INKLING_TWO_NODE = ROOT / "examples" / "disagg" / "run_inkling_dspark_disagg_2no
 KIMI_K3_CAPTURE_PATCH = (
     ROOT / "patches" / "sglang" / "kimi-k3-f8493a4" / "spec-capture.patch"
 )
+V0518_CAPTURE_PATCH = ROOT / "patches" / "sglang" / "v0.5.18" / "spec-capture.patch"
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):
@@ -143,6 +144,24 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn('getattr(store, "batch_put_from", None)', source)
         self.assertIn("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", source)
         self.assertIn("req.finished() and req.spec_capture_result is None", source)
+
+    def test_v0518_capture_patch_routes_capture_only_dspark(self):
+        source = V0518_CAPTURE_PATCH.read_text(encoding="utf-8")
+        added_source = "\n".join(
+            line[1:]
+            for line in source.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        self.assertIn(
+            """is_dspark=(
+                self.spec_algorithm.is_dspark()
+                or (
+                    self.server_args.enable_spec_capture
+                    and self.server_args.spec_capture_method == "dspark"
+                )
+            )""",
+            added_source,
+        )
 
     def test_two_node_wrapper_keeps_training_on_the_unified_cli(self):
         self.assertTrue(os.access(TWO_NODE, os.X_OK))

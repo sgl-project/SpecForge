@@ -20,6 +20,11 @@ from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config, ModelConfig
+from specforge.config.schema import (
+    SGLANG_PASSTHROUGH_FIELDS,
+    SGLANG_SECRET_FLAGS,
+    sglang_field_flag,
+)
 
 if TYPE_CHECKING:
     from specforge.algorithms.registry import AlgorithmRegistration
@@ -37,6 +42,11 @@ _SECRET_NAMES = (
     "credential",
     "wandb_key",
     "swanlab_key",
+    # Passthrough SGLang flags (``--api-key``) and server env (``HF_TOKEN``).
+    "api_key",
+    "access_key",
+    "hf_token",
+    "hub_token",
 )
 
 
@@ -45,12 +55,21 @@ class _ForwardedSignal(BaseException):
         self.signum = signum
 
 
+def _is_secret_name(name: str) -> bool:
+    normalized = name.lower().replace("-", "_")
+    return any(fragment in normalized for fragment in _SECRET_NAMES) or (
+        name.startswith("--")
+        and len(name) > 2
+        and any(flag.startswith(name) for flag in SGLANG_SECRET_FLAGS)
+    )
+
+
 def _redacted(value: str) -> str:
     name = None
     raw = value
     if "=" in value:
         name, raw = value.split("=", 1)
-        if any(fragment in name.lower() for fragment in _SECRET_NAMES):
+        if _is_secret_name(name):
             return f"{name}=<redacted>"
     try:
         parsed = urlsplit(raw)
@@ -78,11 +97,28 @@ def _redacted(value: str) -> str:
     return f"{name}={raw}" if name is not None else raw
 
 
+def _redacted_argv(argv: Sequence[str]) -> list[str]:
+    """Redact ``name=value`` secrets and the value after a ``--secret`` flag."""
+    redacted: list[str] = []
+    for index, value in enumerate(argv):
+        previous = argv[index - 1] if index else ""
+        if (
+            previous.startswith("--")
+            and "=" not in previous
+            and _is_secret_name(previous)
+            and not value.startswith("--")
+        ):
+            redacted.append("<redacted>")
+        else:
+            redacted.append(_redacted(value))
+    return redacted
+
+
 def _redacted_env(values: Mapping[str, Optional[str]]) -> dict[str, Optional[str]]:
     return {
         name: (
             "<redacted>"
-            if any(fragment in name.lower() for fragment in _SECRET_NAMES)
+            if _is_secret_name(name)
             else (_redacted(value) if value is not None else None)
         )
         for name, value in sorted(values.items())
@@ -100,7 +136,7 @@ class CommandSpec:
     def as_dict(self) -> dict:
         return {
             "label": self.label,
-            "argv": [_redacted(value) for value in self.argv],
+            "argv": _redacted_argv(self.argv),
             "env": _redacted_env(self.env),
         }
 
@@ -112,12 +148,14 @@ class ReadinessSpec:
     timeout_s: float
     tcp_host: Optional[str] = None
     tcp_port: Optional[int] = None
+    probe_timeout_s: float = 5.0
 
     def as_dict(self) -> dict:
         return {
             "kind": self.kind,
             "url": _redacted(self.url),
             "timeout_s": self.timeout_s,
+            "probe_timeout_s": self.probe_timeout_s,
             "tcp_host": self.tcp_host,
             "tcp_port": self.tcp_port,
         }
@@ -292,6 +330,9 @@ def _disaggregated_env(
                     )
                     / "inboxes"
                 ),
+                "DISAGG_ASYNC_ACK": base_env.get(
+                    "DISAGG_ASYNC_ACK", "1" if deployment.async_ack else "0"
+                ),
             }
         )
     else:
@@ -314,6 +355,8 @@ def _disaggregated_env(
         values["DISAGG_STORE_ROOT"] = deployment.store_root
     if deployment.backend == "mooncake":
         values["DISAGG_CLIENT_BUFFER_SIZE"] = str(deployment.client_buffer_size)
+        values["DISAGG_RECEIVE_BUFFERS"] = deployment.receive_buffers
+        values["DISAGG_RECEIVE_POOL_BYTES"] = str(deployment.receive_pool_bytes)
 
     optional_values = {
         "MOONCAKE_METADATA_SERVER": deployment.mooncake_metadata_server,
@@ -331,6 +374,14 @@ def _disaggregated_env(
             values[name] = str(value)
 
     if deployment.backend == "mooncake":
+        if (
+            deployment.receive_buffers == "cuda"
+            and values.get("MOONCAKE_PROTOCOL", "tcp") != "rdma"
+        ):
+            raise ValueError(
+                "receive_buffers=cuda needs an RDMA Mooncake transport; "
+                "the effective MOONCAKE_PROTOCOL must be rdma"
+            )
         required = ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
         missing = [
             name for name in required if not values.get(name) and not base_env.get(name)
@@ -403,18 +454,20 @@ def _sglang_argv(
 ) -> list[str]:
     """Derive SGLang CLI args from all ``sglang_*`` fields on *model*.
 
-    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``.
+    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``
+    unless :func:`sglang_field_flag` records SGLang's own spelling.
     Fields whose values require non-trivial resolution (server-level overrides,
     fallback computations) are passed via *overrides* keyed by the original
     field name; every other ``sglang_*`` field is read directly from *model*.
+    Raw passthrough tokens (``sglang_extra_args``) are appended by the caller.
     """
     resolved = overrides or {}
     argv: list[str] = []
     for name in ModelConfig.model_fields:
-        if not name.startswith("sglang_"):
+        if not name.startswith("sglang_") or name in SGLANG_PASSTHROUGH_FIELDS:
             continue
         value = resolved[name] if name in resolved else getattr(model, name)
-        flag = "--" + name.removeprefix("sglang_").replace("_", "-")
+        flag = sglang_field_flag(name)
         if isinstance(value, bool):
             if value:
                 argv.append(flag)
@@ -466,6 +519,7 @@ def _managed_local_services(
             mooncake.startup_timeout_s,
             tcp_host="127.0.0.1",
             tcp_port=mooncake.rpc_port,
+            probe_timeout_s=mooncake.probe_timeout_s,
         ),
         log_path=str(log_dir / "mooncake.log"),
         phase=0,
@@ -529,9 +583,19 @@ def _managed_local_services(
                 },
             )
         )
+        # The schema rejects passthrough flags that repeat any flag above.
+        argv.extend(cfg.model.sglang_extra_args)
+        argv.extend(server.extra_args)
         service_env = {
+            # Validated not to overlap the keys below, which win regardless.
+            **server.env,
             **shared_env,
             device_visibility_env: ",".join(server.cuda_visible_devices),
+            **(
+                {"SGLANG_SPEC_CAPTURE_GPU_PUT": "1" if server.gpu_put else "0"}
+                if server.gpu_put is not None
+                else {}
+            ),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
@@ -545,6 +609,7 @@ def _managed_local_services(
                     "http",
                     f"http://127.0.0.1:{server.port}/health",
                     server.startup_timeout_s,
+                    probe_timeout_s=server.probe_timeout_s,
                 ),
                 log_path=str(log_dir / f"capture-server-{index}.log"),
                 phase=1,
@@ -980,9 +1045,11 @@ def _managed_preflight(plan: LaunchPlan) -> None:
                 ) from exc
 
 
-def _http_ready(readiness: ReadinessSpec) -> bool:
+def _http_ready(readiness: ReadinessSpec, *, timeout_s: Optional[float] = None) -> bool:
+    if timeout_s is None:
+        timeout_s = readiness.probe_timeout_s
     try:
-        with urllib_request.urlopen(readiness.url, timeout=1.0) as response:
+        with urllib_request.urlopen(readiness.url, timeout=timeout_s) as response:
             status = getattr(response, "status", 200)
             return readiness.kind == "mooncake" or 200 <= status < 300
     except urllib_error.HTTPError as exc:
@@ -993,17 +1060,27 @@ def _http_ready(readiness: ReadinessSpec) -> bool:
         return False
 
 
-def _readiness_satisfied(readiness: ReadinessSpec) -> bool:
-    if not _http_ready(readiness):
+def _readiness_satisfied(
+    readiness: ReadinessSpec, *, deadline: Optional[float] = None
+) -> bool:
+    started = time.monotonic()
+    probe_deadline = started + readiness.probe_timeout_s
+    if deadline is not None:
+        probe_deadline = min(probe_deadline, deadline)
+    timeout_s = probe_deadline - started
+    if timeout_s <= 0 or not _http_ready(readiness, timeout_s=timeout_s):
+        return False
+    remaining = probe_deadline - time.monotonic()
+    if remaining <= 0:
         return False
     if readiness.kind != "mooncake":
         return True
     assert readiness.tcp_host is not None and readiness.tcp_port is not None
     try:
         with socket.create_connection(
-            (readiness.tcp_host, readiness.tcp_port), timeout=1.0
+            (readiness.tcp_host, readiness.tcp_port), timeout=remaining
         ):
-            return True
+            return time.monotonic() < probe_deadline
     except OSError:
         return False
 
@@ -1022,9 +1099,12 @@ def _wait_for_service(
                     f"managed service {active_service.command.label!r} exited "
                     f"with status {status}; see {active_service.log_path}"
                 )
-        if _readiness_satisfied(service.readiness):
+        if _readiness_satisfied(service.readiness, deadline=deadline):
             return
-        time.sleep(0.25)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.25, remaining))
     if process.poll() is not None:
         raise RuntimeError(
             f"managed service {service.command.label!r} exited during startup; "

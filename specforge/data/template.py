@@ -22,7 +22,8 @@ class ChatTemplate(BaseModel):
     end_of_turn_token: Optional[str] = None
     parser_type: str = "general"
     assistant_pattern_type: str = "general"
-    enable_thinking: bool = False
+    # None preserves the tokenizer default; booleans explicitly select a mode.
+    enable_thinking: Optional[bool] = None
     ignore_token: Optional[List[str]] = None
 
 
@@ -263,7 +264,8 @@ TEMPLATE_REGISTRY.register(
         system_prompt=None,
         end_of_turn_token="<|end_of_msg|>",
         parser_type="thinking",
-        enable_thinking=False,
+        # Keep the XTML renderer default for reasoning stored inline.
+        enable_thinking=None,
         ignore_token=["<|end_of_msg|>"],
     ),
 )
@@ -301,6 +303,41 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# Ling-3.0 (Bailing V3) keeps Ling-2.0's role headers but always emits a think
+# block: an assistant turn renders as
+#   '<role>ASSISTANT</role>\n<think></think>' + content            (no reasoning)
+#   '<role>ASSISTANT</role>\n<think>' + reasoning + '</think>' + content
+# The opening tag (and, with thinking off, the empty block) is part of the
+# generation prompt, so it is never model output and must stay outside the loss
+# mask. Reusing "ling-flash-2.0" here would supervise that boilerplate, so
+# Ling-3.0 gets its own entries with the think tags folded into the header.
+TEMPLATE_REGISTRY.register(
+    name="ling-3.0",
+    template=ChatTemplate(
+        assistant_header="<role>ASSISTANT</role>\n<think></think>",
+        user_header="<role>HUMAN</role>",
+        system_prompt=None,
+        end_of_turn_token="<|role_end|>",
+        parser_type="thinking",
+        enable_thinking=False,
+    ),
+)
+
+# Thinking variant: reasoning is supervised together with the answer, so the
+# header stops right after the opening tag and the loss covers the closing
+# '</think>' the model itself emits.
+TEMPLATE_REGISTRY.register(
+    name="ling-3.0-thinking",
+    template=ChatTemplate(
+        assistant_header="<role>ASSISTANT</role>\n<think>",
+        user_header="<role>HUMAN</role>",
+        system_prompt=None,
+        end_of_turn_token="<|role_end|>",
+        parser_type="thinking",
+        enable_thinking=True,
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="deepseek-v32",
     template=ChatTemplate(
@@ -310,6 +347,18 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<｜end▁of▁sentence｜>",
         parser_type="thinking",
         enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v4",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        parser_type="deepseek-v4",
+        enable_thinking=False,
     ),
 )
 

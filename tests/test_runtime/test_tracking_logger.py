@@ -125,13 +125,35 @@ class TrackingLoggerTest(unittest.TestCase):
 
         logger({"loss": 1.5}, 7)
 
-        self.assertEqual(tracker.logged, [({"train/loss": 1.5}, 7)])
-        console.assert_called_once_with({"train/loss": 1.5}, 7)
+        expected = {"train/loss": 1.5, "train/optimizer_step": 7.0}
+        self.assertEqual(tracker.logged, [(expected, 7)])
+        console.assert_called_once_with(expected, 7)
 
-    def test_training_namespace_keeps_eval_metrics_unchanged(self):
+    def test_optimizer_step_is_authoritative_for_training_and_eval_rows(self):
+        tracker = _Tracker()
+        logger = TrackerLogger(tracker)
+        logger({"loss": 1, "optimizer_step": 0}, 500)
+        logger({"eval/loss": 2}, 500)
         self.assertEqual(
-            training_metric_names({"loss": 1.0, "eval/loss": 2.0}),
-            {"train/loss": 1.0, "eval/loss": 2.0},
+            [row[0]["train/optimizer_step"] for row in tracker.logged], [500.0, 500.0]
+        )
+
+    def test_training_namespace_keeps_explicit_namespaces_unchanged(self):
+        self.assertEqual(
+            training_metric_names(
+                {
+                    "loss": 1.0,
+                    "eval/loss": 2.0,
+                    "perf/optimizer_step_time_s": 3.0,
+                    "position_1/hard_label/unary_top1_accuracy": 0.5,
+                }
+            ),
+            {
+                "train/loss": 1.0,
+                "eval/loss": 2.0,
+                "perf/optimizer_step_time_s": 3.0,
+                "position_1/hard_label/unary_top1_accuracy": 0.5,
+            },
         )
 
     def test_close_is_idempotent_and_logging_after_close_fails(self):
@@ -155,7 +177,9 @@ class TrackingLoggerTest(unittest.TestCase):
         make.assert_called_once_with("tensorboard")
         tracker_class.validate_args.assert_called_once()
         logger({"loss": 2.0}, 3)
-        self.assertEqual(tracker.logged, [({"train/loss": 2.0}, 3)])
+        self.assertEqual(
+            tracker.logged, [({"train/loss": 2.0, "train/optimizer_step": 3.0}, 3)]
+        )
 
     def test_wandb_tracker_logs_through_its_owned_run_handle(self):
         run = mock.Mock()

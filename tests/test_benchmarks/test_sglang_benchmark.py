@@ -85,10 +85,9 @@ class SGLangBenchmarkTest(unittest.TestCase):
         from specforge.cli import main
 
         output = StringIO()
-        with redirect_stdout(output), self.assertRaises(SystemExit) as exited:
-            main(["benchmark", "--help"])
+        with redirect_stdout(output):
+            self.assertEqual(main(["benchmark", "--help"]), 0)
 
-        self.assertEqual(exited.exception.code, 0)
         help_text = " ".join(output.getvalue().split())
         self.assertIn("a running SGLang server", help_text)
         self.assertNotIn("DSpark", help_text)
