@@ -76,6 +76,13 @@ more patched SGLang capture servers, and the trainer GPU allocation; the same
 Recipes under `online/disaggregated/external` omit `managed_local`, so Mooncake
 and SGLang remain owned by the user, scheduler, or service platform.
 
+For Qwen3-8B DSpark-KV with causal convolution and D-PARD, use
+`online/disaggregated/managed-local/qwen3-8b-dspark-kv-conv-dpard-managed.yaml`.
+It allocates one capture GPU and one trainer GPU. The
+[KV+conv runbook](../../docs/recipes/dspark-kv-conv-objectives.md#start-a-local-d-pard-training-run)
+lists the SGLang capture patches, dependencies, path overrides, launch command,
+TensorBoard command, and the distinction between training and serving support.
+
 The `kimi-k3-dspark-disaggregated.yaml` recipe is the external
 two-node migration of the 64K Kimi K3 continual run. Its dedicated
 [runbook](../../docs/recipes/kimi-k3-dspark-disaggregated.md) pins the K3
