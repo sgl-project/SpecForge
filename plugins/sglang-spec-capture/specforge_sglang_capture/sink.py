@@ -248,7 +248,8 @@ class SpecCaptureSink:
                 if tensor is None:
                     raise RuntimeError(
                         f"spec_capture requested {artifact!r} but the server did "
-                        "not capture it; launch with --aux-hidden-state-capture"
+                        "not capture it; launch with "
+                        "--enable-return-aux-hidden-states"
                     )
                 stage(
                     result_feats,

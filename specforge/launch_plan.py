@@ -484,10 +484,13 @@ def _capture_flags(server_capture: str, contract) -> tuple[str, ...]:
     layer_ids = tuple(str(layer) for layer in contract.aux_layer_ids)
     if server_capture == "plugin":
         # The plugin (enabled by SPECFORGE_SPEC_CAPTURE) reads the aux and
-        # last hidden states that full hidden-state capture produces.
+        # last hidden states that full hidden-state capture produces. With
+        # --enable-return-aux-hidden-states, --speculative-algorithm only names
+        # the capture convention: SGLang resets it, so no draft runs.
         return (
-            "--aux-hidden-state-capture",
-            contract.method,
+            "--speculative-algorithm",
+            contract.method.upper(),
+            "--enable-return-aux-hidden-states",
             "--return-aux-hidden-state-layer-ids",
             *layer_ids,
             "--return-hidden-states-mode",

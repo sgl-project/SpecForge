@@ -43,7 +43,8 @@ SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
     "--enable-spec-capture": "the capture launcher",
     "--spec-capture-method": "the algorithm's capture contract",
     "--spec-capture-aux-layer-ids": "the algorithm's capture contract",
-    "--aux-hidden-state-capture": "the algorithm's capture contract",
+    "--speculative-algorithm": "the algorithm's capture contract (plugin backend)",
+    "--enable-return-aux-hidden-states": "the algorithm's capture contract",
     "--return-aux-hidden-state-layer-ids": "the algorithm's capture contract",
     "--return-hidden-states-mode": "the capture launcher (full prefill capture)",
     "--enable-return-hidden-states": "the capture launcher (full prefill capture)",
@@ -768,7 +769,7 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: How the SGLang capture servers implement spec capture: ``patch`` is the
     #: versioned source patch under ``patches/sglang``; ``plugin`` is the
     #: ``specforge-sglang-capture`` plugin on an SGLang build with forward
-    #: observers, deferred outputs and ``--aux-hidden-state-capture``.
+    #: observers, deferred outputs and ``--enable-return-aux-hidden-states``.
     server_capture: Literal["patch", "plugin"] = "patch"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None

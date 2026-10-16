@@ -176,7 +176,7 @@ class CaptureObserver:
                         item,
                         error=(
                             f"the server did not capture {missing}; launch with "
-                            "--aux-hidden-state-capture and "
+                            "--enable-return-aux-hidden-states and "
                             "--return-hidden-states-mode full"
                         ),
                     )
@@ -422,10 +422,15 @@ def install(scheduler) -> CaptureRuntime:
     ):
         raise RuntimeError(
             "SPECFORGE_SPEC_CAPTURE needs an SGLang build with forward observers, "
-            "deferred outputs and --aux-hidden-state-capture"
+            "deferred outputs and --enable-return-aux-hidden-states"
         )
+    # aux_hidden_state_capture is the resolved capture method: SGLang fills it
+    # from --enable-return-aux-hidden-states and --speculative-algorithm.
     if features.aux_hidden_state_capture is None:
-        raise RuntimeError("SPECFORGE_SPEC_CAPTURE needs --aux-hidden-state-capture")
+        raise RuntimeError(
+            "SPECFORGE_SPEC_CAPTURE needs --enable-return-aux-hidden-states with "
+            "--speculative-algorithm naming the capture convention"
+        )
     if features.return_hidden_states_mode != "full":
         raise RuntimeError(
             "SPECFORGE_SPEC_CAPTURE needs --return-hidden-states-mode full so every "

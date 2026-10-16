@@ -11,7 +11,8 @@
 Installed into the SGLang environment, SGLang's ``load_plugins()`` calls
 :func:`register` in every process (entry point group ``sglang.srt.plugins``).
 Capture is enabled only when ``SPECFORGE_SPEC_CAPTURE=1``; the server must also
-run with ``--aux-hidden-state-capture``, ``--return-hidden-states-mode full``
+run with ``--enable-return-aux-hidden-states`` (plus ``--speculative-algorithm``
+naming the capture convention), ``--return-hidden-states-mode full``
 and ``--chunked-prefill-size -1`` (checked when the scheduler starts).
 """
 

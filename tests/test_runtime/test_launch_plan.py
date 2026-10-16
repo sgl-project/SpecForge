@@ -743,7 +743,8 @@ class LaunchPlanTest(unittest.TestCase):
             "--spec-capture-aux-layer-ids",
         ):
             self.assertNotIn(flag, argv)
-        self.assertEqual(argv[argv.index("--aux-hidden-state-capture") + 1], "dflash")
+        self.assertEqual(argv[argv.index("--speculative-algorithm") + 1], "DFLASH")
+        self.assertIn("--enable-return-aux-hidden-states", argv)
         layers = argv.index("--return-aux-hidden-state-layer-ids")
         self.assertEqual(argv[layers + 1 : layers + 6], ("1", "9", "17", "25", "33"))
         self.assertEqual(argv[argv.index("--return-hidden-states-mode") + 1], "full")
@@ -756,7 +757,7 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(plan.server_capture, "patch")
         capture = plan.services[1].command
         self.assertIn("--enable-spec-capture", capture.argv)
-        self.assertNotIn("--aux-hidden-state-capture", capture.argv)
+        self.assertNotIn("--enable-return-aux-hidden-states", capture.argv)
         self.assertNotIn("SPECFORGE_SPEC_CAPTURE", capture.env)
 
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
@@ -1099,8 +1100,8 @@ class LaunchPlanTest(unittest.TestCase):
                 "set from deployment.disaggregated.server_capture",
             ),
             "plugin capture flag": (
-                model(sglang_extra_args=["--aux-hidden-state-capture", "eagle3"]),
-                "--aux-hidden-state-capture; it is rendered from the algorithm",
+                model(sglang_extra_args=["--enable-return-aux-hidden-states"]),
+                "--enable-return-aux-hidden-states; it is rendered from the algorithm",
             ),
             "legacy hidden-state flag": (
                 server(extra_args=["--enable-return-hidden-states"]),

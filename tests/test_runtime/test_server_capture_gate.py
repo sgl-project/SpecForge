@@ -102,8 +102,9 @@ def _capture_server_flags():
     layer_ids = [str(i) for i in AUX_LAYER_IDS]
     if SERVER_CAPTURE == "plugin":
         return [
-            "--aux-hidden-state-capture",
-            "eagle3",
+            "--speculative-algorithm",
+            "EAGLE3",
+            "--enable-return-aux-hidden-states",
             "--return-aux-hidden-state-layer-ids",
             *layer_ids,
             "--return-hidden-states-mode",
