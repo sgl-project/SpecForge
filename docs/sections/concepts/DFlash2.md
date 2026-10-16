@@ -152,6 +152,5 @@ unary logits in both SpecForge's local generation path and the matching serving
 contract.
 
 Training supports the shared DFlash-family `gqa`, `mha`, and `mla` attention
-modes. SGLang DFlash-family serving currently supports GQA/MHA layouts, so do
-not use an MLA DFlash2 export for a serving benchmark until the corresponding
-loader and kernels are available.
+modes. Serving an MLA DFlash2 export needs an SGLang revision that contains
+[SGLang PR #44676](https://github.com/sgl-project/sglang/pull/44676).
