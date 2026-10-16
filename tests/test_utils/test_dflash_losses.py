@@ -29,6 +29,9 @@ class _DFlashDraftStub(nn.Module):
 
 
 _stub_dflash_draft.DFlashDraftModel = _DFlashDraftStub
+_stub_dflash_draft.resolve_dflash_causal_block = lambda config: getattr(
+    config, "is_causal", None
+)
 
 _spec = importlib.util.spec_from_file_location(
     "specforge.algorithms.common.dflash_family_model",
