@@ -99,7 +99,10 @@ class BuiltinProviderContractTest(unittest.TestCase):
         for registration in self.registry:
             with self.subTest(algorithm=registration.name):
                 providers = registration.providers
-                self.assertGreaterEqual(len(providers.server_streaming), 1)
+                if registration.name == "dspark_kv":
+                    self.assertEqual(providers.server_streaming, ())
+                else:
+                    self.assertGreaterEqual(len(providers.server_streaming), 1)
                 self.assertFalse(hasattr(providers, "colocated"))
                 self.assertFalse(hasattr(providers, "target_backend"))
                 self.assertFalse(hasattr(providers, "deployment"))
@@ -179,7 +182,15 @@ class BuiltinProviderContractTest(unittest.TestCase):
         )
         config = SimpleNamespace(training=training)
         draft = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=2),
+            config=SimpleNamespace(
+                num_hidden_layers=2,
+                dflash_config={
+                    "conditioning_source": "target_kv",
+                    "target_layer_ids": [3, 7],
+                    "target_kv_heads": 2,
+                    "target_kv_head_dim": 4,
+                },
+            ),
             layers=[object(), object()],
             norm_before_residual=True,
             target_layer_ids=[3, 7],

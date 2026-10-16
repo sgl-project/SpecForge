@@ -633,9 +633,14 @@ class AlgorithmProviders:
     offline: Tuple[OfflineDataProvider, ...] = ()
     server_streaming: Tuple[ServerStreamingProvider, ...] = ()
     vocab_mapping_modes: FrozenSet[FeatureMode] = frozenset()
+    configure_conditioning: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.algorithm_name, field_name="algorithm_name")
+        if self.configure_conditioning is not None and not callable(
+            self.configure_conditioning
+        ):
+            raise TypeError("configure_conditioning must be callable or None")
         if not isinstance(self.step, StepProvider):
             raise TypeError("step must be a StepProvider")
         if not isinstance(self.model, ModelProvider):

@@ -54,6 +54,14 @@ def resolve_run(
     except KeyError as exc:
         raise ValueError(str(exc)) from exc
 
+    if cfg.model.conditioning_source == "kv":
+        configure = algorithm.providers.configure_conditioning
+        if configure is None:
+            raise ValueError(
+                f"algorithm {algorithm.name!r} does not support conditioning_source='kv'"
+            )
+        algorithm = configure(cfg, algorithm)
+
     return bind_run(cfg, algorithm)
 
 
