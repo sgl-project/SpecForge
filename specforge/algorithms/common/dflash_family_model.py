@@ -2177,6 +2177,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
         objective_chunk_blocks: int = 128,
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -2188,7 +2190,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
             objective_chunk_blocks=objective_chunk_blocks,
-            loss_type="dflash",
+            loss_type=loss_type,
+            dpace_alpha=dpace_alpha,
         )
         if dspark_ce_loss_alpha < 0:
             raise ValueError("dspark_ce_loss_alpha must be >= 0")
@@ -2196,7 +2199,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError("dspark_l1_loss_alpha must be >= 0")
         if dspark_confidence_head_alpha < 0:
             raise ValueError("dspark_confidence_head_alpha must be >= 0")
-        self.loss_type = "dspark"
+        self.loss_type = "dspark" if loss_type == "dflash" else loss_type
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
@@ -2242,6 +2245,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         eval_mask: torch.Tensor,
     ) -> torch.Tensor:
         loss_weight_mask = eval_mask.to(torch.float32)
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            anchors_per_sequence = eval_mask.any(dim=-1).sum(dim=-1, keepdim=True)
+            return loss_weight_mask / anchors_per_sequence.clamp_min(1).unsqueeze(-1)
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             positions = torch.arange(self.block_size, device=eval_mask.device).view(
                 1, 1, -1
@@ -2298,6 +2304,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
             target_ids.reshape(-1),
             reduction="none",
         ).reshape_as(target_ids)
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            with torch.no_grad():
+                credit = self._dpace_weight(
+                    torch.exp(-cross_entropy.detach().float()),
+                    eval_mask.float(),
+                    eval_mask.bool(),
+                    self.loss_type,
+                )
+            loss_weights = loss_weights * credit
         ce_num = (cross_entropy * loss_weights).sum()
 
         zero = ce_num.new_zeros(())
@@ -2365,15 +2380,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
             )
             if aligned_target_hidden is not None:
                 assert draft_probabilities is not None and teacher_ids is not None
+                teacher_top1 = target_probabilities.max(dim=-1).values
+                draft_top1 = draft_probabilities.max(dim=-1).values
                 teacher_agreement_num = (
                     (predicted_ids == teacher_ids).float() * eval_mask
                 ).sum()
-                teacher_top1_num = (
-                    target_probabilities.max(dim=-1).values * eval_mask
-                ).sum()
-                draft_top1_num = (
-                    draft_probabilities.max(dim=-1).values * eval_mask
-                ).sum()
+                teacher_top1_num = (teacher_top1 * eval_mask).sum()
+                draft_top1_num = (draft_top1 * eval_mask).sum()
                 valid_blocks = eval_mask.any(dim=-1).float()
                 accepted_expectation = (
                     accept_probability.detach() * eval_mask
@@ -2421,7 +2434,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
             -1,
         )
         loss_weights = self._dspark_loss_weight_mask(eval_mask)
-        local_loss_den = loss_weights.sum()
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            local_loss_den = eval_mask.any(dim=-1).any(dim=-1).float().sum()
+        else:
+            local_loss_den = loss_weights.sum()
         need_target = self.dspark_l1_loss_alpha > 0 or (
             self.dspark_confidence_head_alpha > 0
             and getattr(self.draft_model, "confidence_head", None) is not None

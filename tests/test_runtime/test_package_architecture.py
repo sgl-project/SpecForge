@@ -719,6 +719,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
                 "qwen3-8b-dspark-kv-causal-noconf-b16.json",
+                "qwen3-8b-dspark-kv-conv-causal-noconf-b16.json",
                 "qwen3.5-4b-dspark-kv.json",
                 "qwen3.6-27b-dspark.json",
             },
