@@ -4,7 +4,14 @@ import math
 import torch
 import torch.distributed as dist
 
-from specforge.lr_scheduler import ConstantWarmupLR, CosineAnnealingWarmupLR
+from specforge.lr_scheduler import (
+    ConstantLinearDecayWarmupLR,
+    ConstantWarmupLR,
+    CosineAnnealingWarmupLR,
+    completed_updates_from_state,
+    constant_linear_decay_lr,
+    warmup_updates,
+)
 from specforge.utils import print_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -49,6 +56,8 @@ class BF16Optimizer:
         warmup_ratio=0.015,
         lr_scheduler="cosine",
         offload_master=False,
+        lr_decay_start_update=None,
+        lr_decay_end_update=None,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
@@ -83,6 +92,7 @@ class BF16Optimizer:
         self._reduce_grad_norm_across_ranks = True
         scheduler_types = {
             "constant": ConstantWarmupLR,
+            "constant_linear_decay": ConstantLinearDecayWarmupLR,
             "cosine": CosineAnnealingWarmupLR,
         }
         if lr_scheduler not in scheduler_types:
@@ -91,10 +101,37 @@ class BF16Optimizer:
                 f"expected one of {sorted(scheduler_types)}"
             )
         self.lr_scheduler_type = lr_scheduler
+        warmup_steps = warmup_updates(warmup_ratio, total_steps)
+        decay_kwargs = {}
+        self.lr_decay_window = None
+        if lr_scheduler == "constant_linear_decay":
+            if lr_decay_start_update is None or lr_decay_end_update is None:
+                raise ValueError(
+                    "lr_scheduler='constant_linear_decay' requires "
+                    "lr_decay_start_update and lr_decay_end_update"
+                )
+            self.lr_decay_window = {
+                "warmup_updates": warmup_steps,
+                "decay_start_update": int(lr_decay_start_update),
+                "decay_end_update": int(lr_decay_end_update),
+            }
+            decay_kwargs = dict(
+                decay_start=int(lr_decay_start_update),
+                decay_end=int(lr_decay_end_update),
+            )
+        elif lr_decay_start_update is not None or lr_decay_end_update is not None:
+            raise ValueError(
+                "lr_decay_start_update/lr_decay_end_update apply only to "
+                f"lr_scheduler='constant_linear_decay', not {lr_scheduler!r}"
+            )
+        # Set when a cooldown run branches from a ``constant`` checkpoint and
+        # carried through every later checkpoint of that run.
+        self.lr_schedule_branch = None
         self.scheduler = scheduler_types[lr_scheduler](
             self.optimizer,
             total_steps=total_steps,
-            warmup_steps=int(warmup_ratio * total_steps),
+            warmup_steps=warmup_steps,
+            **decay_kwargs,
         )
 
     def configure_grad_norm_reduction(
@@ -281,12 +318,7 @@ class BF16Optimizer:
         fp32 master params; without them the masters are re-cloned from the
         bf16 weights and the resume is not numerically faithful."""
         saved_scheduler_type = state_dict.get("lr_scheduler_type", "cosine")
-        if saved_scheduler_type != self.lr_scheduler_type:
-            raise ValueError(
-                "checkpoint optimizer used lr_scheduler="
-                f"{saved_scheduler_type!r} but this run has "
-                f"lr_scheduler={self.lr_scheduler_type!r}"
-            )
+        branch = self._check_lr_schedule_resume(state_dict, saved_scheduler_type)
         saved_max_grad_norm = state_dict.get("max_grad_norm")
         if saved_max_grad_norm is not None and float(saved_max_grad_norm) != float(
             self.max_grad_norm
@@ -304,6 +336,14 @@ class BF16Optimizer:
         print_on_rank0("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
         print_on_rank0("Successfully loaded scheduler state_dict.")
+        if self.lr_decay_window is not None:
+            self._check_restored_learning_rate()
+        if branch is not None and saved_scheduler_type == "constant":
+            print_on_rank0(
+                "Branched lr_scheduler constant -> constant_linear_decay after "
+                f"update {branch['branch_update']}: {branch}"
+            )
+        self.lr_schedule_branch = branch
         saved_fp32 = state_dict.get("fp32_params")
         if saved_fp32 is not None:
             if len(saved_fp32) != len(self.fp32_params):
@@ -329,7 +369,7 @@ class BF16Optimizer:
                     mp.data.copy_(p.detach().to(device=mp.device, dtype=mp.dtype))
 
     def state_dict(self):
-        return {
+        state = {
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "lr_scheduler_type": self.lr_scheduler_type,
@@ -337,6 +377,127 @@ class BF16Optimizer:
             # rank-local fp32 masters; without them a resume re-quantizes from bf16
             "fp32_params": [t.detach().cpu() for t in self.fp32_params],
         }
+        if self.lr_decay_window is not None:
+            # Only the cooldown schedule adds keys; other types keep the
+            # historical checkpoint layout.
+            state["lr_decay_window"] = dict(self.lr_decay_window)
+            state["lr_schedule_branch"] = (
+                None
+                if self.lr_schedule_branch is None
+                else dict(self.lr_schedule_branch)
+            )
+        return state
+
+    def _check_lr_schedule_resume(self, state_dict, saved_scheduler_type):
+        """Refuse a scheduler change except the cooldown branch.
+
+        Returns the branch metadata this run carries after the load (``None``
+        unless the run is a ``constant_linear_decay`` branch of a ``constant``
+        run).
+        """
+        current = self.lr_scheduler_type
+        if saved_scheduler_type == current:
+            if current != "constant_linear_decay":
+                return None
+            saved_window = state_dict.get("lr_decay_window")
+            if saved_window != self.lr_decay_window:
+                raise ValueError(
+                    "checkpoint optimizer used constant_linear_decay window "
+                    f"{saved_window} but this run has {self.lr_decay_window}; "
+                    "a resumed cooldown must keep identical warmup/D/T"
+                )
+            branch = state_dict.get("lr_schedule_branch")
+            if branch is not None:
+                self._check_branch_window(branch)
+                branch = dict(branch)
+            return branch
+        if saved_scheduler_type == "constant" and current == "constant_linear_decay":
+            window = self.lr_decay_window
+            scheduler_state = state_dict["scheduler_state_dict"]
+            if scheduler_state.get("after_scheduler_type") != "_FlatLR":
+                raise ValueError(
+                    "checkpoint lr_scheduler='constant' has nested scheduler "
+                    f"{scheduler_state.get('after_scheduler_type')!r}, "
+                    "expected '_FlatLR'"
+                )
+            saved_warmup = int(scheduler_state["warmup_epochs"])
+            if saved_warmup != window["warmup_updates"]:
+                raise ValueError(
+                    f"checkpoint warmup={saved_warmup} updates but this run has "
+                    f"warmup={window['warmup_updates']}; the cooldown branch must "
+                    "keep the constant run's warmup"
+                )
+            restored_update = completed_updates_from_state(scheduler_state)
+            if restored_update > window["decay_start_update"]:
+                raise ValueError(
+                    "cannot branch lr_scheduler constant -> constant_linear_decay "
+                    f"from update {restored_update}: it is past "
+                    f"lr_decay_start_update={window['decay_start_update']}"
+                )
+            return {
+                "from_type": "constant",
+                "branch_update": restored_update,
+                "decay_start_update": window["decay_start_update"],
+                "decay_end_update": window["decay_end_update"],
+            }
+        raise ValueError(
+            "checkpoint optimizer used lr_scheduler="
+            f"{saved_scheduler_type!r} but this run has "
+            f"lr_scheduler={current!r}"
+        )
+
+    def _check_branch_window(self, branch):
+        window = self.lr_decay_window
+        expected = {
+            "from_type": "constant",
+            "decay_start_update": window["decay_start_update"],
+            "decay_end_update": window["decay_end_update"],
+        }
+        recorded = {key: branch.get(key) for key in expected}
+        if recorded != expected or not isinstance(branch.get("branch_update"), int):
+            raise ValueError(
+                f"checkpoint lr_schedule_branch {branch} does not match this "
+                f"run's constant_linear_decay window {window}"
+            )
+
+    def _check_restored_learning_rate(self):
+        """The restored rate must be the cooldown rate of the next update (for a
+        ``constant`` checkpoint at update <= D it is by construction)."""
+        window = self.lr_decay_window
+        next_update = self.scheduler.completed_updates() + 1
+        for group in self.optimizer.param_groups:
+            expected = constant_linear_decay_lr(
+                next_update,
+                group["initial_lr"],
+                window["warmup_updates"],
+                window["decay_start_update"],
+                window["decay_end_update"],
+            )
+            if group["lr"] != expected:
+                raise ValueError(
+                    f"restored lr={group['lr']!r} for update {next_update} differs "
+                    f"from constant_linear_decay lr={expected!r}"
+                )
+
+    def lr_schedule(self) -> dict:
+        """The schedule's type, peak rates and update boundaries, for asserting
+        per-update rates with :mod:`specforge.lr_scheduler`'s closed forms."""
+        schedule = {
+            "type": self.lr_scheduler_type,
+            "base_lrs": [group["initial_lr"] for group in self.optimizer.param_groups],
+            "warmup_updates": int(self.scheduler.warmup_epochs),
+        }
+        if self.lr_decay_window is not None:
+            schedule.update(
+                decay_start_update=self.lr_decay_window["decay_start_update"],
+                decay_end_update=self.lr_decay_window["decay_end_update"],
+                branch=(
+                    None
+                    if self.lr_schedule_branch is None
+                    else dict(self.lr_schedule_branch)
+                ),
+            )
+        return schedule
 
     def get_learning_rate(self):
         return self.optimizer.param_groups[0]["lr"]
