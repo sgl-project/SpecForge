@@ -8,13 +8,16 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Server-side spec-capture rollout source (zero-copy Mooncake transport).
 
-An external SGLang server patched with
-``patches/sglang/v0.5.18/spec-capture.patch`` runs
-the prefill and writes captured features straight into Mooncake in
-:class:`MooncakeFeatureStore`'s key layout. Tensors never pass through this
-process — the ``/generate`` response's ``meta_info["spec_capture"]`` carries
-only key/shape/dtype, from which :meth:`SGLangServerCaptureAdapter.produce_refs`
-builds committed-ready ``SampleRef``s.
+An external SGLang capture server runs the prefill and writes captured
+features straight into Mooncake in :class:`MooncakeFeatureStore`'s key layout.
+The server is either patched with ``patches/sglang/v0.5.18/spec-capture.patch``
+(``server_capture="patch"``: the spec rides a top-level ``spec_capture``
+request field) or runs the ``specforge-sglang-capture`` plugin
+(``server_capture="plugin"``: the spec rides ``sampling_params.custom_params``).
+Tensors never pass through this process — the ``/generate`` response's
+``meta_info["spec_capture"]`` carries only key/shape/dtype, from which
+:meth:`SGLangServerCaptureAdapter.produce_refs` builds committed-ready
+``SampleRef``s.
 
 The server knows only generic artifacts (``aux`` = capture layers
 concatenated, ``last_hidden`` = post-norm final hidden) plus passthrough
@@ -24,6 +27,7 @@ tensors.  The application composition root injects an algorithm-owned
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import uuid
@@ -38,6 +42,10 @@ from specforge.inference.capture import (
 from specforge.runtime.contracts import SCHEMA_VERSION, FeatureSpec, PromptTask
 
 logger = logging.getLogger(__name__)
+
+#: How a capture server implements spec capture: the versioned source patch or
+#: the SGLang plugin. Each takes the request spec through a different field.
+SERVER_CAPTURE_BACKENDS = ("patch", "plugin")
 
 
 @dataclass(frozen=True)
@@ -159,7 +167,13 @@ class SGLangServerCaptureAdapter:
         timeout_s: float = 300.0,
         post_fn: Optional[Callable[..., Any]] = None,
         target_model_version: str = "unknown",
+        server_capture: str = "patch",
     ) -> None:
+        if server_capture not in SERVER_CAPTURE_BACKENDS:
+            raise ValueError(
+                f"server_capture must be one of {SERVER_CAPTURE_BACKENDS}, "
+                f"got {server_capture!r}"
+            )
         required_store_api = (
             "adopt",
             "discard_external_attempts",
@@ -193,6 +207,12 @@ class SGLangServerCaptureAdapter:
         self.timeout_s = timeout_s
         self.post_fn = post_fn or _SessionPost()
         self.target_model_version = target_model_version
+        self.server_capture = server_capture
+        self._capture_hint = (
+            "the specforge-sglang-capture plugin with SPECFORGE_SPEC_CAPTURE=1"
+            if server_capture == "plugin"
+            else "the spec-capture patch with --enable-spec-capture"
+        )
         self._healthy = True
 
     # -- request construction -------------------------------------------------
@@ -345,9 +365,23 @@ class SGLangServerCaptureAdapter:
         # targets. Retries need a new key because the prior attempt may have
         # populated its namespace before the response was lost.
         body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
-        body["sampling_params"] = {"temperature": 0.0, "max_new_tokens": 0}
+        sampling_params = {"temperature": 0.0, "max_new_tokens": 0}
         capture_payloads = [self._spec_capture_payload(t) for t in tasks]
-        body["spec_capture"] = capture_payloads
+        if self.server_capture == "plugin":
+            # custom_params values must be JSON scalars, so the spec travels
+            # as one JSON string per request.
+            body["sampling_params"] = [
+                {
+                    **sampling_params,
+                    "custom_params": {
+                        "spec_capture": json.dumps(payload, separators=(",", ":"))
+                    },
+                }
+                for payload in capture_payloads
+            ]
+        else:
+            body["sampling_params"] = sampling_params
+            body["spec_capture"] = capture_payloads
         for payload in capture_payloads:
             feature_names = list(payload["features"].values())
             feature_names.extend(
@@ -389,8 +423,7 @@ class SGLangServerCaptureAdapter:
                         task_id=task.task_id,
                         reason=(
                             "server_capture: response carries no spec_capture "
-                            "result — is the server patched and launched with "
-                            "--enable-spec-capture?"
+                            f"result — is the server running {self._capture_hint}?"
                         ),
                         retryable=False,
                     )
@@ -522,6 +555,7 @@ def _spec_nbytes(shape: Tuple[int, ...], dtype: str) -> int:
 
 
 __all__ = [
+    "SERVER_CAPTURE_BACKENDS",
     "ServerCaptureSchema",
     "ServerCaptureFailure",
     "SGLangServerCaptureAdapter",
