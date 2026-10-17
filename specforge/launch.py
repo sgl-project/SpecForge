@@ -1553,6 +1553,7 @@ def build_disagg_online_consumer(
     dataloader_num_workers: int = 0,
     profiling_options=None,
     async_ack: Optional[bool] = None,
+    scheduling=None,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1727,6 +1728,7 @@ def build_disagg_online_consumer(
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
+                scheduling=scheduling,
             )
             inbox_server_url = os.environ.get("DISAGG_INBOX_SERVER_URL")
             if inbox_server_url:
@@ -1891,6 +1893,11 @@ def build_disagg_online_consumer(
             collate_fn=_streaming_collate(algorithm, modality, collate_fn),
             strategy_kwargs=strategy_kwargs,
             per_sample_transform=None,
+            checkpoint_extra={
+                "cost_aware_scheduling": (
+                    scheduling.contract() if scheduling is not None else None
+                ),
+            },
             max_checkpoints=max_checkpoints,
             tp_size=tp_size,
             sp_ulysses_size=sp_ulysses_size,

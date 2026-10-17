@@ -200,6 +200,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             dspark_ce_loss_alpha=0.1,
             dspark_l1_loss_alpha=0.8,
             dspark_confidence_head_alpha=0.2,
+            loss_normalization="round",
         )
         models = {
             "eagle3": SimpleNamespace(
@@ -256,6 +257,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
+                "dspark_loss_normalization",
             },
             "mtp": {
                 "mtp_draft_num_hidden_layers",

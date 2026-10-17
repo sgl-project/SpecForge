@@ -37,6 +37,12 @@ from specforge.training.controller import TrainerController, TrainerCore
 
 logger = logging.getLogger(__name__)
 
+#: Contract keys older checkpoints lack; missing means the default.
+_OPTIONAL_CONTRACT_DEFAULTS = {
+    "cost_aware_scheduling": None,
+    "dspark_loss_normalization": "round",
+}
+
 
 def _legacy_scheduler_total_steps(state: Mapping[str, object]) -> Optional[int]:
     """Recover the BF16 optimizer horizon from a pre-contract checkpoint.
@@ -338,7 +344,11 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if key in custom_checkpoint_extra and key not in state:
+                if key in _OPTIONAL_CONTRACT_DEFAULTS and key not in state:
+                    persisted = _OPTIONAL_CONTRACT_DEFAULTS[key]
+                    comparison_persisted = persisted
+                    persisted_available = True
+                elif key in custom_checkpoint_extra and key not in state:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
                         f"algorithm resume semantic {key}; start a fresh run "

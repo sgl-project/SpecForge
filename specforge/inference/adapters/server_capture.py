@@ -277,6 +277,19 @@ class SGLangServerCaptureAdapter:
             "passthrough": passthrough,
         }
 
+    @staticmethod
+    def _scheduling_metadata(task: PromptTask) -> Dict[str, Any]:
+        """Cost-aware scheduling inputs the consumer cannot derive from a ref."""
+        loss_mask = task.payload.get("loss_mask")
+        if loss_mask is None:
+            return {}
+        from specforge.runtime.data_plane.window_plan import (
+            VALID_ANCHORS_METADATA_KEY,
+            count_valid_anchors,
+        )
+
+        return {VALID_ANCHORS_METADATA_KEY: count_valid_anchors(loss_mask)}
+
     # -- ref construction ------------------------------------------------------
     def _ref_from_result(
         self, task: PromptTask, result: Dict[str, Any], capture: CaptureConfig
@@ -325,6 +338,7 @@ class SGLangServerCaptureAdapter:
                 "transport": "sglang_server_capture",
                 "server": self.base_url,  # which server captured it (provenance)
                 "generation": gen,  # the zero-copy get() locator
+                **self._scheduling_metadata(task),
             },
         )
 
