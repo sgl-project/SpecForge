@@ -2337,9 +2337,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             )
 
         confidence_hidden_4d = None
-        pop_confidence_hidden = getattr(
-            self.draft_model, "pop_confidence_hidden", None
-        )
+        pop_confidence_hidden = getattr(self.draft_model, "pop_confidence_hidden", None)
         if callable(pop_confidence_hidden):
             confidence_hidden = pop_confidence_hidden()
             if confidence_hidden is not None:

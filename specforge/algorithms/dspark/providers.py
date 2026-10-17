@@ -37,9 +37,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
-COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
-    {DRAFT_ARCHITECTURE, "DSparkV4DraftModel"}
-)
+COMPATIBLE_DRAFT_ARCHITECTURES = frozenset({DRAFT_ARCHITECTURE, "DSparkV4DraftModel"})
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
