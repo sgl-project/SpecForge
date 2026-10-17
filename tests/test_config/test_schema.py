@@ -362,6 +362,10 @@ class ConfigSchemaTest(unittest.TestCase):
         payload = _managed_local_payload(ep_size=1)
         managed = payload["deployment"]["disaggregated"]["managed_local"]
         managed["capture_servers"][0]["gpu_put"] = True
+        # An unset protocol is resolved, and gpu_put rechecked, by the plan.
+        cfg = Config.model_validate(payload)
+        self.assertIsNone(cfg.deployment.disaggregated.managed_local.mooncake.protocol)
+        managed["mooncake"] = {"protocol": "tcp"}
         with self.assertRaisesRegex(ValidationError, "rdma"):
             Config.model_validate(payload)
         managed["mooncake"] = {"protocol": "rdma", "rdma_devices": "mlx5_0"}
