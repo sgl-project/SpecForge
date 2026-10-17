@@ -178,6 +178,52 @@ mixed layout must be edited explicitly in the draft JSON.
 
 The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
 
+Attention range and direction are independent for DFlash, DFlash2, Domino,
+and DSpark. `layer_types` selects global (`full_attention`) or local
+(`sliding_attention`) attention per layer; top-level `is_causal` selects the
+direction uniformly across draft layers:
+
+| Layer type | `is_causal` | Draft-block visibility |
+| --- | --- | --- |
+| `full_attention` | `false` | All positions in the same draft block |
+| `full_attention` | `true` | Current and preceding positions in the same block |
+| `sliding_attention` | `false` | Nearby preceding and following positions in the same block |
+| `sliding_attention` | `true` | Nearby current and preceding positions in the same block |
+
+For example, a bidirectional local draft uses:
+
+```json
+{
+  "layer_types": ["sliding_attention", "sliding_attention"],
+  "num_hidden_layers": 2,
+  "use_sliding_window": true,
+  "sliding_window": 128,
+  "is_causal": false
+}
+```
+
+An explicit window `W` requires positional distance `< W`: causal attention
+has at most `W` visible positions, while bidirectional attention has at most
+`2 * W - 1`, including the current position. Context is always restricted to
+target features strictly before the anchor, and different draft blocks remain
+isolated. Bidirectional does not expose future target features or labels.
+
+Omitting `is_causal` (or setting it to null) preserves the legacy training
+mask exactly: global layers are bidirectional; sliding layers are causal,
+with the window applied to context and the whole causal draft prefix retained.
+Set a boolean explicitly for the independent, strictly windowed semantics.
+The new window semantics are recorded in checkpoints; old window checkpoints
+cannot silently resume under the new interpretation. Existing DSpark global
+causal checkpoints remain compatible. DSpine requires causal attention by
+design and rejects `is_causal: false`.
+
+Explicit training masks work with eager, SDPA, and Flex Attention. Native
+draft inference without a supplied mask supports these settings through
+eager/SDPA, including cached decoding. HF exports preserve `is_causal`.
+The SGLang normalization gate rejects bidirectional sliding-window exports
+until that external serving path is validated; it does not silently fall back
+to a causal mask. These settings do not change CE/L1 losses or kernel optimizations.
+
 ### DFlash2
 
 DFlash2 is a draft-architecture variant of DFlash, not a separate capture

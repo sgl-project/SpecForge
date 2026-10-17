@@ -325,6 +325,13 @@ class SGLangServerCaptureAdapter:
                 "transport": "sglang_server_capture",
                 "server": self.base_url,  # which server captured it (provenance)
                 "generation": gen,  # the zero-copy get() locator
+                "valid_anchor_count": sum(
+                    left > 0.5 and right > 0.5
+                    for left, right in zip(
+                        task.payload.get("loss_mask", []),
+                        task.payload.get("loss_mask", [])[1:],
+                    )
+                ),
             },
         )
 

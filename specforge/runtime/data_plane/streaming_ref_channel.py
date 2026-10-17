@@ -18,8 +18,8 @@ that control-plane channel.
   publish); the feature tensors go through the ``FeatureStore`` (Mooncake), so a
   shared *data* mount is never required -- only this small control file.
 * **Append-only JSONL.** ``publish()`` appends one ref per line and fsyncs;
-  ``poll()`` tail-reads complete lines from the last offset, buffering a partial
-  trailing line so a reader never parses a half-written record.
+  ``poll()`` advances its byte offset only after validating complete records.
+  Partial trailing records are reread on the next poll.
 * **Consume-once friendly.** The reader marks how many refs it has consumed
   (``mark_consumed``) in a sidecar counter the writer reads back, so the producer
   can apply backpressure (``in_flight_remote``) without any shared in-process
@@ -38,16 +38,18 @@ slots in behind the same publish/poll API later.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Sequence
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
+
+logger = logging.getLogger(__name__)
 
 _CLOSED_SUFFIX = ".closed"
 _CONSUMED_SUFFIX = ".consumed_count"
@@ -116,8 +118,6 @@ class StreamingRefChannel:
         self._published = 0
         # consumer-side
         self._read_offset = 0
-        self._partial_line = ""
-        self._complete_lines = deque[str]()
         self._consumed = 0
         # ``mark_consumed`` is called from both the trainer thread (batch acks)
         # and the prefetch worker (failure settlement), so the increment and
@@ -325,31 +325,57 @@ class StreamingRefChannel:
     def poll(self, max_n: Optional[int] = None) -> List[SampleRef]:
         """Return refs appended since the last poll (complete lines only).
 
-        Non-blocking: returns whatever is available now (possibly empty). A
-        partially written trailing line is buffered until its newline arrives, so
-        a ref is never parsed half-written.
+        Does not wait for new records. An incomplete trailing record stays on
+        disk until its newline arrives. Invalid complete records trigger bounded
+        reopen/reread attempts, invalidating file cache where supported, without
+        committing any progress from this poll. Persistent corruption raises
+        rather than silently skipping a sample.
         """
-        try:
-            with open(self.path, "r") as f:
-                f.seek(self._read_offset)
-                chunk = f.read()
-                self._read_offset = f.tell()
-        except FileNotFoundError:
-            chunk = ""
-        if chunk:
-            lines = (self._partial_line + chunk).split("\n")
-            self._partial_line = lines.pop()
-            self._complete_lines.extend(lines)
-        # Parse queued lines even when no new bytes arrived -- a previous max_n
-        # call may have left complete lines buffered.
-        out: List[SampleRef] = []
-        while self._complete_lines:
-            if max_n is not None and len(out) >= max_n:
-                break
-            line = self._complete_lines.popleft().strip()
-            if line:
-                out.append(ref_from_dict(json.loads(line)))
-        return out
+        for attempt in range(3):
+            out: List[SampleRef] = []
+            next_offset = self._read_offset
+            try:
+                with open(self.path, "rb") as stream:
+                    if attempt and hasattr(os, "posix_fadvise"):
+                        try:
+                            os.posix_fadvise(
+                                stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED
+                            )
+                        except OSError as cache_error:
+                            logger.warning(
+                                "ref-channel: cache invalidation failed path=%s: %s",
+                                self.path,
+                                cache_error,
+                            )
+                    end_offset = stream.seek(0, os.SEEK_END)
+                    stream.seek(self._read_offset)
+                    chunk = stream.read(max(0, end_offset - self._read_offset))
+                for line in chunk.split(b"\n")[:-1]:
+                    if max_n is not None and len(out) >= max_n:
+                        break
+                    if line.strip():
+                        out.append(ref_from_dict(json.loads(line.decode("utf-8"))))
+                    next_offset += len(line) + 1
+            except FileNotFoundError:
+                return []
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                if attempt == 2:
+                    raise ValueError(
+                        f"StreamingRefChannel {self.path}: invalid record at "
+                        f"byte offset {next_offset} after 3 attempts: {error}"
+                    ) from error
+                logger.warning(
+                    "ref-channel: retrying invalid record path=%s byte_offset=%d "
+                    "attempt=%d/3 error=%s",
+                    self.path,
+                    next_offset,
+                    attempt + 1,
+                    error,
+                )
+                time.sleep(0.05)
+                continue
+            self._read_offset = next_offset
+            return out
 
     def mark_consumed(self, n: int) -> None:
         """Record n more consumed refs in the sidecar the producer reads back."""

@@ -21,7 +21,7 @@ CLI; there is no second wrapper-owned training lifecycle.
 
 Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;
-`TrainerCore` owns one branch-free train step and the accumulation boundary;
+`TrainerCore` owns forward/backward scheduling and the accumulation boundary;
 `DraftTrainStrategy` owns model-specific validation, forward/loss, target
 projection, and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
 backward, optimizer steps, distributed gradient norms, and full training state.
@@ -58,6 +58,9 @@ The training plane is the only tensor-carrying side besides the data plane; it
 consumes `TrainBatch.tensors`. `TrainerCore.train_step` divides the loss by
 `accumulation_steps`, uses `no_sync()` only for non-boundary micro-batches, and
 returns `optimizer_stepped` as the single authoritative boundary signal.
+For DDP, the backend accumulation context encloses both forward and backward;
+wrapping backward alone does not disable DDP gradient synchronization. FSDP
+retains its backward-only deferral.
 `TrainerController` increments `global_step` only at that boundary, commits the
 pending sample acknowledgements, emits metrics, and performs configured
 interval saves. The outer `Trainer` owns topology cleanup and the guarded final
@@ -65,11 +68,83 @@ save, so CLI, builders, and Python callers cannot select a second loader-based
 training entry. All saves delegate to `CheckpointManager`; the shared draft
 state is written by rank 0 while every rank writes its own optimizer/RNG state.
 
+Losses with coefficients derived from the complete optimizer window can return
+a graph-free `StepOutput` with a `replay_loss` callback. The core accumulates
+the prepass ratio numerators and denominators, then replays and backpropagates
+one micro-batch at a time at the boundary. DSpine uses this when accumulating
+gradients so every micro-batch shares the window's detached backbone CE for
+alignment. Its replay retains CPU inputs and restores each prepass's RNG state;
+it adds a forward pass without retaining a window of accelerator activations.
+Single-micro-batch training and evaluation do not replay. Incomplete replay
+windows are rejected by the same end-of-stream check as ordinary accumulation.
+Each replayed forward/backward pair enters its own backend accumulation context;
+only the last replay in an optimizer window enables DDP gradient synchronization.
+
 Natural end-of-stream is accepted only at an optimizer boundary. If the final
 backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
 gradients or reporting a checkpoint as successful. Queue-mode loaders
 terminally settle and clean a short `drop_last` batch without emitting it;
 fixed offline refs keep normal `drop_last` semantics.
+
+## DSpine kernel controls
+
+DSpine honors `model.use_liger_kernel` through its registered draft provider and
+the existing DFlash kernel factories. The opt-in replaces backbone RMSNorm and
+SwiGLU modules without global Transformers patching or checkpoint-key changes.
+The adjacent injection, transfer space, CE/L1 objectives, alignment schedule,
+last-write refinement and optimizer-window replay remain unchanged. In particular,
+the generic fused linear cross-entropy kernel does not replace DSpine's composite
+objective or remove the logits required for candidate selection and distillation.
+The default remains false and missing optional Liger dependencies fail explicitly.
+
+DSpine projects flattened proposal rows through the frozen vocabulary head with
+2D GEMM, including noncontiguous slices that exclude anchor tokens. The output
+shape and autograd path are preserved. Accumulation prepasses compute only the
+backbone CE and its denominator, skipping teacher projection, L1, top-k,
+refinement and alignment objectives. The detached alignment CE is reduced once
+per optimizer window and shared by all replays. Full objectives and metrics are
+computed during replay; intermediate prepass loss is only CE. Sampling and
+curriculum RNG replay, global denominator normalization and final-step metrics
+are unchanged. GEMM kernel changes may introduce floating-point differences.
+
+`runtime.consumer_dispatch: dspine_balanced` jointly assigns two optimizer
+windows to virtual rank slots, then groups similar-cost slots into real windows.
+It accepts this assignment only if the estimated sum of per-window maximum rank
+costs improves over `cost_balanced`; otherwise it uses the original grouping.
+The high watermark must cover two global batches. This preserves sample
+coverage, complete accumulation windows and durable acknowledgements, but may
+change optimizer-window membership and therefore the exact training trajectory.
+The cost estimate is a scheduling heuristic, not a guarantee of wall-clock gain.
+Existing DFlash and Domino objective paths and dispatch defaults are unchanged.
+
+## Domino performance controls
+
+Domino honors `model.use_liger_kernel` through the draft provider and constructor.
+This selects the existing explicit RMSNorm/MLP kernel bundle; it does not patch
+Transformers globally or change DFlash's provider, fused head, or defaults.
+
+`training.domino_cache_projection: true` selectively saves the frozen linear
+vocabulary projection across objective-chunk activation checkpointing. Backward
+recomputes the GRU and CE as before but reuses this projection instead of running
+the large matrix multiplication twice. The loss, gradient normalization, lambda
+schedule, and checkpoint parameter layout are unchanged. The option defaults to
+false, is rejected for other algorithms, and falls back to recomputation for a
+trainable or non-linear target head. With `objective_chunk_blocks: 0`, objective
+checkpointing is disabled and this option has no effect. Saving logits consumes
+additional activation memory proportional to batch size, effective anchors,
+block size, and vocabulary size; validate peak memory at the intended max length.
+
+`runtime.consumer_dispatch: domino_balanced` buffers two complete global
+optimizer batches, sorts by effective anchor count and sequence length, and
+applies the existing cost-balancing assignment within each resulting window.
+It requires a high watermark of at least two global batches. A closed source
+flushes any complete remaining batch and settles only an incomplete tail using
+the existing drop-last rules. Deduplication and durable acknowledgement retain
+their original controller ownership. This policy changes sample order and
+optimizer-batch membership, so it is not a bitwise training-trajectory-preserving
+optimization even though it retains the same samples and objective. Keep
+`cost_balanced` when original window membership must be preserved. Both original
+dispatch policies remain unchanged, and `domino_balanced` is rejected for DFlash.
 
 ## Endpoints
 
