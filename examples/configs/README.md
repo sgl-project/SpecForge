@@ -103,7 +103,9 @@ DeepSeek-V4 DSpark drafter architecture (`DSparkV4DraftModel`,
 ([runbook](../../docs/recipes/deepseek-v4-flash-dspark-official-2node-h200.md));
 initialize its warm-start dir with `scripts/dspark_v4_official_weights.py`
 and `scripts/init_dspark_v4_from_target.py`, and export a servable drafter
-with `scripts/bundle_dspark_v4_official.py`.
+with `scripts/bundle_dspark_v4_official.py`. The drafter's FFN is the shared
+MoE layer with the `deepseek_v4` preset; check it against DeepSeek's
+reference code with `scripts/gates/dspark_v4_parity_check.py`.
 
 `qwen3.8-27b-dflash2.yaml` (external services, two nodes) and
 its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4.yaml`
