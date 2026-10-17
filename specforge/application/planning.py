@@ -135,6 +135,30 @@ def _validate_algorithm_capabilities(
             "training.dflash_teacher_metrics=false"
         )
 
+    if training.cost_aware_scheduling:
+        if capabilities.scheduling_key is None:
+            raise ValueError(
+                f"algorithm {algorithm.name!r} declares no cost-aware "
+                "scheduling key; training.cost_aware_scheduling is unavailable"
+            )
+        limit = capabilities.scheduling_max_batch_size
+        if limit is not None and training.batch_size > limit:
+            raise ValueError(
+                f"algorithm {algorithm.name!r} keeps its per-token weights unchanged under "
+                f"cost-aware scheduling only for training.batch_size<={limit} "
+                "(its loss is normalized per padded micro-batch); got "
+                f"training.batch_size={training.batch_size}"
+            )
+        if (
+            training.cost_aware_key == "anchors"
+            and capabilities.scheduling_key != "anchors"
+        ):
+            raise ValueError(
+                f"training.cost_aware_key={training.cost_aware_key!r} needs "
+                f"an anchor-sampling objective; algorithm {algorithm.name!r} "
+                f"declares scheduling_key={capabilities.scheduling_key!r}"
+            )
+
 
 def _validate_training_topology(
     cfg: Config,

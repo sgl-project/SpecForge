@@ -244,6 +244,12 @@ class AlgorithmCapabilities:
     #: ``training.dflash_teacher_metrics=false`` can drop the teacher-only
     #: final hidden state from the streaming capture.
     supports_teacher_metrics_opt_out: bool = False
+    #: Cost key for ``training.cost_aware_key=auto`` (``"anchors"`` or
+    #: ``"length"``); None leaves ``cost_aware_scheduling`` unavailable.
+    scheduling_key: str | None = None
+    #: Largest ``training.batch_size`` whose per-token weights survive regrouping
+    #: (per-micro-batch means re-weight tokens); None means any.
+    scheduling_max_batch_size: int | None = None
 
     def __post_init__(self) -> None:
         attention_backends = _normalized_names(
@@ -266,6 +272,19 @@ class AlgorithmCapabilities:
             if not isinstance(getattr(self, field_name), bool):
                 raise TypeError(f"{field_name} must be a bool")
         object.__setattr__(self, "attention_backends", attention_backends)
+        if self.scheduling_key is not None and self.scheduling_key not in (
+            "length",
+            "anchors",
+        ):
+            raise ValueError("scheduling_key must be 'length', 'anchors' or None")
+        if self.scheduling_max_batch_size is not None and (
+            isinstance(self.scheduling_max_batch_size, bool)
+            or not isinstance(self.scheduling_max_batch_size, int)
+            or self.scheduling_max_batch_size <= 0
+        ):
+            raise ValueError(
+                "scheduling_max_batch_size must be a positive integer or None"
+            )
 
 
 @dataclass(frozen=True)
