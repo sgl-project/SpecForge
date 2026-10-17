@@ -33,6 +33,7 @@ from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
 from specforge.runtime.data_plane import mooncake_rdma
 from specforge.training.capture_contract import ServerCaptureContract
+from tests.test_runtime.test_mooncake_rdma import FakeHost
 from tests.utils import wait_for_processes_to_stop
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
@@ -2176,7 +2177,16 @@ class LaunchPlanTest(unittest.TestCase):
                 popen.assert_not_called()
 
     def test_managed_preflight_rejects_mooncake_tcp_overrides(self):
-        with tempfile.TemporaryDirectory() as parent:
+        with (
+            tempfile.TemporaryDirectory() as parent,
+            mock.patch(
+                "specforge.launch_plan.resolve_rdma_devices",
+                side_effect=functools.partial(
+                    mooncake_rdma.resolve_rdma_devices, root=parent
+                ),
+            ),
+        ):
+            FakeHost(parent).add("mlx5_0")
             root = os.path.join(parent, "attempt")
             with mock.patch.dict(os.environ, {"MC_FORCE_TCP": "1"}, clear=True):
                 with self.assertRaisesRegex(
@@ -2222,8 +2232,67 @@ class LaunchPlanTest(unittest.TestCase):
                         self._rdma_plan(root, server_env={"MC_TE_FILTERS": "mlx5_1"})
                     )
 
+    def test_managed_preflight_reprobes_final_capture_environment(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch(
+                "specforge.launch_plan.resolve_rdma_devices",
+                side_effect=functools.partial(
+                    mooncake_rdma.resolve_rdma_devices, root=root
+                ),
+            ),
+            mock.patch("specforge.launch_plan.memlock_shortfall", return_value=None),
+        ):
+            host = FakeHost(root)
+            host.add(
+                "mlx5_0",
+                other_ports=[("2", "1: DOWN"), ("3", "4: ACTIVE")],
+                gids=[("IB/RoCE v1", "eth0", "0000:0000:0000:0001")],
+            )
+            for server_env, error in (
+                ({"MC_IB_PORT": "2"}, "port 2 is not ACTIVE"),
+                ({"MC_GID_INDEX": "1"}, "no GID at index 1"),
+                ({"NCCL_IB_GID_INDEX": "1"}, "no GID at index 1"),
+                ({"MC_IB_PORT": "3"}, None),
+                ({"MC_GID_INDEX": "0"}, None),
+            ):
+                with self.subTest(server_env=server_env):
+                    raw = _managed_raw(protocol="rdma", rdma_devices="mlx5_0")
+                    raw["deployment"]["disaggregated"]["managed_local"][
+                        "capture_servers"
+                    ][0]["env"] = server_env
+                    plan = _build_managed(raw)
+                    self.assertIsNone(plan.managed_rdma_error)
+                    if error is None:
+                        _managed_rdma_preflight(plan)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, error) as raised:
+                            _managed_rdma_preflight(plan)
+                        self.assertIn("capture-server-0", str(raised.exception))
+
+            # Match _spawn_command: a child override wins, and None removes an
+            # inherited switch instead of passing it to the resolver.
+            with mock.patch.dict(os.environ, {"MC_IB_PORT": "2"}):
+                for value in ("3", None):
+                    with self.subTest(port_override=value):
+                        _managed_rdma_preflight(
+                            self._rdma_plan(root, server_env={"MC_IB_PORT": value})
+                        )
+                with self.assertRaisesRegex(RuntimeError, "port 2 is not ACTIVE"):
+                    _managed_rdma_preflight(self._rdma_plan(root))
+
     def test_managed_preflight_requires_memlock_for_rdma_registration(self):
-        with tempfile.TemporaryDirectory() as parent:
+        with (
+            tempfile.TemporaryDirectory() as parent,
+            mock.patch(
+                "specforge.launch_plan.resolve_rdma_devices",
+                side_effect=functools.partial(
+                    mooncake_rdma.resolve_rdma_devices, root=parent
+                ),
+            ),
+        ):
+            FakeHost(parent).add("mlx5_0")
             host = os.path.join(parent, "host")
             os.makedirs(os.path.join(host, "proc", "self"))
             with open(

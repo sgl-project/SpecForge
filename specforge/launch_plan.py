@@ -1174,12 +1174,26 @@ def _managed_rdma_preflight(plan: LaunchPlan) -> None:
         if command.env.get("MOONCAKE_PROTOCOL") != "rdma":
             continue
         # Children start from this environment (see _spawn_command).
-        child_env = {**os.environ, **command.env}
+        child_env = {
+            name: value
+            for name, value in {**os.environ, **command.env}.items()
+            if value is not None
+        }
+        devices = child_env.get("MOONCAKE_RDMA_DEVICES")
         check_rdma_environment(
-            {name: value for name, value in child_env.items() if value is not None},
+            child_env,
             where=f"the {command.label} environment",
             opt_out=opt_out,
-            devices=command.env.get("MOONCAKE_RDMA_DEVICES"),
+            devices=devices,
+        )
+        # Per-command port/GID overrides can invalidate the list selected when
+        # building the plan. Recheck that same list in the child's final env.
+        resolve_rdma_devices(
+            devices,
+            selected_by=f"the {command.label} environment selects RDMA",
+            devices_setting=f"{command.label} MOONCAKE_RDMA_DEVICES",
+            opt_out=opt_out,
+            env=child_env,
         )
     required = plan.managed_rdma_memlock_bytes
     if required is None:

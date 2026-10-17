@@ -228,9 +228,11 @@ export_rdma_devices() {
     # A patched capture server refuses MOONCAKE_PROTOCOL=rdma without an
     # explicit MOONCAKE_RDMA_DEVICES (Mooncake would fall back to TCP when it
     # finds no usable HCA), and only after loading the target. Resolve this
-    # node's usable HCAs up front, as the trainer node's client does for itself.
-    [[ "$MOONCAKE_PROTOCOL" == "rdma" && -z "${MOONCAKE_RDMA_DEVICES:-}" ]] || return 0
+    # node's usable HCAs up front, including validation of an explicit list,
+    # as the trainer node's client does for itself.
+    [[ "$MOONCAKE_PROTOCOL" == "rdma" ]] || return 0
     MOONCAKE_RDMA_DEVICES="$(python -c '
+import os
 import sys
 
 from specforge.runtime.data_plane.mooncake_rdma import resolve_rdma_devices
@@ -238,7 +240,7 @@ from specforge.runtime.data_plane.mooncake_rdma import resolve_rdma_devices
 try:
     print(
         resolve_rdma_devices(
-            None,
+            os.environ.get("MOONCAKE_RDMA_DEVICES"),
             selected_by="MOONCAKE_PROTOCOL is rdma",
             devices_setting="MOONCAKE_RDMA_DEVICES",
             opt_out="set MOONCAKE_PROTOCOL=tcp",

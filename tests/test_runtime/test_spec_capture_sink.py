@@ -256,6 +256,34 @@ class SpecCaptureSinkTest(unittest.TestCase):
                 # The Mooncake connection itself stays lazy.
                 self.assertIsNone(sink._store)
 
+    def test_server_start_checks_rdma_device_filter(self):
+        for whitelist, rejected in (
+            ("mlx5_0", "mlx5_1"),
+            ("mlx5_9", "mlx5_0, mlx5_1"),
+            (" mlx5_0, mlx5_1, mlx5_9 ", None),
+            (" , ", None),
+        ):
+            with self.subTest(whitelist=whitelist):
+                self.module = _load_sink()
+                environ = {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "MOONCAKE_RDMA_DEVICES": " mlx5_0, mlx5_1 ",
+                    "MC_TE_FILTERS": whitelist,
+                    "SGLANG_SPEC_CAPTURE_GPU_PUT": "0",
+                }
+                if rejected is None:
+                    self.assertIsNotNone(self._init_sink(environ))
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, f"MC_TE_FILTERS=.*Mooncake skips {rejected}"
+                    ):
+                        self._init_sink(environ)
+                    self.assertIsNone(self.module.get_sink())
+                # TCP does not use the RDMA device whitelist.
+                self.module = _load_sink()
+                environ["MOONCAKE_PROTOCOL"] = "tcp"
+                self.assertIsNotNone(self._init_sink(environ))
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_gpu_snapshot_survives_overwrite_and_stream_handoff(self):
         store = self.sink._store = _BufferStore(device=True)

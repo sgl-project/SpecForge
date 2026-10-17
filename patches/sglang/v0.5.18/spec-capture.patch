@@ -895,7 +895,7 @@ new file mode 100644
 index 0000000..69c0c4a
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,504 @@
+@@ -0,0 +1,520 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -991,7 +991,7 @@ index 0000000..69c0c4a
 +
 +
 +def check_rdma_environment() -> None:
-+    """Refuse an RDMA environment that Mooncake would run over TCP."""
++    """Refuse switches that replace RDMA or silently drop listed devices."""
 +    if os.environ.get("MOONCAKE_PROTOCOL", "tcp") != "rdma":
 +        return
 +    if not os.environ.get("MOONCAKE_RDMA_DEVICES", "").strip():
@@ -1012,6 +1012,22 @@ index 0000000..69c0c4a
 +            if number is None or int(number.group()) != 1:
 +                continue
 +        conflicts.append(f"{name}={value!r} ({effect})")
++    whitelist = {
++        name.strip()
++        for name in os.environ.get("MC_TE_FILTERS", "").split(",")
++        if name.strip()
++    }
++    devices = [
++        name.strip()
++        for name in os.environ["MOONCAKE_RDMA_DEVICES"].split(",")
++        if name.strip()
++    ]
++    skipped = [name for name in devices if whitelist and name not in whitelist]
++    if skipped:
++        conflicts.append(
++            f"MC_TE_FILTERS={os.environ['MC_TE_FILTERS']!r} (Mooncake skips "
++            f"{', '.join(skipped)} of MOONCAKE_RDMA_DEVICES without a warning)"
++        )
 +    if conflicts:
 +        raise ValueError(
 +            "MOONCAKE_PROTOCOL=rdma conflicts with "

@@ -237,7 +237,7 @@ class DisaggregatedWrapperTest(unittest.TestCase):
             '    echo "$FAKE_RDMA_ERROR" >&2\n'
             "    exit 1\n"
             "fi\n"
-            "echo mlx5_3,mlx5_4\n",
+            'echo "${MOONCAKE_RDMA_DEVICES:-mlx5_3,mlx5_4}"\n',
         )
         self._fake_executable(
             "mooncake_master",
@@ -260,6 +260,15 @@ class DisaggregatedWrapperTest(unittest.TestCase):
             (
                 "unusable",
                 {"MOONCAKE_PROTOCOL": "rdma", "FAKE_RDMA_ERROR": "no usable HCA"},
+                None,
+            ),
+            (
+                "listed-unusable",
+                {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "MOONCAKE_RDMA_DEVICES": "mlx5_7",
+                    "FAKE_RDMA_ERROR": "no usable HCA: mlx5_7 excluded by MC_TE_FILTERS",
+                },
                 None,
             ),
         )
@@ -296,10 +305,14 @@ class DisaggregatedWrapperTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertEqual((run_root / "inference.done").read_text().strip(), "1")
                 resolved = python_args.exists()
-                self.assertEqual(resolved, case in ("resolved", "unusable"))
+                self.assertEqual(resolved, case != "tcp")
                 if resolved:
                     self.assertIn(
                         "resolve_rdma_devices", python_args.read_text(encoding="utf-8")
+                    )
+                    self.assertIn(
+                        'os.environ.get("MOONCAKE_RDMA_DEVICES")',
+                        python_args.read_text(encoding="utf-8"),
                     )
                 if devices is None:
                     self.assertIn("no usable HCA", result.stderr)
