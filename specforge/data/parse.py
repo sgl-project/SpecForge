@@ -15,7 +15,6 @@ __all__ = [
     "GeneralParser",
     "GLMParser",
     "HarmonyParser",
-    "LingParser",
     "ThinkingParser",
 ]
 
@@ -183,12 +182,13 @@ class GeneralParser(Parser):
                 + "|$))"
             )
         elif chat_template.assistant_pattern_type == "glm":
+            # Stop before any next role, leaving assistant headers for the next match.
             self.assistant_pattern = (
                 re.escape(self.assistant_message_separator)
                 + r"(?:</think>)?"
-                + r"([\s\S]*?(?:"
+                + r"([\s\S]*?)(?="
                 + re.escape(self.chat_template.end_of_turn_token)
-                + "|$))"
+                + r"|<\|(?:assistant|system|observation)\|>|$)"
             )
         else:
             self.assistant_pattern = (
@@ -514,8 +514,8 @@ class ThinkingParser(GeneralParser):
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         """Parse conversation, processing all assistant turns for loss mask."""
-        if self.chat_template.enable_thinking:
-            kwargs["enable_thinking"] = True
+        if self.chat_template.enable_thinking is not None:
+            kwargs["enable_thinking"] = self.chat_template.enable_thinking
         return super().parse(
             conversation, max_length, preformatted, train_only_last_turn, tool, **kwargs
         )
@@ -605,23 +605,8 @@ class DeepSeekV4Parser(ThinkingParser):
         )
 
 
-class GLMParser(GeneralParser):
-    """Render GLM-5.2's hybrid-thinking template consistently for training."""
-
-    def apply_chat_template(self, messages, tool, **kwargs) -> str:
-        kwargs.setdefault("enable_thinking", False)
-        return super().apply_chat_template(messages, tool, **kwargs)
-
-
-class LingParser(ThinkingParser):
-    """Render Ling-3.0 (Bailing V3) conversations with thinking turned off.
-
-    The Bailing V3 template defaults to ``thinking_option = 'on'`` when the
-    caller passes nothing, which renders the system line as ``detailed thinking
-    on`` while the data itself carries empty think blocks. Serving with thinking
-    off renders ``detailed thinking off``, so the draft would be trained on a
-    prefix it never sees. Passing the flag explicitly keeps the two consistent.
-    """
+class GLMParser(ThinkingParser):
+    """Render GLM templates while preserving reasoning and tool-result identity."""
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         kwargs.setdefault("enable_thinking", False)

@@ -33,7 +33,7 @@ class TestLing3TemplateRegistration(unittest.TestCase):
         self.assertEqual(t.assistant_header, "<role>ASSISTANT</role>\n<think></think>")
         self.assertEqual(t.user_header, "<role>HUMAN</role>")
         self.assertEqual(t.end_of_turn_token, "<|role_end|>")
-        self.assertEqual(t.parser_type, "ling")
+        self.assertEqual(t.parser_type, "thinking")
         self.assertFalse(t.enable_thinking)
 
     def test_thinking_header_stops_at_the_opening_tag(self):
@@ -113,7 +113,7 @@ class TestLing3LossMask(unittest.TestCase):
 
     def test_thinking_flag_is_passed_explicitly(self):
         # The Bailing V3 template defaults its thinking option to on, so the
-        # ling parser has to pass the flag: otherwise the draft trains on a
+        # thinking parser has to pass False: otherwise the draft trains on a
         # system prefix it never sees when served with thinking off. Compare
         # renderings rather than pinning the template's wording.
         conversation = [

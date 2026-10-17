@@ -111,6 +111,68 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                             run.run()
                 self.assertEqual(events, ["fit", "store.close"])
 
+    def test_online_producer_requests_the_config_selected_capture_layout(self):
+        import tempfile
+
+        for teacher_metrics, last_hidden in (
+            (True, "target_last_hidden_states"),
+            (False, None),
+        ):
+            with self.subTest(dflash_teacher_metrics=teacher_metrics):
+                root = tempfile.mkdtemp(prefix="producer_layout_")
+                cfg = Config.model_validate(
+                    {
+                        "model": {"target_model_path": "t", "draft_model_config": "d"},
+                        "data": {"prompts_path": "prompts.jsonl"},
+                        "training": {
+                            "strategy": "dflash",
+                            "role": "producer",
+                            "max_steps": 1,
+                            "dflash_teacher_metrics": teacher_metrics,
+                        },
+                        "deployment": _disaggregated_deployment(
+                            root, server_urls=["http://capture:30000"]
+                        ),
+                    }
+                )
+                prompt = {"task_id": "p0", "payload": {"input_ids": [1, 2, 3]}}
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"DISAGG_REF_CHANNEL": os.path.join(root, "refs.jsonl")},
+                    ),
+                    mock.patch(
+                        "specforge.runtime.data_plane.streaming_ref_channel."
+                        "StreamingRefChannel"
+                    ),
+                    mock.patch("specforge.training.disaggregated._mooncake_store"),
+                    mock.patch("specforge.training.assembly._load_input_tools"),
+                    mock.patch("specforge.training.model_loading.resolve_draft_config"),
+                    mock.patch(
+                        "specforge.training.disaggregated._producer_capture_metadata",
+                        return_value=([1, 2], 8, 32, 32),
+                    ),
+                    mock.patch(
+                        "specforge.inference.adapters.server_capture."
+                        "SGLangServerCaptureAdapter"
+                    ) as adapter_cls,
+                    mock.patch(
+                        "specforge.launch.build_disagg_online_producer",
+                        return_value=([], mock.Mock()),
+                    ),
+                ):
+                    _build_online(
+                        cfg,
+                        algorithm=ALGORITHM,
+                        build_model_bundle=mock.Mock(),
+                        prepare_prompts=lambda *_args, **_kwargs: [prompt],
+                        optimizer_factory=mock.Mock(),
+                        logger=None,
+                    )
+                schema = adapter_cls.call_args.kwargs["schema"]
+                self.assertEqual("hidden_states", schema.aux_feature)
+                self.assertEqual(last_hidden, schema.last_hidden_feature)
+
     def test_training_run_delegates_to_the_one_trainer_entry(self):
         trainer = _FakeTrainer(fit_step=3)
         self.assertEqual(TrainingRun(trainer=trainer).run(), 3)

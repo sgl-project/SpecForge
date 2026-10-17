@@ -186,7 +186,13 @@ whose architecture is `DFlash2DraftModel`. The target server still captures
 the same selected hidden states with `--spec-capture-method dflash`. Online
 capture also retains the target's final hidden state for teacher-alignment
 telemetry; existing offline DFlash datasets remain compatible and omit only
-the teacher-only metrics.
+the teacher-only metrics. The objective never reads that hidden state. Set
+`training.dflash_teacher_metrics: false` to stop requesting it: the capture
+server no longer writes it and the trainer no longer fetches it, which removes
+one `hidden_size` row per token from every sample (a sixth of the payload with
+five target layers). The run then omits `dflash/teacher/*` and
+`dflash2/selector/self_conditioned_teacher_argmax_agreement`; every other
+metric and the loss are unchanged. Other strategies reject the setting.
 
 The DFlash2 config additionally defines `conv_kernel_size` and
 `conv_group_size` for the local convolution, plus `selector_rank` and
@@ -698,6 +704,19 @@ specforge export --to hf \
 
 Pass `--vocab-mapping /path/to/mapping.pt` when the checkpoint predates the
 mapping buffers or when you intentionally need to refresh them.
+
+Both exporters preserve the dtype and values of the draft weights stored in the
+checkpoint. When all floating-point tensors share one dtype (FP32, FP16, or
+BF16), that dtype is written into the exported `config.json`, so
+`AutoDraftModel.from_pretrained` without an explicit dtype restores the saved
+precision and values. SGLang casts the served draft to its own dtype at load
+time.
+
+For checkpoints with mixed floating-point dtypes, the exported weight tensors
+retain their original dtypes, but the exported config falls back to BF16.
+Default reloading therefore does not guarantee restoration of each tensor's
+original precision. Native mixed-precision or quantized MTP models require
+model-specific loading and export support beyond this precision guarantee.
 
 MTP is deployed by merging its trained native head back into the target model.
 The merge command accepts the same runtime checkpoint shapes as the generic

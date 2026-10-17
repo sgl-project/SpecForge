@@ -27,6 +27,7 @@ class _TinyDraft(nn.Module):
         self.selector_loss_alpha = 0.7
         self.selector_warmup_ratio = 0.0
         self.selector_ramp_ratio = 0.0
+        self.teacher_metrics = False
 
     def forward(self, x):
         return self.linear(x)
@@ -48,6 +49,8 @@ class DFlashStrategySelectorAttrTest(unittest.TestCase):
             self.assertFalse(hasattr(wrapped, "selector_loss_alpha"))
             strategy = DFlashTrainStrategy(wrapped)
             self.assertAlmostEqual(strategy._selector_loss_alpha(None), 0.7)
+            # training.dflash_teacher_metrics=false must survive the wrapper too.
+            self.assertFalse(bool(strategy._draft_attr("teacher_metrics", 1.0)))
         finally:
             dist.destroy_process_group()
 
