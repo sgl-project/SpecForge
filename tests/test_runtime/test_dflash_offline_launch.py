@@ -16,11 +16,23 @@ ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 @unittest.skipUnless(CUDA, "DFlash offline launcher requires CUDA")
 class TestDFlashOfflineLaunch(unittest.TestCase):
     def test_dflash_trains_from_precomputed_features(self):
+        self._check_backend("fsdp")
+
+    def test_fsdp2_trains_through_the_same_launcher(self):
+        self._check_backend("fsdp2")
+
+    def test_dflash2_nested_blocks_train_with_fsdp2(self):
+        self._check_backend("fsdp2", dflash2=True)
+
+    def _check_backend(self, training_backend, *, dflash2=False):
         from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port="29567")
 
+        from torch.distributed.fsdp import FSDPModule
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        expected_wrapper = FSDPModule if training_backend == "fsdp2" else FSDP
 
         from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
@@ -41,6 +53,18 @@ class TestDFlashOfflineLaunch(unittest.TestCase):
             attention_backend="sdpa",
         )
         self.assertEqual(width, hidden)
+        if dflash2:
+            from specforge.modeling.draft.dflash2 import DFlash2DraftModel
+
+            config = model.draft_model.config
+            config.dflash_config.update(
+                conv_kernel_size=3,
+                conv_group_size=16,
+                selector_rank=8,
+                selector_top_k=4,
+            )
+            model.draft_model = DFlash2DraftModel(config).cuda().bfloat16()
+            model.selector_loss_alpha = 0.1
 
         def optimizer_factory(module):
             return BF16Optimizer(
@@ -57,6 +81,7 @@ class TestDFlashOfflineLaunch(unittest.TestCase):
             draft_model=model,
             target_head=None,
             optimizer_factory=optimizer_factory,
+            training_backend=training_backend,
             run_id="dflash-offline",
             output_dir=os.path.join(workdir, "out"),
             max_len=sequence_length,
@@ -66,7 +91,7 @@ class TestDFlashOfflineLaunch(unittest.TestCase):
         )
 
         module = trainer.core.strategy.trainable_module()
-        self.assertIsInstance(module, FSDP)
+        self.assertIsInstance(module, expected_wrapper)
         self.assertEqual(trainer.fit(), 2)
         self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 
