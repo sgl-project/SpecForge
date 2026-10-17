@@ -105,7 +105,7 @@ trainer process. Update its model/data paths and GPU allocation, then run:
 
 ```bash
 specforge train \
-  -c examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml
+  -c examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml
 ```
 
 For external online services, use the same YAML model and training fields but
