@@ -705,6 +705,19 @@ specforge export --to hf \
 Pass `--vocab-mapping /path/to/mapping.pt` when the checkpoint predates the
 mapping buffers or when you intentionally need to refresh them.
 
+Both exporters preserve the dtype and values of the draft weights stored in the
+checkpoint. When all floating-point tensors share one dtype (FP32, FP16, or
+BF16), that dtype is written into the exported `config.json`, so
+`AutoDraftModel.from_pretrained` without an explicit dtype restores the saved
+precision and values. SGLang casts the served draft to its own dtype at load
+time.
+
+For checkpoints with mixed floating-point dtypes, the exported weight tensors
+retain their original dtypes, but the exported config falls back to BF16.
+Default reloading therefore does not guarantee restoration of each tensor's
+original precision. Native mixed-precision or quantized MTP models require
+model-specific loading and export support beyond this precision guarantee.
+
 MTP is deployed by merging its trained native head back into the target model.
 The merge command accepts the same runtime checkpoint shapes as the generic
 exporter (`training_state.pt`, a step/latest directory, or the run output
