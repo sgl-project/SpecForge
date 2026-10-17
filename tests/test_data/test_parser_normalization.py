@@ -150,6 +150,18 @@ class TestParserNormalization(unittest.TestCase):
         self.assertEqual(cleaned["tool_call_id"], "call-7")
         self.assertNotIn("private", cleaned)
 
+    def test_general_parser_requires_end_of_turn_token(self):
+        with self.assertRaisesRegex(ValueError, "end_of_turn_token"):
+            GeneralParser(
+                DummyTokenizer(),
+                ChatTemplate(
+                    assistant_header="<assistant>",
+                    user_header="<user>",
+                    system_prompt=None,
+                    end_of_turn_token=None,
+                ),
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
