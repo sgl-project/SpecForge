@@ -617,6 +617,10 @@ def _build_online(
     channel_path = _env("DISAGG_REF_CHANNEL")
     if cfg.training.role == "producer":
         _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
+    elif preflight_model_bundle is not None:
+        # Check trainer dependencies before opening the store or waiting on
+        # the producer, so a failed preflight owns no transport resources.
+        preflight_model_bundle(cfg)
     # The producer owns capture and explicit attempt cleanup. The consumer must
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
@@ -810,9 +814,6 @@ def _build_online(
 
     from specforge.launch import build_disagg_online_consumer
 
-    if preflight_model_bundle is not None:
-        # Fail before waiting on the producer's schedule and captures.
-        preflight_model_bundle(cfg)
     total_steps = cfg.training.total_steps
     if total_steps is None and cfg.training.max_steps is None:
         total_steps = _read_online_total_steps(cfg, channel_path)

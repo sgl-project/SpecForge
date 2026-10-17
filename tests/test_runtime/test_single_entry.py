@@ -81,6 +81,14 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 bundle = types.SimpleNamespace(
                     model=object(), target_head=None, strategy_kwargs={}
                 )
+                preflight = mock.Mock(
+                    side_effect=lambda _cfg: events.append("preflight")
+                )
+
+                def open_store(*_args, **_kwargs):
+                    events.append("store.open")
+                    return store
+
                 with (
                     mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": "/shared/refs"}),
                     mock.patch(
@@ -89,7 +97,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     ),
                     mock.patch(
                         "specforge.training.disaggregated._mooncake_store",
-                        return_value=store,
+                        side_effect=open_store,
                     ),
                     mock.patch(
                         "specforge.launch.build_disagg_online_consumer",
@@ -103,13 +111,17 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         prepare_prompts=mock.Mock(),
                         optimizer_factory=mock.Mock(),
                         logger=None,
+                        preflight_model_bundle=preflight,
                     )
                     if error is None:
                         self.assertEqual(run.run(), 3)
                     else:
                         with self.assertRaisesRegex(RuntimeError, "fit failed"):
                             run.run()
-                self.assertEqual(events, ["fit", "store.close"])
+                preflight.assert_called_once_with(cfg)
+                self.assertEqual(
+                    events, ["preflight", "store.open", "fit", "store.close"]
+                )
 
     def test_online_producer_requests_the_config_selected_capture_layout(self):
         import tempfile
@@ -136,6 +148,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     }
                 )
                 prompt = {"task_id": "p0", "payload": {"input_ids": [1, 2, 3]}}
+                preflight = mock.Mock(side_effect=AssertionError("consumer-only check"))
                 with (
                     mock.patch.dict(
                         os.environ,
@@ -168,7 +181,9 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         prepare_prompts=lambda *_args, **_kwargs: [prompt],
                         optimizer_factory=mock.Mock(),
                         logger=None,
+                        preflight_model_bundle=preflight,
                     )
+                preflight.assert_not_called()
                 schema = adapter_cls.call_args.kwargs["schema"]
                 self.assertEqual("hidden_states", schema.aux_feature)
                 self.assertEqual(last_hidden, schema.last_hidden_feature)
@@ -326,7 +341,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 with open(channel + suffix, encoding="utf-8") as stream:
                     self.assertIn("RuntimeError: assembly exploded", stream.read())
 
-    def test_consumer_preflight_fails_before_waiting_on_the_producer(self):
+    def test_consumer_preflight_fails_before_opening_store_or_waiting(self):
         import tempfile
 
         for mode in ("offline", "online"):
@@ -352,12 +367,17 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 preflight = mock.Mock(side_effect=ImportError("liger missing"))
                 with (
                     mock.patch.dict(os.environ, {env_name: control}),
-                    mock.patch("specforge.training.disaggregated._mooncake_store"),
+                    mock.patch(
+                        "specforge.training.disaggregated._mooncake_store"
+                    ) as store,
                     mock.patch(
                         "specforge.runtime.data_plane.streaming_ref_channel."
                         "StreamingRefChannel"
-                    ),
+                    ) as channel,
                     mock.patch("specforge.training.disaggregated._wait_for") as wait,
+                    mock.patch(
+                        "specforge.training.disaggregated._read_online_total_steps"
+                    ) as read_total_steps,
                     self.assertRaisesRegex(ImportError, "liger missing"),
                 ):
                     build_disaggregated_run(
@@ -370,7 +390,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         preflight_model_bundle=preflight,
                     )
                 preflight.assert_called_once_with(cfg)
+                store.assert_not_called()
+                channel.assert_not_called()
                 wait.assert_not_called()
+                read_total_steps.assert_not_called()
                 build_model_bundle.assert_not_called()
                 with open(control + ".consumer_failed", encoding="utf-8") as stream:
                     self.assertIn("ImportError: liger missing", stream.read())
