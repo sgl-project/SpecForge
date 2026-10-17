@@ -73,10 +73,16 @@ class TestMetadataStore(unittest.TestCase):
 
 class TestParallelConfigHandles(unittest.TestCase):
     def test_carries_target_and_draft_parallel_state(self):
-        pc = ParallelConfig(tp_size=2, sp_ulysses_size=2, sp_ring_size=2)
+        pc = ParallelConfig(
+            tp_size=2,
+            expert_parallel_size=3,
+            sp_ulysses_size=2,
+            sp_ring_size=2,
+        )
         self.assertIsNone(pc.fsdp_process_group)
         self.assertEqual(pc.sharding_strategy, "SHARD_GRAD_OP")
         self.assertEqual(pc.tp_size, 2)
+        self.assertEqual(pc.expert_parallel_size, 3)
         self.assertEqual(pc.sp_size, 4)
 
     def test_from_distributed_no_dist(self):
@@ -90,6 +96,19 @@ class TestParallelConfigHandles(unittest.TestCase):
         self.assertEqual(pc.world_size, 1)
         self.assertEqual(pc.tp_size, 2)
         self.assertEqual(pc.sp_size, 2)
+
+    def test_expert_parallel_refuses_missing_draft_dp_group(self):
+        with (
+            mock.patch(
+                "specforge.training.backend.dist.is_initialized", return_value=True
+            ),
+            mock.patch(
+                "specforge.training.backend.dist.get_world_size", return_value=2
+            ),
+            mock.patch("specforge.distributed.get_draft_dp_group", return_value=None),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "draft_dp_group"):
+                ParallelConfig.from_distributed(expert_parallel_size=2)
 
     def test_frozen_target_tables_are_ignored_by_fsdp(self):
         class Composite(nn.Module):
@@ -115,6 +134,15 @@ class TestParallelConfigHandles(unittest.TestCase):
         backend.scale_gradients(torch.tensor(0.25))
 
         torch.testing.assert_close(model.weight.grad, torch.tensor([[1.0, 2.0]]))
+
+    def test_expert_parallel_ddp_optimizer_state_is_rank_local(self):
+        regular = FSDPTrainingBackend(ParallelConfig())
+        regular._wrapper_kind = "ddp"
+        expert_parallel = FSDPTrainingBackend(ParallelConfig(expert_parallel_size=2))
+        expert_parallel._wrapper_kind = "ddp"
+
+        self.assertTrue(regular.optimizer_state_is_replicated)
+        self.assertFalse(expert_parallel.optimizer_state_is_replicated)
 
 
 class _FakeBackend(TrainingBackend):
