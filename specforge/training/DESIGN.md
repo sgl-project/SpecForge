@@ -23,11 +23,19 @@ Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;
 `TrainerCore` owns one branch-free train step and the accumulation boundary;
 `DraftTrainStrategy` owns model-specific validation, forward/loss, target
-projection, and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
-backward, optimizer steps, distributed gradient norms, and full training state.
+projection, and checkpoint filtering. `DistributedTrainingBackend` shares the
+optimizer lifecycle, replicated DDP path, local gradient scaling, and RNG
+state. `FSDPTrainingBackend` and `FSDP2TrainingBackend` own their sharding and
+model-state APIs; FSDP2 also implements accumulation with
+`set_requires_gradient_sync`. `training.backend` selects the implementation,
+defaulting to the original `fsdp` backend.
 Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
 state and repositions fixed offline refs through `FeatureDataLoader.seek()`.
+Rank-local checkpoint metadata prevents loading optimizer shards with a
+different backend, sharding strategy, or world size. FSDP2's BF16 optimizer
+accesses local DTensor storage at use time, retaining ordinary FP32 master
+tensors (including CPU offload) and exactly one explicit global-norm reduction.
 
 ## Internal mechanics
 
