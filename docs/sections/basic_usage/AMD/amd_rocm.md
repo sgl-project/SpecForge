@@ -31,7 +31,7 @@ hardware:
 docker pull lmsysorg/sglang:v0.5.18-rocm720-mi30x
 
 # AMD Instinct MI355X (gfx950)
-docker pull lmsysorg/sglang:v0.5.18-rocm700-mi35x
+docker pull lmsysorg/sglang:v0.5.18-rocm720-mi35x
 ```
 
 ### Step 2: Start the container
@@ -68,16 +68,22 @@ clobbers the image's ROCm torch/sglang. If a later step reports a missing
 lightweight dependency (for example `accelerate`), install just that package,
 also with `--no-deps`.
 
+The images ship neither `wandb` nor TensorBoard:
+
+```bash
+python -m pip install wandb
+python -m pip install --no-deps tensorboard tensorboard-data-server absl-py markdown werkzeug
+```
+
 ### Step 4: Apply the capture patch (online runs only)
 
 These images pin SGLang to exactly `0.5.18` (editable at `/sgl-workspace/sglang`),
-so the online capture patch applies with a plain `git apply`. Skip this step for
-offline training, which reads features from disk and needs no capture service:
+so the online capture patch applies unchanged. Skip this step for offline
+training, which reads features from disk and needs no capture service:
 
 ```bash
-cd /sgl-workspace/sglang
-git apply /workspace/SpecForge/patches/sglang/v0.5.18/spec-capture.patch
 cd /workspace/SpecForge
+scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18
 ```
 
 The patch adds the `--enable-spec-capture`, `--spec-capture-method`, and
@@ -365,6 +371,9 @@ auxiliary layer ids — for this recipe `--spec-capture-method dflash` with aux 
 (see External services, Step 2). For external-service prerequisites, freshness
 rules, multi-server capture, inbox relays, and resume, see the
 [Disaggregated training](../disaggregated_training.md) guide.
+
+For DeepSeek-V4-Flash DSpark on MI355X, follow the
+[recipe runbook](../../recipes/deepseek-v4-flash-dspark-disaggregated.md#on-amd-mi355x).
 
 ---
 

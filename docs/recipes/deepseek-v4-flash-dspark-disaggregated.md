@@ -83,6 +83,26 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 specforge train \
 
 Supply `HF_TOKEN` and `WANDB_API_KEY` through the environment, not YAML.
 
+## On AMD MI355X
+
+Use [`deepseek-v4-flash-dspark-disaggregated-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark-disaggregated-amd.yaml),
+this recipe with the capture-server fields changed for ROCm, inside the
+`lmsysorg/sglang:v0.5.18-rocm720-mi35x` container from the
+[AMD ROCm tutorial](../sections/basic_usage/AMD/amd_rocm.md). Everything above
+applies, with three changes to each capture-server command:
+
+- drop `FLASHINFER_USE_CUDA_NORM=1` and `FLASHINFER_USE_CUDA_QUANT=1`;
+- add `export AITER_BF16_FP8_MOE_BOUND=0`, the setting SGLang's own AMD
+  DeepSeek-V4 tests use; without it the server fails on the first MoE batch
+  under 256 tokens;
+- replace `--moe-runner-backend flashinfer_mxfp4` with
+  `--attention-backend dsv4 --page-size 256 --swa-full-tokens-ratio 0.15 --disable-radix-cache`.
+
+Set `HIP_VISIBLE_DEVICES` alongside `CUDA_VISIBLE_DEVICES`. Measured on one
+MI355X node over the full two epochs (1,885 optimizer steps): 6.32 s per
+128-sample step on average, 6.1-6.4 s at steady state (about 3.1 s waiting for
+capture and 3.0 s of trainer compute), 3 h 18 min end to end.
+
 ## Fresh attempts
 
 Delete the run's `outputs/` directory and, whenever a capture server was

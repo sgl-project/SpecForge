@@ -10,8 +10,9 @@
 
 Leases refs (consume-once queue or re-iterable ref list), applies the injected
 per-sample transform and collate, and yields ``TrainBatch``es — no model
-knowledge. clone-on-fetch (default) clones tensors out of the store and releases
-the handle immediately, so prefetch can never race a release.
+knowledge. clone-on-fetch (default unless the store's ``get()`` already returns
+fresh tensors) clones tensors out of the store and releases the handle
+immediately, so prefetch can never race a release.
 """
 
 from __future__ import annotations
@@ -148,7 +149,7 @@ class FeatureDataLoader:
         collate_fn: Optional[CollateFn] = None,
         per_sample_transform: Optional[PerSampleTransform] = None,
         device: "torch.device | str" = "cpu",
-        clone_on_fetch: bool = True,
+        clone_on_fetch: Optional[bool] = None,
         drop_last: bool = True,
         strategy: str = "eagle3",
         ack: bool = True,
@@ -167,11 +168,17 @@ class FeatureDataLoader:
         self.collate_fn = collate_fn or _default_collate
         self.per_sample_transform = per_sample_transform
         self.device = device
-        # CLONE_ON_FETCH=0 skips the defensive clone; safe for the mooncake
-        # zero-copy path, whose get() already allocates a fresh tensor.
-        if os.environ.get("CLONE_ON_FETCH", "1") == "0":
+        # By default clone unless the store's get() already returns fresh
+        # caller-owned tensors (e.g. Mooncake), where the clone only copies.
+        # CLONE_ON_FETCH=0 skips the defensive clone; =1 forces it.
+        if clone_on_fetch is None:
+            clone_on_fetch = not getattr(store, "get_returns_fresh_tensors", False)
+        clone_env = os.environ.get("CLONE_ON_FETCH")
+        if clone_env == "0":
             clone_on_fetch = False
-        self.clone_on_fetch = clone_on_fetch
+        elif clone_env == "1":
+            clone_on_fetch = True
+        self.clone_on_fetch = bool(clone_on_fetch)
         self.drop_last = drop_last
         self.strategy = strategy
         self.ack = ack

@@ -221,6 +221,18 @@ def _consumer_database_path(cfg: Config) -> Optional[str]:
     return os.path.join(state_dir, "consumer.sqlite")
 
 
+def _consumer_async_ack(cfg: Config) -> Optional[bool]:
+    """An explicit ``DISAGG_ASYNC_ACK`` wins; otherwise the typed switch.
+
+    ``None`` lets the consumer builder parse the environment value, so a worker
+    started without the launch plan still honours ``async_ack: false``.
+    """
+    if os.environ.get("DISAGG_ASYNC_ACK", "").strip():
+        return None
+    deployment = cfg.deployment.disaggregated
+    return None if deployment is None else deployment.async_ack
+
+
 def _online_prompt_seed(cfg: Config) -> int:
     """Resolve prompt ordering independently while preserving old configs."""
     configured = getattr(cfg.training, "prompt_seed", None)
@@ -610,6 +622,7 @@ def _build_online(
     channel = StreamingRefChannel(channel_path)
 
     if cfg.training.role == "producer":
+        from specforge.algorithms.common.providers import resolve_server_capture_layout
         from specforge.inference.adapters.server_capture import (
             ServerCaptureSchema,
             SGLangServerCaptureAdapter,
@@ -655,7 +668,7 @@ def _build_online(
         layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
             cfg, algorithm
         )
-        layout = streaming.layout
+        layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
         capture_schema = ServerCaptureSchema(
             aux_feature=layout.aux_feature,
             last_hidden_feature=layout.last_hidden_feature,
@@ -824,6 +837,7 @@ def _build_online(
         resume_from=cfg.training.resume_from,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
+        async_ack=_consumer_async_ack(cfg),
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

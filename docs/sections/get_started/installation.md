@@ -72,3 +72,18 @@ recipes use external SGLang server capture with SDPA consumers. Install a
 compatible SGLang/Mooncake service first. The unified launcher detects the NPU
 device, self-launches the process count recorded in YAML, and selects HCCL; see
 the [training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu).
+
+### Intel GPU
+
+On XPU, install SpecForge into an environment that already provides a XPU
+PyTorch and a XPU SGLang (an official SGLang XPU release container is the
+recommended base), and install the packages:
+
+```bash
+# Inside the XPU SGLang container
+git clone https://github.com/sgl-project/SpecForge.git /sgl-workspace/SpecForge
+cd /sgl-workspace/SpecForge
+cp pyproject.toml pyproject.toml.backup
+cp pyproject_xpu.toml pyproject.toml
+python -m pip install -e .
+```

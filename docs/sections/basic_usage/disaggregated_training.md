@@ -37,7 +37,9 @@ semantics.
 
 Mooncake training uses **pinned receive pools by default**, with a lazily allocated
 8 GiB retained-pool budget per trainer rank. On CUDA with loader prefetch enabled,
-the loader copies received features to the GPU before yielding the batch. Returned
+the loader copies received hidden states to the GPU before yielding the batch;
+integer features such as `input_ids` and `loss_mask` stay on the host (pinned by
+loader workers) so the strategy sizes DFlash-family anchors without a GPU sync. Returned
 tensors, prefetched batches, and overflow allocations consume additional memory.
 Set `deployment.disaggregated.receive_buffers: pageable` to use fresh CPU receives.
 

@@ -701,7 +701,7 @@ class TestPackageArchitecture(unittest.TestCase):
         present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}
         self.assertTrue(CANONICAL_DRAFT_CONFIGS.issubset(present))
 
-    def test_dspark_configs_are_qwen3_gqa_only(self):
+    def test_dspark_configs_are_qwen3_family(self):
         dspark_configs = {}
         for path in sorted((REPO_ROOT / "configs").glob("*.json")):
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -715,6 +715,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "glm-5.2-dspark.json",
                 "inkling-dspark.json",
                 "kimi-k3-dspark.json",
+                "ling-3.0-tiny-dspark.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
                 "qwen3.6-27b-dspark.json",
@@ -723,15 +724,22 @@ class TestPackageArchitecture(unittest.TestCase):
         for name, payload in dspark_configs.items():
             with self.subTest(config=name):
                 self.assertEqual(payload["model_type"], "qwen3")
-                self.assertEqual(payload["dflash_config"]["attention_mode"], "gqa")
-                self.assertLess(
-                    payload["num_key_value_heads"],
-                    payload["num_attention_heads"],
-                )
-                self.assertEqual(
-                    payload["num_attention_heads"] % payload["num_key_value_heads"],
-                    0,
-                )
+                attention_mode = payload["dflash_config"]["attention_mode"]
+                # 'mla' carries its own head geometry and is validated by
+                # validate_dflash_mla_config, so a checked-in MLA DSpark config
+                # must extend this guard deliberately rather than slip through.
+                self.assertIn(attention_mode, {"gqa", "mha"})
+                num_heads = payload["num_attention_heads"]
+                num_kv_heads = payload["num_key_value_heads"]
+                self.assertEqual(num_heads % num_kv_heads, 0)
+                if attention_mode == "gqa":
+                    # DSparkDraftModel rejects gqa with num_key_value_heads >=
+                    # num_attention_heads and points at mha instead.
+                    self.assertLess(num_kv_heads, num_heads)
+                else:
+                    # validate_dflash_attention_config requires equal query and
+                    # KV head counts for mha.
+                    self.assertEqual(num_kv_heads, num_heads)
 
     def test_examples_and_scripts_do_not_bypass_the_cli(self):
         direct_imports = []
