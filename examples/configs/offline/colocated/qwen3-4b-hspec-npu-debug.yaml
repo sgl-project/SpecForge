@@ -1,0 +1,39 @@
+# DEBUG-ONLY NPU smoke recipe. The draft config truncates the official
+# H-Spec block pattern to a single mamba+attention pair for fast Ascend
+# smoke runs; it must never be used to train a final checkpoint.
+model:
+  target_model_path: Qwen/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-hspec-npu-debug.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/qwen3-4b-hspec-npu-debug
+  max_length: 1024
+  chat_template: qwen
+  cache_dir: ./cache
+
+training:
+  strategy: hspec
+  num_epochs: 1
+  max_steps: 10
+  batch_size: 1
+  learning_rate: 6.0e-4
+  warmup_ratio: 0
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  num_anchors: 512
+  save_interval: 1000
+  log_interval: 1
+  dist_timeout: 30
+  seed: 42
+
+run_id: qwen3-4b-hspec-npu-debug
+output_dir: ./outputs/qwen3-4b-hspec-npu-debug
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

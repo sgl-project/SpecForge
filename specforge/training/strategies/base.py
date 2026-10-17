@@ -591,6 +591,13 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
+        # H-Spec strategy subclasses add borrowed-KV features; forward them
+        # when the batch carries them so dspark batches stay unchanged.
+        extra_features = {
+            name: t[name].to(device, non_blocking=True)
+            for name in ("selected_target_k", "selected_target_v", "prefix_masks")
+            if name in t
+        }
         loss, accuracy, model_metrics = self.dspark_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
@@ -602,6 +609,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             collect_detailed_metrics=(
                 ctx.collect_detailed_metrics if ctx is not None else True
             ),
+            **extra_features,
         )
         metrics = {
             "accuracy": accuracy.detach(),
@@ -628,6 +636,21 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             for k, v in state_dict.items()
             if "draft_model." in k
         }
+
+
+class HSpecTrainStrategy(DSparkTrainStrategy):
+    """H-Spec strategy: DSpark objective over borrowed target K/V features.
+
+    Reuses DSparkTrainStrategy.forward_loss, which forwards the borrowed-KV
+    features below to ``OnlineHSpecModel`` when the batch carries them.
+    """
+
+    name = "hspec"
+    required_features = DSparkTrainStrategy.required_features | {
+        "selected_target_k",
+        "selected_target_v",
+        "prefix_masks",
+    }
 
 
 class MTPTrainStrategy(DraftTrainStrategy):
