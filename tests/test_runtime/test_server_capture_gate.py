@@ -76,6 +76,15 @@ def _mooncake_available() -> bool:
     return importlib.util.find_spec("mooncake.store") is not None
 
 
+def _log_tail(path, lines=80):
+    """Last lines of a subprocess log, so CI shows why the process died."""
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+    except OSError as exc:
+        return f"<could not read {path}: {exc}>"
+
+
 @unittest.skipUnless(
     CUDA and ENABLED,
     "server-capture gate: set SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1 (GPU)",
@@ -119,22 +128,6 @@ class TestServerCaptureGate(unittest.TestCase):
         model = LlamaForCausalLM(cfg).to(torch.bfloat16)
         cls.target_dir = os.path.join(cls.workdir, "target")
         model.save_pretrained(cls.target_dir)
-        # save_pretrained writes a single un-indexed shard for tiny models;
-        # TargetHead.load_weights locates lm_head.weight via the index file.
-        index = os.path.join(cls.target_dir, "model.safetensors.index.json")
-        if not os.path.exists(index):
-            import json
-
-            with open(index, "w") as f:
-                json.dump(
-                    {
-                        "metadata": {},
-                        "weight_map": {
-                            "lm_head.weight": "model.safetensors",
-                        },
-                    },
-                    f,
-                )
 
         cls._ensure_mooncake_master()
 
@@ -183,7 +176,9 @@ class TestServerCaptureGate(unittest.TestCase):
                 break
             time.sleep(5)
         raise RuntimeError(
-            f"sglang server did not become healthy; see {cls.workdir}/server.log"
+            "sglang server did not become healthy "
+            f"(exit code {cls.server.poll()}); tail of {cls.workdir}/server.log:\n"
+            + _log_tail(os.path.join(cls.workdir, "server.log"))
         )
 
     @classmethod

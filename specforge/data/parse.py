@@ -182,12 +182,13 @@ class GeneralParser(Parser):
                 + "|$))"
             )
         elif chat_template.assistant_pattern_type == "glm":
+            # Stop before any next role, leaving assistant headers for the next match.
             self.assistant_pattern = (
                 re.escape(self.assistant_message_separator)
                 + r"(?:</think>)?"
-                + r"([\s\S]*?(?:"
+                + r"([\s\S]*?)(?="
                 + re.escape(self.chat_template.end_of_turn_token)
-                + "|$))"
+                + r"|<\|(?:assistant|system|observation)\|>|$)"
             )
         else:
             self.assistant_pattern = (
@@ -604,8 +605,8 @@ class DeepSeekV4Parser(ThinkingParser):
         )
 
 
-class GLMParser(GeneralParser):
-    """Render GLM-5.2's hybrid-thinking template consistently for training."""
+class GLMParser(ThinkingParser):
+    """Render GLM templates while preserving reasoning and tool-result identity."""
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         kwargs.setdefault("enable_thinking", False)

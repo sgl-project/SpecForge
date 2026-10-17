@@ -78,14 +78,14 @@ CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 specforge train \
-  -c examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark-disaggregated.yaml
+  -c examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark.yaml
 ```
 
 Supply `HF_TOKEN` and `WANDB_API_KEY` through the environment, not YAML.
 
 ## On AMD MI355X
 
-Use [`deepseek-v4-flash-dspark-disaggregated-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark-disaggregated-amd.yaml),
+Use [`deepseek-v4-flash-dspark-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark-amd.yaml),
 this recipe with the capture-server fields changed for ROCm, inside the
 `lmsysorg/sglang:v0.5.18-rocm720-mi35x` container from the
 [AMD ROCm tutorial](../sections/basic_usage/AMD/amd_rocm.md). Everything above

@@ -286,8 +286,12 @@ class ModelConfig(StrictConfigModel):
     #: text only; unsupported modalities fail during application resolution.
     input_modality: str = "text"
     trust_remote_code: bool = False
-    #: Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash. Requires ``specforge[liger]``.
-    use_liger_kernel: bool = False
+    #: Liger RMSNorm/SwiGLU kernels for DFlash/DFlash2 drafts. ``None`` (auto)
+    #: enables them for training.strategy=dflash on a CUDA/ROCm trainer with a
+    #: silu/swish draft and keeps the native Qwen3 modules otherwise; ``true``
+    #: fails when they cannot be used; ``false`` disables them. Resolved kernels
+    #: that cannot be imported are an error in both the auto and explicit cases.
+    use_liger_kernel: Optional[bool] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).
@@ -559,7 +563,12 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metadata_port: int = Field(default=35880, gt=0, le=65535)
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
-    protocol: Literal["tcp", "rdma"] = "tcp"
+    #: Transport for every owned Mooncake client. None is resolved once when
+    #: the launch plan is built: tcp on Ascend hosts and rdma everywhere else;
+    #: the launch fails when no usable HCA is found. tcp opts out of RDMA.
+    protocol: Optional[Literal["tcp", "rdma"]] = None
+    #: Comma-separated HCAs for rdma. None selects every usable HCA of one link
+    #: layer; a listed device that is not usable is an error.
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
@@ -604,7 +613,9 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
-    #: None selects CUDA publication on RDMA in the capture worker.
+    #: None selects CUDA publication in the capture worker when
+    #: mooncake.protocol is rdma explicitly, and host publication when the
+    #: protocol is left unset (CUDA publication also needs GPUDirect RDMA).
     gpu_put: Optional[bool] = None
     #: SGLang's generation-based /health waits at least one second internally.
     probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
@@ -708,8 +719,10 @@ class ManagedLocalStackConfig(StrictConfigModel):
         capture_ports = [server.port for server in self.capture_servers]
         if len(set(capture_ports)) != len(capture_ports):
             raise ValueError("managed_local capture server ports must be unique")
+        # An unset protocol can still resolve to tcp; the launch plan repeats
+        # this check after resolving it.
         if any(server.gpu_put for server in self.capture_servers) and (
-            self.mooncake.protocol != "rdma"
+            self.mooncake.protocol == "tcp"
         ):
             raise ValueError(
                 "managed_local capture_servers[].gpu_put needs mooncake.protocol "
@@ -803,8 +816,9 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
         if self.receive_buffers == "cuda" and self.managed_local is not None:
             # External deployments resolve environment overrides in the launch
-            # plan. Managed-local transport is authoritative over the environment.
-            if self.managed_local.mooncake.protocol != "rdma":
+            # plan. Managed-local transport is authoritative over the environment;
+            # an unset protocol is checked after the launch plan resolves it.
+            if self.managed_local.mooncake.protocol == "tcp":
                 raise ValueError(
                     "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
                     "Mooncake transport (mooncake_protocol or "

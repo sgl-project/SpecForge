@@ -14,7 +14,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-export CONFIG="${CONFIG:-$ROOT_DIR/examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml}"
+export CONFIG="${CONFIG:-$ROOT_DIR/examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2.yaml}"
 export RUN_LABEL="${RUN_LABEL:-qwen3.8-27b-dflash2-2node}"
 export TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-Qwen/Qwen3.8-27B}"
 
