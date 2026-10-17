@@ -182,6 +182,9 @@ def _shard_offline_refs(
     shuffle=True,
     dp_rank=None,
     dp_size=None,
+    batch_size: int = 1,
+    length_bucket_size: int = 0,
+    max_len: Optional[int] = None,
 ):
     """Match ``DistributedSampler`` over metadata-only refs for one epoch.
 
@@ -207,6 +210,11 @@ def _shard_offline_refs(
             dp_rank, dp_size = 0, 1
     if dp_size < 1 or not 0 <= dp_rank < dp_size:
         raise ValueError(f"invalid data-DP layout rank={dp_rank}, size={dp_size}")
+    lengths = None
+    if length_bucket_size and shuffle:
+        from specforge.data.length_bucketing import sample_length
+
+        lengths = [sample_length(ref, max_len=max_len) for ref in refs]
     indices = _distributed_sampler_indices(
         len(refs),
         dp_rank=dp_rank,
@@ -214,16 +222,37 @@ def _shard_offline_refs(
         seed=seed,
         epoch=epoch,
         shuffle=shuffle,
+        batch_size=batch_size,
+        length_bucket_size=length_bucket_size,
+        lengths=lengths,
     )
     return [refs[index] for index in indices]
 
 
-def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle=True):
-    """Reproduce ``DistributedSampler(drop_last=False)`` index generation."""
+def _distributed_sampler_indices(
+    size,
+    *,
+    dp_rank,
+    dp_size,
+    seed,
+    epoch,
+    shuffle=True,
+    batch_size=1,
+    length_bucket_size=0,
+    lengths=None,
+):
+    """Reproduce ``DistributedSampler``, optionally grouping its training plan.
+
+    Grouping happens after DP padding and before rank striding, with the
+    loader's incomplete batch tail left in exactly its original positions.
+    Evaluation (``shuffle=False``) always retains its original order.
+    """
     import math
 
     import torch
 
+    if length_bucket_size < 0:
+        raise ValueError("length_bucket_size must be >= 0")
     if size <= 0:
         return []
     if shuffle:
@@ -238,6 +267,22 @@ def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle
     if padding_size:
         repeats = math.ceil(padding_size / len(indices))
         indices.extend((indices * repeats)[:padding_size])
+    if length_bucket_size and shuffle:
+        from specforge.data.length_bucketing import bucket_by_length
+
+        indices = bucket_by_length(
+            indices,
+            length_fn=(
+                (lambda index: lengths[index])
+                if lengths is not None
+                else (lambda _: None)
+            ),
+            batch_size=batch_size,
+            dp_size=dp_size,
+            length_bucket_size=length_bucket_size,
+            seed=seed,
+            epoch=epoch,
+        )
     return indices[dp_rank:total_size:dp_size]
 
 
@@ -538,6 +583,17 @@ def _validate_offline_trainer_tp(tp_size: int) -> None:
         )
 
 
+def _validate_offline_length_bucketing(algorithm, length_bucket_size: int) -> None:
+    if length_bucket_size < 0:
+        raise ValueError("length_bucket_size must be >= 0")
+    if length_bucket_size and algorithm.name != "dflash":
+        raise ValueError(
+            "offline length bucketing currently supports only strategy='dflash' "
+            "(including DFlash2); other strategies need separate objective "
+            "normalization validation before regrouping samples"
+        )
+
+
 def build_offline_runtime(
     *,
     algorithm: AlgorithmRegistration,
@@ -551,6 +607,7 @@ def build_offline_runtime(
     ttt_length: int = 7,
     max_len: int = 2048,
     batch_size: int = 1,
+    length_bucket_size: int = 0,
     accumulation_steps: int = 1,
     num_epochs: int = 1,
     max_steps: Optional[int] = None,
@@ -579,6 +636,7 @@ def build_offline_runtime(
     re-iterable, so this path does not allocate a training ledger or ref queue.
     """
     _validate_offline_trainer_tp(tp_size)
+    _validate_offline_length_bucketing(algorithm, length_bucket_size)
     provider = algorithm.providers.offline_for(modality)
     collate_fn, per_sample_transform = _offline_io(
         algorithm,
@@ -595,6 +653,21 @@ def build_offline_runtime(
     source_refs = provider.build_reader(
         hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
     ).read()
+    length_bucket_contract = {}
+    if length_bucket_size:
+        from specforge.data.length_bucketing import length_bucket_fingerprint
+        from specforge.data.offline_lengths import ensure_offline_lengths
+
+        source_refs = ensure_offline_lengths(
+            source_refs, cache_dir=os.path.join(output_dir, "length-cache")
+        )
+        length_bucket_contract = {
+            "length_bucket_size": length_bucket_size,
+            "length_bucket_max_len": max_len,
+            "length_bucket_ref_fingerprint": length_bucket_fingerprint(
+                source_refs, max_len=max_len
+            ),
+        }
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
@@ -602,6 +675,9 @@ def build_offline_runtime(
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
+            batch_size=batch_size,
+            length_bucket_size=length_bucket_size,
+            max_len=max_len,
         )
 
     refs = refs_for_epoch(0)
@@ -650,9 +726,10 @@ def build_offline_runtime(
         durable_ack=False,
         resume_from=resume_from,
         checkpoint_extra={
-            "offline_sampler_version": 1,
+            "offline_sampler_version": 2 if length_bucket_size else 1,
             "sampler_seed": seed,
             "source_dataset_size": len(source_refs),
+            **length_bucket_contract,
         },
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,
@@ -677,6 +754,7 @@ def build_disagg_offline_runtime(
     ttt_length: int = 7,
     max_len: int = 2048,
     batch_size: int = 1,
+    length_bucket_size: int = 0,
     accumulation_steps: int = 1,
     num_epochs: int = 1,
     max_steps: Optional[int] = None,
@@ -705,6 +783,7 @@ def build_disagg_offline_runtime(
     colocated offline path, so results match within determinism tolerance.
     """
     _validate_offline_trainer_tp(tp_size)
+    _validate_offline_length_bucketing(algorithm, length_bucket_size)
     collate_fn, per_sample_transform = _offline_io(
         algorithm,
         modality,
@@ -713,6 +792,21 @@ def build_disagg_offline_runtime(
         use_usp_preprocess=use_usp_preprocess,
     )
     source_refs = list(refs)
+    length_bucket_contract = {}
+    if length_bucket_size:
+        from specforge.data.length_bucketing import length_bucket_fingerprint
+        from specforge.data.offline_lengths import ensure_offline_lengths
+
+        source_refs = ensure_offline_lengths(
+            source_refs, cache_dir=os.path.join(output_dir, "length-cache")
+        )
+        length_bucket_contract = {
+            "length_bucket_size": length_bucket_size,
+            "length_bucket_max_len": max_len,
+            "length_bucket_ref_fingerprint": length_bucket_fingerprint(
+                source_refs, max_len=max_len
+            ),
+        }
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
@@ -720,6 +814,9 @@ def build_disagg_offline_runtime(
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
+            batch_size=batch_size,
+            length_bucket_size=length_bucket_size,
+            max_len=max_len,
         )
 
     refs = refs_for_epoch(0)
@@ -772,9 +869,10 @@ def build_disagg_offline_runtime(
         durable_ack=False,
         resume_from=resume_from,
         checkpoint_extra={
-            "offline_sampler_version": 1,
+            "offline_sampler_version": 2 if length_bucket_size else 1,
             "sampler_seed": seed,
             "source_dataset_size": len(source_refs),
+            **length_bucket_contract,
         },
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,
@@ -1553,6 +1651,7 @@ def build_disagg_online_consumer(
     dataloader_num_workers: int = 0,
     profiling_options=None,
     async_ack: Optional[bool] = None,
+    length_aware_scheduling: bool = False,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1591,6 +1690,35 @@ def build_disagg_online_consumer(
     actual_rank = dist.get_rank() if distributed else 0
     preflight_exc = None
     try:
+        if length_aware_scheduling and (
+            algorithm.name not in {"dflash", "eagle3"}
+            or (algorithm.name == "eagle3" and batch_size != 1)
+        ):
+            raise ValueError(
+                "online length-aware scheduling supports DFlash/DFlash2 or "
+                "EAGLE3 with batch_size=1"
+            )
+        if resume_from:
+            # Preflight has its own collective error fence below. Do not call
+            # read_resume_state here: its inner collectives would deadlock if
+            # another rank failed a preceding local validation.
+            import torch
+
+            from specforge.training.checkpoint import STATE_FILE, CheckpointManager
+
+            policy_state = torch.load(
+                os.path.join(
+                    CheckpointManager.resolve_resume_dir(resume_from), STATE_FILE
+                ),
+                map_location="cpu",
+                weights_only=False,
+            )
+            saved_scheduling = policy_state.get("online_length_aware_scheduling", False)
+            del policy_state
+            if saved_scheduling != length_aware_scheduling:
+                raise ValueError(
+                    "resume requires the original online_length_aware_scheduling policy"
+                )
         dp_rank, dp_size = _dp_consumer_layout(
             dp_rank,
             dp_size,
@@ -1724,6 +1852,7 @@ def build_disagg_online_consumer(
                 feature_store=feature_store,
                 refs_per_rank_step=batch_size * accumulation_steps,
                 refs_per_rank_batch=batch_size,
+                length_aware_scheduling=length_aware_scheduling,
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
@@ -1899,6 +2028,11 @@ def build_disagg_online_consumer(
             dataloader_num_workers=dataloader_num_workers,
             profiling_options=profiling_options,
             async_ack=async_ack,
+            checkpoint_extra=(
+                {"online_length_aware_scheduling": True}
+                if length_aware_scheduling
+                else None
+            ),
             on_fit_success=mark_consumer_done,
             on_fit_failure=mark_consumer_failed,
             on_fit_finally=stop_distributor_and_drain,
