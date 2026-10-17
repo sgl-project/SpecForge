@@ -262,6 +262,16 @@ class _ConfiguredOptimizerFactory:
         if self.total_steps is None:
             raise RuntimeError("optimizer total_steps was not resolved before assembly")
         t = self.cfg.training
+        # Decay bounds are passed only for the cooldown schedule so every other
+        # schedule builds exactly as before.
+        decay = (
+            dict(
+                lr_decay_start_update=t.lr_decay_start_update,
+                lr_decay_end_update=t.lr_decay_end_update,
+            )
+            if t.lr_scheduler == "constant_linear_decay"
+            else {}
+        )
         return BF16Optimizer(
             draft_module,
             lr=t.learning_rate,
@@ -270,6 +280,7 @@ class _ConfiguredOptimizerFactory:
             lr_scheduler=t.lr_scheduler,
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
+            **decay,
         )
 
 

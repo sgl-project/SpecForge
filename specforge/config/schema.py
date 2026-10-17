@@ -901,7 +901,13 @@ class TrainingConfig(StrictConfigModel):
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
-    lr_scheduler: Literal["cosine", "constant"] = "cosine"
+    lr_scheduler: Literal["cosine", "constant", "constant_linear_decay"] = "cosine"
+    #: ``constant_linear_decay`` only (required there, forbidden otherwise):
+    #: 1-based update D after which the ``constant`` rate decays linearly, and
+    #: update T that gets ``base / (T - D)``. A run may branch from a
+    #: ``constant`` checkpoint at update <= D (see specforge.lr_scheduler).
+    lr_decay_start_update: Optional[int] = Field(default=None, gt=0)
+    lr_decay_end_update: Optional[int] = Field(default=None, gt=0)
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
@@ -988,6 +994,39 @@ class TrainingConfig(StrictConfigModel):
     #: Deterministic online prompt ordering. ``None`` preserves the historical
     #: behavior of using the run RNG seed for both model and prompt sampling.
     prompt_seed: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _validate_lr_decay_window(self):
+        start, end = self.lr_decay_start_update, self.lr_decay_end_update
+        if self.lr_scheduler != "constant_linear_decay":
+            if start is not None or end is not None:
+                raise ValueError(
+                    "training.lr_decay_start_update/lr_decay_end_update apply "
+                    "only to lr_scheduler=constant_linear_decay"
+                )
+            return self
+        if start is None or end is None:
+            raise ValueError(
+                "lr_scheduler=constant_linear_decay requires "
+                "training.lr_decay_start_update and training.lr_decay_end_update"
+            )
+        if self.max_steps is None:
+            raise ValueError(
+                "lr_scheduler=constant_linear_decay requires training.max_steps"
+            )
+        # Same horizon and warmup expression as the optimizer factory /
+        # specforge.lr_scheduler.warmup_updates (kept torch-free here).
+        horizon = self.total_steps or self.max_steps
+        warmup = int(self.warmup_ratio * horizon)
+        if not warmup <= start < end <= min(self.max_steps, horizon):
+            raise ValueError(
+                "lr_scheduler=constant_linear_decay requires warmup <= "
+                "lr_decay_start_update < lr_decay_end_update <= max_steps, got "
+                f"warmup={warmup}, lr_decay_start_update={start}, "
+                f"lr_decay_end_update={end}, max_steps={self.max_steps}, "
+                f"total_steps={horizon}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
