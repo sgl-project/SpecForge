@@ -31,7 +31,7 @@ from specforge.algorithms.common.providers import (
     checkpoint_key_fingerprint,
 )
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
-from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.backend import ParallelConfig, create_training_backend
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 
@@ -87,6 +87,8 @@ class Trainer:
         model,
         target_head,
         optimizer_factory,
+        training_backend: str = "fsdp",
+        fsdp_sharding: Optional[str] = None,
         run_id: str,
         output_dir: str,
         batch_size: int,
@@ -109,6 +111,7 @@ class Trainer:
         dataset_size: Optional[int] = None,
         checkpoint_extra: Optional[dict] = None,
         max_checkpoints: int = 0,
+        checkpoint_async: bool = False,
         tp_size: int = 1,
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
@@ -426,11 +429,14 @@ class Trainer:
             del state, saved_weights
 
         parallel = ParallelConfig.from_distributed(
+            sharding_strategy=fsdp_sharding,
             tp_size=tp_size,
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
         )
-        backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
+        backend = create_training_backend(
+            training_backend, parallel, optimizer_factory=optimizer_factory
+        )
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
@@ -472,7 +478,10 @@ class Trainer:
             logger=logger,
             ack_fn=ack_fn,
             checkpoint_manager=CheckpointManager(
-                output_dir, run_id, max_checkpoints=max_checkpoints
+                output_dir,
+                run_id,
+                max_checkpoints=max_checkpoints,
+                async_write=checkpoint_async,
             ),
             checkpoint_extra=persisted_contract,
             start_step=resume["global_step"] if resume else 0,
@@ -542,6 +551,9 @@ class Trainer:
                 step = self._controller.fit(self._loader)
             if step > 0 and self.last_checkpoint_step != step:
                 self.save_checkpoint()
+            # Every interval checkpoint written asynchronously is complete and
+            # pointed to by ``{run_id}-latest`` before fit reports success.
+            self._wait_for_checkpoints()
             # A distributed consumer is not successful until prefetch has
             # stopped and every never-yielded lease has an explicit outcome.
             # Run this before on_fit_success publishes consumer_done.
@@ -565,6 +577,9 @@ class Trainer:
 
             if not loader_close_attempted:
                 capture_cleanup("FeatureDataLoader.close", close_loader)
+            # A failing rank cannot run the collective wait(); join the writer
+            # so no half-written file outlives the process.
+            capture_cleanup("CheckpointManager.drain", self._drain_checkpoints)
             capture_cleanup(
                 "TrainerController.close_profiler",
                 self._controller.close_profiler,
@@ -602,8 +617,30 @@ class Trainer:
                 raise cleanup_error
 
     def save_checkpoint(self):
-        """Persist the current optimizer step through the one trainer surface."""
-        return self._controller.save_checkpoint(self.global_step)
+        """Persist the current optimizer step through the one trainer surface.
+
+        Returns once the checkpoint is complete on disk, also when interval
+        saves run asynchronously.
+        """
+        checkpoint = self._controller.save_checkpoint(self.global_step)
+        self._wait_for_checkpoints()
+        return checkpoint
+
+    def _checkpoint_manager(self):
+        # Controllers injected by tests may not expose a manager; the runtime
+        # TrainerController always does.
+        getter = getattr(self._controller, "_checkpoint_manager", None)
+        return getter() if callable(getter) else None
+
+    def _wait_for_checkpoints(self) -> None:
+        manager = self._checkpoint_manager()
+        if manager is not None and hasattr(manager, "wait"):
+            manager.wait()
+
+    def _drain_checkpoints(self) -> None:
+        manager = self._checkpoint_manager()
+        if manager is not None and hasattr(manager, "drain"):
+            manager.drain()
 
     def evaluate(self, data=None):
         """Run one eval pass, defaulting to the configured eval source.
