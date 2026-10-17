@@ -182,6 +182,7 @@ def _shard_offline_refs(
     shuffle=True,
     dp_rank=None,
     dp_size=None,
+    plan=None,
 ):
     """Match ``DistributedSampler`` over metadata-only refs for one epoch.
 
@@ -191,6 +192,7 @@ def _shard_offline_refs(
     refs keeps every FSDP rank on the same number of collectives. The
     caller rebuilds this plan with ``seed + epoch`` before applying a resume
     seek, exactly like the legacy ``DistributedSampler.set_epoch`` lifecycle.
+    A cost-aware ``plan`` regroups the global order before the DP striding.
     """
     import torch.distributed as dist
 
@@ -214,12 +216,15 @@ def _shard_offline_refs(
         seed=seed,
         epoch=epoch,
         shuffle=shuffle,
+        plan=plan,
     )
     return [refs[index] for index in indices]
 
 
-def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle=True):
-    """Reproduce ``DistributedSampler(drop_last=False)`` index generation."""
+def _distributed_sampler_indices(
+    size, *, dp_rank, dp_size, seed, epoch, shuffle=True, plan=None
+):
+    """Reproduce ``DistributedSampler(drop_last=False)``; ``plan`` regroups the order first."""
     import math
 
     import torch
@@ -238,7 +243,67 @@ def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle
     if padding_size:
         repeats = math.ceil(padding_size / len(indices))
         indices.extend((indices * repeats)[:padding_size])
+    if plan is not None:
+        indices = _cost_aware_global_order(
+            indices, plan, dp_size=dp_size, seed=seed, epoch=epoch
+        )
     return indices[dp_rank:total_size:dp_size]
+
+
+def _cost_aware_global_order(indices, plan, *, dp_size, seed, epoch):
+    """Regroup the padded global order into cost-balanced rounds, window by window.
+
+    Windows follow the global micro-batch count (accumulation spans epochs), the
+    ``drop_last`` tail keeps its order, and the result is interleaved for the
+    caller's ``[dp_rank::dp_size]`` striding.
+    """
+    import random
+
+    from specforge.runtime.data_plane.window_plan import interleave_rounds, plan_window
+
+    batch_size = int(plan.batch_size)
+    round_size = dp_size * batch_size
+    usable = len(indices) - len(indices) % round_size
+    rounds_per_epoch = usable // round_size
+    window_rounds = int(plan.window_rounds)
+    # The first window finishes the window the previous epoch left open.
+    phase = (int(epoch) * rounds_per_epoch) % window_rounds
+    length = (window_rounds - phase) % window_rounds or window_rounds
+    rng = random.Random(int(seed) + int(epoch))
+    out = []
+    start = 0
+    while start < usable:
+        members = indices[start : min(start + length * round_size, usable)]
+        rounds = plan_window(
+            [plan.costs[index] for index in members],
+            dp_size,
+            batch_size,
+            tiebreak=members,
+            rng=rng,
+        )
+        out.extend(members[position] for position in interleave_rounds(rounds, dp_size))
+        start += len(members)
+        length = window_rounds
+    out.extend(indices[usable:])
+    return out
+
+
+def _offline_scheduling_plan(
+    refs, scheduling, *, batch_size, accumulation_steps, max_len, cache_dir
+):
+    """Sampler plan and checkpoint contract for ``refs`` (``(None, None)`` if off)."""
+    if scheduling is None:
+        return None, None
+    from specforge.runtime.data_plane.offline_index import offline_window_plan
+
+    return offline_window_plan(
+        refs,
+        scheduling,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        max_len=max_len,
+        cache_dir=cache_dir,
+    )
 
 
 def _make_offline_eval_data_factory(
@@ -571,6 +636,7 @@ def build_offline_runtime(
     strategy_kwargs: Optional[Mapping[str, Any]] = None,
     dataloader_num_workers: int = 0,
     profiling_options=None,
+    scheduling=None,
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
@@ -595,6 +661,14 @@ def build_offline_runtime(
     source_refs = provider.build_reader(
         hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
     ).read()
+    window_plan, scheduling_contract = _offline_scheduling_plan(
+        source_refs,
+        scheduling,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        max_len=max_len,
+        cache_dir=output_dir,
+    )
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
@@ -602,6 +676,7 @@ def build_offline_runtime(
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
+            plan=window_plan,
         )
 
     refs = refs_for_epoch(0)
@@ -653,6 +728,7 @@ def build_offline_runtime(
             "offline_sampler_version": 1,
             "sampler_seed": seed,
             "source_dataset_size": len(source_refs),
+            "cost_aware_scheduling": scheduling_contract,
         },
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,
@@ -697,6 +773,7 @@ def build_disagg_offline_runtime(
     strategy_kwargs: Optional[Mapping[str, Any]] = None,
     dataloader_num_workers: int = 0,
     profiling_options=None,
+    scheduling=None,
 ):
     """Consumer side of a disaggregated OFFLINE run.
 
@@ -713,6 +790,14 @@ def build_disagg_offline_runtime(
         use_usp_preprocess=use_usp_preprocess,
     )
     source_refs = list(refs)
+    window_plan, scheduling_contract = _offline_scheduling_plan(
+        source_refs,
+        scheduling,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        max_len=max_len,
+        cache_dir=output_dir,
+    )
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
@@ -720,6 +805,7 @@ def build_disagg_offline_runtime(
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
+            plan=window_plan,
         )
 
     refs = refs_for_epoch(0)
@@ -775,6 +861,7 @@ def build_disagg_offline_runtime(
             "offline_sampler_version": 1,
             "sampler_seed": seed,
             "source_dataset_size": len(source_refs),
+            "cost_aware_scheduling": scheduling_contract,
         },
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,
@@ -1553,6 +1640,7 @@ def build_disagg_online_consumer(
     dataloader_num_workers: int = 0,
     profiling_options=None,
     async_ack: Optional[bool] = None,
+    scheduling=None,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1727,6 +1815,7 @@ def build_disagg_online_consumer(
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
+                scheduling=scheduling,
             )
             inbox_server_url = os.environ.get("DISAGG_INBOX_SERVER_URL")
             if inbox_server_url:
@@ -1891,6 +1980,11 @@ def build_disagg_online_consumer(
             collate_fn=_streaming_collate(algorithm, modality, collate_fn),
             strategy_kwargs=strategy_kwargs,
             per_sample_transform=None,
+            checkpoint_extra={
+                "cost_aware_scheduling": (
+                    scheduling.contract() if scheduling is not None else None
+                ),
+            },
             max_checkpoints=max_checkpoints,
             tp_size=tp_size,
             sp_ulysses_size=sp_ulysses_size,

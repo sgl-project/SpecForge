@@ -164,6 +164,9 @@ def algorithm_spec() -> AlgorithmSpec:
             supports_trim_loss_positions=True,
             supports_vocab_mapping=True,
             allows_aux_layer_override=True,
+            scheduling_key="length",
+            # Per-micro-batch mean loss: only batch 1 keeps token weights fixed.
+            scheduling_max_batch_size=1,
         ),
     )
 

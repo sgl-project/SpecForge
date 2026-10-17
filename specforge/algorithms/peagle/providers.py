@@ -98,6 +98,7 @@ def algorithm_spec() -> AlgorithmSpec:
             required_batch_size=1,
             supports_vocab_mapping=True,
             allows_aux_layer_override=True,
+            scheduling_key="length",
         ),
     )
 
