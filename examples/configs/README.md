@@ -277,6 +277,7 @@ Common fields:
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
+| `training.sequence_packing` | `false` | Pack each original microbatch for text EAGLE3, DFlash, or DFlash2, offline or online. Requires FlexAttention; incompatible with compact teacher and loss-position trimming. DFlash/DFlash2 LK objectives are supported; EAGLE3 LK is not. See [sequence packing](../../docs/sections/basic_usage/training.md#sequence-packing). |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |

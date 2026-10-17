@@ -32,7 +32,8 @@ from specforge.algorithms.eagle3.data import (
     build_offline_collator,
     build_offline_normalizer,
     build_offline_reader,
-    build_server_collator,
+    build_packed_collator,
+    build_padded_server_collator,
 )
 
 ALGORITHM_NAME = "eagle3"
@@ -211,6 +212,7 @@ def algorithm_providers() -> AlgorithmProviders:
                 build_reader=build_offline_reader,
                 build_normalizer=build_offline_normalizer,
                 build_collator=build_offline_collator,
+                build_packed_collator=build_packed_collator,
             ),
         ),
         server_streaming=(
@@ -227,7 +229,8 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                     attention_mask_feature="attention_mask",
                 ),
-                build_collator=build_server_collator,
+                build_collator=build_padded_server_collator,
+                build_packed_collator=build_packed_collator,
             ),
         ),
         vocab_mapping_modes=frozenset({FeatureMode.OFFLINE, FeatureMode.STREAMING}),

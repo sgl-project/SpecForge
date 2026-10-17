@@ -163,10 +163,19 @@ def _offline_io(
     *,
     ttt_length: int,
     use_usp_preprocess: bool,
+    sequence_packing: bool = False,
 ):
     """Resolve the algorithm-owned normalizer and collator for one modality."""
     provider = algorithm.providers.offline_for(modality)
-    return provider.build_collator(), provider.build_normalizer(
+    if sequence_packing:
+        if use_usp_preprocess or provider.build_packed_collator is None:
+            raise ValueError(
+                "sequence_packing requires a supported non-USP offline provider"
+            )
+        collator = provider.build_packed_collator()
+    else:
+        collator = provider.build_collator()
+    return collator, provider.build_normalizer(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
@@ -252,6 +261,7 @@ def _make_offline_eval_data_factory(
     ttt_length: int,
     use_usp_preprocess: bool,
     dataloader_num_workers: int,
+    sequence_packing: bool = False,
 ):
     """Build a fresh re-iterable eval loader over the offline feature path."""
     provider = algorithm.providers.offline_for(modality)
@@ -261,6 +271,7 @@ def _make_offline_eval_data_factory(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        sequence_packing=sequence_packing,
     )
     eval_run_id = f"{run_id}-eval"
     refs = provider.build_reader(
@@ -293,11 +304,22 @@ def _streaming_collate(
     algorithm: AlgorithmRegistration,
     modality: str,
     collate_fn,
+    *,
+    sequence_packing: bool = False,
 ):
     """Resolve an algorithm-owned server-streaming collator."""
     if collate_fn is not None:
+        if sequence_packing:
+            raise ValueError(
+                "sequence_packing cannot be combined with a custom collate_fn"
+            )
         return collate_fn
-    return algorithm.providers.server_streaming_for(modality).build_collator()
+    provider = algorithm.providers.server_streaming_for(modality)
+    if sequence_packing:
+        if provider.build_packed_collator is None:
+            raise ValueError("sequence_packing requires a supported streaming provider")
+        return provider.build_packed_collator()
+    return provider.build_collator()
 
 
 def _resolve_metadata_store(
@@ -563,6 +585,7 @@ def build_offline_runtime(
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     use_usp_preprocess: bool = False,
+    sequence_packing: bool = False,
     seed: int = 0,
     logger=None,
     log_interval: int = 50,
@@ -586,6 +609,7 @@ def build_offline_runtime(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        sequence_packing=sequence_packing,
     )
     controller = DataFlowController(
         run_id,
@@ -621,6 +645,7 @@ def build_offline_runtime(
             ttt_length=ttt_length,
             use_usp_preprocess=use_usp_preprocess,
             dataloader_num_workers=dataloader_num_workers,
+            sequence_packing=sequence_packing,
         )
     return _assemble_trainer(
         algorithm=algorithm,
@@ -689,6 +714,7 @@ def build_disagg_offline_runtime(
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     use_usp_preprocess: bool = False,
+    sequence_packing: bool = False,
     seed: int = 0,
     logger=None,
     log_interval: int = 50,
@@ -711,6 +737,7 @@ def build_disagg_offline_runtime(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        sequence_packing=sequence_packing,
     )
     source_refs = list(refs)
 
@@ -743,6 +770,7 @@ def build_disagg_offline_runtime(
             ttt_length=ttt_length,
             use_usp_preprocess=use_usp_preprocess,
             dataloader_num_workers=dataloader_num_workers,
+            sequence_packing=sequence_packing,
         )
     return _assemble_trainer(
         algorithm=algorithm,
@@ -1536,6 +1564,7 @@ def build_disagg_online_consumer(
     eval_interval: int = 0,
     eval_data_factory=None,
     collate_fn=None,
+    sequence_packing: bool = False,
     idle_timeout_s: Optional[float] = None,
     metadata_store: Optional[MetadataStore] = None,
     metadata_db_path: Optional[str] = None,
@@ -1888,7 +1917,9 @@ def build_disagg_online_consumer(
             eval_data_factory=eval_data_factory,
             logger=logger,
             log_interval=log_interval,
-            collate_fn=_streaming_collate(algorithm, modality, collate_fn),
+            collate_fn=_streaming_collate(
+                algorithm, modality, collate_fn, sequence_packing=sequence_packing
+            ),
             strategy_kwargs=strategy_kwargs,
             per_sample_transform=None,
             max_checkpoints=max_checkpoints,

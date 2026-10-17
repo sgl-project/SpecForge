@@ -70,7 +70,21 @@ def linear_lambda_base(
     return max(0.0, min(1.0, lambda_start * (1.0 - progress)))
 
 
-def _cpu_max_valid_anchors(loss_mask: torch.Tensor) -> Optional[int]:
+def _cpu_valid_anchor_counts(
+    loss_mask: torch.Tensor, sequence_lengths: Tuple[int, ...]
+) -> Optional[Tuple[int, ...]]:
+    """Count packed document anchors on the host before feature H2D copies."""
+    if loss_mask.device.type != "cpu":
+        return None
+    return tuple(
+        int(((mask[:-1] > 0.5) & (mask[1:] > 0.5)).sum())
+        for mask in loss_mask[0].split(sequence_lengths)
+    )
+
+
+def _cpu_max_valid_anchors(
+    loss_mask: torch.Tensor, sequence_lengths: Optional[Tuple[int, ...]] = None
+) -> Optional[int]:
     """Count the widest valid anchor row without synchronizing the GPU.
 
     Online/offline loaders hand strategies CPU integer features; Mooncake
@@ -82,6 +96,10 @@ def _cpu_max_valid_anchors(loss_mask: torch.Tensor) -> Optional[int]:
     """
     if loss_mask.device.type != "cpu":
         return None
+    if sequence_lengths is not None:
+        # Preserve the per-document anchor budget, not the sum across a packed row.
+        counts = _cpu_valid_anchor_counts(loss_mask, sequence_lengths)
+        return max(counts, default=0)
     num_candidates = max(loss_mask.shape[1] - 1, 0)
     valid = (loss_mask[:, :num_candidates] > 0.5) & (
         loss_mask[:, 1 : num_candidates + 1] > 0.5
@@ -128,9 +146,9 @@ def _prepare_eagle_target(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Normalize EAGLE-family teacher features for a training forward.
 
-    Online capture already shifts logits and input IDs. Offline capture stores
-    the target model's final hidden state, so the frozen target head owns the
-    equivalent shift and projection to full-vocabulary logits.
+    Raw hidden-state features from offline readers or online server capture
+    require the frozen target head's shift and full-vocabulary projection.
+    Preprocessed logits and their aligned input IDs are used as delivered.
     """
     if target_repr == "hidden_state":
         if target_head is None:
@@ -278,7 +296,46 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         target_repr = batch.metadata.get("target_repr")
 
         compact_kwargs: Dict[str, Any] = {}
-        if self.compact_teacher:
+        packed_kwargs: Dict[str, Any] = {}
+        sequence_lengths = t.get("sequence_lengths")
+        if sequence_lengths is not None:
+            if self.compact_teacher or self.trim_loss_positions:
+                raise ValueError(
+                    "sequence packing does not support compact_teacher or trim_loss_positions"
+                )
+            if target_repr != "hidden_state" or self.target_head is None:
+                raise ValueError(
+                    "sequence packing requires unshifted hidden_state targets and a target head"
+                )
+            from specforge.modeling.packed_sequence import PackedSequenceLayout
+
+            layout = PackedSequenceLayout.from_lengths(
+                sequence_lengths, t["input_ids"].shape[1], t["input_ids"].device
+            )
+            # TargetHead's ordinary global shift would import the next document's
+            # first token into this document's last row. Shift all three fields
+            # within document boundaries before projecting the frozen teacher.
+            input_ids = layout.shift_left(t["input_ids"]).to(device, non_blocking=True)
+            target_hidden = layout.shift_left(t["target"])
+            target = self.target_head(target_hidden.to(device, non_blocking=True))
+            loss_mask = layout.shift_left(t["loss_mask"])[..., None].to(
+                device, non_blocking=True
+            )
+            loss_denominator = t.get("loss_denominator")
+            if loss_denominator is not None and (
+                loss_denominator.device.type != "cpu" or loss_denominator.numel() != 1
+            ):
+                raise ValueError("loss_denominator must be a scalar CPU tensor")
+            # FSDP moves tensor kwargs onto its compute device. Keep the small
+            # control metadata as Python values so it stays host-side without a
+            # GPU synchronization when the wrapped model builds its layout.
+            packed_kwargs = {
+                "sequence_lengths": tuple(sequence_lengths.tolist()),
+                "loss_denominator": (
+                    int(loss_denominator) if loss_denominator is not None else None
+                ),
+            }
+        elif self.compact_teacher:
             if target_repr != "hidden_state":
                 raise ValueError(
                     "compact teacher is offline-only and requires "
@@ -326,6 +383,7 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
                 else None
             ),
             trim_loss_positions=self.trim_loss_positions,
+            **packed_kwargs,
             **compact_kwargs,
         )
         weights = [self.ploss_decay**i for i in range(len(plosses))]
@@ -516,7 +574,33 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         selector_loss_alpha = self._selector_loss_alpha(ctx)
-        max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
+        sequence_lengths = t.get("sequence_lengths")
+        if sequence_lengths is not None:
+            if (
+                sequence_lengths.device.type != "cpu"
+                or sequence_lengths.dtype != torch.long
+                or sequence_lengths.ndim != 1
+                or not sequence_lengths.numel()
+                or bool((sequence_lengths <= 0).any())
+                or t["input_ids"].shape[0] != 1
+                or int(sequence_lengths.sum()) != t["input_ids"].shape[1]
+            ):
+                raise ValueError(
+                    "sequence_lengths must be positive CPU int64 document lengths for one packed row"
+                )
+            # FSDP moves tensor kwargs to the GPU; small control metadata must
+            # remain host-side so packing does not introduce a device sync.
+            sequence_lengths = tuple(sequence_lengths.tolist())
+        valid_anchor_counts = (
+            _cpu_valid_anchor_counts(t["loss_mask"], sequence_lengths)
+            if sequence_lengths is not None
+            else None
+        )
+        max_valid_anchors = (
+            max(valid_anchor_counts, default=0)
+            if valid_anchor_counts is not None
+            else _cpu_max_valid_anchors(t["loss_mask"])
+        )
         collect_detailed_metrics = (
             ctx.collect_detailed_metrics if ctx is not None else True
         )
@@ -527,6 +611,10 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             "max_valid_anchors": max_valid_anchors,
             "selector_loss_alpha": selector_loss_alpha,
         }
+        if sequence_lengths is not None:
+            model_inputs["sequence_lengths"] = sequence_lengths
+            if valid_anchor_counts is not None:
+                model_inputs["valid_anchor_counts"] = valid_anchor_counts
         if ctx is not None:
             model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
         target_last_hidden_states = t.get("target_last_hidden_states")

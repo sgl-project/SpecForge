@@ -491,10 +491,15 @@ class OfflineDataProvider:
     build_normalizer: Factory
     build_collator: Factory
     capture_layout: OfflineCaptureLayout | None = None
+    build_packed_collator: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.modality, field_name="modality")
         _non_empty(self.normalizer_id, field_name="normalizer_id")
+        if self.build_packed_collator is not None and not callable(
+            self.build_packed_collator
+        ):
+            raise TypeError("build_packed_collator must be callable or None")
         if self.capture_layout is not None and not isinstance(
             self.capture_layout,
             OfflineCaptureLayout,
@@ -581,6 +586,7 @@ class ServerStreamingProvider:
     build_collator: Factory
     build_input_adapter: Factory | None = None
     select_layout: Factory | None = None
+    build_packed_collator: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.modality, field_name="modality")
@@ -594,6 +600,10 @@ class ServerStreamingProvider:
             raise TypeError("layout must be a ServerCaptureLayout")
         if not callable(self.build_collator):
             raise TypeError("build_collator must be callable")
+        if self.build_packed_collator is not None and not callable(
+            self.build_packed_collator
+        ):
+            raise TypeError("build_packed_collator must be callable or None")
         if self.build_input_adapter is not None and not callable(
             self.build_input_adapter
         ):
