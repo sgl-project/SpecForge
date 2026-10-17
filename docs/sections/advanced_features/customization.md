@@ -122,11 +122,12 @@ the DeepSeek default; `false` selects NeoX-style half rotation). Omitting
 `attention_mode` preserves the existing GQA path; `"mha"` requires equal
 query/KV head counts.
 
-MLA is a training-side mode: checkpoints train, evaluate through
-`spec_generate`, and export through `--to hf`. SGLang serving of DFlash-family
-drafts currently implements the GQA/MHA layout only, so plan benchmarks
-accordingly. DFlash2 otherwise follows the same mode selection; its convolution
-and selector do not change the attention projection contract.
+MLA checkpoints train, evaluate through `spec_generate`, and export through
+`--to hf`. SGLang serves DFlash and DFlash2 MLA exports as is
+([SGLang PR #44676](https://github.com/sgl-project/sglang/pull/44676));
+DSpark MLA exports do not serve yet. DFlash2 otherwise follows the same mode
+selection; its convolution and selector do not change the attention projection
+contract.
 
 ## Draft architectures
 
