@@ -3,16 +3,17 @@
 
 Takes a SpecForge-trained DSparkV4DraftModel (an ``specforge export --to hf``
 directory, or a training checkpoint dir/``training_state.pt``) and produces a
-directory laid out exactly like ``deepseek-ai/DeepSeek-V4-Flash-0731``:
+directory laid out exactly like the official
+``deepseek-ai/DeepSeek-V4-Flash-0731`` release:
 
-  - shards 1-45 (target weights), config.json, tokenizer files, index, and
-    the encoding/ dir are HARD-LINKED from the official snapshot (config is
-    byte-identical by construction: the DSpark params in it describe our
-    drafter too);
-  - shards 46-48 are rewritten with our trained ``mtp.*`` tensors quantized
-    to the official dtypes: FP8 E4M3 + 128x128 ue8m0 block scales for
-    attention/shared-expert/main_proj, packed FP4 e2m1 + per-32 ue8m0 scales
-    for routed experts, bf16/fp32 for the rest.
+  - the target shards, config.json, tokenizer files, index and the encoding/
+    dir are HARD-LINKED from the official snapshot (config is byte-identical
+    by construction: its dspark_* fields describe our drafter too, which this
+    script checks);
+  - the shards holding ``mtp.*`` are rewritten with our trained tensors
+    quantized to the official dtypes: FP8 E4M3 + 128x128 ue8m0 block scales
+    for attention/shared-expert/main_proj, packed FP4 e2m1 + per-32 ue8m0
+    scales for routed experts, bf16/fp32 for the rest.
 
 The result serves with the exact official command:
   sglang serve <bundle> --tp 4 --speculative-algorithm DSPARK ...
@@ -41,55 +42,16 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
 from dspark_v4_official_weights import (  # noqa: E402
     DEFAULT_SNAPSHOT,
-    FP4_GROUP,
-    FP8_BLOCK,
-    dequant_fp4_packed,
-    dequant_fp8_block,
     iter_official_tensors,
 )
 
-FP4_POS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-
-
-def quant_fp8_block(weight: torch.Tensor):
-    """bf16 [out, in] -> (fp8 e4m3 weight, e8m0 scale [out/128, in/128])."""
-    out_dim, in_dim = weight.shape
-    assert out_dim % FP8_BLOCK == 0 and in_dim % FP8_BLOCK == 0, weight.shape
-    w = weight.float().view(
-        out_dim // FP8_BLOCK, FP8_BLOCK, in_dim // FP8_BLOCK, FP8_BLOCK
-    )
-    amax = w.abs().amax(dim=(1, 3)).clamp_min(1e-30)  # [bOut, bIn]
-    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
-    q = (w / scale[:, None, :, None]).clamp(-448.0, 448.0)
-    q = q.view(out_dim, in_dim).to(torch.float8_e4m3fn)
-    return q, scale.to(torch.float8_e8m0fnu)
-
-
-def quant_fp4_packed(weight: torch.Tensor):
-    """bf16 [out, in] -> (packed int8 [out, in//2], e8m0 scale [out, in//32]).
-
-    Values snap to the nearest e2m1 grid point; packing order matches the
-    reference decode (low nibble = even element).
-    """
-    out_dim, in_dim = weight.shape
-    assert in_dim % FP4_GROUP == 0, weight.shape
-    w = weight.float().view(out_dim, in_dim // FP4_GROUP, FP4_GROUP)
-    amax = w.abs().amax(dim=-1).clamp_min(6.0 * 2.0**-126)
-    scale = torch.exp2(torch.ceil(torch.log2(amax / 6.0)))
-    q = (w / scale[:, :, None]).clamp(-6.0, 6.0).view(out_dim, in_dim)
-
-    sign = q < 0
-    mag = q.abs()
-    # nearest e2m1 magnitude via bucket midpoints (ties round down toward the
-    # even-mantissa neighbor for the 2.5/3.5/5.0 cases per RNE; exact grid
-    # values — the only thing the round-trip self-test checks — are unaffected)
-    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
-    code = torch.bucketize(mag, midpoints, right=False)  # 0..7
-    nibble = (code + torch.where(sign, 8, 0)).to(torch.uint8)
-
-    nibble = nibble.view(out_dim, in_dim // 2, 2)
-    packed = (nibble[..., 0] | (nibble[..., 1] << 4)).view(torch.int8)
-    return packed, scale.to(torch.float8_e8m0fnu)
+from specforge.modeling.draft.moe.families.deepseek import (  # noqa: E402
+    dequantize_fp4,
+    dequantize_fp8,
+    quantize_fp4,
+    quantize_fp8,
+    read_config,
+)
 
 
 def _official_headers(snapshot: str) -> Dict[str, dict]:
@@ -108,13 +70,10 @@ def _official_headers(snapshot: str) -> Dict[str, dict]:
     return headers
 
 
-_FP32_KEYS = ("attn_sink", "hc_", "gate.bias")
-
-
 def quantize_state(
     state: Dict[str, torch.Tensor], headers: Dict[str, dict]
 ) -> Dict[str, torch.Tensor]:
-    """Quantize a bf16 mtp state dict to the official per-tensor dtypes."""
+    """Quantize an official-named mtp state dict to the official dtypes."""
     out: Dict[str, torch.Tensor] = {}
     for key, meta in headers.items():
         if key.endswith(".scale"):
@@ -123,11 +82,9 @@ def quantize_state(
         base = key[: -len(".weight")] if key.endswith(".weight") else key
         tensor = state[key]
         if dtype == "F8_E4M3":
-            q, s = quant_fp8_block(tensor)
-            out[key], out[base + ".scale"] = q, s
+            out[key], out[base + ".scale"] = quantize_fp8(tensor)
         elif dtype == "I8":
-            q, s = quant_fp4_packed(tensor)
-            out[key], out[base + ".scale"] = q, s
+            out[key], out[base + ".scale"] = quantize_fp4(tensor)
         elif dtype == "F32":
             out[key] = tensor.float()
         elif dtype == "BF16":
@@ -135,7 +92,9 @@ def quantize_state(
         else:
             raise ValueError(f"unexpected official dtype {dtype} for {key}")
         assert tuple(out[key].shape) == tuple(meta["shape"]), (
-            key, tuple(out[key].shape), meta["shape"],
+            key,
+            tuple(out[key].shape),
+            meta["shape"],
         )
     return out
 
@@ -159,7 +118,8 @@ def verify_against_official(bundle: Dict[str, torch.Tensor], headers) -> None:
 
 
 def load_draft_state(source: str) -> Dict[str, torch.Tensor]:
-    """mtp.* bf16 state from an HF export dir or a training checkpoint."""
+    """mtp.* bf16 state, in the checkpoint (official) naming, from an HF export
+    dir or a training checkpoint."""
     if os.path.isdir(source):
         candidates = [
             name for name in os.listdir(source) if name.endswith(".safetensors")
@@ -185,16 +145,39 @@ def load_draft_state(source: str) -> Dict[str, torch.Tensor]:
     return dict(state["draft_state_dict"])
 
 
-def _normalize_head_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Accept module-tree head naming (warm-start dirs) alongside official."""
+def _official_head_names(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Root-owned head names (module tree) -> the official ``mtp.<last>.*``
+    names."""
     stages = {int(k.split(".")[1]) for k in state if k.startswith("mtp.")}
-    last = max(stages)
+    last = f"mtp.{max(stages)}."
     out = {}
     for key, value in state.items():
         if key.startswith(("markov_head.", "confidence_head.")):
-            key = f"mtp.{last}.{key}"
+            key = last + key
         out[key] = value
     return out
+
+
+def _check_expert_counts(draft_source: str, snapshot: str) -> None:
+    """The bundle reuses the official config.json, so the drafter's routing
+    counts must be the ones it declares."""
+    path = os.path.join(draft_source, "config.json")
+    if not os.path.isfile(path):
+        return
+    with open(path) as stream:
+        draft = json.load(stream)
+    official = read_config(snapshot)
+    for draft_key, official_key in (
+        ("n_routed_experts", "dspark_n_routed_experts"),
+        ("num_experts_per_tok", "dspark_num_experts_per_tok"),
+    ):
+        fallback = official_key[len("dspark_") :]
+        expected = official.get(official_key) or official[fallback]
+        if draft_key in draft and int(draft[draft_key]) != int(expected):
+            raise SystemExit(
+                f"drafter {draft_key}={draft[draft_key]} but the official config "
+                f"serves {expected}; the bundle would route differently"
+            )
 
 
 def self_test(snapshot: str) -> None:
@@ -208,13 +191,11 @@ def self_test(snapshot: str) -> None:
         base = key[: -len(".weight")] if key.endswith(".weight") else key
         tensor = raw[key]
         if meta["dtype"] == "F8_E4M3":
-            deq = dequant_fp8_block(tensor, raw[base + ".scale"])
-            q, s = quant_fp8_block(deq)
-            rt = dequant_fp8_block(q, s)
+            deq = dequantize_fp8(tensor, raw[base + ".scale"])
+            rt = dequantize_fp8(*quantize_fp8(deq))
         elif meta["dtype"] == "I8":
-            deq = dequant_fp4_packed(tensor, raw[base + ".scale"])
-            q, s = quant_fp4_packed(deq)
-            rt = dequant_fp4_packed(q, s)
+            deq = dequantize_fp4(tensor, raw[base + ".scale"])
+            rt = dequantize_fp4(*quantize_fp4(deq))
         else:
             continue
         if not torch.equal(rt, deq):
@@ -237,8 +218,10 @@ _LINK_FILES = (
 
 def bundle(draft_source: str, output_dir: str, snapshot: str) -> None:
     headers = _official_headers(snapshot)
+    if os.path.isdir(draft_source):
+        _check_expert_counts(draft_source, snapshot)
     print(f"loading trained drafter state from {draft_source} ...")
-    state = _normalize_head_keys(load_draft_state(draft_source))
+    state = _official_head_names(load_draft_state(draft_source))
     expected_keys = {k for k in headers if not k.endswith(".scale")}
     missing = sorted(expected_keys - set(state))
     extra = sorted(set(state) - expected_keys)
@@ -254,14 +237,12 @@ def bundle(draft_source: str, output_dir: str, snapshot: str) -> None:
     weight_map = index["weight_map"]
     mtp_shards = sorted({headers[k]["shard"] for k in headers})
     target_shards = sorted(
-        {v for k, v in weight_map.items() if k not in headers}
-        - set(mtp_shards)
+        {v for k, v in weight_map.items() if k not in headers} - set(mtp_shards)
     )
     # Shards that mix target and mtp tensors would need rewriting; the official
-    # layout keeps them disjoint (46-48 are mtp-only), assert that holds.
-    mixed = {
-        weight_map[k] for k in weight_map if k not in headers
-    } & set(mtp_shards)
+    # layout keeps them disjoint (the trailing shards are mtp-only), assert
+    # that holds.
+    mixed = {weight_map[k] for k in weight_map if k not in headers} & set(mtp_shards)
     assert not mixed, f"target tensors share mtp shards: {sorted(mixed)}"
 
     def _link(src: str, dst: str) -> None:

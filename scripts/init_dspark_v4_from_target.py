@@ -2,16 +2,21 @@
 """Build a warm-start checkpoint for DSparkV4DraftModel.
 
 Two modes:
-  --from-target (default): initialize the three mtp stages from the TARGET
-    model's own layers 40-42 (dequantized to bf16), the last stage's final
-    norm / hc_head from the target's top-level norm / hc_head, an identity
-    main_proj on the last captured feature, and fresh markov/confidence heads.
-    This is the "train from scratch, but target-initialized" warm start.
+  --from-target (default): initialize the mtp stages from the TARGET model's
+    own layers (the draft config's target_layer_ids unless --stage-layers is
+    given), dequantized to bf16: attention, norms, hyper-connections and the
+    MoE (a draft with fewer routed experts than the target takes an evenly
+    strided subset, with the matching router rows). The last stage's final
+    norm and hc_head come from the target's top-level ones;
+    main_proj starts as the identity on the last captured feature, and the
+    Markov/confidence heads start fresh. This is the "train from scratch, but
+    target-initialized" warm start.
   --from-official: load the official DSpark drafter's own mtp.* weights
-    (dequantized). Used only by validation gates - NOT for training runs.
+    (dequantized). Used by validation gates and by fine-tuning runs that start
+    from the released drafter.
 
-Output: an HF-style draft dir (config.json + model.safetensors) consumable via
-``model.draft_checkpoint_path``.
+Output: an HF-style draft dir (config.json + model.safetensors) in the
+official tensor naming, consumable via ``model.draft_checkpoint_path``.
 
 Example:
     python3 scripts/init_dspark_v4_from_target.py \
@@ -33,22 +38,21 @@ sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
 from dspark_v4_official_weights import (  # noqa: E402
-    dequant_fp4_packed,
-    dequant_fp8_block,
-    iter_official_tensors,
+    DEFAULT_SNAPSHOT,
     load_official_mtp_state,
 )
 
-TARGET_SNAPSHOT = os.path.join(
-    os.environ.get(
-        "HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub")
-    ),
-    "models--deepseek-ai--DeepSeek-V4-Flash-0731",
-    "snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+from specforge.modeling.draft.moe.checkpoint import select_target_experts  # noqa: E402
+from specforge.modeling.draft.moe.families.deepseek import (  # noqa: E402
+    dequantize_tensors,
+    iter_checkpoint_tensors,
+    read_config,
+    select_deepseek_experts,
 )
+
 DRAFT_CONFIG = os.path.join(REPO_ROOT, "configs/deepseek-v4-flash-dspark-official.json")
 
-# Per-stage tensors copied verbatim from target layer (40 + stage).
+# Per-stage tensors copied verbatim from the stage's target layer.
 _STAGE_SUFFIXES = (
     "attn.attn_sink",
     "attn.q_norm.weight",
@@ -60,8 +64,6 @@ _STAGE_SUFFIXES = (
     "attn.wo_b.weight",
     "attn_norm.weight",
     "ffn_norm.weight",
-    "ffn.gate.weight",
-    "ffn.gate.bias",
     "hc_attn_fn",
     "hc_attn_base",
     "hc_attn_scale",
@@ -69,24 +71,15 @@ _STAGE_SUFFIXES = (
     "hc_ffn_base",
     "hc_ffn_scale",
 )
+_HC_HEAD = ("hc_head_fn", "hc_head_base", "hc_head_scale")
 
 
-def _dequant(raw: dict, name: str) -> torch.Tensor:
-    tensor = raw[name]
-    scale_name = name[: -len(".weight")] + ".scale" if name.endswith(".weight") else None
-    if tensor.dtype == torch.float8_e4m3fn:
-        return dequant_fp8_block(tensor, raw[scale_name])
-    if tensor.dtype == torch.int8:
-        return dequant_fp4_packed(tensor, raw[scale_name])
-    return tensor
-
-
-def _load_target_tensors(snapshot: str, prefixes: tuple[str, ...]) -> dict:
+def _read(snapshot: str, prefixes) -> dict:
+    """Dequantized target tensors under ``prefixes`` (only their shards are read)."""
     raw = {}
-    for name, tensor in iter_official_tensors(snapshot, prefix=""):
-        if name.startswith(prefixes):
-            raw[name] = tensor
-    return raw
+    for prefix in prefixes:
+        raw.update(iter_checkpoint_tensors(snapshot, prefix))
+    return dequantize_tensors(raw)
 
 
 def build_target_init_state(
@@ -107,35 +100,35 @@ def build_target_init_state(
     # per stage (the official last-3 layout). A spread capture (e.g. 5 layers
     # [1, 11, 21, 31, 41]) still initializes the 3 stages from layers 40-42.
     n_features = n_stages if n_features is None else int(n_features)
-    prefixes = tuple(f"layers.{lid}." for lid in layer_ids) + (
-        "norm.weight",
-        "hc_head_fn",
-        "hc_head_base",
-        "hc_head_scale",
-    )
+    n_target = int(read_config(snapshot)["n_routed_experts"])
+    expert_ids = select_target_experts(n_target, n_experts)
+    top = ("norm.weight",) + _HC_HEAD
     print(f"reading target tensors for layers {layer_ids} ...")
-    raw = _load_target_tensors(snapshot, prefixes)
+    raw = _read(snapshot, tuple(f"layers.{lid}." for lid in layer_ids) + top)
 
     state = {}
     for stage, lid in enumerate(layer_ids):
         src = f"layers.{lid}."
         dst = f"mtp.{stage}."
         for suffix in _STAGE_SUFFIXES:
-            state[dst + suffix] = _dequant(raw, src + suffix)
-        for expert in range(n_experts):
-            for w in ("w1", "w2", "w3"):
-                suffix = f"ffn.experts.{expert}.{w}.weight"
-                state[dst + suffix] = _dequant(raw, src + suffix)
-        for w in ("w1", "w2", "w3"):
-            suffix = f"ffn.shared_experts.{w}.weight"
-            state[dst + suffix] = _dequant(raw, src + suffix)
+            state[dst + suffix] = raw[src + suffix]
+        moe = {
+            key[len(src + "ffn.") :]: value
+            for key, value in raw.items()
+            if key.startswith(src + "ffn.")
+        }
+        if "gate.tid2eid" in moe:
+            raise SystemExit(
+                f"target layer {lid} routes by token hash and has no learned "
+                "router; pick layers at or above num_hash_layers"
+            )
+        for key, value in select_deepseek_experts(moe, expert_ids).items():
+            state[dst + "ffn." + key] = value
         print(f"  stage {stage} <- target layer {lid}")
 
     last = f"mtp.{n_stages - 1}."
-    state[last + "norm.weight"] = raw["norm.weight"]
-    state[last + "hc_head_fn"] = raw["hc_head_fn"]
-    state[last + "hc_head_base"] = raw["hc_head_base"]
-    state[last + "hc_head_scale"] = raw["hc_head_scale"]
+    for name in top:
+        state[last + name] = raw[name]
     del last  # heads below use the model's root (tree) naming
 
     # main_proj: identity on the last captured feature (or an average).
@@ -165,19 +158,21 @@ def build_target_init_state(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--target-snapshot", default=TARGET_SNAPSHOT)
+    parser.add_argument("--target-snapshot", default=DEFAULT_SNAPSHOT)
     parser.add_argument("--draft-config", default=DRAFT_CONFIG)
     parser.add_argument(
         "--from-official",
         action="store_true",
-        help="use the official drafter weights (validation gates only)",
+        help="use the official drafter weights of --target-snapshot",
     )
     parser.add_argument(
-        "--main-proj-init", choices=("identity-last", "average"),
+        "--main-proj-init",
+        choices=("identity-last", "average"),
         default="identity-last",
     )
     parser.add_argument(
-        "--stage-layers", default=None,
+        "--stage-layers",
+        default=None,
         help="comma-separated target layers to copy into the mtp stages "
         "(default: the draft config's target_layer_ids; use 40,41,42 for a "
         "spread-capture draft whose captured layers differ from its stages)",
@@ -185,12 +180,18 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+    from specforge.modeling.draft.dspark_v4 import rename_official_heads
+    from specforge.modeling.draft.moe import to_checkpoint_state_dict
+
     with open(args.draft_config) as stream:
         cfg = json.load(stream)
+    draft_config = AutoDraftModelConfig.from_file(args.draft_config)
     capture_ids = list(cfg["dflash_config"]["target_layer_ids"])
     layer_ids = (
         [int(x) for x in args.stage_layers.split(",")]
-        if args.stage_layers else capture_ids
+        if args.stage_layers
+        else capture_ids
     )
     if len(layer_ids) != int(cfg["num_hidden_layers"]):
         raise SystemExit(
@@ -200,14 +201,10 @@ def main():
 
     if args.from_official:
         print("loading official drafter weights ...")
-        state = load_official_mtp_state()
+        state = load_official_mtp_state(args.target_snapshot)
         # The model owns the heads at its root (tree naming); official
         # checkpoints keep them under the last stage.
-        last = int(cfg["num_hidden_layers"]) - 1
-        for head in ("markov_head.", "confidence_head."):
-            prefix = f"mtp.{last}.{head}"
-            for key in [k for k in state if k.startswith(prefix)]:
-                state[key[len(f"mtp.{last}."):]] = state.pop(key)
+        rename_official_heads(state, int(cfg["num_hidden_layers"]) - 1)
     else:
         state = build_target_init_state(
             snapshot=args.target_snapshot,
@@ -221,33 +218,25 @@ def main():
             seed=args.seed,
         )
 
-    # Validate against the actual model skeleton before writing anything.
+    # Validate against the actual model skeleton before writing anything:
+    # checkpoint files name the MoE tensors through the deepseek layout.
     print("validating against DSparkV4DraftModel ...")
-    from specforge.modeling.auto import AutoDraftModel
-    from specforge.modeling.auto import AutoDraftModelConfig
-
-    draft_config = AutoDraftModelConfig.from_file(args.draft_config)
     with torch.device("meta"):
         model = AutoDraftModel.from_config(draft_config)
-    from specforge.modeling.draft.moe import unstack_grouped_expert_state_dict
-
-    # The module exposes native stacked expert parameters (FSDP-compatible);
-    # checkpoint FILES use the official per-expert naming, which the loader
-    # accepts. Validate in the official naming.
-    expected = unstack_grouped_expert_state_dict(model.state_dict())
+    expected = to_checkpoint_state_dict(model.state_dict(), model)
     missing = sorted(set(expected) - set(state))
     unexpected = sorted(set(state) - set(expected))
     assert not missing, f"missing: {missing[:8]}"
     assert not unexpected, f"unexpected: {unexpected[:8]}"
     for key, value in state.items():
         assert tuple(value.shape) == tuple(expected[key].shape), (
-            key, tuple(value.shape), tuple(expected[key].shape),
+            key,
+            tuple(value.shape),
+            tuple(expected[key].shape),
         )
 
     os.makedirs(args.output_dir, exist_ok=True)
-    shutil.copyfile(
-        args.draft_config, os.path.join(args.output_dir, "config.json")
-    )
+    shutil.copyfile(args.draft_config, os.path.join(args.output_dir, "config.json"))
     from safetensors.torch import save_file
 
     out = os.path.join(args.output_dir, "model.safetensors")

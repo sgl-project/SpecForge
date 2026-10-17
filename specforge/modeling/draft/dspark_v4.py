@@ -3,10 +3,12 @@
 
 Training-side port of the DSpark speculative-decoding head bundled with
 ``deepseek-ai/DeepSeek-V4-Flash-0731``: three DeepSeek-V4 blocks (MLA-style
-low-rank attention, 256-expert MoE, mHC hyper-connections) stored under the
-``mtp.*`` checkpoint namespace. Module names deliberately mirror the official
-checkpoint tensor names so a trained state dict round-trips into the official
-bundled layout without renaming.
+low-rank attention, a routed MoE, mHC hyper-connections) stored under the
+``mtp.*`` checkpoint namespace. Module names mirror the official checkpoint
+tensor names; the MoE FFN is the shared
+:class:`~specforge.modeling.draft.moe.MoELayer` with the ``deepseek_v4``
+preset, whose ``deepseek`` checkpoint layout writes the official per-expert
+names, so a trained state dict round-trips into the official bundle layout.
 
 Reference implementation: the ``inference/model.py`` shipped with
 ``deepseek-ai/DeepSeek-V4-Flash-DSpark`` (classes ``DSparkBlock``,
@@ -25,7 +27,7 @@ from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 
 from .dspark import VanillaMarkovHead
-from .moe import MoEGate, SparseMoE
+from .moe import MoELayer, apply_pending_balance_updates, resolve_moe_config
 from .registry import register_draft
 
 
@@ -49,7 +51,9 @@ class DSparkV4DraftConfig(PretrainedConfig):
         o_groups: int = 8,
         sliding_window: int = 128,
         rope_theta: float = 10000.0,
-        # moe
+        # moe (resolved by specforge.modeling.draft.moe; the preset supplies
+        # the rest of the DeepSeek-V4 routing recipe)
+        moe_preset: str = "deepseek_v4",
         n_routed_experts: int = 256,
         n_shared_experts: int = 1,
         num_experts_per_tok: int = 6,
@@ -81,6 +85,7 @@ class DSparkV4DraftConfig(PretrainedConfig):
         self.o_groups = o_groups
         self.sliding_window = sliding_window
         self.rope_theta = rope_theta
+        self.moe_preset = moe_preset
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -112,9 +117,7 @@ class DSparkV4RMSNorm(nn.Module):
         return (self.weight.float() * x).to(dtype)
 
 
-def _freqs_cis(
-    positions: torch.Tensor, rope_dim: int, theta: float
-) -> torch.Tensor:
+def _freqs_cis(positions: torch.Tensor, rope_dim: int, theta: float) -> torch.Tensor:
     """Complex rotary frequencies at absolute positions (no YaRN: the DSpark
     window layers disable it and use the base ``rope_theta``)."""
     inv_freq = 1.0 / (
@@ -269,9 +272,10 @@ class DSparkV4Attention(nn.Module):
 
         # Scores over [window (win) | own block (bs)] + sink column, fp32.
         kv_all = torch.cat([window_kv, block_kv], dim=2)  # [B, N, win+bs, hd]
-        scores = torch.einsum(
-            "bnqhd,bnkd->bnhqk", q.float(), kv_all.float()
-        ) * self.softmax_scale
+        scores = (
+            torch.einsum("bnqhd,bnkd->bnhqk", q.float(), kv_all.float())
+            * self.softmax_scale
+        )
         neg_inf = torch.finfo(scores.dtype).min
         window_mask = window_valid.view(bsz, n_blocks, 1, 1, win)
         scores[..., :win] = scores[..., :win].masked_fill(~window_mask, neg_inf)
@@ -292,11 +296,10 @@ class DSparkV4Attention(nn.Module):
         return self.wo_b(o.flatten(3))
 
 
-
 class DSparkV4Stage(nn.Module):
     """One ``mtp.*`` stage: a DeepSeek-V4 block with hyper-connections."""
 
-    def __init__(self, config: DSparkV4DraftConfig, stage_id: int):
+    def __init__(self, config: DSparkV4DraftConfig, stage_id: int, moe_cfg) -> None:
         super().__init__()
         self.stage_id = stage_id
         self.norm_eps = config.rms_norm_eps
@@ -308,7 +311,7 @@ class DSparkV4Stage(nn.Module):
         mix_hc = (2 + self.hc_mult) * self.hc_mult
 
         self.attn = DSparkV4Attention(config)
-        self.ffn = SparseMoE(config)
+        self.ffn = MoELayer(moe_cfg, dim)
         self.attn_norm = DSparkV4RMSNorm(dim, self.norm_eps)
         self.ffn_norm = DSparkV4RMSNorm(dim, self.norm_eps)
         self.hc_attn_fn = nn.Parameter(torch.zeros(mix_hc, hc_dim))
@@ -318,9 +321,9 @@ class DSparkV4Stage(nn.Module):
         self.hc_attn_scale = nn.Parameter(torch.ones(3))
         self.hc_ffn_scale = nn.Parameter(torch.ones(3))
 
-        num_target_features = len(
-            (config.dflash_config or {}).get("target_layer_ids", [])
-        ) or 3
+        num_target_features = (
+            len((config.dflash_config or {}).get("target_layer_ids", [])) or 3
+        )
         self.is_first = stage_id == 0
         self.is_last = stage_id == config.num_hidden_layers - 1
         if self.is_first:
@@ -377,13 +380,13 @@ class DSparkV4Stage(nn.Module):
         the captured features; the last stage applies hc_head + final norm).
         """
         main_x = (
-            self.main_norm(self.main_proj(main_input))
-            if self.is_first
-            else main_input
+            self.main_norm(self.main_proj(main_input)) if self.is_first else main_input
         )
         bsz = x.shape[0]
         residual = x
-        h, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        h, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
         h = self.attn_norm(h)
         h = self.attn(
             h.view(bsz, -1, block_size, h.shape[-1]),
@@ -396,7 +399,9 @@ class DSparkV4Stage(nn.Module):
         x = self.hc_post(h, residual, post, comb)
 
         residual = x
-        h, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        h, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
         h = self.ffn_norm(h)
         h = self.ffn(h)
         x = self.hc_post(h, residual, post, comb)
@@ -423,19 +428,23 @@ class DSparkV4ConfidenceHead(nn.Module):
 _ROOT_HEAD_PREFIXES = ("markov_head.", "confidence_head.")
 
 
-def _rename_root_heads_on_load(
-    module, state_dict, prefix, *args
-):
-    """Accept official ``mtp.<last>.*`` head names for the root-owned heads."""
-    del args
-    last = module.config.num_hidden_layers - 1
-    marker = f"{prefix}mtp.{last}."
+def rename_official_heads(state_dict, last_stage: int, prefix: str = "") -> None:
+    """In place: the official ``mtp.<last>.markov_head.*`` /
+    ``mtp.<last>.confidence_head.*`` names -> the root-owned module names."""
+    marker = f"{prefix}mtp.{last_stage}."
     for head in _ROOT_HEAD_PREFIXES:
         for key in [k for k in state_dict if k.startswith(marker + head)]:
-            renamed = prefix + key[len(marker):]
+            renamed = prefix + key[len(marker) :]
             if renamed not in state_dict:
                 state_dict[renamed] = state_dict[key]
             state_dict.pop(key)
+
+
+def _rename_root_heads_on_load(module, state_dict, prefix, *args):
+    """Accept the official head names when loading (see
+    :func:`rename_official_heads`)."""
+    del args
+    rename_official_heads(state_dict, module.config.num_hidden_layers - 1, prefix)
 
 
 @register_draft
@@ -445,54 +454,19 @@ class DSparkV4DraftModel(PreTrainedModel):
 
     @classmethod
     def from_pretrained(
-        cls,
-        pretrained_model_name_or_path,
-        *model_args,
-        config=None,
-        output_loading_info=False,
-        torch_dtype=None,
-        **kwargs,
+        cls, pretrained_model_name_or_path, *model_args, config=None, **kwargs
     ):
-        """Load via ``Module.load_state_dict`` instead of HF's per-key loader.
+        """Load an export or warm-start directory through the MoE checkpoint
+        layout (official per-expert names -> stacked expert parameters)."""
+        from specforge.modeling.auto import AutoDraftModel
 
-        The checkpoint's per-expert names (``experts.{i}.w*.weight``) are
-        state-dict-hook aliases of the stacked expert parameters, not real
-        submodules, so transformers' key-path navigation cannot resolve
-        them. Checkpoints for this model are local export/bundle dirs.
-        """
-        import json as _json
-        import os as _os
-
-        from safetensors.torch import load_file as _load_safetensors
-
-        path = str(pretrained_model_name_or_path)
         if config is None:
-            config = cls.config_class.from_pretrained(path)
-        model = cls(config)
-        if torch_dtype is not None and torch_dtype != "auto":
-            model = model.to(torch_dtype)
-
-        index_file = _os.path.join(path, "model.safetensors.index.json")
-        if _os.path.isfile(index_file):
-            with open(index_file) as stream:
-                shard_names = sorted(set(_json.load(stream)["weight_map"].values()))
-        elif _os.path.isfile(_os.path.join(path, "model.safetensors")):
-            shard_names = ["model.safetensors"]
-        else:
-            raise OSError(f"no model.safetensors[.index.json] under {path!r}")
-        state: Dict[str, torch.Tensor] = {}
-        for name in shard_names:
-            state.update(_load_safetensors(_os.path.join(path, name)))
-
-        result = model.load_state_dict(state, strict=False)
-        if output_loading_info:
-            return model, {
-                "missing_keys": list(result.missing_keys),
-                "unexpected_keys": list(result.unexpected_keys),
-                "mismatched_keys": [],
-                "error_msgs": [],
-            }
-        return model
+            config = cls.config_class.from_pretrained(pretrained_model_name_or_path)
+        if not getattr(config, "architectures", None):
+            config.architectures = [cls.__name__]
+        return AutoDraftModel.from_pretrained(
+            pretrained_model_name_or_path, *model_args, config=config, **kwargs
+        )
 
     def __init__(self, config: DSparkV4DraftConfig) -> None:
         # The trainer stamps training.attention_backend (``native``) onto the
@@ -504,6 +478,11 @@ class DSparkV4DraftModel(PreTrainedModel):
         self.config = config
         dflash_config = dict(getattr(config, "dflash_config", None) or {})
         config.dflash_config = dflash_config
+        moe_cfg = resolve_moe_config(config)
+        if moe_cfg is None:
+            raise ValueError(
+                "DSparkV4DraftModel needs a moe_preset (deepseek_v4) for its FFN"
+            )
 
         self.block_size = int(config.block_size)
         self.target_layer_ids = list(
@@ -526,13 +505,10 @@ class DSparkV4DraftModel(PreTrainedModel):
 
         self.mtp = nn.ModuleList(
             [
-                DSparkV4Stage(config, stage_id)
+                DSparkV4Stage(config, stage_id, moe_cfg)
                 for stage_id in range(config.num_hidden_layers)
             ]
         )
-        moe_bias_update_rate = float(dflash_config.get("moe_bias_update_rate", 1e-3))
-        for stage in self.mtp:
-            stage.ffn.bias_update_rate = moe_bias_update_rate
 
         # The markov/confidence heads are used by the training wrapper OUTSIDE
         # the stage forwards (in the chunked objective), so they live on the
@@ -546,9 +522,7 @@ class DSparkV4DraftModel(PreTrainedModel):
         self.markov_head = VanillaMarkovHead(
             vocab_size=config.vocab_size, markov_rank=markov_rank
         )
-        self.confidence_head = DSparkV4ConfidenceHead(
-            config.hidden_size + markov_rank
-        )
+        self.confidence_head = DSparkV4ConfidenceHead(config.hidden_size + markov_rank)
         self.register_load_state_dict_pre_hook(_rename_root_heads_on_load)
 
         self._confidence_hidden: Optional[torch.Tensor] = None
@@ -573,10 +547,10 @@ class DSparkV4DraftModel(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=std)
         elif isinstance(module, DSparkV4RMSNorm):
             nn.init.ones_(module.weight)
-        elif isinstance(module, MoEGate):
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-            if pending(module.bias):
-                module.bias.data.zero_()
+        elif isinstance(module, MoELayer):
+            # Router, stacked experts and the selection bias are bare tensors
+            # the branches above never visit.
+            module.reset_parameters(std=std)
         elif isinstance(module, DSparkV4Attention):
             nn.init.zeros_(module.attn_sink)
         elif isinstance(module, DSparkV4Stage):
@@ -641,18 +615,16 @@ class DSparkV4DraftModel(PreTrainedModel):
         ).view(1, 1, block)
         block_freqs = _freqs_cis(block_positions, rope_dim, theta)
 
+        if self.training:
+            # Apply the PREVIOUS forward's balancing update before any routing
+            # this step, outside every activation-checkpoint region (recompute
+            # must route with the bias the forward used).
+            apply_pending_balance_updates(self)
+
         # Hyper-connection expansion of the block-token embeddings. Stage 0
         # projects the captured features into the shared main stream; the last
         # stage applies hc_head and the final norm (all inside stage forwards
         # so per-stage FSDP wrapping is sound).
-        if self.training:
-            # Apply the PREVIOUS forward's balancing update before any routing
-            # this step. It must not run between a forward and its backward:
-            # activation-checkpoint recompute would then route with a mutated
-            # bias and produce different expert-segment shapes.
-            for stage in self.mtp:
-                stage.ffn.apply_pending_balance_update()
-
         x = noise_embedding.unsqueeze(2).repeat(1, 1, self.config.hc_mult, 1)
         main_x = target_hidden
         final_hidden = prenorm_hidden = None
@@ -718,6 +690,7 @@ class DSparkV4DraftModel(PreTrainedModel):
 
 
 __all__ = [
+    "rename_official_heads",
     "DSparkV4DraftConfig",
     "DSparkV4DraftModel",
     "DSparkV4Stage",

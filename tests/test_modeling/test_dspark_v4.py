@@ -10,9 +10,10 @@ from specforge.modeling.draft.dspark_v4 import (
     _fake_quant_fp8_ue8m0,
     _hc_split_sinkhorn,
 )
+from specforge.modeling.draft.moe import MoELayer, to_checkpoint_state_dict
 
 
-def tiny_config(**overrides):
+def tiny_config(dflash_overrides=None, **overrides):
     dflash_config = {
         "target_layer_ids": [1, 2, 3],
         "mask_token_id": 7,
@@ -22,6 +23,7 @@ def tiny_config(**overrides):
         "confidence_head_with_markov": True,
         "kv_fake_quant": True,
         "moe_bias_update_rate": 0.001,
+        **(dflash_overrides or {}),
     }
     defaults = dict(
         vocab_size=128,
@@ -90,8 +92,16 @@ class TestDSparkV4Model:
         assert "mtp.0.main_norm.weight" in keys
         assert "mtp.2.norm.weight" in keys
         assert "mtp.2.hc_head_fn" in keys
-        assert "mtp.1.ffn.gate.bias" in keys
+        assert "mtp.1.ffn.gate.balance.bias" in keys
+        assert "mtp.1.ffn.experts.w1" in keys
         assert "mtp.0.attn.attn_sink" in keys
+        assert isinstance(model.mtp[1].ffn, MoELayer)
+        # Checkpoint files use the official per-expert DeepSeek names.
+        files = set(to_checkpoint_state_dict(model.state_dict(), model))
+        assert "mtp.1.ffn.gate.bias" in files
+        assert "mtp.1.ffn.experts.7.w2.weight" in files
+        assert "mtp.1.ffn.shared_experts.w3.weight" in files
+        assert not any(".experts.w" in key for key in files)
         # The heads live at the module root (FSDP: used outside stage
         # forwards); the bundler maps them back to the official
         # mtp.<last>.* names at export time.
@@ -141,8 +151,9 @@ class TestDSparkV4Model:
             cfg = tiny_config()
             cfg.architectures = ["DSparkV4DraftModel"]
             cfg.save_pretrained(tmp)
+            files = to_checkpoint_state_dict(state, model)
             save_file(
-                {k: v.contiguous() for k, v in state.items()},
+                {k: v.contiguous() for k, v in files.items()},
                 os.path.join(tmp, "model.safetensors"),
             )
             from specforge.modeling.auto import AutoDraftModel
@@ -150,10 +161,13 @@ class TestDSparkV4Model:
             loaded, info = AutoDraftModel.from_pretrained(
                 tmp, config=cfg, output_loading_info=True
             )
+            direct = DSparkV4DraftModel.from_pretrained(tmp, config=cfg)
         assert not info["missing_keys"] and not info["unexpected_keys"]
         loaded_state = dict(loaded.state_dict())
+        direct_state = dict(direct.state_dict())
         for key, value in state.items():
             assert torch.equal(loaded_state[key], value), key
+            assert torch.equal(direct_state[key], value), key
 
     def test_forward_and_backward(self):
         model = build_model()
@@ -174,7 +188,8 @@ class TestDSparkV4Model:
         loss = out.square().mean() + conf.square().mean() + logits.square().mean()
         loss.backward()
         grads = {
-            n for n, p in model.named_parameters()
+            n
+            for n, p in model.named_parameters()
             if p.grad is not None and p.grad.abs().sum() > 0
         }
         # Not every tiny-MoE expert is routed to, but every structural path
@@ -184,8 +199,11 @@ class TestDSparkV4Model:
             "mtp.0.attn.wq_a.weight",
             "mtp.0.attn.wkv.weight",
             "mtp.0.attn.attn_sink",
+            "mtp.0.hc_attn_fn",
             "mtp.1.ffn.gate.weight",
+            "mtp.1.ffn.experts.w1",
             "mtp.1.ffn.shared_experts.w1.weight",
+            "mtp.2.hc_ffn_fn",
             "mtp.2.hc_head_fn",
             "mtp.2.norm.weight",
             # heads live on the root module (FSDP); state_dict hooks rename
@@ -208,29 +226,37 @@ class TestDSparkV4Model:
         keep = torch.ones(1, 1, dtype=torch.bool)
         with torch.no_grad():
             base = model(
-                noise_embedding=noise, target_hidden=features,
-                anchor_positions=anchors, block_keep_mask=keep,
+                noise_embedding=noise,
+                target_hidden=features,
+                anchor_positions=anchors,
+                block_keep_mask=keep,
             )
             # Perturbing features at/after the anchor must not change output.
             after = features.clone()
             after[:, 10:] += 100.0
             out_after = model(
-                noise_embedding=noise, target_hidden=after,
-                anchor_positions=anchors, block_keep_mask=keep,
+                noise_embedding=noise,
+                target_hidden=after,
+                anchor_positions=anchors,
+                block_keep_mask=keep,
             )
             # Perturbing features before the window start must not either.
             before = features.clone()
             before[:, : 10 - cfg.sliding_window] += 100.0
             out_before = model(
-                noise_embedding=noise, target_hidden=before,
-                anchor_positions=anchors, block_keep_mask=keep,
+                noise_embedding=noise,
+                target_hidden=before,
+                anchor_positions=anchors,
+                block_keep_mask=keep,
             )
             # Perturbing inside the window MUST change the output.
             inside = features.clone()
             inside[:, 10 - 2] += 100.0
             out_inside = model(
-                noise_embedding=noise, target_hidden=inside,
-                anchor_positions=anchors, block_keep_mask=keep,
+                noise_embedding=noise,
+                target_hidden=inside,
+                anchor_positions=anchors,
+                block_keep_mask=keep,
             )
         assert torch.equal(base, out_after)
         assert torch.equal(base, out_before)
@@ -248,29 +274,31 @@ class TestDSparkV4Model:
         keep = torch.ones(1, 2, dtype=torch.bool)
         with torch.no_grad():
             base = model(
-                noise_embedding=noise, target_hidden=features,
-                anchor_positions=anchors, block_keep_mask=keep,
+                noise_embedding=noise,
+                target_hidden=features,
+                anchor_positions=anchors,
+                block_keep_mask=keep,
             )
             other = noise.clone()
             other[:, block:] += 100.0  # perturb block 1 tokens only
             out = model(
-                noise_embedding=other, target_hidden=features,
-                anchor_positions=anchors, block_keep_mask=keep,
+                noise_embedding=other,
+                target_hidden=features,
+                anchor_positions=anchors,
+                block_keep_mask=keep,
             )
         assert torch.equal(base[:, :block], out[:, :block])
         assert not torch.equal(base[:, block:], out[:, block:])
 
     def test_stage_gradient_checkpointing_matches(self):
-        model = build_model()
+        # A zero bias update rate keeps the routing state fixed between runs.
+        model = build_model(dflash_overrides={"moe_bias_update_rate": 0.0})
         model.train()
-        for stage in model.mtp:
-            stage.ffn.bias_update_rate = 0.0  # keep routing state fixed
         out, anchors = run_forward(model)
         model.pop_confidence_hidden()
         out.square().sum().backward()
         grads = {
-            n: p.grad.clone() for n, p in model.named_parameters()
-            if p.grad is not None
+            n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None
         }
         model.zero_grad(set_to_none=True)
         model.stage_gradient_checkpointing = True
@@ -290,26 +318,26 @@ class TestDSparkV4Model:
     def test_gate_bias_stays_fp32_and_updates(self):
         model = build_model().to(torch.bfloat16)
         for stage in model.mtp:
-            assert stage.ffn.gate.bias.dtype == torch.float32
+            assert stage.ffn.gate.balance.bias.dtype == torch.float32
         model.train()
-        before = [stage.ffn.gate.bias.clone() for stage in model.mtp]
+        before = [stage.ffn.gate.balance.bias.clone() for stage in model.mtp]
         model = model.float()
         # The update is deferred: forward N stashes counts, forward N+1
         # applies them (keeps checkpoint recompute deterministic).
         run_forward(model)
         run_forward(model)
         changed = any(
-            not torch.equal(before[i], model.mtp[i].ffn.gate.bias)
+            not torch.equal(before[i], model.mtp[i].ffn.gate.balance.bias)
             for i in range(len(model.mtp))
         )
         assert changed
 
     def test_gate_bias_frozen_in_eval(self):
         model = build_model().eval()
-        before = [stage.ffn.gate.bias.clone() for stage in model.mtp]
+        before = [stage.ffn.gate.balance.bias.clone() for stage in model.mtp]
         run_forward(model)
         for i, stage in enumerate(model.mtp):
-            assert torch.equal(before[i], stage.ffn.gate.bias)
+            assert torch.equal(before[i], stage.ffn.gate.balance.bias)
 
     def test_fake_quant_is_idempotent_and_bounded(self):
         torch.manual_seed(0)
@@ -333,9 +361,7 @@ class TestDSparkV4Model:
 
 class TestOnlineDSparkV4Integration:
     def test_native_backend_end_to_end(self):
-        from specforge.algorithms.common.dflash_family_model import (
-            OnlineDSparkModel,
-        )
+        from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 
         model = build_model()
         cfg = model.config
@@ -375,9 +401,7 @@ class TestOnlineDSparkV4Integration:
         assert conf_grad is not None and torch.isfinite(conf_grad).all()
 
     def test_native_backend_requires_capable_model(self):
-        from specforge.algorithms.common.dflash_family_model import (
-            OnlineDSparkModel,
-        )
+        from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
         from specforge.modeling.draft.dspark import DSparkDraftModel  # noqa: F401
 
         model = build_model()
