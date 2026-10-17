@@ -24,6 +24,15 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from torch._subclasses.fake_tensor import FakeTensor
+from torch.library import wrap_triton
+
+
+def _traceable_kernel(kernel, tensor):
+    # Raw launches preserve eager performance; make_fx needs dispatcher-visible
+    # kernel writes so GraphTrainer can functionalize their dependencies.
+    return wrap_triton(kernel) if isinstance(tensor, FakeTensor) else kernel
+
 
 __all__ = ["MAX_FUSED_TOP_K", "dflash_unary_head_fused"]
 
@@ -116,7 +125,9 @@ class _DFlash2UnaryHead(torch.autograd.Function):
         grad_logits = logits
         if num_rows > 0:
             vocab_block, num_warps = _grad_settings(vocab_size)
-            _unary_head_grad_kernel[(num_rows, triton.cdiv(vocab_size, vocab_block))](
+            _traceable_kernel(_unary_head_grad_kernel, logits)[
+                (num_rows, triton.cdiv(vocab_size, vocab_block))
+            ](
                 grad_logits,
                 grad_logits.stride(0),
                 targets,
@@ -130,7 +141,7 @@ class _DFlash2UnaryHead(torch.autograd.Function):
             if grad_topk_values is not None and top_k > 0:
                 # Top-k ids are distinct within a row, so every candidate
                 # rewrites one gradient entry with its complete FP32 value.
-                _unary_head_topk_grad_kernel[(num_rows,)](
+                _traceable_kernel(_unary_head_topk_grad_kernel, logits)[(num_rows,)](
                     grad_logits,
                     grad_logits.stride(0),
                     targets,
@@ -224,7 +235,7 @@ def _launch_stats(
     partial_topk_ids = torch.empty(
         num_rows, num_splits, top_k, device=logits.device, dtype=torch.int32
     )
-    _unary_head_partial_stats_kernel[(num_rows, num_splits)](
+    _traceable_kernel(_unary_head_partial_stats_kernel, logits)[(num_rows, num_splits)](
         logits,
         logits.stride(0),
         partial_max,
@@ -240,7 +251,7 @@ def _launch_stats(
         BLOCK_K=triton.next_power_of_2(max(top_k, 1)),
         num_warps=num_warps,
     )
-    _unary_head_combine_stats_kernel[(num_rows,)](
+    _traceable_kernel(_unary_head_combine_stats_kernel, logits)[(num_rows,)](
         logits,
         logits.stride(0),
         targets,
