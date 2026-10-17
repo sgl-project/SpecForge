@@ -67,7 +67,10 @@ class PolicyRegistryTest(unittest.TestCase):
         self.assertEqual(e3.num_capture_layers, 3)
         self.assertTrue(e3.sglang_build_kwargs["wrap_eagle3_logits"])
         self.assertTrue(e3.sglang_strict_capture_layers)
-        self.assertFalse(df.sglang_build_kwargs["wrap_eagle3_logits"])
+        # DFlash now also wraps the sglang logits processor, so it can surface the
+        # post-norm final hidden (last_hidden_states) for DSpark's L1 / confidence
+        # losses. It still requests no vocab logits, so no eagle3 vocab mapping.
+        self.assertTrue(df.sglang_build_kwargs["wrap_eagle3_logits"])
         self.assertFalse(df.sglang_strict_capture_layers)
 
     def test_legacy_policy_names_are_aliases(self):
