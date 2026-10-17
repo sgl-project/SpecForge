@@ -18,6 +18,10 @@ directory laid out exactly like the official
 The result serves with the exact official command:
   sglang serve <bundle> --tp 4 --speculative-algorithm DSPARK ...
 
+``--draft-only`` writes just the ``mtp.*`` shards, an index of them and the
+official config/tokenizer files: a standalone drafter directory for
+``--speculative-draft-model-path`` next to the unchanged official target.
+
 Self-test (run BEFORE trusting any bundle): dequantize the official mtp
 weights, requantize with this script's quantizers, and verify the dequantized
 round trip matches the official values exactly:
@@ -216,7 +220,9 @@ _LINK_FILES = (
 )
 
 
-def bundle(draft_source: str, output_dir: str, snapshot: str) -> None:
+def bundle(
+    draft_source: str, output_dir: str, snapshot: str, draft_only: bool = False
+) -> None:
     headers = _official_headers(snapshot)
     if os.path.isdir(draft_source):
         _check_expert_counts(draft_source, snapshot)
@@ -252,11 +258,16 @@ def bundle(draft_source: str, output_dir: str, snapshot: str) -> None:
             os.remove(dst)
         os.link(os.path.realpath(src), dst)
 
-    for name in target_shards:
-        _link(os.path.join(snapshot, name), os.path.join(output_dir, name))
+    if not draft_only:
+        for name in target_shards:
+            _link(os.path.join(snapshot, name), os.path.join(output_dir, name))
     for name in _LINK_FILES:
         src = os.path.join(snapshot, name)
-        if os.path.exists(src):
+        if draft_only and name == "model.safetensors.index.json":
+            only_mtp = {k: headers[k]["shard"] for k in sorted(headers)}
+            with open(os.path.join(output_dir, name), "w") as stream:
+                json.dump({"metadata": {}, "weight_map": only_mtp}, stream, indent=2)
+        elif os.path.exists(src):
             _link(src, os.path.join(output_dir, name))
     enc_src = os.path.join(snapshot, "encoding")
     enc_dst = os.path.join(output_dir, "encoding")
@@ -290,9 +301,14 @@ def bundle(draft_source: str, output_dir: str, snapshot: str) -> None:
     ), "config.json differs from official"
     print(f"bundle complete: {output_dir}")
     print("serve with:")
+    target, draft_flag = (
+        (snapshot, f" --speculative-draft-model-path {output_dir}")
+        if draft_only
+        else (output_dir, "")
+    )
     print(
-        f"  sglang serve {output_dir} --trust-remote-code --tp 4 "
-        "--speculative-algorithm DSPARK --moe-runner-backend marlin "
+        f"  sglang serve {target} --trust-remote-code --tp 4 "
+        f"--speculative-algorithm DSPARK{draft_flag} --moe-runner-backend marlin "
         "--mem-fraction-static 0.90 --chunked-prefill-size 4096"
     )
 
@@ -303,13 +319,18 @@ def main():
     parser.add_argument("--output-dir")
     parser.add_argument("--official-snapshot", default=DEFAULT_SNAPSHOT)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--draft-only",
+        action="store_true",
+        help="write only the drafter (no linked target shards)",
+    )
     args = parser.parse_args()
     if args.self_test:
         self_test(args.official_snapshot)
         return
     if not args.draft or not args.output_dir:
         parser.error("--draft and --output-dir are required (or use --self-test)")
-    bundle(args.draft, args.output_dir, args.official_snapshot)
+    bundle(args.draft, args.output_dir, args.official_snapshot, args.draft_only)
 
 
 if __name__ == "__main__":

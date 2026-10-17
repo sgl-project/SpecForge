@@ -121,7 +121,9 @@ specforge export --to hf \
   --draft-config configs/deepseek-v4-flash-dspark-official.json \
   --output-dir outputs/dspark-v4-official-hf-step<N>
 
-# 2. quantize + bundle into the official 0731 layout (fp8/fp4 + linked shards)
+# 2. quantize + bundle into the official 0731 layout (fp8/fp4 + linked shards);
+#    --draft-only writes just the drafter, served with
+#    --speculative-draft-model-path next to the official target
 python3 scripts/bundle_dspark_v4_official.py \
   --draft outputs/dspark-v4-official-hf-step<N> \
   --output-dir /path/to/models/dspark-v4-trained-bundle
