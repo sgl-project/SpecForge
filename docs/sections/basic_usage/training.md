@@ -747,3 +747,15 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 Set this before chasing data or numeric bugs that match the symptoms above. The
 Ascend equivalent (`PYTORCH_NPU_ALLOC_CONF`) is already set in the NPU recipes
 earlier in this page.
+
+### DDP gradient accumulation
+
+Replicated `NO_SHARD` training uses DDP. The trainer encloses both forward and
+backward in `no_sync()` on non-boundary microbatches, then synchronizes the
+accumulated gradients at the optimizer boundary. Sharded FSDP retains its
+backward-only synchronization control.
+
+`SPECFORGE_DDP_BUCKET_CAP_MB` optionally sets DDP's gradient bucket capacity in
+MiB. It must be a positive integer; when unset, PyTorch's default is preserved.
+Larger buckets reduce the number of collectives but delay communication overlap.
+Choose the capacity from measurements for your model and interconnect.

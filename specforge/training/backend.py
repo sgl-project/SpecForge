@@ -151,6 +151,10 @@ class TrainingBackend(abc.ABC):
     #: ``TrainerCore`` skip its own synchronizing check.
     checks_loss_denominator: bool = False
 
+    def accumulation_context(self, *, is_boundary: bool):
+        """Context covering both forward and backward for an accumulated step."""
+        return contextlib.nullcontext()
+
     @abc.abstractmethod
     def prepare_model(self, model: nn.Module) -> nn.Module: ...
 
@@ -267,6 +271,13 @@ class FSDPTrainingBackend(TrainingBackend):
                 if model_device.type in ("cuda", "npu"):
                     device_ids = [model_device.index]
                     output_device = model_device.index
+                ddp_options = {}
+                bucket_cap = os.environ.get("SPECFORGE_DDP_BUCKET_CAP_MB")
+                if bucket_cap is not None:
+                    bucket_cap = int(bucket_cap)
+                    if bucket_cap <= 0:
+                        raise ValueError("SPECFORGE_DDP_BUCKET_CAP_MB must be positive")
+                    ddp_options["bucket_cap_mb"] = bucket_cap
                 model = DDP(
                     model,
                     device_ids=device_ids,
@@ -274,6 +285,7 @@ class FSDPTrainingBackend(TrainingBackend):
                     process_group=pc.fsdp_process_group,
                     broadcast_buffers=False,
                     gradient_as_bucket_view=True,
+                    **ddp_options,
                 )
                 self._wrapper_kind = "ddp"
             else:
@@ -332,13 +344,19 @@ class FSDPTrainingBackend(TrainingBackend):
                 ),
             )
 
+    def accumulation_context(self, *, is_boundary: bool):
+        # DDP reads the sync flag during forward, so backward-only no_sync is too late.
+        if not is_boundary and self._wrapper_kind == "ddp":
+            return self.module.no_sync()
+        return contextlib.nullcontext()
+
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
         """Backward one micro-step with one gradient collective per window.
 
-        Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
-        the boundary backward reduces the accumulated sum once.
+        DDP requires ``accumulation_context`` around forward and backward.
+        FSDP defers reduction with a backward-only ``no_sync`` context.
         """
-        if is_boundary or not self._wrapped:
+        if is_boundary or self._wrapper_kind != "fsdp":
             loss.backward()
         else:
             with self.module.no_sync():
