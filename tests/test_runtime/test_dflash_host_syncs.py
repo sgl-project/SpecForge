@@ -287,14 +287,14 @@ class _WeightedStrategy:
 
 def _boundary_core(*, denominator=4.0, accumulation_steps=2):
     from specforge.optimizer import BF16Optimizer
-    from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+    from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
     from specforge.training.controller import TrainerCore
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(16, 32), nn.GELU(), nn.Linear(32, 8)).to(
         "cuda", torch.bfloat16
     )
-    backend = FSDPTrainingBackend(
+    backend = FSDP1TrainingBackend(
         ParallelConfig(),
         optimizer_factory=lambda module: BF16Optimizer(
             module, lr=1e-3, max_grad_norm=0.05, total_steps=10, warmup_ratio=0.0

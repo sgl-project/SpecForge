@@ -119,15 +119,30 @@ def _fake_seam():
 @contextlib.contextmanager
 def _no_fsdp_wrap():
     """Force the production backend to register without FSDP (CPU, world 1)."""
-    from specforge.training.backend import FSDPTrainingBackend
+    from specforge.training.backend import FSDP1TrainingBackend, FSDP2TrainingBackend
 
-    orig = FSDPTrainingBackend.prepare_model
+    def unwrapped_for(cls):
+        orig = cls.prepare_model
 
-    def unwrapped(self, model, *, wrap=True, optimizer_target=None):
-        return orig(self, model, wrap=False, optimizer_target=optimizer_target)
+        def unwrapped(self, model, *, wrap=True, optimizer_target=None):
+            return orig(self, model, wrap=False, optimizer_target=optimizer_target)
 
-    with mock.patch.object(FSDPTrainingBackend, "prepare_model", unwrapped):
+        return unwrapped
+
+    with (
+        mock.patch.object(
+            FSDP1TrainingBackend, "prepare_model", unwrapped_for(FSDP1TrainingBackend)
+        ),
+        mock.patch.object(
+            FSDP2TrainingBackend, "prepare_model", unwrapped_for(FSDP2TrainingBackend)
+        ),
+    ):
         yield
+
+
+def _current_backend_kind() -> str:
+    """The ``training_backend`` this process records (sharded modes only)."""
+    return "fsdp2" if os.environ.get("FSDP_VERSION") == "2" else "fsdp1"
 
 
 class TestTrainerResumeEntrypoint(unittest.TestCase):
@@ -306,7 +321,10 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 "run_id": "rz",
                 "world_size": 1,
                 "effective_total_steps": 100,
+                "training_backend": _current_backend_kind(),
             }
+            for key in overrides.pop("__drop__", ()):
+                payload.pop(key, None)
             payload.update(overrides)
             torch.save(payload, os.path.join(d, "training_state.pt"))
             torch.save(
@@ -315,6 +333,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             )
             return d
 
+        current_backend = _current_backend_kind()
+        other_backend = "fsdp1" if current_backend == "fsdp2" else "fsdp2"
         cases = [
             ("strategy", {"strategy": "dflash"}, "was written by strategy"),
             ("dataset", {"dataset_size": 999}, "dataset_size=999 but this run has"),
@@ -336,6 +356,22 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 {"sp_ring_size": 2},
                 "sp_ring_size=2 but this run has",
             ),
+            # rank-local optimizer shards are implementation specific
+            (
+                "backend",
+                {"training_backend": other_backend},
+                f"training_backend={other_backend} but this run has "
+                f"training_backend={current_backend}",
+            ),
+            # a pre-fsdp2 DDP checkpoint: replicated optimizer in the shared payload, layout inferred
+            (
+                "legacy_ddp",
+                {
+                    "__drop__": ["training_backend"],
+                    "replicated_optimizer_state": {"optimizer_state_dict": {}},
+                },
+                f"training_backend=ddp but this run has training_backend={current_backend}",
+            ),
             (
                 "weights",
                 {"draft_state_dict": {"bogus.weight": torch.zeros(1)}},
@@ -351,6 +387,19 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                         max_steps=4,
                         resume_from=write_ckpt(name, **overrides),
                     )
+
+        # a pre-fsdp2 sharded checkpoint (no key, rank-local optimizer) is fsdp1 and must not load into fsdp2
+        with mock.patch.dict("os.environ", {"FSDP_VERSION": "2"}):
+            with self.assertRaisesRegex(
+                ValueError,
+                "training_backend=fsdp1 but this run has training_backend=fsdp2",
+            ):
+                self._make_trainer(
+                    os.path.join(workdir, "out_legacy_fsdp1"),
+                    feat_dir=feat_dir,
+                    max_steps=4,
+                    resume_from=write_ckpt("legacy_fsdp1", __drop__=["training_backend"]),
+                )
 
         peagle_semantics = (
             ("peagle_num_draft_layers", 2, 4),
@@ -1073,7 +1122,7 @@ class TestCheckpointResume(unittest.TestCase):
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
 
@@ -1116,7 +1165,7 @@ class TestCheckpointResume(unittest.TestCase):
             warmup_ratio=0.0,
             total_steps=10,
         )
-        backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+        backend = FSDP1TrainingBackend(ParallelConfig.from_distributed())
         backend.prepare_model(model, wrap=False)  # no FSDP at 1 rank
         backend.set_optimizer(opt)
         strategy = Eagle3TrainStrategy(model, target_head=head)
@@ -1202,7 +1251,7 @@ class TestCheckpointResume(unittest.TestCase):
         fx.build_single_rank_distributed(port="29564")
 
         from specforge.optimizer import BF16Optimizer
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
 
@@ -1226,7 +1275,7 @@ class TestCheckpointResume(unittest.TestCase):
             torch.manual_seed(0)
             torch.use_deterministic_algorithms(True, warn_only=True)
             model, head = fx.build_eagle3(workdir, ttt=TTT)
-            backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+            backend = FSDP1TrainingBackend(ParallelConfig.from_distributed())
             backend.prepare_model(model, wrap=False)
             backend.set_optimizer(
                 BF16Optimizer(

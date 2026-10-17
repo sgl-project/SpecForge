@@ -29,6 +29,8 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29566")
 
+        from torch.distributed.fsdp import FSDPModule  # fsdp_version=2 wraps in place
+
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         from specforge.launch import build_offline_runtime
@@ -67,7 +69,7 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
         # Issue 1: the strategy runs forward through the FSDP-wrapped module
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(
-            module, FSDP, "strategy must hold the FSDP-wrapped module"
+            module, (FSDP, FSDPModule), "strategy must hold the FSDP-wrapped module"
         )
         self.assertIsNotNone(trainer.core.backend.optimizer)
 

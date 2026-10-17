@@ -59,6 +59,8 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 return "PARALLEL"
 
         class FakeBackend:
+            name = "fsdp1"
+
             def __init__(self, parallel, *, optimizer_factory):
                 cap["backend_parallel"] = parallel
                 cap["optimizer_factory"] = optimizer_factory
@@ -127,7 +129,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
             tr,
             FeatureDataLoader=FakeLoader,
             ParallelConfig=FakeParallel,
-            FSDPTrainingBackend=FakeBackend,
+            FSDP1TrainingBackend=FakeBackend,
             TrainerCore=FakeCore,
             TrainerController=FakeController,
         ):
@@ -235,6 +237,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 "tp_size": 1,
                 "sp_ulysses_size": 1,
                 "sp_ring_size": 1,
+                "training_backend": "fsdp1",
             },
         )
 

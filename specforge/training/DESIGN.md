@@ -23,7 +23,7 @@ Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;
 `TrainerCore` owns one branch-free train step and the accumulation boundary;
 `DraftTrainStrategy` owns model-specific validation, forward/loss, target
-projection, and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
+projection, and checkpoint filtering; `FSDP1TrainingBackend` (or `FSDP2TrainingBackend`, selected by `training.fsdp_version`) owns wrapping,
 backward, optimizer steps, distributed gradient norms, and full training state.
 Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
@@ -41,7 +41,7 @@ flowchart TD
   FIT -->|for batch in loader| TS[TrainerCore train_step]
   FIT -->|append sample_ids| PA[pending_ack accumulator]
   TS -->|forward_loss| ST[DraftTrainStrategy projection plus loss]
-  TS -->|backward| BK[FSDPTrainingBackend]
+  TS -->|backward| BK[FSDP1/FSDP2TrainingBackend]
   TS -->|step at accum boundary| BK
   TS -->|StepResult optimizer_stepped| FIT
   FIT -->|on boundary global_step plus 1| BND[boundary actions]
@@ -56,8 +56,11 @@ flowchart TD
 
 The training plane is the only tensor-carrying side besides the data plane; it
 consumes `TrainBatch.tensors`. `TrainerCore.train_step` divides the loss by
-`accumulation_steps`, uses `no_sync()` only for non-boundary micro-batches, and
-returns `optimizer_stepped` as the single authoritative boundary signal.
+`accumulation_steps`, runs every non-boundary micro-batch inside the backend's
+`micro_step()` context (the backend skips the gradient collective there: FSDP1
+via `no_sync`, FSDP2 via `set_requires_gradient_sync`, DDP via `no_sync` around
+the whole micro-step), and returns `optimizer_stepped` as the single
+authoritative boundary signal.
 `TrainerController` increments `global_step` only at that boundary, commits the
 pending sample acknowledgements, emits metrics, and performs configured
 interval saves. The outer `Trainer` owns topology cleanup and the guarded final
@@ -66,10 +69,10 @@ training entry. All saves delegate to `CheckpointManager`; the shared draft
 state is written by rank 0 while every rank writes its own optimizer/RNG state.
 
 Natural end-of-stream is accepted only at an optimizer boundary. If the final
-backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
-gradients or reporting a checkpoint as successful. Queue-mode loaders
-terminally settle and clean a short `drop_last` batch without emitting it;
-fixed offline refs keep normal `drop_last` semantics.
+backward is a non-boundary micro-step (gradients not yet reduced), `fit` fails
+instead of stepping unreduced gradients or reporting a checkpoint as
+successful. Queue-mode loaders terminally settle and clean a short `drop_last`
+batch without emitting it; fixed offline refs keep normal `drop_last` semantics.
 
 ## Endpoints
 
@@ -81,5 +84,5 @@ fixed offline refs keep normal `drop_last` semantics.
 | `TrainerController` | `TrainerCore.train_step` | compute |
 | `TrainerController` | `DataFlowController.ack_train_refs` | control |
 | `TrainerCore` | `Eagle3TrainStrategy.forward_loss` | compute |
-| `TrainerCore` | `FSDPTrainingBackend.backward` | compute |
-| `TrainerCore` | `FSDPTrainingBackend.step` | compute |
+| `TrainerCore` | `FSDP1/FSDP2TrainingBackend.backward` | compute |
+| `TrainerCore` | `FSDP1/FSDP2TrainingBackend.step` | compute |
