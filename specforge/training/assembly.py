@@ -116,11 +116,11 @@ def _load_draft(cfg: Config, algorithm: AlgorithmRegistration):
     provider = algorithm.providers.model
     draft_config = resolve_draft_config(cfg, provider=provider.draft_config)
     draft_model = provider.build_draft(cfg, draft_config)
-    architecture = provider.draft_config.architecture
-    expected_type = resolve_draft(architecture)
-    if not isinstance(draft_model, expected_type):
+    architectures = sorted(provider.draft_config.compatible_architectures)
+    expected_types = tuple(resolve_draft(name) for name in architectures)
+    if not isinstance(draft_model, expected_types):
         raise ValueError(
-            f"training.strategy={algorithm.name!r} requires {architecture}, but "
+            f"training.strategy={algorithm.name!r} requires one of {architectures}, but "
             f"the resolved draft config builds "
             f"{type(draft_model).__name__}"
         )

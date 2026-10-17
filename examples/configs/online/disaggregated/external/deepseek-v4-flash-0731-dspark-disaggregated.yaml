@@ -1,0 +1,82 @@
+model:
+  target_model_path: /path/to/DeepSeek-V4-Flash-0731
+  target_backend: sglang
+  draft_model_config: configs/deepseek-v4-flash-0731-dspark.json
+  draft_checkpoint_path: ./models/deepseek-v4-flash-0731-dspark
+  trust_remote_code: true
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  tokenizer_pad_token_id: 1
+
+data:
+  # Pre-tokenized regenerate records with input_ids and loss_mask.
+  train_data_path: ./cache/dataset/regenerate_train.jsonl
+  max_length: 65536
+  chat_template: deepseek-v4
+  dataloader_num_workers: 0
+
+training:
+  strategy: dspark
+  role: auto
+  num_epochs: 10
+  batch_size: 1
+  accumulation_steps: 126
+  learning_rate: 1.0e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  fsdp_sharding: FULL_SHARD
+  num_anchors: 512
+  loss_decay_gamma: 10.0
+  objective_chunk_blocks: 0
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 100
+  max_checkpoints: 2
+  log_interval: 1
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: tensorboard
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 2
+  in_flight_high_watermark: 1512
+  in_flight_low_watermark: 1008
+  resident_high_watermark_bytes: 206158430208
+  resident_low_watermark_bytes: 171798691840
+  feature_store_max_resident_bytes: 240518168576
+
+run_id: deepseek-v4-flash-0731-dspark-disaggregated
+output_dir: ./outputs/deepseek-v4-flash-0731-dspark-disaggregated
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: ./outputs/deepseek-v4-flash-0731-dspark-disaggregated/control
+    consumer_state_dir: ./outputs/deepseek-v4-flash-0731-dspark-disaggregated/consumer-state
+    backend: mooncake
+    store_id: deepseek-v4-flash-0731-dspark
+    # Replace loopback addresses when capture and training run on different hosts.
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_local_hostname: 127.0.0.1
+    mooncake_protocol: tcp
+    client_buffer_size: 4294967296
+    receive_buffers: pinned
+    receive_pool_bytes: 4294967296
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200
+    shutdown_grace_s: 600
