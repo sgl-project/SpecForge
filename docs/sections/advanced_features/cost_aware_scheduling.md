@@ -112,7 +112,7 @@ profiler off, mean of the steady windows (steps 11-30); scheduling rows use
 
 | Run | samples/s |
 | --- | ---: |
-| offline, Qwen3.5-27B target, DP4, batch 2 x 32, defaults (`round`) | 17.0 |
+| offline, Qwen3.8-27B target, DP4, batch 2 x 32, defaults (`round`) | 17.0 |
 | offline, DSpark per-step normalization alone (no regrouping) | 17.5 |
 | offline, `cost_aware_scheduling: true` (`auto` = anchors) | 19.2 |
 | offline, `cost_aware_key: length` | 19.3 |
