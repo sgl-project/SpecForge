@@ -388,14 +388,17 @@ class TestExportCheckpointPrecision(unittest.TestCase):
         from specforge.export import export_to_hf
         from specforge.modeling.auto import AutoDraftModel
 
-        weights = self._checkpoint(torch.float32)
-        export_to_hf(self.checkpoint, self.cfg_path, self.output)
-        self.assertEqual(self._read_config_dtype(), "float32")
-        # No explicit dtype: Transformers follows the exported config.
-        reloaded = AutoDraftModel.from_pretrained(self.output).state_dict()
-        for key, value in weights.items():
-            self.assertEqual(reloaded[key].dtype, value.dtype, key)
-            self.assertTrue(torch.equal(reloaded[key], value), key)
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                weights = self._checkpoint(dtype)
+                export_to_hf(self.checkpoint, self.cfg_path, self.output)
+                self.assertEqual(self._read_config_dtype(), str(dtype).split(".")[1])
+                # No explicit dtype: Transformers follows the exported config.
+                reloaded = AutoDraftModel.from_pretrained(self.output).state_dict()
+                self.assertEqual(set(reloaded), set(weights))
+                for key, value in weights.items():
+                    self.assertEqual(reloaded[key].dtype, value.dtype, key)
+                    self.assertTrue(torch.equal(reloaded[key], value), key)
 
 
 @unittest.skipUnless(CUDA, "export round-trip requires CUDA")
