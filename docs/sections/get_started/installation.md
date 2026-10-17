@@ -39,7 +39,9 @@ pip install specforge
 
 The standard installation above uses the platform selected by PyTorch. Install
 a CUDA build compatible with the host driver, then run every recipe through
-the same `specforge train` entry.
+the same `specforge train` entry. On Linux it also installs `liger-kernel`,
+whose RMSNorm/SwiGLU kernels DFlash drafts use by default on CUDA and ROCm
+(`model.use_liger_kernel`).
 
 ### AMD ROCm
 
@@ -53,6 +55,9 @@ not pull CUDA wheels over the working ROCm stack:
 git clone https://github.com/sgl-project/SpecForge.git /workspace/SpecForge
 cd /workspace/SpecForge
 python -m pip install -e . --no-deps
+# DFlash drafts use Liger RMSNorm/SwiGLU by default on ROCm; --no-deps keeps
+# the container's ROCm Triton.
+python -m pip install --no-deps "liger-kernel>=0.8.3,<0.9"
 ```
 
 For the complete container setup and an end-to-end walkthrough covering
@@ -72,6 +77,8 @@ recipes use external SGLang server capture with SDPA consumers. Install a
 compatible SGLang/Mooncake service first. The unified launcher detects the NPU
 device, self-launches the process count recorded in YAML, and selects HCCL; see
 the [training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu).
+DFlash drafts keep the native RMSNorm/SwiGLU on NPU; Liger's Ascend backend is
+not validated in SpecForge.
 
 ### Intel GPU
 

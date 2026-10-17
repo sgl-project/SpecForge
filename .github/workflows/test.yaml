@@ -106,6 +106,15 @@ jobs:
           python -c 'import importlib.util, shutil, torch; assert torch.cuda.is_available(), "live capture gate requires CUDA"; assert importlib.util.find_spec("mooncake.store"), "live capture gate requires mooncake.store"; assert shutil.which("mooncake_master") or __import__("os").environ.get("MOONCAKE_MASTER_SERVER_ADDR"), "live capture gate requires mooncake_master"'
           python -m unittest tests.test_runtime.test_server_capture_gate -v
 
+      - name: Run Liger kernel tests
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          source sf/bin/activate
+          export PYTHONPATH=$PWD
+          # test_training is not a package, so discovery does not collect it.
+          python -m unittest tests.test_training.test_liger_kernel -v
+
       - name: Run test
         timeout-minutes: 45
         shell: bash

@@ -435,6 +435,7 @@ def _build_offline(
     build_model_bundle: Callable,
     optimizer_factory: Callable,
     logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
 ):
     from specforge.training.assembly import (
         TrainingRun,
@@ -521,6 +522,9 @@ def _build_offline(
 
         return TrainingRun(execute=produce)
 
+    if preflight_model_bundle is not None:
+        # The model is otherwise first built only after the whole ingest.
+        preflight_model_bundle(cfg)
     _wait_for(done, failure_path=manifest + ".failed")
     from specforge.launch import build_disagg_offline_runtime
     from specforge.runtime.data_plane.disagg_ingest import read_ref_manifest
@@ -599,6 +603,7 @@ def _build_online(
     prepare_prompts: Callable,
     optimizer_factory: Callable,
     logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
 ):
     from specforge.training.assembly import (
         TrainingRun,
@@ -612,6 +617,10 @@ def _build_online(
     channel_path = _env("DISAGG_REF_CHANNEL")
     if cfg.training.role == "producer":
         _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
+    elif preflight_model_bundle is not None:
+        # Check trainer dependencies before opening the store or waiting on
+        # the producer, so a failed preflight owns no transport resources.
+        preflight_model_bundle(cfg)
     # The producer owns capture and explicit attempt cleanup. The consumer must
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
@@ -851,8 +860,13 @@ def build_disaggregated_run(
     prepare_prompts: Callable,
     optimizer_factory: Callable,
     logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
 ):
-    """Assemble the configured producer or consumer role."""
+    """Assemble the configured producer or consumer role.
+
+    ``preflight_model_bundle(cfg)`` runs on the consumer before it waits on the
+    producer, so dependencies ``build_model_bundle`` needs fail at startup.
+    """
     if cfg.training.role not in ("producer", "consumer"):
         raise ValueError(
             "disaggregated runs require training.role=producer or consumer"
@@ -865,6 +879,7 @@ def build_disaggregated_run(
                 build_model_bundle=build_model_bundle,
                 optimizer_factory=optimizer_factory,
                 logger=logger,
+                preflight_model_bundle=preflight_model_bundle,
             )
         return _build_online(
             cfg,
@@ -873,6 +888,7 @@ def build_disaggregated_run(
             prepare_prompts=prepare_prompts,
             optimizer_factory=optimizer_factory,
             logger=logger,
+            preflight_model_bundle=preflight_model_bundle,
         )
     except BaseException as exc:
         _publish_role_assembly_failure(cfg, exc)

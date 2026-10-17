@@ -68,6 +68,18 @@ clobbers the image's ROCm torch/sglang. If a later step reports a missing
 lightweight dependency (for example `accelerate`), install just that package,
 also with `--no-deps`.
 
+DFlash drafts use the Liger RMSNorm/SwiGLU kernels by default on ROCm
+(`model.use_liger_kernel`), and training stops with an install hint when Liger
+cannot be imported. Install it without dependencies so pip keeps the image's
+ROCm Triton instead of pulling the CUDA `triton` wheel:
+
+```bash
+python -m pip install --no-deps "liger-kernel>=0.8.3,<0.9"
+```
+
+Set `model.use_liger_kernel: false` to train with the native Qwen3 modules
+instead.
+
 The images ship neither `wandb` nor TensorBoard:
 
 ```bash

@@ -592,11 +592,15 @@ checked-in environment before installing SpecForge:
 ```bash
 python -m pip install -r requirements-rocm.txt
 python -m pip install -e . --no-deps
+python -m pip install --no-deps "liger-kernel>=0.8.3,<0.9"
 ```
 
 Use a model/backend combination supported by that PyTorch ROCm environment;
 HF + SDPA recipes are the portable baseline. PyTorch exposes ROCm devices
-through its `torch.cuda` API and distributed runs use NCCL.
+through its `torch.cuda` API and distributed runs use NCCL. DFlash drafts use
+Liger RMSNorm/SwiGLU by default on CUDA and ROCm, which is why Liger is
+installed without dependencies above; set `model.use_liger_kernel: false` to
+use the native Qwen3 modules.
 
 For Ascend, install the vendor-matched PyTorch and `torch_npu` packages first.
 The checked-in NPU recipes use an external NPU-compatible SGLang capture server

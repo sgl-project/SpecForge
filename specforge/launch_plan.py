@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, Optional, Sequence
 from urllib import error as urllib_error
@@ -201,6 +202,9 @@ class LaunchPlan:
     #: The plan still renders (``--plan`` off the training node); the managed
     #: preflight raises it before anything starts.
     managed_rdma_error: Optional[str] = None
+    #: Deferred trainer-side dependency checks a supervisor runs before it
+    #: starts any service or worker; planning itself stays side-effect free.
+    preflight_checks: tuple[Callable[[], None], ...] = ()
     # SIGTERM-trapped workers run Mooncake drains, checkpoint flushes, and
     # failure-sentinel publication inside this window before SIGKILL.
     shutdown_grace_s: float = 30.0
@@ -750,6 +754,22 @@ def _managed_local_services(
     return (mooncake_service, *capture_services)
 
 
+def _trainer_preflight_checks(
+    cfg: Config,
+    algorithm: Optional["AlgorithmRegistration"],
+) -> tuple[Callable[[], None], ...]:
+    """Trainer-side import checks a supervisor runs before it spawns anything.
+
+    The supervisor runs on the trainer host, so its device matches the
+    trainer's; the trainer rank still owns the authoritative resolution.
+    """
+    if algorithm is None:
+        return ()
+    from specforge.training.model_loading import preflight_draft_kernels
+
+    return (partial(preflight_draft_kernels, cfg, algorithm=algorithm),)
+
+
 def _worker_argv(
     command_prefix: Sequence[str],
     config_path: str,
@@ -1092,12 +1112,14 @@ def build_launch_plan(
                 cfg, managed_environment
             ),
             managed_rdma_error=managed_rdma_error,
+            preflight_checks=_trainer_preflight_checks(cfg, algorithm),
             shutdown_grace_s=managed_local.shutdown_grace_s,
         )
     return LaunchPlan(
         "supervisor",
         "both",
         commands=(producer, consumer),
+        preflight_checks=_trainer_preflight_checks(cfg, algorithm),
         shutdown_grace_s=deployment.shutdown_grace_s,
     )
 
@@ -1247,6 +1269,10 @@ def _managed_preflight(plan: LaunchPlan) -> None:
                 raise RuntimeError(
                     f"managed_local port 127.0.0.1:{port} is unavailable: {exc}"
                 ) from exc
+    # Trainer dependencies otherwise fail only after every capture server has
+    # warmed up.
+    for check in plan.preflight_checks:
+        check()
 
 
 def _http_ready(readiness: ReadinessSpec, *, timeout_s: Optional[float] = None) -> bool:
@@ -1447,6 +1473,11 @@ def run_commands(
                     services.append((service, _spawn_service(service, popen=popen)))
                 for service, process in services[-len(current_phase) :]:
                     readiness_waiter(service, process, tuple(services))
+        elif plan.kind == "supervisor":
+            # Otherwise a trainer dependency fails only in the consumer, after
+            # the producer has started its work.
+            for check in plan.preflight_checks:
+                check()
         for command in plan.commands:
             processes.append(_spawn_command(command, popen=popen))
         remaining = set(range(len(processes)))
