@@ -97,11 +97,11 @@ servers. Its
 [runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
-The `...-official-*.yaml` recipes train the official DeepSeek-V4 DSpark
-drafter architecture (`DSparkV4DraftModel`, `training.attention_backend:
-native`) on two-node H200 or B200 stacks
+`deepseek-v4-flash-dspark-official-2node-h200.yaml` trains the official
+DeepSeek-V4 DSpark drafter architecture (`DSparkV4DraftModel`,
+`training.attention_backend: native`) on a two-node H200 stack
 ([runbook](../../docs/recipes/deepseek-v4-flash-dspark-official-2node-h200.md));
-initialize their warm-start dir with `scripts/dspark_v4_official_weights.py`
+initialize its warm-start dir with `scripts/dspark_v4_official_weights.py`
 and `scripts/init_dspark_v4_from_target.py`, and export a servable drafter
 with `scripts/bundle_dspark_v4_official.py`.
 
