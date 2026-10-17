@@ -2,6 +2,7 @@ import json
 import os
 from typing import Union
 
+import torch
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import PretrainedConfig, modeling_utils
@@ -33,7 +34,20 @@ class AutoDraftModel(AutoModelForCausalLMBase):
             A model instance.
         """
         _model_cls = cls._model_cls_from_config(config)
-        model = _model_cls(config, **config_kwargs)
+        # Build MoE drafters directly in the requested dtype: built in fp32 and
+        # cast afterwards, the 13B Qwen3.8-Flash-Next 512-expert drafter peaks
+        # at twice its bf16 size before the cast. Dense drafters keep their
+        # fp32 construction, so their random initialization is unchanged bit
+        # for bit.
+        previous_dtype = None
+        if torch_dtype is not None and int(getattr(config, "num_experts", 0) or 0) > 0:
+            previous_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(torch_dtype)
+        try:
+            model = _model_cls(config, **config_kwargs)
+        finally:
+            if previous_dtype is not None:
+                torch.set_default_dtype(previous_dtype)
 
         # Convert model to specified dtype if provided
         if torch_dtype is not None:

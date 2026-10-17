@@ -86,6 +86,9 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
             {
                 "qwen2-5-vl-7b-eagle3.json",
                 "qwen2.5-vl-32b-eagle3.json",
+                # The 512-expert Flash-Next arm needs expert parallelism to
+                # train; its 64-expert sibling carries the recipe.
+                "qwen3.8-flash-next-dspark-moe512.json",
             },
         )
 

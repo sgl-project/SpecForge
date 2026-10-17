@@ -1,6 +1,6 @@
 import copy
 import math
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import torch
 from torch import nn
@@ -22,6 +22,7 @@ from typing_extensions import Tuple, Unpack
 
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .flex_attention_backend import flex_attention_backend
+from .qwen_moe import QwenSparseMoE, moe_enabled
 from .registry import register_draft
 
 FULL_ATTENTION = "full_attention"
@@ -156,16 +157,61 @@ def validate_dflash_attention_config(config: Qwen3Config) -> str:
 
 
 def _rope_config(config: Qwen3Config, attention_mode: str) -> Qwen3Config:
-    """Rotary config for the mode: MLA rotates only the partial-RoPE slice."""
+    """Rotary config for the mode: only the rotated channels of each head.
 
-    if attention_mode != "mla":
+    MLA rotates its ``qk_rope_head_dim`` slice. A GQA/MHA draft that mirrors a
+    partial-rotary target (Qwen3.8-Flash-Next turns 64 of 256 channels) sets
+    ``partial_rotary_factor``; its embedding is built for the rotary channels
+    only, and ``apply_rotary_pos_emb`` leaves the rest untouched.
+    """
+
+    if attention_mode == "mla":
+        rope_config = copy.deepcopy(config)
+        rope_config.head_dim = config.qk_rope_head_dim
+        return rope_config
+    factor = float(getattr(config, "partial_rotary_factor", None) or 1.0)
+    if factor == 1.0:
         return config
+    head_dim = getattr(config, "head_dim", None) or (
+        config.hidden_size // config.num_attention_heads
+    )
+    rotary_dim = int(head_dim * factor)
+    if not 0 < rotary_dim <= head_dim or rotary_dim % 2:
+        raise ValueError(
+            f"partial_rotary_factor={factor} gives {rotary_dim} rotary channels "
+            f"of head_dim={head_dim}; it must be a positive even count"
+        )
     rope_config = copy.deepcopy(config)
-    rope_config.head_dim = config.qk_rope_head_dim
+    rope_config.head_dim = rotary_dim
+    # The factor is now folded into head_dim. Some Transformers releases apply
+    # partial_rotary_factor inside the rotary embedding as well, which would
+    # shrink the rotated slice a second time.
+    rope_config.partial_rotary_factor = 1.0
+    rope_parameters = getattr(rope_config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict) and "partial_rotary_factor" in rope_parameters:
+        rope_config.rope_parameters = {
+            **rope_parameters,
+            "partial_rotary_factor": 1.0,
+        }
     return rope_config
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    rotary_dim = cos.shape[-1]
+    if rotary_dim < q.shape[-1]:
+        # Partial rotary: only the leading rotary_dim channels of each head turn.
+        q_rot, k_rot = apply_rotary_pos_emb(
+            q[..., :rotary_dim],
+            k[..., :rotary_dim],
+            cos,
+            sin,
+            position_ids,
+            unsqueeze_dim,
+        )
+        return (
+            torch.cat([q_rot, q[..., rotary_dim:]], dim=-1),
+            torch.cat([k_rot, k[..., rotary_dim:]], dim=-1),
+        )
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_len = q.size(-2)
@@ -265,6 +311,23 @@ class Qwen3DFlashAttentionBase(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
+    def _compute_qkv_and_gate(
+        self,
+        hidden_states: torch.Tensor,
+        target_hidden: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """``_compute_qkv`` plus an optional output gate.
+
+        The gate, ``[batch, q_len, heads * head_dim]`` or ``None``, scales the
+        attention output by its sigmoid before ``o_proj``.
+        """
+
+        return (
+            *self._compute_qkv(hidden_states, target_hidden, position_embeddings),
+            None,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -276,7 +339,9 @@ class Qwen3DFlashAttentionBase(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
-        q, k, v = self._compute_qkv(hidden_states, target_hidden, position_embeddings)
+        q, k, v, gate = self._compute_qkv_and_gate(
+            hidden_states, target_hidden, position_embeddings
+        )
         if past_key_values is not None:
             cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -321,6 +386,8 @@ class Qwen3DFlashAttentionBase(nn.Module):
             if valid_queries is not None and attn_weights is not None:
                 attn_weights = attn_weights.masked_fill(~valid_queries, 0)
         attn_output = attn_output.reshape(bsz, q_len, -1)
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
         attn_output = self.o_proj(attn_output)
         if valid_queries is not None:
             attn_output = attn_output.masked_fill(
@@ -341,9 +408,13 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
             config.num_attention_heads // config.num_key_value_heads
         )
         self.scaling = self.head_dim**-0.5
+        # Gated attention (Qwen3-Next / Qwen3.8-Flash-Next): q_proj also emits a
+        # per-channel gate, interleaved per head as [query | gate], and the
+        # attention output is scaled by its sigmoid before o_proj.
+        self.output_gate = bool(getattr(config, "attn_output_gate", False))
         self.q_proj = nn.Linear(
             config.hidden_size,
-            config.num_attention_heads * self.head_dim,
+            config.num_attention_heads * self.head_dim * (2 if self.output_gate else 1),
             bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
@@ -370,10 +441,24 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
         target_hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._compute_qkv_and_gate(
+            hidden_states, target_hidden, position_embeddings
+        )[:3]
+
+    def _compute_qkv_and_gate(
+        self,
+        hidden_states: torch.Tensor,
+        target_hidden: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
         q = self.q_proj(hidden_states)
-        q = q.view(bsz, q_len, -1, self.head_dim)
+        gate = None
+        if self.output_gate:
+            q, gate = q.view(bsz, q_len, -1, self.head_dim * 2).chunk(2, dim=-1)
+            gate = gate.reshape(bsz, q_len, -1)
+        q = q.reshape(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
         k_ctx = self.k_proj(target_hidden)
         k_noise = self.k_proj(hidden_states)
@@ -389,7 +474,7 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        return q, k, v
+        return q, k, v, gate
 
 
 class Qwen3DFlashMLAAttention(Qwen3DFlashAttentionBase):
@@ -558,7 +643,9 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             layer_idx=layer_idx,
             kernels=kernels,
         )
-        self.mlp = kernels.make_mlp(config)
+        self.mlp = (
+            QwenSparseMoE(config) if moe_enabled(config) else kernels.make_mlp(config)
+        )
         self.input_layernorm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -581,6 +668,10 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
+        # Which draft tokens count toward an MoE FFN's router balance; taken
+        # from kwargs so the attention never sees it and the signature stays
+        # the one subclasses mirror.
+        moe_balance_mask = kwargs.pop("moe_balance_mask", None)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -598,7 +689,10 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, QwenSparseMoE):
+            hidden_states = self.mlp(hidden_states, balance_mask=moe_balance_mask)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -736,6 +830,37 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config
 
+    def moe_blocks(self) -> List[QwenSparseMoE]:
+        layers = getattr(self, "layers", None) or ()
+        mlps = (getattr(layer, "mlp", None) for layer in layers)
+        return [mlp for mlp in mlps if isinstance(mlp, QwenSparseMoE)]
+
+    def pop_moe_aux_loss(self) -> Optional[torch.Tensor]:
+        """The router balance loss since the last call, averaged over MoE layers.
+
+        Each MoE forward records one term; a recomputed (checkpointed) forward
+        records another, which the next call discards with the rest. ``None``
+        when the drafter has no MoE layer or nothing was recorded.
+        """
+
+        blocks = self.moe_blocks()
+        losses = [loss for block in blocks for loss in block.pop_aux_losses()]
+        if not losses:
+            return None
+        return torch.stack(losses).sum() / len(blocks)
+
+    def moe_load_metrics(self) -> dict:
+        """Mean over MoE layers of the last forward's expert-load statistics."""
+
+        stats = [block.load_balance() for block in self.moe_blocks()]
+        stats = [entry for entry in stats if entry is not None]
+        if not stats:
+            return {}
+        return {
+            "moe_max_load_ratio": sum(entry[0] for entry in stats) / len(stats),
+            "moe_unused_expert_frac": sum(entry[1] for entry in stats) / len(stats),
+        }
+
     def apply_logits_head(
         self,
         base_logits: torch.Tensor,
@@ -793,8 +918,16 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        moe_balance_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        """``moe_balance_mask``, ``[batch, query_len]`` over the draft tokens,
+        marks which of them count toward an MoE drafter's router balance."""
+
+        if moe_balance_mask is not None:
+            # Only MoE decoder layers accept it; a layer receives it as a call
+            # argument, so a checkpointed recompute reuses the same mask.
+            kwargs["moe_balance_mask"] = moe_balance_mask
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
