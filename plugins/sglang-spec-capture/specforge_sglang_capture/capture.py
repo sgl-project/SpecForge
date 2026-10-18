@@ -21,7 +21,8 @@ Per scheduler process, on the attention-TP writer rank:
    capture requests out of the forward's hidden states: the aux-layer
    concatenation in ``hidden_states`` and the post-norm ``last_hidden_states``.
 2. ``CaptureDeviceOutput.copy_to_host`` copies them to pinned host memory with
-   the generation result, or keeps device tensors for RDMA device publication.
+   the generation result, or keeps device tensors for device publication (RDMA,
+   or the NVLink arena under ``MOONCAKE_PROTOCOL=nvlink``).
 3. ``CaptureHostOutput.consume`` hands each finished request's rows to the
    Mooncake sink and holds the request's response (``Req.defer_output``).
 4. ``PendingCaptures`` (an SGLang ``DeferredOutputSource``) releases requests in
@@ -48,7 +49,9 @@ from specforge_sglang_capture.sink import (
     ARTIFACT_LAST_HIDDEN,
     Sample,
     SpecCaptureSink,
+    arena_bytes,
     gpu_put_enabled,
+    nvlink_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -441,6 +444,11 @@ def install(scheduler) -> CaptureRuntime:
             "SPECFORGE_SPEC_CAPTURE needs --chunked-prefill-size -1 so each prompt "
             "is captured by one forward"
         )
+    nvlink = nvlink_enabled()
+    if nvlink:
+        # The sink allocates the arena on the first capture; reject a missing
+        # size now rather than failing every capture batch.
+        arena_bytes()
 
     runtime = CaptureRuntime(
         sink=SpecCaptureSink(features.return_aux_hidden_state_layer_ids),
@@ -452,9 +460,10 @@ def install(scheduler) -> CaptureRuntime:
     model_runner.forward_observer = runtime.observer
     scheduler.register_deferred_output_source(runtime.pending)
     scheduler.output_streamer.spec_capture_results = runtime.results
+    scheduler._specforge_capture_runtime = runtime
     logger.info(
         "SpecForge spec capture enabled (%s publication, writer=%s)",
-        "device" if runtime.gpu_put else "host",
+        "nvlink" if nvlink else "device" if runtime.gpu_put else "host",
         runtime.is_writer,
     )
     return runtime
