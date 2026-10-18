@@ -49,8 +49,8 @@ from specforge_sglang_capture.sink import (
     ARTIFACT_LAST_HIDDEN,
     Sample,
     SpecCaptureSink,
+    arena_bytes,
     gpu_put_enabled,
-    nvlink_arena_bytes,
     nvlink_enabled,
 )
 
@@ -448,7 +448,7 @@ def install(scheduler) -> CaptureRuntime:
     if nvlink:
         # The sink allocates the arena on the first capture; reject a missing
         # size now rather than failing every capture batch.
-        nvlink_arena_bytes()
+        arena_bytes()
 
     runtime = CaptureRuntime(
         sink=SpecCaptureSink(features.return_aux_hidden_state_layer_ids),
@@ -460,6 +460,7 @@ def install(scheduler) -> CaptureRuntime:
     model_runner.forward_observer = runtime.observer
     scheduler.register_deferred_output_source(runtime.pending)
     scheduler.output_streamer.spec_capture_results = runtime.results
+    scheduler._specforge_capture_runtime = runtime
     logger.info(
         "SpecForge spec capture enabled (%s publication, writer=%s)",
         "nvlink" if nvlink else "device" if runtime.gpu_put else "host",

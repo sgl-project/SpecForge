@@ -64,16 +64,22 @@ GPU to GPU without the Mooncake store. Mooncake's NVLink transport only exports
 fabric memory, and the store cannot place objects there. So the sink copies
 captures into one arena that the TransferEngine allocates on the writer GPU,
 on the first capture. Its size comes from the required
-`SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES`, which the scheduler checks at
+`SGLANG_SPEC_CAPTURE_ARENA_BYTES`, which the scheduler checks at
 startup. Reserve that much HBM below `--mem-fraction-static`.
 
-Each result also carries `nvlink: {session, control}`, and every feature gains
+Before submitting capture, the client discovers `spec_capture_control` in
+`/server_info`'s `internal_states`. The plugin's writer scheduler exposes a TCP
+listener without allocating the GPU arena; the first capture reuses that
+listener. This lets clients clean up objects even if the first response is lost.
+
+Each result also carries `arena: {session, control}`, and every feature gains
 an `address`. Objects keep the store keys and stay until a client frees them:
 the client writes a JSON list of keys, one line per list, to the `control`
 TCP endpoint. Frees are one-way. The writer thread reads them before it
 allocates, so no extra thread competes with the scheduler for the GIL. If a
-batch does not fit, the writer waits up to 30 s for frees, then fails the
-batch.
+batch does not fit, all its objects share one 30 s allocation deadline. On
+timeout, the writer finishes queued copies and releases objects placed by that
+batch before reporting failure.
 
 NVLink always publishes device tensors, so `SGLANG_SPEC_CAPTURE_GPU_PUT=0` is
 rejected. You need a Mooncake build with `USE_MNNVL` (the aarch64 CUDA
@@ -88,6 +94,6 @@ with RDMA NICs. Without it, Mooncake installs its RDMA transport instead.
 | `SGLANG_SPEC_CAPTURE_GPU_PUT` | `1`: publish device tensors (needs RDMA). `0`: publish from pinned host memory. Unset: device on RDMA+CUDA or NVLink, host otherwise. |
 | `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES` | Scheduler batches the writer may hold (default 2). |
 | `SGLANG_SPEC_CAPTURE_TIMING=1` | Log per-batch publish timings. |
-| `SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES` | Arena size in bytes. Required with `MOONCAKE_PROTOCOL=nvlink`. |
+| `SGLANG_SPEC_CAPTURE_ARENA_BYTES` | Arena size in bytes. Required with `MOONCAKE_PROTOCOL=nvlink`. |
 | `SGLANG_SPEC_CAPTURE_CONTROL_PORT` | Port of the NVLink free endpoint (default: ephemeral). |
 | `MOONCAKE_*` | Mooncake client settings. |

@@ -20,7 +20,7 @@ device publication (and RDMA).
 
 ``MOONCAKE_PROTOCOL=nvlink`` (multi-node NVLink) keeps objects in an
 :class:`NvlinkArena` on the writer GPU instead of the store. Each result then
-also carries ``"nvlink": {"session", "control"}`` and every feature its
+also carries ``"arena": {"session", "control"}`` and every feature its
 ``"address"``; the trainer reads objects over MNNVL and frees them by writing
 JSON key lists to the ``control`` TCP endpoint.
 """
@@ -66,18 +66,18 @@ Sample = Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]]
 
 NVLINK = "nvlink"
 #: HBM the writer GPU reserves for NVLink capture objects (required for nvlink).
-NVLINK_ARENA_BYTES_ENV = "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"
+ARENA_BYTES_ENV = "SGLANG_SPEC_CAPTURE_ARENA_BYTES"
 
 
 def nvlink_enabled() -> bool:
     return os.environ.get("MOONCAKE_PROTOCOL", "tcp") == NVLINK
 
 
-def nvlink_arena_bytes() -> int:
-    capacity = os.environ.get(NVLINK_ARENA_BYTES_ENV)
+def arena_bytes() -> int:
+    capacity = os.environ.get(ARENA_BYTES_ENV)
     if not capacity:
         raise ValueError(
-            f"MOONCAKE_PROTOCOL=nvlink needs {NVLINK_ARENA_BYTES_ENV}, the HBM the "
+            f"MOONCAKE_PROTOCOL=nvlink needs {ARENA_BYTES_ENV}, the HBM the "
             "writer GPU reserves for capture objects"
         )
     return int(capacity)
@@ -128,7 +128,7 @@ class NvlinkArena:
 
     Mooncake's NVLink transport can only export memory allocated with a fabric
     handle, and the Mooncake store cannot place objects there. The arena is one
-    ``SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES``-byte allocation from the
+    ``SGLANG_SPEC_CAPTURE_ARENA_BYTES``-byte allocation from the
     TransferEngine. Objects keep the store's keys and, like hard-pinned store
     objects, live until a client frees them by writing a JSON list of keys, one
     per line, to the ``control`` TCP endpoint. Only the writer thread touches
@@ -140,8 +140,10 @@ class NvlinkArena:
     #: How long a full arena waits for frees before failing the batch.
     _WAIT_S = 30.0
 
-    def __init__(self, device: torch.device) -> None:
-        self.capacity = nvlink_arena_bytes()
+    def __init__(
+        self, device: torch.device, *, listener: Optional[socket.socket] = None
+    ) -> None:
+        self.capacity = arena_bytes()
         from mooncake.engine import TransferEngine
 
         host = os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost")
@@ -154,7 +156,7 @@ class NvlinkArena:
         if not self._base:
             raise MemoryError(
                 f"spec-capture could not allocate a {self.capacity}-byte NVLink "
-                f"arena; leave room for {NVLINK_ARENA_BYTES_ENV} below "
+                f"arena; leave room for {ARENA_BYTES_ENV} below "
                 "--mem-fraction-static"
             )
         self._bytes = torch.as_tensor(
@@ -163,8 +165,10 @@ class NvlinkArena:
         self._stream = torch.cuda.Stream(device)
         self._spans = [(0, self.capacity)]  # free (offset, size), sorted, coalesced
         self._objects: Dict[str, Tuple[int, int]] = {}  # key -> (offset, size)
-        port = int(os.environ.get("SGLANG_SPEC_CAPTURE_CONTROL_PORT", "0"))
-        self._listener = socket.create_server(("", port))
+        if listener is None:
+            port = int(os.environ.get("SGLANG_SPEC_CAPTURE_CONTROL_PORT", "0"))
+            listener = socket.create_server(("", port))
+        self._listener = listener
         self._listener.setblocking(False)
         self._peers: Dict[socket.socket, bytes] = {}  # connection -> partial line
         self.session = f"{host}:{self._engine.get_rpc_port()}"
@@ -180,6 +184,7 @@ class NvlinkArena:
         self, keys: List[str], tensors: List[torch.Tensor], replace_keys: List[str]
     ) -> List[int]:
         """Copy each tensor into its own object; return the device addresses."""
+        deadline = time.monotonic() + self._WAIT_S
         self.receive_frees()
         self.free(replace_keys)
         placed: List[str] = []
@@ -187,7 +192,7 @@ class NvlinkArena:
             with torch.cuda.stream(self._stream):
                 for key, tensor in zip(keys, tensors):
                     nbytes = tensor.numel() * tensor.element_size()
-                    offset = self._allocate(key, nbytes)
+                    offset = self._allocate(key, nbytes, deadline=deadline)
                     placed.append(key)
                     self._bytes[offset : offset + nbytes].copy_(
                         tensor.reshape(-1).view(torch.uint8), non_blocking=True
@@ -246,12 +251,19 @@ class NvlinkArena:
             "largest_free_bytes": max((size for _, size in self._spans), default=0),
         }
 
-    def _allocate(self, key: str, nbytes: int) -> int:
+    def _allocate(self, key: str, nbytes: int, *, deadline: float) -> int:
         if key in self._objects:
             raise RuntimeError(f"spec-capture object {key} already exists")
         size = -(-max(nbytes, 1) // self._ALIGNMENT) * self._ALIGNMENT
-        deadline = time.monotonic() + self._WAIT_S
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MemoryError(
+                    f"spec-capture NVLink arena ({self.capacity} bytes) has no "
+                    f"room for {nbytes} bytes before the batch deadline; raise "
+                    f"{ARENA_BYTES_ENV} or lower the producer's "
+                    "runtime.resident_high_watermark_bytes"
+                )
             for index, (offset, span) in enumerate(self._spans):
                 if span >= size:
                     if span == size:
@@ -260,13 +272,6 @@ class NvlinkArena:
                         self._spans[index] = (offset + size, span - size)
                     self._objects[key] = (offset, size)
                     return offset
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise MemoryError(
-                    f"spec-capture NVLink arena ({self.capacity} bytes) has no "
-                    f"room for {nbytes} bytes; raise {NVLINK_ARENA_BYTES_ENV} "
-                    "or lower the producer's runtime.resident_high_watermark_bytes"
-                )
             self.receive_frees(timeout=remaining)
 
     def _release(self, offset: int, size: int) -> None:
@@ -288,6 +293,7 @@ class SpecCaptureSink:
         self._store = None
         self._put_config = None
         self._nvlink: Optional[NvlinkArena] = None
+        self._control_listener: Optional[socket.socket] = None
         self._lock = threading.Lock()
         # One writer is enough: Mooncake stripes a batched transfer itself.
         # The thread only decouples that transfer from the scheduler.
@@ -362,11 +368,24 @@ class SpecCaptureSink:
             logger.info("spec-capture mooncake sink connected")
             return store
 
+    def control_endpoint(self) -> Optional[str]:
+        """Advertise cleanup before the first capture, without allocating HBM."""
+        if not nvlink_enabled():
+            return None
+        with self._lock:
+            if self._control_listener is None:
+                port = int(os.environ.get("SGLANG_SPEC_CAPTURE_CONTROL_PORT", "0"))
+                self._control_listener = socket.create_server(("", port))
+                self._control_listener.setblocking(False)
+            host = os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost")
+            return f"{host}:{self._control_listener.getsockname()[1]}"
+
     def _arena(self, device: torch.device) -> NvlinkArena:
         # Lazy like _connect(): only the writer rank allocates, on first capture.
+        self.control_endpoint()
         with self._lock:
             if self._nvlink is None:
-                self._nvlink = NvlinkArena(device)
+                self._nvlink = NvlinkArena(device, listener=self._control_listener)
             return self._nvlink
 
     def _remove_many_quiet(self, keys: List[str]) -> None:
@@ -606,7 +625,7 @@ class SpecCaptureSink:
         for meta, address in zip(feature_meta, addresses):
             meta["address"] = address
         for result in results:
-            result["nvlink"] = {"session": arena.session, "control": arena.control}
+            result["arena"] = {"session": arena.session, "control": arena.control}
         if os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1":
             logger.info(
                 "[spec-capture-timing] nvlink_sink samples=%d objects=%d "

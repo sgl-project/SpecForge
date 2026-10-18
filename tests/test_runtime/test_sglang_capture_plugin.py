@@ -399,6 +399,7 @@ class TestInstall(unittest.TestCase):
         )
         self.assertEqual(scheduler.sources, [runtime.pending])
         self.assertIs(scheduler.output_streamer.spec_capture_results, runtime.results)
+        self.assertIs(scheduler._specforge_capture_runtime, runtime)
         self.assertEqual(runtime.sink.aux_layer_ids, [1, 3])
         self.assertTrue(runtime.is_writer)
         self.assertFalse(runtime.gpu_put)
@@ -433,7 +434,7 @@ class TestInstall(unittest.TestCase):
     def test_nvlink_publishes_device_tensors_into_a_lazy_arena(self):
         env = {
             "MOONCAKE_PROTOCOL": "nvlink",
-            "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES": str(1 << 30),
+            "SGLANG_SPEC_CAPTURE_ARENA_BYTES": str(1 << 30),
         }
         with self.assertLogs(capture.logger, "INFO") as logs:
             _, runtime = self._install(env=env)
@@ -444,14 +445,46 @@ class TestInstall(unittest.TestCase):
     def test_nvlink_rejects_a_missing_arena_size_and_host_publication(self):
         nvlink = {"MOONCAKE_PROTOCOL": "nvlink"}
         with mock.patch.dict(os.environ):
-            os.environ.pop("SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES", None)
-            with self.assertRaisesRegex(
-                ValueError, "SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"
-            ):
+            os.environ.pop("SGLANG_SPEC_CAPTURE_ARENA_BYTES", None)
+            with self.assertRaisesRegex(ValueError, "SGLANG_SPEC_CAPTURE_ARENA_BYTES"):
                 self._install(env=nvlink)
-        nvlink["SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES"] = str(1 << 30)
+        nvlink["SGLANG_SPEC_CAPTURE_ARENA_BYTES"] = str(1 << 30)
         with self.assertRaisesRegex(ValueError, "conflicts"):
             self._install(env={**nvlink, "SGLANG_SPEC_CAPTURE_GPU_PUT": "0"})
+
+    def test_internal_state_advertises_control_before_gpu_allocation(self):
+        env = {
+            "MOONCAKE_PROTOCOL": "nvlink",
+            "MOONCAKE_LOCAL_HOSTNAME": "127.0.0.1",
+            "SGLANG_SPEC_CAPTURE_ARENA_BYTES": "4096",
+        }
+        scheduler, runtime = self._install(env=env)
+        self.addCleanup(runtime.sink._executor.shutdown)
+        result = SimpleNamespace(internal_state={"existing": "value"})
+        with mock.patch.dict(os.environ, env, clear=True):
+            returned = specforge_sglang_capture._capture_internal_state(
+                result, scheduler
+            )
+            self.addCleanup(runtime.sink._control_listener.close)
+            self.assertIs(returned, result)
+            self.assertEqual(result.internal_state["existing"], "value")
+            self.assertEqual(
+                result.internal_state["spec_capture_control"],
+                runtime.sink.control_endpoint(),
+            )
+        self.assertIsNone(runtime.sink._nvlink)
+
+    def test_internal_state_omits_control_for_store_protocols_and_nonwriters(self):
+        for protocol, writer in (("tcp", True), ("rdma", True), ("nvlink", False)):
+            with self.subTest(protocol=protocol, writer=writer):
+                scheduler, runtime = self._install()
+                self.addCleanup(runtime.sink._executor.shutdown)
+                runtime.is_writer = writer
+                result = SimpleNamespace(internal_state={"existing": "value"})
+                with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": protocol}):
+                    specforge_sglang_capture._capture_internal_state(result, scheduler)
+                self.assertEqual(result.internal_state, {"existing": "value"})
+                self.assertIsNone(runtime.sink._control_listener)
 
 
 class TestRegister(unittest.TestCase):
@@ -490,6 +523,10 @@ class TestRegister(unittest.TestCase):
                     "after",
                 ),
                 ("sglang.srt.managers.scheduler.Scheduler.__init__", "after"),
+                (
+                    "sglang.srt.managers.scheduler.Scheduler.get_internal_state",
+                    "after",
+                ),
             ],
         )
 

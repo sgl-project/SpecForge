@@ -41,6 +41,9 @@ def register() -> None:
         HookType.AFTER,
     )
     HookRegistry.register(f"{_SCHEDULER}.__init__", _install, HookType.AFTER)
+    HookRegistry.register(
+        f"{_SCHEDULER}.get_internal_state", _capture_internal_state, HookType.AFTER
+    )
 
 
 def _capture_streamer_class(streamer_class, scheduler, *args, **kwargs):
@@ -55,4 +58,14 @@ def _install(result, scheduler, *args, **kwargs):
     # Raising here fails scheduler startup, unlike errors in register(), which
     # load_plugins() only logs.
     install(scheduler)
+    return result
+
+
+def _capture_internal_state(result, scheduler, *args, **kwargs):
+    """Expose the writer's cleanup endpoint through SGLang's /server_info."""
+    runtime = getattr(scheduler, "_specforge_capture_runtime", None)
+    if runtime is not None and runtime.is_writer:
+        control = runtime.sink.control_endpoint()
+        if control is not None:
+            result.internal_state["spec_capture_control"] = control
     return result

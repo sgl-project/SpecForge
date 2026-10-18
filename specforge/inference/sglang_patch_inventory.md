@@ -129,8 +129,9 @@ The plugin keeps the patch's contract:
   `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`;
 - `SGLANG_SPEC_CAPTURE_GPU_PUT` / `SGLANG_SPEC_CAPTURE_TIMING`;
 - `MOONCAKE_PROTOCOL=nvlink` publication into a fabric-memory arena on the
-  writer GPU, sized by `SGLANG_SPEC_CAPTURE_NVLINK_ARENA_BYTES` and checked at
-  startup;
+  writer GPU, sized by `SGLANG_SPEC_CAPTURE_ARENA_BYTES` and checked at
+  startup; results use the same `arena` locator as the patch, and the writer
+  advertises `spec_capture_control` through `/server_info` before any capture;
 - the `logits_mup_width_multiplier` restoration.
 
 Its scheduler refuses to start without the required flags. The capture server
