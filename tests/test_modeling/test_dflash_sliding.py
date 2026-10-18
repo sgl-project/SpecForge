@@ -328,6 +328,21 @@ class TestDFlashGenerationMasks(unittest.TestCase):
     "CUDA, BF16 and FlashAttention 2 are required",
 )
 class TestDFlashFlashAttentionParity(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from transformers.modeling_flash_attention_utils import (
+            lazy_import_flash_attention,
+        )
+
+        # The availability flag only checks package metadata, not the CUDA ABI.
+        # CI separately requires this import to succeed before running tests.
+        try:
+            lazy_import_flash_attention("flash_attention_2")
+        except (ImportError, OSError) as error:
+            raise unittest.SkipTest(
+                f"FlashAttention 2 cannot be loaded: {error}"
+            ) from error
+
     def test_real_flash_attention_matches_sdpa_outputs_and_gradients(self):
         torch.manual_seed(91)
         for window in (None, 1, 3, 4, 16):
