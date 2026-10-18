@@ -370,6 +370,7 @@ class SGLangServerCaptureAdapter:
                 payload["sample_id"],
                 generation=int(payload["gen"]),
                 feature_names=feature_names,
+                server_url=self.base_url,
             )
         rows = self.post_fn(
             f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s

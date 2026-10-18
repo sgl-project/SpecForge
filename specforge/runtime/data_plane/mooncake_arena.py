@@ -23,6 +23,9 @@ object by writing its key to the server's control connection. Frees are one-way
 messages the server applies before it next allocates, so the durable ack never
 waits on the capture server. Objects are located per ref via
 :meth:`locate_ref_objects`, which the feature store calls on ``adopt``/``get``.
+Before submitting capture, ``/server_info`` resolves the cleanup endpoints.
+Every attempted endpoint travels with the final ref so a trainer also frees
+copies left by a lost response followed by a retry on another server.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 from specforge.runtime.data_plane.mooncake_store import MOONCAKE_OBJECT_NOT_FOUND
 
-#: ``SampleRef.metadata`` entry holding ``{"session", "control", "addresses"}``.
+#: Ref metadata: session, read addresses, and all attempted control endpoints.
 REF_METADATA_KEY = "mooncake_arena"
 _CONNECT_TIMEOUT_S = 30.0
 
@@ -48,10 +51,40 @@ class ArenaObjectClient:
         self._engine = None
         # key -> (transfer-engine session, device address, control endpoint)
         self._objects: Dict[str, Tuple[str, int, str]] = {}
+        # Every arena that may hold this key, including failed capture attempts.
+        self._object_controls: Dict[str, Set[str]] = {}
+        self._server_controls: Dict[str, Set[str]] = {}
         self._controls: Set[str] = set()
         self._connections: Dict[str, socket.socket] = {}
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
+
+    def track_capture_attempt(self, keys: List[str], server_url: str) -> None:
+        """Resolve cleanup destinations before a request can write any objects."""
+        with self._lock:
+            controls = self._server_controls.get(server_url)
+        if controls is None:
+            import requests
+
+            response = requests.get(
+                f"{server_url.rstrip('/')}/server_info", timeout=_CONNECT_TIMEOUT_S
+            )
+            response.raise_for_status()
+            controls = {
+                state["spec_capture_control"]
+                for state in response.json().get("internal_states", [])
+                if state.get("spec_capture_control")
+            }
+            if not controls:
+                raise RuntimeError(
+                    f"{server_url} does not advertise spec_capture_control; "
+                    "apply the current SGLang capture patch before NVLink capture"
+                )
+        with self._lock:
+            self._server_controls[server_url] = controls
+            self._controls.update(controls)
+            for key in keys:
+                self._object_controls.setdefault(key, set()).update(controls)
 
     def locate_ref_objects(
         self, keys: Dict[str, str], metadata: Dict[str, Any]
@@ -62,8 +95,14 @@ class ArenaObjectClient:
             return
         addresses = info["addresses"]
         with self._lock:
-            self._controls.add(info["control"])
+            controls = set(info.get("controls", [])) | {info["control"]}
+            for key in keys.values():
+                controls.update(self._object_controls.get(key, ()))
+            # Preserve attempt locations across the producer -> trainer boundary.
+            info["controls"] = sorted(controls)
+            self._controls.update(controls)
             for name, key in keys.items():
+                self._object_controls.setdefault(key, set()).update(controls)
                 if name in addresses:
                     self._objects[key] = (
                         info["session"],
@@ -73,8 +112,10 @@ class ArenaObjectClient:
 
     # -- the Mooncake store API subset MooncakeFeatureStore uses ---------------
     def is_exist(self, key: str) -> int:
+        # A pending attempt may exist remotely even without a read address.
+        # Never let the feature store treat its failed removal as absence.
         with self._lock:
-            return int(key in self._objects)
+            return int(key in self._objects or key in self._object_controls)
 
     def get_into(self, key: str, ptr: int, nbytes: int) -> int:
         with self._lock:
@@ -91,18 +132,25 @@ class ArenaObjectClient:
 
     def remove(self, key: str, force: bool = False) -> int:
         with self._lock:
-            entry = self._objects.pop(key, None)
-            # A key no response located (a lost capture response) may live on
-            # any server this client has seen.
-            controls = [entry[2]] if entry is not None else sorted(self._controls)
+            entry = self._objects.get(key)
+            controls = set(self._object_controls.get(key, ()))
+            if entry is not None:
+                controls.add(entry[2])
+            if not controls:
+                controls.update(self._controls)
+            # Unknown is not confirmed absent. Keep it pending even if no
+            # destination is known, and preserve every destination on failure.
+            self._object_controls[key] = controls
+        if not controls:
+            return -1
         try:
-            for control in controls:
+            for control in sorted(controls):
                 self._send_free(control, [key])
         except OSError:
-            if entry is not None:
-                with self._lock:
-                    self._objects.setdefault(key, entry)
             return -1
+        with self._lock:
+            self._objects.pop(key, None)
+            self._object_controls.pop(key, None)
         return 0
 
     def put_from(self, key: str, ptr: int, nbytes: int, config: Any = None) -> int:

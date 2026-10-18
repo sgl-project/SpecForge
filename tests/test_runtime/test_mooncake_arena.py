@@ -7,12 +7,14 @@ addresses, so the real client stack runs end to end: adapter -> ref metadata ->
 ``MooncakeFeatureStore`` -> ``ArenaObjectClient`` reads and frees.
 """
 
+import copy
 import ctypes
 import json
 import socketserver
 import threading
 import time
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import torch
@@ -106,6 +108,22 @@ class ArenaObjectClientTest(unittest.TestCase):
         self.addCleanup(self.arena.close)
         self.server = _ArenaCaptureServer(self.arena)
         self.client = ArenaObjectClient(local_hostname="127.0.0.1")
+        self.addCleanup(self._close_client, self.client)
+        self.controls = {"http://server:30000": self.arena.control}
+        self.info_requests = []
+
+        def server_info(url, **kwargs):
+            self.info_requests.append(url)
+            control = self.controls[url.removesuffix("/server_info")]
+            response = mock.Mock()
+            response.json.return_value = {
+                "internal_states": [{"spec_capture_control": control}]
+            }
+            return response
+
+        info_patcher = mock.patch("requests.get", side_effect=server_info)
+        self.get_info = info_patcher.start()
+        self.addCleanup(info_patcher.stop)
         self.engine = _FakeTransferEngine()
         patcher = mock.patch.object(
             ArenaObjectClient, "_transfer_engine", return_value=self.engine
@@ -121,6 +139,24 @@ class ArenaObjectClientTest(unittest.TestCase):
             schema=_capture_schema("eagle3"),
             post_fn=self.server,
         )
+
+    @staticmethod
+    def _close_client(client):
+        for connection in client._connections.values():
+            connection.close()
+
+    def _lose_response(self, task):
+        def post_then_lose(*args, **kwargs):
+            self.server(*args, **kwargs)
+            raise TimeoutError("response lost after publication")
+
+        with mock.patch.object(self.adapter, "post_fn", side_effect=post_then_lose):
+            with self.assertRaises(TimeoutError):
+                self.adapter.produce_refs([task], capture=_eagle3_contract())
+        prefix = f"run0/{self.adapter._sample_id(task)}/g1/"
+        keys = [key for key in self.arena.objects if key.startswith(prefix)]
+        self.assertTrue(keys)
+        return keys
 
     def _refs(self, *lengths):
         tasks = [_task(i, length) for i, length in enumerate(lengths)]
@@ -169,6 +205,102 @@ class ArenaObjectClientTest(unittest.TestCase):
     def test_server_writes_are_never_put_from_trainer_roles(self):
         with self.assertRaisesRegex(RuntimeError, "written by the capture server"):
             self.client.put_from("key", 0, 1)
+
+    def test_first_lost_response_can_be_freed_without_a_ref(self):
+        keys = self._lose_response(_task(0, 5))
+        self.assertEqual(self.info_requests, ["http://server:30000/server_info"])
+        self.assertEqual(self.store.discard_external_attempts(), 1)
+        for key in keys:
+            self.assertTrue(self.arena.wait_freed(key), key)
+        self.assertEqual(self.arena.objects, {})
+        self.assertEqual(self.store.health()["release_pending"], 0)
+
+    def test_unlocated_failed_free_remains_pending_and_is_retried(self):
+        task = _task(0, 5)
+        keys = self._lose_response(task)
+        with mock.patch.object(
+            self.client, "_send_free", side_effect=ConnectionResetError
+        ):
+            self.store.discard_external_attempts()
+            self.assertEqual(self.store.health()["release_pending"], 1)
+            self.assertTrue(all(self.client.is_exist(key) for key in keys))
+            # The final drain must not turn an unlocated key into confirmed absence.
+            with self.assertRaises(RuntimeError):
+                self.store.drain_pending_removals(max_attempts=1)
+        report = self.store.retry_sample_removals([self.adapter._sample_id(task)])
+        self.assertEqual(report["remaining_ids"], [])
+        for key in keys:
+            self.assertTrue(self.arena.wait_freed(key), key)
+        self.assertEqual(self.arena.objects, {})
+
+    def test_cross_server_retry_carries_all_attempts_to_the_trainer(self):
+        task = _task(0, 5)
+        keys = self._lose_response(task)
+        other = _ServerArena()
+        self.addCleanup(other.close)
+        self.controls["http://other:30000"] = other.control
+        adapter_b = SGLangServerCaptureAdapter(
+            "http://other:30000",
+            self.store,
+            run_id="run0",
+            algorithm="eagle3",
+            schema=self.adapter.schema,
+            post_fn=_ArenaCaptureServer(other),
+        )
+        (ref,) = adapter_b.produce_refs(
+            [replace(task, attempt=1)], capture=_eagle3_contract()
+        )
+        self.assertEqual(
+            set(ref.metadata[REF_METADATA_KEY]["controls"]),
+            {self.arena.control, other.control},
+        )
+        # A separate trainer process has no producer-local attempt dictionary.
+        trainer = ArenaObjectClient(local_hostname="trainer")
+        self.addCleanup(self._close_client, trainer)
+        trainer_store = MooncakeFeatureStore(store=trainer, store_id="run0")
+        trainer_store.adopt(copy.deepcopy(ref))
+        trainer_store.abort(ref.sample_id, reason="optimizer-boundary-durable-ack")
+        for key in keys:
+            self.assertTrue(self.arena.wait_freed(key), key)
+            self.assertTrue(other.wait_freed(key), key)
+        self.assertEqual(self.arena.objects, {})
+        self.assertEqual(other.objects, {})
+
+    def test_partial_free_retries_all_possible_locations(self):
+        key = "run0/lost/g1/hidden_state"
+        self.client._controls.update({"a:1", "b:2"})
+        with mock.patch.object(
+            self.client, "_send_free", side_effect=[None, ConnectionResetError]
+        ):
+            self.assertEqual(self.client.remove(key), -1)
+        self.assertEqual(self.client.is_exist(key), 1)
+        with mock.patch.object(self.client, "_send_free") as send:
+            self.assertEqual(self.client.remove(key), 0)
+            self.assertEqual(
+                send.call_args_list, [mock.call("a:1", [key]), mock.call("b:2", [key])]
+            )
+        self.assertEqual(self.client.is_exist(key), 0)
+
+    def test_unknown_destination_is_not_successfully_removed(self):
+        self.assertEqual(self.client.remove("unknown"), -1)
+        self.assertEqual(self.client.is_exist("unknown"), 1)
+
+    def test_discovery_failure_prevents_capture_writes(self):
+        response = mock.Mock()
+        response.json.return_value = {"internal_states": [{}]}
+        self.get_info.side_effect = None
+        self.get_info.return_value = response
+        with mock.patch.object(self.adapter, "post_fn") as post:
+            with self.assertRaisesRegex(RuntimeError, "spec_capture_control"):
+                self._refs(4)
+            post.assert_not_called()
+        self.assertEqual(self.arena.objects, {})
+        self.assertEqual(self.store.discard_external_attempts(), 0)
+
+    def test_control_discovery_is_cached_between_capture_batches(self):
+        self._refs(4)
+        self.adapter.produce_refs([_task(1, 5)], capture=_eagle3_contract())
+        self.assertEqual(self.info_requests, ["http://server:30000/server_info"])
 
 
 class ArenaStoreFactoryTest(unittest.TestCase):
