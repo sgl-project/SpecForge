@@ -216,7 +216,7 @@ index 3ff2a29f3f..ad8ef20dc9 100755
          # Extra key for caller-defined request classification.
          if lora_id is not None:
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 7dc5be833f..5dc9c81946 100644
+index 7dc5be833f..8212d4efe4 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -655,6 +655,19 @@ class Scheduler(
@@ -371,6 +371,20 @@ index 7dc5be833f..5dc9c81946 100644
              and self._pp_microbatches_drained()
          )
  
+@@ -4328,6 +4402,13 @@
+         # signal handler); no reader consumes them.
+         ret.pop("model_config", None)
+         ret.pop("custom_sigquit_handler", None)
++
++        if self.server_args.enable_spec_capture:
++            from sglang.srt.spec_capture_sink import get_sink
++
++            sink = get_sink()
++            if sink is not None:
++                ret["spec_capture_control"] = sink.control_endpoint()
+
+         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
+
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 index 024781c37e..31defd0da1 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
@@ -892,10 +906,10 @@ index 5c4f3ff44a..c40bcc6c42 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000..2b9f14f
+index 0000000..2deff06ff0
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,775 @@
+@@ -0,0 +1,791 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -1094,7 +1108,7 @@ index 0000000..2b9f14f
 +    #: How long a full arena waits for frees before failing the batch.
 +    _WAIT_S = 30.0
 +
-+    def __init__(self, device: torch.device) -> None:
++    def __init__(self, device: torch.device, *, listener=None) -> None:
 +        capacity = os.environ.get(_ARENA_BYTES_ENV)
 +        if not capacity:
 +            raise ValueError(
@@ -1124,7 +1138,7 @@ index 0000000..2b9f14f
 +        self._spans = [(0, self.capacity)]  # free (offset, size), sorted, coalesced
 +        self._objects: Dict[str, Tuple[int, int]] = {}  # key -> (offset, size)
 +        port = int(os.environ.get("SGLANG_SPEC_CAPTURE_CONTROL_PORT", "0"))
-+        self._listener = socket.create_server(("", port))
++        self._listener = listener or socket.create_server(("", port))
 +        self._listener.setblocking(False)
 +        self._peers: Dict[socket.socket, bytes] = {}  # connection -> partial line
 +        self.session = f"{host}:{self._engine.get_rpc_port()}"
@@ -1260,6 +1274,7 @@ index 0000000..2b9f14f
 +        self._store = None
 +        self._put_config = None
 +        self._capture_arena: Optional[CaptureArena] = None
++        self._control_listener: Optional[socket.socket] = None
 +        self._lock = threading.Lock()
 +        # One store writer is sufficient: Mooncake already stripes a batched
 +        # transfer internally.  The executor decouples that host transfer from
@@ -1315,11 +1330,26 @@ index 0000000..2b9f14f
 +            logger.info("spec-capture mooncake sink connected")
 +            return store
 +
++    def control_endpoint(self) -> Optional[str]:
++        """Advertise cleanup before the first capture, without allocating HBM."""
++        if not arena_enabled():
++            return None
++        with self._lock:
++            if self._control_listener is None:
++                port = int(os.environ.get("SGLANG_SPEC_CAPTURE_CONTROL_PORT", "0"))
++                self._control_listener = socket.create_server(("", port))
++                self._control_listener.setblocking(False)
++            host = os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost")
++            return f"{host}:{self._control_listener.getsockname()[1]}"
++
 +    def _arena(self, device: torch.device) -> CaptureArena:
 +        # Lazy like _connect(): only the writer rank allocates, on first capture.
++        self.control_endpoint()
 +        with self._lock:
 +            if self._capture_arena is None:
-+                self._capture_arena = CaptureArena(device)
++                self._capture_arena = CaptureArena(
++                    device, listener=self._control_listener
++                )
 +            return self._capture_arena
 +
 +    # -- key/put primitives (pinned to MooncakeFeatureStore's layout) --------

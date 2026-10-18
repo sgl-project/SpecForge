@@ -335,6 +335,16 @@ class SpecCaptureSinkTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "SGLANG_SPEC_CAPTURE_ARENA_BYTES"):
                 self.module.CaptureArena(torch.device("cpu"))
 
+    def test_control_is_discoverable_before_any_gpu_allocation(self):
+        with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
+            with mock.patch.object(self.module, "CaptureArena") as arena:
+                control = self.sink.control_endpoint()
+                self.addCleanup(self.sink._control_listener.close)
+                self.assertEqual(self.sink.control_endpoint(), control)
+                self.assertGreater(int(control.rsplit(":", 1)[1]), 0)
+                self.assertIsNone(self.sink._capture_arena)
+                arena.assert_not_called()
+
     def test_nvlink_always_publishes_device_memory(self):
         with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
             self.assertTrue(self.module.gpu_put_enabled())
@@ -368,7 +378,11 @@ class SpecCaptureSinkTest(unittest.TestCase):
             mock.patch.dict("os.environ", env, clear=True),
             mock.patch.dict(sys.modules, {"mooncake.engine": mooncake}),
         ):
+            control = self.sink.control_endpoint()
+            listener = self.sink._control_listener
             (result,) = self.sink.put_samples([(spec, aux, last)])
+        self.assertEqual(result["arena"]["control"], control)
+        self.assertIs(self.sink._capture_arena._listener, listener)
         self.assertEqual(result["arena"]["session"], "127.0.0.1:15459")
         expected = {
             "hidden_states": aux.unsqueeze(0),

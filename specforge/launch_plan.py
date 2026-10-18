@@ -25,6 +25,7 @@ from specforge.config.schema import (
     SGLANG_PASSTHROUGH_FIELDS,
     SGLANG_SECRET_FLAGS,
     sglang_field_flag,
+    validate_receive_buffers,
 )
 from specforge.runtime.data_plane.mooncake_rdma import (
     check_rdma_environment,
@@ -393,15 +394,22 @@ def _disaggregated_env(
             values[name] = str(value)
 
     if deployment.backend == "mooncake":
-        if (
-            deployment.receive_buffers == "cuda"
-            and values.get("MOONCAKE_PROTOCOL", "tcp") != "rdma"
-        ):
+        protocol = values.get("MOONCAKE_PROTOCOL", "tcp")
+        validate_receive_buffers(deployment.receive_buffers, protocol)
+        if protocol == "nvlink" and cfg.runtime.resident_high_watermark_bytes is None:
             raise ValueError(
-                "receive_buffers=cuda needs an RDMA Mooncake transport; "
-                "the effective MOONCAKE_PROTOCOL must be rdma"
+                "MOONCAKE_PROTOCOL=nvlink keeps objects in capture-server HBM; set "
+                "runtime.resident_high_watermark_bytes at or below the servers' "
+                "summed SGLANG_SPEC_CAPTURE_ARENA_BYTES"
             )
-        required = ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
+        values.update(_mooncake_transport_env(protocol))
+        # Arena objects stay on the capture servers, so there are no store
+        # endpoints; currently only online NVLink capture uses the arena.
+        required = (
+            ()
+            if protocol == "nvlink"
+            else ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
+        )
         missing = [
             name for name in required if not values.get(name) and not base_env.get(name)
         ]
@@ -459,6 +467,9 @@ def _managed_mooncake_transport(
         protocol = "tcp"
     else:
         protocol = "rdma"
+    if protocol == "nvlink":
+        validate_receive_buffers(deployment.receive_buffers, protocol)
+        return protocol, None, None
     if protocol == "rdma":
         try:
             devices = rdma_device_resolver(
@@ -512,6 +523,7 @@ def _managed_local_environment(
     # auto-discovery with a silent TCP fallback.
     if rdma_devices:
         values["MOONCAKE_RDMA_DEVICES"] = rdma_devices
+    values.update(_mooncake_transport_env(protocol))
     return values
 
 
@@ -541,6 +553,11 @@ def _managed_rdma_memlock_bytes(
     )
     devices = environment["MOONCAKE_RDMA_DEVICES"].split(",")
     return len(devices) * max(server_bytes, trainer_bytes)
+
+
+def _mooncake_transport_env(protocol: str) -> dict[str, str]:
+    # Mooncake picks NVLink over present RDMA NICs only when this is set.
+    return {"MC_FORCE_MNNVL": "1"} if protocol == "nvlink" else {}
 
 
 def _device_visibility_env_var() -> str:
@@ -735,6 +752,11 @@ def _managed_local_services(
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
+            **(
+                {"SGLANG_SPEC_CAPTURE_ARENA_BYTES": str(mooncake.arena_bytes)}
+                if mooncake.arena_bytes is not None
+                else {}
+            ),
         }
         capture_services.append(
             ServiceSpec(
