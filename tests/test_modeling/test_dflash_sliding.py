@@ -1,3 +1,4 @@
+import copy
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -5,6 +6,7 @@ from unittest import mock
 import torch
 from torch import nn
 from transformers import DynamicCache, Qwen3Config
+from transformers.utils import is_flash_attn_2_available
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.modeling.draft.dflash import (
@@ -84,7 +86,7 @@ def _reference_generation_mask(context_length, query_length, causal, window):
         [
             [
                 (not causal or key <= context_length + query)
-                and (window is None or context_length + query - key < window)
+                and (window is None or abs(context_length + query - key) < window)
                 for key in range(context_length + query_length)
             ]
             for query in range(query_length)
@@ -263,6 +265,25 @@ class TestDFlashGenerationMasks(unittest.TestCase):
         block.assert_not_called()
         self.assertTrue(all(layer.attention_mask is None for layer in layers))
 
+    def test_flash_attention_accepts_windows_smaller_than_query(self):
+        for window, causal, override in (
+            (1, None, None),
+            (1, True, None),
+            (1, False, None),
+            (1, False, True),
+            (1, True, False),
+            (2, False, None),
+            (3, False, None),
+        ):
+            with self.subTest(window=window, causal=causal, override=override):
+                model, layers = _capture_model(
+                    ["full_attention", "sliding_attention"], sliding_window=window
+                )
+                model.config._attn_implementation = "flash_attention_2"
+                model.config.is_causal = causal
+                _forward(model, None, is_causal=override)
+                self.assertTrue(all(layer.attention_mask is None for layer in layers))
+
     def test_default_flex_masks_select_backend_block_size(self):
         for backend in (None, "TRITON", "FLASH"):
             with self.subTest(backend=backend):
@@ -298,6 +319,127 @@ class TestDFlashGenerationMasks(unittest.TestCase):
                 _forward(model, None)
             create_mask.assert_not_called()
             self.assertIsNone(layers[0].attention_mask)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and torch.cuda.is_bf16_supported()
+    and is_flash_attn_2_available(),
+    "CUDA, BF16 and FlashAttention 2 are required",
+)
+class TestDFlashFlashAttentionParity(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from transformers.modeling_flash_attention_utils import (
+            lazy_import_flash_attention,
+        )
+
+        # The availability flag only checks package metadata, not the CUDA ABI.
+        # CI separately requires this import to succeed before running tests.
+        try:
+            lazy_import_flash_attention("flash_attention_2")
+        except (ImportError, OSError) as error:
+            raise unittest.SkipTest(
+                f"FlashAttention 2 cannot be loaded: {error}"
+            ) from error
+
+    def test_real_flash_attention_matches_sdpa_outputs_and_gradients(self):
+        torch.manual_seed(91)
+        for window in (None, 1, 3, 4, 16):
+            for causal in (None, False, True):
+                config = _draft_config(
+                    (
+                        ["full_attention"]
+                        if window is None
+                        else ["full_attention", "sliding_attention"]
+                    ),
+                    window,
+                )
+                config.hidden_size = 64
+                config.intermediate_size = 128
+                config.head_dim = 32
+                config.is_causal = causal
+                config.dtype = torch.bfloat16
+                sdpa = DFlashDraftModel(config).to("cuda", dtype=torch.bfloat16).eval()
+                fa_config = copy.deepcopy(config)
+                fa_config._attn_implementation = "flash_attention_2"
+                flash = (
+                    DFlashDraftModel(fa_config).to("cuda", dtype=torch.bfloat16).eval()
+                )
+                flash.load_state_dict(sdpa.state_dict())
+                for cached_length, query_length in ((0, 4), (5, 4), (5, 1)):
+                    with self.subTest(
+                        window=window,
+                        causal=causal,
+                        cache=cached_length,
+                        query=query_length,
+                    ):
+                        inputs = dict(
+                            noise_embedding=torch.randn(
+                                1, query_length, 64, device="cuda", dtype=torch.bfloat16
+                            ),
+                            target_hidden=torch.randn(
+                                1,
+                                3,
+                                sdpa.fc.in_features,
+                                device="cuda",
+                                dtype=torch.bfloat16,
+                            ),
+                            position_ids=torch.arange(
+                                cached_length,
+                                cached_length + 3 + query_length,
+                                device="cuda",
+                            )[None],
+                        )
+                        caches = [DynamicCache(), DynamicCache()]
+                        if cached_length:
+                            for layer_idx in range(config.num_hidden_layers):
+                                key = torch.randn(
+                                    1,
+                                    1,
+                                    cached_length,
+                                    32,
+                                    device="cuda",
+                                    dtype=torch.bfloat16,
+                                )
+                                value = torch.randn_like(key)
+                                for cache in caches:
+                                    cache.update(key.clone(), value.clone(), layer_idx)
+                        gradient = torch.randn_like(inputs["noise_embedding"])
+                        results = []
+                        for model, cache in zip((sdpa, flash), caches):
+                            noise = inputs["noise_embedding"].clone().requires_grad_()
+                            context = inputs["target_hidden"].clone().requires_grad_()
+                            output = model(
+                                noise_embedding=noise,
+                                target_hidden=context,
+                                position_ids=inputs["position_ids"],
+                                past_key_values=cache,
+                            )
+                            grads = torch.autograd.grad(
+                                (output.float() * gradient.float()).sum(),
+                                (noise, context, *model.parameters()),
+                            )
+                            results.append((output.detach(), *grads))
+                        torch.testing.assert_close(
+                            results[1][0], results[0][0], atol=3e-3, rtol=3e-2
+                        )
+                        names = (
+                            "noise_embedding",
+                            "target_hidden",
+                            *(name for name, _ in sdpa.named_parameters()),
+                        )
+                        for name, expected, actual in zip(
+                            names, results[0][1:], results[1][1:]
+                        ):
+                            # BF16 reductions can cancel near zero, making an
+                            # elementwise relative gradient check unstable.
+                            expected, actual = expected.float(), actual.float()
+                            self.assertLessEqual(
+                                (actual - expected).norm().item(),
+                                0.02 * expected.norm().item() + 1e-6,
+                                msg=f"Gradient mismatch for {name}",
+                            )
 
 
 class TestDFlashSlidingDispatch(unittest.TestCase):

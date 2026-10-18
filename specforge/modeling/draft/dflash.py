@@ -805,10 +805,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         Training always passes masks. A mask-free call is one draft block after
         the cached plus new context (``spec_generate``); build masks matching
-        SGLang's DFlash attention. Backends without mask support
-        (flash_attention_2) apply ``is_causal`` and the window natively; FA2's
-        window is symmetric, so a bidirectional sliding layer with
-        sliding_window < block_size also bounds the right side there.
+        the training masks. FA2 applies causality and the symmetric window
+        natively, including when the query block is longer than the window.
         """
         if attention_mask is not None:
             return attention_mask

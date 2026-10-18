@@ -63,11 +63,10 @@ def create_dflash_sdpa_mask(
     if is_causal:
         mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
     if sliding_window is not None:
-        # Left window bound inside the block. Only bites when sliding_window <
-        # block_size; no right bound, since SGLang backends disagree on one for
-        # non-causal windows (FA3 symmetric, FlashInfer/Triton left-only).
+        # Bound both sides independently of causality, matching FA2/FA3's
+        # (W - 1, W - 1) window. Causal layers additionally hide future keys.
         mask_draft = mask_draft & (
-            kv_block_offsets >= q_block_offsets - (sliding_window - 1)
+            (kv_block_offsets - q_block_offsets).abs() < sliding_window
         )
 
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
@@ -121,7 +120,7 @@ def create_dflash_block_mask(
             mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
         if sliding_window is not None:
             mask_draft = mask_draft & (
-                kv_block_offset >= q_block_offset - (sliding_window - 1)
+                (kv_block_offset - q_block_offset).abs() < sliding_window
             )
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]

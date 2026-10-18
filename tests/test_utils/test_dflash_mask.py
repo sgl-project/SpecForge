@@ -60,7 +60,7 @@ def _reference_dflash_mask(
                         kv_idx >= anchor_pos + q_offset - (sliding_window - 1)
                     )
                     draft_visible = draft_visible and (
-                        kv_offset >= q_offset - (sliding_window - 1)
+                        abs(kv_offset - q_offset) < sliding_window
                     )
 
                 if ctx_visible or draft_visible:
@@ -391,7 +391,7 @@ class TestDFlashMask(unittest.TestCase):
             (8, None, False, True),  # sliding, unset -> causal
             (8, False, True, True),
             (8, True, False, True),
-            (2, False, True, False),  # window bounds the left side only
+            (2, False, False, False),  # both sides obey the window
             (2, True, False, False),
         )
         for sliding_window, is_causal, sees_right, sees_far_left in cases:
@@ -408,6 +408,30 @@ class TestDFlashMask(unittest.TestCase):
                 self.assertEqual(mask[0, 0, 0, 12 + 3].item(), sees_right)
                 self.assertEqual(mask[0, 0, 3, 12 + 0].item(), sees_far_left)
                 self.assertTrue(mask[0, 0, 3, 12 + 3].item())
+
+    def test_bidirectional_window_bounds_both_sides_of_draft_block(self):
+        anchors = torch.tensor([[6]], device=self.device)
+        keep = torch.tensor([[True]], device=self.device)
+        for window in (1, 2, 3, 4, 8):
+            with self.subTest(window=window):
+                kwargs = dict(
+                    anchor_positions=anchors,
+                    block_keep_mask=keep,
+                    S=12,
+                    block_size=4,
+                    device=self.device,
+                    sliding_window=window,
+                    is_causal=False,
+                )
+                dense = create_dflash_sdpa_mask(**kwargs)[0, 0, :, 12:]
+                block = create_dflash_block_mask(**kwargs)
+                positions = torch.arange(4, device=self.device)
+                expected = (positions[:, None] - positions[None, :]).abs() < window
+                actual = block.mask_mod(
+                    0, 0, positions[:, None], 12 + positions[None, :]
+                )
+                torch.testing.assert_close(dense, expected)
+                torch.testing.assert_close(actual, expected)
 
     def test_training_mask_reads_draft_config_is_causal(self):
         anchors = torch.tensor([[12]], device=self.device)
