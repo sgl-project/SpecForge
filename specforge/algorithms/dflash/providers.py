@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 
 from specforge.algorithms.common.defaults import (
@@ -42,6 +43,16 @@ DRAFT_ARCHITECTURE = "DFlashDraftModel"
 DFLASH2_DRAFT_ARCHITECTURE = "DFlash2DraftModel"
 COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
     {DRAFT_ARCHITECTURE, DFLASH2_DRAFT_ARCHITECTURE}
+)
+# The objective reads only the aux hidden states. The final hidden state feeds
+# teacher-agreement diagnostics and is optional for every consumer.
+SERVER_CAPTURE_LAYOUT = ServerCaptureLayout(
+    aux_feature="hidden_states",
+    last_hidden_feature="target_last_hidden_states",
+    passthrough=(
+        ("input_ids", "input_ids", ()),
+        ("loss_mask", "loss_mask", ()),
+    ),
 )
 
 
@@ -96,18 +107,30 @@ def resume_contract(_config, draft_model, training_model):
     return contract
 
 
-def resolve_dflash_kernels(config):
-    if not config.model.use_liger_kernel:
-        return None
-    if config.training.strategy != "dflash":
-        raise ValueError(
-            "model.use_liger_kernel is currently supported only with "
-            "training.strategy=dflash"
+def resolve_dflash_kernels(config, draft_config):
+    """Resolve ``model.use_liger_kernel`` on this trainer rank's device.
+
+    Planning already rejected an explicit ``true`` for other strategies. Export
+    and inference build the draft without kernels, so they stay native.
+    """
+    from specforge.modeling.draft.dflash_kernels import (
+        load_liger_dflash_kernels,
+        resolve_draft_liger_kernel_choice,
+    )
+    from specforge.training.checkpoint import CheckpointManager
+
+    choice = resolve_draft_liger_kernel_choice(
+        config.model.use_liger_kernel, draft_config
+    )
+    kernels = load_liger_dflash_kernels(choice) if choice.enabled else None
+    if CheckpointManager.is_rank0():
+        advice = (
+            "; compare the loss against model.use_liger_kernel: false"
+            if choice.unvalidated
+            else ""
         )
-
-    from specforge.modeling.draft.dflash_kernels import load_liger_dflash_kernels
-
-    return load_liger_dflash_kernels()
+        print(f"[dflash] {choice.describe()}{advice}", flush=True)
+    return kernels
 
 
 def build_draft(config, draft_config):
@@ -116,7 +139,7 @@ def build_draft(config, draft_config):
     return build_dflash_draft(
         config,
         draft_config,
-        resolve_dflash_kernels(config),
+        resolve_dflash_kernels(config, draft_config),
     )
 
 
@@ -162,6 +185,14 @@ def needs_input_tools(config, draft_model):
     return dflash_needs_input_tools(config, draft_model)
 
 
+def select_server_capture_layout(config):
+    """Stop requesting the final hidden state when teacher metrics are off."""
+
+    if config.training.dflash_teacher_metrics:
+        return SERVER_CAPTURE_LAYOUT
+    return replace(SERVER_CAPTURE_LAYOUT, last_hidden_feature=None)
+
+
 def algorithm_spec() -> AlgorithmSpec:
     ready = {"input_ids", "loss_mask", "hidden_states"}
     return AlgorithmSpec(
@@ -195,6 +226,8 @@ def algorithm_spec() -> AlgorithmSpec:
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
+            supports_teacher_metrics_opt_out=True,
+            supports_liger_kernel=True,
         ),
     )
 
@@ -253,15 +286,9 @@ def algorithm_providers() -> AlgorithmProviders:
                 modality="text",
                 capture_method="dflash",
                 target_representation=None,
-                layout=ServerCaptureLayout(
-                    aux_feature="hidden_states",
-                    last_hidden_feature="target_last_hidden_states",
-                    passthrough=(
-                        ("input_ids", "input_ids", ()),
-                        ("loss_mask", "loss_mask", ()),
-                    ),
-                ),
+                layout=SERVER_CAPTURE_LAYOUT,
                 build_collator=collator,
+                select_layout=select_server_capture_layout,
             ),
             ServerStreamingProvider(
                 modality="multimodal",

@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
@@ -145,12 +145,32 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     ):
         if os.environ.get(env_name):
             setup_kwargs[key] = int(os.environ[env_name])
+    deployment = cfg.deployment.disaggregated
+    receive_kwargs: Dict[str, Any] = {
+        "receive_buffers": deployment.receive_buffers if deployment else "pinned"
+    }
+    if os.environ.get("DISAGG_RECEIVE_BUFFERS"):
+        receive_kwargs["receive_buffers"] = os.environ["DISAGG_RECEIVE_BUFFERS"]
+        if (
+            receive_kwargs["receive_buffers"] == "cuda"
+            and setup_kwargs["protocol"] != "rdma"
+        ):
+            raise ValueError(
+                "DISAGG_RECEIVE_BUFFERS=cuda needs MOONCAKE_PROTOCOL=rdma; the "
+                f"{setup_kwargs['protocol']!r} transport cannot write into device memory"
+            )
+    if os.environ.get("DISAGG_RECEIVE_POOL_BYTES"):
+        receive_kwargs["receive_pool_bytes"] = int(
+            os.environ["DISAGG_RECEIVE_POOL_BYTES"]
+        )
     return MooncakeFeatureStore(
         store_id=os.environ.get("DISAGG_STORE_ID", cfg.run_id),
         setup_kwargs=setup_kwargs,
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
+        max_quarantined_bytes=cfg.runtime.feature_store_max_quarantined_bytes,
+        **receive_kwargs,
     )
 
 
@@ -199,6 +219,18 @@ def _consumer_database_path(cfg: Config) -> Optional[str]:
         return None
     state_dir = deployment.consumer_state_dir or deployment.control_dir
     return os.path.join(state_dir, "consumer.sqlite")
+
+
+def _consumer_async_ack(cfg: Config) -> Optional[bool]:
+    """An explicit ``DISAGG_ASYNC_ACK`` wins; otherwise the typed switch.
+
+    ``None`` lets the consumer builder parse the environment value, so a worker
+    started without the launch plan still honours ``async_ack: false``.
+    """
+    if os.environ.get("DISAGG_ASYNC_ACK", "").strip():
+        return None
+    deployment = cfg.deployment.disaggregated
+    return None if deployment is None else deployment.async_ack
 
 
 def _online_prompt_seed(cfg: Config) -> int:
@@ -403,6 +435,7 @@ def _build_offline(
     build_model_bundle: Callable,
     optimizer_factory: Callable,
     logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
 ):
     from specforge.training.assembly import (
         TrainingRun,
@@ -489,6 +522,9 @@ def _build_offline(
 
         return TrainingRun(execute=produce)
 
+    if preflight_model_bundle is not None:
+        # The model is otherwise first built only after the whole ingest.
+        preflight_model_bundle(cfg)
     _wait_for(done, failure_path=manifest + ".failed")
     from specforge.launch import build_disagg_offline_runtime
     from specforge.runtime.data_plane.disagg_ingest import read_ref_manifest
@@ -497,10 +533,11 @@ def _build_offline(
     accumulation_steps = cfg.training.accumulation_steps
     if cfg.training.attention_backend == "usp":
         accumulation_steps *= cfg.training.sp_ulysses_size * cfg.training.sp_ring_size
+    store = _offline_store(cfg, retain_on_release=True)
     trainer = build_disagg_offline_runtime(
         algorithm=algorithm,
         modality=cfg.model.input_modality,
-        feature_store=_offline_store(cfg, retain_on_release=True),
+        feature_store=store,
         refs=read_ref_manifest(manifest),
         draft_model=bundle.model,
         target_head=bundle.target_head,
@@ -542,6 +579,7 @@ def _build_offline(
         trainer=trainer,
         on_success=mark_consumed,
         on_failure=mark_consumer_failed,
+        on_finally=getattr(store, "close", None),
     )
 
 
@@ -565,6 +603,7 @@ def _build_online(
     prepare_prompts: Callable,
     optimizer_factory: Callable,
     logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
 ):
     from specforge.training.assembly import (
         TrainingRun,
@@ -578,6 +617,10 @@ def _build_online(
     channel_path = _env("DISAGG_REF_CHANNEL")
     if cfg.training.role == "producer":
         _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
+    elif preflight_model_bundle is not None:
+        # Check trainer dependencies before opening the store or waiting on
+        # the producer, so a failed preflight owns no transport resources.
+        preflight_model_bundle(cfg)
     # The producer owns capture and explicit attempt cleanup. The consumer must
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
@@ -588,6 +631,7 @@ def _build_online(
     channel = StreamingRefChannel(channel_path)
 
     if cfg.training.role == "producer":
+        from specforge.algorithms.common.providers import resolve_server_capture_layout
         from specforge.inference.adapters.server_capture import (
             ServerCaptureSchema,
             SGLangServerCaptureAdapter,
@@ -633,7 +677,7 @@ def _build_online(
         layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
             cfg, algorithm
         )
-        layout = streaming.layout
+        layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
         capture_schema = ServerCaptureSchema(
             aux_feature=layout.aux_feature,
             last_hidden_feature=layout.last_hidden_feature,
@@ -802,9 +846,10 @@ def _build_online(
         resume_from=cfg.training.resume_from,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
+        async_ack=_consumer_async_ack(cfg),
     )
 
-    return TrainingRun(trainer=trainer)
+    return TrainingRun(trainer=trainer, on_finally=store.close)
 
 
 def build_disaggregated_run(
@@ -815,8 +860,13 @@ def build_disaggregated_run(
     prepare_prompts: Callable,
     optimizer_factory: Callable,
     logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
 ):
-    """Assemble the configured producer or consumer role."""
+    """Assemble the configured producer or consumer role.
+
+    ``preflight_model_bundle(cfg)`` runs on the consumer before it waits on the
+    producer, so dependencies ``build_model_bundle`` needs fail at startup.
+    """
     if cfg.training.role not in ("producer", "consumer"):
         raise ValueError(
             "disaggregated runs require training.role=producer or consumer"
@@ -829,6 +879,7 @@ def build_disaggregated_run(
                 build_model_bundle=build_model_bundle,
                 optimizer_factory=optimizer_factory,
                 logger=logger,
+                preflight_model_bundle=preflight_model_bundle,
             )
         return _build_online(
             cfg,
@@ -837,6 +888,7 @@ def build_disaggregated_run(
             prepare_prompts=prepare_prompts,
             optimizer_factory=optimizer_factory,
             logger=logger,
+            preflight_model_bundle=preflight_model_bundle,
         )
     except BaseException as exc:
         _publish_role_assembly_failure(cfg, exc)

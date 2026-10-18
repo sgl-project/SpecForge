@@ -5,7 +5,7 @@ its model and data paths, and launch it directly; multi-process topology is
 already recorded in the YAML:
 
 ```bash
-specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml
 ```
 
 The directory path identifies feature mode, topology, and—in the online
@@ -14,10 +14,10 @@ choose the model and strategy inside it:
 
 | Category | Use it when | Representative config |
 | --- | --- | --- |
-| Offline colocated | Feature checkpoints already exist and the trainer can read them directly | [`offline/colocated/qwen3-8b-eagle3-offline.yaml`](./configs/offline/colocated/qwen3-8b-eagle3-offline.yaml) |
-| Offline disaggregated | A producer must ingest existing features for a separate trainer pool | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](./configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
-| Online disaggregated, external | Mooncake and patched SGLang are started by the user or scheduler | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](./configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
-| Online disaggregated, managed-local | One command should own a single-node Mooncake/SGLang/trainer stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](./configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+| Offline colocated | Feature checkpoints already exist and the trainer can read them directly | [`offline/colocated/qwen3-8b-eagle3.yaml`](./configs/offline/colocated/qwen3-8b-eagle3.yaml) |
+| Offline disaggregated | A producer must ingest existing features for a separate trainer pool | [`offline/disaggregated/qwen3-8b-eagle3.yaml`](./configs/offline/disaggregated/qwen3-8b-eagle3.yaml) |
+| Online disaggregated, external | Mooncake and patched SGLang are started by the user or scheduler | [`online/disaggregated/external/qwen3-8b-eagle3.yaml`](./configs/online/disaggregated/external/qwen3-8b-eagle3.yaml) |
+| Online disaggregated, managed-local | One command should own a single-node Mooncake/SGLang/trainer stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml`](./configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml) |
 
 The complete model, strategy, CUDA/ROCm/Ascend, and resource-layout catalog is
 documented in [`examples/configs/README.md`](./configs/README.md). The
@@ -47,13 +47,13 @@ delegates to `specforge train`. The
 cluster-provided node rank to the same CLI's producer or consumer role. Launch
 topology remains in YAML. The complete
 environment contract is in the [disaggregated training
-guide](../docs/basic_usage/disaggregated_training.md).
+guide](../docs/sections/basic_usage/disaggregated_training.md).
 
 Offline feature training supports EAGLE3, DFlash, Domino, and DSpark, including
 local and disaggregated consumers. Optional config sections provide
 offline evaluation with `<run_id>-best` selection, compact teacher
 projection for offline text EAGLE3, and W&B, TensorBoard, SwanLab, or MLflow
-tracking. See the [training guide](../docs/basic_usage/training.md) for the full
+tracking. See the [training guide](../docs/sections/basic_usage/training.md) for the full
 capability matrix, ROCm installation, and Ascend NPU/HCCL launch example.
 
 Offline colocated and offline disaggregated resume are supported.

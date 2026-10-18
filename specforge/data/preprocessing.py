@@ -37,7 +37,13 @@ from transformers import PreTrainedTokenizer
 
 from ..distributed import get_draft_sp_group, get_sp_ring_group
 from .loss_mask import has_consecutive_supervised_tokens
-from .parse import GeneralParser, GLMParser, HarmonyParser, ThinkingParser
+from .parse import (
+    DeepSeekV4Parser,
+    GeneralParser,
+    GLMParser,
+    HarmonyParser,
+    ThinkingParser,
+)
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -141,6 +147,8 @@ def preprocess_conversations(
         parser = GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
         parser = ThinkingParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "deepseek-v4":
+        parser = DeepSeekV4Parser(tokenizer, chat_template)
     elif chat_template.parser_type == "glm":
         parser = GLMParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
@@ -505,9 +513,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         attention_mask[:, :valid_len] = 1
         new_data["attention_mask"] = attention_mask
 
-        # Position ids should align with Ulysses all2all-expanded sequence length.
-        # Within each ring group there are sp_ulysses_size Ulysses peers; each holds a
-        # distinct usp_chunk_size slice, so position IDs must differ by ulysses_rank offset.
+        # RoPE runs on local Q/K before Ulysses all-to-all. Each rank needs
+        # the global positions of its own chunk, excluding rollout overlap.
+        # Preserve both Ring-block and Ulysses-peer offsets.
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
         usp_chunk_size = max(local_len - ttt_length, 0)
         ring_chunk = usp_chunk_size * sp_ulysses_size

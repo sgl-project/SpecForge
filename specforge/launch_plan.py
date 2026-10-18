@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, Optional, Sequence
 from urllib import error as urllib_error
@@ -20,6 +21,16 @@ from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config, ModelConfig
+from specforge.config.schema import (
+    SGLANG_PASSTHROUGH_FIELDS,
+    SGLANG_SECRET_FLAGS,
+    sglang_field_flag,
+)
+from specforge.runtime.data_plane.mooncake_rdma import (
+    check_rdma_environment,
+    memlock_shortfall,
+    resolve_rdma_devices,
+)
 
 if TYPE_CHECKING:
     from specforge.algorithms.registry import AlgorithmRegistration
@@ -37,6 +48,11 @@ _SECRET_NAMES = (
     "credential",
     "wandb_key",
     "swanlab_key",
+    # Passthrough SGLang flags (``--api-key``) and server env (``HF_TOKEN``).
+    "api_key",
+    "access_key",
+    "hf_token",
+    "hub_token",
 )
 
 
@@ -45,12 +61,21 @@ class _ForwardedSignal(BaseException):
         self.signum = signum
 
 
+def _is_secret_name(name: str) -> bool:
+    normalized = name.lower().replace("-", "_")
+    return any(fragment in normalized for fragment in _SECRET_NAMES) or (
+        name.startswith("--")
+        and len(name) > 2
+        and any(flag.startswith(name) for flag in SGLANG_SECRET_FLAGS)
+    )
+
+
 def _redacted(value: str) -> str:
     name = None
     raw = value
     if "=" in value:
         name, raw = value.split("=", 1)
-        if any(fragment in name.lower() for fragment in _SECRET_NAMES):
+        if _is_secret_name(name):
             return f"{name}=<redacted>"
     try:
         parsed = urlsplit(raw)
@@ -78,11 +103,28 @@ def _redacted(value: str) -> str:
     return f"{name}={raw}" if name is not None else raw
 
 
+def _redacted_argv(argv: Sequence[str]) -> list[str]:
+    """Redact ``name=value`` secrets and the value after a ``--secret`` flag."""
+    redacted: list[str] = []
+    for index, value in enumerate(argv):
+        previous = argv[index - 1] if index else ""
+        if (
+            previous.startswith("--")
+            and "=" not in previous
+            and _is_secret_name(previous)
+            and not value.startswith("--")
+        ):
+            redacted.append("<redacted>")
+        else:
+            redacted.append(_redacted(value))
+    return redacted
+
+
 def _redacted_env(values: Mapping[str, Optional[str]]) -> dict[str, Optional[str]]:
     return {
         name: (
             "<redacted>"
-            if any(fragment in name.lower() for fragment in _SECRET_NAMES)
+            if _is_secret_name(name)
             else (_redacted(value) if value is not None else None)
         )
         for name, value in sorted(values.items())
@@ -100,7 +142,7 @@ class CommandSpec:
     def as_dict(self) -> dict:
         return {
             "label": self.label,
-            "argv": [_redacted(value) for value in self.argv],
+            "argv": _redacted_argv(self.argv),
             "env": _redacted_env(self.env),
         }
 
@@ -112,12 +154,14 @@ class ReadinessSpec:
     timeout_s: float
     tcp_host: Optional[str] = None
     tcp_port: Optional[int] = None
+    probe_timeout_s: float = 5.0
 
     def as_dict(self) -> dict:
         return {
             "kind": self.kind,
             "url": _redacted(self.url),
             "timeout_s": self.timeout_s,
+            "probe_timeout_s": self.probe_timeout_s,
             "tcp_host": self.tcp_host,
             "tcp_port": self.tcp_port,
         }
@@ -150,6 +194,17 @@ class LaunchPlan:
     services: tuple[ServiceSpec, ...] = ()
     managed_root: Optional[str] = None
     managed_ports: tuple[int, ...] = ()
+    #: Host bytes the largest owned Mooncake client registers over RDMA, which
+    #: RLIMIT_MEMLOCK must cover; None when the managed stack uses TCP or its
+    #: RDMA devices are unresolved.
+    managed_rdma_memlock_bytes: Optional[int] = None
+    #: Why the managed stack's RDMA devices could not be resolved on this host.
+    #: The plan still renders (``--plan`` off the training node); the managed
+    #: preflight raises it before anything starts.
+    managed_rdma_error: Optional[str] = None
+    #: Deferred trainer-side dependency checks a supervisor runs before it
+    #: starts any service or worker; planning itself stays side-effect free.
+    preflight_checks: tuple[Callable[[], None], ...] = ()
     # SIGTERM-trapped workers run Mooncake drains, checkpoint flushes, and
     # failure-sentinel publication inside this window before SIGKILL.
     shutdown_grace_s: float = 30.0
@@ -167,6 +222,8 @@ class LaunchPlan:
                     "services": [service.as_dict() for service in self.services],
                     "managed_root": self.managed_root,
                     "managed_ports": list(self.managed_ports),
+                    "managed_rdma_memlock_bytes": self.managed_rdma_memlock_bytes,
+                    "managed_rdma_error": self.managed_rdma_error,
                     "shutdown_grace_s": self.shutdown_grace_s,
                 }
             )
@@ -292,6 +349,9 @@ def _disaggregated_env(
                     )
                     / "inboxes"
                 ),
+                "DISAGG_ASYNC_ACK": base_env.get(
+                    "DISAGG_ASYNC_ACK", "1" if deployment.async_ack else "0"
+                ),
             }
         )
     else:
@@ -314,6 +374,8 @@ def _disaggregated_env(
         values["DISAGG_STORE_ROOT"] = deployment.store_root
     if deployment.backend == "mooncake":
         values["DISAGG_CLIENT_BUFFER_SIZE"] = str(deployment.client_buffer_size)
+        values["DISAGG_RECEIVE_BUFFERS"] = deployment.receive_buffers
+        values["DISAGG_RECEIVE_POOL_BYTES"] = str(deployment.receive_pool_bytes)
 
     optional_values = {
         "MOONCAKE_METADATA_SERVER": deployment.mooncake_metadata_server,
@@ -331,6 +393,14 @@ def _disaggregated_env(
             values[name] = str(value)
 
     if deployment.backend == "mooncake":
+        if (
+            deployment.receive_buffers == "cuda"
+            and values.get("MOONCAKE_PROTOCOL", "tcp") != "rdma"
+        ):
+            raise ValueError(
+                "receive_buffers=cuda needs an RDMA Mooncake transport; "
+                "the effective MOONCAKE_PROTOCOL must be rdma"
+            )
         required = ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
         missing = [
             name for name in required if not values.get(name) and not base_env.get(name)
@@ -343,7 +413,85 @@ def _disaggregated_env(
     return values
 
 
-def _managed_local_environment(cfg: Config) -> dict[str, str]:
+def _resolve_managed_rdma_devices(
+    requested: Optional[str], *, defaulted: bool, env: Mapping[str, str]
+) -> str:
+    return resolve_rdma_devices(
+        requested,
+        selected_by=(
+            "managed_local.mooncake.protocol "
+            + ("defaulted to rdma" if defaulted else "is rdma")
+        ),
+        devices_setting="managed_local.mooncake.rdma_devices",
+        opt_out="set managed_local.mooncake.protocol: tcp",
+        env=env,
+    )
+
+
+def _managed_mooncake_transport(
+    cfg: Config,
+    base_env: Mapping[str, str],
+    *,
+    managed_child: bool,
+    rdma_device_resolver: Callable[..., str],
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Resolve the owned stack's Mooncake protocol and RDMA devices once.
+
+    Returns ``(protocol, rdma_devices, error)``; *error* says why the RDMA
+    devices could not be resolved on this host.
+    """
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.managed_local is not None
+    managed = deployment.managed_local
+    mooncake = managed.mooncake
+    if managed_child and base_env.get("MOONCAKE_PROTOCOL"):
+        # The supervisor rendered its resolution into this child's environment.
+        return (
+            base_env["MOONCAKE_PROTOCOL"],
+            base_env.get("MOONCAKE_RDMA_DEVICES"),
+            None,
+        )
+    if mooncake.protocol is not None:
+        protocol = mooncake.protocol
+    elif _device_visibility_env_var() == "ASCEND_RT_VISIBLE_DEVICES":
+        # Ascend stacks keep TCP (the detection behind the NPU attention
+        # backend default).
+        protocol = "tcp"
+    else:
+        protocol = "rdma"
+    if protocol == "rdma":
+        try:
+            devices = rdma_device_resolver(
+                mooncake.rdma_devices,
+                defaulted=mooncake.protocol is None,
+                env=base_env,
+            )
+        except RuntimeError as error:
+            # Keep --plan usable off the training node; the configured list, if
+            # any, is rendered and nothing starts (see _managed_rdma_preflight).
+            return protocol, mooncake.rdma_devices, str(error)
+        return protocol, devices, None
+    # The schema rejects these with an explicit tcp; recheck the Ascend default.
+    if any(server.gpu_put for server in managed.capture_servers):
+        raise ValueError(
+            "managed_local capture_servers[].gpu_put needs Mooncake RDMA, but "
+            "managed_local.mooncake.protocol defaulted to tcp on this Ascend host "
+            "and the tcp transport cannot read device memory; set "
+            "managed_local.mooncake.protocol: rdma or remove gpu_put"
+        )
+    if deployment.receive_buffers == "cuda":
+        raise ValueError(
+            "deployment.disaggregated.receive_buffers=cuda needs Mooncake RDMA, "
+            "but managed_local.mooncake.protocol defaulted to tcp on this Ascend "
+            "host and the tcp transport cannot write into device memory; set "
+            "managed_local.mooncake.protocol: rdma or use pinned receive buffers"
+        )
+    return protocol, mooncake.rdma_devices, None
+
+
+def _managed_local_environment(
+    cfg: Config, *, protocol: str, rdma_devices: Optional[str]
+) -> dict[str, str]:
     deployment = cfg.deployment.disaggregated
     assert deployment is not None and deployment.managed_local is not None
     managed = deployment.managed_local
@@ -357,12 +505,42 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
         ),
         "MOONCAKE_MASTER_SERVER_ADDR": f"127.0.0.1:{mooncake.rpc_port}",
         "MOONCAKE_LOCAL_HOSTNAME": mooncake.local_hostname,
-        "MOONCAKE_PROTOCOL": mooncake.protocol,
+        "MOONCAKE_PROTOCOL": protocol,
         "DISAGG_SERVER_URLS": ",".join(server_urls),
     }
-    if mooncake.rdma_devices:
-        values["MOONCAKE_RDMA_DEVICES"] = mooncake.rdma_devices
+    # Under rdma the list is always resolved; Mooncake treats an empty one as
+    # auto-discovery with a silent TCP fallback.
+    if rdma_devices:
+        values["MOONCAKE_RDMA_DEVICES"] = rdma_devices
     return values
+
+
+def _managed_rdma_memlock_bytes(
+    cfg: Config, environment: Mapping[str, str]
+) -> Optional[int]:
+    """Host bytes one owned Mooncake client may register under RDMA.
+
+    Mooncake registers each host buffer with every selected HCA, and the kernel
+    charges each registration to the process's RLIMIT_MEMLOCK, which every
+    child inherits from the supervisor. The largest client is a capture server
+    (global segment plus local buffer) or a trainer rank (client buffer plus a
+    pinned receive pool; cuda pools live in device memory and pageable reads
+    register one transient buffer per fetch).
+    """
+    if environment["MOONCAKE_PROTOCOL"] != "rdma":
+        return None
+    if not environment.get("MOONCAKE_RDMA_DEVICES"):
+        # Unresolved; the preflight refuses the plan before sizing matters.
+        return None
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.managed_local is not None
+    mooncake = deployment.managed_local.mooncake
+    server_bytes = mooncake.global_segment_size_bytes + mooncake.local_buffer_size_bytes
+    trainer_bytes = deployment.client_buffer_size + (
+        deployment.receive_pool_bytes if deployment.receive_buffers == "pinned" else 0
+    )
+    devices = environment["MOONCAKE_RDMA_DEVICES"].split(",")
+    return len(devices) * max(server_bytes, trainer_bytes)
 
 
 def _device_visibility_env_var() -> str:
@@ -403,18 +581,20 @@ def _sglang_argv(
 ) -> list[str]:
     """Derive SGLang CLI args from all ``sglang_*`` fields on *model*.
 
-    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``.
+    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``
+    unless :func:`sglang_field_flag` records SGLang's own spelling.
     Fields whose values require non-trivial resolution (server-level overrides,
     fallback computations) are passed via *overrides* keyed by the original
     field name; every other ``sglang_*`` field is read directly from *model*.
+    Raw passthrough tokens (``sglang_extra_args``) are appended by the caller.
     """
     resolved = overrides or {}
     argv: list[str] = []
     for name in ModelConfig.model_fields:
-        if not name.startswith("sglang_"):
+        if not name.startswith("sglang_") or name in SGLANG_PASSTHROUGH_FIELDS:
             continue
         value = resolved[name] if name in resolved else getattr(model, name)
-        flag = "--" + name.removeprefix("sglang_").replace("_", "-")
+        flag = sglang_field_flag(name)
         if isinstance(value, bool):
             if value:
                 argv.append(flag)
@@ -427,6 +607,7 @@ def _managed_local_services(
     cfg: Config,
     *,
     algorithm: "AlgorithmRegistration",
+    shared_env: Mapping[str, str],
 ) -> tuple[ServiceSpec, ...]:
     from specforge.training.capture_contract import resolve_server_capture_contract
 
@@ -436,10 +617,17 @@ def _managed_local_services(
     mooncake = managed.mooncake
     control_dir = Path(deployment.control_dir)
     log_dir = control_dir / "logs"
-    shared_env = _managed_local_environment(cfg)
     device_visibility_env = _device_visibility_env_var()
     capture_context_length = cfg.model.sglang_context_length or (
         cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
+    )
+    # GPU publication also needs GPUDirect RDMA (nvidia_peermem or DMA-BUF),
+    # which the preflight cannot see and the sink meets only at its first
+    # capture, so only an explicit protocol: rdma turns it on automatically.
+    default_gpu_put = (
+        False
+        if mooncake.protocol is None and shared_env["MOONCAKE_PROTOCOL"] == "rdma"
+        else None
     )
 
     mooncake_service = ServiceSpec(
@@ -466,6 +654,7 @@ def _managed_local_services(
             mooncake.startup_timeout_s,
             tcp_host="127.0.0.1",
             tcp_port=mooncake.rpc_port,
+            probe_timeout_s=mooncake.probe_timeout_s,
         ),
         log_path=str(log_dir / "mooncake.log"),
         phase=0,
@@ -540,9 +729,20 @@ def _managed_local_services(
                 },
             )
         )
+        # The schema rejects passthrough flags that repeat any flag above.
+        argv.extend(cfg.model.sglang_extra_args)
+        argv.extend(server.extra_args)
+        gpu_put = server.gpu_put if server.gpu_put is not None else default_gpu_put
         service_env = {
+            # Validated not to overlap the keys below, which win regardless.
+            **server.env,
             **shared_env,
             device_visibility_env: ",".join(server.cuda_visible_devices),
+            **(
+                {"SGLANG_SPEC_CAPTURE_GPU_PUT": "1" if gpu_put else "0"}
+                if gpu_put is not None
+                else {}
+            ),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
@@ -560,12 +760,29 @@ def _managed_local_services(
                     "http",
                     f"http://127.0.0.1:{server.port}/health",
                     server.startup_timeout_s,
+                    probe_timeout_s=server.probe_timeout_s,
                 ),
                 log_path=str(log_dir / f"capture-server-{index}.log"),
                 phase=1,
             )
         )
     return (mooncake_service, *capture_services)
+
+
+def _trainer_preflight_checks(
+    cfg: Config,
+    algorithm: Optional["AlgorithmRegistration"],
+) -> tuple[Callable[[], None], ...]:
+    """Trainer-side import checks a supervisor runs before it spawns anything.
+
+    The supervisor runs on the trainer host, so its device matches the
+    trainer's; the trainer rank still owns the authoritative resolution.
+    """
+    if algorithm is None:
+        return ()
+    from specforge.training.model_loading import preflight_draft_kernels
+
+    return (partial(preflight_draft_kernels, cfg, algorithm=algorithm),)
 
 
 def _worker_argv(
@@ -709,8 +926,16 @@ def build_launch_plan(
     env: Optional[Mapping[str, str]] = None,
     worker_prefix: Optional[Sequence[str]] = None,
     torchrun_prefix: Optional[Sequence[str]] = None,
+    rdma_device_resolver: Optional[Callable[..., str]] = None,
 ) -> LaunchPlan:
-    """Resolve one validated config into a side-effect-free process plan."""
+    """Resolve one validated config into a side-effect-free process plan.
+
+    A managed-local stack on RDMA reads the host's HCAs from sysfs;
+    *rdma_device_resolver* replaces that probe (``(rdma_devices, *, defaulted,
+    env) -> device list``). A probe that fails is recorded as
+    ``managed_rdma_error`` instead of raising, so the plan still renders on a
+    host without the HCAs, and the managed preflight refuses to launch it.
+    """
     if cfg.mode == "online":
         if cfg.deployment.mode != "disaggregated":
             raise ValueError(
@@ -773,8 +998,19 @@ def build_launch_plan(
     if cfg.deployment.mode == "disaggregated":
         role_base_env = base_env
         managed_environment: dict[str, str] = {}
+        managed_rdma_error: Optional[str] = None
         if managed_local is not None:
-            managed_environment = _managed_local_environment(cfg)
+            protocol, rdma_devices, managed_rdma_error = _managed_mooncake_transport(
+                cfg,
+                base_env,
+                managed_child=managed_child,
+                rdma_device_resolver=(
+                    rdma_device_resolver or _resolve_managed_rdma_devices
+                ),
+            )
+            managed_environment = _managed_local_environment(
+                cfg, protocol=protocol, rdma_devices=rdma_devices
+            )
             role_base_env = {**base_env, **managed_environment}
         if role in ("producer", "both"):
             producer_env = _disaggregated_env(cfg, role_base_env, role="producer")
@@ -877,7 +1113,9 @@ def build_launch_plan(
             "managed_supervisor",
             "both",
             commands=(producer, consumer),
-            services=_managed_local_services(cfg, algorithm=algorithm),
+            services=_managed_local_services(
+                cfg, algorithm=algorithm, shared_env=managed_environment
+            ),
             managed_root=deployment.control_dir,
             managed_ports=(
                 managed_local.mooncake.rpc_port,
@@ -885,12 +1123,18 @@ def build_launch_plan(
                 managed_local.mooncake.metrics_port,
                 *[server.port for server in managed_local.capture_servers],
             ),
+            managed_rdma_memlock_bytes=_managed_rdma_memlock_bytes(
+                cfg, managed_environment
+            ),
+            managed_rdma_error=managed_rdma_error,
+            preflight_checks=_trainer_preflight_checks(cfg, algorithm),
             shutdown_grace_s=managed_local.shutdown_grace_s,
         )
     return LaunchPlan(
         "supervisor",
         "both",
         commands=(producer, consumer),
+        preflight_checks=_trainer_preflight_checks(cfg, algorithm),
         shutdown_grace_s=deployment.shutdown_grace_s,
     )
 
@@ -958,6 +1202,52 @@ def _terminate_processes(
                 pass
 
 
+def _managed_rdma_preflight(plan: LaunchPlan) -> None:
+    """Refuse an RDMA stack that would fall back to TCP or fail to register."""
+    if plan.managed_rdma_error is not None:
+        raise RuntimeError(plan.managed_rdma_error)
+    opt_out = "set managed_local.mooncake.protocol: tcp"
+    for command in (*(service.command for service in plan.services), *plan.commands):
+        if command.env.get("MOONCAKE_PROTOCOL") != "rdma":
+            continue
+        # Children start from this environment (see _spawn_command).
+        child_env = {
+            name: value
+            for name, value in {**os.environ, **command.env}.items()
+            if value is not None
+        }
+        devices = child_env.get("MOONCAKE_RDMA_DEVICES")
+        check_rdma_environment(
+            child_env,
+            where=f"the {command.label} environment",
+            opt_out=opt_out,
+            devices=devices,
+        )
+        # Per-command port/GID overrides can invalidate the list selected when
+        # building the plan. Recheck that same list in the child's final env.
+        resolve_rdma_devices(
+            devices,
+            selected_by=f"the {command.label} environment selects RDMA",
+            devices_setting=f"{command.label} MOONCAKE_RDMA_DEVICES",
+            opt_out=opt_out,
+            env=child_env,
+        )
+    required = plan.managed_rdma_memlock_bytes
+    if required is None:
+        return
+    limit = memlock_shortfall(required)
+    if limit is not None:
+        raise RuntimeError(
+            f"managed_local Mooncake RDMA registers up to {required} bytes "
+            f"({required / (1 << 30):.1f} GiB) of host memory in one process "
+            "(every host buffer once per selected HCA), but RLIMIT_MEMLOCK is "
+            f"{limit} bytes and this process lacks CAP_IPC_LOCK; owned processes "
+            "inherit both. Raise the limit before launching (ulimit -l unlimited; "
+            "in a container --ulimit memlock=-1 or --cap-add IPC_LOCK), or, to "
+            f"use TCP, {opt_out}."
+        )
+
+
 def _managed_preflight(plan: LaunchPlan) -> None:
     if plan.managed_root is None:
         raise ValueError("managed supervisor plan is missing managed_root")
@@ -984,6 +1274,7 @@ def _managed_preflight(plan: LaunchPlan) -> None:
             "managed_local requires patched SGLang spec capture; run "
             "scripts/apply_sglang_spec_capture_patch.sh"
         )
+    _managed_rdma_preflight(plan)
 
     for port in plan.managed_ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -993,11 +1284,17 @@ def _managed_preflight(plan: LaunchPlan) -> None:
                 raise RuntimeError(
                     f"managed_local port 127.0.0.1:{port} is unavailable: {exc}"
                 ) from exc
+    # Trainer dependencies otherwise fail only after every capture server has
+    # warmed up.
+    for check in plan.preflight_checks:
+        check()
 
 
-def _http_ready(readiness: ReadinessSpec) -> bool:
+def _http_ready(readiness: ReadinessSpec, *, timeout_s: Optional[float] = None) -> bool:
+    if timeout_s is None:
+        timeout_s = readiness.probe_timeout_s
     try:
-        with urllib_request.urlopen(readiness.url, timeout=1.0) as response:
+        with urllib_request.urlopen(readiness.url, timeout=timeout_s) as response:
             status = getattr(response, "status", 200)
             return readiness.kind == "mooncake" or 200 <= status < 300
     except urllib_error.HTTPError as exc:
@@ -1008,17 +1305,27 @@ def _http_ready(readiness: ReadinessSpec) -> bool:
         return False
 
 
-def _readiness_satisfied(readiness: ReadinessSpec) -> bool:
-    if not _http_ready(readiness):
+def _readiness_satisfied(
+    readiness: ReadinessSpec, *, deadline: Optional[float] = None
+) -> bool:
+    started = time.monotonic()
+    probe_deadline = started + readiness.probe_timeout_s
+    if deadline is not None:
+        probe_deadline = min(probe_deadline, deadline)
+    timeout_s = probe_deadline - started
+    if timeout_s <= 0 or not _http_ready(readiness, timeout_s=timeout_s):
+        return False
+    remaining = probe_deadline - time.monotonic()
+    if remaining <= 0:
         return False
     if readiness.kind != "mooncake":
         return True
     assert readiness.tcp_host is not None and readiness.tcp_port is not None
     try:
         with socket.create_connection(
-            (readiness.tcp_host, readiness.tcp_port), timeout=1.0
+            (readiness.tcp_host, readiness.tcp_port), timeout=remaining
         ):
-            return True
+            return time.monotonic() < probe_deadline
     except OSError:
         return False
 
@@ -1037,9 +1344,12 @@ def _wait_for_service(
                     f"managed service {active_service.command.label!r} exited "
                     f"with status {status}; see {active_service.log_path}"
                 )
-        if _readiness_satisfied(service.readiness):
+        if _readiness_satisfied(service.readiness, deadline=deadline):
             return
-        time.sleep(0.25)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.25, remaining))
     if process.poll() is not None:
         raise RuntimeError(
             f"managed service {service.command.label!r} exited during startup; "
@@ -1178,6 +1488,11 @@ def run_commands(
                     services.append((service, _spawn_service(service, popen=popen)))
                 for service, process in services[-len(current_phase) :]:
                     readiness_waiter(service, process, tuple(services))
+        elif plan.kind == "supervisor":
+            # Otherwise a trainer dependency fails only in the consumer, after
+            # the producer has started its work.
+            for check in plan.preflight_checks:
+                check()
         for command in plan.commands:
             processes.append(_spawn_command(command, popen=popen))
         remaining = set(range(len(processes)))

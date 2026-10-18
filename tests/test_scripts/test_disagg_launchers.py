@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ INKLING_TWO_NODE = ROOT / "examples" / "disagg" / "run_inkling_dspark_disagg_2no
 KIMI_K3_CAPTURE_PATCH = (
     ROOT / "patches" / "sglang" / "kimi-k3-f8493a4" / "spec-capture.patch"
 )
+V0518_CAPTURE_PATCH = ROOT / "patches" / "sglang" / "v0.5.18" / "spec-capture.patch"
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):
@@ -144,6 +146,24 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", source)
         self.assertIn("req.finished() and req.spec_capture_result is None", source)
 
+    def test_v0518_capture_patch_routes_capture_only_dspark(self):
+        source = V0518_CAPTURE_PATCH.read_text(encoding="utf-8")
+        added_source = "\n".join(
+            line[1:]
+            for line in source.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        self.assertIn(
+            """is_dspark=(
+                self.spec_algorithm.is_dspark()
+                or (
+                    self.server_args.enable_spec_capture
+                    and self.server_args.spec_capture_method == "dspark"
+                )
+            )""",
+            added_source,
+        )
+
     def test_two_node_wrapper_keeps_training_on_the_unified_cli(self):
         self.assertTrue(os.access(TWO_NODE, os.X_OK))
         syntax = subprocess.run(
@@ -199,6 +219,112 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertNotIn("run_disagg_dflash.py", "".join(outputs.values()))
         self.assertNotIn("torchrun", "".join(outputs.values()))
         self.assertFalse(shared_root.exists())
+
+    def _fake_executable(self, name, body):
+        executable = self.bin_dir / name
+        executable.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+        executable.chmod(0o755)
+
+    def test_two_node_wrapper_resolves_capture_node_hcas_for_rdma(self):
+        # A patched capture server refuses rdma without MOONCAKE_RDMA_DEVICES,
+        # so rank 0 resolves its HCAs before starting anything. The fake python
+        # stands in for the resolver; the fake master records what it inherits
+        # and exits, which ends the attempt.
+        self._fake_executable(
+            "python",
+            'printf "%s\\n" "$@" > "$PYTHON_ARGS"\n'
+            'if [[ -n "${FAKE_RDMA_ERROR:-}" ]]; then\n'
+            '    echo "$FAKE_RDMA_ERROR" >&2\n'
+            "    exit 1\n"
+            "fi\n"
+            'echo "${MOONCAKE_RDMA_DEVICES:-mlx5_3,mlx5_4}"\n',
+        )
+        self._fake_executable(
+            "mooncake_master",
+            'printf "%s\\n" "${MOONCAKE_RDMA_DEVICES:-}" > "$MASTER_DEVICES"\n'
+            "exit 3\n",
+        )
+        self._fake_executable("setsid", 'exec "$@"\n')
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed_port = str(probe.getsockname()[1])
+
+        cases = (
+            ("resolved", {"MOONCAKE_PROTOCOL": "rdma"}, "mlx5_3,mlx5_4"),
+            (
+                "listed",
+                {"MOONCAKE_PROTOCOL": "rdma", "MOONCAKE_RDMA_DEVICES": "mlx5_7"},
+                "mlx5_7",
+            ),
+            ("tcp", {"MOONCAKE_PROTOCOL": "tcp"}, ""),
+            (
+                "unusable",
+                {"MOONCAKE_PROTOCOL": "rdma", "FAKE_RDMA_ERROR": "no usable HCA"},
+                None,
+            ),
+            (
+                "listed-unusable",
+                {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "MOONCAKE_RDMA_DEVICES": "mlx5_7",
+                    "FAKE_RDMA_ERROR": "no usable HCA: mlx5_7 excluded by MC_TE_FILTERS",
+                },
+                None,
+            ),
+        )
+        for case, overrides, devices in cases:
+            with self.subTest(case=case):
+                run_root = self.root / f"rdma-{case}"
+                python_args = self.root / f"{case}-python.txt"
+                master_devices = self.root / f"{case}-master.txt"
+                env = self._env()
+                env.pop("MOONCAKE_RDMA_DEVICES", None)
+                env.update(
+                    {
+                        "NODE_RANK": "0",
+                        "NUM_NODES": "2",
+                        "HEAD_IP": "127.0.0.1",
+                        "DISAGG_STORE_ID": f"rdma-{case}",
+                        "DISAGG_RUN_ROOT": str(run_root),
+                        "APPLY_SGLANG_CAPTURE_PATCH": "0",
+                        "MOONCAKE_HTTP_PORT": closed_port,
+                        "PYTHON_ARGS": str(python_args),
+                        "MASTER_DEVICES": str(master_devices),
+                        **overrides,
+                    }
+                )
+                result = subprocess.run(
+                    [str(TWO_NODE)],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual((run_root / "inference.done").read_text().strip(), "1")
+                resolved = python_args.exists()
+                self.assertEqual(resolved, case != "tcp")
+                if resolved:
+                    self.assertIn(
+                        "resolve_rdma_devices", python_args.read_text(encoding="utf-8")
+                    )
+                    self.assertIn(
+                        'os.environ.get("MOONCAKE_RDMA_DEVICES")',
+                        python_args.read_text(encoding="utf-8"),
+                    )
+                if devices is None:
+                    self.assertIn("no usable HCA", result.stderr)
+                    self.assertIn(
+                        "could not resolve this node's RDMA devices", result.stderr
+                    )
+                    self.assertFalse(master_devices.exists())
+                else:
+                    self.assertIn("Mooncake exited", result.stderr)
+                    self.assertEqual(
+                        master_devices.read_text(encoding="utf-8").strip(), devices
+                    )
 
     def test_inkling_two_node_wrapper_pins_the_validated_server_contract(self):
         self.assertTrue(os.access(INKLING_TWO_NODE, os.X_OK))
