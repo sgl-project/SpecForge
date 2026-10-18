@@ -78,6 +78,10 @@ from specforge.runtime.data_plane.feature_store import (
     FeatureStore,
     spec_from_tensor,
 )
+from specforge.runtime.data_plane.mooncake_rdma import (
+    check_rdma_environment,
+    resolve_rdma_devices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +93,16 @@ MOONCAKE_OBJECT_HAS_LEASE = -706  # remove() during a live read lease
 _MOONCAKE_SETUP_DEFAULTS = {
     "global_segment_size": 1 << 30,  # 1 GiB per-node segment
     "local_buffer_size": 1 << 30,
-    "protocol": "tcp",  # bring up on TCP; flip to "rdma" once NICs are verified
+    # Every client of one store must use the same protocol, and SpecForge
+    # cannot see an external server's, so the default stays explicit tcp.
+    "protocol": "tcp",
+    # Empty under rdma selects this node's usable HCAs (see _connect_store).
     "rdma_devices": "",
 }
+_RDMA_OPT_OUT = (
+    "set MOONCAKE_PROTOCOL=tcp (deployment.disaggregated.mooncake_protocol or "
+    "managed_local.mooncake.protocol) for every capture server and trainer"
+)
 
 _GET_RETRY_DELAYS_S = (2.0, 4.0, 8.0)
 # TRANSFER_FAIL and a lease that expired during transfer are retryable with a
@@ -179,9 +190,24 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
             "official wheel (`mooncake-transfer-engine` for CUDA < 13, or "
             "`mooncake-transfer-engine-cuda13` for CUDA >= 13)."
         ) from e
+    setup_kwargs = dict(setup_kwargs)
+    if setup_kwargs.get("protocol") == "rdma":
+        # Mooncake would auto-discover HCAs for an empty list and fall back to
+        # TCP silently, and drops a listed device it cannot use without a warning.
+        setup_kwargs["rdma_devices"] = resolve_rdma_devices(
+            setup_kwargs.get("rdma_devices") or None,
+            selected_by="MOONCAKE_PROTOCOL is rdma",
+            devices_setting="MOONCAKE_RDMA_DEVICES",
+            opt_out=_RDMA_OPT_OUT,
+        )
+        check_rdma_environment(
+            os.environ,
+            where="this process's environment",
+            opt_out=_RDMA_OPT_OUT,
+            devices=setup_kwargs["rdma_devices"],
+        )
     # Ascend's transport needs a bound device context (see _bind_transport_device).
     _bind_transport_device()
-    setup_kwargs = dict(setup_kwargs)
     if _ascend_runtime_available():
         # Ascend rejects the wildcard-location staging-buffer registration
         # ("location:* is not supported"); zero-copy clients can drop it.
@@ -959,6 +985,7 @@ class MooncakeFeatureStore(FeatureStore):
             raise ValueError(
                 f"cannot adopt {sample_ref.sample_id}: ref carries no generation"
             )
+        self._locate(sample_ref)
         with self._lock:
             gen = int(gen)
             self._generation[sample_ref.sample_id] = gen
@@ -977,12 +1004,24 @@ class MooncakeFeatureStore(FeatureStore):
         *,
         generation: int,
         feature_names: List[str],
+        server_url: Optional[str] = None,
     ) -> None:
         """Track server-owned keys before an HTTP response makes a ref adoptable."""
         names = list(dict.fromkeys(str(name) for name in feature_names))
         if not names:
             raise ValueError("external capture attempt must name at least one feature")
         with self._lock:
+            track = getattr(self._store, "track_capture_attempt", None)
+            if track is not None:
+                if server_url is None:
+                    raise ValueError("arena capture attempts require a server_url")
+                track(
+                    [
+                        self._tkey(str(sample_id), int(generation), name)
+                        for name in names
+                    ],
+                    server_url,
+                )
             self._external_provisional[(str(sample_id), int(generation))] = names
 
     def discard_external_attempts(
@@ -1064,6 +1103,7 @@ class MooncakeFeatureStore(FeatureStore):
                     f"refusing use-after-free"
                 )
         wanted = names or list(sample_ref.feature_keys.keys())
+        self._locate(sample_ref)
         out, gen = self._get_tensors(sample_ref, wanted, device)
         # Pooled reads already placed every feature (integer features on the
         # host); pageable reads land on the host and move here.
@@ -1087,6 +1127,24 @@ class MooncakeFeatureStore(FeatureStore):
             )
             self._active_leases[handle.lease_token] = handle
         return out, handle
+
+    def _locate(self, sample_ref: SampleRef) -> None:
+        """Pass server-owned object locations to backends that need them.
+
+        The arena backend (``mooncake_arena.ArenaObjectClient``) has no
+        master to resolve keys; the capture server's addresses ride on the ref.
+        """
+        locate = getattr(self._store, "locate_ref_objects", None)
+        gen = sample_ref.metadata.get("generation")
+        if locate is None or gen is None:
+            return
+        locate(
+            {
+                name: self._tkey(sample_ref.sample_id, int(gen), name)
+                for name in sample_ref.feature_keys
+            },
+            sample_ref.metadata,
+        )
 
     def _get_tensors(
         self, ref: SampleRef, wanted: List[str], device="cpu"

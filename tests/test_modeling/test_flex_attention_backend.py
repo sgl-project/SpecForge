@@ -203,15 +203,15 @@ class FlexAttentionBackendTest(unittest.TestCase):
             ),
         )
 
-        def run_backend(backend, flex_block_size=None):
+        def run_backend(backend, **mask_kwargs):
             block_mask = create_dflash_block_mask(
                 anchor_positions=anchors,
                 block_keep_mask=keep_blocks,
                 S=context_len,
                 block_size=draft_block_size,
                 device=device,
-                flex_block_size=flex_block_size,
                 sliding_window=128,
+                **mask_kwargs,
             )
 
             compiled_attention = torch.compile(
@@ -239,7 +239,7 @@ class FlexAttentionBackendTest(unittest.TestCase):
         triton_output, triton_grads = run_backend("TRITON")
         with mock.patch.dict(os.environ, {"SPECFORGE_FLEX_ATTENTION_BACKEND": "FLASH"}):
             self.assertEqual(flex_attention_backend(), "FLASH")
-            flash_output, flash_grads = run_backend("FLASH", (256, 128))
+            flash_output, flash_grads = run_backend("FLASH", BLOCK_SIZE=(256, 128))
 
         self.assertTrue(torch.isfinite(flash_output).all())
         torch.testing.assert_close(flash_output, triton_output, atol=3e-3, rtol=2e-2)
@@ -290,7 +290,7 @@ class FlexAttentionBackendTest(unittest.TestCase):
             S=256,
             block_size=64,
             device=torch.device("cuda"),
-            flex_block_size=(256, 128),
+            BLOCK_SIZE=(256, 128),
         )
         cos = torch.ones(1, 512, config.head_dim, device="cuda", dtype=torch.bfloat16)
         sin = torch.zeros_like(cos)
