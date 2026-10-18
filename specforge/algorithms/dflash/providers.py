@@ -27,6 +27,7 @@ from specforge.algorithms.common.providers import (
     TargetDerivedDraftDefaults,
     make_registration,
 )
+from specforge.algorithms.common.vlm_input import build_vlm_input_adapter
 from specforge.algorithms.contracts import (
     AlgorithmCapabilities,
     AlgorithmSpec,
@@ -217,6 +218,11 @@ def algorithm_spec() -> AlgorithmSpec:
                 modality="text",
                 required_tensors=ready,
             ),
+            FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="multimodal",
+                required_tensors=ready,
+            ),
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
@@ -283,6 +289,21 @@ def algorithm_providers() -> AlgorithmProviders:
                 layout=SERVER_CAPTURE_LAYOUT,
                 build_collator=collator,
                 select_layout=select_server_capture_layout,
+            ),
+            ServerStreamingProvider(
+                modality="multimodal",
+                capture_method="dflash",
+                target_representation=None,
+                layout=ServerCaptureLayout(
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                ),
+                build_collator=collator,
+                build_input_adapter=build_vlm_input_adapter,
             ),
         ),
     )

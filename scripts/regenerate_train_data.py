@@ -244,6 +244,29 @@ def build_query_kwargs(args, messages, max_tokens=None):
     return query_kwargs
 
 
+def _extract_record_images(data: Dict[str, Any]) -> List[str]:
+    """Resolve image references of a record (``image``/``image_path`` string or
+    ``images`` list), in insertion order."""
+    refs: List[str] = []
+    single = data.get("image") or data.get("image_path")
+    if isinstance(single, str):
+        refs.append(single)
+    images = data.get("images")
+    if isinstance(images, list):
+        refs.extend(r for r in images if isinstance(r, str))
+    return refs
+
+
+def _image_url_part(path: str) -> Dict[str, Any]:
+    import base64
+    import mimetypes
+
+    mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+
+
 def call_sglang(
     args,
     server_address: str,
@@ -260,6 +283,8 @@ def call_sglang(
 
     messages = data["conversations"]
     regenerated_messages = []
+    record_images = _extract_record_images(data)
+    image_attached = False
 
     # ignore data which starts with an assistant message
     if messages[0]["role"] == "assistant":
@@ -273,6 +298,26 @@ def call_sglang(
         elif message["role"] == "assistant":
             continue
         elif message["role"] == "user":
+            # Multimodal records: attach the record's images to the first user
+            # turn that carries the <image> placeholder (OpenAI content parts).
+            content = message.get("content")
+            if (
+                record_images
+                and not image_attached
+                and isinstance(content, str)
+                and "<image>" in content
+            ):
+                try:
+                    parts = [_image_url_part(p) for p in record_images]
+                except OSError as exc:
+                    data["status"] = "error"
+                    data["error"] = f"unreadable image file: {exc}"
+                    return data
+                text = content.replace("<image>\n", "").replace("<image>", "")
+                parts.append({"type": "text", "text": text})
+                message = dict(message)
+                message["content"] = parts
+                image_attached = True
             regenerated_messages.append(message)
 
             query_kwargs = build_query_kwargs(args, regenerated_messages, max_tokens)
