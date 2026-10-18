@@ -985,6 +985,7 @@ class MooncakeFeatureStore(FeatureStore):
             raise ValueError(
                 f"cannot adopt {sample_ref.sample_id}: ref carries no generation"
             )
+        self._locate(sample_ref)
         with self._lock:
             gen = int(gen)
             self._generation[sample_ref.sample_id] = gen
@@ -1003,12 +1004,24 @@ class MooncakeFeatureStore(FeatureStore):
         *,
         generation: int,
         feature_names: List[str],
+        server_url: Optional[str] = None,
     ) -> None:
         """Track server-owned keys before an HTTP response makes a ref adoptable."""
         names = list(dict.fromkeys(str(name) for name in feature_names))
         if not names:
             raise ValueError("external capture attempt must name at least one feature")
         with self._lock:
+            track = getattr(self._store, "track_capture_attempt", None)
+            if track is not None:
+                if server_url is None:
+                    raise ValueError("arena capture attempts require a server_url")
+                track(
+                    [
+                        self._tkey(str(sample_id), int(generation), name)
+                        for name in names
+                    ],
+                    server_url,
+                )
             self._external_provisional[(str(sample_id), int(generation))] = names
 
     def discard_external_attempts(
@@ -1090,6 +1103,7 @@ class MooncakeFeatureStore(FeatureStore):
                     f"refusing use-after-free"
                 )
         wanted = names or list(sample_ref.feature_keys.keys())
+        self._locate(sample_ref)
         out, gen = self._get_tensors(sample_ref, wanted, device)
         # Pooled reads already placed every feature (integer features on the
         # host); pageable reads land on the host and move here.
@@ -1113,6 +1127,24 @@ class MooncakeFeatureStore(FeatureStore):
             )
             self._active_leases[handle.lease_token] = handle
         return out, handle
+
+    def _locate(self, sample_ref: SampleRef) -> None:
+        """Pass server-owned object locations to backends that need them.
+
+        The arena backend (``mooncake_arena.ArenaObjectClient``) has no
+        master to resolve keys; the capture server's addresses ride on the ref.
+        """
+        locate = getattr(self._store, "locate_ref_objects", None)
+        gen = sample_ref.metadata.get("generation")
+        if locate is None or gen is None:
+            return
+        locate(
+            {
+                name: self._tkey(sample_ref.sample_id, int(gen), name)
+                for name in sample_ref.feature_keys
+            },
+            sample_ref.metadata,
+        )
 
     def _get_tensors(
         self, ref: SampleRef, wanted: List[str], device="cpu"

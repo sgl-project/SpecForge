@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import ctypes
+import socket
 import sys
 import textwrap
+import threading
+import time
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -326,6 +330,83 @@ class SpecCaptureSinkTest(unittest.TestCase):
         forward.synchronize()
         self.assertTrue(torch.all(logits.spec_capture_aux_gpu == 7).item())
 
+    def test_arena_size_is_required(self):
+        with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_SPEC_CAPTURE_ARENA_BYTES"):
+                self.module.CaptureArena(torch.device("cpu"))
+
+    def test_control_is_discoverable_before_any_gpu_allocation(self):
+        with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
+            with mock.patch.object(self.module, "CaptureArena") as arena:
+                control = self.sink.control_endpoint()
+                self.addCleanup(self.sink._control_listener.close)
+                self.assertEqual(self.sink.control_endpoint(), control)
+                self.assertGreater(int(control.rsplit(":", 1)[1]), 0)
+                self.assertIsNone(self.sink._capture_arena)
+                arena.assert_not_called()
+
+    def test_nvlink_always_publishes_device_memory(self):
+        with mock.patch.dict("os.environ", {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
+            self.assertTrue(self.module.gpu_put_enabled())
+            with mock.patch.dict("os.environ", {"SGLANG_SPEC_CAPTURE_GPU_PUT": "0"}):
+                with self.assertRaisesRegex(ValueError, "conflicts"):
+                    self.module.gpu_put_enabled()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_nvlink_publishes_addresses_into_the_arena(self):
+        backing = torch.zeros(1 << 20, dtype=torch.uint8, device="cuda")
+        engine = types.SimpleNamespace(
+            initialize=lambda *args: 0,
+            get_rpc_port=lambda: 15459,
+            allocate_managed_buffer=lambda size: backing.data_ptr(),
+        )
+        mooncake = types.ModuleType("mooncake.engine")
+        mooncake.TransferEngine = lambda: engine
+        env = {
+            "MOONCAKE_PROTOCOL": "nvlink",
+            "MOONCAKE_LOCAL_HOSTNAME": "127.0.0.1",
+            "SGLANG_SPEC_CAPTURE_ARENA_BYTES": str(backing.numel()),
+        }
+        spec = dict(self._request("nv").spec_capture)
+        spec["features"] = {"aux": "hidden_states", "last_hidden": "target"}
+        spec["passthrough"] = [
+            {"name": "input_ids", "data": [3, 1, 2], "shape": [1, 3], "dtype": "int64"}
+        ]
+        aux = torch.randn(3, 8, device="cuda", dtype=torch.bfloat16)
+        last = torch.randn(3, 4, device="cuda")
+        with (
+            mock.patch.dict("os.environ", env, clear=True),
+            mock.patch.dict(sys.modules, {"mooncake.engine": mooncake}),
+        ):
+            control = self.sink.control_endpoint()
+            listener = self.sink._control_listener
+            (result,) = self.sink.put_samples([(spec, aux, last)])
+        self.assertEqual(result["arena"]["control"], control)
+        self.assertIs(self.sink._capture_arena._listener, listener)
+        self.assertEqual(result["arena"]["session"], "127.0.0.1:15459")
+        expected = {
+            "hidden_states": aux.unsqueeze(0),
+            "target": last.unsqueeze(0),
+            "input_ids": torch.tensor([[3, 1, 2]], device="cuda"),
+        }
+        for name, tensor in expected.items():
+            offset = result["features"][name]["address"] - backing.data_ptr()
+            nbytes = tensor.numel() * tensor.element_size()
+            self.assertTrue(
+                torch.equal(
+                    backing[offset : offset + nbytes],
+                    tensor.reshape(-1).view(torch.uint8),
+                ),
+                name,
+            )
+        arena = self.sink._capture_arena
+        self.addCleanup(_close_arena, arena)
+        host, port = result["arena"]["control"].rsplit(":", 1)
+        with socket.create_connection((host, int(port)), timeout=5) as client:
+            client.sendall(b'["test/nv/g1/target", "missing"]\n')
+            self.assertEqual(_receive_frees(arena, 1), 1)
+        self.assertEqual(arena.health()["objects"], 2)
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_gpu_registration_failure_prevents_publication(self):
         store = self.sink._store = _BufferStore(device=True, register_status=-600)
@@ -342,3 +423,136 @@ class SpecCaptureSinkTest(unittest.TestCase):
                 )
         self.assertEqual(store.values, {})
         self.assertEqual(store.unregistered, [])
+
+
+def _receive_frees(arena, expected, timeout=5.0):
+    """Drain the arena's control connections until ``expected`` frees land."""
+    freed, deadline = 0, time.monotonic() + timeout
+    while freed < expected and time.monotonic() < deadline:
+        freed += arena.receive_frees(timeout=0.1)
+    return freed
+
+
+def _close_arena(arena):
+    for peer in arena._peers:
+        peer.close()
+    arena._listener.close()
+
+
+class CaptureArenaTest(unittest.TestCase):
+    """Allocation and the free protocol, without CUDA or Mooncake."""
+
+    def setUp(self):
+        self.module = _load_sink()
+        self.arena = object.__new__(self.module.CaptureArena)
+        self.arena.capacity = 4096
+        self.arena._spans = [(0, 4096)]
+        self.arena._objects = {}
+        self.arena._listener = socket.create_server(("127.0.0.1", 0))
+        self.arena._listener.setblocking(False)
+        self.arena._peers = {}
+        self.addCleanup(_close_arena, self.arena)
+        self.control = self.arena._listener.getsockname()
+
+    def _allocate(self, key, nbytes):
+        return self.arena._allocate(
+            key, nbytes, deadline=time.monotonic() + self.arena._WAIT_S
+        )
+
+    def test_freed_space_is_reused_and_coalesced(self):
+        sizes = (("a", 100), ("b", 1000), ("c", 1))
+        offsets = [self._allocate(key, n) for key, n in sizes]
+        self.assertEqual(offsets, [0, 512, 1536])
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            self._allocate("a", 1)
+        self.assertEqual(self.arena.free(["a", "c", "missing"]), 2)
+        self.assertEqual(self._allocate("d", 512), 0)
+        self.assertEqual(self.arena.free(["b", "d"]), 2)
+        self.assertEqual(self.arena._spans, [(0, 4096)])
+
+    def test_a_full_arena_waits_for_frees_then_fails(self):
+        self._allocate("all", 4096)
+
+        def free_later():
+            with socket.create_connection(self.control, timeout=5) as client:
+                time.sleep(0.1)
+                client.sendall(b'["all"]\n')
+
+        threading.Thread(target=free_later, daemon=True).start()
+        self.assertEqual(self._allocate("next", 4096), 0)
+        self.arena._WAIT_S = 0.05
+        with self.assertRaisesRegex(MemoryError, "no room"):
+            self._allocate("more", 1)
+
+    def test_frees_arrive_as_json_lines_across_reads(self):
+        for key in ("k1", "k2", "k3"):
+            self._allocate(key, 10)
+        with socket.create_connection(self.control, timeout=5) as client:
+            client.sendall(b'["k1", "unknown"]\n["k')
+            self.assertEqual(_receive_frees(self.arena, 1), 1)
+            client.sendall(b'2"]\n')
+            self.assertEqual(_receive_frees(self.arena, 1), 1)
+        self.assertEqual(set(self.arena._objects), {"k3"})
+        self.arena.receive_frees(timeout=0.1)  # the closed connection is dropped
+        self.assertEqual(self.arena._peers, {})
+
+    def test_invalid_free_messages_do_not_drop_following_valid_messages(self):
+        self._allocate("keep", 512)
+        invalid = (
+            b"not-json",
+            b"\xff",
+            b"null",
+            b'"keep"',
+            b"{}",
+            b'["keep", 1]',
+            b'["keep", []]',
+        )
+        with socket.create_connection(self.control, timeout=5) as client:
+            for line in invalid:
+                with self.subTest(line=line):
+                    self._allocate("release", 512)
+                    client.sendall(line + b'\n["release"]\n')
+                    with self.assertLogs(self.module.logger, level="WARNING"):
+                        self.assertEqual(_receive_frees(self.arena, 1), 1)
+                    self.assertEqual(set(self.arena._objects), {"keep"})
+
+    def test_publish_shares_one_deadline_and_rolls_back_on_timeout(self):
+        self._allocate("old-a", 2048)
+        self._allocate("old-b", 2048)
+        self.arena._base = 0
+        self.arena._bytes = torch.zeros(4096, dtype=torch.uint8)
+        self.arena._stream = mock.Mock()
+        now = [0.0]
+        releases = [(20.0, "old-a"), (40.0, "old-b")]
+        waits = []
+
+        def receive_frees(timeout=0.0):
+            if not timeout:
+                return 0
+            waits.append(timeout)
+            release_at, key = releases[0]
+            if release_at <= now[0] + timeout:
+                now[0] = release_at
+                releases.pop(0)
+                return self.arena.free([key])
+            now[0] += timeout
+            return 0
+
+        with (
+            mock.patch.object(
+                self.module.time, "monotonic", side_effect=lambda: now[0]
+            ),
+            mock.patch.object(self.arena, "receive_frees", side_effect=receive_frees),
+            mock.patch.object(torch.cuda, "stream", return_value=nullcontext()),
+        ):
+            with self.assertRaisesRegex(MemoryError, "batch deadline"):
+                self.arena.publish(
+                    ["new-a", "new-b"],
+                    [torch.ones(2048, dtype=torch.uint8) for _ in range(2)],
+                    [],
+                )
+        self.assertEqual(now[0], 30.0)
+        self.assertEqual(waits, [30.0, 10.0])
+        self.assertEqual(self.arena._objects, {"old-b": (2048, 2048)})
+        self.assertEqual(self.arena._spans, [(0, 2048)])
+        self.arena._stream.synchronize.assert_called_once_with()
