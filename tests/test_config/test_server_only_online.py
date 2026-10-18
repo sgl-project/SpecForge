@@ -106,10 +106,10 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
             )
         self.assertTrue(online_recipes)
         self.assertFalse(
-            any(EXAMPLE_CONFIG_DIR.rglob("qwen2.5-vl-7b-eagle3-online.yaml"))
+            any((EXAMPLE_CONFIG_DIR / "online").rglob("qwen2.5-vl-7b-eagle3.yaml"))
         )
         self.assertFalse(
-            any(EXAMPLE_CONFIG_DIR.rglob("qwen2.5-vl-32b-eagle3-online.yaml"))
+            any((EXAMPLE_CONFIG_DIR / "online").rglob("qwen2.5-vl-32b-eagle3.yaml"))
         )
 
     def test_application_resolution_accepts_the_server_only_contract(self):

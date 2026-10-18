@@ -240,6 +240,9 @@ def train(
     )
     if plan:
         print(launch.render())
+        if launch.managed_rdma_error is not None:
+            # The plan renders anywhere; launching it on this host would fail.
+            click.echo(f"warning: {launch.managed_rdma_error}", err=True)
         return 0
     if launch.kind == "worker":
         for key, value in launch.worker_env.items():
