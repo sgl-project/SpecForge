@@ -892,10 +892,10 @@ index 5c4f3ff44a..c40bcc6c42 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000..9b3817e
+index 0000000..2b9f14f
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,698 @@
+@@ -0,0 +1,775 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -925,7 +925,9 @@ index 0000000..9b3817e
 +Mooncake connection uses the standard ``MOONCAKE_*`` env vars (see
 +``MooncakeFeatureStore``). CUDA capture uses device publication on RDMA by
 +default. ``SGLANG_SPEC_CAPTURE_GPU_PUT=0`` selects host publication; ``1``
-+explicitly enables device publication and requires RDMA.
++explicitly enables device publication and requires RDMA. RDMA requires an
++explicit ``MOONCAKE_RDMA_DEVICES`` list: Mooncake auto-discovers HCAs for an
++empty list and silently falls back to TCP when none is usable.
 +
 +``MOONCAKE_PROTOCOL=nvlink`` (multi-node NVLink) keeps objects in a
 +:class:`CaptureArena` on the writer GPU instead of the store. Each result then
@@ -940,6 +942,7 @@ index 0000000..9b3817e
 +import json
 +import logging
 +import os
++import re
 +import select
 +import socket
 +import threading
@@ -1004,6 +1007,61 @@ index 0000000..9b3817e
 +            "SGLANG_SPEC_CAPTURE_GPU_PUT=1 requires MOONCAKE_PROTOCOL=rdma"
 +        )
 +    return enabled
++
++
++# Mooncake switches that replace the RDMA transport or ignore its device list.
++_RDMA_OVERRIDES = (
++    ("MC_FORCE_TCP", "installs the TCP transport"),
++    ("MC_MS_AUTO_DISC", "auto-discovers HCAs and ignores MOONCAKE_RDMA_DEVICES"),
++    ("MC_USE_TENT", "selects the TENT engine, which ignores MOONCAKE_RDMA_DEVICES"),
++    ("MC_USE_TEV1", "selects the TENT engine, which ignores MOONCAKE_RDMA_DEVICES"),
++)
++
++
++def check_rdma_environment() -> None:
++    """Refuse switches that replace RDMA or silently drop listed devices."""
++    if os.environ.get("MOONCAKE_PROTOCOL", "tcp") != "rdma":
++        return
++    if not os.environ.get("MOONCAKE_RDMA_DEVICES", "").strip():
++        raise ValueError(
++            "MOONCAKE_PROTOCOL=rdma requires MOONCAKE_RDMA_DEVICES to list this "
++            "server's HCAs (for example mlx5_0,mlx5_1); with an empty list "
++            "Mooncake falls back to TCP when it finds no usable HCA. Set "
++            "MOONCAKE_PROTOCOL=tcp to use TCP"
++        )
++    conflicts = []
++    for name, effect in _RDMA_OVERRIDES:
++        value = os.environ.get(name)
++        if value is None:
++            continue
++        if name == "MC_MS_AUTO_DISC":
++            # Mooncake parses the value with std::stoi and acts only on 1.
++            number = re.match(r"\s*[+-]?\d+", value)
++            if number is None or int(number.group()) != 1:
++                continue
++        conflicts.append(f"{name}={value!r} ({effect})")
++    whitelist = {
++        name.strip()
++        for name in os.environ.get("MC_TE_FILTERS", "").split(",")
++        if name.strip()
++    }
++    devices = [
++        name.strip()
++        for name in os.environ["MOONCAKE_RDMA_DEVICES"].split(",")
++        if name.strip()
++    ]
++    skipped = [name for name in devices if whitelist and name not in whitelist]
++    if skipped:
++        conflicts.append(
++            f"MC_TE_FILTERS={os.environ['MC_TE_FILTERS']!r} (Mooncake skips "
++            f"{', '.join(skipped)} of MOONCAKE_RDMA_DEVICES without a warning)"
++        )
++    if conflicts:
++        raise ValueError(
++            "MOONCAKE_PROTOCOL=rdma conflicts with "
++            + "; ".join(conflicts)
++            + ". Unset them or set MOONCAKE_PROTOCOL=tcp"
++        )
 +
 +
 +class _CudaBytes:
@@ -1082,6 +1140,7 @@ index 0000000..9b3817e
 +        self, keys: List[str], tensors: List[torch.Tensor], replace_keys: List[str]
 +    ) -> List[int]:
 +        """Copy each tensor into its own object; return the device addresses."""
++        deadline = time.monotonic() + self._WAIT_S
 +        self.receive_frees()
 +        self.free(replace_keys)
 +        placed: List[str] = []
@@ -1089,7 +1148,7 @@ index 0000000..9b3817e
 +            with torch.cuda.stream(self._stream):
 +                for key, tensor in zip(keys, tensors):
 +                    nbytes = tensor.numel() * tensor.element_size()
-+                    offset = self._allocate(key, nbytes)
++                    offset = self._allocate(key, nbytes, deadline=deadline)
 +                    placed.append(key)
 +                    self._bytes[offset : offset + nbytes].copy_(
 +                        tensor.reshape(-1).view(torch.uint8), non_blocking=True
@@ -1136,8 +1195,19 @@ index 0000000..9b3817e
 +                continue
 +            *lines, self._peers[sock] = (self._peers[sock] + chunk).split(b"\n")
 +            for line in lines:
-+                if line:
-+                    freed += self.free(json.loads(line))
++                if not line:
++                    continue
++                try:
++                    keys = json.loads(line)
++                except (json.JSONDecodeError, UnicodeDecodeError):
++                    logger.warning("Ignoring malformed arena free message")
++                    continue
++                if not isinstance(keys, list) or any(
++                    not isinstance(key, str) for key in keys
++                ):
++                    logger.warning("Arena free message must be a list of string keys")
++                    continue
++                freed += self.free(keys)
 +        return freed
 +
 +    def health(self) -> Dict[str, int]:
@@ -1148,12 +1218,19 @@ index 0000000..9b3817e
 +            "largest_free_bytes": max((size for _, size in self._spans), default=0),
 +        }
 +
-+    def _allocate(self, key: str, nbytes: int) -> int:
++    def _allocate(self, key: str, nbytes: int, *, deadline: float) -> int:
 +        if key in self._objects:
 +            raise RuntimeError(f"spec-capture object {key} already exists")
 +        size = -(-max(nbytes, 1) // self._ALIGNMENT) * self._ALIGNMENT
-+        deadline = time.monotonic() + self._WAIT_S
 +        while True:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise MemoryError(
++                    f"spec-capture arena ({self.capacity} bytes) has no "
++                    f"room for {nbytes} bytes before the batch deadline; raise "
++                    f"{_ARENA_BYTES_ENV} or lower the producer's "
++                    "runtime.resident_high_watermark_bytes"
++                )
 +            for index, (offset, span) in enumerate(self._spans):
 +                if span >= size:
 +                    if span == size:
@@ -1162,13 +1239,6 @@ index 0000000..9b3817e
 +                        self._spans[index] = (offset + size, span - size)
 +                    self._objects[key] = (offset, size)
 +                    return offset
-+            remaining = deadline - time.monotonic()
-+            if remaining <= 0:
-+                raise MemoryError(
-+                    f"spec-capture arena ({self.capacity} bytes) has no "
-+                    f"room for {nbytes} bytes; raise {_ARENA_BYTES_ENV} "
-+                    "or lower the producer's runtime.resident_high_watermark_bytes"
-+                )
 +            self.receive_frees(timeout=remaining)
 +
 +    def _release(self, offset: int, size: int) -> None:
@@ -1463,8 +1533,12 @@ index 0000000..9b3817e
 +                    elif tensor.is_cuda:
 +                        raise RuntimeError(
 +                            f"GPU capture buffer registration failed ({rc}); "
-+                            "use RDMA-registerable CUDA memory and disable "
-+                            "PyTorch expandable_segments for this server"
++                            "GPU publication needs GPUDirect RDMA (nvidia_peermem "
++                            "loaded or DMA-BUF support) and RDMA-registerable "
++                            "CUDA memory (disable PyTorch expandable_segments for "
++                            "this server). Set SGLANG_SPEC_CAPTURE_GPU_PUT=0 "
++                            "(managed-local gpu_put: false) to publish from host "
++                            "memory instead"
 +                        )
 +            register_ms = (time.perf_counter() - register_started) * 1000.0
 +            put_started = time.perf_counter()
@@ -1580,9 +1654,12 @@ index 0000000..9b3817e
 +
 +    Connection to Mooncake is lazy (first put), so a capture-enabled server
 +    without a reachable Mooncake master still boots and serves normal traffic.
++    The transport environment is checked here, so an RDMA setup that would
++    fall back to TCP fails server start instead of the first capture.
 +    """
 +    global _SINK
 +    if getattr(server_args, "enable_spec_capture", False) and _SINK is None:
++        check_rdma_environment()
 +        logger.info(
 +            "Spec capture Mooncake publication uses %s tensors",
 +            "device" if gpu_put_enabled() else "host",

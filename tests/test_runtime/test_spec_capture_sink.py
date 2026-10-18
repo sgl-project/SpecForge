@@ -10,6 +10,7 @@ import threading
 import time
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -199,6 +200,94 @@ class SpecCaptureSinkTest(unittest.TestCase):
         ):
             self.assertFalse(self.module.gpu_put_enabled())
 
+    def _init_sink(self, environ):
+        server_args = types.SimpleNamespace(
+            enable_spec_capture=True, spec_capture_aux_layer_ids=None
+        )
+        with mock.patch.dict("os.environ", environ, clear=True):
+            self.module.maybe_init_sink(server_args)
+        sink = self.module.get_sink()
+        if sink is not None:
+            self.addCleanup(sink._executor.shutdown)
+        return sink
+
+    def test_server_start_refuses_rdma_that_would_fall_back_to_tcp(self):
+        for environ, message in (
+            ({"MOONCAKE_PROTOCOL": "rdma"}, "requires MOONCAKE_RDMA_DEVICES"),
+            (
+                {"MOONCAKE_PROTOCOL": "rdma", "MOONCAKE_RDMA_DEVICES": " "},
+                "requires MOONCAKE_RDMA_DEVICES",
+            ),
+            (
+                {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "MOONCAKE_RDMA_DEVICES": "mlx5_0",
+                    "MC_FORCE_TCP": "1",
+                },
+                r"conflicts with MC_FORCE_TCP='1' \(installs the TCP transport\)",
+            ),
+            (
+                {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "MOONCAKE_RDMA_DEVICES": "mlx5_0",
+                    "MC_MS_AUTO_DISC": "1",
+                    "MC_USE_TEV1": "",
+                },
+                "MC_MS_AUTO_DISC='1' .*; MC_USE_TEV1=''",
+            ),
+        ):
+            with self.subTest(environ=environ):
+                self.module = _load_sink()
+                with self.assertRaisesRegex(ValueError, message):
+                    self._init_sink(environ)
+                self.assertIsNone(self.module.get_sink())
+
+    def test_server_start_accepts_tcp_and_explicit_rdma_devices(self):
+        for environ in (
+            {"MC_FORCE_TCP": "1"},
+            {"MOONCAKE_PROTOCOL": "tcp", "MC_USE_TENT": "1"},
+            {
+                "MOONCAKE_PROTOCOL": "rdma",
+                "MOONCAKE_RDMA_DEVICES": "mlx5_0,mlx5_1",
+                "MC_MS_AUTO_DISC": "0",
+                "SGLANG_SPEC_CAPTURE_GPU_PUT": "0",
+            },
+        ):
+            with self.subTest(environ=environ):
+                self.module = _load_sink()
+                sink = self._init_sink(environ)
+                self.assertIsNotNone(sink)
+                # The Mooncake connection itself stays lazy.
+                self.assertIsNone(sink._store)
+
+    def test_server_start_checks_rdma_device_filter(self):
+        for whitelist, rejected in (
+            ("mlx5_0", "mlx5_1"),
+            ("mlx5_9", "mlx5_0, mlx5_1"),
+            (" mlx5_0, mlx5_1, mlx5_9 ", None),
+            (" , ", None),
+        ):
+            with self.subTest(whitelist=whitelist):
+                self.module = _load_sink()
+                environ = {
+                    "MOONCAKE_PROTOCOL": "rdma",
+                    "MOONCAKE_RDMA_DEVICES": " mlx5_0, mlx5_1 ",
+                    "MC_TE_FILTERS": whitelist,
+                    "SGLANG_SPEC_CAPTURE_GPU_PUT": "0",
+                }
+                if rejected is None:
+                    self.assertIsNotNone(self._init_sink(environ))
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, f"MC_TE_FILTERS=.*Mooncake skips {rejected}"
+                    ):
+                        self._init_sink(environ)
+                    self.assertIsNone(self.module.get_sink())
+                # TCP does not use the RDMA device whitelist.
+                self.module = _load_sink()
+                environ["MOONCAKE_PROTOCOL"] = "tcp"
+                self.assertIsNotNone(self._init_sink(environ))
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_gpu_snapshot_survives_overwrite_and_stream_handoff(self):
         store = self.sink._store = _BufferStore(device=True)
@@ -297,7 +386,7 @@ class SpecCaptureSinkTest(unittest.TestCase):
                 name,
             )
         arena = self.sink._capture_arena
-        self.addCleanup(arena._listener.close)
+        self.addCleanup(_close_arena, arena)
         host, port = result["arena"]["control"].rsplit(":", 1)
         with socket.create_connection((host, int(port)), timeout=5) as client:
             client.sendall(b'["test/nv/g1/target", "missing"]\n')
@@ -330,33 +419,45 @@ def _receive_frees(arena, expected, timeout=5.0):
     return freed
 
 
+def _close_arena(arena):
+    for peer in arena._peers:
+        peer.close()
+    arena._listener.close()
+
+
 class CaptureArenaTest(unittest.TestCase):
     """Allocation and the free protocol, without CUDA or Mooncake."""
 
     def setUp(self):
-        self.arena = object.__new__(_load_sink().CaptureArena)
+        self.module = _load_sink()
+        self.arena = object.__new__(self.module.CaptureArena)
         self.arena.capacity = 4096
         self.arena._spans = [(0, 4096)]
         self.arena._objects = {}
         self.arena._listener = socket.create_server(("127.0.0.1", 0))
         self.arena._listener.setblocking(False)
         self.arena._peers = {}
-        self.addCleanup(self.arena._listener.close)
+        self.addCleanup(_close_arena, self.arena)
         self.control = self.arena._listener.getsockname()
+
+    def _allocate(self, key, nbytes):
+        return self.arena._allocate(
+            key, nbytes, deadline=time.monotonic() + self.arena._WAIT_S
+        )
 
     def test_freed_space_is_reused_and_coalesced(self):
         sizes = (("a", 100), ("b", 1000), ("c", 1))
-        offsets = [self.arena._allocate(key, n) for key, n in sizes]
+        offsets = [self._allocate(key, n) for key, n in sizes]
         self.assertEqual(offsets, [0, 512, 1536])
         with self.assertRaisesRegex(RuntimeError, "already exists"):
-            self.arena._allocate("a", 1)
+            self._allocate("a", 1)
         self.assertEqual(self.arena.free(["a", "c", "missing"]), 2)
-        self.assertEqual(self.arena._allocate("d", 512), 0)
+        self.assertEqual(self._allocate("d", 512), 0)
         self.assertEqual(self.arena.free(["b", "d"]), 2)
         self.assertEqual(self.arena._spans, [(0, 4096)])
 
     def test_a_full_arena_waits_for_frees_then_fails(self):
-        self.arena._allocate("all", 4096)
+        self._allocate("all", 4096)
 
         def free_later():
             with socket.create_connection(self.control, timeout=5) as client:
@@ -364,14 +465,14 @@ class CaptureArenaTest(unittest.TestCase):
                 client.sendall(b'["all"]\n')
 
         threading.Thread(target=free_later, daemon=True).start()
-        self.assertEqual(self.arena._allocate("next", 4096), 0)
+        self.assertEqual(self._allocate("next", 4096), 0)
         self.arena._WAIT_S = 0.05
         with self.assertRaisesRegex(MemoryError, "no room"):
-            self.arena._allocate("more", 1)
+            self._allocate("more", 1)
 
     def test_frees_arrive_as_json_lines_across_reads(self):
         for key in ("k1", "k2", "k3"):
-            self.arena._allocate(key, 10)
+            self._allocate(key, 10)
         with socket.create_connection(self.control, timeout=5) as client:
             client.sendall(b'["k1", "unknown"]\n["k')
             self.assertEqual(_receive_frees(self.arena, 1), 1)
@@ -380,3 +481,64 @@ class CaptureArenaTest(unittest.TestCase):
         self.assertEqual(set(self.arena._objects), {"k3"})
         self.arena.receive_frees(timeout=0.1)  # the closed connection is dropped
         self.assertEqual(self.arena._peers, {})
+
+    def test_invalid_free_messages_do_not_drop_following_valid_messages(self):
+        self._allocate("keep", 512)
+        invalid = (
+            b"not-json",
+            b"\xff",
+            b"null",
+            b'"keep"',
+            b"{}",
+            b'["keep", 1]',
+            b'["keep", []]',
+        )
+        with socket.create_connection(self.control, timeout=5) as client:
+            for line in invalid:
+                with self.subTest(line=line):
+                    self._allocate("release", 512)
+                    client.sendall(line + b'\n["release"]\n')
+                    with self.assertLogs(self.module.logger, level="WARNING"):
+                        self.assertEqual(_receive_frees(self.arena, 1), 1)
+                    self.assertEqual(set(self.arena._objects), {"keep"})
+
+    def test_publish_shares_one_deadline_and_rolls_back_on_timeout(self):
+        self._allocate("old-a", 2048)
+        self._allocate("old-b", 2048)
+        self.arena._base = 0
+        self.arena._bytes = torch.zeros(4096, dtype=torch.uint8)
+        self.arena._stream = mock.Mock()
+        now = [0.0]
+        releases = [(20.0, "old-a"), (40.0, "old-b")]
+        waits = []
+
+        def receive_frees(timeout=0.0):
+            if not timeout:
+                return 0
+            waits.append(timeout)
+            release_at, key = releases[0]
+            if release_at <= now[0] + timeout:
+                now[0] = release_at
+                releases.pop(0)
+                return self.arena.free([key])
+            now[0] += timeout
+            return 0
+
+        with (
+            mock.patch.object(
+                self.module.time, "monotonic", side_effect=lambda: now[0]
+            ),
+            mock.patch.object(self.arena, "receive_frees", side_effect=receive_frees),
+            mock.patch.object(torch.cuda, "stream", return_value=nullcontext()),
+        ):
+            with self.assertRaisesRegex(MemoryError, "batch deadline"):
+                self.arena.publish(
+                    ["new-a", "new-b"],
+                    [torch.ones(2048, dtype=torch.uint8) for _ in range(2)],
+                    [],
+                )
+        self.assertEqual(now[0], 30.0)
+        self.assertEqual(waits, [30.0, 10.0])
+        self.assertEqual(self.arena._objects, {"old-b": (2048, 2048)})
+        self.assertEqual(self.arena._spans, [(0, 2048)])
+        self.arena._stream.synchronize.assert_called_once_with()

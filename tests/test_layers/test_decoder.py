@@ -29,11 +29,11 @@ def _standard_flash_attn_available() -> bool:
 
 
 _HAS_FLASH_ATTN = _standard_flash_attn_available()
-_HAS_2_GPUS = torch.cuda.is_available() and torch.cuda.device_count() >= 2
+_GPU_COUNT = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
 def _model_config() -> PretrainedConfig:
-    """Small but kernel-real Llama decoder config for the two-GPU gate."""
+    """Small but kernel-real Llama decoder config for the multi-GPU gates."""
     return PretrainedConfig.from_dict(
         {
             "architectures": ["LlamaForCausalLMEagle3"],
@@ -127,9 +127,7 @@ def _assert_adapter_contract(
         global_input_ids=torch.zeros((1, padded_len), dtype=torch.long, device=device),
         attention_mask=torch.ones((1, padded_len), device=device),
         loss_mask=torch.ones((1, padded_len, 1), device=device),
-        position_ids=torch.arange(
-            local_seq_len * sp_ulysses_size, device=device
-        ).unsqueeze(0),
+        position_ids=torch.arange(local_seq_len, device=device).unsqueeze(0),
         hidden_states=torch.zeros((1, padded_len, 8), device=device),
         target_p_padded=torch.zeros((1, padded_len, 8), device=device),
         position_mask=torch.ones((1, padded_len, 1), device=device),
@@ -137,11 +135,36 @@ def _assert_adapter_contract(
     )
     assert state.input_ids.shape[1] == local_seq_len
     assert state.hidden_states.shape[1] == local_seq_len
-    assert state.position_ids.shape[1] == local_seq_len * sp_ulysses_size
+    assert state.position_ids.shape[1] == local_seq_len
+
+
+def _assert_gradient_close(actual, expected, name):
+    """Bound BF16 reduction-order error without hiding small gradients in atol.
+
+    Relative L2 checks the whole tensor; the max-error bound also catches a
+    localized mismatch. Both are scaled to the reference, with only a 1e-7
+    absolute floor for zero/tiny tensors.
+    """
+    assert actual is not None and expected is not None, f"missing gradient: {name}"
+    actual, expected = actual.float(), expected.float()
+    assert torch.isfinite(actual).all(), f"non-finite gradient: {name}"
+    error = actual - expected
+    relative_l2 = error.norm() / expected.norm().clamp_min(1e-7)
+    max_error = error.abs().max()
+    assert (
+        error.norm() <= 0.02 * expected.norm() + 1e-7
+    ), f"{name}: gradient relative L2={relative_l2.item():.6g}"
+    assert (
+        max_error <= 0.02 * expected.abs().max() + 1e-7
+    ), f"{name}: gradient max error={max_error.item():.6g}"
+    return relative_l2.item()
 
 
 def _run_decoder_parity(
-    rank: int, world_size: int, rendezvous_ports: tuple[int, int]
+    rank: int,
+    world_size: int,
+    rendezvous_ports: tuple[int, ...],
+    topologies: tuple[tuple[int, int], ...],
 ) -> None:
     device = _setup_worker(rank, world_size, rendezvous_ports[0])
     config = _model_config()
@@ -179,18 +202,34 @@ def _run_decoder_parity(
     )
     assert golden_state.input_ids.shape[1] == seq_len
 
-    with torch.no_grad():
-        golden_output = _run_iterative_pass(
-            golden_decoder,
-            embed_tokens,
-            global_input_steps,
-            hidden_states,
-            position_ids,
-        )
+    # The embedding is frozen in training. The hidden leaf must have distinct
+    # values at every position so token/gradient permutations are observable.
+    embed_tokens.requires_grad_(False)
+    hidden_states.requires_grad_(True)
+    golden_output = _run_iterative_pass(
+        golden_decoder,
+        embed_tokens,
+        global_input_steps,
+        hidden_states,
+        position_ids,
+    )
+    # A nonuniform upstream gradient exercises every output position/channel.
+    # Each rank uses its slice and the SAME global normalization, so local
+    # losses sum to the reference loss (no implicit world-size averaging).
+    probe = torch.randn_like(golden_output, dtype=torch.float32) / seq_len
+    golden_loss = (golden_output.float() * probe).sum()
+    golden_loss.backward()
+    golden_hidden_grad = hidden_states.grad.detach().clone()
+    golden_grads = {
+        name: parameter.grad.detach().float().clone()
+        for name, parameter in golden_decoder.named_parameters()
+    }
     golden_state_dict = golden_decoder.state_dict()
+    golden_output = golden_output.detach()
+    golden_loss = golden_loss.detach()
+    hidden_states = hidden_states.detach()
     del golden_decoder
 
-    topologies = ((2, 1), (1, 2))
     for (sp_ulysses_size, sp_ring_size), rendezvous_port in zip(
         topologies, rendezvous_ports, strict=True
     ):
@@ -222,28 +261,91 @@ def _run_decoder_parity(
                 _local_sequence_shard(step, rank, world_size)
                 for step in global_input_steps
             ]
-            local_hidden_states = _local_sequence_shard(hidden_states, rank, world_size)
-            if sp_ring_size > 1:
-                local_position_ids = _local_sequence_shard(
-                    position_ids, rank, world_size
-                )
-            else:
-                local_position_ids = position_ids
+            # Exercise production position construction, including collator
+            # padding and adapter slicing. RoPE consumes local positions
+            # before Ulysses exchanges the rotated Q/K.
+            from specforge.algorithms.eagle3.data import (
+                build_offline_collator,
+                build_offline_normalizer,
+            )
 
-            with torch.no_grad():
-                usp_output = _run_iterative_pass(
-                    usp_decoder,
-                    embed_tokens,
-                    local_input_steps,
-                    local_hidden_states,
-                    local_position_ids,
-                )
+            normalize = build_offline_normalizer(
+                seq_len, ttt_length=ttt_length, use_usp_preprocess=True
+            )
+            batch = build_offline_collator()(
+                [
+                    normalize(
+                        {
+                            "input_ids": input_ids.cpu(),
+                            "loss_mask": torch.ones_like(input_ids, device="cpu"),
+                            "aux_hidden_state": hidden_states.cpu(),
+                            "hidden_state": hidden_states.cpu(),
+                        }
+                    )
+                ]
+            )
+            view = UspAdapter(object()).backbone_view(
+                row_count=seq_len // world_size,
+                global_input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                position_ids=batch["position_ids"],
+                hidden_states=batch["hidden_state"],
+            )
+            local_position_ids = view.position_ids.to(device)
+            local_hidden_states = (
+                view.hidden_states.to(device).detach().requires_grad_(True)
+            )
+            torch.testing.assert_close(
+                local_hidden_states,
+                _local_sequence_shard(hidden_states, rank, world_size),
+                rtol=0,
+                atol=0,
+            )
+            usp_output = _run_iterative_pass(
+                usp_decoder,
+                embed_tokens,
+                local_input_steps,
+                local_hidden_states,
+                local_position_ids,
+            )
 
             expected = _local_sequence_shard(golden_output, rank, world_size)
             max_diff = (usp_output - expected).abs().max().item()
             assert torch.allclose(usp_output, expected, rtol=2e-2, atol=2e-2), (
                 f"rank={rank} USP U{sp_ulysses_size}R{sp_ring_size} decoder "
                 f"mismatch; max_diff={max_diff}"
+            )
+            local_probe = _local_sequence_shard(probe, rank, world_size)
+            local_loss = (usp_output.float() * local_probe).sum()
+            local_loss.backward()
+            total_loss = local_loss.detach().clone()
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            torch.testing.assert_close(total_loss, golden_loss, rtol=2e-2, atol=2e-2)
+
+            # Communication backward already accumulates contributions for
+            # each owned input token. Replicated parameter gradients, however,
+            # must be SUM-reduced over the entire SP group before comparison.
+            reduced_grads = {}
+            for name, parameter in usp_decoder.named_parameters():
+                assert parameter.grad is not None, f"missing gradient: {name}"
+                grad = parameter.grad.detach().float().clone()
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+                reduced_grads[name] = grad
+            label = f"rank={rank} U{sp_ulysses_size}R{sp_ring_size}"
+            hidden_error = _assert_gradient_close(
+                local_hidden_states.grad,
+                _local_sequence_shard(golden_hidden_grad, rank, world_size),
+                f"{label} hidden",
+            )
+            parameter_error = max(
+                _assert_gradient_close(grad, golden_grads[name], f"{label} {name}")
+                for name, grad in reduced_grads.items()
+            )
+            print(
+                f"{label}: output max_abs={max_diff:.6g}, "
+                f"hidden grad rel_l2={hidden_error:.6g}, "
+                f"parameter grad worst_rel_l2={parameter_error:.6g}",
+                flush=True,
             )
             # This is a device-less NCCL collective, so identify the GPU
             # explicitly instead of asking NCCL to infer it from global rank.
@@ -252,12 +354,14 @@ def _run_decoder_parity(
             destroy_distributed()
 
 
+@unittest.skipUnless(
+    _HAS_FLASH_ATTN,
+    "standard flash-attn forward/backward and padding interfaces are required",
+)
 class TestDecoderParity(unittest.TestCase):
-    @unittest.skipUnless(
-        _HAS_FLASH_ATTN,
-        "standard flash-attn forward/backward and padding interfaces are required",
-    )
-    @unittest.skipUnless(_HAS_2_GPUS, "requires at least two CUDA devices")
+    """Real BF16 kernels: three-step outputs, input and parameter gradients."""
+
+    @unittest.skipUnless(_GPU_COUNT >= 2, "requires at least two CUDA devices")
     def test_two_gpu_usp_decoder_matches_flash_attention(self):
         world_size = 2
         first_port = get_available_port()
@@ -269,7 +373,16 @@ class TestDecoderParity(unittest.TestCase):
         mp.spawn(
             _run_decoder_parity,
             nprocs=world_size,
-            args=(world_size, (first_port, second_port)),
+            args=(world_size, (first_port, second_port), ((2, 1), (1, 2))),
+            join=True,
+        )
+
+    @unittest.skipUnless(_GPU_COUNT >= 4, "requires at least four CUDA devices")
+    def test_four_gpu_u2r2_decoder_matches_flash_attention(self):
+        mp.spawn(
+            _run_decoder_parity,
+            nprocs=4,
+            args=(4, (get_available_port(),), ((2, 2),)),
             join=True,
         )
 
