@@ -271,6 +271,7 @@ def benchmark_draft(model, config, args):
         S=seq_len,
         block_size=block_size,
         device=device,
+        is_causal=getattr(model.config, "is_causal", None),
     )
     if flex_attention_backend() == "FLASH":
         mask_args["flex_block_size"] = (256, 128)
