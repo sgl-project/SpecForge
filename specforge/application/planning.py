@@ -135,6 +135,15 @@ def _validate_algorithm_capabilities(
             "training.dflash_teacher_metrics=false"
         )
 
+    # Only an explicit true is an error; the default (None) is auto and is off
+    # for drafts that do not wire the kernels.
+    if cfg.model.use_liger_kernel is True and not capabilities.supports_liger_kernel:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} does not support "
+            "model.use_liger_kernel=true (its draft does not wire Liger "
+            "kernels); remove the key or set it to false"
+        )
+
 
 def _validate_training_topology(
     cfg: Config,

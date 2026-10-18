@@ -25,6 +25,14 @@ The patch adds `--enable-spec-capture` and a server-side sink that:
    request has been durably published — a response therefore guarantees the
    refs it names are readable.
 
+Under `MOONCAKE_PROTOCOL=rdma` the v0.5.18 sink checks its environment when the
+scheduler starts, before `/health` succeeds: it refuses an empty
+`MOONCAKE_RDMA_DEVICES`, for which Mooncake would auto-discover HCAs and fall
+back to TCP silently, and `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` or
+`MC_USE_TEV1`. The Mooncake connection itself stays lazy. The Kimi K3 patch
+does not check. When a GPU capture buffer fails to register, the error names
+the GPUDirect RDMA requirement and the `SGLANG_SPEC_CAPTURE_GPU_PUT=0` opt-out.
+
 Capture transfers overlap the next target prefill instead of blocking it:
 the aux/last-hidden D2H rides the overlap scheduler's `copy_to_cpu` copy
 stream, per-request tensors stay zero-copy views into the batch-level host
@@ -35,6 +43,29 @@ backpressure. The idle loop never enters the sleeper while a transfer is
 outstanding, so a lone in-flight response cannot deadlock a waiting
 producer. Set `SGLANG_SPEC_CAPTURE_TIMING=1` to log per-stage
 materialize/register/put timings and queue-to-stream latency.
+
+On multi-node NVLink systems (GB200/GB300 NVL72), `MOONCAKE_PROTOCOL=nvlink`
+moves captures GPU to GPU without the store. Mooncake's NVLink transport only
+exports fabric memory, where the store cannot place objects, so the v0.5.18
+sink copies captures into an arena: one `SGLANG_SPEC_CAPTURE_ARENA_BYTES`-byte
+allocation (`managed_local.mooncake.arena_bytes`) that the TransferEngine makes
+on the writer GPU. Currently only online NVLink capture uses the arena.
+Responses carry each object's device address. Trainers read with
+`transfer_sync_read` into `receive_buffers: cuda` and free objects wherever they
+would remove store objects, by writing the keys to the sink's control
+connection (port `SGLANG_SPEC_CAPTURE_CONTROL_PORT`, ephemeral by default).
+Before the first capture request, the client queries `/server_info` for each
+scheduler's `spec_capture_control` endpoint. This opens only the control socket;
+HBM is still allocated lazily on first capture. Use the current server patch:
+clients refuse capture if these endpoints are not advertised. Every attempted
+endpoint is carried in `SampleRef.metadata["mooncake_arena"]["controls"]`, so a
+lost response followed by a retry on another server does not strand the first
+copy. Failed frees retain their destinations for lifecycle retries.
+Frees are one-way; the writer thread applies them before it allocates, so no
+extra thread competes with the scheduler. Reserve the arena below
+`--mem-fraction-static`; with `nvlink`, `runtime.resident_high_watermark_bytes`
+is required and must fit in the summed arenas. Requires a Mooncake build with
+`USE_MNNVL` (the aarch64 CUDA wheels) and an IMEX channel in every container.
 
 The client boundary is
 [`adapters/server_capture.py`](adapters/server_capture.py). Algorithm-owned
@@ -73,7 +104,8 @@ SGLang builds that ship three generic extension points run the same capture as
 a plugin instead of a source patch:
 
 - aux hidden-state capture on a target without a draft
-  (`--aux-hidden-state-capture`, `--aux-hidden-state-layer-ids`);
+  (`--enable-return-aux-hidden-states` with `--speculative-algorithm` naming
+  the convention, `--return-aux-hidden-state-layer-ids`);
 - `ModelRunner.forward_observer`;
 - `DeferredOutputSource`.
 
@@ -83,8 +115,8 @@ into the server's environment with `pip install --no-deps`, then select it
 with `deployment.disaggregated.server_capture: plugin`.
 
 Managed-local capture servers are then launched with `SPECFORGE_SPEC_CAPTURE=1`
-and the flags `--aux-hidden-state-capture <method>`,
-`--aux-hidden-state-layer-ids ...`, `--return-hidden-states-mode full` and
+and the flags `--speculative-algorithm <METHOD> --enable-return-aux-hidden-states`,
+`--return-aux-hidden-state-layer-ids ...`, `--return-hidden-states-mode full` and
 `--chunked-prefill-size -1`. The producer sends each spec as a JSON string in
 `sampling_params.custom_params["spec_capture"]` instead of the patch's
 top-level `spec_capture` field.

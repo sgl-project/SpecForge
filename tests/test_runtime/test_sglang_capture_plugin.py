@@ -373,8 +373,9 @@ def _scheduler():
 
 class TestInstall(unittest.TestCase):
     FEATURES = dict(
+        enable_return_aux_hidden_states=True,
         aux_hidden_state_capture="dflash",
-        aux_hidden_state_layer_ids=[1, 3],
+        return_aux_hidden_state_layer_ids=[1, 3],
         return_hidden_states_mode="full",
     )
 
@@ -415,7 +416,7 @@ class TestInstall(unittest.TestCase):
 
     def test_rejects_servers_missing_required_flags(self):
         for overrides, match in (
-            (dict(aux_hidden_state_capture=None), "--aux-hidden-state-capture"),
+            (dict(aux_hidden_state_capture=None), "--enable-return-aux-hidden-states"),
             (dict(return_hidden_states_mode=None), "--return-hidden-states-mode full"),
             (dict(chunked_prefill_size=8192), "--chunked-prefill-size -1"),
         ):

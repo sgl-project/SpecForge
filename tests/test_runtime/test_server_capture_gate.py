@@ -102,9 +102,10 @@ def _capture_server_flags():
     layer_ids = [str(i) for i in AUX_LAYER_IDS]
     if SERVER_CAPTURE == "plugin":
         return [
-            "--aux-hidden-state-capture",
-            "eagle3",
-            "--aux-hidden-state-layer-ids",
+            "--speculative-algorithm",
+            "EAGLE3",
+            "--enable-return-aux-hidden-states",
+            "--return-aux-hidden-state-layer-ids",
             *layer_ids,
             "--return-hidden-states-mode",
             "full",
@@ -114,6 +115,15 @@ def _capture_server_flags():
 
 def _mooncake_available() -> bool:
     return importlib.util.find_spec("mooncake.store") is not None
+
+
+def _log_tail(path, lines=80):
+    """Last lines of a subprocess log, so CI shows why the process died."""
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+    except OSError as exc:
+        return f"<could not read {path}: {exc}>"
 
 
 @unittest.skipUnless(
@@ -161,22 +171,6 @@ class TestServerCaptureGate(unittest.TestCase):
         model = LlamaForCausalLM(cfg).to(torch.bfloat16)
         cls.target_dir = os.path.join(cls.workdir, "target")
         model.save_pretrained(cls.target_dir)
-        # save_pretrained writes a single un-indexed shard for tiny models;
-        # TargetHead.load_weights locates lm_head.weight via the index file.
-        index = os.path.join(cls.target_dir, "model.safetensors.index.json")
-        if not os.path.exists(index):
-            import json
-
-            with open(index, "w") as f:
-                json.dump(
-                    {
-                        "metadata": {},
-                        "weight_map": {
-                            "lm_head.weight": "model.safetensors",
-                        },
-                    },
-                    f,
-                )
 
         cls._ensure_mooncake_master()
 
@@ -225,7 +219,9 @@ class TestServerCaptureGate(unittest.TestCase):
                 break
             time.sleep(5)
         raise RuntimeError(
-            f"sglang server did not become healthy; see {cls.workdir}/server.log"
+            "sglang server did not become healthy "
+            f"(exit code {cls.server.poll()}); tail of {cls.workdir}/server.log:\n"
+            + _log_tail(os.path.join(cls.workdir, "server.log"))
         )
 
     @classmethod
