@@ -94,6 +94,22 @@ jobs:
           # container's site-packages. cu130 image -> the cuda13 wheel.
           uv pip install mooncake-transfer-engine-cuda13
 
+      - name: Verify FlashAttention ABI
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          source sf/bin/activate
+          # A restored venv can contain an FA2 extension built for another torch.
+          # Check after all dependencies are resolved, using the same loader as tests.
+          if ! python -c 'from transformers.modeling_flash_attention_utils import lazy_import_flash_attention; lazy_import_flash_attention("flash_attention_2")'; then
+            # Bypass installed/cached wheels and FA2's own prebuilt-wheel download.
+            # Build against the final torch without allowing dependency changes.
+            FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=8 uv pip install -v \
+              --no-cache --no-binary flash-attn --reinstall-package flash-attn \
+              --no-build-isolation --no-deps flash-attn
+            python -c 'from transformers.modeling_flash_attention_utils import lazy_import_flash_attention; lazy_import_flash_attention("flash_attention_2")'
+          fi
+
       - name: Run live server-capture numerics gate
         timeout-minutes: 15
         shell: bash
