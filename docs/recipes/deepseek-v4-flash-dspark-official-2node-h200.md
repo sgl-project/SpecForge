@@ -57,6 +57,12 @@ python3 scripts/init_dspark_v4_from_target.py \
 key for a random init, or pass `--from-official` to fine-tune the released
 drafter instead.
 
+The recipe's learning rate (6e-4) is for the target-layer start. Fine-tuning
+the released drafter needs a much lower one: in a 10-step check (global batch
+4, one TP2 capture server, two trainer ranks), its accuracy stayed at the
+starting 0.42 with 1e-5 and 6e-5, and fell to about 0.1 by the fourth step
+with 6e-4 in two runs.
+
 ## Launch
 
 Capture node (192.0.2.10 in the recipe): a Mooncake master and four TP2

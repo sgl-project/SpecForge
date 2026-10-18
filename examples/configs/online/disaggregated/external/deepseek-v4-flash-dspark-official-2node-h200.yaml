@@ -40,6 +40,9 @@ training:
   # 128 sequences per optimizer step (same quantum as the baseline recipe).
   batch_size: 1
   accumulation_steps: 16
+  # For the target-layer warm start (model.draft_checkpoint_path). Fine-tuning
+  # the released drafter (init --from-official) needs a much lower rate; see
+  # the runbook.
   learning_rate: 0.0006
   lr_scheduler: constant
   # The baseline run (no warmup, constant 6e-4) diverged to NaN at step ~1380;
