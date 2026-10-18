@@ -28,6 +28,7 @@ from specforge.launch_plan import (
     ServiceSpec,
     _http_ready,
     _managed_rdma_preflight,
+    _spawn_command,
 )
 from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
@@ -1043,7 +1044,23 @@ class LaunchPlanTest(unittest.TestCase):
         capture = plan.services[1].command
         self.assertIn("--enable-spec-capture", capture.argv)
         self.assertNotIn("--enable-return-aux-hidden-states", capture.argv)
-        self.assertNotIn("SPECFORGE_SPEC_CAPTURE", capture.env)
+        self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "0")
+
+    def test_managed_capture_backend_overrides_inherited_plugin_switch(self):
+        for backend, inherited, expected in (
+            ("patch", "1", "0"),
+            ("plugin", "0", "1"),
+        ):
+            with (
+                self.subTest(backend=backend),
+                mock.patch.dict(os.environ, {"SPECFORGE_SPEC_CAPTURE": inherited}),
+            ):
+                plan = self._managed_plan_for(backend)
+                popen = mock.Mock()
+                _spawn_command(plan.services[1].command, popen=popen)
+                child_env = popen.call_args.kwargs["env"]
+                self.assertEqual(child_env["SPECFORGE_SPEC_CAPTURE"], expected)
+                self.assertEqual(os.environ["SPECFORGE_SPEC_CAPTURE"], inherited)
 
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [
