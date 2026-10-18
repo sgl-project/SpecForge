@@ -79,8 +79,9 @@ the `eagle3` strategy; EAGLE3.1 is a draft-model configuration variant, not a
 second runtime or launch path.
 
 Multimodal (image+text) training is supported for `training.strategy=dflash`
-via `model.input_modality: multimodal` (see
-`online/disaggregated/external/qwen3.5-4b-vl-dflash.yaml`); the
+and `training.strategy=dspark` via `model.input_modality: multimodal` (see
+`online/disaggregated/external/qwen3.5-4b-vl-dflash.yaml` and
+`online/disaggregated/external/qwen3.5-4b-vl-dspark.yaml`); the
 remaining catalog is text-only.
 
 Recipes under `online/disaggregated/managed-local` are opt-in, single-node
