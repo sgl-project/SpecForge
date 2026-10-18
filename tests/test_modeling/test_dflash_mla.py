@@ -498,7 +498,7 @@ class TestDFlashMLASpecGenerate(unittest.TestCase):
                 if resolved:
                     expected &= keys <= queries
                 if window is not None:
-                    expected &= queries - keys < window
+                    expected &= (queries - keys).abs() < window
                 assert_close(actual, expected[None, None])
             return masks
 
