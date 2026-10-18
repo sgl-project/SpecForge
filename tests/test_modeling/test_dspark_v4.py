@@ -1,7 +1,8 @@
 # coding=utf-8
 """Tests for the DeepSeek-V4 official-architecture DSpark draft model."""
 
-import pytest
+import unittest
+
 import torch
 
 from specforge.modeling.draft.dspark_v4 import (
@@ -84,7 +85,7 @@ def run_forward(model, batch=2, seq=24, n_blocks=3, keep=None):
     return out, anchors
 
 
-class TestDSparkV4Model:
+class TestDSparkV4Model(unittest.TestCase):
     def test_state_dict_naming(self):
         model = build_model()
         keys = set(model.state_dict())
@@ -311,9 +312,9 @@ class TestDSparkV4Model:
             assert got is not None, name
             assert torch.allclose(got, expected, rtol=1e-5, atol=1e-7), name
 
-    @pytest.mark.skipif(
+    @unittest.skipIf(
         not (torch.cuda.is_available() and hasattr(torch, "_grouped_mm")),
-        reason="grouped MoE dispatch needs CUDA torch._grouped_mm",
+        "grouped MoE dispatch needs CUDA torch._grouped_mm",
     )
     def test_gate_bias_stays_fp32_and_updates(self):
         model = build_model().to(torch.bfloat16)
@@ -359,7 +360,7 @@ class TestDSparkV4Model:
         assert torch.allclose(comb.sum(-2), torch.ones(2, 3, 4), atol=1e-3)
 
 
-class TestOnlineDSparkV4Integration:
+class TestOnlineDSparkV4Integration(unittest.TestCase):
     def test_native_backend_end_to_end(self):
         from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 
@@ -415,10 +416,14 @@ class TestOnlineDSparkV4Integration:
             attention_backend="native",
             num_anchors=4,
         )
-        with pytest.raises(ValueError, match="native"):
+        with self.assertRaisesRegex(ValueError, "native"):
             online(
                 input_ids=torch.randint(0, 128, (1, 16)),
                 hidden_states=torch.randn(1, 16, 96),
                 loss_mask=torch.ones(1, 16),
                 target_last_hidden_states=torch.randn(1, 16, 32),
             )
+
+
+if __name__ == "__main__":
+    unittest.main()
