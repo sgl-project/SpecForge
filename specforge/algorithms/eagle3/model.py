@@ -34,7 +34,11 @@ from specforge.core.compact_teacher import (
     compute_target_p_padded_from_hidden,
 )
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
-from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
+from specforge.core.lk_loss import (
+    _reduce_acceptance_rows,
+    compute_acceptance_rate,
+    compute_lk_loss,
+)
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
@@ -71,17 +75,28 @@ def _compute_loss_and_acceptance_rate(
         reduce_metrics_fn: Optional distributed reducer for metric numer/denom.
         reduce_loss_fn: Optional distributed reducer for KL loss.
     """
-    kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+    acceptance_rows = None
+    if lk_loss_type is None and target_p_on_draft.dtype == torch.float32:
+        kl_loss, acceptance_rows = LogSoftmaxLoss.apply(
+            logits, target_p, position_mask, target_p_on_draft
+        )
+    else:
+        kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
     if reduce_loss_fn is not None:
         kl_loss = reduce_loss_fn(kl_loss)
 
     with torch.set_grad_enabled(lk_loss_type is not None):
-        acceptance_rate, log_acceptance_rate = compute_acceptance_rate(
-            logits=logits,
-            target_probs=target_p_on_draft,
-            position_mask=position_mask,
-            reduce_fn=reduce_metrics_fn,
-        )
+        if acceptance_rows is not None:
+            acceptance_rate, log_acceptance_rate = _reduce_acceptance_rows(
+                acceptance_rows, position_mask, reduce_fn=reduce_metrics_fn
+            )
+        else:
+            acceptance_rate, log_acceptance_rate = compute_acceptance_rate(
+                logits=logits,
+                target_probs=target_p_on_draft,
+                position_mask=position_mask,
+                reduce_fn=reduce_metrics_fn,
+            )
 
     if lk_loss_type is None:
         loss = kl_loss
