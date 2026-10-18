@@ -195,6 +195,8 @@ class LaunchPlan:
     services: tuple[ServiceSpec, ...] = ()
     managed_root: Optional[str] = None
     managed_ports: tuple[int, ...] = ()
+    #: How managed capture servers implement spec capture (preflight checks it).
+    server_capture: Literal["patch", "plugin"] = "patch"
     #: Host bytes the largest owned Mooncake client registers over RDMA, which
     #: RLIMIT_MEMLOCK must cover; None when the managed stack uses TCP or its
     #: RDMA devices are unresolved.
@@ -223,6 +225,7 @@ class LaunchPlan:
                     "services": [service.as_dict() for service in self.services],
                     "managed_root": self.managed_root,
                     "managed_ports": list(self.managed_ports),
+                    "server_capture": self.server_capture,
                     "managed_rdma_memlock_bytes": self.managed_rdma_memlock_bytes,
                     "managed_rdma_error": self.managed_rdma_error,
                     "shutdown_grace_s": self.shutdown_grace_s,
@@ -620,6 +623,32 @@ def _sglang_argv(
     return argv
 
 
+def _capture_flags(server_capture: str, contract) -> tuple[str, ...]:
+    """SGLang flags enabling spec capture for the selected server backend."""
+    layer_ids = tuple(str(layer) for layer in contract.aux_layer_ids)
+    if server_capture == "plugin":
+        # The plugin (enabled by SPECFORGE_SPEC_CAPTURE) reads the aux and
+        # last hidden states that full hidden-state capture produces. With
+        # --enable-return-aux-hidden-states, --speculative-algorithm only names
+        # the capture convention: SGLang resets it, so no draft runs.
+        return (
+            "--speculative-algorithm",
+            contract.method.upper(),
+            "--enable-return-aux-hidden-states",
+            "--return-aux-hidden-state-layer-ids",
+            *layer_ids,
+            "--return-hidden-states-mode",
+            "full",
+        )
+    return (
+        "--enable-spec-capture",
+        "--spec-capture-method",
+        contract.method,
+        "--spec-capture-aux-layer-ids",
+        *layer_ids,
+    )
+
+
 def _managed_local_services(
     cfg: Config,
     *,
@@ -700,11 +729,7 @@ def _managed_local_services(
                 str(server.tp_size),
                 "--chunked-prefill-size",
                 "-1",
-                "--enable-spec-capture",
-                "--spec-capture-method",
-                contract.method,
-                "--spec-capture-aux-layer-ids",
-                *[str(layer) for layer in contract.aux_layer_ids],
+                *_capture_flags(deployment.server_capture, contract),
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -748,6 +773,9 @@ def _managed_local_services(
                 {"SGLANG_SPEC_CAPTURE_GPU_PUT": "1" if gpu_put else "0"}
                 if gpu_put is not None
                 else {}
+            ),
+            "SPECFORGE_SPEC_CAPTURE": (
+                "1" if deployment.server_capture == "plugin" else "0"
             ),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
@@ -1130,6 +1158,7 @@ def build_launch_plan(
                 managed_local.mooncake.metrics_port,
                 *[server.port for server in managed_local.capture_servers],
             ),
+            server_capture=deployment.server_capture,
             managed_rdma_memlock_bytes=_managed_rdma_memlock_bytes(
                 cfg, managed_environment
             ),
@@ -1209,6 +1238,13 @@ def _terminate_processes(
                 pass
 
 
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
 def _managed_rdma_preflight(plan: LaunchPlan) -> None:
     """Refuse an RDMA stack that would fall back to TCP or fail to register."""
     if plan.managed_rdma_error is not None:
@@ -1270,13 +1306,24 @@ def _managed_preflight(plan: LaunchPlan) -> None:
         mooncake_available = False
     if not mooncake_available:
         raise RuntimeError("managed_local requires the mooncake Python package")
-    try:
-        patched_sglang = (
-            importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
-        )
-    except ModuleNotFoundError:
-        patched_sglang = False
-    if not patched_sglang:
+    if plan.server_capture == "plugin":
+        missing = [
+            module
+            for module in (
+                "specforge_sglang_capture",
+                "sglang.srt.model_executor.forward_observer",
+                "sglang.srt.managers.deferred_output",
+            )
+            if not _module_available(module)
+        ]
+        if missing:
+            raise RuntimeError(
+                "managed_local server_capture=plugin requires the "
+                "specforge-sglang-capture plugin (pip install --no-deps "
+                "plugins/sglang-spec-capture) on an SGLang build with forward "
+                f"observers and deferred outputs; missing {missing}"
+            )
+    elif not _module_available("sglang.srt.spec_capture_sink"):
         raise RuntimeError(
             "managed_local requires patched SGLang spec capture; run "
             "scripts/apply_sglang_spec_capture_patch.sh"

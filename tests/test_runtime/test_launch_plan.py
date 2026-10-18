@@ -28,6 +28,7 @@ from specforge.launch_plan import (
     ServiceSpec,
     _http_ready,
     _managed_rdma_preflight,
+    _spawn_command,
 )
 from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
@@ -998,6 +999,69 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(envs["capture-server-1"]["SGLANG_SPEC_CAPTURE_GPU_PUT"], "0")
         self.assertNotIn("SGLANG_SPEC_CAPTURE_GPU_PUT", envs["mooncake"])
 
+    def _managed_plan_for(self, server_capture):
+        with tempfile.TemporaryDirectory() as root:
+            raw = _managed_config(os.path.join(root, "attempt")).model_dump()
+            raw["deployment"]["disaggregated"]["server_capture"] = server_capture
+            cfg = Config.model_validate(raw)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                return build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env={},
+                )
+
+    def test_managed_local_plugin_capture_renders_plugin_flags(self):
+        plan = self._managed_plan_for("plugin")
+
+        self.assertEqual(plan.server_capture, "plugin")
+        self.assertEqual(json.loads(plan.render())["server_capture"], "plugin")
+        capture = plan.services[1].command
+        argv = capture.argv
+        for flag in (
+            "--enable-spec-capture",
+            "--spec-capture-method",
+            "--spec-capture-aux-layer-ids",
+        ):
+            self.assertNotIn(flag, argv)
+        self.assertEqual(argv[argv.index("--speculative-algorithm") + 1], "DFLASH")
+        self.assertIn("--enable-return-aux-hidden-states", argv)
+        layers = argv.index("--return-aux-hidden-state-layer-ids")
+        self.assertEqual(argv[layers + 1 : layers + 6], ("1", "9", "17", "25", "33"))
+        self.assertEqual(argv[argv.index("--return-hidden-states-mode") + 1], "full")
+        self.assertEqual(argv[argv.index("--chunked-prefill-size") + 1], "-1")
+        self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "1")
+
+    def test_managed_local_patch_capture_is_the_default(self):
+        plan = self._managed_plan_for("patch")
+
+        self.assertEqual(plan.server_capture, "patch")
+        capture = plan.services[1].command
+        self.assertIn("--enable-spec-capture", capture.argv)
+        self.assertNotIn("--enable-return-aux-hidden-states", capture.argv)
+        self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "0")
+
+    def test_managed_capture_backend_overrides_inherited_plugin_switch(self):
+        for backend, inherited, expected in (
+            ("patch", "1", "0"),
+            ("plugin", "0", "1"),
+        ):
+            with (
+                self.subTest(backend=backend),
+                mock.patch.dict(os.environ, {"SPECFORGE_SPEC_CAPTURE": inherited}),
+            ):
+                plan = self._managed_plan_for(backend)
+                popen = mock.Mock()
+                _spawn_command(plan.services[1].command, popen=popen)
+                child_env = popen.call_args.kwargs["env"]
+                self.assertEqual(child_env["SPECFORGE_SPEC_CAPTURE"], expected)
+                self.assertEqual(os.environ["SPECFORGE_SPEC_CAPTURE"], inherited)
+
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [
             {
@@ -1332,6 +1396,18 @@ class LaunchPlanTest(unittest.TestCase):
             "gpu put env": (
                 server(env={"SGLANG_SPEC_CAPTURE_GPU_PUT": "1"}),
                 r"set from capture_servers\[\].gpu_put",
+            ),
+            "plugin enable env": (
+                server(env={"SPECFORGE_SPEC_CAPTURE": "1"}),
+                "set from deployment.disaggregated.server_capture",
+            ),
+            "plugin capture flag": (
+                model(sglang_extra_args=["--enable-return-aux-hidden-states"]),
+                "--enable-return-aux-hidden-states; it is rendered from the algorithm",
+            ),
+            "legacy hidden-state flag": (
+                server(extra_args=["--enable-return-hidden-states"]),
+                "--enable-return-hidden-states",
             ),
             "invalid env name": (
                 server(env={"NOT-A-NAME": "1"}),
@@ -2194,6 +2270,32 @@ class LaunchPlanTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "is unavailable"),
             ):
                 run_commands(plan, popen=mock.Mock())
+
+    def test_managed_preflight_requires_the_selected_capture_backend(self):
+        cases = (
+            ("plugin", "specforge_sglang_capture", "specforge-sglang-capture plugin"),
+            ("plugin", "sglang.srt.managers.deferred_output", "deferred_output"),
+            ("patch", "sglang.srt.spec_capture_sink", "patched SGLang spec capture"),
+        )
+        for server_capture, missing, message in cases:
+            with (
+                self.subTest(server_capture=server_capture, missing=missing),
+                tempfile.TemporaryDirectory() as parent,
+            ):
+                plan = _managed_plan(os.path.join(parent, "attempt"))
+                plan = LaunchPlan(**{**plan.__dict__, "server_capture": server_capture})
+                with (
+                    mock.patch(
+                        "specforge.launch_plan.shutil.which",
+                        return_value="/usr/bin/mooncake_master",
+                    ),
+                    mock.patch(
+                        "specforge.launch_plan.importlib.util.find_spec",
+                        side_effect=lambda name: None if name == missing else object(),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, message),
+                ):
+                    run_commands(plan, popen=mock.Mock())
 
     def _rdma_plan(self, root, *, server_env=None, memlock_bytes=None, protocol="rdma"):
         plan = _managed_plan(root)

@@ -43,6 +43,11 @@ SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
     "--enable-spec-capture": "the capture launcher",
     "--spec-capture-method": "the algorithm's capture contract",
     "--spec-capture-aux-layer-ids": "the algorithm's capture contract",
+    "--speculative-algorithm": "the algorithm's capture contract (plugin backend)",
+    "--enable-return-aux-hidden-states": "the algorithm's capture contract",
+    "--return-aux-hidden-state-layer-ids": "the algorithm's capture contract",
+    "--return-hidden-states-mode": "the capture launcher (full prefill capture)",
+    "--enable-return-hidden-states": "the capture launcher (full prefill capture)",
     "--host": "the capture launcher (loopback)",
     "--port": "capture_servers[].port",
     "--context-length": "model.sglang_context_length",
@@ -150,6 +155,7 @@ _OWNED_SERVER_ENV = {
     "HIP_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "ROCR_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "SGLANG_SPEC_CAPTURE_GPU_PUT": "capture_servers[].gpu_put",
+    "SPECFORGE_SPEC_CAPTURE": "deployment.disaggregated.server_capture",
     "SGLANG_SPEC_CAPTURE_ARENA_BYTES": "mooncake.arena_bytes",
     "FLASHINFER_DISABLE_VERSION_CHECK": "the capture launcher",
 }
@@ -809,6 +815,11 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     store_root: Optional[str] = None
     store_id: Optional[str] = None
     server_urls: List[str] = Field(default_factory=list)
+    #: How the SGLang capture servers implement spec capture: ``patch`` is the
+    #: versioned source patch under ``patches/sglang``; ``plugin`` is the
+    #: ``specforge-sglang-capture`` plugin on an SGLang build with forward
+    #: observers, deferred outputs and ``--enable-return-aux-hidden-states``.
+    server_capture: Literal["patch", "plugin"] = "patch"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None
