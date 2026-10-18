@@ -26,9 +26,9 @@ Choose checked-in recipes by directory:
 
 | Workflow | Catalog | Representative config |
 | --- | --- | --- |
-| Offline disaggregated | [`offline/disaggregated/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/offline/disaggregated) | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
-| Online, external services | [`online/disaggregated/external/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/online/disaggregated/external) | [`qwen3-8b-dflash-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml) |
-| Online, managed-local stack | [`online/disaggregated/managed-local/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/online/disaggregated/managed-local) | [`qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
+| Offline disaggregated | [`offline/disaggregated/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/offline/disaggregated) | [`qwen3-8b-eagle3.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/disaggregated/qwen3-8b-eagle3.yaml) |
+| Online, external services | [`online/disaggregated/external/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/online/disaggregated/external) | [`qwen3-8b-dflash-1server-dp4.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml) |
+| Online, managed-local stack | [`online/disaggregated/managed-local/`](https://github.com/sgl-project/SpecForge/tree/main/examples/configs/online/disaggregated/managed-local) | [`qwen3-8b-dflash-1server-dp7.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml) |
 
 The full model and strategy index is in the
 [recipe catalog](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/README.md). Filename suffixes are
@@ -44,12 +44,15 @@ tensors, prefetched batches, and overflow allocations consume additional memory.
 Set `deployment.disaggregated.receive_buffers: pageable` to use fresh CPU receives.
 
 Patched CUDA capture servers automatically publish device tensors when
-`MOONCAKE_PROTOCOL=rdma`. TCP and non-CUDA workers keep host publication.
-Set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` on an external server, or `gpu_put: false`
-on a managed-local capture-server entry, to disable GPU publication explicitly.
-GPU publication needs RDMA-registerable allocations; custom expandable CUDA
-allocations may require `PYTORCH_ALLOC_CONF=expandable_segments:False` on the
-capture server. The trainer's allocator is independent.
+`MOONCAKE_PROTOCOL=rdma`; managed-local servers do so only when
+`mooncake.protocol: rdma` is set explicitly. TCP and non-CUDA workers keep host
+publication. Set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` on an external server, or
+`gpu_put: false` on a managed-local capture-server entry, to disable GPU
+publication explicitly. GPU publication needs GPUDirect RDMA (`nvidia_peermem`
+loaded, or DMA-BUF support) and RDMA-registerable allocations; custom
+expandable CUDA allocations may require
+`PYTORCH_ALLOC_CONF=expandable_segments:False` on the capture server. The
+trainer's allocator is independent.
 
 ## One config owns the launch topology
 
@@ -110,7 +113,7 @@ With `deployment.trainer.nnodes: 1`, omitting `--role` starts a supervisor for
 both SpecForge roles:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml
 ```
 
 The checked-in external online recipes use the local demo endpoints shown
@@ -128,7 +131,7 @@ canceling it.
 Inspect the resolved plan without starting processes:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-disaggregated.yaml --plan
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml --plan
 ```
 
 Plan output redacts secret-shaped overrides and credentials embedded in URLs.
@@ -170,7 +173,7 @@ four producer workers against one server while keeping the checked-in YAML as
 the source of every other setting:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-domino-disaggregated.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3-8b-domino-1server-dp4.yaml \
   'deployment.disaggregated.server_urls=["http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000","http://127.0.0.1:30000"]'
 ```
 
@@ -190,10 +193,10 @@ TP=1 capture server on GPU 0 and a DP=7 trainer on GPUs 1–7:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml
 
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7.yaml
 ```
 
 The checked-in multi-server Qwen3-8B Domino recipe records two TP=1 capture
@@ -203,7 +206,7 @@ the unified training entry:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml
 ```
 
 The Qwen3.6 DFlash one-server recipe owns a TP=1 server on GPU 0 and a DP=2
@@ -212,10 +215,10 @@ GPUs 0–3 and a DP=2 trainer on GPUs 4–5:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2.yaml
 
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-2server-dp2.yaml
 ```
 
 DFlash2 uses this same DFlash capture topology and feature contract. Its
@@ -224,7 +227,7 @@ and selector settings, and owns one capture process plus one trainer process:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml
 ```
 
 The selector runs only on the consumer; capture servers still use
@@ -240,7 +243,7 @@ records the throughput measured on B300 and H200 nodes:
 
 ```bash
 specforge train -c \
-  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml
+  examples/configs/online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml
 ```
 
 The launcher starts Mooncake first, waits for its metadata and RPC endpoints,
@@ -253,6 +256,34 @@ Mooncake. Logs remain under the configured `control_dir/logs/`.
 Managed capture derives SGLang `--context-length` as `data.max_length + 7` to
 reserve the request headroom required by the capture endpoint. An explicit
 `model.sglang_context_length` must be at least that value.
+
+Managed-local stacks move Mooncake traffic over RDMA by default. The launcher
+resolves `managed_local.mooncake.protocol` once, when it builds the plan: unset
+means `rdma`, except on Ascend hosts, which keep `tcp`. Under RDMA it selects
+every usable HCA of one link layer (InfiniBand before RoCE) when `rdma_devices`
+is unset, checks every listed device otherwise, and renders the result into
+every owned process. A device is usable when the one port Mooncake opens
+(`MC_IB_PORT`, default 1) is ACTIVE, with a RoCE v2 GID bound to a network
+interface on RoCE (or a non-zero GID at `MC_GID_INDEX`), when its
+`/dev/infiniband` node is readable and writable, and when `MC_TE_FILTERS`, if
+set, admits it. On the training node `--plan` shows the exact
+`MOONCAKE_PROTOCOL` and `MOONCAKE_RDMA_DEVICES`; on a host without the HCAs it
+still prints the plan, with the reason in `managed_rdma_error` and a warning,
+and a launch there refuses to start. It never falls back to TCP. The launch
+fails with the reason and the fix when no HCA is usable, when a listed device
+is not, when `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` or
+`MC_USE_TEV1` is set, when `MC_TE_FILTERS` excludes a selected device, or when
+`RLIMIT_MEMLOCK` cannot cover the host memory Mooncake registers. A container
+needs `--device /dev/infiniband` and `--ulimit memlock=-1` (or
+`--cap-add IPC_LOCK`). Set `protocol: tcp` to opt out; recipes that already do
+behave as before.
+
+An unset protocol keeps the capture servers on host publication unless an entry
+sets `gpu_put: true`. An explicit `protocol: rdma` also turns on GPU
+publication, whose GPUDirect RDMA requirement no preflight checks: a missing
+`nvidia_peermem` or DMA-BUF support shows only when the first capture fails to
+register GPU memory, after `/health`. Set `gpu_put: false` on the entries to
+keep RDMA with host publication.
 
 ## Split pools and multi-node consumers
 
@@ -271,7 +302,7 @@ the launcher-provided rank to those same two commands:
 
 ```bash
 rcli exec --per-node <job> \
-  'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml bash examples/disagg/run_offline_2node.sh'
+  'CONFIG=examples/configs/offline/disaggregated/qwen2.5-7b-eagle3.yaml bash examples/disagg/run_offline_2node.sh'
 ```
 
 `RCLI_NODE_RANK=0` selects the producer and rank 1 selects the consumer. The
@@ -386,6 +417,19 @@ export MOONCAKE_LOCAL_HOSTNAME=this-node-routable-address
 Keep `DISAGG_AUTH_TOKEN`, node-local hostnames, and device visibility out of
 checked-in YAML. `MOONCAKE_PROTOCOL` and `MOONCAKE_RDMA_DEVICES` may also be
 node-local deployment values.
+
+External deployments stay on `tcp` unless `mooncake_protocol` or
+`MOONCAKE_PROTOCOL` selects `rdma`. SpecForge cannot see the servers' protocol,
+and a store whose clients mix TCP and RDMA fails on the first read, so set the
+same value for every server, producer and trainer. Under RDMA a producer or
+trainer checks every device in `MOONCAKE_RDMA_DEVICES`, uses its node's usable
+HCAs when the list is empty, and fails when there is none. A patched capture
+server refuses to start without an explicit `MOONCAKE_RDMA_DEVICES`; the
+two-node wrapper resolves the capture node's HCAs before starting its servers.
+Both reject `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` and
+`MC_USE_TEV1`, which would put Mooncake on TCP or ignore the device list, and a
+producer or trainer also rejects an `MC_TE_FILTERS` that excludes a listed
+device.
 
 The online producer sends prompts to the URLs in
 `deployment.disaggregated.server_urls`. Start a patched SGLang server separately
