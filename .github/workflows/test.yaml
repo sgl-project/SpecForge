@@ -48,6 +48,9 @@ jobs:
     # case-insensitive, so no separate no_proxy; Python reads either case.)
     env:
       NO_PROXY: localhost,127.0.0.1,::1
+      # v2 deliberately ignores the legacy venv cache with stale dist-info files.
+      SPECFORGE_CI_CACHE: /github/home/specforge-ci-v2
+      FLASH_ATTN_VERSION: 2.8.3.post2
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -66,8 +69,9 @@ jobs:
             cp -p -r /github/home/cache ./
           fi
 
-          if [ -d /github/home/sf ] && [ ! -z "$(ls -A /github/home/sf/)" ]; then
-            cp -p -r /github/home/sf ./
+          if [ -d "$SPECFORGE_CI_CACHE/sf" ]; then
+            rm -rf sf
+            cp -a "$SPECFORGE_CI_CACHE/sf" sf
           fi
 
       - name: Remove flashinfer # this is needed to avoid flashinfer jit compilation makes the program hang
@@ -84,7 +88,6 @@ jobs:
           source sf/bin/activate
           uv pip install wheel setuptools psutil packaging ninja
           uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
-          MAX_JOBS=8  uv pip install -v flash-attn --no-build-isolation
           uv pip install -v . --prerelease=allow
           # SGLang 0.5.18 installs cubin separately and requires it to match
           # flashinfer-python; replace the 0.6.12 copy in cached venvs.
@@ -94,21 +97,24 @@ jobs:
           # container's site-packages. cu130 image -> the cuda13 wheel.
           uv pip install mooncake-transfer-engine-cuda13
 
-      - name: Verify FlashAttention ABI
+      - name: Ensure FlashAttention ABI
         timeout-minutes: 30
         shell: bash
         run: |
           source sf/bin/activate
-          # A restored venv can contain an FA2 extension built for another torch.
-          # Check after all dependencies are resolved, using the same loader as tests.
-          if ! python -c 'from transformers.modeling_flash_attention_utils import lazy_import_flash_attention; lazy_import_flash_attention("flash_attention_2")'; then
-            # Bypass installed/cached wheels and FA2's own prebuilt-wheel download.
-            # Build against the final torch without allowing dependency changes.
-            FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=8 uv pip install -v \
-              --no-cache --no-binary flash-attn --reinstall-package flash-attn \
-              --no-build-isolation --no-deps flash-attn
-            python -c 'from transformers.modeling_flash_attention_utils import lazy_import_flash_attention; lazy_import_flash_attention("flash_attention_2")'
-          fi
+          bash .github/workflows/scripts/ensure_flash_attention.sh
+
+      - name: Save dependency cache
+        shell: bash
+        run: |
+          # Publish a complete snapshot, never merge into the previous venv.
+          # Save before tests so a test failure does not discard a valid FA build.
+          mkdir -p "$SPECFORGE_CI_CACHE"
+          staging=$(mktemp -d "$SPECFORGE_CI_CACHE/sf.XXXXXX")
+          trap 'rm -rf "$staging"' EXIT
+          cp -a sf "$staging/sf"
+          rm -rf "${SPECFORGE_CI_CACHE:?}/sf"
+          mv "$staging/sf" "$SPECFORGE_CI_CACHE/sf"
 
       - name: Run live server-capture numerics gate
         timeout-minutes: 15
@@ -141,5 +147,4 @@ jobs:
 
       - name: Save cache
         run: |
-          cp -p -r sf /github/home/
           cp -p -r cache /github/home/
