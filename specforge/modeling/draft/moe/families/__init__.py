@@ -12,4 +12,5 @@ Adding a family adds its module and one import line below; nothing else in
 the package changes. Core modules never import this package.
 """
 
+from . import deepseek  # noqa: F401  (registers deepseek_v4 and its layout)
 from . import qwen  # noqa: F401  (registers qwen3_5_moe and the qwen layout)
