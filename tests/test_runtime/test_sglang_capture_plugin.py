@@ -13,6 +13,7 @@ import os
 import sys
 import types
 import unittest
+import weakref
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest import mock
@@ -52,7 +53,6 @@ def _req(rid, prompt_len, spec=None, *, finished=True):
         rid=rid,
         origin_input_ids=list(range(prompt_len)),
         sampling_params=SimpleNamespace(custom_params=custom_params),
-        defer_output=False,
         finished=lambda: finished,
     )
 
@@ -92,6 +92,7 @@ def _runtime(*, is_writer=True, gpu_put=False, max_pending=2):
         is_writer=is_writer,
         gpu_put=gpu_put,
         max_pending_batches=max_pending,
+        defer_response=mock.Mock(),
     )
 
 
@@ -246,12 +247,14 @@ class TestConsume(unittest.TestCase):
         out = _logits_output(5)
         self._consume(runtime, reqs, [2, 3], out)
 
-        [(samples, _future)] = runtime.sink.submissions
+        [(samples, future)] = runtime.sink.submissions
         self.assertEqual([spec["sample_id"] for spec, _, _ in samples], ["a", "b"])
         torch.testing.assert_close(samples[1][1], out.hidden_states[2:5])
         torch.testing.assert_close(samples[1][2], out.last_hidden_states[2:5])
-        self.assertTrue(all(req.defer_output for req in reqs))
-        self.assertTrue(runtime.pending.has_pending())
+        calls = runtime.defer_response.call_args_list
+        self.assertEqual([call.args[0] for call in calls], reqs)
+        self.assertTrue(all(call.args[1].future is future for call in calls))
+        self.assertEqual(runtime.results, {})
 
     def test_errors_stream_immediately_with_an_error_result(self):
         runtime = _runtime()
@@ -259,51 +262,81 @@ class TestConsume(unittest.TestCase):
         self._consume(runtime, [req], [2], _logits_output(2))
 
         self.assertEqual(runtime.sink.submissions, [])
-        self.assertFalse(req.defer_output)
+        runtime.defer_response.assert_not_called()
         self.assertIn("max_new_tokens=0", runtime.results["a"]["error"])
         self.assertEqual(runtime.results["a"]["sample_id"], "a")
 
 
-class TestPendingCaptures(unittest.TestCase):
-    def _submit(self, runtime, rid):
-        req = _req(rid, 1, _spec(rid))
-        runtime.pending.submit([req], [(_spec(rid), None, None)])
-        return req, runtime.sink.submissions[-1][1]
+class TestCaptureCompletion(unittest.TestCase):
+    def _batch(self):
+        runtime = _runtime()
+        future = runtime.pending.submit([(_spec(rid), None, None) for rid in "ab"])
+        completions = [
+            capture.CaptureCompletion(future, i, 2, rid, _spec(rid), runtime.results)
+            for i, rid in enumerate("ab")
+        ]
+        return runtime, future, completions
 
-    def test_releases_in_submission_order(self):
-        runtime = _runtime(max_pending=4)
-        first, first_future = self._submit(runtime, "a")
-        second, second_future = self._submit(runtime, "b")
-
-        second_future.set_result([{"sample_id": "b"}])
-        self.assertEqual(runtime.pending.poll(), [])
-
-        first_future.set_result([{"sample_id": "a"}])
-        self.assertEqual(runtime.pending.poll(), [first, second])
+    def test_metadata_is_applied_only_when_the_scheduler_reads_the_result(self):
+        runtime, future, completions = self._batch()
+        self.assertTrue(all(not item.done() for item in completions))
+        future.set_result([{"sample_id": "a"}, {"sample_id": "b"}])
+        self.assertEqual(runtime.results, {})
+        for completion in completions:
+            self.assertTrue(completion.done())
+            self.assertIsNone(completion.result())
         self.assertEqual(
             runtime.results, {"a": {"sample_id": "a"}, "b": {"sample_id": "b"}}
         )
-        self.assertFalse(runtime.pending.has_pending())
+        self.assertFalse(completions[0].cancel())
 
-    def test_a_failed_batch_releases_its_requests_with_error_results(self):
-        runtime = _runtime()
-        req, future = self._submit(runtime, "a")
-        future.set_exception(RuntimeError("put failed"))
+    def test_failed_or_malformed_batches_produce_each_requests_error(self):
+        for failure in (RuntimeError("put failed"), []):
+            with self.subTest(failure=failure):
+                runtime, future, completions = self._batch()
+                if isinstance(failure, Exception):
+                    future.set_exception(failure)
+                else:
+                    future.set_result(failure)
+                for completion in completions:
+                    completion.result()
+                for rid in "ab":
+                    self.assertEqual(runtime.results[rid]["sample_id"], rid)
+                    self.assertIn("error", runtime.results[rid])
 
-        self.assertEqual(runtime.pending.poll(), [req])
-        self.assertEqual(
-            runtime.results["a"], {"sample_id": "a", "error": "put failed"}
-        )
+    def test_cancellation_suppresses_metadata_without_cancelling_siblings(self):
+        runtime, future, (first, second) = self._batch()
+        self.assertTrue(first.cancel())
+        self.assertTrue(first.done())
+        self.assertFalse(future.cancelled())
+        future.set_result([{"sample_id": "a"}, {"sample_id": "b"}])
+        first.result()
+        second.result()
+        self.assertEqual(runtime.results, {"b": {"sample_id": "b"}})
 
+
+class TestPendingCaptures(unittest.TestCase):
     def test_backpressure_waits_for_the_oldest_batch(self):
         runtime = _runtime(max_pending=1)
-        _, first_future = self._submit(runtime, "a")
+        first_future = runtime.pending.submit([(_spec("a"), None, None)])
         waited = []
         with mock.patch.object(
             capture, "wait_futures", side_effect=lambda fs: waited.extend(fs)
         ):
-            self._submit(runtime, "b")
+            runtime.pending.submit([(_spec("b"), None, None)])
         self.assertEqual(waited, [first_future])
+
+    def test_completed_batches_are_released_before_the_next_submission(self):
+        runtime = _runtime(max_pending=1)
+        future = runtime.pending.submit([(_spec("a"), None, None)])
+        future.set_result([{"sample_id": "a"}])
+        previous = weakref.ref(future)
+        runtime.sink.submissions.clear()
+        del future
+        with mock.patch.object(capture, "wait_futures") as wait:
+            runtime.pending.submit([(_spec("b"), None, None)])
+        wait.assert_not_called()
+        self.assertIsNone(previous())
 
 
 class FakeStreamer:
@@ -348,13 +381,18 @@ class TestStreamer(unittest.TestCase):
 
 
 def _fake_sglang_modules(features, *, chunked_prefill_size=-1, attn_tp_rank=0):
+    disaggregation = types.ModuleType("sglang.srt.disaggregation.utils")
+    disaggregation.DisaggregationMode = SimpleNamespace(NULL="null")
     runtime_context = types.ModuleType("sglang.srt.runtime_context")
     runtime_context.get_exec = lambda: SimpleNamespace(features=features)
     runtime_context.get_parallel = lambda: SimpleNamespace(attn_tp_rank=attn_tp_rank)
     runtime_context.get_schedule = lambda: SimpleNamespace(
         chunked_prefill_size=chunked_prefill_size
     )
-    return {"sglang.srt.runtime_context": runtime_context}
+    return {
+        "sglang.srt.disaggregation.utils": disaggregation,
+        "sglang.srt.runtime_context": runtime_context,
+    }
 
 
 class _ModelRunner:
@@ -365,9 +403,9 @@ def _scheduler():
     scheduler = SimpleNamespace(
         tp_worker=SimpleNamespace(model_runner=_ModelRunner()),
         output_streamer=SimpleNamespace(),
-        sources=[],
+        defer_response=mock.Mock(),
+        disaggregation_mode="null",
     )
-    scheduler.register_deferred_output_source = scheduler.sources.append
     return scheduler
 
 
@@ -392,12 +430,12 @@ class TestInstall(unittest.TestCase):
         ):
             return scheduler, capture.install(scheduler)
 
-    def test_wires_observer_source_and_results(self):
+    def test_wires_observer_completions_and_results(self):
         scheduler, runtime = self._install()
         self.assertIs(
             scheduler.tp_worker.model_runner.forward_observer, runtime.observer
         )
-        self.assertEqual(scheduler.sources, [runtime.pending])
+        self.assertIs(runtime.defer_response, scheduler.defer_response)
         self.assertIs(scheduler.output_streamer.spec_capture_results, runtime.results)
         self.assertIs(scheduler._specforge_capture_runtime, runtime)
         self.assertEqual(runtime.sink.aux_layer_ids, [1, 3])
@@ -425,11 +463,24 @@ class TestInstall(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, match):
                     self._install(**overrides)
 
+    def test_rejects_pd_disaggregation_at_install(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                scheduler = _scheduler()
+                scheduler.disaggregation_mode = mode
+                with self.assertRaisesRegex(RuntimeError, "PD disaggregation"):
+                    self._install(scheduler)
+
     def test_rejects_sglang_builds_without_the_extension_points(self):
-        scheduler = _scheduler()
-        scheduler.tp_worker.model_runner = SimpleNamespace()
-        with self.assertRaisesRegex(RuntimeError, "forward observers"):
-            self._install(scheduler)
+        for missing in ("forward_observer", "defer_response"):
+            with self.subTest(missing=missing):
+                scheduler = _scheduler()
+                if missing == "forward_observer":
+                    scheduler.tp_worker.model_runner = SimpleNamespace()
+                else:
+                    del scheduler.defer_response
+                with self.assertRaisesRegex(RuntimeError, "forward observers"):
+                    self._install(scheduler)
 
     def test_nvlink_publishes_device_tensors_into_a_lazy_arena(self):
         env = {
