@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from specforge_tpu import hooks
+from specforge_tpu import hooks, shapes
 
 # One TPU core per torchrun rank: every rank sees its core as tpu:0.
 TPU_DEVICE = torch.device("tpu", 0)
@@ -88,3 +88,11 @@ def apply() -> None:
     distributed._DISTRIBUTED_BACKENDS["tpu"] = "tpu_dist"
     hooks.around("specforge.distributed._bind_local_device", _bind_local_device)
     hooks.around("specforge.launch_plan._trainer_command", _trainer_command)
+    hooks.around(
+        "specforge.algorithms.common.hidden_states_data._padded_collator",
+        shapes.padded_collator,
+    )
+    hooks.around(
+        "specforge.training.strategies.base._cpu_max_valid_anchors",
+        shapes.shape_only_max_valid_anchors,
+    )
