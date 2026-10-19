@@ -35,7 +35,14 @@ from specforge.modeling.draft.moe import (
     resolve_moe_config,
     to_checkpoint_state_dict,
 )
-from specforge.modeling.draft.moe.balance import BALANCE_CONTROLLERS, BalanceController
+from specforge.modeling.draft.moe.balance import (
+    BALANCE_CONTROLLERS,
+    AuxLossController,
+    BalanceController,
+    NoAuxTCController,
+    load_balancing_loss,
+)
+from specforge.modeling.draft.moe.base import RoutingResult
 from specforge.modeling.draft.moe.checkpoint import (
     LAYOUTS,
     layout_for,
@@ -66,6 +73,8 @@ def _to_per_expert(layer):
         if key.startswith("experts.w") and value.dim() == 3:
             for i in range(value.shape[0]):
                 out[f"experts.{i}.{key[len('experts.'):]}.weight"] = value[i]
+        elif key == "gate.balance.bias":
+            out["gate.selection_bias"] = value
         else:
             out[key] = value
     return out
@@ -77,6 +86,8 @@ def _from_per_expert(layer):
         parts = key.split(".")
         if key.startswith("experts.") and parts[1].isdigit():
             groups.setdefault(parts[2], {})[int(parts[1])] = value
+        elif key == "gate.selection_bias":
+            out["gate.balance.bias"] = value
         else:
             out[key] = value
     for name, members in groups.items():
@@ -89,6 +100,7 @@ def setUpModule():
     register_moe_preset(
         PRESET,
         scoring_func="sqrtsoftplus",
+        balance="noaux_tc",
         routed_scaling_factor=1.5,
         layout=LAYOUT,
     )
@@ -130,15 +142,16 @@ class TestConfig(unittest.TestCase):
     def test_preset_defaults_and_explicit_overrides(self):
         cfg = resolve_moe_config(_moe_json(routed_scaling_factor=2.0))
         self.assertEqual(cfg.scoring_func, "sqrtsoftplus")
+        self.assertEqual(cfg.balance, "noaux_tc")
         self.assertEqual(cfg.routed_scaling_factor, 2.0)
         self.assertEqual(cfg.layout, LAYOUT)
         self.assertEqual(cfg.shared_expert_intermediate_size, 8)
 
     def test_training_keys_live_under_dflash_config(self):
         cfg = resolve_moe_config(
-            _moe_json(dflash_config={"moe_aux_loss_coeff": 0.01, "moe_dispatch": "x"})
+            _moe_json(dflash_config={"moe_bias_update_rate": 0.01, "moe_dispatch": "x"})
         )
-        self.assertEqual(cfg.aux_loss_coeff, 0.01)
+        self.assertEqual(cfg.bias_update_rate, 0.01)
         self.assertEqual(cfg.dispatch, "x")
         with self.assertRaisesRegex(ValueError, "unknown MoE training keys"):
             resolve_moe_config(_moe_json(dflash_config={"moe_typo": 1}))
@@ -180,7 +193,7 @@ class TestConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "per-run/training"):
             register_moe_preset("_bad", n_routed_experts=4)
         with self.assertRaisesRegex(ValueError, "per-run/training"):
-            register_moe_preset("_bad", aux_loss_coeff=0.1)
+            register_moe_preset("_bad", bias_update_rate=0.1)
         with self.assertRaisesRegex(ValueError, "unknown MoEConfig"):
             register_moe_preset("_bad", not_a_field=1)
 
@@ -192,18 +205,7 @@ class TestConfig(unittest.TestCase):
         self.assertIs(BALANCE_CONTROLLERS.get("none"), BalanceController)
 
 
-# -- router -----------------------------------------------------------------------
-
-
-class _FixedBias(BalanceController):
-    """A selection bias the test sets directly."""
-
-    def __init__(self, cfg, n_experts):
-        super().__init__(cfg, n_experts)
-        self.bias = torch.zeros(n_experts)
-
-    def adjust_selection_scores(self, scores):
-        return scores + self.bias
+# -- router, balance --------------------------------------------------------------------
 
 
 class TestRouter(unittest.TestCase):
@@ -243,17 +245,15 @@ class TestRouter(unittest.TestCase):
         self.assertTrue(torch.isfinite(layer.gate.weight.grad).all())
 
     def test_selection_bias_changes_choices_not_weights(self):
-        cfg = resolve_moe_config(_moe_json())
-        torch.manual_seed(0)
-        router = TopKRouter(cfg, H, _FixedBias(cfg, 8))
-        router.reset_parameters(0.2)
+        layer = _layer()
         x = torch.randn(10, H)
-        before = router(x)
-        router.balance.bias.fill_(-100.0)
-        router.balance.bias[[1, 5]] = 100.0
-        after = router(x)
+        before = layer.gate(x)
+        with torch.no_grad():
+            layer.balance.bias.fill_(-100.0)
+            layer.balance.bias[[1, 5]] = 100.0
+        after = layer.gate(x)
         self.assertTrue((after.indices.sort(-1).values == torch.tensor([1, 5])).all())
-        scores = F.softplus(x @ router.weight.t()).sqrt()
+        scores = F.softplus(x @ layer.gate.weight.t()).sqrt()
         expected = scores[:, [1, 5]]
         expected = 1.5 * expected / expected.sum(-1, keepdim=True)
         self.assertTrue(
@@ -270,6 +270,79 @@ class TestRouter(unittest.TestCase):
         masked = group_limited_mask(selection, n_group=3, topk_group=1)
         self.assertTrue(torch.isinf(masked[0, [0, 1, 4, 5]]).all())
         self.assertTrue(torch.equal(masked[0, [2, 3]], selection[0, [2, 3]]))
+
+
+class TestBalance(unittest.TestCase):
+    def test_noaux_bias_moves_against_load_outside_the_forward(self):
+        layer = _layer(dflash_config={"moe_bias_update_rate": 0.01}).train()
+        layer(torch.randn(12, H))
+        self.assertEqual(float(layer.balance.bias.abs().sum()), 0.0)
+        counts = layer.last_counts.float()
+        layer.apply_pending_update()
+        expected = 0.01 * torch.sign(counts.mean() - counts)
+        self.assertTrue(torch.allclose(layer.balance.bias, expected))
+        metrics = layer.metrics()
+        self.assertIn("bias_spread", metrics)
+        self.assertIn("global_load_max_ratio", metrics)
+
+    def test_noaux_bias_stays_exact_through_dtype_casts(self):
+        # A bias loaded from a checkpoint must not be rounded when the model
+        # is cast afterwards: the per-expert differences decide routing.
+        layer = _layer()
+        values = torch.tensor([3.1234567, 2.0000123, 1.5555555, -2.7182818] * 2)
+        layer.balance.bias.copy_(values)
+        layer.to(torch.bfloat16)
+        self.assertEqual(layer.balance.bias.dtype, torch.float32)
+        self.assertTrue(torch.equal(layer.balance.bias, values))
+        layer.float()
+        self.assertTrue(torch.equal(layer.balance.bias, values))
+
+    def test_fp32_buffers_survive_meta_materialization(self):
+        with torch.device("meta"):
+            layer = MoELayer(resolve_moe_config(_moe_json()), H)
+        layer.to_empty(device="cpu")
+        self.assertEqual(layer.balance.bias.dtype, torch.float32)
+
+    def test_noaux_complementary_sequence_loss(self):
+        cfg = resolve_moe_config(_moe_json(dflash_config={"moe_aux_loss_coeff": 0.5}))
+        controller = NoAuxTCController(cfg, 8)
+        scores = torch.rand(10, 8, requires_grad=True)
+        indices = scores.topk(2).indices
+        counts = torch.bincount(indices.flatten(), minlength=8)
+        controller.observe(
+            RoutingResult(scores.gather(1, indices), indices, counts, scores)
+        )
+        f = counts.float() * (8 / (2 * 10))
+        p = (scores / scores.sum(-1, keepdim=True)).mean(0)
+        self.assertTrue(torch.allclose(controller.aux_loss(), 0.5 * (f * p).sum()))
+
+    def test_aux_loss_matches_transformers(self):
+        from transformers.models.mixtral.modeling_mixtral import (
+            load_balancing_loss_func,
+        )
+
+        torch.manual_seed(0)
+        logits = torch.randn(20, 8)
+        scores = logits.softmax(-1)
+        indices = scores.topk(2).indices
+        counts = torch.bincount(indices.flatten(), minlength=8)
+        ours = load_balancing_loss(counts, scores, 20)
+        theirs = load_balancing_loss_func((logits,), 8, 2)
+        self.assertTrue(torch.allclose(ours, theirs, atol=1e-6))
+        cfg = resolve_moe_config(
+            _moe_json(
+                scoring_func="softmax",
+                balance="aux_loss",
+                dflash_config={"moe_aux_loss_coeff": 0.01},
+            )
+        )
+        controller = AuxLossController(cfg, 8)
+        scores = scores.clone().requires_grad_(True)
+        controller.observe(
+            RoutingResult(scores.gather(1, indices), indices, counts, scores)
+        )
+        self.assertTrue(torch.allclose(controller.aux_loss(), 0.01 * theirs, atol=1e-7))
+        self.assertIn("load_frac_max", controller.metrics())
 
 
 # -- experts, shared expert, layer ---------------------------------------------------
@@ -377,27 +450,22 @@ class TestExpertsAndLayer(unittest.TestCase):
         self.assertEqual(len(layer.balance.observed), 1)
 
     def test_components_run_through_one_training_state_loop(self):
-        register_balance_controller("_test_grad_balance")(_GradBalance)
-        self.addCleanup(BALANCE_CONTROLLERS.unregister, "_test_grad_balance")
         layer = _layer(
-            balance="_test_grad_balance", dflash_config={"moe_aux_loss_coeff": 0.1}
+            dflash_config={"moe_aux_loss_coeff": 0.1, "moe_bias_update_rate": 0.01}
         ).train()
         layer(torch.randn(2, 4, H))
         self.assertTrue(torch.allclose(layer.aux_loss(), layer.balance.aux_loss()))
         metrics = layer.metrics()
-        for key in ("load_max_ratio", "experts_unused_frac", "grad_balance"):
+        for key in ("load_max_ratio", "experts_unused_frac", "bias_spread"):
             self.assertIn(key, metrics)
 
 
 class TestHooks(unittest.TestCase):
     def test_hooks_walk_any_module_tree(self):
-        register_balance_controller("_test_grad_balance")(_GradBalance)
-        self.addCleanup(BALANCE_CONTROLLERS.unregister, "_test_grad_balance")
-        balanced = dict(
-            balance="_test_grad_balance", dflash_config={"moe_aux_loss_coeff": 0.1}
-        )
         tree = nn.Sequential(
-            _layer(0, **balanced), nn.Linear(H, H), _layer(1, **balanced)
+            _layer(0, dflash_config={"moe_aux_loss_coeff": 0.1}),
+            nn.Linear(H, H),
+            _layer(1, dflash_config={"moe_aux_loss_coeff": 0.1}),
         ).train()
         tree(torch.randn(3, H))
         self.assertEqual(len(list(iter_moe_layers(tree))), 2)
@@ -437,6 +505,7 @@ class TestCheckpointBoundary(unittest.TestCase):
         state = model.state_dict()
         files = to_checkpoint_state_dict(state, model)
         self.assertIn("layers.11.experts.7.w2.weight", files)
+        self.assertIn("layers.1.gate.selection_bias", files)
         self.assertIn("layers.dense.weight", files)
         self.assertNotIn("layers.1.experts.w1", files)
         back = from_checkpoint_state_dict(files, model)
@@ -595,7 +664,10 @@ def _dflash_config(moe=True, **overrides):
     )
     if moe:
         fields.update(_moe_json())
-        fields["dflash_config"] = {"attention_mode": "gqa"}
+        fields["dflash_config"] = {
+            "attention_mode": "gqa",
+            "moe_bias_update_rate": 0.005,
+        }
     fields.update(overrides)
     config = Qwen3Config(**fields)
     config._attn_implementation = "sdpa"
@@ -618,7 +690,7 @@ class TestDraftModelSeams(unittest.TestCase):
         model = DFlashDraftModel(_dflash_config(moe=False))
         self.assertEqual(list(iter_moe_layers(model)), [])
 
-    def test_moe_draft_initializes_and_trains(self):
+    def test_moe_draft_initializes_trains_and_updates_balance(self):
         torch.manual_seed(0)
         model = DFlashDraftModel(_dflash_config())
         layers = list(iter_moe_layers(model))
@@ -629,6 +701,8 @@ class TestDraftModelSeams(unittest.TestCase):
         out = _forward(model, steps=2)
         out.float().pow(2).mean().backward()
         self.assertGreater(float(layers[0].experts.w1.grad.abs().sum()), 0.0)
+        # the second forward applied the first forward's stashed counts
+        self.assertGreater(float(layers[0].balance.bias.abs().sum()), 0.0)
 
     def test_training_forward_applies_pending_updates_first(self):
         register_balance_controller("_test_counting")(_CountingBalance)

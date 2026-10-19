@@ -1,19 +1,48 @@
 # coding=utf-8
-"""Shared building blocks: :class:`Registry`, :class:`RoutingResult` and the
-:class:`TrainingState` contract every MoE component implements. Imports no
-other module of the package."""
+"""Shared building blocks: :class:`Registry`, :class:`RoutingResult`, the
+:class:`TrainingState` contract every MoE component implements, and
+:func:`apply_keeping_fp32`. Imports no other module of the package."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Generic, Optional, TypeVar, Union
+from typing import Callable, Dict, Generic, Optional, Sequence, TypeVar, Union
 
 import torch
+from torch import nn
 
 T = TypeVar("T")
 
 #: A scalar diagnostic: a 0-d tensor (no host sync) or a Python float.
 MetricValue = Union[torch.Tensor, float]
+
+
+def apply_keeping_fp32(
+    module: nn.Module,
+    parent_apply: Callable[..., nn.Module],
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    recurse: bool,
+    names: Sequence[str],
+) -> nn.Module:
+    """``parent_apply(fn, recurse)`` for ``module``, except that the fp32
+    buffers ``names`` keep their exact values and only follow device moves.
+
+    A module-wide cast such as ``.to(torch.bfloat16)`` would otherwise round
+    them before any dtype restore: a selection bias loaded from a checkpoint
+    loses the small per-expert differences that decide routing. Buffers on
+    the meta device (``to_empty``) are only restored to fp32.
+    """
+    before = {name: getattr(module, name, None) for name in names}
+    module = parent_apply(fn, recurse)
+    for name, old in before.items():
+        new = getattr(module, name, None)
+        if old is None or new is None or new.dtype == torch.float32:
+            continue
+        if old.is_meta or old.dtype != torch.float32:
+            new.data = new.data.float()
+        else:
+            new.data = old.to(device=new.device, dtype=torch.float32)
+    return module
 
 
 class Registry(Generic[T]):

@@ -153,8 +153,9 @@ module under `moe/families/`, and the JSON states the per-run sizes:
   be positive integers, and `n_routed_experts` without a `moe_preset` is an
   error, never a silent dense fallback.
 - **Training-only keys** live under `dflash_config` with an `moe_` prefix and
-  never change the checkpoint's architecture: `moe_aux_loss_coeff`
-  (balancing) and `moe_dispatch` (`sorted_loop` or `grouped_mm`).
+  never change the checkpoint's architecture: `moe_bias_update_rate` and
+  `moe_aux_loss_coeff` (balancing), and `moe_dispatch` (`sorted_loop` or
+  `grouped_mm`).
 - **Losses and metrics** need no strategy code: the trainer adds every MoE
   layer's auxiliary loss to the objective and logs layer-averaged `moe/*`
   load metrics for every strategy.

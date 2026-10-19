@@ -41,6 +41,7 @@ ARCHITECTURE_KEYS["moe_layout"] = "layout"
 
 #: ``dflash_config`` key (training-only) -> ``MoEConfig`` field.
 TRAINING_KEYS: Dict[str, str] = {
+    "moe_bias_update_rate": "bias_update_rate",
     "moe_aux_loss_coeff": "aux_loss_coeff",
     "moe_dispatch": "dispatch",
 }
@@ -85,6 +86,7 @@ class MoEConfig:
     #: Checkpoint file naming (a registered :mod:`.checkpoint` layout).
     layout: str = "native"
     # ---- training-only (never part of the checkpoint's architecture) ----
+    bias_update_rate: float = 0.0
     aux_loss_coeff: float = 0.0
     dispatch: str = "sorted_loop"
 
@@ -122,8 +124,8 @@ class MoEConfig:
             raise ValueError(
                 f"topk_group={self.topk_group} must be in [1, n_group={self.n_group}]"
             )
-        if self.aux_loss_coeff < 0:
-            raise ValueError("aux_loss_coeff must be >= 0")
+        if self.bias_update_rate < 0 or self.aux_loss_coeff < 0:
+            raise ValueError("bias_update_rate and aux_loss_coeff must be >= 0")
 
     @property
     def group_limited(self) -> bool:

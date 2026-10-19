@@ -18,7 +18,7 @@ Modules:
 - :mod:`.base`        ``Registry``, ``RoutingResult``, ``TrainingState``
 - :mod:`.config`      ``MoEConfig`` + presets; resolves a draft JSON
 - :mod:`.router`      score functions and routers
-- :mod:`.balance`     balancing policies
+- :mod:`.balance`     balancing policies (none, noaux_tc, aux_loss)
 - :mod:`.experts`     routed experts
 - :mod:`.shared`      the shared expert
 - :mod:`.layer`       ``MoELayer``, ``build_ffn`` and the model-level hooks

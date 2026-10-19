@@ -29,7 +29,7 @@ of small functions while the expensive parts are shared:
 | differs per target family | shared by every family |
 | --- | --- |
 | score function (softmax, sigmoid, sqrtsoftplus) | token dispatch (sorted segments, grouped GEMM) |
-| balancing policy | deferred update timing vs activation checkpointing |
+| balancing (aux loss, aux-loss-free bias, none) | deferred update timing vs activation checkpointing |
 | combine-weight renorm and scale | FSDP-friendly stacked expert layout |
 | shared expert (none or one) | fp32 accumulation of routed and shared output |
 | checkpoint file naming | load metrics |
@@ -50,10 +50,10 @@ The drafter's MoE should be the *target's* MoE, expressed as a preset:
 ## Layout
 
 ```
-base.py        Registry, RoutingResult, TrainingState
+base.py        Registry, RoutingResult, TrainingState, apply_keeping_fp32
 config.py      MoEConfig + preset registry; resolves a draft JSON
 router.py      score functions, Router ABC, TopKRouter, group-limited mask
-balance.py     BalanceController: none
+balance.py     BalanceController: none, noaux_tc, aux_loss
 experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu
 shared.py      SharedExpert ABC, SwiGLUSharedExpert
 layer.py       MoELayer, build_ffn, and the model-level hooks
@@ -96,9 +96,9 @@ a child of the router, so its buffers keep the `gate.balance.*` keys.
 **Updates are deferred.** `observe` only stashes (overwrite, never
 accumulate) so an activation-checkpoint recompute leaves identical state.
 `apply_pending_update` runs from the *model* forward before any routing,
-outside checkpoint regions, and may run collectives (a balance controller's
-selection bias, say). Mutating selection state inside a layer forward would
-make the recompute route differently and raise `CheckpointError`.
+outside checkpoint regions, and may run collectives (the noaux bias moves
+there). Mutating selection state inside a layer forward would make the
+recompute route differently and raise `CheckpointError`.
 
 **Official accumulation order.** `RoutedExperts.forward` returns the weighted
 routed sum as a fresh fp32 tensor; `MoELayer` adds the shared expert into it
@@ -121,14 +121,22 @@ config: `FSDPTrainingBackend` save/load, resume, warm start,
 Layouts act on one MoE layer at a time (the layer prefix is the text before
 its `experts` component) and only the layout the config names runs.
 
+**Routing state stays fp32 and exact.** The selection bias is an fp32 buffer
+that no optimizer owns. Trainers cast the draft to bf16 after warm-starting
+it, so the controller's `_apply` keeps the bias exact (`apply_keeping_fp32`)
+instead of rounding it and restoring the dtype: a warm-started DeepSeek
+selection bias differs across experts by less than bf16's step at its
+magnitude.
+
 **Model-level terms ride every strategy.** `DraftTrainStrategy.finalize_step_output`
 (called by `TrainerCore` after `forward_loss`) adds the layers' summed
 auxiliary loss to whichever term backpropagates (`loss`, or the `loss_terms`
 numerator scaled by the micro-batch denominator) and the layer-averaged
 `moe/*` metrics to `StepOutput.metrics`: `load_max_ratio`, `load_min_ratio`,
-`experts_unused_frac`, plus the balance controller's own. Strategies hold no
-MoE code; dense drafts log no `moe/*` keys; evaluation calls `forward_loss`
-alone, so eval losses exclude the auxiliary term.
+`experts_unused_frac`, plus the balance controller's (`aux_loss`,
+`load_frac_*`, or `bias_*` and `global_load_*`). Strategies hold no MoE code;
+dense drafts log no `moe/*` keys; evaluation calls `forward_loss` alone, so
+eval losses exclude the auxiliary term.
 The trainer DP-averages the `moe/*` metrics and logs them like any other
 scalar.
 
