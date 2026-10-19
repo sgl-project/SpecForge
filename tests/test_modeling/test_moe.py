@@ -1,7 +1,8 @@
 # coding=utf-8
-"""MoE FFN skeleton: config resolution, component contracts, composition, and
-the model/trainer/checkpoint seams — exercised with stub components so the
-contracts are pinned independently of any target-family implementation."""
+"""MoE FFN: config resolution, the router and experts, composition, and the
+model/trainer/checkpoint seams. The test family registers its own score
+function and a stub balance controller, so the contracts are pinned
+independently of any target family."""
 
 import unittest
 from types import SimpleNamespace
@@ -21,10 +22,7 @@ from specforge.modeling.draft.moe import (
     SHARED_EXPERTS,
     BalanceController,
     MoELayer,
-    RoutedExperts,
     Router,
-    RoutingResult,
-    SharedExpert,
     apply_pending_balance_updates,
     build_ffn,
     collect_moe_aux_loss,
@@ -43,13 +41,16 @@ from specforge.modeling.draft.moe import (
     select_target_experts,
     to_checkpoint_state_dict,
 )
+from specforge.modeling.draft.moe.experts import GroupedExperts, swiglu
+from specforge.modeling.draft.moe.router import TopKRouter
+from specforge.modeling.draft.moe.shared import SwiGLUSharedExpert
 from specforge.modeling.draft.moe.state_dict import unregister_state_dict_converter
 from specforge.training.strategies.base import _moe_metrics
 
 PRESET = "_test_family"
 
 
-# --- stub components: a minimal but real top-k reference for the contracts ---
+# --- stub balance controller: the contract the router and the layer call ---
 
 
 class _StubBalance(BalanceController):
@@ -78,78 +79,20 @@ class _StubBalance(BalanceController):
         return {"stub_metric": 1.0}
 
 
-class _StubRouter(Router):
-    def __init__(self, cfg, hidden_size, balance):
-        super().__init__(cfg, hidden_size, balance)
-        self.weight = nn.Parameter(torch.empty(self.n_experts, hidden_size))
-        self.score_fn = SCORE_FUNCTIONS.get(cfg.scoring_func)
-
-    def reset_parameters(self, std):
-        nn.init.normal_(self.weight, std=std)
-
-    def forward(self, x):
-        scores = self.score_fn(x.float() @ self.weight.float().t())
-        indices = self.balance.adjust_selection_scores(scores).topk(self.topk).indices
-        weights = scores.gather(1, indices)
-        if self.cfg.norm_topk_prob:
-            weights = weights / weights.sum(-1, keepdim=True)
-        weights = weights * self.cfg.routed_scaling_factor
-        counts = torch.zeros(
-            self.n_experts, dtype=torch.long, device=x.device
-        ).scatter_add_(0, indices.flatten(), torch.ones_like(indices.flatten()))
-        return RoutingResult(
-            weights=weights, indices=indices, counts=counts, scores=scores
-        )
-
-
-class _StubExperts(RoutedExperts):
-    def __init__(self, cfg, hidden_size):
-        super().__init__(cfg, hidden_size)
-        self.w = nn.Parameter(torch.empty(self.n_experts, hidden_size, hidden_size))
-
-    def reset_parameters(self, std):
-        nn.init.normal_(self.w, std=std)
-
-    def forward(self, x, routing):
-        # dense gather: fine for tiny tests, pins the [T, k] -> [T, H] contract
-        per_choice = torch.einsum(
-            "td,tkdo->tko", x.float(), self.w[routing.indices].float()
-        )
-        return (routing.weights.unsqueeze(-1) * per_choice).sum(1).to(x.dtype)
-
-
-class _StubShared(SharedExpert):
-    def __init__(self, cfg, hidden_size):
-        super().__init__(cfg, hidden_size)
-        self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
-
-    def forward(self, x):
-        return self.proj(x)
-
-
 def setUpModule():
     register_score_function("_test_softplus")(torch.nn.functional.softplus)
-    register_router("_test_router")(_StubRouter)
     register_balance_controller("_test_balance")(_StubBalance)
-    register_experts_backend("_test_experts")(_StubExperts)
-    register_shared_expert("_test_shared")(_StubShared)
     register_moe_preset(
         PRESET,
         scoring_func="_test_softplus",
-        router="_test_router",
         balance="_test_balance",
-        experts_backend="_test_experts",
-        shared_expert="_test_shared",
         routed_scaling_factor=1.5,
     )
 
 
 def tearDownModule():
     SCORE_FUNCTIONS.unregister("_test_softplus")
-    ROUTERS.unregister("_test_router")
     BALANCE_CONTROLLERS.unregister("_test_balance")
-    EXPERTS_BACKENDS.unregister("_test_experts")
-    SHARED_EXPERTS.unregister("_test_shared")
     MOE_PRESETS.unregister(PRESET)
 
 
@@ -254,7 +197,7 @@ class TestMoEConfig(unittest.TestCase):
         with self.assertRaisesRegex(KeyError, "MoE router.*available"):
             ROUTERS.get("missing")
         with self.assertRaisesRegex(ValueError, "already registered"):
-            register_router("_test_router")(_StubRouter.__mro__[1])
+            register_router("topk")(Router)
         self.assertIs(BALANCE_CONTROLLERS.get("none"), BalanceController)
 
 
@@ -330,6 +273,84 @@ class TestMoELayerComposition(unittest.TestCase):
         self.assertIn(favored, after.indices[0].tolist())
         # combine weights come from raw scores: still normalized and scaled
         self.assertAlmostEqual(float(after.weights.detach().sum()), 1.5, places=5)
+
+
+class TestRouter(unittest.TestCase):
+    def test_score_functions(self):
+        logits = torch.randn(4, 6)
+        cfg = resolve_moe_config(_moe_json(scoring_func="softmax"))
+        router = TopKRouter(cfg, 16, BalanceController(cfg, 8))
+        self.assertTrue(torch.allclose(router.score_fn(logits), logits.softmax(-1)))
+
+
+def _reference_routed(x, routing, w1, w2, w3):
+    """Per-token, per-choice reference of the routed sum in fp32."""
+    out = torch.zeros(x.shape, dtype=torch.float32)
+    for t in range(x.shape[0]):
+        for j in range(routing.topk):
+            e = int(routing.indices[t, j])
+            h = swiglu(x[t] @ w1[e].t(), x[t] @ w3[e].t())
+            out[t] += routing.weights[t, j] * (h.to(x.dtype) @ w2[e].t()).float()
+    return out
+
+
+class TestExpertsAndLayer(unittest.TestCase):
+    def _layer(self, **overrides):
+        torch.manual_seed(0)
+        layer = MoELayer(resolve_moe_config(_moe_json(**overrides)), 16)
+        layer.reset_parameters(std=0.2)
+        return layer
+
+    def test_grouped_experts_match_the_per_token_reference_and_return_fp32(self):
+        layer = self._layer()
+        x = torch.randn(9, 16) * 4
+        routing = layer.gate(x)
+        y = layer.experts(x, routing)
+        self.assertEqual(y.dtype, torch.float32)
+        e = layer.experts
+        expected = _reference_routed(x, routing, e.w1, e.w2, e.w3)
+        self.assertTrue(torch.allclose(y, expected, atol=1e-5))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "grouped_mm needs CUDA")
+    def test_grouped_mm_matches_the_loop(self):
+        loop = self._layer().cuda().to(torch.bfloat16)
+        grouped = self._layer(dflash_config={"moe_dispatch": "grouped_mm"}).cuda()
+        grouped.load_state_dict(loop.state_dict())
+        grouped.to(torch.bfloat16)
+        x = torch.randn(64, 16, device="cuda", dtype=torch.bfloat16)
+        a, b = loop(x).float(), grouped(x).float()
+        self.assertLess(float((a - b).norm() / a.norm()), 1e-2)
+
+    def test_layer_accumulates_routed_and_shared_in_fp32_and_casts_once(self):
+        layer = self._layer().to(torch.bfloat16)
+        x = torch.randn(2, 5, 16, dtype=torch.bfloat16)
+        y = layer.eval()(x)
+        flat = x.reshape(-1, 16)
+        routing = layer.gate(flat)
+        expected = layer.experts(flat, routing) + layer.shared_experts(flat).float()
+        self.assertEqual(y.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(y, expected.to(torch.bfloat16).view_as(x)))
+
+    def test_layer_builds_the_registered_implementations(self):
+        layer = self._layer()
+        self.assertIsInstance(layer.experts, GroupedExperts)
+        self.assertIsInstance(layer.shared_experts, SwiGLUSharedExpert)
+
+        class _Experts(GroupedExperts):
+            pass
+
+        class _Shared(SwiGLUSharedExpert):
+            pass
+
+        register_experts_backend("_test_experts")(_Experts)
+        self.addCleanup(EXPERTS_BACKENDS.unregister, "_test_experts")
+        register_shared_expert("_test_shared")(_Shared)
+        self.addCleanup(SHARED_EXPERTS.unregister, "_test_shared")
+        layer = self._layer(
+            experts_backend="_test_experts", shared_expert="_test_shared"
+        )
+        self.assertIs(type(layer.experts), _Experts)
+        self.assertIs(type(layer.shared_experts), _Shared)
 
 
 class TestHooks(unittest.TestCase):
@@ -441,7 +462,7 @@ class TestDFlashWiring(unittest.TestCase):
             # _init_weights reached the bare Parameters (no uninitialized memory)
             self.assertTrue(torch.isfinite(layer.gate.weight).all())
             self.assertGreater(float(layer.gate.weight.abs().sum()), 0.0)
-            self.assertTrue(torch.isfinite(layer.experts.w).all())
+            self.assertTrue(torch.isfinite(layer.experts.w1).all())
         model.train()
         self._forward(model)
         self._forward(model)
@@ -455,7 +476,7 @@ class TestDFlashWiring(unittest.TestCase):
         model = DFlashDraftModel(_dflash_config())
         keys = set(model.state_dict())
         self.assertIn("layers.0.mlp.gate.weight", keys)
-        self.assertIn("layers.0.mlp.shared_experts.proj.weight", keys)
+        self.assertIn("layers.0.mlp.shared_experts.w1.weight", keys)
         self.assertTrue(any(k.startswith("layers.0.mlp.experts.") for k in keys))
 
 

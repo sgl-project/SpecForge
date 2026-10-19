@@ -17,10 +17,10 @@ Modules:
 
 - :mod:`.base`        ``Registry``, ``RoutingResult``, ``TrainingState``
 - :mod:`.config`      ``MoEConfig`` + the preset registry; resolves a draft JSON
-- :mod:`.router`      ``Router`` contract (scores -> top-k) + score functions
+- :mod:`.router`      score functions and routers
 - :mod:`.balance`     ``BalanceController`` contract: balancing as a policy
-- :mod:`.experts`     ``RoutedExperts`` contract: expert weights + dispatch
-- :mod:`.shared`      ``SharedExpert`` contract
+- :mod:`.experts`     routed experts
+- :mod:`.shared`      the shared expert
 - :mod:`.layer`       ``MoELayer`` composition; ``build_ffn`` is the dense/MoE switch
 - :mod:`.hooks`       model-level plumbing: balance updates, aux loss, metrics
 - :mod:`.state_dict`  module layout <-> official checkpoint naming boundary
@@ -63,7 +63,6 @@ from .router import (
     SCORE_FUNCTIONS,
     Router,
     build_router,
-    get_score_function,
     register_router,
     register_score_function,
 )
@@ -104,7 +103,6 @@ __all__ = [
     "collect_moe_aux_loss",
     "collect_moe_metrics",
     "from_checkpoint_state_dict",
-    "get_score_function",
     "is_moe_config",
     "iter_moe_layers",
     "plan_warm_start",

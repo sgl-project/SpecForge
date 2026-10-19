@@ -16,12 +16,16 @@ from torch import nn
 from .balance import MetricValue, build_balance_controller
 from .config import MoEConfig, requests_routed_experts, resolve_moe_config
 from .experts import build_routed_experts
-from .router import RoutingResult, build_router
+from .router import build_router
 from .shared import build_shared_expert
 
 
 class MoELayer(nn.Module):
-    """Routed FFN: ``y = experts(x, gate(x)) + shared_experts(x)``."""
+    """Routed FFN: ``y = cast(experts(x, gate(x)) + shared_experts(x))``.
+
+    The routed sum and the shared expert are accumulated in fp32 and cast to
+    the input dtype once (DeepSeek's reference order).
+    """
 
     def __init__(self, cfg: MoEConfig, hidden_size: int) -> None:
         super().__init__()
@@ -42,15 +46,16 @@ class MoELayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
-        x = x.reshape(-1, self.hidden_size)
-        routing: RoutingResult = self.gate(x)
+        flat = x.reshape(-1, self.hidden_size)
+        tokens_per_sample = int(shape[-2]) if len(shape) >= 3 else None
+        routing = self.gate(flat, tokens_per_sample=tokens_per_sample)
         if self.training:
             self.last_counts = routing.counts.detach()
             self.balance.observe(routing)
-        y = self.experts(x, routing)
+        y = self.experts(flat, routing)  # fresh fp32 accumulator
         if self.shared_experts is not None:
-            y = y + self.shared_experts(x)
-        return y.view(shape)
+            y.add_(self.shared_experts(flat))
+        return y.to(x.dtype).view(shape)
 
     # -- model-level hooks (see hooks.py) ---------------------------------
     def apply_pending_balance_update(self) -> None:
