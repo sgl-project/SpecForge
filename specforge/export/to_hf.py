@@ -25,8 +25,9 @@ from specforge.export.checkpoint_io import (
     resolve_training_state,
 )
 from specforge.modeling.draft.moe import (
+    exported_config_updates,
     from_checkpoint_state_dict,
-    to_checkpoint_state_dict,
+    to_serving_state_dict,
 )
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
@@ -91,8 +92,14 @@ def export_to_hf(
             if not (vocab_mapping_path and key in {"t2d", "d2t"})
         }
     )
-    # MoE drafts: write the family's file naming.
-    full_state = to_checkpoint_state_dict(full_state, model)
+    # MoE drafts: fold training-only state (router centering), write the
+    # family's file naming, and make config.json describe the folded draft.
+    updates = exported_config_updates(model)
+    full_state = to_serving_state_dict(full_state, model)
+    for key, value in updates.items():
+        if key == "dflash_config":
+            value = {**(getattr(model.config, key, None) or {}), **value}
+        setattr(model.config, key, value)
     model.save_pretrained(output_dir, state_dict=full_state)
     apply_legacy_rope_scaling(output_dir)
     return output_dir

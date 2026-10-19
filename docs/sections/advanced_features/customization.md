@@ -149,20 +149,26 @@ module under `moe/families/`, and the JSON states the per-run sizes:
 - **Architecture keys** at the top level override the preset for ablations
   (`scoring_func`, `norm_topk_prob`, `routed_scaling_factor`, `balance`,
   `n_shared_experts`, `shared_expert_intermediate_size`, `shared_expert_gate`,
-  `swiglu_limit`, ...). `moe_layout` overrides the checkpoint file naming the
-  preset selects. Expert counts must be positive integers, and
-  `n_routed_experts` without a `moe_preset` is an error, never a silent dense
-  fallback.
+  `swiglu_limit`, `moe_router_bias`, ...). `moe_layout` overrides the
+  checkpoint file naming the preset selects. Expert counts must be positive
+  integers, and `n_routed_experts` without a `moe_preset` is an error, never a
+  silent dense fallback.
 - **Training-only keys** live under `dflash_config` with an `moe_` prefix and
   never change the checkpoint's architecture: `moe_bias_update_rate` and
-  `moe_aux_loss_coeff` (balancing), and `moe_dispatch` (`sorted_loop` or
-  `grouped_mm`).
+  `moe_aux_loss_coeff` (balancing), `moe_dispatch` (`sorted_loop` or
+  `grouped_mm`), and router centering `moe_router_center` (`"sample"`) with
+  `moe_router_center_momentum`. From-scratch drafters whose routers collapse
+  onto a few experts need `moe_router_center`.
 - **Losses and metrics** need no strategy code: the trainer adds every MoE
   layer's auxiliary loss to the objective and logs layer-averaged `moe/*`
   load metrics for every strategy.
 - **Checkpoints and exports** name MoE tensors through the preset's layout.
-  Serving an MoE draft requires the serving engine to implement the draft
-  architecture with an MoE FFN; check the family's documentation.
+  `export --to hf` also folds training-only router state into the gate
+  (router centering becomes a fixed router logit bias, `moe_router_bias`)
+  and rewrites `config.json` to describe the folded draft so the export
+  reloads as is. Serving an MoE draft requires the serving engine to
+  implement the draft architecture with an MoE FFN; check the family's
+  documentation.
 - **New families and components** register by name: a module under
   `moe/families/` registers a family's preset and layout, and a score
   function, router, balance controller, experts backend or shared expert

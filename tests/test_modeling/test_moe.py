@@ -1,7 +1,7 @@
 # coding=utf-8
 """MoE FFN framework: config resolution, the family-agnostic components, the
-layer and its hooks, the checkpoint boundary (layouts), and the model/trainer
-seams.
+layer and its hooks, the checkpoint boundary (layouts, the centering export
+fold), and the model/trainer seams.
 
 Family presets and layouts are registered by the tests themselves, so this
 file pins the framework independently of any target family.
@@ -24,6 +24,7 @@ from specforge.modeling.draft.moe import (
     build_ffn,
     collect_moe_aux_loss,
     collect_moe_metrics,
+    exported_config_updates,
     from_checkpoint_state_dict,
     iter_moe_layers,
     register_balance_controller,
@@ -34,6 +35,7 @@ from specforge.modeling.draft.moe import (
     register_shared_expert,
     resolve_moe_config,
     to_checkpoint_state_dict,
+    to_serving_state_dict,
 )
 from specforge.modeling.draft.moe.balance import (
     BALANCE_CONTROLLERS,
@@ -54,7 +56,12 @@ from specforge.modeling.draft.moe.experts import (
     GroupedExperts,
     swiglu,
 )
-from specforge.modeling.draft.moe.router import ROUTERS, TopKRouter, group_limited_mask
+from specforge.modeling.draft.moe.router import (
+    ROUTERS,
+    TopKRouter,
+    fold_router_centering,
+    group_limited_mask,
+)
 from specforge.modeling.draft.moe.shared import SHARED_EXPERTS, SwiGLUSharedExpert
 from specforge.training.controller import TrainerCore
 from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
@@ -205,12 +212,18 @@ class TestConfig(unittest.TestCase):
             register_router("topk")(Router)
         self.assertIs(BALANCE_CONTROLLERS.get("none"), BalanceController)
 
-    def test_shared_gate_is_validated(self):
+    def test_router_center_and_shared_gate_are_validated(self):
+        with self.assertRaisesRegex(ValueError, "router_center"):
+            resolve_moe_config(_moe_json(dflash_config={"moe_router_center": "x"}))
+        with self.assertRaisesRegex(ValueError, "router_center_momentum"):
+            resolve_moe_config(
+                _moe_json(dflash_config={"moe_router_center_momentum": 1.0})
+            )
         with self.assertRaisesRegex(ValueError, "shared_expert_gate"):
             resolve_moe_config(_moe_json(shared_expert_gate="x"))
 
 
-# -- router, balance --------------------------------------------------------------------
+# -- router, router centering, balance --------------------------------------------------
 
 
 class TestRouter(unittest.TestCase):
@@ -277,6 +290,104 @@ class TestRouter(unittest.TestCase):
         self.assertTrue(torch.equal(masked[0, [2, 3]], selection[0, [2, 3]]))
 
 
+class TestRouterCentering(unittest.TestCase):
+    def _router(self, **dflash):
+        cfg = resolve_moe_config(_moe_json(dflash_config=dflash))
+        torch.manual_seed(0)
+        router = TopKRouter(cfg, H, BalanceController(cfg, 8))
+        router.reset_parameters(0.2)
+        return router
+
+    def test_sample_centering_uses_each_samples_mean_and_defers_the_running_mean(self):
+        router = self._router(moe_router_center="sample").train()
+        x = torch.randn(2, 5, H) + torch.tensor([5.0, -5.0]).view(2, 1, 1)
+        flat = x.reshape(-1, H)
+        out = router(flat, tokens_per_sample=5)
+        centered = (x - x.mean(1, keepdim=True)).reshape(-1, H)
+        expected = F.softplus(centered @ router.weight.t()).sqrt()
+        self.assertTrue(torch.allclose(out.scores, expected, atol=1e-5))
+        self.assertEqual(float(router.input_mean.abs().sum()), 0.0)
+        router.apply_pending_update()
+        self.assertTrue(torch.allclose(router.input_mean, flat.mean(0)))
+        router.eval()
+        out = router(flat)
+        expected = F.softplus((flat - flat.mean(0)) @ router.weight.t()).sqrt()
+        self.assertTrue(torch.allclose(out.scores, expected, atol=1e-5))
+
+    def test_running_mean_momentum(self):
+        router = self._router(
+            moe_router_center="sample", moe_router_center_momentum=0.5
+        ).train()
+        a, b = torch.randn(6, H), torch.randn(6, H) + 2.0
+        router(a)
+        router.apply_pending_update()
+        router(b)
+        router.apply_pending_update()
+        self.assertTrue(
+            torch.allclose(router.input_mean, 0.5 * a.mean(0) + 0.5 * b.mean(0))
+        )
+        self.assertEqual(int(router.input_mean_steps), 2)
+
+    def test_centering_buffers_stay_exact_under_dtype_casts(self):
+        router = self._router(moe_router_center="sample")
+        mean = torch.randn(H) * 3.0
+        router.input_mean.copy_(mean)
+        router.to(torch.bfloat16)
+        self.assertEqual(router.input_mean.dtype, torch.float32)
+        self.assertTrue(torch.equal(router.input_mean, mean))
+        self.assertEqual(router.weight.dtype, torch.bfloat16)
+
+    def test_fold_router_centering_matches_the_trained_routing(self):
+        router = self._router(moe_router_center="sample").train()
+        x = torch.randn(9, H) + 3.0
+        router(x)
+        router.apply_pending_update()
+        router.eval()
+        expected_logits = (x - router.input_mean) @ router.weight.t()
+        folded = fold_router_centering(
+            {f"gate.{k}": v for k, v in router.state_dict().items()}
+        )
+        self.assertEqual(sorted(folded), ["gate.bias", "gate.weight"])
+        logits = x @ folded["gate.weight"].t() + folded["gate.bias"]
+        self.assertTrue(torch.allclose(logits, expected_logits, atol=1e-4))
+        self.assertEqual(folded["gate.bias"].dtype, torch.float32)
+        plain = {"gate.weight": router.weight.detach()}
+        self.assertIs(fold_router_centering(plain), plain)
+
+    def test_router_bias_is_a_fixed_fp32_logit_offset(self):
+        cfg = resolve_moe_config(_moe_json(moe_router_bias=True))
+        router = TopKRouter(cfg, H, BalanceController(cfg, 8))
+        router.reset_parameters(0.2)
+        self.assertEqual(router.bias.tolist(), [0.0] * 8)
+        self.assertNotIn("bias", dict(router.named_parameters()))
+        with torch.no_grad():
+            router.bias.copy_(torch.linspace(-1.2345678, 3.3333333, 8))
+        exact = router.bias.clone()
+        router.to(torch.bfloat16)
+        self.assertEqual(router.bias.dtype, torch.float32)
+        self.assertTrue(torch.equal(router.bias, exact))
+        router.float()
+        x = torch.randn(5, H)
+        base = router(x).scores
+        with torch.no_grad():
+            router.bias.fill_(-50.0)
+            router.bias[3] = 50.0
+        # sqrtsoftplus scores: expert 3 now wins every token
+        self.assertTrue((router(x).indices[:, 0] == 3).all())
+        self.assertFalse(torch.equal(router(x).scores, base))
+
+    def test_fold_adds_to_an_existing_router_bias(self):
+        layer = {
+            "gate.weight": torch.randn(8, H),
+            "gate.bias": torch.ones(8),
+            "gate.input_mean": torch.randn(H),
+            "gate.input_mean_steps": torch.tensor(3),
+        }
+        folded = fold_router_centering(layer)
+        expected = 1.0 - layer["gate.weight"] @ layer["gate.input_mean"]
+        self.assertTrue(torch.allclose(folded["gate.bias"], expected))
+
+
 class TestBalance(unittest.TestCase):
     def test_noaux_bias_moves_against_load_outside_the_forward(self):
         layer = _layer(dflash_config={"moe_bias_update_rate": 0.01}).train()
@@ -304,9 +415,15 @@ class TestBalance(unittest.TestCase):
 
     def test_fp32_buffers_survive_meta_materialization(self):
         with torch.device("meta"):
-            layer = MoELayer(resolve_moe_config(_moe_json()), H)
+            layer = MoELayer(
+                resolve_moe_config(
+                    _moe_json(dflash_config={"moe_router_center": "sample"})
+                ),
+                H,
+            )
         layer.to_empty(device="cpu")
         self.assertEqual(layer.balance.bias.dtype, torch.float32)
+        self.assertEqual(layer.gate.input_mean.device.type, "cpu")
 
     def test_noaux_complementary_sequence_loss(self):
         cfg = resolve_moe_config(_moe_json(dflash_config={"moe_aux_loss_coeff": 0.5}))
@@ -541,6 +658,38 @@ class TestCheckpointBoundary(unittest.TestCase):
         layer = _layer(moe_layout="native")
         state = layer.state_dict()
         self.assertEqual(sorted(to_checkpoint_state_dict(state, layer)), sorted(state))
+
+    def test_serving_state_folds_then_names(self):
+        layer = _layer(dflash_config={"moe_router_center": "sample"}).train()
+        layer(torch.randn(4, H) + 1.0)
+        layer.apply_pending_update()
+        served = to_serving_state_dict(layer.state_dict(), layer)
+        self.assertIn("gate.bias", served)
+        self.assertNotIn("gate.input_mean", served)
+        self.assertIn("gate.selection_bias", served)
+        self.assertIn("experts.0.w1.weight", served)
+
+    def test_centered_export_reloads_as_the_draft_it_describes(self):
+        layer = _layer(dflash_config={"moe_router_center": "sample"}).train()
+        layer(torch.randn(2, 6, H) + 2.0)
+        layer.apply_pending_update()
+        layer.eval()
+        updates = exported_config_updates(layer)
+        self.assertEqual(updates["moe_router_bias"], True)
+        self.assertEqual(updates["dflash_config"]["moe_router_center"], "none")
+        exported_json = _moe_json(
+            **{k: v for k, v in updates.items() if k != "dflash_config"},
+            dflash_config={"moe_router_center": "sample", **updates["dflash_config"]},
+        )
+        reloaded = MoELayer(resolve_moe_config(exported_json), H).eval()
+        files = to_serving_state_dict(layer.state_dict(), layer)
+        reloaded.load_state_dict(from_checkpoint_state_dict(files, reloaded))
+        x = torch.randn(32, H) * 2.0 + 1.0
+        with torch.no_grad():
+            want, got = layer.gate(x), reloaded.gate(x)
+        self.assertTrue(torch.equal(want.indices, got.indices))
+        self.assertTrue(torch.allclose(want.weights, got.weights, atol=1e-5))
+        self.assertEqual(exported_config_updates(nn.Linear(H, H)), {})
 
 
 class TestWarmStart(unittest.TestCase):

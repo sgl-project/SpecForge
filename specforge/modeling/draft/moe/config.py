@@ -40,12 +40,15 @@ ARCHITECTURE_KEYS: Dict[str, str] = {
     )
 }
 ARCHITECTURE_KEYS["moe_layout"] = "layout"
+ARCHITECTURE_KEYS["moe_router_bias"] = "router_bias"
 
 #: ``dflash_config`` key (training-only) -> ``MoEConfig`` field.
 TRAINING_KEYS: Dict[str, str] = {
     "moe_bias_update_rate": "bias_update_rate",
     "moe_aux_loss_coeff": "aux_loss_coeff",
     "moe_dispatch": "dispatch",
+    "moe_router_center": "router_center",
+    "moe_router_center_momentum": "router_center_momentum",
 }
 
 #: Fields a draft JSON must state explicitly (a preset may not default them).
@@ -82,6 +85,9 @@ class MoEConfig:
     topk_group: int = 1
     router: str = "topk"
     balance: str = "none"
+    #: A fixed fp32 router logit bias (``gate.bias``). Exports of centered
+    #: routers set it: router centering folds into this bias.
+    router_bias: bool = False
     #: Registered implementations of the routed and the shared experts.
     experts_backend: str = "grouped"
     shared_expert: str = "swiglu"
@@ -95,6 +101,12 @@ class MoEConfig:
     bias_update_rate: float = 0.0
     aux_loss_coeff: float = 0.0
     dispatch: str = "sorted_loop"
+    #: ``"sample"`` centers the router input on each sample's token mean in
+    #: training and on a running mean (``router_center_momentum``) in eval and
+    #: export. From-scratch DFlash-family drafters otherwise feed every router
+    #: a token-independent common mode and route every token alike.
+    router_center: str = "none"
+    router_center_momentum: float = 0.99
 
     def __post_init__(self) -> None:
         for name in PER_RUN_FIELDS:
@@ -139,6 +151,13 @@ class MoEConfig:
             )
         if self.bias_update_rate < 0 or self.aux_loss_coeff < 0:
             raise ValueError("bias_update_rate and aux_loss_coeff must be >= 0")
+        if self.router_center not in ("none", "sample"):
+            raise ValueError(
+                f"unknown router_center {self.router_center!r}; "
+                "choose 'none' or 'sample'"
+            )
+        if not 0 <= self.router_center_momentum < 1:
+            raise ValueError("router_center_momentum must be in [0, 1)")
 
     @property
     def group_limited(self) -> bool:

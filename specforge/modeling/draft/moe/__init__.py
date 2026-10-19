@@ -17,21 +17,23 @@ Modules:
 
 - :mod:`.base`        ``Registry``, ``RoutingResult``, ``TrainingState``
 - :mod:`.config`      ``MoEConfig`` + presets; resolves a draft JSON
-- :mod:`.router`      score functions and routers
+- :mod:`.router`      score functions and routers (with router centering)
 - :mod:`.balance`     balancing policies (none, noaux_tc, aux_loss)
 - :mod:`.experts`     routed experts
 - :mod:`.shared`      the shared expert
 - :mod:`.layer`       ``MoELayer``, ``build_ffn`` and the model-level hooks
-- :mod:`.checkpoint`  checkpoint layouts
+- :mod:`.checkpoint`  checkpoint layouts, the export fold
 - :mod:`.families`    per-family presets and layouts
 """
 
 from .balance import BalanceController, register_balance_controller
 from .base import RoutingResult, TrainingState
 from .checkpoint import (
+    exported_config_updates,
     from_checkpoint_state_dict,
     register_layout,
     to_checkpoint_state_dict,
+    to_serving_state_dict,
 )
 from .config import MoEConfig, is_moe_config, register_moe_preset, resolve_moe_config
 from .experts import RoutedExperts, register_experts_backend
@@ -62,6 +64,7 @@ __all__ = [
     "build_ffn",
     "collect_moe_aux_loss",
     "collect_moe_metrics",
+    "exported_config_updates",
     "families",
     "from_checkpoint_state_dict",
     "is_moe_config",
@@ -75,4 +78,5 @@ __all__ = [
     "register_shared_expert",
     "resolve_moe_config",
     "to_checkpoint_state_dict",
+    "to_serving_state_dict",
 ]

@@ -32,7 +32,7 @@ of small functions while the expensive parts are shared:
 | balancing (aux loss, aux-loss-free bias, none) | deferred update timing vs activation checkpointing |
 | combine-weight renorm and scale | FSDP-friendly stacked expert layout |
 | shared-expert gate (none, sigmoid), SwiGLU clamp | fp32 accumulation of routed and shared output |
-| checkpoint file naming | load metrics |
+| checkpoint file naming | load metrics, router centering and its export fold |
 
 ## Why match the target's MoE
 
@@ -52,7 +52,8 @@ The drafter's MoE should be the *target's* MoE, expressed as a preset:
 ```
 base.py        Registry, RoutingResult, TrainingState, apply_keeping_fp32
 config.py      MoEConfig + preset registry; resolves a draft JSON
-router.py      score functions, Router ABC, TopKRouter, group-limited mask
+router.py      score functions, Router ABC, TopKRouter (router bias and
+               centering), group-limited mask, the centering export fold
 balance.py     BalanceController: none, noaux_tc, aux_loss
 experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu
 shared.py      SharedExpert ABC, SwiGLUSharedExpert
@@ -96,9 +97,10 @@ a child of the router, so its buffers keep the `gate.balance.*` keys.
 **Updates are deferred.** `observe` only stashes (overwrite, never
 accumulate) so an activation-checkpoint recompute leaves identical state.
 `apply_pending_update` runs from the *model* forward before any routing,
-outside checkpoint regions, and may run collectives (the noaux bias moves
-there). Mutating selection state inside a layer forward would make the
-recompute route differently and raise `CheckpointError`.
+outside checkpoint regions, and may run collectives (the noaux bias and the
+router's centering mean move there). Mutating selection state inside a layer
+forward would make the recompute route differently and raise
+`CheckpointError`.
 
 **Official accumulation order.** `RoutedExperts.forward` returns the weighted
 routed sum as a fresh fp32 tensor; `MoELayer` adds the shared expert into it
@@ -121,12 +123,22 @@ config: `FSDPTrainingBackend` save/load, resume, warm start,
 Layouts act on one MoE layer at a time (the layer prefix is the text before
 its `experts` component) and only the layout the config names runs.
 
-**Routing state stays fp32 and exact.** The selection bias is an fp32 buffer
-that no optimizer owns. Trainers cast the draft to bf16 after warm-starting
-it, so the controller's `_apply` keeps the bias exact (`apply_keeping_fp32`)
-instead of rounding it and restoring the dtype: a warm-started DeepSeek
-selection bias differs across experts by less than bf16's step at its
-magnitude.
+**Router centering.** From-scratch DFlash-family drafters feed every router a
+token-independent common mode (mask-token embeddings plus near-uniform
+attention over the target features), so every token picks the same top-k and
+an aux loss alone does not recover. `moe_router_center: "sample"` centers the
+router input on each sample's token mean in training and on a running mean in
+eval. Exports fold the running mean into a fixed fp32 router logit bias
+(`gate.bias = -W @ mu`) and set `moe_router_bias` in `config.json`, so an
+export reloads as the draft it describes and a serving engine that reads a
+router bias reproduces the trained routing.
+
+**Routing state stays fp32 and exact.** The selection bias, the centering
+mean and the router bias are fp32 buffers that no optimizer owns. Trainers
+cast the draft to bf16 after warm-starting it, so the components' `_apply`
+keeps those values exact (`apply_keeping_fp32`) instead of rounding them and
+restoring the dtype: a warm-started DeepSeek selection bias differs across
+experts by less than bf16's step at its magnitude.
 
 **Model-level terms ride every strategy.** `DraftTrainStrategy.finalize_step_output`
 (called by `TrainerCore` after `forward_loss`) adds the layers' summed

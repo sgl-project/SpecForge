@@ -130,8 +130,7 @@ def iter_moe_layers(module: nn.Module) -> Iterator[MoELayer]:
 def apply_pending_balance_updates(module: nn.Module) -> None:
     """Call at the top of the model forward (training only), outside every
     activation-checkpoint region: applies the previous forward's stashed
-    routing statistics (a balance controller's selection bias, say) before
-    any routing."""
+    routing statistics (balance bias, router centering) before any routing."""
     for layer in iter_moe_layers(module):
         layer.apply_pending_update()
 

@@ -5,7 +5,8 @@ Checkpoint files (trainer checkpoints, warm-start sources, exports) name an
 MoE layer's tensors in each target family's own way, while modules keep a
 native layout (stacked ``[E, out, in]`` experts). A layout, registered by name
 and chosen by the preset (``moe_layout`` overrides it), maps one MoE layer at
-a time in both directions. See ``DESIGN.md``.
+a time in both directions. Exports also fold router centering into the gate.
+See ``DESIGN.md``.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from torch import nn
 from .base import Registry
 from .config import MoEConfig, resolve_moe_config
 from .layer import iter_moe_layers
+from .router import fold_router_centering, fold_router_centering_config
 
 StateDict = Dict[str, Any]
 #: One MoE layer's tensors (layer-relative keys) -> the same layer, other naming.
@@ -114,6 +116,27 @@ def from_checkpoint_state_dict(state: Mapping[str, Any], owner: Any) -> StateDic
     """The file naming of ``owner``'s layout -> module naming (identity if dense)."""
     layout = layout_for(owner)
     return dict(state) if layout is None else _per_layer(state, layout.from_file)
+
+
+# -- exports: fold router centering, then name for serving ----------------------
+
+
+def to_serving_state_dict(state: Mapping[str, Any], owner: Any) -> StateDict:
+    """Module naming -> a servable file: router centering folded into the
+    gate, then the layout's naming."""
+    layout = layout_for(owner)
+    if layout is None:
+        return dict(state)
+    return _per_layer(state, lambda layer: layout.to_file(fold_router_centering(layer)))
+
+
+def exported_config_updates(owner: Any) -> Dict[str, Any]:
+    """``config.json`` changes for an export of ``owner``'s draft: the folded
+    router centering (training keys under ``"dflash_config"``)."""
+    cfg = moe_config_for(owner)
+    if cfg is None:
+        return {}
+    return fold_router_centering_config(cfg)
 
 
 # -- warm start ------------------------------------------------------------------
