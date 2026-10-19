@@ -29,6 +29,8 @@ ARCHITECTURE_KEYS: Dict[str, str] = {
         "scoring_func",
         "norm_topk_prob",
         "routed_scaling_factor",
+        "n_group",
+        "topk_group",
         "router",
         "balance",
         "experts_backend",
@@ -73,6 +75,8 @@ class MoEConfig:
     scoring_func: str = "softmax"
     norm_topk_prob: bool = True
     routed_scaling_factor: float = 1.0
+    n_group: int = 1
+    topk_group: int = 1
     router: str = "topk"
     balance: str = "none"
     #: Registered implementations of the routed and the shared experts.
@@ -109,8 +113,22 @@ class MoEConfig:
                 "shared_expert_intermediate_size", self.shared_expert_intermediate_size
             ),
         )
+        if self.n_group <= 0 or self.n_routed_experts % self.n_group:
+            raise ValueError(
+                f"n_group={self.n_group} must divide n_routed_experts="
+                f"{self.n_routed_experts}"
+            )
+        if not 0 < self.topk_group <= self.n_group:
+            raise ValueError(
+                f"topk_group={self.topk_group} must be in [1, n_group={self.n_group}]"
+            )
         if self.aux_loss_coeff < 0:
             raise ValueError("aux_loss_coeff must be >= 0")
+
+    @property
+    def group_limited(self) -> bool:
+        """Whether routing restricts top-k to ``topk_group`` of ``n_group``."""
+        return self.topk_group < self.n_group
 
 
 #: Preset name -> one target family's architecture defaults.

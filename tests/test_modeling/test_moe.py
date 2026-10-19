@@ -12,6 +12,7 @@ import tempfile
 import unittest
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3Config
 
@@ -46,7 +47,7 @@ from specforge.modeling.draft.moe.experts import (
     GroupedExperts,
     swiglu,
 )
-from specforge.modeling.draft.moe.router import ROUTERS, TopKRouter
+from specforge.modeling.draft.moe.router import ROUTERS, TopKRouter, group_limited_mask
 from specforge.modeling.draft.moe.shared import SHARED_EXPERTS, SwiGLUSharedExpert
 from specforge.training.controller import TrainerCore
 from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
@@ -85,7 +86,12 @@ def _from_per_expert(layer):
 
 def setUpModule():
     register_layout(LAYOUT, to_file=_to_per_expert, from_file=_from_per_expert)
-    register_moe_preset(PRESET, routed_scaling_factor=1.5, layout=LAYOUT)
+    register_moe_preset(
+        PRESET,
+        scoring_func="sqrtsoftplus",
+        routed_scaling_factor=1.5,
+        layout=LAYOUT,
+    )
 
 
 def tearDownModule():
@@ -122,8 +128,8 @@ class TestConfig(unittest.TestCase):
         self.assertIsNone(resolve_moe_config({"n_routed_experts": 0}))
 
     def test_preset_defaults_and_explicit_overrides(self):
-        self.assertEqual(resolve_moe_config(_moe_json()).routed_scaling_factor, 1.5)
         cfg = resolve_moe_config(_moe_json(routed_scaling_factor=2.0))
+        self.assertEqual(cfg.scoring_func, "sqrtsoftplus")
         self.assertEqual(cfg.routed_scaling_factor, 2.0)
         self.assertEqual(cfg.layout, LAYOUT)
         self.assertEqual(cfg.shared_expert_intermediate_size, 8)
@@ -206,6 +212,35 @@ class TestRouter(unittest.TestCase):
         cfg = resolve_moe_config(_moe_json(scoring_func="softmax"))
         router = TopKRouter(cfg, H, BalanceController(cfg, 8))
         self.assertTrue(torch.allclose(router.score_fn(logits), logits.softmax(-1)))
+        cfg = resolve_moe_config(_moe_json())
+        router = TopKRouter(cfg, H, BalanceController(cfg, 8))
+        self.assertTrue(
+            torch.allclose(router.score_fn(logits), F.softplus(logits).sqrt())
+        )
+
+    def test_sqrtsoftplus_gradient_stays_finite_for_underflowing_logits(self):
+        cfg = resolve_moe_config(_moe_json())
+        score_fn = TopKRouter(cfg, H, BalanceController(cfg, 8)).score_fn
+        logits = torch.tensor([[-200.0, -110.0, -50.0, 0.0, 3.0]], requires_grad=True)
+        scores = score_fn(logits)
+        scores.sum().backward()
+        # softplus underflows to 0 below about -104: no NaN, a zero gradient
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertTrue(torch.equal(logits.grad[0, :2], torch.zeros(2)))
+        normal = logits.detach()[0, 2:]
+        self.assertTrue(
+            torch.allclose(scores.detach()[0, 2:], F.softplus(normal).sqrt())
+        )
+        # through a whole layer: a router row that drives its logits far
+        # negative must not poison the router weight gradient
+        layer = _layer()
+        with torch.no_grad():
+            layer.gate.weight[3] = -50.0
+        x = torch.randn(16, H).abs() + 1.0
+        out = layer(x)
+        out.float().pow(2).mean().backward()
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertTrue(torch.isfinite(layer.gate.weight.grad).all())
 
     def test_selection_bias_changes_choices_not_weights(self):
         cfg = resolve_moe_config(_moe_json())
@@ -218,7 +253,7 @@ class TestRouter(unittest.TestCase):
         router.balance.bias[[1, 5]] = 100.0
         after = router(x)
         self.assertTrue((after.indices.sort(-1).values == torch.tensor([1, 5])).all())
-        scores = (x @ router.weight.t()).softmax(-1)
+        scores = F.softplus(x @ router.weight.t()).sqrt()
         expected = scores[:, [1, 5]]
         expected = 1.5 * expected / expected.sum(-1, keepdim=True)
         self.assertTrue(
@@ -229,6 +264,12 @@ class TestRouter(unittest.TestCase):
         self.assertTrue(torch.allclose(after.weights.sum(-1), torch.full((10,), 1.5)))
         self.assertEqual(int(after.counts.sum()), 20)
         self.assertFalse(torch.equal(before.indices, after.indices))
+
+    def test_group_limited_mask_keeps_the_best_groups(self):
+        selection = torch.tensor([[1.0, 2.0, 9.0, 8.0, 0.0, 0.5]])
+        masked = group_limited_mask(selection, n_group=3, topk_group=1)
+        self.assertTrue(torch.isinf(masked[0, [0, 1, 4, 5]]).all())
+        self.assertTrue(torch.equal(masked[0, [2, 3]], selection[0, [2, 3]]))
 
 
 # -- experts, shared expert, layer ---------------------------------------------------

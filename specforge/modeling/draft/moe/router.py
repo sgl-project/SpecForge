@@ -4,7 +4,8 @@
 A router owns the gate projection and composes a :class:`~.balance.BalanceController`
 (``self.balance``) that may shift scores for *selection only*. Routers register
 by name (``MoEConfig.router``); score functions register separately
-(``MoEConfig.scoring_func``) so one top-k router serves every score function.
+(``MoEConfig.scoring_func``) so one top-k router serves the softmax, sigmoid
+and sqrtsoftplus families.
 
 Every router receives ``tokens_per_sample``: the flat ``[T, hidden]`` batch is
 ``T / tokens_per_sample`` samples of that many tokens each, in order, or
@@ -37,6 +38,39 @@ def register_score_function(name: str):
 @register_score_function("softmax")
 def _softmax(logits: torch.Tensor) -> torch.Tensor:
     return logits.softmax(dim=-1)
+
+
+@register_score_function("sigmoid")
+def _sigmoid(logits: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(logits)
+
+
+@register_score_function("sqrtsoftplus")
+def _sqrtsoftplus(logits: torch.Tensor) -> torch.Tensor:
+    """DeepSeek-V4 scoring: ``sqrt(softplus(logits))``.
+
+    ``softplus`` underflows to exactly 0 once a logit drops below about -104
+    in fp32, where ``sqrt``'s derivative is infinite: the backward would be
+    NaN even where the incoming gradient is 0 (every unselected expert), while
+    the forward looks fine. Clamping at the smallest normal value gives those
+    entries a zero gradient and moves their score by less than 1e-19.
+    """
+    return F.softplus(logits).clamp_min(torch.finfo(logits.dtype).tiny).sqrt()
+
+
+def group_limited_mask(
+    selection: torch.Tensor, n_group: int, topk_group: int
+) -> torch.Tensor:
+    """Keep only the ``topk_group`` groups with the highest top-2 score sums
+    (DeepSeek ``noaux_tc`` group scoring); other groups become ``-inf``."""
+    tokens, n_experts = selection.shape
+    grouped = selection.view(tokens, n_group, n_experts // n_group)
+    group_scores = grouped.topk(min(2, grouped.shape[-1]), dim=-1).values.sum(-1)
+    keep = group_scores.topk(topk_group, dim=-1).indices
+    mask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(1, keep, True)
+    return grouped.masked_fill(~mask.unsqueeze(-1), float("-inf")).view(
+        tokens, n_experts
+    )
 
 
 class Router(TrainingState, nn.Module, abc.ABC):
@@ -99,6 +133,10 @@ class TopKRouter(Router):
         logits = F.linear(x.float(), self.weight.float())
         scores = self.score_fn(logits)
         selection = self.balance.adjust_selection_scores(scores)
+        if self.cfg.group_limited:
+            selection = group_limited_mask(
+                selection, self.cfg.n_group, self.cfg.topk_group
+            )
         indices = selection.topk(self.topk, dim=-1).indices
         weights = scores.gather(1, indices)
         if self.cfg.norm_topk_prob:

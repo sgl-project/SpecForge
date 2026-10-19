@@ -28,7 +28,7 @@ of small functions while the expensive parts are shared:
 
 | differs per target family | shared by every family |
 | --- | --- |
-| score function | token dispatch (sorted segments, grouped GEMM) |
+| score function (softmax, sigmoid, sqrtsoftplus) | token dispatch (sorted segments, grouped GEMM) |
 | balancing policy | deferred update timing vs activation checkpointing |
 | combine-weight renorm and scale | FSDP-friendly stacked expert layout |
 | shared expert (none or one) | fp32 accumulation of routed and shared output |
@@ -52,7 +52,7 @@ The drafter's MoE should be the *target's* MoE, expressed as a preset:
 ```
 base.py        Registry, RoutingResult, TrainingState
 config.py      MoEConfig + preset registry; resolves a draft JSON
-router.py      score functions, Router ABC, TopKRouter
+router.py      score functions, Router ABC, TopKRouter, group-limited mask
 balance.py     BalanceController: none
 experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu
 shared.py      SharedExpert ABC, SwiGLUSharedExpert
