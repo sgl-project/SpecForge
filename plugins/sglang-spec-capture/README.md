@@ -42,12 +42,12 @@ For a live store test, it must provide both `mooncake.store` and the
 `mooncake_master` executable (for example, `mooncake-transfer-engine-cuda13`
 on CUDA 13).
 
-For example, from the SpecForge checkout on a CUDA 13 host, with an SGLang
-checkout containing both changes:
-
 Source installation requires the Rust toolchain pinned by SGLang, a C/C++
 compiler, and CUDA development tools. An existing compatible SGLang server
 environment can also be used.
+
+For example, from the SpecForge checkout on a CUDA 13 host, with an SGLang
+checkout containing both changes:
 
 ```bash
 python3.12 -m venv .venv-sglang .venv-training
