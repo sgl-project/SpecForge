@@ -217,6 +217,14 @@ class TestServerCaptureGate(unittest.TestCase):
                 "triton",
                 "--mem-fraction-static",
                 "0.3",
+                "--max-total-tokens",
+                "4096",
+                (
+                    "--cuda-graph-max-bs-decode"
+                    if SERVER_CAPTURE == "plugin"
+                    else "--cuda-graph-max-bs"
+                ),
+                "4",
                 "--chunked-prefill-size",
                 "-1",
                 "--tp-size",

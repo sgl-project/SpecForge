@@ -1,8 +1,9 @@
 # coding=utf-8
-"""Unit tests for the ``specforge-sglang-capture`` SGLang plugin (CPU, fakes).
+"""Unit tests for the ``specforge-sglang-capture`` SGLang plugin.
 
 The plugin's logic is driven with stand-ins for SGLang's batch, forward batch,
 logits output and scheduler, so these run on any installed SGLang version.
+The graph replay regression additionally requires CUDA.
 ``test_sglang_capture_plugin_integration.py`` drives the same plugin through
 SGLang's real result-processing and streaming code when the installed SGLang
 has the forward-observer extension points.
@@ -172,14 +173,36 @@ class TestObserver(unittest.TestCase):
         self.assertIs(device.aux, out.hidden_states)
         self.assertIs(device.last_hidden, out.last_hidden_states)
 
-    def test_graph_outputs_are_copied_out_of_static_buffers(self):
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_graph_outputs_survive_replay_and_host_copy(self):
         batch = SimpleNamespace(reqs=[_req("a", 2, _spec("a"))])
         out = _logits_output(2)
+        out.hidden_states = out.hidden_states.cuda()
+        out.last_hidden_states = out.last_hidden_states.cuda()
+        aux_input = torch.full_like(out.hidden_states, 7)
+        last_input = torch.full_like(out.last_hidden_states, 11)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out.hidden_states.copy_(aux_input)
+            out.last_hidden_states.copy_(last_input)
+        graph.replay()
         device = _runtime().observer.after_forward(
             batch, _forward_batch([2]), out, can_run_graph=True
         )
-        self.assertIsNot(device.aux, out.hidden_states)
-        torch.testing.assert_close(device.aux, out.hidden_states)
+        aux_input.fill_(19)
+        last_input.fill_(23)
+        graph.replay()
+
+        def copy_to_host(tensor):
+            host = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            return host.copy_(tensor, non_blocking=True)
+
+        host = device.copy_to_host(copy_to_host)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.hidden_states, aux_input)
+        torch.testing.assert_close(out.last_hidden_states, last_input)
+        torch.testing.assert_close(host.aux, torch.full((2, 6), 7.0))
+        torch.testing.assert_close(host.last_hidden, torch.full((2, 2), 11.0))
 
     def test_mixed_batch_gathers_capture_rows_and_rebases_items(self):
         reqs = [_req("plain", 2), _req("a", 3, _spec("a")), _req("b", 1, _spec("b"))]

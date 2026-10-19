@@ -45,10 +45,16 @@ on CUDA 13).
 For example, from the SpecForge checkout on a CUDA 13 host, with an SGLang
 checkout containing both changes:
 
+Source installation requires the Rust toolchain pinned by SGLang, a C/C++
+compiler, and CUDA development tools. An existing compatible SGLang server
+environment can also be used.
+
 ```bash
 python3.12 -m venv .venv-sglang .venv-training
+.venv-sglang/bin/python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
 .venv-sglang/bin/python -m pip install -e /path/to/sglang/python mooncake-transfer-engine-cuda13
 .venv-sglang/bin/python -m pip install --no-deps plugins/sglang-spec-capture
+.venv-training/bin/python -m pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
 .venv-training/bin/python -m pip install -e . mooncake-transfer-engine-cuda13
 .venv-sglang/bin/python -m pip check
 .venv-training/bin/python -m pip check
@@ -63,7 +69,7 @@ SGLang discovers the plugin through the `sglang.srt.plugins` entry point. If
 SPECFORGE_SPEC_CAPTURE=1 \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:50051 \
 MOONCAKE_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-python -m sglang.launch_server --model-path <target> --skip-tokenizer-init \
+.venv-sglang/bin/python -m sglang.launch_server --model-path <target> --skip-tokenizer-init \
   --chunked-prefill-size -1 \
   --speculative-algorithm DFLASH --enable-return-aux-hidden-states \
   --return-aux-hidden-state-layer-ids 1 16 31 46 61 \
