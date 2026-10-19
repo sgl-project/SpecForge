@@ -568,7 +568,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             kernels=kernels,
         )
         # Dense MLP from the kernel provider, or an MoELayer when the draft
-        # JSON sets n_routed_experts > 0 (see modeling/draft/moe).
+        # JSON names a moe_preset (see modeling/draft/moe).
         self.mlp = build_ffn(config, dense=kernels.make_mlp)
         self.input_layernorm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps

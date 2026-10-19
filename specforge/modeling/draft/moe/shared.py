@@ -16,7 +16,7 @@ from typing import Type
 import torch
 from torch import nn
 
-from ._registry import Registry
+from .base import Registry
 from .config import MoEConfig
 
 

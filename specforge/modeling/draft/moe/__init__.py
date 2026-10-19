@@ -15,6 +15,7 @@ naming, FSDP layout, deferred balance updates) are shared. See ``DESIGN.md``.
 
 Modules:
 
+- :mod:`.base`        ``Registry``, ``RoutingResult``, ``TrainingState``
 - :mod:`.config`      ``MoEConfig`` + the preset registry; resolves a draft JSON
 - :mod:`.router`      ``Router`` contract (scores -> top-k) + score functions
 - :mod:`.balance`     ``BalanceController`` contract: balancing as a policy
@@ -35,10 +36,10 @@ from .balance import (
     build_balance_controller,
     register_balance_controller,
 )
+from .base import RoutingResult, TrainingState
 from .config import (
     MOE_PRESETS,
     MoEConfig,
-    available_moe_presets,
     is_moe_config,
     register_moe_preset,
     resolve_moe_config,
@@ -61,7 +62,6 @@ from .router import (
     ROUTERS,
     SCORE_FUNCTIONS,
     Router,
-    RoutingResult,
     build_router,
     get_score_function,
     register_router,
@@ -93,9 +93,9 @@ __all__ = [
     "SCORE_FUNCTIONS",
     "SHARED_EXPERTS",
     "SharedExpert",
+    "TrainingState",
     "WarmStartPlan",
     "apply_pending_balance_updates",
-    "available_moe_presets",
     "build_balance_controller",
     "build_ffn",
     "build_routed_experts",

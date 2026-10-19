@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from .balance import MetricValue, build_balance_controller
-from .config import MoEConfig, resolve_moe_config
+from .config import MoEConfig, requests_routed_experts, resolve_moe_config
 from .experts import build_routed_experts
 from .router import RoutingResult, build_router
 from .shared import build_shared_expert
@@ -83,10 +83,15 @@ def build_ffn(config, dense: Callable[[object], nn.Module]) -> nn.Module:
     """The dense/MoE switch for a decoder layer's FFN.
 
     ``config`` is the draft's HF config; ``dense`` builds the dense MLP (the
-    kernel provider's factory) and is used verbatim when the config is dense,
-    so dense drafts are byte-for-byte unaffected by this package.
+    kernel provider's factory) and is used verbatim when the config names no
+    ``moe_preset``, so dense drafts are byte-for-byte unaffected.
     """
     moe_cfg = resolve_moe_config(config)
-    if moe_cfg is None:
-        return dense(config)
-    return MoELayer(moe_cfg, int(config.hidden_size))
+    if moe_cfg is not None:
+        return MoELayer(moe_cfg, int(config.hidden_size))
+    if requests_routed_experts(config):
+        raise ValueError(
+            "the draft config sets n_routed_experts but no moe_preset; name the "
+            "target family's preset (see specforge.modeling.draft.moe)"
+        )
+    return dense(config)
