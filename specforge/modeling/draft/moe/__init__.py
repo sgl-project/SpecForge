@@ -18,16 +18,12 @@ Modules:
 - :mod:`.base`        ``Registry``, ``RoutingResult``, ``TrainingState``
 - :mod:`.config`      ``MoEConfig`` + the preset registry; resolves a draft JSON
 - :mod:`.router`      score functions and routers
-- :mod:`.balance`     ``BalanceController`` contract: balancing as a policy
+- :mod:`.balance`     balancing policies
 - :mod:`.experts`     routed experts
 - :mod:`.shared`      the shared expert
-- :mod:`.layer`       ``MoELayer`` composition; ``build_ffn`` is the dense/MoE switch
-- :mod:`.hooks`       model-level plumbing: balance updates, aux loss, metrics
+- :mod:`.layer`       ``MoELayer``, ``build_ffn`` and the model-level hooks
 - :mod:`.state_dict`  module layout <-> official checkpoint naming boundary
 - :mod:`.init`        warm-start plans from a target model's experts
-
-Implementations register into the registries from their own modules; this
-package defines contracts and holds no routing math itself.
 """
 
 from .balance import (
@@ -50,14 +46,15 @@ from .experts import (
     build_routed_experts,
     register_experts_backend,
 )
-from .hooks import (
+from .init import WarmStartPlan, plan_warm_start, select_target_experts
+from .layer import (
+    MoELayer,
     apply_pending_balance_updates,
+    build_ffn,
     collect_moe_aux_loss,
     collect_moe_metrics,
     iter_moe_layers,
 )
-from .init import WarmStartPlan, plan_warm_start, select_target_experts
-from .layer import MoELayer, build_ffn
 from .router import (
     ROUTERS,
     SCORE_FUNCTIONS,

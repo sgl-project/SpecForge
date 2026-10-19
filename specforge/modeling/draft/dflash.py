@@ -881,9 +881,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         if self.training:
-            # Consume the PREVIOUS forward's routing statistics before any
+            # Apply the PREVIOUS forward's routing statistics before any
             # routing this step, outside every activation-checkpoint region
-            # (see modeling/draft/moe/balance.py for why the timing matters).
+            # (see modeling/draft/moe/base.py for why the timing matters).
             apply_pending_balance_updates(self)
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
