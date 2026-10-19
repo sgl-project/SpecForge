@@ -1,10 +1,17 @@
 # coding=utf-8
 """DeepSeek-V4 MoE family: the deepseek_v4 preset against transformers'
-DeepSeek-V4 MoE block, the deepseek checkpoint layout and the serving config."""
+DeepSeek-V4 MoE block, the deepseek checkpoint layout, the FP4/FP8 checkpoint
+dtypes against transformers' dequantizer, the serving config and the target
+reader."""
 
+import json
+import os
+import tempfile
 import unittest
 
 import torch
+from safetensors.torch import save_file
+from transformers.integrations.finegrained_fp8 import Fp8Dequantize
 from transformers.models.deepseek_v4 import modeling_deepseek_v4 as hf
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
@@ -180,6 +187,107 @@ class TestDeepSeekServing(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "cannot serve"),
             ):
                 serving_config(_moe(**override))
+
+
+def _fp8_reference(weight, scale):
+    return Fp8Dequantize(None)._dequantize_one(weight, scale, torch.float32)
+
+
+class TestCheckpointDtypes(unittest.TestCase):
+    def test_fp8_blocks_match_transformers(self):
+        torch.manual_seed(0)
+        weight = torch.randn(256, 384) * 3
+        q, scale = deepseek.quantize_fp8(weight)
+        self.assertEqual(tuple(scale.shape), (2, 3))
+        self.assertEqual(scale.dtype, torch.float8_e8m0fnu)
+        ours = deepseek.dequantize_fp8(q, scale, torch.float32)
+        self.assertTrue(torch.equal(ours, _fp8_reference(q, scale)))
+        # Dequantized values survive a requantization exactly (the export
+        # bundle relies on this for weights it did not change).
+        again = deepseek.dequantize_fp8(*deepseek.quantize_fp8(ours), torch.float32)
+        self.assertTrue(torch.equal(again, ours))
+        with self.assertRaisesRegex(ValueError, "scale"):
+            deepseek.dequantize_fp8(q, scale[:1])
+
+    def test_fp4_matches_transformers(self):
+        torch.manual_seed(1)
+        weight = torch.randn(64, 256)
+        packed, scale = deepseek.quantize_fp4(weight)
+        self.assertEqual((packed.dtype, tuple(packed.shape)), (torch.int8, (64, 128)))
+        self.assertEqual(tuple(scale.shape), (64, 256 // deepseek.FP4_GROUP))
+        ours = deepseek.dequantize_fp4(packed, scale, torch.float32)
+        self.assertTrue(torch.equal(ours, _fp8_reference(packed, scale)))
+        # Values round-trip exactly; the codes need not (+0/-0, and a group
+        # whose largest value lands on 3 requantizes with half the scale).
+        again = deepseek.dequantize_fp4(*deepseek.quantize_fp4(ours), torch.float32)
+        self.assertTrue(torch.equal(again, ours))
+        # Nearest grid point: within half the coarsest grid step of the scale.
+        step = 2.0 * scale.float().repeat_interleave(deepseek.FP4_GROUP, 1)
+        self.assertTrue(bool(((ours - weight).abs() <= step / 2 + 1e-6).all()))
+
+
+def _write_snapshot(root, layers):
+    """A tiny sharded DeepSeek-V4 checkpoint in the official dtypes."""
+    config = {"architectures": ["DeepseekV4ForCausalLM"], "n_routed_experts": E}
+    with open(os.path.join(root, "config.json"), "w") as stream:
+        json.dump(config, stream)
+    weight_map = {}
+    for shard, tensors in enumerate(layers):
+        name = f"model-{shard:05d}.safetensors"
+        save_file(tensors, os.path.join(root, name))
+        weight_map.update({key: name for key in tensors})
+    with open(os.path.join(root, "model.safetensors.index.json"), "w") as stream:
+        json.dump({"weight_map": weight_map}, stream)
+
+
+def _official_layer(prefix, seed):
+    torch.manual_seed(seed)
+    tensors = {
+        prefix + "gate.weight": torch.randn(E, H).to(torch.bfloat16),
+        prefix + "gate.bias": torch.randn(E),
+    }
+    for i in range(E):
+        for w, shape in (("w1", (I, H)), ("w3", (I, H)), ("w2", (H, I))):
+            q, s = deepseek.quantize_fp4(torch.randn(*shape))
+            tensors[f"{prefix}experts.{i}.{w}.weight"] = q
+            tensors[f"{prefix}experts.{i}.{w}.scale"] = s
+    for w, shape in (("w1", (I, H)), ("w3", (I, H)), ("w2", (H, I))):
+        # smaller than one 128x128 block: a single scale covers the tensor
+        tensors[f"{prefix}shared_experts.{w}.weight"] = torch.randn(*shape).to(
+            torch.float8_e4m3fn
+        )
+        tensors[f"{prefix}shared_experts.{w}.scale"] = torch.full((1, 1), 0.5).to(
+            torch.float8_e8m0fnu
+        )
+    return tensors
+
+
+class TestSnapshotReading(unittest.TestCase):
+    def test_reads_only_the_prefix_and_dequantizes(self):
+        prefix = "layers.3.ffn."
+        with tempfile.TemporaryDirectory() as root:
+            learned = _official_layer(prefix, seed=3)
+            other = {
+                "layers.1.ffn.gate.weight": torch.zeros(E, H, dtype=torch.bfloat16)
+            }
+            _write_snapshot(root, [other, learned])
+            self.assertEqual(deepseek.read_config(root)["n_routed_experts"], E)
+            raw = dict(deepseek.iter_checkpoint_tensors(root, prefix))
+        self.assertEqual(set(raw), set(learned))
+        source = deepseek.dequantize_tensors(
+            {key[len(prefix) :]: value for key, value in raw.items()}
+        )
+        self.assertNotIn("experts.0.w1.scale", source)
+        self.assertEqual(source["gate.bias"].dtype, torch.float32)
+        self.assertTrue(
+            torch.equal(
+                source["shared_experts.w2.weight"],
+                _fp8_reference(
+                    learned[prefix + "shared_experts.w2.weight"],
+                    learned[prefix + "shared_experts.w2.scale"],
+                ).to(torch.bfloat16),
+            )
+        )
 
 
 if __name__ == "__main__":
