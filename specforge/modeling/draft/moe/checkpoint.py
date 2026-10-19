@@ -5,14 +5,15 @@ Checkpoint files (trainer checkpoints, warm-start sources, exports) name an
 MoE layer's tensors in each target family's own way, while modules keep a
 native layout (stacked ``[E, out, in]`` experts). A layout, registered by name
 and chosen by the preset (``moe_layout`` overrides it), maps one MoE layer at
-a time in both directions. Exports also fold router centering into the gate.
-See ``DESIGN.md``.
+a time in both directions. Exports also fold router centering into the gate
+and add the ``config.json`` fields the family's serving engine reads. See
+``DESIGN.md``.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from torch import nn
@@ -25,6 +26,8 @@ from .router import fold_router_centering, fold_router_centering_config
 StateDict = Dict[str, Any]
 #: One MoE layer's tensors (layer-relative keys) -> the same layer, other naming.
 LayerTransform = Callable[[StateDict], StateDict]
+#: Resolved config -> the ``config.json`` fields a serving engine reads.
+ServingConfig = Callable[[MoEConfig], Dict[str, Any]]
 
 
 # -- layouts: module naming <-> file naming -------------------------------------
@@ -37,19 +40,35 @@ class CheckpointLayout:
     ``to_file`` and ``from_file`` map one layer between module naming and file
     naming; ``from_file(to_file(state))`` must give back ``state``. Both keep
     the layer's ``experts`` component (the boundary finds layers by it).
+    ``serving_config(cfg)`` returns the
+    ``config.json`` fields a serving engine needs to rebuild the routing, and
+    ``serving_architectures`` maps a dense draft's serving class to the
+    engine's class for the same draft with this family's MoE FFN.
     """
 
     to_file: LayerTransform
     from_file: LayerTransform
+    serving_config: Optional[ServingConfig] = None
+    serving_architectures: Mapping[str, str] = field(default_factory=dict)
 
 
 LAYOUTS: Registry[CheckpointLayout] = Registry("MoE checkpoint layout")
 
 
 def register_layout(
-    name: str, *, to_file: LayerTransform, from_file: LayerTransform
+    name: str,
+    *,
+    to_file: LayerTransform,
+    from_file: LayerTransform,
+    serving_config: Optional[ServingConfig] = None,
+    serving_architectures: Optional[Mapping[str, str]] = None,
 ) -> None:
-    LAYOUTS.register(name, CheckpointLayout(to_file, from_file))
+    LAYOUTS.register(
+        name,
+        CheckpointLayout(
+            to_file, from_file, serving_config, dict(serving_architectures or {})
+        ),
+    )
 
 
 def _same_names(state: StateDict) -> StateDict:
@@ -130,13 +149,41 @@ def to_serving_state_dict(state: Mapping[str, Any], owner: Any) -> StateDict:
     return _per_layer(state, lambda layer: layout.to_file(fold_router_centering(layer)))
 
 
-def exported_config_updates(owner: Any) -> Dict[str, Any]:
-    """``config.json`` changes for an export of ``owner``'s draft: the folded
-    router centering (training keys under ``"dflash_config"``)."""
+def serving_config(owner: Any) -> Dict[str, Any]:
+    """``config.json`` fields a serving engine needs for ``owner``'s MoE layers."""
     cfg = moe_config_for(owner)
     if cfg is None:
         return {}
-    return fold_router_centering_config(cfg)
+    layout = LAYOUTS.get(cfg.layout)
+    return {} if layout.serving_config is None else dict(layout.serving_config(cfg))
+
+
+def exported_config_updates(owner: Any) -> Dict[str, Any]:
+    """``config.json`` changes for an export of ``owner``'s draft: the folded
+    router centering (training keys under ``"dflash_config"``), then the
+    serving fields of the layout."""
+    cfg = moe_config_for(owner)
+    if cfg is None:
+        return {}
+    updates = fold_router_centering_config(cfg)
+    updates.update(serving_config(owner))
+    return updates
+
+
+def serving_architecture(owner: Any, dense_architecture: str) -> str:
+    """The serving engine's class for ``owner``'s draft, given the class it
+    would use if the draft were dense; ``dense_architecture`` for drafts
+    without MoE layers. Raises when the family has no such class."""
+    cfg = moe_config_for(owner)
+    if cfg is None:
+        return dense_architecture
+    mapping = LAYOUTS.get(cfg.layout).serving_architectures
+    if dense_architecture not in mapping:
+        raise ValueError(
+            f"MoE layout {cfg.layout!r} names no serving class for a "
+            f"{dense_architecture} draft with an MoE FFN; known: {dict(mapping)}"
+        )
+    return mapping[dense_architecture]
 
 
 # -- warm start ------------------------------------------------------------------

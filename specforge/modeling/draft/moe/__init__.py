@@ -22,7 +22,7 @@ Modules:
 - :mod:`.experts`     routed experts
 - :mod:`.shared`      the shared expert
 - :mod:`.layer`       ``MoELayer``, ``build_ffn`` and the model-level hooks
-- :mod:`.checkpoint`  checkpoint layouts, the export fold
+- :mod:`.checkpoint`  checkpoint layouts, the export fold, serving config
 - :mod:`.families`    per-family presets and layouts
 """
 
@@ -32,6 +32,8 @@ from .checkpoint import (
     exported_config_updates,
     from_checkpoint_state_dict,
     register_layout,
+    serving_architecture,
+    serving_config,
     to_checkpoint_state_dict,
     to_serving_state_dict,
 )
@@ -77,6 +79,8 @@ __all__ = [
     "register_score_function",
     "register_shared_expert",
     "resolve_moe_config",
+    "serving_architecture",
+    "serving_config",
     "to_checkpoint_state_dict",
     "to_serving_state_dict",
 ]

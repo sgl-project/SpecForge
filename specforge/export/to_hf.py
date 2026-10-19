@@ -93,7 +93,8 @@ def export_to_hf(
         }
     )
     # MoE drafts: fold training-only state (router centering), write the
-    # family's file naming, and make config.json describe the folded draft.
+    # family's file naming, and make config.json describe the folded draft
+    # plus the fields serving engines read.
     updates = exported_config_updates(model)
     full_state = to_serving_state_dict(full_state, model)
     for key, value in updates.items():

@@ -1,15 +1,18 @@
 # coding=utf-8
 """MoE FFN framework: config resolution, the family-agnostic components, the
 layer and its hooks, the checkpoint boundary (layouts, the centering export
-fold), and the model/trainer seams.
+fold, serving config), and the model/trainer seams.
 
 Family presets and layouts are registered by the tests themselves, so this
 file pins the framework independently of any target family.
 """
 
+import importlib.util
+import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +37,8 @@ from specforge.modeling.draft.moe import (
     register_router,
     register_shared_expert,
     resolve_moe_config,
+    serving_architecture,
+    serving_config,
     to_checkpoint_state_dict,
     to_serving_state_dict,
 )
@@ -103,7 +108,16 @@ def _from_per_expert(layer):
 
 
 def setUpModule():
-    register_layout(LAYOUT, to_file=_to_per_expert, from_file=_from_per_expert)
+    register_layout(
+        LAYOUT,
+        to_file=_to_per_expert,
+        from_file=_from_per_expert,
+        serving_config=lambda cfg: {"num_experts": cfg.n_routed_experts},
+        serving_architectures={
+            "DenseDraft": "MoEDraft",
+            "DFlashDraftModel": "MoEDFlashDraft",
+        },
+    )
     register_moe_preset(
         PRESET,
         scoring_func="sqrtsoftplus",
@@ -668,6 +682,31 @@ class TestCheckpointBoundary(unittest.TestCase):
         self.assertNotIn("gate.input_mean", served)
         self.assertIn("gate.selection_bias", served)
         self.assertIn("experts.0.w1.weight", served)
+        self.assertEqual(serving_config(layer), {"num_experts": 8})
+        self.assertEqual(serving_config(nn.Linear(H, H)), {})
+        self.assertEqual(serving_architecture(layer, "DenseDraft"), "MoEDraft")
+        self.assertEqual(serving_architecture(nn.Linear(H, H), "X"), "X")
+        with self.assertRaisesRegex(ValueError, "no serving class"):
+            serving_architecture(layer, "OtherDraft")
+
+    def test_export_normalizer_leaves_dense_exports_alone(self):
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "gates"
+            / "normalize_dflash_export.py"
+        )
+        spec = importlib.util.spec_from_file_location("normalize_export", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        dense = {"hidden_size": H, "architectures": ["DFlashDraftModel"]}
+        dense["block_size"] = 4
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            Path(path).write_text(json.dumps(dense))
+            config = module.normalize_export(path, expected_block_size=4)
+            self.assertEqual(config["architectures"], ["DFlashDraftModel"])
+            self.assertNotIn("num_experts", config)
 
     def test_centered_export_reloads_as_the_draft_it_describes(self):
         layer = _layer(dflash_config={"moe_router_center": "sample"}).train()
@@ -677,6 +716,7 @@ class TestCheckpointBoundary(unittest.TestCase):
         updates = exported_config_updates(layer)
         self.assertEqual(updates["moe_router_bias"], True)
         self.assertEqual(updates["dflash_config"]["moe_router_center"], "none")
+        self.assertEqual(updates["num_experts"], 8)  # the layout's serving field
         exported_json = _moe_json(
             **{k: v for k, v in updates.items() if k != "dflash_config"},
             dflash_config={"moe_router_center": "sample", **updates["dflash_config"]},

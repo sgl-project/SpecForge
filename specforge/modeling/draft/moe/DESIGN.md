@@ -32,7 +32,7 @@ of small functions while the expensive parts are shared:
 | balancing (aux loss, aux-loss-free bias, none) | deferred update timing vs activation checkpointing |
 | combine-weight renorm and scale | FSDP-friendly stacked expert layout |
 | shared-expert gate (none, sigmoid), SwiGLU clamp | fp32 accumulation of routed and shared output |
-| checkpoint file naming | load metrics, router centering and its export fold |
+| checkpoint file naming, serving config | load metrics, router centering and its export fold |
 
 ## Why match the target's MoE
 
@@ -58,7 +58,7 @@ balance.py     BalanceController: none, noaux_tc, aux_loss
 experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu
 shared.py      SharedExpert ABC, SwiGLUSharedExpert
 layer.py       MoELayer, build_ffn, and the model-level hooks
-checkpoint.py  checkpoint layouts, select_target_experts
+checkpoint.py  checkpoint layouts, serving config, select_target_experts
 families/      one module per target family: preset and layout
 ```
 
@@ -131,7 +131,11 @@ router input on each sample's token mean in training and on a running mean in
 eval. Exports fold the running mean into a fixed fp32 router logit bias
 (`gate.bias = -W @ mu`) and set `moe_router_bias` in `config.json`, so an
 export reloads as the draft it describes and a serving engine that reads a
-router bias reproduces the trained routing.
+router bias reproduces the trained routing. `exported_config_updates` adds
+the `config.json` fields the layout's serving engine reads, and
+`serving_architecture` maps the class a dense draft is served with to the
+engine's class for the same draft with the family's MoE FFN (the export
+normalizer uses it).
 
 **Routing state stays fp32 and exact.** The selection bias, the centering
 mean and the router bias are fp32 buffers that no optimizer owns. Trainers
@@ -155,7 +159,8 @@ scalar.
 ## Extension points
 
 - New target family: a module under `families/` with `register_moe_preset`
-  (recipe + default layout) and `register_layout` (file naming).
+  (recipe + default layout) and `register_layout` (file naming, serving
+  config, serving class).
 - New routing mechanism: `register_score_function`, `register_router` or
   `register_balance_controller`.
 - New expert implementation: a `RoutedExperts` subclass under
