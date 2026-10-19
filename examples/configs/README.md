@@ -110,6 +110,19 @@ server/trainer splits, Mooncake lease, in-flight watermarks and throughput
 measured on B300 and H200 nodes, and the two-node launcher that starts eight
 capture servers.
 
+`qwen3.8-27b-dspark-moe-h200-disaggregated.yaml` (one 8x H200 node, four FP8
+capture servers plus a 4-rank FULL_SHARD trainer with optimizer offload)
+trains the DSpark drafter with a Qwen3.5-MoE FFN in
+`configs/qwen3.8-27b-dspark-moe.json` (`moe_preset: qwen3_5_moe`, 512 experts
+of width 512, top-10, router centering) from scratch. See "MoE FFN for
+DFlash-family drafts" in the
+[customization guide](../../docs/sections/advanced_features/customization.md)
+for the MoE keys; serving this drafter needs an SGLang `Qwen3MoeDSparkModel`.
+Launch it with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: its trainer
+ranks run at the H200 memory limit, where the caching allocator otherwise
+fragments (see "Late OOM or non-finite hidden states on online runs" in the
+[training guide](../../docs/sections/basic_usage/training.md)).
+
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes
 intentionally record their GPU allocation and loopback services. External
