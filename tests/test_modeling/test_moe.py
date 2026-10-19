@@ -102,6 +102,7 @@ def setUpModule():
         scoring_func="sqrtsoftplus",
         balance="noaux_tc",
         routed_scaling_factor=1.5,
+        swiglu_limit=10.0,
         layout=LAYOUT,
     )
 
@@ -203,6 +204,10 @@ class TestConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already registered"):
             register_router("topk")(Router)
         self.assertIs(BALANCE_CONTROLLERS.get("none"), BalanceController)
+
+    def test_shared_gate_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "shared_expert_gate"):
+            resolve_moe_config(_moe_json(shared_expert_gate="x"))
 
 
 # -- router, balance --------------------------------------------------------------------
@@ -363,13 +368,13 @@ class _CountingBalance(BalanceController):
         self.applied += 1
 
 
-def _reference_routed(x, routing, w1, w2, w3):
+def _reference_routed(x, routing, w1, w2, w3, limit):
     """Per-token, per-choice reference of the routed sum in fp32."""
     out = torch.zeros(x.shape, dtype=torch.float32)
     for t in range(x.shape[0]):
         for j in range(routing.topk):
             e = int(routing.indices[t, j])
-            h = swiglu(x[t] @ w1[e].t(), x[t] @ w3[e].t())
+            h = swiglu(x[t] @ w1[e].t(), x[t] @ w3[e].t(), limit)
             out[t] += routing.weights[t, j] * (h.to(x.dtype) @ w2[e].t()).float()
     return out
 
@@ -377,12 +382,12 @@ def _reference_routed(x, routing, w1, w2, w3):
 class TestExpertsAndLayer(unittest.TestCase):
     def test_grouped_experts_match_the_per_token_reference_and_return_fp32(self):
         layer = _layer()
-        x = torch.randn(9, H) * 4
+        x = torch.randn(9, H) * 4  # large enough to hit the SwiGLU clamp
         routing = layer.gate(x)
         y = layer.experts(x, routing)
         self.assertEqual(y.dtype, torch.float32)
         e = layer.experts
-        expected = _reference_routed(x, routing, e.w1, e.w2, e.w3)
+        expected = _reference_routed(x, routing, e.w1, e.w2, e.w3, 10.0)
         self.assertTrue(torch.allclose(y, expected, atol=1e-5))
 
     @unittest.skipUnless(torch.cuda.is_available(), "grouped_mm needs CUDA")
@@ -404,6 +409,16 @@ class TestExpertsAndLayer(unittest.TestCase):
         expected = layer.experts(flat, routing) + layer.shared_experts(flat).float()
         self.assertEqual(y.dtype, torch.bfloat16)
         self.assertTrue(torch.equal(y, expected.to(torch.bfloat16).view_as(x)))
+
+    def test_gated_shared_expert(self):
+        cfg = resolve_moe_config(
+            _moe_json(shared_expert_gate="sigmoid", swiglu_limit=0.0)
+        )
+        shared = SwiGLUSharedExpert(cfg, H)
+        x = torch.randn(4, H)
+        ungated = shared.w2(F.silu(shared.w1(x)) * shared.w3(x))
+        expected = torch.sigmoid(shared.gate(x)) * ungated
+        self.assertTrue(torch.allclose(shared(x), expected, atol=1e-6))
 
     def test_layer_without_shared_expert(self):
         layer = _layer(n_shared_experts=0)

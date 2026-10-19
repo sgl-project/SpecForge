@@ -27,9 +27,15 @@ from .base import Registry, RoutingResult, TrainingState
 from .config import MoEConfig
 
 
-def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """SwiGLU in fp32: ``silu(gate) * up``."""
-    return F.silu(gate.float()) * up.float()
+def swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
+    """SwiGLU in fp32 with the optional DeepSeek-V4 clamp (``limit`` 0 = off):
+    ``up`` is clamped to ``[-limit, limit]`` and ``gate`` from above."""
+    gate = gate.float()
+    up = up.float()
+    if limit > 0:
+        up = torch.clamp(up, min=-limit, max=limit)
+        gate = torch.clamp(gate, max=limit)
+    return F.silu(gate) * up
 
 
 class RoutedExperts(TrainingState, nn.Module, abc.ABC):
@@ -95,6 +101,7 @@ class GroupedExperts(RoutedExperts):
                 f"unknown MoE dispatch {cfg.dispatch!r}; choose from {DISPATCH_MODES}"
             )
         self.grouped_mm = cfg.dispatch == "grouped_mm" and hasattr(torch, "_grouped_mm")
+        self.swiglu_limit = float(cfg.swiglu_limit)
         e, d, i = cfg.n_routed_experts, hidden_size, cfg.moe_intermediate_size
         self.w1 = nn.Parameter(torch.empty(e, i, d))
         self.w2 = nn.Parameter(torch.empty(e, d, i))
@@ -119,7 +126,7 @@ class GroupedExperts(RoutedExperts):
             offs = counts.cumsum(0).to(torch.int32)
             gate = torch._grouped_mm(x_sorted, self.w1.transpose(-1, -2), offs=offs)
             up = torch._grouped_mm(x_sorted, self.w3.transpose(-1, -2), offs=offs)
-            h = w_sorted * swiglu(gate, up)
+            h = w_sorted * swiglu(gate, up, self.swiglu_limit)
             y_routed = torch._grouped_mm(
                 h.to(x.dtype), self.w2.transpose(-1, -2), offs=offs
             )
@@ -133,7 +140,7 @@ class GroupedExperts(RoutedExperts):
                 continue
             seg = x_sorted[offset : offset + n]
             h = w_sorted[offset : offset + n] * swiglu(
-                F.linear(seg, self.w1[i]), F.linear(seg, self.w3[i])
+                F.linear(seg, self.w1[i]), F.linear(seg, self.w3[i]), self.swiglu_limit
             )
             parts.append(F.linear(h.to(seg.dtype), self.w2[i]))
             offset += n

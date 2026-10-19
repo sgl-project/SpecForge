@@ -31,7 +31,7 @@ of small functions while the expensive parts are shared:
 | score function (softmax, sigmoid, sqrtsoftplus) | token dispatch (sorted segments, grouped GEMM) |
 | balancing (aux loss, aux-loss-free bias, none) | deferred update timing vs activation checkpointing |
 | combine-weight renorm and scale | FSDP-friendly stacked expert layout |
-| shared expert (none or one) | fp32 accumulation of routed and shared output |
+| shared-expert gate (none, sigmoid), SwiGLU clamp | fp32 accumulation of routed and shared output |
 | checkpoint file naming | load metrics |
 
 ## Why match the target's MoE

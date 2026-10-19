@@ -31,10 +31,12 @@ ARCHITECTURE_KEYS: Dict[str, str] = {
         "routed_scaling_factor",
         "n_group",
         "topk_group",
+        "swiglu_limit",
         "router",
         "balance",
         "experts_backend",
         "shared_expert",
+        "shared_expert_gate",
     )
 }
 ARCHITECTURE_KEYS["moe_layout"] = "layout"
@@ -83,6 +85,10 @@ class MoEConfig:
     #: Registered implementations of the routed and the shared experts.
     experts_backend: str = "grouped"
     shared_expert: str = "swiglu"
+    # Expert MLPs: the SwiGLU clamp (0 = off) and the shared expert's gate
+    # (``"none"`` or a per-token ``"sigmoid"``).
+    swiglu_limit: float = 0.0
+    shared_expert_gate: str = "none"
     #: Checkpoint file naming (a registered :mod:`.checkpoint` layout).
     layout: str = "native"
     # ---- training-only (never part of the checkpoint's architecture) ----
@@ -123,6 +129,13 @@ class MoEConfig:
         if not 0 < self.topk_group <= self.n_group:
             raise ValueError(
                 f"topk_group={self.topk_group} must be in [1, n_group={self.n_group}]"
+            )
+        if self.swiglu_limit < 0:
+            raise ValueError("swiglu_limit must be >= 0 (0 disables the clamp)")
+        if self.shared_expert_gate not in ("none", "sigmoid"):
+            raise ValueError(
+                f"unknown shared_expert_gate {self.shared_expert_gate!r}; "
+                "choose 'none' or 'sigmoid'"
             )
         if self.bias_update_rate < 0 or self.aux_loss_coeff < 0:
             raise ValueError("bias_update_rate and aux_loss_coeff must be >= 0")
