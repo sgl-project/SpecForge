@@ -10,7 +10,6 @@ file pins the framework independently of any target family.
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -49,7 +48,8 @@ from specforge.modeling.draft.moe.experts import (
 )
 from specforge.modeling.draft.moe.router import ROUTERS, TopKRouter
 from specforge.modeling.draft.moe.shared import SHARED_EXPERTS, SwiGLUSharedExpert
-from specforge.training.strategies.base import _moe_metrics
+from specforge.training.controller import TrainerCore
+from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 
 H = 16
 PRESET = "_test_family"
@@ -446,13 +446,91 @@ class _GradBalance(BalanceController):
         return {"grad_balance": 1.0}
 
 
-class TestStrategyMetrics(unittest.TestCase):
-    def test_strategy_metrics_read_the_wrapped_draft(self):
-        tree = nn.Sequential(_layer(0), _layer(1)).train()
-        tree(torch.randn(3, H))
-        metrics = _moe_metrics(SimpleNamespace(draft_model=tree))
-        self.assertIn("moe/load_max_ratio", metrics)
-        self.assertEqual(_moe_metrics(SimpleNamespace()), {})
+class _EagerBackend:
+    """Plain backward and gradient scaling; no optimizer, no collectives."""
+
+    parallel_config = None
+
+    def __init__(self, params=()):
+        self.params = list(params)
+
+    def backward(self, loss, is_boundary):
+        loss.backward()
+
+    def scale_gradients(self, scale):
+        for param in self.params:
+            if param.grad is not None:
+                param.grad.mul_(scale)
+
+    def step(self):
+        return None
+
+
+class _PlainStrategy(DraftTrainStrategy):
+    """A strategy with no MoE code at all."""
+
+    name = "_test_plain"
+    required_features = set()
+
+    def __init__(self, module, use_loss_terms):
+        self.module = module
+        self.use_loss_terms = use_loss_terms
+
+    def trainable_module(self):
+        return self.module
+
+    def forward_loss(self, batch, ctx=None):
+        loss = self.module(batch).float().pow(2).mean()
+        loss_terms = None
+        if self.use_loss_terms:
+            denominator = torch.tensor(4.0)
+            loss_terms = (loss * denominator, denominator)
+        return StepOutput(loss=loss, metrics={}, loss_terms=loss_terms)
+
+
+class TestTrainerAddsMoETerms(unittest.TestCase):
+    def setUp(self):
+        register_balance_controller("_test_grad_balance")(_GradBalance)
+        self.addCleanup(BALANCE_CONTROLLERS.unregister, "_test_grad_balance")
+        self.x = torch.randn(6, H)
+
+    def _step_layer(self, coeff):
+        layer = _layer(
+            balance="_test_grad_balance", dflash_config={"moe_aux_loss_coeff": coeff}
+        )
+        return layer.train()
+
+    def _step(self, coeff, use_loss_terms):
+        layer = self._step_layer(coeff)
+        core = TrainerCore(
+            _PlainStrategy(layer, use_loss_terms), _EagerBackend(layer.parameters())
+        )
+        result = core.train_step(self.x)
+        return layer.gate.weight.grad.clone(), result
+
+    def test_aux_loss_reaches_the_gradient_with_and_without_loss_terms(self):
+        aux_only = self._step_layer(0.5)
+        aux_only(self.x)
+        collect_moe_aux_loss(aux_only).backward()
+        expected = aux_only.gate.weight.grad
+        self.assertGreater(float(expected.abs().sum()), 0.0)
+        for use_loss_terms in (False, True):
+            with_aux, _ = self._step(0.5, use_loss_terms)
+            without_aux, _ = self._step(0.0, use_loss_terms)
+            self.assertTrue(
+                torch.allclose(with_aux - without_aux, expected, atol=1e-6),
+                f"use_loss_terms={use_loss_terms}",
+            )
+
+    def test_moe_metrics_reach_strategies_without_moe_code(self):
+        _, result = self._step(0.5, use_loss_terms=False)
+        self.assertIn("moe/load_max_ratio", result.metrics)
+        self.assertIn("moe/grad_balance", result.metrics)
+
+    def test_dense_step_output_is_untouched(self):
+        strategy = _PlainStrategy(nn.Linear(H, H), use_loss_terms=True)
+        out = StepOutput(loss=torch.tensor(1.0), metrics={"a": 1.0})
+        self.assertIs(strategy.finalize_step_output(out), out)
 
 
 # -- draft model, loading, export ---------------------------------------------------
