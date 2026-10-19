@@ -179,9 +179,9 @@ def materialize_draft(
     model = AutoDraftModel.from_config(draft_config, torch_dtype=torch_dtype)
     from specforge.modeling.draft.moe import from_checkpoint_state_dict
 
-    # Files use the official naming; modules may use a native MoE layout.
+    # draft_state_dict uses the draft's checkpoint layout (MoE file naming).
     missing, unexpected = model.load_state_dict(
-        from_checkpoint_state_dict(state["draft_state_dict"]), strict=False
+        from_checkpoint_state_dict(state["draft_state_dict"], model), strict=False
     )
     if unexpected:
         raise ValueError(

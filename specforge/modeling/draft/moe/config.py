@@ -35,6 +35,7 @@ ARCHITECTURE_KEYS: Dict[str, str] = {
         "shared_expert",
     )
 }
+ARCHITECTURE_KEYS["moe_layout"] = "layout"
 
 #: ``dflash_config`` key (training-only) -> ``MoEConfig`` field.
 TRAINING_KEYS: Dict[str, str] = {
@@ -77,6 +78,8 @@ class MoEConfig:
     #: Registered implementations of the routed and the shared experts.
     experts_backend: str = "grouped"
     shared_expert: str = "swiglu"
+    #: Checkpoint file naming (a registered :mod:`.checkpoint` layout).
+    layout: str = "native"
     # ---- training-only (never part of the checkpoint's architecture) ----
     aux_loss_coeff: float = 0.0
     dispatch: str = "sorted_loop"
@@ -119,8 +122,8 @@ _FIELD_NAMES = {f.name for f in fields(MoEConfig)}
 def register_moe_preset(name: str, **defaults: Any) -> None:
     """Register the architecture defaults of one target family.
 
-    A preset may set any ``MoEConfig`` architecture field, but not the
-    training-only fields or the per-run sizes
+    A preset may set any ``MoEConfig`` architecture field, including the
+    default ``layout``, but not the training-only fields or the per-run sizes
     (``n_routed_experts``, ``num_experts_per_tok``, ``moe_intermediate_size``),
     which the draft JSON must state explicitly.
     """
@@ -166,7 +169,7 @@ def resolve_moe_config(config: Any) -> Optional[MoEConfig]:
 
     Returns ``None`` when the config names no ``moe_preset``. Otherwise every
     architecture key gets the preset's default unless the config sets it, and
-    the result is validated (positive integer expert counts).
+    the result is validated (positive integer expert counts, known layout).
     """
     if not is_moe_config(config):
         return None
@@ -193,4 +196,8 @@ def resolve_moe_config(config: Any) -> Optional[MoEConfig]:
     for json_key, field_name in TRAINING_KEYS.items():
         if json_key in dflash_config:
             values[field_name] = dflash_config[json_key]
-    return MoEConfig(preset=name, **values)
+    cfg = MoEConfig(preset=name, **values)
+    from .checkpoint import LAYOUTS  # local: checkpoint imports this module
+
+    LAYOUTS.get(cfg.layout)  # unknown layouts fail at model build, not at save
+    return cfg

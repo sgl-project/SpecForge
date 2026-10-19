@@ -24,7 +24,10 @@ from specforge.export.checkpoint_io import (
     materialize_draft,
     resolve_training_state,
 )
-from specforge.modeling.draft.moe import to_checkpoint_state_dict
+from specforge.modeling.draft.moe import (
+    from_checkpoint_state_dict,
+    to_checkpoint_state_dict,
+)
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
 
@@ -50,7 +53,7 @@ def export_to_hf(
     model = materialize_draft(
         state, draft_config_path, vocab_mapping_path=vocab_mapping_path
     )
-    full_state = dict(to_checkpoint_state_dict(model.state_dict()))
+    full_state = dict(model.state_dict())
     owns_embedding = hasattr(model, "embed_tokens")
     if owns_embedding and "embed_tokens.weight" not in state["draft_state_dict"]:
         if not embedding_source:
@@ -76,15 +79,20 @@ def export_to_hf(
             embedding_source,
             keys=[embedding_key],
         )[embedding_key]
-    # Preserve checkpoint weights at their original precision, but keep the
-    # mapping explicitly loaded by materialize_draft when one was requested.
+    # Trained keys win at their original precision, converted from the
+    # checkpoint layout to the module's; keep the mapping explicitly loaded by
+    # materialize_draft when one was requested.
     full_state.update(
         {
             key: value
-            for key, value in state["draft_state_dict"].items()
+            for key, value in from_checkpoint_state_dict(
+                state["draft_state_dict"], model
+            ).items()
             if not (vocab_mapping_path and key in {"t2d", "d2t"})
         }
     )
+    # MoE drafts: write the family's file naming.
+    full_state = to_checkpoint_state_dict(full_state, model)
     model.save_pretrained(output_dir, state_dict=full_state)
     apply_legacy_rope_scaling(output_dir)
     return output_dir

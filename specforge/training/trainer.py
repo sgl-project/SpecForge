@@ -351,7 +351,13 @@ class Trainer:
                         f"{key}={comparison_current}; "
                         f"resume with the original configuration"
                     )
-            saved_weights = state["draft_state_dict"]
+            from specforge.modeling.draft.moe import from_checkpoint_state_dict
+
+            # draft_state_dict uses the draft's checkpoint layout (MoE file
+            # naming); convert to the module layout before loading.
+            saved_weights = from_checkpoint_state_dict(
+                state["draft_state_dict"], model.draft_model
+            )
             load_result = model.draft_model.load_state_dict(saved_weights, strict=False)
             loaded = len(saved_weights) - len(load_result.unexpected_keys)
             missing_keys = set(load_result.missing_keys)

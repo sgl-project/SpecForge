@@ -10,8 +10,8 @@ that accumulator and casts once, the order DeepSeek's reference
 ``MoE.forward`` uses (each expert's down projection runs in the model dtype;
 their weighted sum and the shared expert are accumulated in fp32).
 
-The weight layout is the implementation's choice; :mod:`.state_dict`
-converters map it to the checkpoint files' naming.
+The weight layout is the implementation's choice; checkpoint files name the
+tensors through a :mod:`.checkpoint` layout.
 """
 
 from __future__ import annotations
