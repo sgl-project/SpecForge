@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from specforge_tpu import hooks, shapes
+from specforge_tpu import hooks, producer, shapes
 
 
 def _pick_ports(count: int) -> list[int]:
@@ -93,4 +93,8 @@ def apply() -> None:
     hooks.around(
         "specforge.training.strategies.base._cpu_max_valid_anchors",
         shapes.shape_only_max_valid_anchors,
+    )
+    hooks.around(
+        "specforge.inference.adapters.server_capture.SGLangServerCaptureAdapter.__init__",
+        producer.adapter_init,
     )
