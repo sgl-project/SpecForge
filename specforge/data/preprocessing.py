@@ -163,7 +163,7 @@ def preprocess_conversations(
         if not source:
             # if the source is None, skip it
             continue
-        input_ids, loss_mask = parser.parse(
+        parsed = parser.parse(
             source,
             max_length,
             preformatted=is_preformatted,
@@ -171,6 +171,10 @@ def preprocess_conversations(
             tool=tool,
             **kwargs_item,
         )
+        if parsed is None:
+            # the parser found nothing to render (e.g. no 'user' turn), skip it
+            continue
+        input_ids, loss_mask = parsed
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
