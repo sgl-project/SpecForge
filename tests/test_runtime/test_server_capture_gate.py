@@ -59,7 +59,11 @@ def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
 
     registration = builtin_algorithm_registry().resolve(algorithm)
     config = SimpleNamespace(
-        training=SimpleNamespace(dflash_teacher_metrics=teacher_metrics)
+        training=SimpleNamespace(
+            dflash_teacher_metrics=teacher_metrics,
+            dflash_ce_loss_alpha=1.0,
+            dflash_l1_loss_alpha=0.0,
+        )
     )
     layout = resolve_server_capture_layout(registration, config, modality="text")
     return ServerCaptureSchema(

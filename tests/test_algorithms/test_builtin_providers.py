@@ -27,8 +27,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
 
 
-def _teacher_metrics_config(enabled: bool):
-    return SimpleNamespace(training=SimpleNamespace(dflash_teacher_metrics=enabled))
+def _teacher_metrics_config(enabled: bool, l1_loss_alpha: float = 0.0):
+    return SimpleNamespace(
+        training=SimpleNamespace(
+            dflash_teacher_metrics=enabled,
+            dflash_ce_loss_alpha=1.0,
+            dflash_l1_loss_alpha=l1_loss_alpha,
+        )
+    )
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
@@ -470,6 +476,16 @@ class BuiltinProviderContractTest(unittest.TestCase):
         )
         self.assertLessEqual(required.required_tensors, disabled.emitted_features)
         self.assertTrue(registration.spec.capabilities.supports_teacher_metrics_opt_out)
+
+        # A token objective that distills from the target distribution reads
+        # the final hidden state on every step, so the diagnostics opt-out
+        # must not drop it from the capture.
+        distilling = resolve_server_capture_layout(
+            registration,
+            _teacher_metrics_config(False, l1_loss_alpha=0.9),
+            modality="text",
+        )
+        self.assertEqual(registered, distilling)
 
     def test_other_builtins_always_request_their_registered_layout(self):
         # Planning rejects the opt-out for these algorithms; resolution keeps

@@ -174,6 +174,48 @@ class TestHostAnchorSizing(unittest.TestCase):
                 self.assertEqual(model.kwargs["loss_mask"].device.type, device)
 
 
+class TestTeacherStatesForTheDistillingObjective(unittest.TestCase):
+    """CPU: an objective that distills from the teacher (``l1_loss_alpha > 0``)
+    gets target states on every step, not only on log steps; the strategy
+    reads that need from ``requires_teacher_distribution``, not from the
+    diagnostics flag."""
+
+    def _passed(self, l1_loss_alpha, collect_detailed_metrics, teacher_metrics=True):
+        model = _RecordingModel()
+        model.teacher_metrics = teacher_metrics
+        model.requires_teacher_distribution = l1_loss_alpha > 0
+        tensors = {
+            "input_ids": torch.zeros(1, 6, dtype=torch.long),
+            "loss_mask": torch.ones(1, 6),
+            "hidden_states": torch.randn(1, 6, 4),
+            "target_last_hidden_states": torch.randn(1, 6, 4),
+        }
+        strategy = DFlashTrainStrategy(model)
+        strategy.forward_loss(
+            TrainBatch(
+                sample_ids=["a"], strategy=strategy.name, tensors=tensors, metadata={}
+            ),
+            StepContext(
+                global_step=5,
+                total_steps=100,
+                collect_detailed_metrics=collect_detailed_metrics,
+            ),
+        )
+        return "target_last_hidden_states" in model.kwargs
+
+    def test_l1_objective_gets_teacher_states_on_every_step(self):
+        self.assertTrue(self._passed(0.9, collect_detailed_metrics=False))
+        self.assertTrue(self._passed(0.9, collect_detailed_metrics=True))
+        # The diagnostics opt-out does not starve the objective.
+        self.assertTrue(
+            self._passed(0.9, collect_detailed_metrics=False, teacher_metrics=False)
+        )
+
+    def test_plain_ce_keeps_teacher_states_to_log_steps(self):
+        self.assertFalse(self._passed(0.0, collect_detailed_metrics=False))
+        self.assertTrue(self._passed(0.0, collect_detailed_metrics=True))
+
+
 @unittest.skipUnless(CUDA, "requires CUDA")
 class TestDFlashMicroStepSyncs(unittest.TestCase):
     def test_micro_step_is_sync_free_with_host_loss_mask(self):

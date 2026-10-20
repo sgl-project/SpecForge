@@ -43,8 +43,9 @@ DFLASH2_DRAFT_ARCHITECTURE = "DFlash2DraftModel"
 COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
     {DRAFT_ARCHITECTURE, DFLASH2_DRAFT_ARCHITECTURE}
 )
-# The objective reads only the aux hidden states. The final hidden state feeds
-# teacher-agreement diagnostics and is optional for every consumer.
+# The hard-label objective reads only the aux hidden states. The final hidden
+# state feeds the teacher-agreement diagnostics and, when the token objective
+# distills from the target distribution, the objective itself.
 SERVER_CAPTURE_LAYOUT = ServerCaptureLayout(
     aux_feature="hidden_states",
     last_hidden_feature="target_last_hidden_states",
@@ -81,6 +82,11 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_kl_scale": float(training_model.kl_scale),
         "dflash_kl_decay": float(training_model.kl_decay),
     }
+    objective = getattr(training_model, "token_objective", None)
+    if objective is not None and not objective.uses_default_weights:
+        # Recorded only off the defaults: CE checkpoints keep their contract.
+        contract["dflash_ce_loss_alpha"] = float(objective.hard_ce_weight)
+        contract["dflash_l1_loss_alpha"] = float(objective.teacher_l1_weight)
     if getattr(draft_model, "candidate_selector", None) is not None:
         method_config = dict(getattr(draft_model.config, "dflash_config", None) or {})
         contract.update(
@@ -184,10 +190,32 @@ def needs_input_tools(config, draft_model):
     return dflash_needs_input_tools(config, draft_model)
 
 
-def select_server_capture_layout(config):
-    """Stop requesting the final hidden state when teacher metrics are off."""
+def token_objective_config(config):
+    """The token-objective weights this run configures (data needs only)."""
 
-    if config.training.dflash_teacher_metrics:
+    # Transitional runtime import: the catalog must stay importable without
+    # torch, which the shared objective module pulls in.
+    from specforge.core.token_objective import TokenObjectiveConfig
+
+    return TokenObjectiveConfig(
+        hard_ce_weight=config.training.dflash_ce_loss_alpha,
+        teacher_l1_weight=config.training.dflash_l1_loss_alpha,
+    )
+
+
+def select_server_capture_layout(config):
+    """Request the final hidden state only when something reads it.
+
+    The teacher diagnostics (``training.dflash_teacher_metrics``) read it on
+    log steps; a token objective that distills from the target distribution
+    (``training.dflash_l1_loss_alpha > 0``) reads it on every step, whatever
+    the diagnostics flag says.
+    """
+
+    if (
+        config.training.dflash_teacher_metrics
+        or token_objective_config(config).requires_teacher_distribution
+    ):
         return SERVER_CAPTURE_LAYOUT
     return replace(SERVER_CAPTURE_LAYOUT, last_hidden_feature=None)
 

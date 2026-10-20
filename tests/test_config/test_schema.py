@@ -557,6 +557,39 @@ class ConfigSchemaTest(unittest.TestCase):
                     build_training_model(config, None, None, None, None)
                 self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
 
+    def test_dflash_l1_loss_alpha_composes_plain_ce_online_only(self):
+        online = _online_payload("dflash")
+        online["training"].update(
+            {"dflash_ce_loss_alpha": 0.1, "dflash_l1_loss_alpha": 0.9}
+        )
+        config = Config.model_validate(online)
+        self.assertEqual(config.training.dflash_l1_loss_alpha, 0.9)
+
+        # The objective, not the diagnostics flag, decides that the capture
+        # carries the target's final hidden state.
+        diagnostics_off = copy.deepcopy(online)
+        diagnostics_off["training"]["dflash_teacher_metrics"] = False
+        self.assertFalse(
+            Config.model_validate(diagnostics_off).training.dflash_teacher_metrics
+        )
+
+        offline = copy.deepcopy(MINIMAL)
+        offline["training"] = {"strategy": "dflash", "dflash_l1_loss_alpha": 0.9}
+        with self.assertRaisesRegex(ValueError, "requires online training"):
+            Config.model_validate(offline)
+
+        for overrides, message in (
+            ({"lk_loss_type": "alpha"}, "plain DFlash CE"),
+            ({"loss_type": "dpace"}, "plain DFlash CE"),
+            ({"dflash_ce_loss_alpha": 0.0, "dflash_l1_loss_alpha": 0.0}, "must be > 0"),
+            ({"dflash_l1_loss_alpha": -0.1}, "dflash_l1_loss_alpha"),
+        ):
+            with self.subTest(overrides=overrides):
+                payload = copy.deepcopy(online)
+                payload["training"].update(overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    Config.model_validate(payload)
+
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
         payload["training"]["lk_loss_type"] = "tv"
