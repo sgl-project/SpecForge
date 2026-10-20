@@ -8,7 +8,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Sparse MoE FFN for draft models, configured by ``moe_preset``; see ``DESIGN.md``."""
 
-from .balance import BalanceController, register_balance_controller
+from .balance import BalanceController, register_aux_loss, register_balance_controller
 from .base import RoutingResult, TrainingState
 from .checkpoint import (
     exported_config_updates,
@@ -53,6 +53,7 @@ __all__ = [
     "from_checkpoint_state_dict",
     "is_moe_config",
     "iter_moe_layers",
+    "register_aux_loss",
     "register_balance_controller",
     "register_experts_backend",
     "register_layout",

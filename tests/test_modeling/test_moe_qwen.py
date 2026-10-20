@@ -97,7 +97,7 @@ class TestQwenPreset(unittest.TestCase):
         cfg = resolve_moe_config(_moe())
         self.assertEqual(
             (cfg.scoring_func, cfg.balance, cfg.shared_expert_gate, cfg.layout),
-            ("softmax", "aux_loss", "sigmoid", "qwen"),
+            ("softmax", "none", "sigmoid", "qwen"),
         )
         self.assertEqual(cfg.routed_scaling_factor, 1.0)
         checked_in = resolve_moe_config(AutoDraftModelConfig.from_file(str(CONFIG)))

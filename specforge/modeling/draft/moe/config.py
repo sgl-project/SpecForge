@@ -35,6 +35,7 @@ ARCHITECTURE_KEYS["moe_router_bias"] = "router_bias"
 #: ``dflash_config`` key (training-only) -> ``MoEConfig`` field.
 TRAINING_KEYS: Dict[str, str] = {
     "moe_aux_loss_coeff": "aux_loss_coeff",
+    "moe_aux_loss_type": "aux_loss_type",
     "moe_dispatch": "dispatch",
     "moe_router_center": "router_center",
     "moe_router_center_momentum": "router_center_momentum",
@@ -82,6 +83,7 @@ class MoEConfig:
     layout: str = "native"
     # Training-only fields, never part of the checkpoint's architecture.
     aux_loss_coeff: float = 0.0
+    aux_loss_type: str = "switch"  # a registered aux loss (balance.AUX_LOSSES)
     dispatch: str = "sorted_loop"
     #: "sample": center router input on each sample's mean (eval: a running mean).
     router_center: str = "none"

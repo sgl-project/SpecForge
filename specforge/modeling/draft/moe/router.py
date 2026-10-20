@@ -11,8 +11,14 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from .balance import BalanceController
-from .base import Registry, RoutingResult, TrainingState, apply_keeping_fp32
+from .balance import AUX_LOSSES, BalanceController
+from .base import (
+    MetricValue,
+    Registry,
+    RoutingResult,
+    TrainingState,
+    apply_keeping_fp32,
+)
 from .config import MoEConfig
 
 #: name -> f(logits [T, E] fp32) -> scores [T, E] fp32
@@ -70,7 +76,7 @@ def build_router(
 
 @register_router("topk")
 class TopKRouter(Router):
-    """Top-k router: ``f(x W^T + b)`` scores in fp32, selection on balance-adjusted scores."""
+    """Top-k router: ``f(x W^T + b)`` scores in fp32; adds the aux loss in training."""
 
     #: Routing state that stays fp32 and exact through module-wide dtype casts.
     FP32_BUFFERS = ("bias", "input_mean")
@@ -100,6 +106,9 @@ class TopKRouter(Router):
         )
         self.center_momentum = float(cfg.router_center_momentum)
         self.score_fn = SCORE_FUNCTIONS.get(cfg.scoring_func)
+        self.aux_loss_coeff = float(cfg.aux_loss_coeff)
+        self.aux_loss_fn = AUX_LOSSES.get(cfg.aux_loss_type)
+        self._aux_loss: Optional[torch.Tensor] = None
         self._pending_mean: Optional[torch.Tensor] = None
 
     def _apply(self, fn, recurse=True):
@@ -146,9 +155,22 @@ class TopKRouter(Router):
         counts = torch.zeros(
             self.n_experts, dtype=torch.long, device=x.device
         ).scatter_add_(0, flat, torch.ones_like(flat))
-        return RoutingResult(
+        routing = RoutingResult(
             weights=weights, indices=indices, counts=counts, scores=scores
         )
+        self._aux_loss = None  # overwrite, never accumulate
+        if self.training and self.aux_loss_coeff > 0 and scores.requires_grad:
+            # Changes no routing decision, only the router's gradient; the trainer adds it.
+            self._aux_loss = self.aux_loss_coeff * self.aux_loss_fn(
+                routing, tokens_per_sample
+            )
+        return routing
+
+    def aux_loss(self) -> Optional[torch.Tensor]:
+        return self._aux_loss
+
+    def metrics(self) -> Dict[str, MetricValue]:
+        return {} if self._aux_loss is None else {"aux_loss": self._aux_loss.detach()}
 
     def apply_pending_update(self) -> None:
         """Move the running centering mean, averaged across ranks."""

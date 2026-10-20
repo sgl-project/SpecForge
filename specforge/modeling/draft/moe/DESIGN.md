@@ -22,7 +22,7 @@ of small functions while the expensive parts are shared:
 | differs per target family | shared by every family |
 | --- | --- |
 | score function | token dispatch (sorted segments, grouped GEMM) |
-| balancing (aux loss, none) | deferred update timing vs activation checkpointing |
+| balancing (aux loss formula, selection policy) | deferred update timing vs activation checkpointing |
 | combine-weight renorm and scale | FSDP-friendly stacked expert layout |
 | shared-expert gate (none, sigmoid) | fp32 accumulation of routed and shared output |
 | checkpoint file naming, serving config | load metrics, router centering and its export fold |
@@ -42,9 +42,9 @@ The drafter's MoE follows a target family's recipe, expressed as a preset:
 ```
 base.py        Registry, RoutingResult, TrainingState, apply_keeping_fp32
 config.py      MoEConfig + preset registry; resolves a draft JSON
-router.py      score functions, Router ABC, TopKRouter (router bias and
-               centering), the centering export fold
-balance.py     BalanceController: none, aux_loss
+router.py      score functions, Router ABC, TopKRouter (aux loss, router bias
+               and centering), the centering export fold
+balance.py     load_balancing_loss; BalanceController (selection policy): none
 experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu
 shared.py      SharedExpert ABC, SwiGLUSharedExpert
 layer.py       MoELayer, build_ffn, and the model-level hooks
@@ -65,8 +65,8 @@ Every module except `families/` is family-agnostic.
 3. **A new family only adds files.** Its module under `families/` registers a
    preset and a layout; `families/__init__.py` gets one import line. A new
    routing mechanism or expert implementation is a family-agnostic component:
-   a score function, router, balance controller, experts backend or shared
-   expert registered in its core module.
+   a score function, router, aux loss, balance controller, experts backend or
+   shared expert registered in its core module.
 
 ## Contracts that matter
 
@@ -83,6 +83,13 @@ shared expert all implement `TrainingState` (`observe`,
 no-op defaults. `MoELayer` drives them in a fixed order
 (`gate, gate.balance, experts, shared_experts`). The balance controller stays
 a child of the router, so its buffers keep the `gate.balance.*` keys.
+
+**Load balancing has two independent knobs.** `moe_aux_loss_coeff` > 0 makes
+the router add a load-balancing loss in each training forward, with the
+formula `moe_aux_loss_type` names (`"switch"`, transformers' loss); it changes
+no routing decision, only the router's gradient. `balance` names a controller
+that may shift the scores used to pick experts, never the combine weights,
+such as an aux-loss-free selection bias; `"none"` keeps them.
 
 **Updates are deferred.** `observe` runs inside the layer forward (training
 only) and may only stash, overwriting and never accumulating: an
@@ -139,10 +146,9 @@ to the token-specific spread, so bf16 rounding could flip top-k choices.
 auxiliary loss to whichever term backpropagates (`loss`, or the `loss_terms`
 numerator scaled by the micro-batch denominator) and the layer-averaged
 `moe/*` metrics to `StepOutput.metrics`: `load_max_ratio`, `load_min_ratio`,
-`experts_unused_frac`, plus the balance controller's (`aux_loss` and
-`load_frac_*`). Strategies hold no MoE code; dense drafts log no `moe/*` keys;
-evaluation calls `forward_loss` alone, so eval losses exclude the auxiliary
-term.
+`experts_unused_frac`, plus the router's `aux_loss` when it adds one.
+Strategies hold no MoE code; dense drafts log no `moe/*` keys; evaluation
+calls `forward_loss` alone, so eval losses exclude the auxiliary term.
 The trainer DP-averages the `moe/*` metrics and logs them like any other
 scalar.
 
@@ -151,8 +157,8 @@ scalar.
 - New target family: a module under `families/` with `register_moe_preset`
   (recipe + default layout) and `register_layout` (file naming, serving
   config, serving class).
-- New routing mechanism: `register_score_function`, `register_router` or
-  `register_balance_controller`.
+- New routing mechanism: `register_score_function`, `register_router`,
+  `register_balance_controller` or `register_aux_loss`.
 - New expert implementation: a `RoutedExperts` subclass under
   `register_experts_backend` (or a new `MoEConfig.dispatch` value inside an
   existing backend), or a `SharedExpert` subclass under

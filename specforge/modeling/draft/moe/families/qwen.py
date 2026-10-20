@@ -29,7 +29,7 @@ register_moe_preset(
     routed_scaling_factor=1.0,
     n_shared_experts=1,
     router="topk",
-    balance="aux_loss",
+    balance="none",
     shared_expert_gate="sigmoid",
     layout="qwen",
 )
@@ -93,8 +93,8 @@ def qwen_serving_config(cfg: MoEConfig) -> Dict[str, Any]:
     problems = []
     if cfg.scoring_func != "softmax":
         problems.append(f"scoring_func={cfg.scoring_func!r} (softmax only)")
-    if cfg.balance not in ("none", "aux_loss"):
-        problems.append(f"balance={cfg.balance!r} (none or aux_loss only)")
+    if cfg.balance != "none":
+        problems.append(f"balance={cfg.balance!r} (none only)")
     if cfg.n_shared_experts and cfg.shared_expert_gate != "sigmoid":
         problems.append("an ungated shared expert")
     if problems:

@@ -38,7 +38,6 @@ from specforge.modeling.draft.moe import (
 )
 from specforge.modeling.draft.moe.balance import (
     BALANCE_CONTROLLERS,
-    AuxLossController,
     BalanceController,
     load_balancing_loss,
 )
@@ -368,8 +367,8 @@ class TestRouterCentering(unittest.TestCase):
         self.assertEqual(layer.gate.input_mean.device.type, "cpu")
 
 
-class TestBalance(unittest.TestCase):
-    def test_aux_loss_matches_transformers(self):
+class TestAuxLoss(unittest.TestCase):
+    def test_router_aux_loss_matches_transformers(self):
         from transformers.models.mixtral.modeling_mixtral import (
             load_balancing_loss_func,
         )
@@ -379,23 +378,27 @@ class TestBalance(unittest.TestCase):
         scores = logits.softmax(-1)
         indices = scores.topk(2).indices
         counts = torch.bincount(indices.flatten(), minlength=8)
-        ours = load_balancing_loss(counts, scores, 20)
-        theirs = load_balancing_loss_func((logits,), 8, 2)
-        self.assertTrue(torch.allclose(ours, theirs, atol=1e-6))
-        cfg = resolve_moe_config(
-            _moe_json(
-                scoring_func="softmax",
-                balance="aux_loss",
-                dflash_config={"moe_aux_loss_coeff": 0.01},
-            )
-        )
-        controller = AuxLossController(cfg, 8)
-        scores = scores.clone().requires_grad_(True)
-        controller.observe(
+        ours = load_balancing_loss(
             RoutingResult(scores.gather(1, indices), indices, counts, scores)
         )
-        self.assertTrue(torch.allclose(controller.aux_loss(), 0.01 * theirs, atol=1e-7))
-        self.assertIn("load_frac_max", controller.metrics())
+        theirs = load_balancing_loss_func((logits,), 8, 2)
+        self.assertTrue(torch.allclose(ours, theirs, atol=1e-6))
+        cfg = resolve_moe_config(_moe_json(dflash_config={"moe_aux_loss_coeff": 0.01}))
+        router = TopKRouter(cfg, H, BalanceController(cfg, 8)).train()
+        router.reset_parameters(0.2)
+        x = torch.randn(20, H)
+        router(x)
+        logits = x @ router.weight.t()
+        expected = 0.01 * load_balancing_loss_func((logits,), 8, 2)
+        self.assertTrue(torch.allclose(router.aux_loss(), expected, atol=1e-7))
+        self.assertIn("aux_loss", router.metrics())
+        router.eval()(x)
+        self.assertIsNone(router.aux_loss())
+
+    def test_unknown_aux_loss_type_lists_the_choices(self):
+        cfg = resolve_moe_config(_moe_json(dflash_config={"moe_aux_loss_type": "x"}))
+        with self.assertRaisesRegex(KeyError, "MoE aux loss.*available: switch"):
+            TopKRouter(cfg, H, BalanceController(cfg, 8))
 
 
 # -- experts, shared expert, layer ---------------------------------------------------
@@ -520,7 +523,9 @@ class TestExpertsAndLayer(unittest.TestCase):
             balance="_test_grad_balance", dflash_config={"moe_aux_loss_coeff": 0.1}
         ).train()
         layer(torch.randn(2, 4, H))
-        self.assertTrue(torch.allclose(layer.aux_loss(), layer.balance.aux_loss()))
+        # The router's aux loss and the controller's both reach the layer's sum.
+        expected = layer.gate.aux_loss() + layer.balance.aux_loss()
+        self.assertTrue(torch.allclose(layer.aux_loss(), expected))
         metrics = layer.metrics()
         for key in ("load_max_ratio", "experts_unused_frac", "grad_balance"):
             self.assertIn(key, metrics)
