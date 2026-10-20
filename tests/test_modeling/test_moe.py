@@ -28,7 +28,13 @@ from specforge.modeling.draft.moe import (
     resolve_moe_config,
     to_checkpoint_state_dict,
 )
-from specforge.modeling.draft.moe.balance import BALANCE_CONTROLLERS, BalanceController
+from specforge.modeling.draft.moe.balance import (
+    BALANCE_CONTROLLERS,
+    AuxLossController,
+    BalanceController,
+    load_balancing_loss,
+)
+from specforge.modeling.draft.moe.base import RoutingResult
 from specforge.modeling.draft.moe.checkpoint import LAYOUTS, layout_for
 from specforge.modeling.draft.moe.config import MOE_PRESETS
 from specforge.modeling.draft.moe.experts import (
@@ -176,7 +182,7 @@ class TestConfig(unittest.TestCase):
         self.assertIs(BALANCE_CONTROLLERS.get("none"), BalanceController)
 
 
-# -- router -----------------------------------------------------------------------
+# -- router, balance --------------------------------------------------------------------
 
 
 class _FixedBias(BalanceController):
@@ -219,6 +225,36 @@ class TestRouter(unittest.TestCase):
         self.assertTrue(torch.allclose(after.weights.sum(-1), torch.full((10,), 1.5)))
         self.assertEqual(int(after.counts.sum()), 20)
         self.assertFalse(torch.equal(before.indices, after.indices))
+
+
+class TestBalance(unittest.TestCase):
+    def test_aux_loss_matches_transformers(self):
+        from transformers.models.mixtral.modeling_mixtral import (
+            load_balancing_loss_func,
+        )
+
+        torch.manual_seed(0)
+        logits = torch.randn(20, 8)
+        scores = logits.softmax(-1)
+        indices = scores.topk(2).indices
+        counts = torch.bincount(indices.flatten(), minlength=8)
+        ours = load_balancing_loss(counts, scores, 20)
+        theirs = load_balancing_loss_func((logits,), 8, 2)
+        self.assertTrue(torch.allclose(ours, theirs, atol=1e-6))
+        cfg = resolve_moe_config(
+            _moe_json(
+                scoring_func="softmax",
+                balance="aux_loss",
+                dflash_config={"moe_aux_loss_coeff": 0.01},
+            )
+        )
+        controller = AuxLossController(cfg, 8)
+        scores = scores.clone().requires_grad_(True)
+        controller.observe(
+            RoutingResult(scores.gather(1, indices), indices, counts, scores)
+        )
+        self.assertTrue(torch.allclose(controller.aux_loss(), 0.01 * theirs, atol=1e-7))
+        self.assertIn("load_frac_max", controller.metrics())
 
 
 # -- experts, shared expert, layer ---------------------------------------------------

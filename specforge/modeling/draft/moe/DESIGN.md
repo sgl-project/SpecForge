@@ -22,7 +22,7 @@ of small functions while the expensive parts are shared:
 | differs per target family | shared by every family |
 | --- | --- |
 | score function | token dispatch (sorted segments, grouped GEMM) |
-| balancing policy | deferred update timing vs activation checkpointing |
+| balancing (aux loss, none) | deferred update timing vs activation checkpointing |
 | combine-weight renorm and scale | FSDP-friendly stacked expert layout |
 | shared expert (none or one) | fp32 accumulation of routed and shared output |
 | checkpoint file naming | load metrics |
@@ -43,7 +43,7 @@ The drafter's MoE follows a target family's recipe, expressed as a preset:
 base.py        Registry, RoutingResult, TrainingState
 config.py      MoEConfig + preset registry; resolves a draft JSON
 router.py      score functions, Router ABC, TopKRouter
-balance.py     BalanceController: none
+balance.py     BalanceController: none, aux_loss
 experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu
 shared.py      SharedExpert ABC, SwiGLUSharedExpert
 layer.py       MoELayer, build_ffn, and the model-level hooks
@@ -116,9 +116,10 @@ its `experts` component) and only the layout the config names runs.
 auxiliary loss to whichever term backpropagates (`loss`, or the `loss_terms`
 numerator scaled by the micro-batch denominator) and the layer-averaged
 `moe/*` metrics to `StepOutput.metrics`: `load_max_ratio`, `load_min_ratio`,
-`experts_unused_frac`, plus the balance controller's own. Strategies hold no
-MoE code; dense drafts log no `moe/*` keys; evaluation calls `forward_loss`
-alone, so eval losses exclude the auxiliary term.
+`experts_unused_frac`, plus the balance controller's (`aux_loss` and
+`load_frac_*`). Strategies hold no MoE code; dense drafts log no `moe/*` keys;
+evaluation calls `forward_loss` alone, so eval losses exclude the auxiliary
+term.
 The trainer DP-averages the `moe/*` metrics and logs them like any other
 scalar.
 
