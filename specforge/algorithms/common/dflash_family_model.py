@@ -283,6 +283,8 @@ class OnlineDFlashModel(nn.Module):
         kl_decay: float = 1.0,
         metric_top_k: int = 16,
         teacher_metrics: bool = True,
+        ce_loss_alpha: float = 1.0,
+        l1_loss_alpha: float = 0.0,
     ):
         super().__init__()
         if metric_top_k <= 0:
@@ -304,6 +306,17 @@ class OnlineDFlashModel(nn.Module):
         if lk_loss_type not in _VALID_LK_LOSS_TYPES:
             raise ValueError(
                 "lk_loss_type must be one of None, 'alpha', 'lambda', or 'tv'"
+            )
+        if ce_loss_alpha < 0 or l1_loss_alpha < 0:
+            raise ValueError("ce_loss_alpha and l1_loss_alpha must be >= 0")
+        if ce_loss_alpha + l1_loss_alpha <= 0:
+            raise ValueError("ce_loss_alpha + l1_loss_alpha must be > 0")
+        if (l1_loss_alpha > 0 or ce_loss_alpha != 1.0) and (
+            loss_type != "dflash" or lk_loss_type is not None
+        ):
+            raise ValueError(
+                "ce_loss_alpha/l1_loss_alpha compose the plain DFlash CE objective "
+                "only (loss_type='dflash', lk_loss_type=None)"
             )
 
         self.draft_model = draft_model
@@ -328,6 +341,11 @@ class OnlineDFlashModel(nn.Module):
         self.metric_top_k = int(metric_top_k)
         # Diagnostics-only: compare against target_last_hidden_states when fed.
         self.teacher_metrics = bool(teacher_metrics)
+        # Token-objective weights ``ce_alpha * CE + l1_alpha * L1``; the shared
+        # objective (``token_objective``) applies them and reads
+        # target_last_hidden_states when ``l1_alpha > 0``.
+        self.ce_loss_alpha = float(ce_loss_alpha)
+        self.l1_loss_alpha = float(l1_loss_alpha)
         self._fused_unary_head_requested = (
             os.environ.get(_FUSED_UNARY_HEAD_ENV, "1") != "0"
         )
@@ -355,11 +373,14 @@ class OnlineDFlashModel(nn.Module):
         """The shared token objective bound to the unary prediction output.
 
         Derived from the resolved loss attributes (``loss_type``,
-        ``lk_loss_type``, ``kl_scale``, ``kl_decay``, ``dpace_alpha``) so the
-        objective and the resume contract never disagree.
+        ``lk_loss_type``, ``kl_scale``, ``kl_decay``, ``dpace_alpha``,
+        ``ce_loss_alpha``, ``l1_loss_alpha``) so the objective and the resume
+        contract never disagree.
         """
 
         return TokenObjectiveConfig(
+            hard_ce_weight=self.ce_loss_alpha,
+            teacher_l1_weight=self.l1_loss_alpha,
             hard_label_mode=self.lk_loss_type,
             kl_scale=self.kl_scale,
             kl_decay=self.kl_decay,
@@ -818,6 +839,9 @@ class OnlineDFlashModel(nn.Module):
 
         if not self._fused_unary_head_requested or self.block_size <= 1:
             return False
+        if self.requires_teacher_distribution:
+            # The teacher L1 term needs the full objective logits.
+            return False
         if getattr(self.draft_model, "candidate_selector", None) is None:
             return False
         is_identity = getattr(
@@ -847,6 +871,7 @@ class OnlineDFlashModel(nn.Module):
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
         sequence_anchor_scale: Optional[torch.Tensor] = None,
+        aligned_target_hidden: Optional[torch.Tensor] = None,
         *,
         fused_head: bool = False,
     ) -> DFlashObjectiveTerms:
@@ -854,7 +879,9 @@ class OnlineDFlashModel(nn.Module):
 
         ``fused_head=True`` (see ``_use_fused_unary_head``) takes the unary CE,
         strict top-k, and argmax from the fused Triton head. Its inputs omit
-        block slot 0, so decay positions start at 1.
+        block slot 0, so decay positions start at 1. ``aligned_target_hidden``
+        (the target's final hidden state at each label) feeds the teacher
+        distribution when the token objective distills from it.
         """
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
@@ -899,13 +926,29 @@ class OnlineDFlashModel(nn.Module):
         else:  # defensive: __init__ validates the configured loss type.
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
+        objective = self.token_objective
+        teacher_logits = None
+        if objective.requires_teacher_distribution:
+            if aligned_target_hidden is None or objective_logits is None:
+                raise ValueError(
+                    "the token objective distills from the teacher distribution "
+                    "(l1_loss_alpha > 0) and needs target_last_hidden_states "
+                    "and the reference (non-fused) unary head"
+                )
+            with torch.no_grad():
+                teacher_logits = self.lm_head(
+                    aligned_target_hidden.reshape(
+                        batch_size, num_blocks * block_size, hidden_size
+                    )
+                ).reshape_as(objective_logits)
         token = token_objective_chunk_terms(
-            self.token_objective,
+            objective,
             labels=target_ids,
             loss_mask=weight_mask,
             logits=objective_logits,
             neg_log_q=neg_log_q,
             loss_weights=loss_weights,
+            teacher_logits=teacher_logits,
             sequence_anchor_scale=sequence_anchor_scale,
         )
         ce_loss_num = token.terms.ce_num
@@ -1458,6 +1501,12 @@ class OnlineDFlashModel(nn.Module):
             self.block_size,
             -1,
         )
+        needs_teacher_objective = self.requires_teacher_distribution
+        if needs_teacher_objective and target_last_hidden_states is None:
+            raise ValueError(
+                "the token objective distills from the teacher distribution "
+                "(l1_loss_alpha > 0) and needs target_last_hidden_states"
+            )
         aligned_target_hidden = (
             self._aligned_target_hidden(
                 target_last_hidden_states,
@@ -1465,11 +1514,16 @@ class OnlineDFlashModel(nn.Module):
             )
             if (
                 target_last_hidden_states is not None
-                and collect_detailed_metrics
-                and self.teacher_metrics
+                and (
+                    needs_teacher_objective
+                    or (collect_detailed_metrics and self.teacher_metrics)
+                )
             )
             else None
         )
+        # The teacher diagnostics stay opt-out even when the objective reads
+        # the teacher state on every step.
+        teacher_metric_hidden = aligned_target_hidden if self.teacher_metrics else None
         sequence_anchor_scale = None
         if self.loss_type in _DPACE_LOSS_TYPES:
             sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
@@ -1488,7 +1542,7 @@ class OnlineDFlashModel(nn.Module):
                     target_ids,
                     weight_mask,
                     predecessor_ids,
-                    aligned_target_hidden,
+                    teacher_metric_hidden,
                     sequence_anchor_scale,
                     torch.arange(anchor_positions.shape[1], device=device).unsqueeze(0),
                     chunk_size=self.objective_chunk_blocks,
@@ -1503,6 +1557,10 @@ class OnlineDFlashModel(nn.Module):
             predecessor_ids,
             sequence_anchor_scale,
         )
+        if needs_teacher_objective:
+            # Chunked with the other block tensors; the fused head is off
+            # whenever the objective distills, so it never sees this input.
+            objective_inputs = (*objective_inputs, aligned_target_hidden)
         fused_head = self._use_fused_unary_head(hidden_4d)
         if fused_head:
             # Block slot 0 holds the clean anchor. ``weight_mask`` zeroes it in
@@ -1568,10 +1626,21 @@ class OnlineDFlashModel(nn.Module):
                 accuracy_denom.detach(),
             ),
             "lk_loss" if self.lk_loss_type is not None else "ce_loss": (
-                token_loss_num.detach(),
+                (
+                    token_loss_num if self.lk_loss_type is not None else ce_loss_num
+                ).detach(),
                 loss_denominator.detach(),
             ),
         }
+        if not self.token_objective.uses_default_weights:
+            ratio_metrics["l1_loss"] = (
+                teacher_l1_num.detach(),
+                loss_denominator.detach(),
+            )
+            ratio_metrics["token_objective"] = (
+                token_loss_num.detach(),
+                loss_denominator.detach(),
+            )
         lk_kl_weight = self._lk_kl_weight(target_probability_num, accuracy_denom)
         if lk_kl_weight is not None:
             ratio_metrics["objective/lk_kl_weight"] = (
@@ -1639,7 +1708,7 @@ class OnlineDFlashModel(nn.Module):
                 top_k,
                 has_selector=candidate_selector is not None,
             )
-            if aligned_target_hidden is not None:
+            if teacher_metric_hidden is not None:
                 ratio_metrics["dflash/teacher/unary_overlap_chain_length"] = (
                     terms.teacher_expected_accepted_length_num.detach(),
                     terms.block_den.detach(),
@@ -1681,7 +1750,7 @@ class OnlineDFlashModel(nn.Module):
                     terms.greedy_accepted_length_num.detach(),
                     terms.block_den.detach(),
                 )
-                if aligned_target_hidden is not None:
+                if teacher_metric_hidden is not None:
                     self._add_ratio_family(
                         ratio_metrics,
                         "dflash2/selector/self_conditioned_teacher_argmax_agreement",

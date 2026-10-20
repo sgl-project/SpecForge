@@ -1015,6 +1015,15 @@ class TrainingConfig(StrictConfigModel):
     #: writing it and the trainer from fetching it (one ``hidden_size`` row per
     #: token next to the ``len(target_layer_ids) * hidden_size`` aux row).
     dflash_teacher_metrics: bool = True
+    #: DFlash/DFlash2 token objective ``ce_alpha * CE + l1_alpha * L1``: L1 is the
+    #: full-vocabulary L1 distance (2 x TV) between the draft and the frozen target
+    #: distribution at each supervised block position, DSpark's distillation term.
+    #: ``l1_alpha > 0`` reads the target final hidden state on every step, so the
+    #: online capture carries it regardless of ``dflash_teacher_metrics``; offline
+    #: DFlash features do not store it, so the term is online-only. The defaults
+    #: keep the plain CE objective.
+    dflash_ce_loss_alpha: float = Field(default=1.0, ge=0.0)
+    dflash_l1_loss_alpha: float = Field(default=0.0, ge=0.0)
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1
@@ -1050,6 +1059,16 @@ class TrainingConfig(StrictConfigModel):
     def _validate_training_shape(self):
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
+        if self.dflash_l1_loss_alpha > 0 or self.dflash_ce_loss_alpha != 1.0:
+            if self.loss_type != "dflash" or self.lk_loss_type is not None:
+                raise ValueError(
+                    "training.dflash_ce_loss_alpha/dflash_l1_loss_alpha compose the "
+                    "plain DFlash CE objective only (loss_type=dflash, lk_loss_type=null)"
+                )
+        if self.dflash_ce_loss_alpha + self.dflash_l1_loss_alpha <= 0:
+            raise ValueError(
+                "training.dflash_ce_loss_alpha + training.dflash_l1_loss_alpha must be > 0"
+            )
         if not 0.0 < self.down_sample_ratio <= 1.0:
             raise ValueError("training.down_sample_ratio must be in (0, 1]")
         if not 0.0 < self.down_sample_ratio_min <= self.down_sample_ratio:
@@ -1222,6 +1241,13 @@ class Config(StrictConfigModel):
         if self.data.eval_hidden_states_path and mode != "offline":
             raise ValueError(
                 "data.eval_hidden_states_path requires an offline training data source"
+            )
+        if mode == "offline" and self.training.dflash_l1_loss_alpha > 0:
+            raise ValueError(
+                "training.dflash_l1_loss_alpha > 0 distills from the target "
+                "distribution, which needs the target's final hidden state on "
+                "every step; offline DFlash features (specforge_hidden_states_v1) "
+                "do not store it, so the L1 term requires online training"
             )
         if (
             not self.training.compact_teacher

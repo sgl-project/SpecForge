@@ -186,7 +186,10 @@ whose architecture is `DFlash2DraftModel`. The target server still captures
 the same selected hidden states with `--spec-capture-method dflash`. Online
 capture also retains the target's final hidden state for teacher-alignment
 telemetry; existing offline DFlash datasets remain compatible and omit only
-the teacher-only metrics. The objective never reads that hidden state. Set
+the teacher-only metrics. The default CE objective never reads that hidden
+state; only an L1 distillation term (`training.dflash_l1_loss_alpha > 0`)
+does, on every step, so it is online-only and keeps the capture on whatever
+`dflash_teacher_metrics` says. Otherwise, set
 `training.dflash_teacher_metrics: false` to stop requesting it: the capture
 server no longer writes it and the trainer no longer fetches it, which removes
 one `hidden_size` row per token from every sample (a sixth of the payload with

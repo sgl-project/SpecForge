@@ -306,7 +306,7 @@ Common fields:
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
-| `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
+| `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. Captures the target's final hidden state online for the `dflash/teacher/*` diagnostics. `false` stops the diagnostics and, with the plain CE objective, the capture; an L1 objective term (`training.dflash_l1_loss_alpha > 0`) keeps the capture on because it reads the state on every step. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
@@ -316,7 +316,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | Strategy | Fields and defaults |
 | --- | --- |
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
-| DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
+| DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash/DFlash 2's token-objective weights `training.dflash_ce_loss_alpha` (`1.0`) and `training.dflash_l1_loss_alpha` (`0.0`; a positive weight adds the L1 distance to the target distribution, needs `loss_type: dflash` and `lk_loss_type: null`, and is online-only: offline DFlash features do not store the target final hidden state), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 | MTP | `training.mtp_objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
@@ -592,7 +592,15 @@ selection inside the unified trainer, not another training entry.
 DFlash 2 treats the token objective and position weighting as independent A/B
 axes. `training.lk_loss_type: null` keeps hard-target CE, `tv` minimizes the
 one-hot total-variation objective, and `lambda` adaptively mixes CE with TV;
-`alpha` is equivalent to CE for these hard targets. Independently,
+`alpha` is equivalent to CE for these hard targets. With CE,
+`training.dflash_l1_loss_alpha > 0` distills from the target instead: the token
+objective becomes `dflash_ce_loss_alpha * CE + dflash_l1_loss_alpha * L1`, where
+L1 is the full-vocabulary distance (2 × TV) between the draft and frozen-target
+distributions, computed from the captured target final hidden state (DSpark's
+`0.1 * CE + 0.9 * L1` is `0.1` / `0.9`). The same shared token objective
+(`specforge/core/token_objective.py`) serves DSpark, so the two spellings
+compute the same term. Offline DFlash features do not store the target final
+hidden state, so the L1 term is rejected in offline mode. Independently,
 `training.loss_type: dflash` uses `loss_decay_gamma`, while `dpace` applies one
 detached dynamic position weight to both the unary and candidate-selector
 objectives. For example, LK-lambda with D-PACE uses:
