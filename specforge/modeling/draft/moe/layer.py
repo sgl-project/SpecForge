@@ -1,15 +1,15 @@
 # coding=utf-8
-"""``MoELayer`` (router + balance + routed experts + shared expert) and ``build_ffn``."""
+"""``MoELayer``, the dense/MoE switch ``build_ffn`` and the model-level hooks."""
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Iterator, Optional, Tuple
 
 import torch
 from torch import nn
 
 from .balance import build_balance_controller
-from .base import MetricValue
+from .base import MetricValue, TrainingState
 from .config import MoEConfig, requests_routed_experts, resolve_moe_config
 from .experts import build_routed_experts
 from .router import build_router
@@ -37,6 +37,13 @@ class MoELayer(nn.Module):
     def balance(self):
         return self.gate.balance
 
+    def components(self) -> Tuple[TrainingState, ...]:
+        """The parts that carry training state, in a fixed order."""
+        parts = [self.gate, self.balance, self.experts]
+        if self.shared_experts is not None:
+            parts.append(self.shared_experts)
+        return tuple(parts)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         flat = x.reshape(-1, self.hidden_size)
@@ -44,18 +51,25 @@ class MoELayer(nn.Module):
         routing = self.gate(flat, tokens_per_sample=tokens_per_sample)
         if self.training:
             self.last_counts = routing.counts.detach()
-            self.balance.observe(routing)
+            for component in self.components():
+                component.observe(routing)
         y = self.experts(flat, routing)  # fresh fp32 accumulator
         if self.shared_experts is not None:
             y.add_(self.shared_experts(flat))
         return y.to(x.dtype).view(shape)
 
-    # -- model-level hooks (see hooks.py) ---------------------------------
-    def apply_pending_balance_update(self) -> None:
-        self.balance.apply_pending_update()
+    def apply_pending_update(self) -> None:
+        for component in self.components():
+            component.apply_pending_update()
 
     def aux_loss(self) -> Optional[torch.Tensor]:
-        return self.balance.aux_loss()
+        """Sum of the components' already-scaled losses, or ``None``."""
+        total: Optional[torch.Tensor] = None
+        for component in self.components():
+            loss = component.aux_loss()
+            if loss is not None:
+                total = loss if total is None else total + loss
+        return total
 
     def metrics(self) -> Dict[str, MetricValue]:
         out: Dict[str, MetricValue] = {}
@@ -66,15 +80,14 @@ class MoELayer(nn.Module):
             out["load_max_ratio"] = load.max() / mean
             out["load_min_ratio"] = load.min() / mean
             out["experts_unused_frac"] = (load == 0).float().mean()
-        out.update(self.balance.metrics())
+        for component in self.components():
+            out.update(component.metrics())
         return out
 
     def reset_parameters(self, std: float) -> None:
         """Initialize bare Parameters the HF ``_init_weights`` pass cannot see."""
-        self.gate.reset_parameters(std)
-        self.experts.reset_parameters(std)
-        if self.shared_experts is not None:
-            self.shared_experts.reset_parameters(std)
+        for component in self.components():
+            component.reset_parameters(std)
 
 
 def build_ffn(config, dense: Callable[[object], nn.Module]) -> nn.Module:
@@ -88,3 +101,41 @@ def build_ffn(config, dense: Callable[[object], nn.Module]) -> nn.Module:
             "target family's preset (see specforge.modeling.draft.moe)"
         )
     return dense(config)
+
+
+# -- model-level hooks over any module tree -------------------------------------
+
+
+def iter_moe_layers(module: nn.Module) -> Iterator[MoELayer]:
+    for sub in module.modules():
+        if isinstance(sub, MoELayer):
+            yield sub
+
+
+def apply_pending_balance_updates(module: nn.Module) -> None:
+    """Apply stashed routing statistics; call first in the training forward."""
+    for layer in iter_moe_layers(module):
+        layer.apply_pending_update()
+
+
+def collect_moe_aux_loss(module: nn.Module) -> Optional[torch.Tensor]:
+    """Sum of the layers' already-scaled auxiliary losses, or ``None``."""
+    total: Optional[torch.Tensor] = None
+    for layer in iter_moe_layers(module):
+        loss = layer.aux_loss()
+        if loss is not None:
+            total = loss if total is None else total + loss
+    return total
+
+
+def collect_moe_metrics(
+    module: nn.Module, prefix: str = "moe/"
+) -> Dict[str, MetricValue]:
+    """Layer-averaged scalar metrics under ``prefix``; ``{}`` without MoE layers."""
+    sums: Dict[str, MetricValue] = {}
+    n = 0
+    for layer in iter_moe_layers(module):
+        n += 1
+        for key, value in layer.metrics().items():
+            sums[key] = value if key not in sums else sums[key] + value
+    return {f"{prefix}{key}": value / n for key, value in sums.items()}

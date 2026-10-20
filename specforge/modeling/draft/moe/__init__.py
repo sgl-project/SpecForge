@@ -28,14 +28,15 @@ from .experts import (
     build_routed_experts,
     register_experts_backend,
 )
-from .hooks import (
+from .init import WarmStartPlan, plan_warm_start, select_target_experts
+from .layer import (
+    MoELayer,
     apply_pending_balance_updates,
+    build_ffn,
     collect_moe_aux_loss,
     collect_moe_metrics,
     iter_moe_layers,
 )
-from .init import WarmStartPlan, plan_warm_start, select_target_experts
-from .layer import MoELayer, build_ffn
 from .router import (
     ROUTERS,
     SCORE_FUNCTIONS,

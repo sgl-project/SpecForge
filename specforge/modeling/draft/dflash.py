@@ -745,8 +745,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, MoELayer):
-            # MoE components hold bare Parameters (gate weight, stacked
-            # experts) that the inherited Qwen3 init never visits.
+            # MoE layers hold bare Parameters the inherited Qwen3 init never visits.
             module.reset_parameters(std=self.config.initializer_range)
             return
         super()._init_weights(module)
@@ -880,9 +879,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         if self.training:
-            # Consume the PREVIOUS forward's routing statistics before any
-            # routing this step, outside every activation-checkpoint region
-            # (see modeling/draft/moe/balance.py for why the timing matters).
+            # Stashed routing statistics, outside checkpoint regions; see moe/DESIGN.md.
             apply_pending_balance_updates(self)
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

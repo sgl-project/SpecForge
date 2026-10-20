@@ -244,6 +244,7 @@ class TestExpertsAndLayer(unittest.TestCase):
     def test_layer_without_shared_expert(self):
         layer = _layer(n_shared_experts=0)
         self.assertIsNone(layer.shared_experts)
+        self.assertEqual(len(layer.components()), 3)
 
     def test_layer_builds_the_registered_implementations(self):
         layer = _layer()
@@ -286,6 +287,18 @@ class TestExpertsAndLayer(unittest.TestCase):
         self.assertTrue(torch.equal(layer.last_counts, layer.balance.observed[0]))
         layer.eval()(x)
         self.assertEqual(len(layer.balance.observed), 1)
+
+    def test_components_run_through_one_training_state_loop(self):
+        register_balance_controller("_test_grad_balance")(_GradBalance)
+        self.addCleanup(BALANCE_CONTROLLERS.unregister, "_test_grad_balance")
+        layer = _layer(
+            balance="_test_grad_balance", dflash_config={"moe_aux_loss_coeff": 0.1}
+        ).train()
+        layer(torch.randn(2, 4, H))
+        self.assertTrue(torch.allclose(layer.aux_loss(), layer.balance.aux_loss()))
+        metrics = layer.metrics()
+        for key in ("load_max_ratio", "experts_unused_frac", "grad_balance"):
+            self.assertIn(key, metrics)
 
 
 class TestHooks(unittest.TestCase):
