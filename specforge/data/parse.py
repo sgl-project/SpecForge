@@ -15,6 +15,7 @@ __all__ = [
     "GeneralParser",
     "GLMParser",
     "HarmonyParser",
+    "MuseParser",
     "ThinkingParser",
 ]
 
@@ -613,6 +614,47 @@ class DeepSeekV4Parser(ThinkingParser):
             drop_thinking=kwargs.pop("drop_thinking", True),
             add_default_bos_token=kwargs.pop("add_default_bos_token", True),
             reasoning_effort=kwargs.pop("reasoning_effort", None),
+        )
+
+
+class MuseParser(ThinkingParser):
+    """Loss mask for Muse Spark's rendered Harmony messages.
+
+    Rendering stays on ``tokenizer.apply_chat_template``. This parser does not
+    build the text and does not pass ``enable_thinking``. The checkpoint emits
+    one assistant message per span, so a single header and end token cannot
+    describe them:
+
+    - ``to=self`` reasoning, closed by ``<|eom|>``
+    - ``to=commentary`` intermediate text, closed by ``<|eom|>``
+    - ``to=<tool name>`` tool-call arguments, closed by ``<|eom|>`` or ``<|eot|>``
+    - ``to=user`` final answer, closed by ``<|eot|>``
+
+    Each of those interiors is supervised, and so is its closing token. The
+    ``<|start|>assistant to=…<|message|>`` prefix is not. System, user, and
+    tool-result turns stay unsupervised.
+    """
+
+    allow_chat_template_fallback = False
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        chat_template: ChatTemplate,
+    ):
+        super().__init__(tokenizer, chat_template)
+        self.standard_keys.update(
+            {"reasoning_content", "name", "tool_call_id", "recipient", "end_turn"}
+        )
+
+    def _sanitize_message(self, message: dict) -> dict:
+        # Keep arguments as objects. The Muse Jinja rejects argument strings.
+        return Parser._sanitize_message(self, message)
+
+    def set_assistant_pattern(self, chat_template: ChatTemplate):
+        del chat_template
+        self.assistant_pattern = (
+            r"<\|start\|>assistant to=.*?<\|message\|>([\s\S]*?(?:<\|eom\|>|<\|eot\|>))"
         )
 
 
