@@ -18,6 +18,7 @@ hyperparameters.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Any, Callable, Dict, Optional, Sequence
@@ -832,6 +833,15 @@ def _build_online(
     total_steps = cfg.training.total_steps
     if total_steps is None and cfg.training.max_steps is None:
         total_steps = _read_online_total_steps(cfg, channel_path)
+    steps_per_epoch = None
+    if total_steps and cfg.training.num_epochs > 1:
+        steps_per_epoch = total_steps / int(cfg.training.num_epochs)
+    logging.getLogger(__name__).info(
+        "disagg-online per-epoch schedule: steps_per_epoch=%s total_steps=%s num_epochs=%s",
+        steps_per_epoch,
+        total_steps,
+        cfg.training.num_epochs,
+    )
     bundle = build_model_bundle(cfg)
     trainer = build_disagg_online_consumer(
         algorithm=algorithm,
@@ -847,6 +857,7 @@ def _build_online(
         accumulation_steps=cfg.training.accumulation_steps,
         max_steps=cfg.training.max_steps,
         total_steps=total_steps,
+        steps_per_epoch=steps_per_epoch,
         save_interval=cfg.training.save_interval,
         idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", "0")) or None,
         metadata_db_path=_consumer_database_path(cfg),
