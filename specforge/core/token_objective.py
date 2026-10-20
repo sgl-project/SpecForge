@@ -49,7 +49,8 @@ DPACE_POSITION_WEIGHT_MODES = frozenset(
 )
 POSITION_WEIGHT_MODES = frozenset({"static"}) | DPACE_POSITION_WEIGHT_MODES
 #: ``"1"`` routes the teacher TV/L1 distance through the fused Triton kernel,
-#: ``"0"`` keeps the FP32 eager distance. Unset: fused for BF16 logits only.
+#: ``"0"`` keeps the FP32 eager distance. Unset: fused for BF16 logits and for
+#: CUDA FP32 logits (DFlash2's unary transform returns FP32).
 FUSED_TEACHER_TV_ENV = "SPECFORGE_TOKEN_OBJECTIVE_FUSED_TV"
 #: Legacy DSpark spelling of :data:`FUSED_TEACHER_TV_ENV`; still honored.
 LEGACY_FUSED_TEACHER_TV_ENV = "SPECFORGE_DSPARK_FUSED_LOSS"
@@ -194,7 +195,10 @@ def dpace_position_weights(
 
 
 def _use_fused_teacher_tv(draft_logits: torch.Tensor) -> bool:
-    default = "1" if draft_logits.dtype == torch.bfloat16 else "0"
+    fused_by_default = draft_logits.dtype == torch.bfloat16 or (
+        draft_logits.dtype == torch.float32 and draft_logits.is_cuda
+    )
+    default = "1" if fused_by_default else "0"
     value = os.environ.get(FUSED_TEACHER_TV_ENV)
     if value is None:
         value = os.environ.get(LEGACY_FUSED_TEACHER_TV_ENV, default)
@@ -209,9 +213,10 @@ def teacher_tv_distance(
 
     ``l1 = 2 * tv`` for normalized softmax pairs, and ``1 - tv`` is the expected
     rejection-sampling acceptance. Gradients flow into ``draft_logits`` only.
-    BF16 logits default to the fused Triton kernel (no ``[..., V]`` probability
-    tensor); other dtypes use the FP32 eager distance unless
-    :data:`FUSED_TEACHER_TV_ENV` overrides the choice.
+    BF16 logits and CUDA FP32 logits (DFlash2's unary transform returns FP32)
+    default to the fused Triton kernel, which reads its inputs as FP32 and
+    materializes no ``[..., V]`` probability tensor; other logits use the FP32
+    eager distance unless :data:`FUSED_TEACHER_TV_ENV` overrides the choice.
     """
 
     vocab_size = draft_logits.shape[-1]
