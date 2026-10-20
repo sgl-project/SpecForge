@@ -11,9 +11,11 @@
 from .balance import BalanceController, register_balance_controller
 from .base import RoutingResult, TrainingState
 from .checkpoint import (
+    exported_config_updates,
     from_checkpoint_state_dict,
     register_layout,
     to_checkpoint_state_dict,
+    to_serving_state_dict,
 )
 from .config import MoEConfig, is_moe_config, register_moe_preset, resolve_moe_config
 from .experts import RoutedExperts, register_experts_backend
@@ -44,6 +46,7 @@ __all__ = [
     "build_ffn",
     "collect_moe_aux_loss",
     "collect_moe_metrics",
+    "exported_config_updates",
     "families",
     "from_checkpoint_state_dict",
     "is_moe_config",
@@ -57,4 +60,5 @@ __all__ = [
     "register_shared_expert",
     "resolve_moe_config",
     "to_checkpoint_state_dict",
+    "to_serving_state_dict",
 ]

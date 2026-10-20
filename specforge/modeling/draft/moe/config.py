@@ -30,11 +30,14 @@ ARCHITECTURE_KEYS: Dict[str, str] = {
     )
 }
 ARCHITECTURE_KEYS["moe_layout"] = "layout"
+ARCHITECTURE_KEYS["moe_router_bias"] = "router_bias"
 
 #: ``dflash_config`` key (training-only) -> ``MoEConfig`` field.
 TRAINING_KEYS: Dict[str, str] = {
     "moe_aux_loss_coeff": "aux_loss_coeff",
     "moe_dispatch": "dispatch",
+    "moe_router_center": "router_center",
+    "moe_router_center_momentum": "router_center_momentum",
 }
 
 #: Fields a draft JSON must state explicitly (a preset may not default them).
@@ -71,6 +74,8 @@ class MoEConfig:
     #: Registered implementations of the routed and the shared experts.
     experts_backend: str = "grouped"
     shared_expert: str = "swiglu"
+    #: A fixed fp32 router logit bias (``gate.bias``); centering exports fold into it.
+    router_bias: bool = False
     #: The shared expert's gate: ``"none"`` or a per-token ``"sigmoid"``.
     shared_expert_gate: str = "none"
     #: Checkpoint file naming (a registered :mod:`.checkpoint` layout).
@@ -78,6 +83,9 @@ class MoEConfig:
     # Training-only fields, never part of the checkpoint's architecture.
     aux_loss_coeff: float = 0.0
     dispatch: str = "sorted_loop"
+    #: "sample": center router input on each sample's mean (eval: a running mean).
+    router_center: str = "none"
+    router_center_momentum: float = 0.99
 
     def __post_init__(self) -> None:
         for name in PER_RUN_FIELDS:
@@ -111,6 +119,13 @@ class MoEConfig:
             )
         if self.aux_loss_coeff < 0:
             raise ValueError("aux_loss_coeff must be >= 0")
+        if self.router_center not in ("none", "sample"):
+            raise ValueError(
+                f"unknown router_center {self.router_center!r}; "
+                "choose 'none' or 'sample'"
+            )
+        if not 0 <= self.router_center_momentum < 1:
+            raise ValueError("router_center_momentum must be in [0, 1)")
 
 
 #: Preset name -> one target family's architecture defaults.

@@ -25,7 +25,7 @@ of small functions while the expensive parts are shared:
 | balancing (aux loss, none) | deferred update timing vs activation checkpointing |
 | combine-weight renorm and scale | FSDP-friendly stacked expert layout |
 | shared-expert gate (none, sigmoid) | fp32 accumulation of routed and shared output |
-| checkpoint file naming | load metrics |
+| checkpoint file naming | load metrics, router centering and its export fold |
 
 ## Why a preset per target family
 
@@ -40,14 +40,15 @@ The drafter's MoE follows a target family's recipe, expressed as a preset:
 ## Layout
 
 ```
-base.py        Registry, RoutingResult, TrainingState
+base.py        Registry, RoutingResult, TrainingState, apply_keeping_fp32
 config.py      MoEConfig + preset registry; resolves a draft JSON
-router.py      score functions, Router ABC, TopKRouter
+router.py      score functions, Router ABC, TopKRouter (router bias and
+               centering), the centering export fold
 balance.py     BalanceController: none, aux_loss
 experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu
 shared.py      SharedExpert ABC, SwiGLUSharedExpert
 layer.py       MoELayer, build_ffn, and the model-level hooks
-checkpoint.py  checkpoint layouts
+checkpoint.py  checkpoint layouts, the export fold
 families/      one module per target family: preset and layout
 ```
 
@@ -89,8 +90,9 @@ activation-checkpoint recompute re-runs the forward and must leave identical
 state behind, and a loss built there is consumed right after the same
 forward. `apply_pending_update` runs from the *model* forward before any
 routing, outside checkpoint regions, and may mutate selection state and run
-collectives. Mutating selection state inside a layer forward would make the
-recompute route differently and raise `CheckpointError`.
+collectives (the router's centering mean moves there). Mutating selection
+state inside a layer forward would make the recompute route differently and
+raise `CheckpointError`.
 
 **Accumulation order.** `RoutedExperts.forward` returns the weighted routed
 sum as a fresh fp32 tensor; `MoELayer` adds the shared expert into it and
@@ -110,6 +112,23 @@ config: `FSDPTrainingBackend` save/load, resume, warm start,
 `AutoDraftModel.from_pretrained`, `materialize_draft` and the HF exporter.
 Layouts act on one MoE layer at a time (the layer prefix is the text before
 its `experts` component) and only the layout the config names runs.
+
+**Router centering.** From-scratch DFlash-family drafters feed every router a
+token-independent common mode (mask-token embeddings plus near-uniform
+attention over the target features), so every token picks the same top-k and
+an aux loss alone does not recover. `moe_router_center: "sample"` centers the
+router input on each sample's token mean in training and on a running mean in
+eval. Exports fold the running mean into a fixed fp32 router logit bias
+(`gate.bias = -W @ mu`) and set `moe_router_bias` in `config.json`, so an
+export reloads as the draft it describes and a serving engine that reads a
+router bias reproduces the trained routing.
+
+**Routing state stays fp32 and exact.** The centering mean and the router
+bias are fp32 buffers that no optimizer owns. Trainers cast the draft to bf16
+after warm-starting it, so the router's `_apply` keeps those values exact
+(`apply_keeping_fp32`) instead of rounding them and restoring the dtype: the
+folded router bias is the common-mode logit the centering removes, large next
+to the token-specific spread, so bf16 rounding could flip top-k choices.
 
 **Model-level terms ride every strategy.** `DraftTrainStrategy.finalize_step_output`
 (called by `TrainerCore` after `forward_loss`) adds the layers' summed

@@ -1,5 +1,5 @@
 # coding=utf-8
-"""The checkpoint-file boundary: each family's file naming of MoE tensors."""
+"""The checkpoint-file boundary: per-family file naming and the export fold."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from torch import nn
 from .base import Registry
 from .config import MoEConfig, resolve_moe_config
 from .layer import iter_moe_layers
+from .router import fold_router_centering, fold_router_centering_config
 
 StateDict = Dict[str, Any]
 #: One MoE layer's tensors (layer-relative keys) -> the same layer, other naming.
@@ -99,3 +100,36 @@ def from_checkpoint_state_dict(state: Mapping[str, Any], owner: Any) -> StateDic
     """The file naming of ``owner``'s layout -> module naming (identity if dense)."""
     layout = layout_for(owner)
     return dict(state) if layout is None else _per_layer(state, layout.from_file)
+
+
+# -- exports: fold router centering, then name for serving ----------------------
+
+
+def to_serving_state_dict(state: Mapping[str, Any], owner: Any) -> StateDict:
+    """Module naming -> file naming, with router centering folded into the gate."""
+    layout = layout_for(owner)
+    if layout is None:
+        return dict(state)
+    return _per_layer(state, lambda layer: layout.to_file(fold_router_centering(layer)))
+
+
+def exported_config_updates(owner: Any) -> Dict[str, Any]:
+    """``config.json`` changes of an export: the folded router centering."""
+    cfg = moe_config_for(owner)
+    if cfg is None:
+        return {}
+    return fold_router_centering_config(cfg)
+
+
+def serving_architecture(owner: Any, dense_architecture: str) -> str:
+    """The serving class for ``owner``'s draft, given the dense draft's class."""
+    cfg = moe_config_for(owner)
+    if cfg is None:
+        return dense_architecture
+    mapping = LAYOUTS.get(cfg.layout).serving_architectures
+    if dense_architecture not in mapping:
+        raise ValueError(
+            f"MoE layout {cfg.layout!r} names no serving class for a "
+            f"{dense_architecture} draft with an MoE FFN; known: {dict(mapping)}"
+        )
+    return mapping[dense_architecture]

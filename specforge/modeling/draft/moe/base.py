@@ -4,14 +4,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Generic, Optional, TypeVar, Union
+from typing import Callable, Dict, Generic, Optional, Sequence, TypeVar, Union
 
 import torch
+from torch import nn
 
 T = TypeVar("T")
 
 #: A scalar diagnostic: a 0-d tensor (no host sync) or a Python float.
 MetricValue = Union[torch.Tensor, float]
+
+
+def apply_keeping_fp32(
+    module: nn.Module,
+    parent_apply: Callable[..., nn.Module],
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    recurse: bool,
+    names: Sequence[str],
+) -> nn.Module:
+    """``parent_apply(fn, recurse)``; the fp32 buffers ``names`` keep exact values."""
+    # A module-wide cast would round them; meta buffers are only restored to fp32.
+    before = {name: getattr(module, name, None) for name in names}
+    module = parent_apply(fn, recurse)
+    for name, old in before.items():
+        new = getattr(module, name, None)
+        if old is None or new is None or new.dtype == torch.float32:
+            continue
+        if old.is_meta or old.dtype != torch.float32:
+            new.data = new.data.float()
+        else:
+            new.data = old.to(device=new.device, dtype=torch.float32)
+    return module
 
 
 class Registry(Generic[T]):
