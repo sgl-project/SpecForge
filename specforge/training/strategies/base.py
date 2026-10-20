@@ -17,7 +17,7 @@ code, so it is imported by training entry points, not at package load.
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -54,16 +54,6 @@ class StepContext:
     global_step: int = 0
     total_steps: Optional[int] = None
     collect_detailed_metrics: bool = True
-
-
-def _moe_metrics(model_wrapper: nn.Module) -> Dict[str, Any]:
-    """``moe/...`` load diagnostics of the wrapped draft; ``{}`` for dense drafts."""
-    from specforge.modeling.draft.moe import collect_moe_metrics
-
-    draft_model = getattr(model_wrapper, "draft_model", None)
-    if draft_model is None:
-        return {}
-    return collect_moe_metrics(draft_model)
 
 
 def linear_lambda_base(
@@ -125,6 +115,36 @@ class DraftTrainStrategy(abc.ABC):
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Select the keys this strategy persists as draft weights."""
         return state_dict
+
+    def finalize_step_output(self, out: StepOutput) -> StepOutput:
+        """Add the draft's MoE auxiliary loss and ``moe/*`` metrics; unchanged if dense."""
+        from specforge.modeling.draft.moe import (
+            collect_moe_aux_loss,
+            collect_moe_metrics,
+        )
+
+        module = self.trainable_module()
+        moe_metrics = collect_moe_metrics(module)
+        aux = collect_moe_aux_loss(module)
+        if aux is None and not moe_metrics:
+            return out
+        metrics = {**out.metrics, **moe_metrics}
+        if aux is None:
+            return replace(out, metrics=metrics)
+        loss_terms = out.loss_terms
+        if loss_terms is not None:
+            # Scale by this micro-batch's denominator, as the objective is.
+            numerator, denominator = loss_terms
+            loss_terms = (
+                numerator + aux.to(numerator.dtype) * denominator,
+                denominator,
+            )
+        return replace(
+            out,
+            loss=out.loss + aux.to(out.loss.dtype),
+            loss_terms=loss_terms,
+            metrics=metrics,
+        )
 
 
 def _prepare_eagle_target(
@@ -556,7 +576,6 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
         if "selector_loss_alpha" in model_metrics:
             metrics["selector_loss_alpha"] = model_metrics["selector_loss_alpha"]
-        metrics.update(_moe_metrics(self.dflash_model))
         return StepOutput(
             loss=loss,
             metrics=metrics,
@@ -627,7 +646,6 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         ):
             if name in model_metrics:
                 metrics[name] = model_metrics[name]
-        metrics.update(_moe_metrics(self.dspark_model))
         return StepOutput(
             loss=loss,
             metrics=metrics,
