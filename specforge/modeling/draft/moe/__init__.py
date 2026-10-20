@@ -41,7 +41,6 @@ from .router import (
     SCORE_FUNCTIONS,
     Router,
     build_router,
-    get_score_function,
     register_router,
     register_score_function,
 )
@@ -82,7 +81,6 @@ __all__ = [
     "collect_moe_aux_loss",
     "collect_moe_metrics",
     "from_checkpoint_state_dict",
-    "get_score_function",
     "is_moe_config",
     "iter_moe_layers",
     "plan_warm_start",

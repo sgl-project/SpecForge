@@ -1,10 +1,5 @@
 # coding=utf-8
-"""``MoELayer``: the FFN that composes router, experts and shared expert.
-
-Attribute names follow the official DeepSeek-style checkpoint layout
-(``gate``, ``experts``, ``shared_experts``) so that per-implementation
-converters only need to handle their own internals.
-"""
+"""``MoELayer`` (router + balance + routed experts + shared expert) and ``build_ffn``."""
 
 from __future__ import annotations
 
@@ -13,24 +8,26 @@ from typing import Callable, Dict, Optional
 import torch
 from torch import nn
 
-from .balance import MetricValue, build_balance_controller
+from .balance import build_balance_controller
+from .base import MetricValue
 from .config import MoEConfig, requests_routed_experts, resolve_moe_config
 from .experts import build_routed_experts
-from .router import RoutingResult, build_router
+from .router import build_router
 from .shared import build_shared_expert
 
 
 class MoELayer(nn.Module):
-    """Routed FFN: ``y = experts(x, gate(x)) + shared_experts(x)``."""
+    """Routed FFN ``cast(experts(x, gate(x)) + shared_experts(x))``, summed in fp32."""
 
     def __init__(self, cfg: MoEConfig, hidden_size: int) -> None:
         super().__init__()
         self.cfg = cfg
         self.hidden_size = hidden_size
+        # gate / experts / shared_experts are the module-side naming contract.
         balance = build_balance_controller(cfg, cfg.n_routed_experts)
         self.gate = build_router(cfg, hidden_size, balance)
         self.experts = build_routed_experts(cfg, hidden_size)
-        self.shared_experts: Optional[nn.Module] = (
+        self.shared_experts = (
             build_shared_expert(cfg, hidden_size) if cfg.n_shared_experts else None
         )
         # Detached per-expert counts of the last training forward, for metrics.
@@ -42,15 +39,16 @@ class MoELayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
-        x = x.reshape(-1, self.hidden_size)
-        routing: RoutingResult = self.gate(x)
+        flat = x.reshape(-1, self.hidden_size)
+        tokens_per_sample = int(shape[-2]) if len(shape) >= 3 else None
+        routing = self.gate(flat, tokens_per_sample=tokens_per_sample)
         if self.training:
             self.last_counts = routing.counts.detach()
             self.balance.observe(routing)
-        y = self.experts(x, routing)
+        y = self.experts(flat, routing)  # fresh fp32 accumulator
         if self.shared_experts is not None:
-            y = y + self.shared_experts(x)
-        return y.view(shape)
+            y.add_(self.shared_experts(flat))
+        return y.to(x.dtype).view(shape)
 
     # -- model-level hooks (see hooks.py) ---------------------------------
     def apply_pending_balance_update(self) -> None:
