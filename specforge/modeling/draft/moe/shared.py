@@ -36,7 +36,8 @@ def register_shared_expert(name: str):
 
 
 def build_shared_expert(cfg: MoEConfig, hidden_size: int) -> SharedExpert:
-    return SHARED_EXPERTS.get(cfg.shared_expert)(cfg, hidden_size)
+    shared_cls = SHARED_EXPERTS.get(cfg.shared_expert)
+    return shared_cls(cfg, hidden_size)
 
 
 @register_shared_expert("swiglu")

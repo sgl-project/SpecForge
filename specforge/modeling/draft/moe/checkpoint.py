@@ -153,7 +153,8 @@ def serving_architecture(owner: Any, dense_architecture: str) -> str:
     cfg = moe_config_for(owner)
     if cfg is None:
         return dense_architecture
-    mapping = LAYOUTS.get(cfg.layout).serving_architectures
+    layout = LAYOUTS.get(cfg.layout)
+    mapping = layout.serving_architectures
     if dense_architecture not in mapping:
         raise ValueError(
             f"MoE layout {cfg.layout!r} names no serving class for a "

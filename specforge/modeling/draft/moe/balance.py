@@ -36,7 +36,8 @@ def register_balance_controller(name: str):
 
 
 def build_balance_controller(cfg: MoEConfig, n_experts: int) -> BalanceController:
-    return BALANCE_CONTROLLERS.get(cfg.balance)(cfg, n_experts)
+    controller_cls = BALANCE_CONTROLLERS.get(cfg.balance)
+    return controller_cls(cfg, n_experts)
 
 
 def load_balancing_loss(

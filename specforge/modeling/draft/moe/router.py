@@ -64,7 +64,8 @@ def register_router(name: str):
 def build_router(
     cfg: MoEConfig, hidden_size: int, balance: BalanceController
 ) -> Router:
-    return ROUTERS.get(cfg.router)(cfg, hidden_size, balance)
+    router_cls = ROUTERS.get(cfg.router)
+    return router_cls(cfg, hidden_size, balance)
 
 
 @register_router("topk")

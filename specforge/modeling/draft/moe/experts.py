@@ -48,7 +48,8 @@ def register_experts_backend(name: str):
 
 
 def build_routed_experts(cfg: MoEConfig, hidden_size: int) -> RoutedExperts:
-    return EXPERTS_BACKENDS.get(cfg.experts_backend)(cfg, hidden_size)
+    experts_cls = EXPERTS_BACKENDS.get(cfg.experts_backend)
+    return experts_cls(cfg, hidden_size)
 
 
 @register_experts_backend("grouped")
