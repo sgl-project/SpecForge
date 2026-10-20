@@ -20,7 +20,12 @@ from .checkpoint import (
     to_serving_state_dict,
 )
 from .config import MoEConfig, is_moe_config, register_moe_preset, resolve_moe_config
-from .experts import RoutedExperts, register_experts_backend
+from .experts import (
+    RoutedExperts,
+    SharedExpert,
+    register_experts_backend,
+    register_shared_expert,
+)
 from .layer import (
     MoELayer,
     apply_pending_balance_updates,
@@ -30,7 +35,6 @@ from .layer import (
     iter_moe_layers,
 )
 from .router import Router, register_router, register_score_function
-from .shared import SharedExpert, register_shared_expert
 
 # Registers every family's preset and layout.
 from . import families  # isort: skip

@@ -11,9 +11,8 @@ from torch import nn
 from .balance import build_balance_controller
 from .base import MetricValue, TrainingState
 from .config import MoEConfig, requests_routed_experts, resolve_moe_config
-from .experts import build_routed_experts
+from .experts import build_routed_experts, build_shared_expert
 from .router import build_router
-from .shared import build_shared_expert
 
 
 class MoELayer(nn.Module):

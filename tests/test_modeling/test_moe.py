@@ -46,7 +46,9 @@ from specforge.modeling.draft.moe.checkpoint import LAYOUTS, layout_for
 from specforge.modeling.draft.moe.config import MOE_PRESETS
 from specforge.modeling.draft.moe.experts import (
     EXPERTS_BACKENDS,
+    SHARED_EXPERTS,
     GroupedExperts,
+    SwiGLUSharedExpert,
     swiglu,
 )
 from specforge.modeling.draft.moe.router import (
@@ -54,7 +56,6 @@ from specforge.modeling.draft.moe.router import (
     TopKRouter,
     fold_router_centering,
 )
-from specforge.modeling.draft.moe.shared import SHARED_EXPERTS, SwiGLUSharedExpert
 from specforge.training.controller import TrainerCore
 from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 

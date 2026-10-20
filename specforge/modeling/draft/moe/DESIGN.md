@@ -45,8 +45,8 @@ config.py      MoEConfig + preset registry; resolves a draft JSON
 router.py      score functions, Router ABC, TopKRouter (aux loss, router bias
                and centering), the centering export fold
 balance.py     load_balancing_loss; BalanceController (selection policy): none
-experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu
-shared.py      SharedExpert ABC, SwiGLUSharedExpert
+experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu;
+               SharedExpert ABC, SwiGLUSharedExpert
 layer.py       MoELayer, build_ffn, and the model-level hooks
 checkpoint.py  checkpoint layouts, the export fold, serving config
 families/      one module per target family: preset and layout
