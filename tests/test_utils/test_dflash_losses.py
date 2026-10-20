@@ -390,6 +390,49 @@ class TestDFlashLosses(unittest.TestCase):
         want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=gamma)
         torch.testing.assert_close(got, want, rtol=0, atol=1e-8)
 
+    def test_gamma_warmup_grows_effective_gamma_per_epoch(self):
+        base, step = 4.0, 1.0
+        model = _make_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            loss_type="dflash",
+            loss_decay_gamma=base,
+            loss_decay_gamma_warmup_step=step,
+        )
+        for epoch in (0, 1, 3):
+            loss, _accuracy, _metrics = model(
+                input_ids=self.input_ids,
+                hidden_states=self.hidden_states,
+                loss_mask=self.loss_mask,
+                epoch=epoch,
+            )
+            want_gamma = base + step * epoch
+            want = _naive_dflash_loss(
+                self.neg_log_q, self.binary_mask, gamma=want_gamma
+            )
+            torch.testing.assert_close(loss, want, rtol=0, atol=1e-8)
+            self.assertEqual(model._effective_loss_decay_gamma(), want_gamma)
+
+    def test_gamma_warmup_off_keeps_gamma_static_across_epochs(self):
+        model = _make_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            loss_type="dflash",
+            loss_decay_gamma=5.0,
+        )
+        want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=5.0)
+        for epoch in (0, 4):
+            loss, _accuracy, _metrics = model(
+                input_ids=self.input_ids,
+                hidden_states=self.hidden_states,
+                loss_mask=self.loss_mask,
+                epoch=epoch,
+            )
+            torch.testing.assert_close(loss, want, rtol=0, atol=1e-8)
+            self.assertEqual(model._effective_loss_decay_gamma(), 5.0)
+
     def test_dflash_tv_objective_matches_hard_target_total_variation(self):
         got = self._forward_loss(lk_loss_type="tv")
         want = ((1.0 - self.q) * self.binary_mask).sum() / self.binary_mask.sum()

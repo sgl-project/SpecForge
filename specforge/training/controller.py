@@ -967,6 +967,7 @@ class TrainerController:
                     ctx=StepContext(
                         global_step=self.global_step,
                         total_steps=self.total_steps,
+                        epoch=self.epoch,
                         collect_detailed_metrics=(
                             self.logger is not None
                             and (self.global_step + 1) % max(1, self.log_interval) == 0
@@ -1157,7 +1158,11 @@ class TrainerController:
         module.eval()
         # Use the train path's live context so schedule-dependent losses (for
         # example Domino's lambda_base) are not evaluated as if at step zero.
-        ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
+        ctx = StepContext(
+            global_step=self.global_step,
+            total_steps=self.total_steps,
+            epoch=self.epoch,
+        )
         try:
             return Evaluator().run(
                 lambda batch: self.core.strategy.forward_loss(batch, ctx), data

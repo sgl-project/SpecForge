@@ -53,6 +53,7 @@ class StepContext:
 
     global_step: int = 0
     total_steps: Optional[int] = None
+    epoch: int = 0
     collect_detailed_metrics: bool = True
 
 
@@ -526,6 +527,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             "loss_mask": t["loss_mask"].to(device, non_blocking=True),
             "max_valid_anchors": max_valid_anchors,
             "selector_loss_alpha": selector_loss_alpha,
+            "epoch": ctx.epoch if ctx is not None else 0,
         }
         if ctx is not None:
             model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
@@ -602,6 +604,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             collect_detailed_metrics=(
                 ctx.collect_detailed_metrics if ctx is not None else True
             ),
+            epoch=ctx.epoch if ctx is not None else 0,
         )
         metrics = {
             "accuracy": accuracy.detach(),
@@ -739,6 +742,7 @@ class DominoTrainStrategy(DraftTrainStrategy):
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
             lambda_base=lambda_base,
             max_valid_anchors=max_valid_anchors,
+            epoch=ctx.epoch if ctx is not None else 0,
             collect_detailed_metrics=(
                 ctx.collect_detailed_metrics if ctx is not None else True
             ),

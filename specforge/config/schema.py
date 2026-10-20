@@ -990,6 +990,8 @@ class TrainingConfig(StrictConfigModel):
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None
+    #: Added to ``loss_decay_gamma`` on each epoch (0.0 keeps gamma fixed).
+    loss_decay_gamma_warmup_step: float = Field(default=0.0, ge=0.0)
     #: Anchor blocks per objective slice (0 = materialize all objective logits).
     objective_chunk_blocks: int = Field(default=128, ge=0)
     loss_type: Literal[
