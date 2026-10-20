@@ -14,7 +14,12 @@ class _CharTokenizer:
     unk_token_id = 0
 
     def apply_chat_template(
-        self, messages, tokenize=False, add_generation_prompt=False, tools=None, **kwargs
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=None,
+        **kwargs,
     ):
         del tokenize, add_generation_prompt, tools
         if "enable_thinking" in kwargs:
@@ -46,7 +51,9 @@ class _CharTokenizer:
                     for index, tool_call in enumerate(tool_calls):
                         name = tool_call["function"]["name"]
                         arguments = tool_call["function"]["arguments"]
-                        closer = "<|eot|>" if index == len(tool_calls) - 1 else "<|eom|>"
+                        closer = (
+                            "<|eot|>" if index == len(tool_calls) - 1 else "<|eom|>"
+                        )
                         parts.append(
                             f"<|start|>assistant to={name}<|message|>{arguments}{closer}"
                         )
