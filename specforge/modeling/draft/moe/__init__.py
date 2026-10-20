@@ -8,27 +8,15 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Sparse MoE FFN for draft models, configured by ``moe_preset``; see ``DESIGN.md``."""
 
-from .balance import (
-    BALANCE_CONTROLLERS,
-    BalanceController,
-    build_balance_controller,
-    register_balance_controller,
-)
+from .balance import BalanceController, register_balance_controller
 from .base import RoutingResult, TrainingState
-from .config import (
-    MOE_PRESETS,
-    MoEConfig,
-    is_moe_config,
-    register_moe_preset,
-    resolve_moe_config,
+from .checkpoint import (
+    from_checkpoint_state_dict,
+    register_layout,
+    to_checkpoint_state_dict,
 )
-from .experts import (
-    EXPERTS_BACKENDS,
-    RoutedExperts,
-    build_routed_experts,
-    register_experts_backend,
-)
-from .init import WarmStartPlan, plan_warm_start, select_target_experts
+from .config import MoEConfig, is_moe_config, register_moe_preset, resolve_moe_config
+from .experts import RoutedExperts, register_experts_backend
 from .layer import (
     MoELayer,
     apply_pending_balance_updates,
@@ -37,62 +25,36 @@ from .layer import (
     collect_moe_metrics,
     iter_moe_layers,
 )
-from .router import (
-    ROUTERS,
-    SCORE_FUNCTIONS,
-    Router,
-    build_router,
-    register_router,
-    register_score_function,
-)
-from .shared import (
-    SHARED_EXPERTS,
-    SharedExpert,
-    build_shared_expert,
-    register_shared_expert,
-)
-from .state_dict import (
-    from_checkpoint_state_dict,
-    register_state_dict_converter,
-    to_checkpoint_state_dict,
-)
+from .router import Router, register_router, register_score_function
+from .shared import SharedExpert, register_shared_expert
+
+# Registers every family's preset and layout.
+from . import families  # isort: skip
 
 __all__ = [
-    "BALANCE_CONTROLLERS",
     "BalanceController",
-    "EXPERTS_BACKENDS",
-    "MOE_PRESETS",
     "MoEConfig",
     "MoELayer",
-    "ROUTERS",
     "RoutedExperts",
     "Router",
     "RoutingResult",
-    "SCORE_FUNCTIONS",
-    "SHARED_EXPERTS",
     "SharedExpert",
     "TrainingState",
-    "WarmStartPlan",
     "apply_pending_balance_updates",
-    "build_balance_controller",
     "build_ffn",
-    "build_routed_experts",
-    "build_router",
-    "build_shared_expert",
     "collect_moe_aux_loss",
     "collect_moe_metrics",
+    "families",
     "from_checkpoint_state_dict",
     "is_moe_config",
     "iter_moe_layers",
-    "plan_warm_start",
     "register_balance_controller",
     "register_experts_backend",
+    "register_layout",
     "register_moe_preset",
     "register_router",
     "register_score_function",
     "register_shared_expert",
-    "register_state_dict_converter",
     "resolve_moe_config",
-    "select_target_experts",
     "to_checkpoint_state_dict",
 ]

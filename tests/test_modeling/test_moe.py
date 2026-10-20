@@ -1,6 +1,8 @@
 # coding=utf-8
-"""MoE FFN framework tests; the file registers its own preset."""
+"""MoE FFN framework tests; the file registers its own preset and layout."""
 
+import os
+import tempfile
 import unittest
 
 import torch
@@ -17,18 +19,17 @@ from specforge.modeling.draft.moe import (
     collect_moe_metrics,
     from_checkpoint_state_dict,
     iter_moe_layers,
-    plan_warm_start,
     register_balance_controller,
     register_experts_backend,
+    register_layout,
     register_moe_preset,
     register_router,
     register_shared_expert,
-    register_state_dict_converter,
     resolve_moe_config,
-    select_target_experts,
     to_checkpoint_state_dict,
 )
 from specforge.modeling.draft.moe.balance import BALANCE_CONTROLLERS, BalanceController
+from specforge.modeling.draft.moe.checkpoint import LAYOUTS, layout_for
 from specforge.modeling.draft.moe.config import MOE_PRESETS
 from specforge.modeling.draft.moe.experts import (
     EXPERTS_BACKENDS,
@@ -37,18 +38,47 @@ from specforge.modeling.draft.moe.experts import (
 )
 from specforge.modeling.draft.moe.router import ROUTERS, TopKRouter
 from specforge.modeling.draft.moe.shared import SHARED_EXPERTS, SwiGLUSharedExpert
-from specforge.modeling.draft.moe.state_dict import unregister_state_dict_converter
 
 H = 16
 PRESET = "_test_family"
+LAYOUT = "_test_per_expert"
+
+
+# -- a per-expert test layout, as a family would register it -------------------
+
+
+def _to_per_expert(layer):
+    out = {}
+    for key, value in layer.items():
+        if key.startswith("experts.w") and value.dim() == 3:
+            for i in range(value.shape[0]):
+                out[f"experts.{i}.{key[len('experts.'):]}.weight"] = value[i]
+        else:
+            out[key] = value
+    return out
+
+
+def _from_per_expert(layer):
+    groups, out = {}, {}
+    for key, value in layer.items():
+        parts = key.split(".")
+        if key.startswith("experts.") and parts[1].isdigit():
+            groups.setdefault(parts[2], {})[int(parts[1])] = value
+        else:
+            out[key] = value
+    for name, members in groups.items():
+        out[f"experts.{name}"] = torch.stack([members[i] for i in sorted(members)])
+    return out
 
 
 def setUpModule():
-    register_moe_preset(PRESET, routed_scaling_factor=1.5)
+    register_layout(LAYOUT, to_file=_to_per_expert, from_file=_from_per_expert)
+    register_moe_preset(PRESET, routed_scaling_factor=1.5, layout=LAYOUT)
 
 
 def tearDownModule():
     MOE_PRESETS.unregister(PRESET)
+    LAYOUTS.unregister(LAYOUT)
 
 
 def _moe_json(**overrides):
@@ -83,6 +113,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(resolve_moe_config(_moe_json()).routed_scaling_factor, 1.5)
         cfg = resolve_moe_config(_moe_json(routed_scaling_factor=2.0))
         self.assertEqual(cfg.routed_scaling_factor, 2.0)
+        self.assertEqual(cfg.layout, LAYOUT)
         self.assertEqual(cfg.shared_expert_intermediate_size, 8)
 
     def test_training_keys_live_under_dflash_config(self):
@@ -119,6 +150,13 @@ class TestConfig(unittest.TestCase):
         del payload["moe_intermediate_size"]
         with self.assertRaisesRegex(ValueError, "moe_intermediate_size"):
             resolve_moe_config(payload)
+
+    def test_layout_override_and_unknown_layout(self):
+        self.assertEqual(
+            resolve_moe_config(_moe_json(moe_layout="native")).layout, "native"
+        )
+        with self.assertRaisesRegex(KeyError, "checkpoint layout"):
+            resolve_moe_config(_moe_json(moe_layout="_nope"))
 
     def test_presets_may_not_set_per_run_or_training_fields(self):
         with self.assertRaisesRegex(ValueError, "per-run/training"):
@@ -333,63 +371,45 @@ class TestHooks(unittest.TestCase):
         self.assertEqual([layer.balance.applied for layer in tree], [1, 1])
 
 
-# -- checkpoint boundary, warm start --------------------------------------------------
+# -- checkpoint boundary --------------------------------------------------------------
 
 
-class TestStateDictBoundary(unittest.TestCase):
-    def test_dense_state_passes_through_unchanged(self):
-        state = {"a": torch.zeros(1), "layers.0.mlp.gate_proj.weight": torch.ones(1)}
-        for convert in (to_checkpoint_state_dict, from_checkpoint_state_dict):
-            out = convert(dict(state))
-            self.assertEqual(set(out), set(state))
-            for key in state:
-                self.assertIs(out[key], state[key])
-
-    def test_registered_converters_apply_in_both_directions(self):
-        def to_ckpt(state):
-            return {k.replace("native.", "official."): v for k, v in state.items()}
-
-        def from_ckpt(state):
-            return {k.replace("official.", "native."): v for k, v in state.items()}
-
-        register_state_dict_converter(
-            "_test", to_checkpoint=to_ckpt, from_checkpoint=from_ckpt
+class TestCheckpointBoundary(unittest.TestCase):
+    def _tree(self):
+        # "layers.1." is a prefix of "layers.11.": the split must keep them apart.
+        tree = nn.ModuleDict(
+            {"1": _layer(1), "11": _layer(11), "dense": nn.Linear(H, H)}
         )
-        try:
-            with self.assertRaisesRegex(ValueError, "already registered"):
-                register_state_dict_converter(
-                    "_test", to_checkpoint=to_ckpt, from_checkpoint=from_ckpt
-                )
-            official = to_checkpoint_state_dict({"native.w": 1, "other": 2})
-            self.assertEqual(official, {"official.w": 1, "other": 2})
-            self.assertEqual(
-                from_checkpoint_state_dict(official), {"native.w": 1, "other": 2}
-            )
-        finally:
-            unregister_state_dict_converter("_test")
-        self.assertEqual(to_checkpoint_state_dict({"native.w": 1}), {"native.w": 1})
+        return nn.ModuleDict({"layers": tree})
+
+    def test_round_trip_per_layer_with_prefix_disambiguation(self):
+        model = self._tree()
+        state = model.state_dict()
+        files = to_checkpoint_state_dict(state, model)
+        self.assertIn("layers.11.experts.7.w2.weight", files)
+        self.assertIn("layers.dense.weight", files)
+        self.assertNotIn("layers.1.experts.w1", files)
+        back = from_checkpoint_state_dict(files, model)
+        self.assertEqual(sorted(back), sorted(state))
+        for key in state:
+            self.assertTrue(torch.equal(back[key], state[key]), key)
+
+    def test_owner_may_be_the_model_or_its_config(self):
+        model = self._tree()
+        self.assertIs(layout_for(model), LAYOUTS.get(LAYOUT))
+        self.assertIs(layout_for(_moe_json()), LAYOUTS.get(LAYOUT))
+        self.assertIsNone(layout_for(nn.Linear(H, H)))
+        self.assertIsNone(layout_for({"hidden_size": H}))
+        state = {"a": torch.ones(1)}
+        self.assertEqual(to_checkpoint_state_dict(state, nn.Linear(H, H)), state)
+
+    def test_native_layout_is_the_identity(self):
+        layer = _layer(moe_layout="native")
+        state = layer.state_dict()
+        self.assertEqual(sorted(to_checkpoint_state_dict(state, layer)), sorted(state))
 
 
-class TestWarmStartPlan(unittest.TestCase):
-    def test_selection_strategies(self):
-        self.assertEqual(select_target_experts(256, 4), (0, 64, 128, 192))
-        self.assertEqual(select_target_experts(8, 3, "strided"), (0, 2, 5))
-        self.assertEqual(select_target_experts(8, 3, "first"), (0, 1, 2))
-        self.assertEqual(len(set(select_target_experts(256, 64))), 64)
-        with self.assertRaises(ValueError):
-            select_target_experts(4, 8)
-        with self.assertRaises(ValueError):
-            select_target_experts(8, 2, "random")
-
-    def test_plan_follows_the_moe_config(self):
-        cfg = resolve_moe_config(_moe_json(n_shared_experts=0))
-        plan = plan_warm_start(cfg, n_target_experts=64)
-        self.assertEqual(plan.n_draft_experts, 8)
-        self.assertFalse(plan.copy_shared_expert)
-        self.assertTrue(plan.copy_gate_rows)
-
-
-# -- draft model, loading, export # -- draft model, loading, export ---------------------------------------------------
+# -- trainer seam ---------------------------------------------------------------------
 
 
 class _GradBalance(BalanceController):
@@ -403,6 +423,9 @@ class _GradBalance(BalanceController):
 
     def metrics(self):
         return {"grad_balance": 1.0}
+
+
+# -- draft model, loading, export ---------------------------------------------------
 
 
 def _dflash_config(moe=True, **overrides):
@@ -473,6 +496,26 @@ class TestDraftModelSeams(unittest.TestCase):
             target_hidden=torch.randn(1, 4, model.fc.in_features),
         )
         self.assertEqual([layer.balance.applied for layer in layers], [2, 2])
+
+    def test_pretrained_round_trip_through_the_layout(self):
+        from specforge.modeling.auto import AutoDraftModel
+
+        torch.manual_seed(0)
+        config = _dflash_config()
+        model = DFlashDraftModel(config)
+        with tempfile.TemporaryDirectory() as tmp:
+            model.save_pretrained(
+                tmp, state_dict=to_checkpoint_state_dict(model.state_dict(), model)
+            )
+            from safetensors import safe_open
+
+            files = [f for f in os.listdir(tmp) if f.endswith(".safetensors")]
+            with safe_open(os.path.join(tmp, files[0]), "pt") as handle:
+                keys = set(handle.keys())
+            self.assertIn("layers.0.mlp.experts.3.w1.weight", keys)
+            reloaded = AutoDraftModel.from_pretrained(tmp, config=config)
+        for key, value in model.state_dict().items():
+            self.assertTrue(torch.equal(reloaded.state_dict()[key], value), key)
 
 
 if __name__ == "__main__":

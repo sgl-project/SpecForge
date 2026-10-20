@@ -28,6 +28,7 @@ ARCHITECTURE_KEYS: Dict[str, str] = {
         "shared_expert",
     )
 }
+ARCHITECTURE_KEYS["moe_layout"] = "layout"
 
 #: ``dflash_config`` key (training-only) -> ``MoEConfig`` field.
 TRAINING_KEYS: Dict[str, str] = {
@@ -69,6 +70,8 @@ class MoEConfig:
     #: Registered implementations of the routed and the shared experts.
     experts_backend: str = "grouped"
     shared_expert: str = "swiglu"
+    #: Checkpoint file naming (a registered :mod:`.checkpoint` layout).
+    layout: str = "native"
     # Training-only fields, never part of the checkpoint's architecture.
     aux_loss_coeff: float = 0.0
     dispatch: str = "sorted_loop"
@@ -168,4 +171,8 @@ def resolve_moe_config(config: Any) -> Optional[MoEConfig]:
     for json_key, field_name in TRAINING_KEYS.items():
         if json_key in dflash_config:
             values[field_name] = dflash_config[json_key]
-    return MoEConfig(preset=name, **values)
+    cfg = MoEConfig(preset=name, **values)
+    from .checkpoint import LAYOUTS  # local: checkpoint imports this module
+
+    LAYOUTS.get(cfg.layout)  # unknown layouts fail at model build, not at save
+    return cfg

@@ -442,7 +442,13 @@ def warm_start_draft_model(
     runtime_state = _runtime_state_file(source)
     if runtime_state is not None:
         checkpoint_format: Literal["specforge", "pretrained"] = "specforge"
-        state = _load_specforge_draft_state(runtime_state, expected_strategy=strategy)
+        from specforge.modeling.draft.moe import from_checkpoint_state_dict
+
+        # Trainer checkpoints use the draft's checkpoint layout (MoE file naming).
+        state = from_checkpoint_state_dict(
+            _load_specforge_draft_state(runtime_state, expected_strategy=strategy),
+            model,
+        )
     else:
         checkpoint_format = "pretrained"
         state = _load_pretrained_draft_state(
@@ -455,10 +461,7 @@ def warm_start_draft_model(
     if not state:
         raise ValueError(f"warm-start checkpoint {source!r} contains no draft weights")
     try:
-        # Files use the official naming; modules may use a native MoE layout.
-        from specforge.modeling.draft.moe import from_checkpoint_state_dict
-
-        result = model.load_state_dict(from_checkpoint_state_dict(state), strict=False)
+        result = model.load_state_dict(state, strict=False)
     except RuntimeError as exc:
         raise ValueError(
             f"warm-start checkpoint {source!r} has incompatible draft tensor "
