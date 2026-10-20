@@ -18,9 +18,8 @@ from typing import Type
 import torch
 from torch import nn
 
-from ._registry import Registry
+from .base import Registry, RoutingResult
 from .config import MoEConfig
-from .router import RoutingResult
 
 
 class RoutedExperts(nn.Module, abc.ABC):

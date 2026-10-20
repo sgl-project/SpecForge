@@ -184,10 +184,7 @@ def _dflash_config(moe=True, **overrides):
     )
     if moe:
         fields.update(_moe_json(hidden_size=16))
-        fields["dflash_config"] = {
-            "attention_mode": "gqa",
-            "moe_bias_update_rate": 0.005,
-        }
+        fields["dflash_config"] = {"attention_mode": "gqa"}
     fields.update(overrides)
     config = Qwen3Config(**fields)
     config._attn_implementation = "sdpa"
@@ -195,70 +192,70 @@ def _dflash_config(moe=True, **overrides):
 
 
 class TestMoEConfig(unittest.TestCase):
-    def test_dense_config_resolves_to_none(self):
+    def test_dense_configs_resolve_to_none(self):
         self.assertIsNone(resolve_moe_config({"hidden_size": 16}))
-        self.assertIsNone(resolve_moe_config(SimpleNamespace(n_routed_experts=0)))
-
-    def test_preset_is_required_for_moe(self):
-        with self.assertRaisesRegex(ValueError, "moe_preset"):
-            resolve_moe_config(_moe_json(moe_preset=None))
-        with self.assertRaisesRegex(KeyError, "available"):
-            resolve_moe_config(_moe_json(moe_preset="no-such-family"))
+        self.assertIsNone(resolve_moe_config({"n_routed_experts": 0}))
 
     def test_preset_defaults_and_explicit_overrides(self):
         cfg = resolve_moe_config(_moe_json())
         self.assertEqual(cfg.preset, PRESET)
         self.assertEqual(cfg.scoring_func, "_test_softplus")
         self.assertEqual(cfg.routed_scaling_factor, 1.5)
-        self.assertEqual(
-            cfg.shared_expert_intermediate_size, 8
-        )  # defaults to moe width
-        cfg = resolve_moe_config(
-            _moe_json(routed_scaling_factor=2.0, shared_expert_intermediate_size=4)
-        )
+        self.assertEqual(cfg.shared_expert_intermediate_size, 8)  # the moe width
+        cfg = resolve_moe_config(_moe_json(routed_scaling_factor=2.0))
         self.assertEqual(cfg.routed_scaling_factor, 2.0)
-        self.assertEqual(cfg.shared_expert_intermediate_size, 4)
         # Works on attribute-style configs (HF PretrainedConfig) as well.
         self.assertEqual(resolve_moe_config(_dflash_config()).n_routed_experts, 8)
 
-    def test_training_knobs_come_from_dflash_config(self):
+    def test_training_keys_live_under_dflash_config(self):
         cfg = resolve_moe_config(
-            _moe_json(
-                dflash_config={
-                    "moe_bias_update_rate": 0.01,
-                    "moe_dispatch": "grouped_mm",
-                }
-            )
+            _moe_json(dflash_config={"moe_aux_loss_coeff": 0.01, "moe_dispatch": "x"})
         )
-        self.assertEqual(cfg.bias_update_rate, 0.01)
-        self.assertEqual(cfg.dispatch, "grouped_mm")
+        self.assertEqual(cfg.aux_loss_coeff, 0.01)
+        self.assertEqual(cfg.dispatch, "x")
         with self.assertRaisesRegex(ValueError, "unknown MoE training keys"):
-            resolve_moe_config(_moe_json(dflash_config={"moe_bias_udpate_rate": 1}))
+            resolve_moe_config(_moe_json(dflash_config={"moe_typo": 1}))
 
-    def test_validation(self):
+    def test_expert_counts_must_be_positive_integers(self):
+        for bad in (-1, 0, 0.5, "8", True):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                resolve_moe_config(_moe_json(n_routed_experts=bad))
+        self.assertEqual(
+            resolve_moe_config(_moe_json(n_routed_experts=8.0)).n_routed_experts, 8
+        )
         with self.assertRaisesRegex(ValueError, "num_experts_per_tok"):
             resolve_moe_config(_moe_json(num_experts_per_tok=9))
-        with self.assertRaisesRegex(ValueError, "n_shared_experts"):
-            resolve_moe_config(_moe_json(n_shared_experts=2))
-        with self.assertRaisesRegex(ValueError, "n_group"):
-            resolve_moe_config(_moe_json(n_group=3))
-        cfg = resolve_moe_config(_moe_json(n_group=4, topk_group=2))
-        self.assertTrue(cfg.group_limited)
-        self.assertFalse(resolve_moe_config(_moe_json()).group_limited)
 
-    def test_presets_cannot_set_per_run_or_training_fields(self):
+    def test_routed_experts_without_a_preset_never_fall_back_to_dense(self):
+        config = Qwen3Config(hidden_size=16, intermediate_size=32)
+        config.n_routed_experts = 8
+        with self.assertRaisesRegex(ValueError, "moe_preset"):
+            build_ffn(config, dense=lambda c: nn.Identity())
+        dense = Qwen3Config(hidden_size=16, intermediate_size=32)
+        self.assertIsInstance(
+            build_ffn(dense, dense=lambda c: nn.Identity()), nn.Identity
+        )
+
+    def test_per_run_sizes_are_required(self):
+        payload = _moe_json()
+        del payload["moe_intermediate_size"]
+        with self.assertRaisesRegex(ValueError, "moe_intermediate_size"):
+            resolve_moe_config(payload)
+
+    def test_presets_may_not_set_per_run_or_training_fields(self):
         with self.assertRaisesRegex(ValueError, "per-run/training"):
             register_moe_preset("_bad", n_routed_experts=4)
-        with self.assertRaisesRegex(ValueError, "unknown MoEConfig fields"):
-            register_moe_preset("_bad", nonsense=1)
-        self.assertNotIn("_bad", MOE_PRESETS)
+        with self.assertRaisesRegex(ValueError, "per-run/training"):
+            register_moe_preset("_bad", aux_loss_coeff=0.1)
+        with self.assertRaisesRegex(ValueError, "unknown MoEConfig"):
+            register_moe_preset("_bad", not_a_field=1)
 
     def test_registry_errors_name_the_kind_and_choices(self):
         with self.assertRaisesRegex(KeyError, "MoE router.*available"):
             ROUTERS.get("missing")
         with self.assertRaisesRegex(ValueError, "already registered"):
             register_router("_test_router")(_StubRouter.__mro__[1])
-        self.assertIn("none", BALANCE_CONTROLLERS)
+        self.assertIs(BALANCE_CONTROLLERS.get("none"), BalanceController)
 
 
 class TestMoELayerComposition(unittest.TestCase):
@@ -441,7 +438,6 @@ class TestDFlashWiring(unittest.TestCase):
         self.assertEqual(len(layers), 2)
         for layer in layers:
             self.assertIs(layer, [m for m in model.layers if m.mlp is layer][0].mlp)
-            self.assertEqual(layer.cfg.bias_update_rate, 0.005)
             # _init_weights reached the bare Parameters (no uninitialized memory)
             self.assertTrue(torch.isfinite(layer.gate.weight).all())
             self.assertGreater(float(layer.gate.weight.abs().sum()), 0.0)

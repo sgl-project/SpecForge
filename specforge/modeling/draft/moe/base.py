@@ -1,0 +1,78 @@
+# coding=utf-8
+"""Shared building blocks; imports no other module of the package."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Dict, Generic, Optional, TypeVar, Union
+
+import torch
+
+T = TypeVar("T")
+
+#: A scalar diagnostic: a 0-d tensor (no host sync) or a Python float.
+MetricValue = Union[torch.Tensor, float]
+
+
+class Registry(Generic[T]):
+    """Name -> implementation map; ``register(name)`` doubles as a decorator."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self._items: Dict[str, T] = {}
+
+    def register(self, name: str, item: Optional[T] = None) -> Callable[[T], T] | T:
+        def _register(obj: T) -> T:
+            if name in self._items and self._items[name] is not obj:
+                raise ValueError(f"{self.kind} {name!r} is already registered")
+            self._items[name] = obj
+            return obj
+
+        return _register if item is None else _register(item)
+
+    def unregister(self, name: str) -> None:
+        self._items.pop(name, None)
+
+    def get(self, name: str) -> T:
+        try:
+            return self._items[name]
+        except KeyError:
+            available = ", ".join(sorted(self._items)) or "<none registered>"
+            raise KeyError(
+                f"unknown {self.kind} {name!r}; available: {available}"
+            ) from None
+
+
+@dataclass
+class RoutingResult:
+    """Routing decision for a flat batch of ``T`` tokens; routing math is fp32."""
+
+    weights: torch.Tensor  # [T, k] fp32 combine weights, normalized and scaled
+    indices: torch.Tensor  # [T, k] long, the chosen experts
+    counts: torch.Tensor  # [E] long per-expert assignment counts, on device
+    scores: Optional[torch.Tensor] = None  # [T, E] fp32 pre-selection scores
+
+    @property
+    def topk(self) -> int:
+        return int(self.indices.shape[-1])
+
+
+class TrainingState:
+    """Training hooks of an MoE component, no-op by default; timing: DESIGN.md."""
+
+    def observe(self, routing: RoutingResult) -> None:
+        """Stash (never accumulate) this training forward's routing."""
+
+    def apply_pending_update(self) -> None:
+        """Consume the stash; the model calls this outside checkpoint regions."""
+
+    def aux_loss(self) -> Optional[torch.Tensor]:
+        """Already-scaled auxiliary loss of the last forward, or ``None``."""
+        return None
+
+    def metrics(self) -> Dict[str, MetricValue]:
+        """Rank-local scalar diagnostics of the last training forward."""
+        return {}
+
+    def reset_parameters(self, std: float) -> None:
+        """Initialize bare Parameters the HF ``_init_weights`` pass cannot see."""

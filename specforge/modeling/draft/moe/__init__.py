@@ -6,28 +6,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Sparse MoE FFN for DFlash-family drafts.
-
-One configurable layer, not one block per target family. A draft JSON selects a
-``moe_preset`` (the routing recipe of a target family) and may override any
-architecture knob for ablations; the expensive parts (dispatch, checkpoint
-naming, FSDP layout, deferred balance updates) are shared. See ``DESIGN.md``.
-
-Modules:
-
-- :mod:`.config`      ``MoEConfig`` + the preset registry; resolves a draft JSON
-- :mod:`.router`      ``Router`` contract (scores -> top-k) + score functions
-- :mod:`.balance`     ``BalanceController`` contract: balancing as a policy
-- :mod:`.experts`     ``RoutedExperts`` contract: expert weights + dispatch
-- :mod:`.shared`      ``SharedExpert`` contract
-- :mod:`.layer`       ``MoELayer`` composition; ``build_ffn`` is the dense/MoE switch
-- :mod:`.hooks`       model-level plumbing: balance updates, aux loss, metrics
-- :mod:`.state_dict`  module layout <-> official checkpoint naming boundary
-- :mod:`.init`        warm-start plans from a target model's experts
-
-Implementations register into the registries from their own modules; this
-package defines contracts and holds no routing math itself.
-"""
+"""Sparse MoE FFN for draft models, configured by ``moe_preset``; see ``DESIGN.md``."""
 
 from .balance import (
     BALANCE_CONTROLLERS,
@@ -35,10 +14,10 @@ from .balance import (
     build_balance_controller,
     register_balance_controller,
 )
+from .base import RoutingResult, TrainingState
 from .config import (
     MOE_PRESETS,
     MoEConfig,
-    available_moe_presets,
     is_moe_config,
     register_moe_preset,
     resolve_moe_config,
@@ -61,7 +40,6 @@ from .router import (
     ROUTERS,
     SCORE_FUNCTIONS,
     Router,
-    RoutingResult,
     build_router,
     get_score_function,
     register_router,
@@ -93,9 +71,9 @@ __all__ = [
     "SCORE_FUNCTIONS",
     "SHARED_EXPERTS",
     "SharedExpert",
+    "TrainingState",
     "WarmStartPlan",
     "apply_pending_balance_updates",
-    "available_moe_presets",
     "build_balance_controller",
     "build_ffn",
     "build_routed_experts",

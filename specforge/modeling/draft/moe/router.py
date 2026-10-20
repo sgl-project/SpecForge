@@ -11,38 +11,14 @@ sqrtsoftplus families.
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass
-from typing import Callable, Optional, Type
+from typing import Callable, Type
 
 import torch
 from torch import nn
 
-from ._registry import Registry
 from .balance import BalanceController
+from .base import Registry, RoutingResult
 from .config import MoEConfig
-
-
-@dataclass
-class RoutingResult:
-    """Routing decision for a flat batch of ``T`` tokens.
-
-    ``weights`` are the final combine weights (normalized and scaled as the
-    recipe dictates) in fp32; ``indices`` the chosen experts; ``counts`` the
-    per-expert token counts on device (no host sync), which dispatch and
-    balancing both consume. ``scores`` are the full pre-selection affinities
-    (differentiable, fp32) for balance policies that need a gradient signal,
-    e.g. an auxiliary balance loss; routers may leave it ``None``.
-    """
-
-    weights: torch.Tensor  # [T, k] fp32
-    indices: torch.Tensor  # [T, k] long
-    counts: torch.Tensor  # [E] long
-    scores: Optional[torch.Tensor] = None  # [T, E] fp32, differentiable
-
-    @property
-    def topk(self) -> int:
-        return int(self.indices.shape[-1])
-
 
 #: name -> f(logits [T, E] fp32) -> scores [T, E] fp32
 SCORE_FUNCTIONS: Registry[Callable[[torch.Tensor], torch.Tensor]] = Registry(

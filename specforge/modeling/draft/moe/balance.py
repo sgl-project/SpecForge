@@ -20,18 +20,13 @@ Two timing rules every implementation must respect:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Optional, Type, Union
+from typing import Dict, Optional, Type
 
 import torch
 from torch import nn
 
-from ._registry import Registry
+from .base import MetricValue, Registry, RoutingResult
 from .config import MoEConfig
-
-if TYPE_CHECKING:  # pragma: no cover - import cycle with router.py
-    from .router import RoutingResult
-
-MetricValue = Union[torch.Tensor, float]
 
 
 class BalanceController(nn.Module):
@@ -46,7 +41,7 @@ class BalanceController(nn.Module):
         """Scores used to pick experts; combine weights still use the raw ones."""
         return scores
 
-    def observe(self, routing: "RoutingResult") -> None:
+    def observe(self, routing: RoutingResult) -> None:
         """Stash this forward's routing outcome (training only).
 
         ``routing.counts`` feeds load statistics; ``routing.scores`` (when the
