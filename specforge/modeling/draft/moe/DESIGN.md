@@ -1,36 +1,38 @@
 # MoE FFN Design (`specforge.modeling.draft.moe`)
 
-Design note for the sparse-MoE FFN that any DFlash-family draft (DFlash,
-DFlash2, DSpark) can opt into. The training plane's picture is in
+Design note for the sparse-MoE FFN that a draft model can opt into. The
+training plane's picture is in
 [`../../../training/DESIGN.md`](../../../training/DESIGN.md).
 
 ## Responsibility
 
-Owns the FFN of a decoder layer when the draft JSON sets
-`n_routed_experts > 0`, and nothing else: attention, heads, losses and the
-trainer loop are unchanged. The package is **one configurable layer**, not one
-block per target family. This is the Megatron-Core split (one `MoELayer`,
-router/balancing/experts/dispatcher/shared-expert as orthogonal components
-picked by config), chosen over the transformers pattern of a copied
-`XxxSparseMoeBlock` per model because the family differences are a handful of
-small functions while the expensive parts are shared:
+Owns the FFN of a decoder layer when the draft JSON names a `moe_preset`, and
+nothing else: attention, heads, losses and the trainer loop are unchanged.
+DFlash-family drafters (DFlash, DFlash2, DSpark, Domino) build it through
+`build_ffn`; they all inherit the Qwen3-based `DFlashDraftModel`, so the FFN
+is the only part a preset changes, and a new target family adds one module
+under `families/` and no model code.
 
-| differs per target family        | shared by every family                    |
-| -------------------------------- | ----------------------------------------- |
-| score function (softmax, sigmoid, sqrtsoftplus) | token dispatch (sorted segments, grouped GEMM) |
-| balancing policy (aux loss, aux-loss-free bias, none) | deferred balance-update timing vs activation checkpointing |
-| combine-weight renorm and scale  | FSDP-friendly stacked expert layout       |
-| shared-expert gate (none, sigmoid) | checkpoint naming boundary               |
-| SwiGLU clamp                     | load metrics, warm-start plans            |
+The package is **one configurable layer**, not one block per target family:
+one `MoELayer` whose router, balancing and experts are picked by config (the
+Megatron-Core split), chosen over the transformers pattern of a copied
+`XxxSparseMoeBlock` per model because the family differences are a handful
+of small functions while the expensive parts are shared:
 
-## Why match the target's MoE
+| differs per target family | shared by every family |
+| --- | --- |
+| score function | token dispatch (sorted segments, grouped GEMM) |
+| balancing policy | deferred update timing vs activation checkpointing |
+| combine-weight renorm and scale | FSDP-friendly stacked expert layout |
+| shared expert (none or one) | fp32 accumulation of routed and shared output |
+| checkpoint file naming | load metrics |
 
-The drafter's MoE should be the *target's* MoE, expressed as a preset:
+## Why a preset per target family
 
-- **Warm start.** Same expert shape means the draft experts can be seeded from
-  a subset of the target's, which a dense drafter cannot do.
-- **Serving.** The drafter runs inside SGLang's draft model; matching the
-  target's routing reuses its fused MoE kernels and weight naming.
+The drafter's MoE follows a target family's recipe, expressed as a preset:
+
+- **Serving.** The drafter runs inside SGLang's draft model; the family's
+  routing and weight naming let that family's MoE code path serve it.
 - **Latency.** At small batch, top-k of narrow experts reads about the same
   bytes as the dense MLP, so MoE buys parameters at roughly constant step
   cost. That is the hypothesis the dense-vs-MoE ablation tests.
@@ -38,64 +40,97 @@ The drafter's MoE should be the *target's* MoE, expressed as a preset:
 ## Layout
 
 ```
-config.py      MoEConfig + preset registry. Architecture keys use the target
-               checkpoints' native HF names at the draft JSON top level;
-               training-only knobs live under dflash_config as moe_*.
-router.py      Router contract (x -> RoutingResult) + score-function registry.
-balance.py     BalanceController contract; owns selection-bias buffers, stashes
-               counts in forward, applies updates from the model forward.
-experts.py     RoutedExperts contract (weights + dispatch), MoEConfig.dispatch knob.
-shared.py      SharedExpert contract, gate variant via MoEConfig.shared_expert_gate.
-layer.py       MoELayer = gate + experts + shared_experts; build_ffn() is the
-               dense/MoE switch used by the DFlash decoder layer.
-hooks.py       apply_pending_balance_updates / collect_moe_aux_loss /
-               collect_moe_metrics over any module tree.
-state_dict.py  to/from_checkpoint_state_dict: module layout <-> official names.
-init.py        WarmStartPlan: which target experts seed which draft experts.
+base.py        Registry, RoutingResult, TrainingState
+config.py      MoEConfig + preset registry; resolves a draft JSON
+router.py      score functions, Router ABC, TopKRouter
+balance.py     BalanceController: none
+experts.py     RoutedExperts ABC, GroupedExperts (stacked [E,out,in]), swiglu
+shared.py      SharedExpert ABC, SwiGLUSharedExpert
+layer.py       MoELayer, build_ffn, and the model-level hooks
+checkpoint.py  checkpoint layouts
+families/      one module per target family: preset and layout
 ```
 
-Implementations (a target-family preset, its score function, controller,
-experts backend, shared expert, converter) live in their own module and
-register into these registries at import time. This package holds contracts
-and composition only.
+Every module except `families/` is family-agnostic.
+
+## Rules
+
+1. **Core never imports families.** Only `__init__.py` imports `families`, at
+   the bottom, to trigger registration.
+2. **Every choice is explicit.** The preset gives a default for each
+   architecture field, including the checkpoint layout; the draft JSON may
+   override any of them (`moe_layout` for the layout). Nothing is guessed from
+   which keys a file happens to contain.
+3. **A new family only adds files.** Its module under `families/` registers a
+   preset and a layout; `families/__init__.py` gets one import line. A new
+   routing mechanism or expert implementation is a family-agnostic component:
+   a score function, router, balance controller, experts backend or shared
+   expert registered in its core module.
 
 ## Contracts that matter
 
-**Attribute names are the checkpoint contract.** `MoELayer` exposes `gate`,
-`experts`, `shared_experts` (the DeepSeek-family names SGLang loads). A
-component whose native parameter layout differs from the official file naming
-registers a `state_dict` converter pair; both directions are idempotent and
-no-ops on dense models.
+**Detection keys on the preset.** A draft is MoE iff it names `moe_preset`.
+Configs copied from an MoE target (an MTP draft, say) carry
+`n_routed_experts` without asking this package for anything, so the count
+alone does not switch a layer to MoE; but a DFlash-family layer that sees
+`n_routed_experts` without a preset refuses to build, and expert counts must
+be positive integers. Neither case falls back to a dense FFN silently.
+
+**One training-state loop.** Router, balance controller, routed experts and
+shared expert all implement `TrainingState` (`observe`,
+`apply_pending_update`, `aux_loss`, `metrics`, `reset_parameters`), with
+no-op defaults. `MoELayer` drives them in a fixed order
+(`gate, gate.balance, experts, shared_experts`). The balance controller stays
+a child of the router, so its buffers keep the `gate.balance.*` keys.
+
+**Updates are deferred.** `observe` runs inside the layer forward (training
+only) and may only stash, overwriting and never accumulating: an
+activation-checkpoint recompute re-runs the forward and must leave identical
+state behind, and a loss built there is consumed right after the same
+forward. `apply_pending_update` runs from the *model* forward before any
+routing, outside checkpoint regions, and may mutate selection state and run
+collectives. Mutating selection state inside a layer forward would make the
+recompute route differently and raise `CheckpointError`.
+
+**Accumulation order.** `RoutedExperts.forward` returns the weighted routed
+sum as a fresh fp32 tensor; `MoELayer` adds the shared expert into it and
+casts to the input dtype once. Casting the routed sum to bf16 before adding
+the shared expert differs by ~3e-3 relative, enough to flip top-k choices
+downstream; the fp32 add costs under 2% of the layer's fwd+bwd on H200.
+
+**Attribute names are the module-side contract.** `MoELayer` exposes `gate`
+(with its balance controller at `gate.balance`), `experts` and
+`shared_experts`; a family's layout maps them to its file naming.
 
 **Naming is converted at the boundary, not in `state_dict()`.** FSDP's
 full-state-dict hooks index the gathered dict by the module's own parameter
-FQNs, so a rename inside `state_dict()` breaks under `use_orig_params`. Every
-file read/write goes through `to_checkpoint_state_dict` /
-`from_checkpoint_state_dict`: `FSDPTrainingBackend` save/load, warm start,
-`materialize_draft`, and the HF and SGLang exporters.
+FQNs. Every file read/write calls `to_checkpoint_state_dict` /
+`from_checkpoint_state_dict` with the draft model (any module tree) or its
+config: `FSDPTrainingBackend` save/load, resume, warm start,
+`AutoDraftModel.from_pretrained`, `materialize_draft` and the HF exporter.
+Layouts act on one MoE layer at a time (the layer prefix is the text before
+its `experts` component) and only the layout the config names runs.
 
-**Balance updates are deferred.** `BalanceController.observe` only stashes
-(overwrite, never accumulate) so an activation-checkpoint recompute leaves
-identical state. `apply_pending_update` runs from the *model* forward before
-any routing, outside checkpoint regions, and may run collectives. Mutating
-selection state inside a layer forward would make the recompute route
-differently and raise `CheckpointError`.
-
-**Metrics ride the existing scalar channel.** `collect_moe_metrics` yields
-`moe/load_max_ratio`, `moe/load_min_ratio`, `moe/experts_unused_frac` plus
-controller metrics; the DFlash/DSpark strategies add them to `StepOutput.metrics`,
-and the trainer DP-averages and logs them like any other scalar.
-
-**Aux losses are collected, not yet consumed.** `collect_moe_aux_loss` sums
-scaled layer losses; wiring it into an objective is done with the first preset
-whose balancing policy emits one (aux-loss-free policies do not).
+**Model-level terms ride every strategy.** `DraftTrainStrategy.finalize_step_output`
+(called by `TrainerCore` after `forward_loss`) adds the layers' summed
+auxiliary loss to whichever term backpropagates (`loss`, or the `loss_terms`
+numerator scaled by the micro-batch denominator) and the layer-averaged
+`moe/*` metrics to `StepOutput.metrics`: `load_max_ratio`, `load_min_ratio`,
+`experts_unused_frac`, plus the balance controller's own. Strategies hold no
+MoE code; dense drafts log no `moe/*` keys; evaluation calls `forward_loss`
+alone, so eval losses exclude the auxiliary term.
+The trainer DP-averages the `moe/*` metrics and logs them like any other
+scalar.
 
 ## Extension points
 
-- New target family: `register_moe_preset("<family>", scoring_func=..., ...)`
-  plus any missing component registrations. The draft JSON then sets
-  `moe_preset` and the per-run sizes.
-- New dispatch: a `RoutedExperts` subclass under `register_experts_backend`,
-  or a new `MoEConfig.dispatch` value handled inside an existing backend.
-- Ablation knobs: any `ARCHITECTURE_KEYS` entry at the draft JSON top level
-  overrides its preset default; `dflash_config.moe_*` overrides training knobs.
+- New target family: a module under `families/` with `register_moe_preset`
+  (recipe + default layout) and `register_layout` (file naming).
+- New routing mechanism: `register_score_function`, `register_router` or
+  `register_balance_controller`.
+- New expert implementation: a `RoutedExperts` subclass under
+  `register_experts_backend` (or a new `MoEConfig.dispatch` value inside an
+  existing backend), or a `SharedExpert` subclass under
+  `register_shared_expert`.
+- Ablations: any architecture key at the draft JSON top level overrides its
+  preset default; `dflash_config.moe_*` sets training knobs.
