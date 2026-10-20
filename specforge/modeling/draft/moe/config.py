@@ -26,6 +26,7 @@ ARCHITECTURE_KEYS: Dict[str, str] = {
         "balance",
         "experts_backend",
         "shared_expert",
+        "shared_expert_gate",
     )
 }
 ARCHITECTURE_KEYS["moe_layout"] = "layout"
@@ -70,6 +71,8 @@ class MoEConfig:
     #: Registered implementations of the routed and the shared experts.
     experts_backend: str = "grouped"
     shared_expert: str = "swiglu"
+    #: The shared expert's gate: ``"none"`` or a per-token ``"sigmoid"``.
+    shared_expert_gate: str = "none"
     #: Checkpoint file naming (a registered :mod:`.checkpoint` layout).
     layout: str = "native"
     # Training-only fields, never part of the checkpoint's architecture.
@@ -101,6 +104,11 @@ class MoEConfig:
                 "shared_expert_intermediate_size", self.shared_expert_intermediate_size
             ),
         )
+        if self.shared_expert_gate not in ("none", "sigmoid"):
+            raise ValueError(
+                f"unknown shared_expert_gate {self.shared_expert_gate!r}; "
+                "choose 'none' or 'sigmoid'"
+            )
         if self.aux_loss_coeff < 0:
             raise ValueError("aux_loss_coeff must be >= 0")
 

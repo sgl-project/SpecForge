@@ -24,7 +24,7 @@ of small functions while the expensive parts are shared:
 | score function | token dispatch (sorted segments, grouped GEMM) |
 | balancing (aux loss, none) | deferred update timing vs activation checkpointing |
 | combine-weight renorm and scale | FSDP-friendly stacked expert layout |
-| shared expert (none or one) | fp32 accumulation of routed and shared output |
+| shared-expert gate (none, sigmoid) | fp32 accumulation of routed and shared output |
 | checkpoint file naming | load metrics |
 
 ## Why a preset per target family

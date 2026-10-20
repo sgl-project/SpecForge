@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3Config
 
@@ -181,6 +182,10 @@ class TestConfig(unittest.TestCase):
             register_router("topk")(Router)
         self.assertIs(BALANCE_CONTROLLERS.get("none"), BalanceController)
 
+    def test_shared_gate_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "shared_expert_gate"):
+            resolve_moe_config(_moe_json(shared_expert_gate="x"))
+
 
 # -- router, balance --------------------------------------------------------------------
 
@@ -316,6 +321,14 @@ class TestExpertsAndLayer(unittest.TestCase):
         expected = layer.experts(flat, routing) + layer.shared_experts(flat).float()
         self.assertEqual(y.dtype, torch.bfloat16)
         self.assertTrue(torch.equal(y, expected.to(torch.bfloat16).view_as(x)))
+
+    def test_gated_shared_expert(self):
+        cfg = resolve_moe_config(_moe_json(shared_expert_gate="sigmoid"))
+        shared = SwiGLUSharedExpert(cfg, H)
+        x = torch.randn(4, H)
+        ungated = shared.w2(F.silu(shared.w1(x)) * shared.w3(x))
+        expected = torch.sigmoid(shared.gate(x)) * ungated
+        self.assertTrue(torch.allclose(shared(x), expected, atol=1e-6))
 
     def test_layer_without_shared_expert(self):
         layer = _layer(n_shared_experts=0)

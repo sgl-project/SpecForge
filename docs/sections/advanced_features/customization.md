@@ -148,10 +148,10 @@ module under `moe/families/`, and the JSON states the per-run sizes:
 
 - **Architecture keys** at the top level override the preset for ablations
   (`scoring_func`, `norm_topk_prob`, `routed_scaling_factor`, `balance`,
-  `n_shared_experts`, `shared_expert_intermediate_size`, ...). `moe_layout`
-  overrides the checkpoint file naming the preset selects. Expert counts must
-  be positive integers, and `n_routed_experts` without a `moe_preset` is an
-  error, never a silent dense fallback.
+  `n_shared_experts`, `shared_expert_intermediate_size`, `shared_expert_gate`,
+  ...). `moe_layout` overrides the checkpoint file naming the preset selects.
+  Expert counts must be positive integers, and `n_routed_experts` without a
+  `moe_preset` is an error, never a silent dense fallback.
 - **Training-only keys** live under `dflash_config` with an `moe_` prefix and
   never change the checkpoint's architecture: `moe_aux_loss_coeff`
   (balancing) and `moe_dispatch` (`sorted_loop` or `grouped_mm`).
