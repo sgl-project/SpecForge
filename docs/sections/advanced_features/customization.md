@@ -165,9 +165,10 @@ module under `moe/families/`, and the JSON states the per-run sizes:
 - **Checkpoints and exports** name MoE tensors through the preset's layout.
   `export --to hf` also folds training-only router state into the gate
   (router centering becomes a fixed router logit bias, `moe_router_bias`),
-  and rewrites `config.json` to describe the folded draft so the export
-  reloads as is. Serving an MoE draft requires the serving engine to implement
-  the draft architecture with an MoE FFN; check the family's documentation.
+  rewrites `config.json` to describe the folded draft so the export reloads
+  as is, and adds the routing fields the family's serving engine reads.
+  Serving an MoE draft requires that engine to implement the draft
+  architecture with an MoE FFN; check the family's documentation.
 - **New families and components** register by name: a module under
   `moe/families/` registers a family's preset and layout, and a score
   function, router, balance controller, experts backend or shared expert

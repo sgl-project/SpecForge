@@ -86,6 +86,16 @@ def _normalize_dspark(config: Dict[str, Any], method_config: Dict[str, Any]) -> 
     config["architectures"] = ["Qwen3DSparkModel"]
 
 
+def _apply_moe_serving(config: Dict[str, Any]) -> None:
+    """MoE drafts: the family's serving class and the routing fields its engine reads."""
+    if not config.get("moe_preset"):
+        return
+    from specforge.modeling.draft.moe import serving_architecture, serving_config
+
+    config["architectures"] = [serving_architecture(config, config["architectures"][0])]
+    config.update(serving_config(config))
+
+
 def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, Any]:
     path = Path(config_path)
     with path.open(encoding="utf-8") as handle:
@@ -132,6 +142,7 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
         _normalize_dflash2(config, method_config)
     else:
         config["architectures"] = ["DFlashDraftModel"]
+    _apply_moe_serving(config)
     config.pop("auto_map", None)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)

@@ -1,10 +1,10 @@
 # coding=utf-8
-"""The checkpoint-file boundary: per-family file naming and the export fold."""
+"""The checkpoint-file boundary: per-family file naming, the export fold, serving."""
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from torch import nn
@@ -17,24 +17,40 @@ from .router import fold_router_centering, fold_router_centering_config
 StateDict = Dict[str, Any]
 #: One MoE layer's tensors (layer-relative keys) -> the same layer, other naming.
 LayerTransform = Callable[[StateDict], StateDict]
+#: Resolved config -> the ``config.json`` fields a serving engine reads.
+ServingConfig = Callable[[MoEConfig], Dict[str, Any]]
 
 
 @dataclass(frozen=True)
 class CheckpointLayout:
-    """One family's file naming of an MoE layer; ``from_file(to_file(s)) == s``."""
+    """One family's file naming of an MoE layer and what its serving engine reads."""
 
-    # Both directions keep the layer's ``experts.*`` keys: layers are found by them.
+    # from_file(to_file(s)) == s; both keep the experts.* keys, which locate layers.
     to_file: LayerTransform
     from_file: LayerTransform
+    #: ``config.json`` fields the engine needs to rebuild the routing.
+    serving_config: Optional[ServingConfig] = None
+    #: A dense draft's serving class -> the engine's class for it with this MoE FFN.
+    serving_architectures: Mapping[str, str] = field(default_factory=dict)
 
 
 LAYOUTS: Registry[CheckpointLayout] = Registry("MoE checkpoint layout")
 
 
 def register_layout(
-    name: str, *, to_file: LayerTransform, from_file: LayerTransform
+    name: str,
+    *,
+    to_file: LayerTransform,
+    from_file: LayerTransform,
+    serving_config: Optional[ServingConfig] = None,
+    serving_architectures: Optional[Mapping[str, str]] = None,
 ) -> None:
-    LAYOUTS.register(name, CheckpointLayout(to_file, from_file))
+    LAYOUTS.register(
+        name,
+        CheckpointLayout(
+            to_file, from_file, serving_config, dict(serving_architectures or {})
+        ),
+    )
 
 
 def _same_names(state: StateDict) -> StateDict:
@@ -113,12 +129,23 @@ def to_serving_state_dict(state: Mapping[str, Any], owner: Any) -> StateDict:
     return _per_layer(state, lambda layer: layout.to_file(fold_router_centering(layer)))
 
 
-def exported_config_updates(owner: Any) -> Dict[str, Any]:
-    """``config.json`` changes of an export: the folded router centering."""
+def serving_config(owner: Any) -> Dict[str, Any]:
+    """``config.json`` fields a serving engine needs for ``owner``'s MoE layers."""
     cfg = moe_config_for(owner)
     if cfg is None:
         return {}
-    return fold_router_centering_config(cfg)
+    layout = LAYOUTS.get(cfg.layout)
+    return {} if layout.serving_config is None else dict(layout.serving_config(cfg))
+
+
+def exported_config_updates(owner: Any) -> Dict[str, Any]:
+    """``config.json`` changes of an export: centering fold, then serving fields."""
+    cfg = moe_config_for(owner)
+    if cfg is None:
+        return {}
+    updates = fold_router_centering_config(cfg)
+    updates.update(serving_config(owner))
+    return updates
 
 
 def serving_architecture(owner: Any, dense_architecture: str) -> str:
