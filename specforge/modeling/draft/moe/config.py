@@ -82,7 +82,7 @@ class MoEConfig:
     #: Checkpoint file naming (a registered :mod:`.checkpoint` layout).
     layout: str = "native"
     # Training-only fields, never part of the checkpoint's architecture.
-    aux_loss_coeff: float = 0.0
+    aux_loss_coeff: float = 0.001  # 0 turns the aux loss off
     aux_loss_type: str = "switch"  # a registered aux loss (balance.AUX_LOSSES)
     dispatch: str = "sorted_loop"
     #: "sample": center router input on each sample's mean (eval: a running mean).

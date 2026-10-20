@@ -154,12 +154,12 @@ module under `moe/families/`, and the JSON states the per-run sizes:
   `n_routed_experts` without a `moe_preset` is an error, never a silent dense
   fallback.
 - **Training-only keys** live under `dflash_config` with an `moe_` prefix and
-  never change the checkpoint's architecture: `moe_aux_loss_coeff` and
-  `moe_aux_loss_type` (the load-balancing loss the router adds),
-  `moe_dispatch` (`sorted_loop` or `grouped_mm`), and router centering
-  `moe_router_center` (`"sample"`) with `moe_router_center_momentum`.
-  From-scratch drafters whose routers collapse onto a few experts need
-  `moe_router_center`.
+  never change the checkpoint's architecture: `moe_aux_loss_coeff` (the
+  load-balancing loss the router adds, on by default at 0.001; `0` turns it
+  off) and `moe_aux_loss_type` (its formula), `moe_dispatch` (`sorted_loop`
+  or `grouped_mm`), and router centering `moe_router_center` (`"sample"`)
+  with `moe_router_center_momentum`. From-scratch drafters whose routers
+  collapse onto a few experts need `moe_router_center`.
 - **Losses and metrics** need no strategy code: the trainer adds every MoE
   layer's auxiliary loss to the objective and logs layer-averaged `moe/*`
   load metrics for every strategy.

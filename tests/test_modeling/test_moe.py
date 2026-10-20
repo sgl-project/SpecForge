@@ -395,6 +395,16 @@ class TestAuxLoss(unittest.TestCase):
         router.eval()(x)
         self.assertIsNone(router.aux_loss())
 
+    def test_aux_loss_is_on_by_default_and_zero_turns_it_off(self):
+        self.assertEqual(resolve_moe_config(_moe_json()).aux_loss_coeff, 0.001)
+        x = torch.randn(20, H)
+        for dflash_config, on in (({}, True), ({"moe_aux_loss_coeff": 0}, False)):
+            cfg = resolve_moe_config(_moe_json(dflash_config=dflash_config))
+            router = TopKRouter(cfg, H, BalanceController(cfg, 8)).train()
+            router.reset_parameters(0.2)
+            router(x)
+            self.assertEqual(router.aux_loss() is not None, on, dflash_config)
+
     def test_unknown_aux_loss_type_lists_the_choices(self):
         cfg = resolve_moe_config(_moe_json(dflash_config={"moe_aux_loss_type": "x"}))
         with self.assertRaisesRegex(KeyError, "MoE aux loss.*available: switch"):

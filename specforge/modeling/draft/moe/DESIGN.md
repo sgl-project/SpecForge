@@ -87,7 +87,9 @@ a child of the router, so its buffers keep the `gate.balance.*` keys.
 **Load balancing has two independent knobs.** `moe_aux_loss_coeff` > 0 makes
 the router add a load-balancing loss in each training forward, with the
 formula `moe_aux_loss_type` names (`"switch"`, transformers' loss); it changes
-no routing decision, only the router's gradient. `balance` names a controller
+no routing decision, only the router's gradient. The coefficient defaults to
+0.001, transformers' `router_aux_loss_coef` for Qwen MoE, and `0` turns the
+loss off. `balance` names a controller
 that may shift the scores used to pick experts, never the combine weights,
 such as an aux-loss-free selection bias; `"none"` keeps them.
 
