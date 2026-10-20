@@ -28,6 +28,7 @@ from .dflash_mask import (
 from .flex_attention import compile_friendly_flex_attention
 from .flex_attention_backend import flex_attention_backend
 from .registry import register_draft
+from specforge.modeling.precision import CheckpointDtypeMixin
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
@@ -676,7 +677,7 @@ def normalize_draft_head_checkpoint_keys(
 
 
 @register_draft
-class DFlashDraftModel(Qwen3PreTrainedModel):
+class DFlashDraftModel(CheckpointDtypeMixin, Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
     decoder_layer_class = Qwen3DFlashDecoderLayer

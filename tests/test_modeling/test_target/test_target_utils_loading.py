@@ -119,7 +119,7 @@ class TargetEmbeddingsAndHeadLoadingTest(unittest.TestCase):
             (5.0, 5.0, torch.float32, True),
             (5.0, 7.0, torch.float32, False),
             (1.0, 1.001, torch.float32, False),
-            (1.0, 1.001, torch.bfloat16, True),
+            (1.0, 1.001, torch.bfloat16, False),
         ):
             with (
                 self.subTest(embed=embed_value, head=head_value, dtype=dtype),
@@ -153,11 +153,11 @@ class TargetEmbeddingsAndHeadLoadingTest(unittest.TestCase):
                 expected_head = head_value if head_value is not None else embed_value
                 torch.testing.assert_close(
                     module.embed_tokens.weight,
-                    torch.full((4, 3), expected_embed, dtype=dtype),
+                    torch.full((4, 3), expected_embed, dtype=torch.float32),
                 )
                 torch.testing.assert_close(
                     module.lm_head.weight,
-                    torch.full((4, 3), expected_head, dtype=dtype),
+                    torch.full((4, 3), expected_head, dtype=torch.float32),
                 )
 
     def test_tied_checkpoint_accepts_same_embedding_and_head_key(self):

@@ -50,7 +50,8 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
-    return {
+
+    contract = {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -66,6 +67,14 @@ def resume_contract(_config, draft_model, training_model):
             training_model.dspark_confidence_head_alpha
         ),
     }
+    # Record both modes so resume detects enabling or disabling DPACE.
+    contract["dspark_loss_type"] = training_model.loss_type
+    contract["dspark_dpace_alpha"] = float(training_model.dpace_alpha)
+    contract["dspark_objective"] = getattr(training_model, "dspark_objective", "ce_l1")
+    if contract["dspark_objective"] == "dpard":
+        contract["dspark_dpard_rho"] = float(training_model.dspark_dpard_rho)
+        contract["dspark_dpard_normalization"] = "valid_token_mean"
+    return contract
 
 
 def build_draft(config, draft_config):

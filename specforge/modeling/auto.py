@@ -33,12 +33,11 @@ class AutoDraftModel(AutoModelForCausalLMBase):
             A model instance.
         """
         _model_cls = cls._model_cls_from_config(config)
-        model = _model_cls(config, **config_kwargs)
-
-        # Convert model to specified dtype if provided
+        # Set the default during construction; do not recast module-owned
+        # parameters or buffers after initialization (e.g. FP32 RoPE frequencies).
         if torch_dtype is not None:
-            model = model.to(dtype=torch_dtype)
-        return model
+            config_kwargs["dtype"] = torch_dtype
+        return _model_cls._from_config(config, **config_kwargs)
 
     @classmethod
     def from_pretrained(

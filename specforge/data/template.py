@@ -365,6 +365,20 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# The Python encoder keeps the latest turn's reasoning by default; historical
+# reasoning is dropped unless tools require retaining it.
+TEMPLATE_REGISTRY.register(
+    name="deepseek-v4-thinking",
+    template=ChatTemplate(
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        system_prompt=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        parser_type="deepseek-v4",
+        enable_thinking=True,
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="glm-5.2",
     template=ChatTemplate(

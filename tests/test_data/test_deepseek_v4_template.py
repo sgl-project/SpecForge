@@ -208,6 +208,84 @@ class TestDeepseekV4Template(unittest.TestCase):
         )
         self.assertTrue(torch.all(processed["attention_mask"][0] == 1))
 
+    def test_thinking_template_preprocessing_preserves_and_supervises_reasoning(self):
+        messages = [
+            {"role": "user", "content": "Question"},
+            {
+                "role": "assistant",
+                "reasoning_content": "Reasoning",
+                "content": "Answer",
+            },
+        ]
+        for name, expected_assistant in (
+            ("deepseek-v4", "</think>Answer<｜end▁of▁sentence｜>"),
+            (
+                "deepseek-v4-thinking",
+                "<think>Reasoning</think>Answer<｜end▁of▁sentence｜>",
+            ),
+        ):
+            with self.subTest(template=name):
+                processed = preprocess_conversations(
+                    CharacterTokenizer(),
+                    [messages],
+                    TEMPLATE_REGISTRY.get(name),
+                    max_length=512,
+                    tools=[[]],
+                )
+                ids = processed["input_ids"][0].flatten()
+                mask = processed["loss_mask"][0].flatten().bool()
+                self.assertEqual(
+                    "".join(chr(value) for value in ids.tolist()),
+                    "<｜begin▁of▁sentence｜><｜User｜>Question<｜Assistant｜>"
+                    + expected_assistant,
+                )
+                self.assertEqual(
+                    "".join(chr(value) for value in ids[mask].tolist()),
+                    expected_assistant,
+                )
+
+    def test_thinking_template_multiturn_reasoning_policy(self):
+        messages = [
+            {"role": "user", "content": "First"},
+            {
+                "role": "assistant",
+                "reasoning_content": "old reasoning",
+                "content": "First answer",
+            },
+            {"role": "user", "content": "Second"},
+            {
+                "role": "assistant",
+                "reasoning_content": "latest reasoning",
+                "content": "Second answer",
+            },
+        ]
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup a value",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for tools, keep_history in (([], False), ([tool_schema], True)):
+            with self.subTest(keep_history=keep_history):
+                processed = preprocess_conversations(
+                    CharacterTokenizer(),
+                    [messages],
+                    TEMPLATE_REGISTRY.get("deepseek-v4-thinking"),
+                    max_length=16384,
+                    tools=[tools],
+                )
+                rendered = "".join(
+                    chr(value)
+                    for value in processed["input_ids"][0].flatten().tolist()
+                )
+                self.assertEqual("old reasoning" in rendered, keep_history)
+                self.assertIn("First answer", rendered)
+                self.assertIn(
+                    "<think>latest reasoning</think>Second answer", rendered
+                )
+
     def test_encoder_errors_do_not_fall_back_to_generic_rendering(self):
         template = TEMPLATE_REGISTRY.get("deepseek-v4")
         parser = DeepSeekV4Parser(CharacterTokenizer(), template)

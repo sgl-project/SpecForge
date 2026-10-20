@@ -338,7 +338,7 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if key in custom_checkpoint_extra and key not in state:
+                if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
                         f"algorithm resume semantic {key}; start a fresh run "
@@ -352,7 +352,9 @@ class Trainer:
                         f"resume with the original configuration"
                     )
             saved_weights = state["draft_state_dict"]
-            load_result = model.draft_model.load_state_dict(saved_weights, strict=False)
+            from specforge.modeling.precision import load_state_dict_preserving_dtype
+
+            load_result = load_state_dict_preserving_dtype(model.draft_model, saved_weights, strict=False)
             loaded = len(saved_weights) - len(load_result.unexpected_keys)
             missing_keys = set(load_result.missing_keys)
             disallowed_missing = missing_keys - allowed_missing_checkpoint_keys
