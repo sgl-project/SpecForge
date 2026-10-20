@@ -165,6 +165,242 @@ class TestLegacyVocabMappingCompatibility(unittest.TestCase):
             )
 
 
+class TestHFVocabMappingExport(unittest.TestCase):
+    """Exercise serialized and reloaded exports on CPU, without model downloads."""
+
+    def setUp(self):
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from tests.test_runtime import _fixtures as fx
+
+        self.tempdir = tempfile.TemporaryDirectory(prefix="hf_mapping_export_")
+        self.addCleanup(self.tempdir.cleanup)
+        self.cfg_path = fx.write_draft_config(
+            os.path.join(self.tempdir.name, "draft.json")
+        )
+        old_path = fx.write_vocab_mapping(
+            os.path.join(self.tempdir.name, "old.pt"), seed=0
+        )
+        self.mapping_path = fx.write_vocab_mapping(
+            os.path.join(self.tempdir.name, "replacement.pt"), seed=1
+        )
+        self.replacement = torch.load(self.mapping_path, weights_only=True)
+        with torch.random.fork_rng(devices=[]):
+            model = AutoDraftModel.from_config(
+                AutoDraftModelConfig.from_file(self.cfg_path), torch_dtype=torch.float32
+            )
+        model.load_vocab_mapping(old_path)
+        self.weights = model.state_dict()
+        # Not representable in BF16: exporting must retain checkpoint precision.
+        self.weights["fc.weight"][0, 0] = 0.1234567
+        self.checkpoint = os.path.join(self.tempdir.name, "training_state.pt")
+        self.output = os.path.join(self.tempdir.name, "export")
+        self._save_checkpoint(self.weights)
+
+    def _save_checkpoint(self, weights):
+        torch.save({"strategy": "eagle3", "draft_state_dict": weights}, self.checkpoint)
+
+    def _assert_export(self, expected_mapping):
+        from safetensors.torch import load_file
+
+        from specforge.modeling.auto import AutoDraftModel
+
+        saved = load_file(os.path.join(self.output, "model.safetensors"))
+        reloaded, info = AutoDraftModel.from_pretrained(
+            self.output, torch_dtype=torch.float32, output_loading_info=True
+        )
+        self.assertFalse(info["missing_keys"])
+        self.assertFalse(info["unexpected_keys"])
+        self.assertEqual(set(saved), set(self.weights))
+        reloaded_weights = reloaded.state_dict()
+        for key, original in self.weights.items():
+            expected = expected_mapping[key] if key in {"t2d", "d2t"} else original
+            self.assertEqual(saved[key].dtype, expected.dtype, key)
+            self.assertTrue(torch.equal(saved[key], expected), key)
+            self.assertTrue(torch.equal(reloaded_weights[key], expected), key)
+
+    def test_explicit_mapping_replaces_checkpoint_buffers(self):
+        from specforge.export import export_to_hf
+
+        for key in ("t2d", "d2t"):
+            self.assertFalse(torch.equal(self.weights[key], self.replacement[key]))
+        export_to_hf(
+            self.checkpoint,
+            self.cfg_path,
+            self.output,
+            vocab_mapping_path=self.mapping_path,
+        )
+        self._assert_export(self.replacement)
+
+    def test_no_override_preserves_checkpoint_buffers(self):
+        from specforge.export import export_to_hf
+
+        export_to_hf(self.checkpoint, self.cfg_path, self.output)
+        self._assert_export(self.weights)
+
+    def test_explicit_mapping_restores_legacy_checkpoint_buffers(self):
+        from specforge.export import export_to_hf
+
+        self._save_checkpoint(
+            {
+                key: value
+                for key, value in self.weights.items()
+                if key not in {"t2d", "d2t"}
+            }
+        )
+        export_to_hf(
+            self.checkpoint,
+            self.cfg_path,
+            self.output,
+            vocab_mapping_path=self.mapping_path,
+        )
+        self._assert_export(self.replacement)
+
+    def test_cli_mapping_override_with_external_embedding(self):
+        from click.testing import CliRunner
+        from safetensors.torch import save_file
+
+        from specforge.cli import cli
+
+        self._save_checkpoint(
+            {
+                key: value
+                for key, value in self.weights.items()
+                if key != "embed_tokens.weight"
+            }
+        )
+        source = os.path.join(self.tempdir.name, "target")
+        os.mkdir(source)
+        # Use an exactly representable embedding to isolate mapping precedence.
+        self.weights["embed_tokens.weight"].fill_(0.5)
+        save_file(
+            {"model.embed_tokens.weight": self.weights["embed_tokens.weight"]},
+            os.path.join(source, "model.safetensors"),
+        )
+        result = CliRunner().invoke(
+            cli,
+            [
+                "export",
+                "--to",
+                "hf",
+                "--checkpoint",
+                self.checkpoint,
+                "--draft-config",
+                self.cfg_path,
+                "--output-dir",
+                self.output,
+                "--vocab-mapping",
+                self.mapping_path,
+                "--embedding-source",
+                source,
+            ],
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        # The embedding loader materializes in the export dtype, which follows
+        # the checkpoint; this checkpoint is FP32, so the embedding stays FP32.
+        self._assert_export(self.replacement)
+
+
+class TestExportCheckpointPrecision(unittest.TestCase):
+    """Both exporters carry the checkpoint's own precision, on CPU."""
+
+    def setUp(self):
+        from tests.test_runtime import _fixtures as fx
+
+        self.tempdir = tempfile.TemporaryDirectory(prefix="export_precision_")
+        self.addCleanup(self.tempdir.cleanup)
+        self.cfg_path = fx.write_draft_config(
+            os.path.join(self.tempdir.name, "draft.json")
+        )
+        self.vocab_path = fx.write_vocab_mapping(
+            os.path.join(self.tempdir.name, "mapping.pt"), seed=0
+        )
+        self.replacement_path = fx.write_vocab_mapping(
+            os.path.join(self.tempdir.name, "replacement.pt"), seed=1
+        )
+        self.checkpoint = os.path.join(self.tempdir.name, "training_state.pt")
+        self.output = os.path.join(self.tempdir.name, "export")
+
+    def _checkpoint(self, dtype):
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            model = AutoDraftModel.from_config(
+                AutoDraftModelConfig.from_file(self.cfg_path), torch_dtype=dtype
+            )
+        model.load_vocab_mapping(self.vocab_path)
+        weights = model.state_dict()
+        # Not representable in BF16: any re-materialization in BF16 shows up.
+        weights["fc.weight"][0, 0] = 0.1234567
+        torch.save({"strategy": "eagle3", "draft_state_dict": weights}, self.checkpoint)
+        return weights
+
+    def _read_config_dtype(self):
+        with open(os.path.join(self.output, "config.json"), encoding="utf-8") as f:
+            config = json.load(f)
+        # Transformers 5 writes ``dtype``; Transformers 4 wrote ``torch_dtype``.
+        return config.get("dtype", config.get("torch_dtype"))
+
+    def test_to_sglang_serializes_checkpoint_precision(self):
+        from safetensors.torch import load_file
+
+        from specforge.export import export_to_sglang
+
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                weights = self._checkpoint(dtype)
+                export_to_sglang(self.checkpoint, self.cfg_path, self.output)
+                served = load_file(os.path.join(self.output, "model.safetensors"))
+                expected = {
+                    key: value
+                    for key, value in weights.items()
+                    if "embed" not in key.lower()
+                }
+                self.assertEqual(set(served), set(expected))
+                for key, value in expected.items():
+                    self.assertEqual(served[key].dtype, value.dtype, key)
+                    self.assertTrue(torch.equal(served[key], value), key)
+                self.assertEqual(self._read_config_dtype(), str(dtype).split(".")[1])
+
+    def test_to_sglang_explicit_mapping_keeps_other_weights_exact(self):
+        from safetensors.torch import load_file
+
+        from specforge.export import export_to_sglang
+
+        weights = self._checkpoint(torch.float32)
+        replacement = torch.load(self.replacement_path, weights_only=True)
+        export_to_sglang(
+            self.checkpoint,
+            self.cfg_path,
+            self.output,
+            vocab_mapping_path=self.replacement_path,
+        )
+        served = load_file(os.path.join(self.output, "model.safetensors"))
+        for key in ("t2d", "d2t"):
+            self.assertTrue(torch.equal(served[key], replacement[key]), key)
+        for key, value in weights.items():
+            if "embed" in key.lower() or key in {"t2d", "d2t"}:
+                continue
+            self.assertEqual(served[key].dtype, value.dtype, key)
+            self.assertTrue(torch.equal(served[key], value), key)
+
+    def test_to_hf_reloads_checkpoint_precision_by_default(self):
+        from specforge.export import export_to_hf
+        from specforge.modeling.auto import AutoDraftModel
+
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                weights = self._checkpoint(dtype)
+                export_to_hf(self.checkpoint, self.cfg_path, self.output)
+                self.assertEqual(self._read_config_dtype(), str(dtype).split(".")[1])
+                # No explicit dtype: Transformers follows the exported config.
+                reloaded = AutoDraftModel.from_pretrained(self.output).state_dict()
+                self.assertEqual(set(reloaded), set(weights))
+                for key, value in weights.items():
+                    self.assertEqual(reloaded[key].dtype, value.dtype, key)
+                    self.assertTrue(torch.equal(reloaded[key], value), key)
+
+
 @unittest.skipUnless(CUDA, "export round-trip requires CUDA")
 class TestExporters(unittest.TestCase):
     @classmethod

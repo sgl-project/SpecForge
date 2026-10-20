@@ -13,17 +13,21 @@ What is pinned here:
   layers, and ``lm_head(last_hidden)`` matches the HF logits (norm-placement
   agnostic), within the documented bf16 tolerance;
 - strategy-agnosticism: the same server serves eagle3 (aux + last_hidden) and
-  dflash (aux only) requests, named per strategy by the client schema.
+  dflash (aux + last_hidden, or aux only with
+  ``training.dflash_teacher_metrics=false``) requests, named per strategy by
+  the client schema; an unrequested artifact is never written.
 - cache isolation: radix cache stays enabled and sequential identical prompts
   still capture every token because each request attempt has a fresh
   ``extra_key`` namespace.
 
 The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
-GPU, sglang patched with
+GPU, the ``mooncake`` package, a reachable/spawnable ``mooncake_master``, and a
+capture-capable SGLang: either patched with
 ``patches/sglang/v0.5.18/spec-capture.patch`` (see
-``scripts/apply_sglang_spec_capture_patch.sh``), the ``mooncake`` package, and
-a reachable/spawnable ``mooncake_master``; opt in locally with
-``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
+``scripts/apply_sglang_spec_capture_patch.sh``) or a build with the forward
+observer extension points plus the installed ``specforge-sglang-capture``
+plugin. ``SPECFORGE_SERVER_CAPTURE=patch|plugin`` selects one; otherwise the
+installed one is used. Opt in locally with ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
 """
 
 import importlib.util
@@ -46,12 +50,18 @@ AUX_LAYER_IDS = [1, 3, 4]
 H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
 
 
-def _capture_schema(algorithm: str):
+def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
+    from types import SimpleNamespace
+
     from specforge.algorithms.builtin import builtin_algorithm_registry
+    from specforge.algorithms.common.providers import resolve_server_capture_layout
     from specforge.inference.adapters.server_capture import ServerCaptureSchema
 
     registration = builtin_algorithm_registry().resolve(algorithm)
-    layout = registration.providers.server_streaming_for("text").layout
+    config = SimpleNamespace(
+        training=SimpleNamespace(dflash_teacher_metrics=teacher_metrics)
+    )
+    layout = resolve_server_capture_layout(registration, config, modality="text")
     return ServerCaptureSchema(
         aux_feature=layout.aux_feature,
         last_hidden_feature=layout.last_hidden_feature,
@@ -64,8 +74,56 @@ def _patched_sglang() -> bool:
     return importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
 
 
+def _capture_plugin() -> bool:
+    return all(
+        importlib.util.find_spec(name) is not None
+        for name in (
+            "specforge_sglang_capture",
+            "sglang.srt.model_executor.forward_observer",
+        )
+    )
+
+
+def _server_capture_backend():
+    requested = os.environ.get("SPECFORGE_SERVER_CAPTURE")
+    if requested:
+        return requested
+    if _patched_sglang():
+        return "patch"
+    if _capture_plugin():
+        return "plugin"
+    return None
+
+
+SERVER_CAPTURE = _server_capture_backend()
+
+
+def _capture_server_flags():
+    layer_ids = [str(i) for i in AUX_LAYER_IDS]
+    if SERVER_CAPTURE == "plugin":
+        return [
+            "--speculative-algorithm",
+            "EAGLE3",
+            "--enable-return-aux-hidden-states",
+            "--return-aux-hidden-state-layer-ids",
+            *layer_ids,
+            "--return-hidden-states-mode",
+            "full",
+        ]
+    return ["--enable-spec-capture", "--spec-capture-aux-layer-ids", *layer_ids]
+
+
 def _mooncake_available() -> bool:
     return importlib.util.find_spec("mooncake.store") is not None
+
+
+def _log_tail(path, lines=80):
+    """Last lines of a subprocess log, so CI shows why the process died."""
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+    except OSError as exc:
+        return f"<could not read {path}: {exc}>"
 
 
 @unittest.skipUnless(
@@ -80,11 +138,13 @@ class TestServerCaptureGate(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not _patched_sglang():
+        if SERVER_CAPTURE is None:
             raise unittest.SkipTest(
-                "installed sglang lacks spec_capture_sink — apply "
+                "installed sglang has no spec capture — apply "
                 "patches/sglang/v0.5.18/spec-capture.patch "
-                "(scripts/apply_sglang_spec_capture_patch.sh)"
+                "(scripts/apply_sglang_spec_capture_patch.sh) or install the "
+                "specforge-sglang-capture plugin on an SGLang build with "
+                "forward observers"
             )
         if not _mooncake_available():
             raise unittest.SkipTest("mooncake package not installed")
@@ -111,22 +171,6 @@ class TestServerCaptureGate(unittest.TestCase):
         model = LlamaForCausalLM(cfg).to(torch.bfloat16)
         cls.target_dir = os.path.join(cls.workdir, "target")
         model.save_pretrained(cls.target_dir)
-        # save_pretrained writes a single un-indexed shard for tiny models;
-        # TargetHead.load_weights locates lm_head.weight via the index file.
-        index = os.path.join(cls.target_dir, "model.safetensors.index.json")
-        if not os.path.exists(index):
-            import json
-
-            with open(index, "w") as f:
-                json.dump(
-                    {
-                        "metadata": {},
-                        "weight_map": {
-                            "lm_head.weight": "model.safetensors",
-                        },
-                    },
-                    f,
-                )
 
         cls._ensure_mooncake_master()
 
@@ -137,6 +181,8 @@ class TestServerCaptureGate(unittest.TestCase):
                 "MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"
             ),
         )
+        if SERVER_CAPTURE == "plugin":
+            env["SPECFORGE_SPEC_CAPTURE"] = "1"
         cls.server = subprocess.Popen(
             [
                 sys.executable,
@@ -151,9 +197,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 "0.3",
                 "--chunked-prefill-size",
                 "-1",
-                "--enable-spec-capture",
-                "--spec-capture-aux-layer-ids",
-                *[str(i) for i in AUX_LAYER_IDS],
+                *_capture_server_flags(),
                 "--port",
                 str(PORT),
             ],
@@ -175,7 +219,9 @@ class TestServerCaptureGate(unittest.TestCase):
                 break
             time.sleep(5)
         raise RuntimeError(
-            f"sglang server did not become healthy; see {cls.workdir}/server.log"
+            "sglang server did not become healthy "
+            f"(exit code {cls.server.poll()}); tail of {cls.workdir}/server.log:\n"
+            + _log_tail(os.path.join(cls.workdir, "server.log"))
         )
 
     @classmethod
@@ -290,6 +336,7 @@ class TestServerCaptureGate(unittest.TestCase):
             run_id="gate0",
             algorithm="eagle3",
             schema=_capture_schema("eagle3"),
+            server_capture=SERVER_CAPTURE,
         )
         contract = CaptureConfig.from_strategy(
             required_features={
@@ -407,6 +454,7 @@ class TestServerCaptureGate(unittest.TestCase):
             run_id="gate1",
             algorithm="dflash",
             schema=_capture_schema("dflash"),
+            server_capture=SERVER_CAPTURE,
         )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},
@@ -433,6 +481,55 @@ class TestServerCaptureGate(unittest.TestCase):
             out["hidden_states"].float(), aux_ref[0].float(), rtol=TOL, atol=TOL
         )
         store.release(handle)
+
+    def test_dflash_capture_without_teacher_metrics_skips_last_hidden(self):
+        from specforge.inference.adapters.server_capture import (
+            SGLangServerCaptureAdapter,
+        )
+        from specforge.inference.capture import CaptureConfig
+        from specforge.runtime.contracts import SampleRef
+
+        rows = [[3, 1, 4, 1, 5], [2, 7, 1, 8, 2, 8]]
+        store = self._store("gate-dflash-noteacher")
+        adapter = SGLangServerCaptureAdapter(
+            f"http://localhost:{PORT}",
+            store,
+            run_id="gate2",
+            algorithm="dflash",
+            schema=_capture_schema("dflash", teacher_metrics=False),
+            server_capture=SERVER_CAPTURE,
+        )
+        contract = CaptureConfig.from_strategy(
+            required_features={"input_ids", "hidden_states", "loss_mask"},
+            aux_hidden_state_layer_ids=tuple(AUX_LAYER_IDS),
+            target_repr="hidden_state",
+            target_hidden_size=H,
+        )
+        refs = adapter.produce_refs(self._tasks(rows), capture=contract)
+        aux_ref, _ = self._hf_reference(rows)
+        for i, ref in enumerate(refs):
+            self.assertIsInstance(ref, SampleRef, f"expected a ref, got: {ref}")
+            self.assertEqual(
+                ["hidden_states", "input_ids", "loss_mask"], sorted(ref.feature_specs)
+            )
+            # The sink wrote no object under the teacher feature's key.
+            generation = int(ref.metadata["generation"])
+            self.assertFalse(
+                store._store_exists(
+                    store._tkey(ref.sample_id, generation, "target_last_hidden_states")
+                )
+            )
+            self.assertTrue(
+                store._store_exists(
+                    store._tkey(ref.sample_id, generation, "hidden_states")
+                )
+            )
+            out, handle = store.get(ref)
+            self.assertEqual(["hidden_states", "input_ids", "loss_mask"], sorted(out))
+            torch.testing.assert_close(
+                out["hidden_states"].float(), aux_ref[i].float(), rtol=TOL, atol=TOL
+            )
+            store.release(handle)
 
 
 if __name__ == "__main__":

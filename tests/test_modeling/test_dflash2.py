@@ -9,6 +9,7 @@ from transformers import Qwen3Config
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.algorithms.dflash.providers import resume_contract
+from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import Qwen3DFlashDecoderLayer
 from specforge.modeling.draft.dflash2 import (
     CandidateSelector,
@@ -16,6 +17,7 @@ from specforge.modeling.draft.dflash2 import (
     DFlashGroupedConv,
     Qwen3DFlash2DecoderLayer,
 )
+from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import DFlashTrainStrategy, StepContext
 
 
@@ -386,6 +388,7 @@ class CandidateSelectorTest(unittest.TestCase):
             output_hidden,
         )
 
+        output_hidden.requires_grad_()
         _loss, _accuracy, metrics = model(
             input_ids=torch.tensor([[0, 1, 3]]),
             hidden_states=torch.zeros(1, 3, 4),
@@ -396,26 +399,41 @@ class CandidateSelectorTest(unittest.TestCase):
         ratios = metrics["ratio_metrics"]
         expected_keys = {
             "lk_loss",
-            "expected_acceptance",
+            "target_probability",
             "dflash/hard_label/unary_top1_accuracy",
             "dflash/hard_label/unary_top2_oracle_accepted_length",
-            "dflash2/selector/conditional_accuracy",
-            "dflash2/selector/serving_accepted_length",
+            "dflash2/selector/teacher_forced_covered_accuracy",
+            "dflash2/selector/greedy_accepted_length",
             "position_1/hard_label/unary_top1_accuracy",
             "position_2/hard_label/unary_top1_accuracy",
             "position_1/hard_label/unary_top2_recall",
             "position_2/hard_label/unary_top2_recall",
             "position_1/hard_label/unary_top2_mass",
             "position_1/selector/loss",
-            "position_2/selector/conditional_accuracy",
-            "position_2/selector/teacher_serving_agreement",
+            "position_2/selector/teacher_forced_covered_accuracy",
+            "position_2/selector/self_conditioned_teacher_argmax_agreement",
             "position_1/objective/loss_weight_share",
-            "position_1/teacher/expected_acceptance",
-            "position_2/teacher/expected_acceptance",
+            "position_1/teacher/unary_distribution_overlap",
+            "position_2/teacher/unary_distribution_overlap",
             "position_1/teacher/unary_top1_agreement",
             "position_2/teacher/unary_top2_mass",
         }
         self.assertTrue(expected_keys.issubset(ratios))
+        for removed in (
+            "expected_acceptance",
+            "dflash/hard_label/expected_acceptance",
+            "selector_loss",
+            "selector_accuracy",
+            "selector_coverage",
+            "selector_target_probability",
+        ):
+            self.assertNotIn(removed, ratios)
+        self.assertFalse(any("serving" in key for key in ratios))
+        counts = metrics["sum_metrics"]
+        self.assertEqual(counts["dflash/hard_label/block_count"], 1)
+        self.assertEqual(counts["position_1/selector/greedy_reached_count"], 1)
+        self.assertEqual(counts["position_2/selector/greedy_coverage_miss_count"], 1)
+        self.assertEqual(counts["position_2/selector/greedy_ranking_error_count"], 0)
         self.assertFalse(any(key.startswith("position_0/") for key in ratios))
         self.assertFalse(any("/position_" in key for key in ratios))
         self.assertNotIn("objective/lk_kl_weight", ratios)
@@ -435,19 +453,29 @@ class CandidateSelectorTest(unittest.TestCase):
         self.assertEqual(
             ratio("dflash/hard_label/unary_top2_oracle_accepted_length"), 2.0
         )
-        self.assertEqual(ratio("dflash2/selector/serving_accepted_length"), 2.0)
+        self.assertEqual(ratio("dflash2/selector/greedy_accepted_length"), 2.0)
+        self.assertEqual(ratio("dflash/hard_label/unary_greedy_accepted_length"), 2.0)
+        self.assertEqual(ratio("position_1/selector/greedy_prefix_acceptance"), 1.0)
+        self.assertEqual(ratio("position_2/selector/greedy_prefix_acceptance"), 0.0)
+        self.assertEqual(
+            ratio("position_2/selector/greedy_prefix_coverage_miss_rate"), 1.0
+        )
+        self.assertEqual(
+            ratio("position_2/selector/greedy_prefix_ranking_error_rate"), 0.0
+        )
+        self.assertEqual(ratio("dflash/hard_label/supervised_prefix_length"), 3.0)
         # Uniform dflash weights split the objective evenly over both slots.
         self.assertEqual(ratio("position_1/objective/loss_weight_share"), 0.5)
         self.assertEqual(ratio("position_2/objective/loss_weight_share"), 0.5)
         # Expected accepted lengths chain the per-slot probabilities of the two
         # predicted slots; the teacher rows are aligned to label index - 1.
-        draft_probabilities = torch.softmax(output_hidden[0, 1:], dim=-1)
+        draft_probabilities = torch.softmax(output_hidden[0, 1:].detach(), dim=-1)
         teacher_probabilities = torch.softmax(target_hidden[0, :2], dim=-1)
         gold_probability = draft_probabilities.gather(
             -1, torch.tensor([[1], [3]])
         ).squeeze(-1)
         self.assertAlmostEqual(
-            ratio("dflash/hard_label/expected_accepted_length"),
+            ratio("dflash/hard_label/unary_gold_probability_chain_length"),
             float(1.0 + gold_probability.cumprod(dim=-1).sum()),
             places=5,
         )
@@ -455,10 +483,186 @@ class CandidateSelectorTest(unittest.TestCase):
             draft_probabilities - teacher_probabilities
         ).abs().sum(dim=-1)
         self.assertAlmostEqual(
-            ratio("dflash/teacher/expected_accepted_length"),
+            ratio("dflash/teacher/unary_overlap_chain_length"),
             float(1.0 + acceptance.cumprod(dim=-1).sum()),
             places=5,
         )
+
+        reference_loss, _, _ = model(
+            input_ids=torch.tensor([[0, 1, 3]]),
+            hidden_states=torch.zeros(1, 3, 4),
+            loss_mask=torch.ones(1, 3),
+            collect_detailed_metrics=False,
+        )
+        torch.testing.assert_close(_loss, reference_loss)
+        parameters = (output_hidden, *draft.parameters())
+        detailed_gradients = torch.autograd.grad(_loss, parameters)
+        reference_gradients = torch.autograd.grad(reference_loss, parameters)
+        for actual, expected in zip(detailed_gradients, reference_gradients):
+            torch.testing.assert_close(actual, expected)
+
+    def test_teacher_metrics_off_drops_only_teacher_families(self):
+        class SelectorDraft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=4,
+                    vocab_size=4,
+                    state_rank=2,
+                    top_k=2,
+                    initializer_range=0.02,
+                )
+
+            @staticmethod
+            def transform_unary_logits(logits):
+                return logits.float()
+
+        output_hidden = torch.tensor(
+            [[[0.0, 0.0, 0.0, 0.0], [0.0, 4.0, 1.0, 0.0], [0.0, 3.0, 4.0, 2.0]]]
+        )
+        target_hidden = torch.tensor(
+            [[[0.0, 5.0, 0.0, 0.0], [0.0, 0.0, 0.0, 5.0], [0.0, 0.0, 0.0, 0.0]]]
+        )
+
+        def run(draft, *, teacher_metrics, feed_teacher=True):
+            model = OnlineDFlashModel(
+                draft_model=draft,
+                target_lm_head=nn.Identity(),
+                target_embed_tokens=nn.Embedding(4, 4),
+                mask_token_id=3,
+                block_size=3,
+                attention_backend="eager",
+                metric_top_k=2,
+                teacher_metrics=teacher_metrics,
+            )
+            model._forward_draft_blocks = lambda **_kwargs: (
+                torch.tensor([[0]]),
+                torch.tensor([[True]]),
+                output_hidden,
+            )
+            return model(
+                input_ids=torch.tensor([[0, 1, 3]]),
+                hidden_states=torch.zeros(1, 3, 4),
+                loss_mask=torch.ones(1, 3),
+                target_last_hidden_states=target_hidden if feed_teacher else None,
+            )
+
+        def is_teacher_metric(name):
+            return "/teacher/" in name or name.endswith("teacher_argmax_agreement")
+
+        torch.manual_seed(0)
+        for label, draft in (("dflash", nn.Module()), ("dflash2", SelectorDraft())):
+            with self.subTest(draft=label):
+                loss_on, accuracy_on, metrics_on = run(draft, teacher_metrics=True)
+                for feed_teacher in (True, False):
+                    loss_off, accuracy_off, metrics_off = run(
+                        draft, teacher_metrics=False, feed_teacher=feed_teacher
+                    )
+                    ratios_on = metrics_on["ratio_metrics"]
+                    ratios_off = metrics_off["ratio_metrics"]
+                    teacher_keys = {key for key in ratios_on if is_teacher_metric(key)}
+                    self.assertIn(
+                        "dflash/teacher/unary_overlap_chain_length", teacher_keys
+                    )
+                    self.assertEqual(
+                        label == "dflash2",
+                        "dflash2/selector/self_conditioned_teacher_argmax_agreement"
+                        in teacher_keys,
+                    )
+                    self.assertEqual(set(ratios_on) - teacher_keys, set(ratios_off))
+                    for key, (numerator, denominator) in ratios_off.items():
+                        torch.testing.assert_close(numerator, ratios_on[key][0])
+                        torch.testing.assert_close(denominator, ratios_on[key][1])
+                    self.assertEqual(
+                        set(metrics_on["sum_metrics"]), set(metrics_off["sum_metrics"])
+                    )
+                    torch.testing.assert_close(loss_off, loss_on)
+                    torch.testing.assert_close(accuracy_off, accuracy_on)
+
+    def test_teacher_metrics_off_keeps_real_draft_loss_and_gradients_exact(self):
+        # Unlike the stubbed block stack above, this runs a real DFlash2 draft
+        # through the strategy on a log step, so the teacher-off path must also
+        # leave the backward bit-identical for every objective variant.
+        def step(loss_kwargs, *, teacher_metrics, feed_teacher):
+            torch.manual_seed(0)
+            draft = DFlash2DraftModel(_tiny_config())
+            model = OnlineDFlashModel(
+                draft_model=draft,
+                target_lm_head=nn.Linear(16, 32, bias=False).requires_grad_(False),
+                target_embed_tokens=nn.Embedding(32, 16).requires_grad_(False),
+                mask_token_id=31,
+                block_size=4,
+                attention_backend="sdpa",
+                num_anchors=6,
+                objective_chunk_blocks=2,
+                teacher_metrics=teacher_metrics,
+                **loss_kwargs,
+            )
+            generator = torch.Generator().manual_seed(1)
+            loss_mask = torch.ones(2, 20, dtype=torch.long)
+            loss_mask[1, 14:] = 0
+            tensors = {
+                "input_ids": torch.randint(0, 30, (2, 20), generator=generator),
+                "hidden_states": torch.randn(2, 20, 16, generator=generator),
+                "loss_mask": loss_mask,
+            }
+            if feed_teacher:
+                tensors["target_last_hidden_states"] = torch.randn(
+                    2, 20, 16, generator=generator
+                )
+            batch = TrainBatch(
+                sample_ids=["a", "b"], strategy="dflash", tensors=tensors
+            )
+            torch.manual_seed(2)
+            out = DFlashTrainStrategy(model).forward_loss(
+                batch, ctx=StepContext(global_step=1, total_steps=4)
+            )
+            out.loss.backward()
+            gradients = {
+                name: parameter.grad
+                for name, parameter in model.named_parameters()
+                if parameter.grad is not None
+            }
+            return out, gradients
+
+        for loss_kwargs in (
+            {},
+            {"loss_type": "dpace"},
+            {"lk_loss_type": "lambda"},
+            {"selector_stop_gradient": True},
+        ):
+            with self.subTest(**loss_kwargs):
+                reference, reference_gradients = step(
+                    loss_kwargs, teacher_metrics=True, feed_teacher=True
+                )
+                teacher_keys = {
+                    key
+                    for key in reference.ratio_metrics
+                    if "/teacher/" in key or key.endswith("teacher_argmax_agreement")
+                }
+                self.assertIn("dflash/teacher/unary_overlap_chain_length", teacher_keys)
+                for feed_teacher in (True, False):
+                    out, gradients = step(
+                        loss_kwargs, teacher_metrics=False, feed_teacher=feed_teacher
+                    )
+                    self.assertTrue(torch.equal(out.loss, reference.loss))
+                    self.assertEqual(set(reference_gradients), set(gradients))
+                    for name, gradient in gradients.items():
+                        self.assertTrue(
+                            torch.equal(gradient, reference_gradients[name]), name
+                        )
+                    self.assertEqual(
+                        set(reference.ratio_metrics) - teacher_keys,
+                        set(out.ratio_metrics),
+                    )
+                    for key, (numerator, denominator) in out.ratio_metrics.items():
+                        self.assertTrue(
+                            torch.equal(numerator, reference.ratio_metrics[key][0])
+                        )
+                        self.assertTrue(
+                            torch.equal(denominator, reference.ratio_metrics[key][1])
+                        )
+                    self.assertEqual(reference.sum_metrics, out.sum_metrics)
 
     def test_plain_dflash_draft_reports_family_metrics_without_selector_keys(self):
         # A DFlash draft has neither a candidate selector nor a unary transform.
@@ -511,7 +715,7 @@ class CandidateSelectorTest(unittest.TestCase):
         )
         self.assertEqual(ratio("position_1/objective/loss_weight_share"), 0.5)
         self.assertEqual(ratio("position_1/teacher/unary_top1_agreement"), 1.0)
-        self.assertIn("dflash/teacher/expected_accepted_length", ratios)
+        self.assertIn("dflash/teacher/unary_overlap_chain_length", ratios)
         self.assertFalse(
             any(
                 key.startswith("dflash2/") or "/selector/" in key or "selector_" in key
@@ -552,7 +756,7 @@ class CandidateSelectorTest(unittest.TestCase):
             attention_backend="eager",
             loss_type="dpace",
         )
-        # Block 0: slot 1 covers gold at rank 1 (serving misses), slot 2 at
+        # Block 0: slot 1 covers gold at rank 1 (greedy misses), slot 2 at
         # rank 0. Block 1: slot 1 misses the top-2 entirely, slot 2 at rank 0.
         hidden = torch.tensor(
             [
@@ -574,15 +778,48 @@ class CandidateSelectorTest(unittest.TestCase):
         weights = torch.tensor([[[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]])
         predecessors = torch.tensor([[[4, 4, 2], [4, 4, 1]]])
 
+        with self.assertRaisesRegex(ValueError, "sequence_anchor_scale"):
+            model._dflash_metric_chunk_terms(hidden, target_ids, weights, predecessors)
         terms = model._dflash_metric_chunk_terms(
-            hidden, target_ids, weights, predecessors
+            hidden,
+            target_ids,
+            weights,
+            predecessors,
+            sequence_anchor_scale=model._sequence_anchor_scale(weights),
         )
+
+        for chunk_size in (0, 1, 2):
+            chunked = checkpointed_chunk_reduce(
+                model._dflash_metric_chunk_terms,
+                hidden,
+                target_ids,
+                weights,
+                predecessors,
+                None,
+                model._sequence_anchor_scale(weights),
+                chunk_size=chunk_size,
+                dim=1,
+            )
+            for actual, expected in zip(chunked, terms):
+                torch.testing.assert_close(actual, expected)
 
         self.assertEqual(terms.block_den.item(), 2.0)
         # Oracle: anchor + 2 slots in block 0, anchor only in block 1.
         self.assertEqual(terms.oracle_accepted_length_num.item(), 4.0)
-        # Serving path misses slot 1 in both blocks, so each accepts the anchor.
-        self.assertEqual(terms.serving_accepted_length_num.item(), 2.0)
+        # Greedy path misses slot 1 in both blocks, so each accepts the anchor.
+        self.assertEqual(terms.greedy_accepted_length_num.item(), 2.0)
+        # The marginal slot-2 score is perfect, but neither selector prefix
+        # reaches slot 2. Its prefix rate must therefore have denominator zero.
+        torch.testing.assert_close(
+            terms.selector_greedy_correct_num, torch.tensor([0.0, 0.0, 2.0])
+        )
+        torch.testing.assert_close(
+            terms.prefix_reached_num[2], torch.tensor([0.0, 2.0, 0.0])
+        )
+        torch.testing.assert_close(terms.prefix_accepted_num[2], torch.zeros(3))
+        torch.testing.assert_close(
+            terms.selector_prefix_covered_num, torch.tensor([0.0, 1.0, 0.0])
+        )
         torch.testing.assert_close(
             terms.selector_covered_den, torch.tensor([0.0, 1.0, 2.0])
         )
@@ -604,6 +841,20 @@ class CandidateSelectorTest(unittest.TestCase):
             .gather(-1, target_ids[0].unsqueeze(-1))
             .squeeze(-1)
         )
+        expected_loss_weights = (
+            weights
+            * model._dpace_weight(
+                gold_probability.unsqueeze(0),
+                weights,
+                weights > 0,
+                "dpace",
+            )
+            / 2.0
+        )
+        torch.testing.assert_close(
+            terms.loss_weight_num,
+            expected_loss_weights.sum(dim=(0, 1)),
+        )
         torch.testing.assert_close(
             terms.expected_accepted_length_num,
             (1.0 + gold_probability[:, 1:].cumprod(dim=-1).sum(dim=-1)).sum(),
@@ -617,7 +868,7 @@ class CandidateSelectorTest(unittest.TestCase):
             terms.teacher_expected_acceptance_num,
             terms.teacher_unary_top1_agreement_num,
             terms.teacher_unary_topk_mass_num,
-            terms.teacher_selector_serving_agreement_num,
+            terms.teacher_selector_greedy_agreement_num,
         ):
             torch.testing.assert_close(teacher_term, torch.zeros(3))
 
@@ -706,14 +957,15 @@ class CandidateSelectorTest(unittest.TestCase):
             collect_detailed_metrics=False,
         )
 
+        self.assertEqual(metrics["sum_metrics"], {})
         self.assertFalse(
             any(
                 name.startswith(
                     (
                         "dflash/",
                         "position_",
-                        "dflash2/selector/serving_",
-                        "dflash2/selector/conditional_",
+                        "dflash2/selector/greedy_",
+                        "dflash2/selector/teacher_forced_covered_accuracy",
                     )
                 )
                 for name in metrics["ratio_metrics"]
@@ -911,11 +1163,19 @@ class CandidateSelectorTest(unittest.TestCase):
         # position weight, and that same weight must scale both objectives.
         model.loss_type = "dpace"
         model.dpace_alpha = 0.5
+        with self.assertRaisesRegex(ValueError, "sequence_anchor_scale"):
+            model._dflash_objective_chunk_terms(
+                hidden,
+                covered_targets,
+                weights,
+                predecessors,
+            )
         dpace_terms = model._dflash_objective_chunk_terms(
             hidden,
             covered_targets,
             weights,
             predecessors,
+            sequence_anchor_scale=model._sequence_anchor_scale(weights),
         )
         unary_probability = torch.exp(-covered_base_ce)
         dpace_weight = 0.5 * unary_probability + 0.5
@@ -928,6 +1188,42 @@ class CandidateSelectorTest(unittest.TestCase):
             selector_ce * dpace_weight,
         )
         torch.testing.assert_close(dpace_terms.selector_weight_den, dpace_weight)
+        self.assertEqual(dpace_terms.loss_den.item(), 1.0)
+
+        # Sequence-balanced anchor normalization applies the same 1 / A_b
+        # scale to the shared base and selector numerators. The first sequence
+        # has two valid anchors while the second has one.
+        multi_hidden = hidden.expand(2, 2, -1, -1).clone()
+        multi_targets = covered_targets.expand(2, 2, -1).clone()
+        multi_weights = torch.tensor(
+            [
+                [[0.0, 1.0], [0.0, 1.0]],
+                [[0.0, 1.0], [0.0, 0.0]],
+            ]
+        )
+        multi_predecessors = predecessors.expand(2, 2, -1).clone()
+
+        multi_terms = model._dflash_objective_chunk_terms(
+            multi_hidden,
+            multi_targets,
+            multi_weights,
+            multi_predecessors,
+            sequence_anchor_scale=model._sequence_anchor_scale(multi_weights),
+        )
+
+        torch.testing.assert_close(
+            multi_terms.ce_loss_num,
+            2.0 * covered_base_ce * dpace_weight,
+        )
+        torch.testing.assert_close(
+            multi_terms.selector_ce_num,
+            2.0 * selector_ce * dpace_weight,
+        )
+        torch.testing.assert_close(
+            multi_terms.selector_weight_den,
+            2.0 * dpace_weight,
+        )
+        self.assertEqual(multi_terms.loss_den.item(), 2.0)
 
     def test_selector_keeps_ce_when_base_uses_tv(self):
         class Draft(nn.Module):
@@ -980,7 +1276,7 @@ class CandidateSelectorTest(unittest.TestCase):
             torch.tensor([1]),
         )
         torch.testing.assert_close(loss, (1.0 - target_probability) + selector_ce)
-        selector_num, selector_den = metrics["ratio_metrics"]["selector_loss"]
+        selector_num, selector_den = metrics["ratio_metrics"]["dflash2/selector/loss"]
         torch.testing.assert_close(selector_num / selector_den, selector_ce)
 
     def test_selector_objective_backpropagates_to_all_selector_factors(self):

@@ -19,15 +19,248 @@ from __future__ import annotations
 import copy
 import json
 import os
-from typing import List, Literal, Optional
+import re
+from typing import Dict, List, Literal, Mapping, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
 SGLANG_CAPTURE_CONTEXT_HEADROOM = 7
+
+#: SGLang flags the managed-local launcher renders for every capture server,
+#: mapped to the setting that owns them. Passthrough arguments must not repeat
+#: them.
+SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
+    "--model-path": "model.target_model_path",
+    "--dtype": "model.torch_dtype",
+    "--trust-remote-code": "model.trust_remote_code",
+    "--skip-tokenizer-init": "the capture launcher",
+    "--tp-size": "capture_servers[].tp_size",
+    "--chunked-prefill-size": "the capture launcher (complete prefills)",
+    "--enable-spec-capture": "the capture launcher",
+    "--spec-capture-method": "the algorithm's capture contract",
+    "--spec-capture-aux-layer-ids": "the algorithm's capture contract",
+    "--speculative-algorithm": "the algorithm's capture contract (plugin backend)",
+    "--enable-return-aux-hidden-states": "the algorithm's capture contract",
+    "--return-aux-hidden-state-layer-ids": "the algorithm's capture contract",
+    "--return-hidden-states-mode": "the capture launcher (full prefill capture)",
+    "--enable-return-hidden-states": "the capture launcher (full prefill capture)",
+    "--host": "the capture launcher (loopback)",
+    "--port": "capture_servers[].port",
+    "--context-length": "model.sglang_context_length",
+}
+#: Passthrough flags a managed-local capture server must not receive, and why.
+_SGLANG_UNSUPPORTED_FLAGS: Mapping[str, str] = {
+    # /health stays open under --api-key, so the stack would start and then
+    # fail every unauthenticated capture /generate.
+    "--api-key": "the capture adapter sends no API key to its /generate calls",
+    "--enable-dp-attention": (
+        "managed_local capture servers do not support SGLang DP options"
+    ),
+    "--enable-dp-lm-head": (
+        "managed_local capture servers do not support SGLang DP options"
+    ),
+    "--config": "SGLang merges that file unchecked; list its flags instead",
+}
+#: SGLang v0.5.18 spellings that write the same option, checked against its
+#: parser in tests. Positive/negative boolean flags belong to one group too:
+#: they conflict under the no-overrides rule, but their argv is never rewritten.
+_SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
+    "--model-path": ("--model",),
+    "--dist-init-addr": ("--nccl-init-addr",),
+    "--tp-size": ("--tensor-parallel-size",),
+    "--dcp-size": ("--decode-context-parallel-size",),
+    "--pp-size": ("--pipeline-parallel-size",),
+    "--ep-size": ("--expert-parallel-size", "--ep"),
+    "--dp-size": ("--data-parallel-size",),
+    "--attn-cp-size": ("--attention-context-parallel-size",),
+    "--moe-dp-size": ("--moe-data-parallel-size",),
+    "--dcp-replicate-q-proj": ("--no-dcp-replicate-q-proj",),
+    "--enable-tp-lm-head-all-to-all": ("--no-enable-tp-lm-head-all-to-all",),
+    "--smg-http-sidecar-port": ("--grpc-http-sidecar-port",),
+    "--speculative-draft-model-path": ("--speculative-draft-model",),
+    "--hisparse-config": ("--hierarchical-sparse-attention-extra-config",),
+    "--experts-shared-outer-loras": ("--no-experts-shared-outer-loras",),
+    "--lora-strict-loading": ("--no-lora-strict-loading",),
+    "--dllm-fdfo": ("--no-dllm-fdfo",),
+    "--mamba-radix-cache-strategy": ("--mamba-scheduler-strategy",),
+    "--stream-output": ("--incremental-streaming-output",),
+    "--cuda-graph-bs-decode": ("--cuda-graph-bs",),
+    "--cuda-graph-max-bs-decode": ("--cuda-graph-max-bs",),
+    "--cuda-graph-bs-prefill": ("--piecewise-cuda-graph-tokens",),
+    "--cuda-graph-max-bs-prefill": ("--piecewise-cuda-graph-max-tokens",),
+    "--cuda-graph-backend-prefill": (
+        "--enable-breakable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
+        "--enforce-piecewise-cuda-graph",
+    ),
+    "--cuda-graph-tc-compiler": ("--piecewise-cuda-graph-compiler",),
+    "--dsa-prefill-cp-mode": ("--nsa-prefill-cp-mode",),
+    "--dsa-prefill-backend": ("--nsa-prefill-backend",),
+    "--dsa-decode-backend": ("--nsa-decode-backend",),
+    "--enable-dsa-prefill-context-parallel": ("--enable-nsa-prefill-context-parallel",),
+    "--enable-linear-replayssm-spec": ("--enable-gdn-replayssm-spec",),
+    "--speculative-draft-window-size": ("--speculative-dflash-draft-window-size",),
+}
+#: Complete SGLang v0.5.18 options that are also prefixes of other options.
+#: argparse matches these exactly instead of expanding them. Keep this small
+#: table in sync with the pinned parser (covered by the launch-plan tests),
+#: without importing SGLang/PyTorch during configuration validation.
+_SGLANG_EXACT_PREFIX_FLAGS = frozenset(
+    {
+        "--cuda-graph-bs",
+        "--cuda-graph-max-bs",
+        "--disable-cuda-graph",
+        "--dllm-algorithm",
+        "--enable-dp-attention",
+        "--enable-linear-replayssm",
+        "--enable-lora",
+        "--enable-metrics",
+        "--enable-torch-compile",
+        "--ep",
+        "--export-metrics-to-file",
+        "--hicache-storage-backend",
+        "--kv-canary",
+        "--log-level",
+        "--log-requests",
+        "--model",
+        "--quantization",
+        "--sidecar",
+        "--speculative-adaptive",
+        "--speculative-draft-model",
+        "--ssl-keyfile",
+    }
+)
+#: Secret-valued SGLang options must be spelled out; plan rendering also
+#: recognizes their prefixes so even an unvalidated command stays redacted.
+SGLANG_SECRET_FLAGS = ("--api-key", "--admin-api-key")
+
+
+#: ``sglang_*`` fields whose SGLang flag does not follow the
+#: ``sglang_foo_bar`` -> ``--foo-bar`` convention.
+_SGLANG_FLAG_NAMES: Mapping[str, str] = {
+    "sglang_fp4_gemm_runner_backend": "--fp4-gemm-backend",
+}
+#: ``sglang_*`` fields that carry raw argv tokens instead of one flag.
+SGLANG_PASSTHROUGH_FIELDS = frozenset({"sglang_extra_args"})
+#: Capture-server environment the managed-local launcher sets itself.
+_OWNED_SERVER_ENV_PREFIXES = ("MOONCAKE_", "DISAGG_")
+_OWNED_SERVER_ENV = {
+    "CUDA_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "ASCEND_RT_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "ASCEND_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "HIP_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "ROCR_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
+    "SGLANG_SPEC_CAPTURE_GPU_PUT": "capture_servers[].gpu_put",
+    "SPECFORGE_SPEC_CAPTURE": "deployment.disaggregated.server_capture",
+    "SGLANG_SPEC_CAPTURE_ARENA_BYTES": "mooncake.arena_bytes",
+    "FLASHINFER_DISABLE_VERSION_CHECK": "the capture launcher",
+}
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SGLANG_CANONICAL_FLAGS = {
+    alias: flag for flag, aliases in _SGLANG_FLAG_ALIASES.items() for alias in aliases
+}
+
+
+def sglang_field_flag(name: str) -> str:
+    """The SGLang CLI flag rendered for the ``ModelConfig`` field *name*."""
+    return _SGLANG_FLAG_NAMES.get(
+        name, "--" + name.removeprefix("sglang_").replace("_", "-")
+    )
+
+
+def _with_aliases(flags: Mapping[str, str]) -> Dict[str, str]:
+    """Extend *flags* with every other SGLang spelling of the same options."""
+    expanded = dict(flags)
+    for flag, owner in flags.items():
+        canonical = _SGLANG_CANONICAL_FLAGS.get(flag, flag)
+        for spelling in (canonical, *_SGLANG_FLAG_ALIASES.get(canonical, ())):
+            expanded.setdefault(spelling, owner)
+    return expanded
+
+
+def _as_string_tokens(value, *, field_name: str):
+    """Accept unquoted YAML numbers where SGLang expects a string token."""
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{field_name} must hold strings; quote boolean-looking values"
+        )
+    if isinstance(value, (int, float)):
+        return str(value)
+    return value
+
+
+def _validate_sglang_extra_args(
+    tokens: List[str],
+    *,
+    field_name: str,
+    reserved: Mapping[str, str],
+) -> None:
+    """Reject passthrough tokens that repeat or split a rendered SGLang flag.
+
+    *reserved* maps every flag spelling already on the server command line to
+    the setting that owns it. Flags are the ``--``-prefixed tokens; the rest
+    are their values, so the list must open with a flag. SGLang's parser also
+    expands unambiguous prefixes, so abbreviations of reserved, supplied,
+    unsupported, or secret flags are rejected too. Exact options that happen
+    to be prefixes remain valid.
+    """
+    if tokens and not tokens[0].startswith("--"):
+        raise ValueError(f"{field_name} must start with a --flag, got {tokens[0]!r}")
+    supplied = _with_aliases(
+        {
+            token.split("=", 1)[0]: field_name
+            for token in tokens
+            if token.startswith("--")
+        }
+    )
+    spellings = sorted(
+        set(reserved)
+        | set(supplied)
+        | set(_SGLANG_UNSUPPORTED_FLAGS)
+        | set(SGLANG_SECRET_FLAGS)
+    )
+    seen = set()
+    for token in tokens:
+        if not token.startswith("--"):
+            continue
+        flag = token.split("=", 1)[0]
+        if flag == "--" or any(character.isspace() for character in flag):
+            raise ValueError(
+                f"{field_name} entry {token!r} is not a single flag; list each "
+                "flag and each value as its own item"
+            )
+        if flag in reserved:
+            raise ValueError(
+                f"{field_name} must not set {flag}; it is rendered from "
+                f"{reserved[flag]}"
+            )
+        if flag in _SGLANG_UNSUPPORTED_FLAGS:
+            raise ValueError(
+                f"{field_name} must not set {flag}; "
+                f"{_SGLANG_UNSUPPORTED_FLAGS[flag]}"
+            )
+        for other in spellings:
+            # Compare both directions: a global abbreviation can precede a
+            # full per-server flag, or the abbreviation can come second.
+            short, full = sorted((flag, other), key=len)
+            if (
+                short != full
+                and short not in _SGLANG_EXACT_PREFIX_FLAGS
+                and full.startswith(short)
+            ):
+                owner = reserved.get(other, field_name)
+                raise ValueError(
+                    f"{field_name} entry {flag} conflicts with {other} from {owner}: "
+                    f"{short} is a prefix of {full}; spell out the full flag"
+                )
+        canonical = _SGLANG_CANONICAL_FLAGS.get(flag, flag)
+        if canonical in seen:
+            raise ValueError(f"{field_name} repeats {flag}")
+        seen.add(canonical)
 
 
 class StrictConfigModel(BaseModel):
@@ -60,8 +293,12 @@ class ModelConfig(StrictConfigModel):
     #: text only; unsupported modalities fail during application resolution.
     input_modality: str = "text"
     trust_remote_code: bool = False
-    #: Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash. Requires ``specforge[liger]``.
-    use_liger_kernel: bool = False
+    #: Liger RMSNorm/SwiGLU kernels for DFlash/DFlash2 drafts. ``None`` (auto)
+    #: enables them for training.strategy=dflash on a CUDA/ROCm trainer with a
+    #: silu/swish draft and keeps the native Qwen3 modules otherwise; ``true``
+    #: fails when they cannot be used; ``false`` disables them. Resolved kernels
+    #: that cannot be imported are an error in both the auto and explicit cases.
+    use_liger_kernel: Optional[bool] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).
@@ -114,6 +351,53 @@ class ModelConfig(StrictConfigModel):
         gt=0.0,
         le=1.0,
     )
+    #: Positive token budget of one SGLang prefill batch.
+    sglang_max_prefill_tokens: Optional[int] = Field(default=None, gt=0)
+    #: Kernel backend for linear-attention (GDN/KDA) prefill in hybrid targets.
+    sglang_linear_attn_prefill_backend: Optional[str] = None
+    #: Blockwise FP8 GEMM runner, rendered as ``--fp8-gemm-backend``.
+    sglang_fp8_gemm_backend: Optional[str] = None
+    #: Pass SGLang's ``--disable-cuda-graph`` (decode and prefill graphs).
+    sglang_disable_cuda_graph: bool = False
+    #: Further SGLang CLI tokens appended to every managed-local capture
+    #: server, one flag or value per item. Flags the launcher or another
+    #: ``sglang_*`` field already renders are rejected.
+    sglang_extra_args: List[str] = Field(default_factory=list)
+
+    @field_validator("sglang_extra_args", mode="before")
+    @classmethod
+    def _string_extra_args(cls, value):
+        if not isinstance(value, list):
+            return value
+        return [
+            _as_string_tokens(item, field_name="model.sglang_extra_args")
+            for item in value
+        ]
+
+    def rendered_sglang_flags(self) -> Dict[str, str]:
+        """Every flag spelling the managed capture command derives from this model.
+
+        Maps each flag, including SGLang aliases, to the setting that owns it.
+        """
+        rendered = dict(SGLANG_LAUNCHER_OWNED_FLAGS)
+        if self.cache_dir:
+            rendered["--download-dir"] = "model.cache_dir"
+        for name in type(self).model_fields:
+            if not name.startswith("sglang_") or name in SGLANG_PASSTHROUGH_FIELDS:
+                continue
+            value = getattr(self, name)
+            if value is not None and value is not False:
+                rendered.setdefault(sglang_field_flag(name), f"model.{name}")
+        return _with_aliases(rendered)
+
+    @model_validator(mode="after")
+    def _check_sglang_extra_args(self):
+        _validate_sglang_extra_args(
+            self.sglang_extra_args,
+            field_name="model.sglang_extra_args",
+            reserved=self.rendered_sglang_flags(),
+        )
+        return self
 
     @model_validator(mode="after")
     def _validate_input_modality(self):
@@ -204,6 +488,7 @@ class RuntimeConfig(StrictConfigModel):
     resident_high_watermark_bytes: Optional[int] = Field(default=None, gt=0)
     resident_low_watermark_bytes: Optional[int] = Field(default=None, ge=0)
     feature_store_max_resident_bytes: Optional[int] = Field(default=None, gt=0)
+    feature_store_max_quarantined_bytes: int = Field(default=8 << 30, ge=0)
 
     @model_validator(mode="after")
     def _validate_watermarks(self):
@@ -267,6 +552,23 @@ class TrainerDeploymentConfig(StrictConfigModel):
         return self
 
 
+def validate_receive_buffers(receive_buffers: str, protocol: str) -> None:
+    """Device receive buffers need a transport that writes device memory.
+
+    NVLink reads only into device memory, so it also requires them.
+    """
+    if receive_buffers == "cuda" and protocol not in ("rdma", "nvlink"):
+        raise ValueError(
+            "deployment.disaggregated.receive_buffers=cuda needs an RDMA or NVLink "
+            f"Mooncake transport; the effective MOONCAKE_PROTOCOL is {protocol!r}"
+        )
+    if protocol == "nvlink" and receive_buffers != "cuda":
+        raise ValueError(
+            "MOONCAKE_PROTOCOL=nvlink reads into device memory; set "
+            "deployment.disaggregated.receive_buffers=cuda"
+        )
+
+
 def _validate_cuda_devices(devices: List[str], *, field_name: str) -> None:
     for device in devices:
         if not device or device.strip() != device or "," in device:
@@ -285,11 +587,22 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metadata_port: int = Field(default=35880, gt=0, le=65535)
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
-    protocol: Literal["tcp", "rdma"] = "tcp"
+    #: Transport for every owned Mooncake client. None is resolved once when
+    #: the launch plan is built: tcp on Ascend hosts and rdma everywhere else;
+    #: the launch fails when no usable HCA is found. tcp opts out of RDMA.
+    protocol: Optional[Literal["tcp", "rdma", "nvlink"]] = None
+    #: nvlink keeps captures in server GPU arenas; see arena_bytes.
+    #: Comma-separated HCAs for rdma. None selects every usable HCA of one link
+    #: layer; a listed device that is not usable is an error.
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
+    #: Arena size: HBM each capture server reserves for capture objects.
+    #: Required with ``nvlink``. Leave room for it below ``mem_fraction_static``.
+    arena_bytes: Optional[int] = Field(default=None, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
+    #: Budget for one readiness probe, capped by the remaining startup timeout.
+    probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     #: Master key-lease TTL (ms) forwarded to ``mooncake_master
     #: --default_kv_lease_ttl``. The consumer's teardown drain allows about
     #: 19.5s for leases to settle. Keep the managed-local default at 500ms so
@@ -302,6 +615,13 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
         ports = (self.rpc_port, self.metadata_port, self.metrics_port)
         if len(set(ports)) != len(ports):
             raise ValueError("managed_local Mooncake ports must be unique")
+        # Currently only online NVLink capture uses the arena.
+        if (self.protocol == "nvlink") != (self.arena_bytes is not None):
+            raise ValueError(
+                "managed_local.mooncake.arena_bytes is required with protocol "
+                "'nvlink', the only protocol that uses the arena, and applies "
+                "only to it"
+            )
         if (
             not self.local_hostname
             or self.local_hostname.strip() != self.local_hostname
@@ -328,6 +648,43 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
+    #: None selects CUDA publication in the capture worker when
+    #: mooncake.protocol is rdma explicitly, and host publication when the
+    #: protocol is left unset (CUDA publication also needs GPUDirect RDMA).
+    gpu_put: Optional[bool] = None
+    #: SGLang's generation-based /health waits at least one second internally.
+    probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    #: SGLang CLI tokens for this server only, appended after
+    #: ``model.sglang_extra_args``.
+    extra_args: List[str] = Field(default_factory=list)
+    #: Extra environment for this server process, such as the capture
+    #: patch's ``SGLANG_SPEC_CAPTURE_*`` knobs. Keys the launcher sets
+    #: (Mooncake, transport and device visibility) are rejected.
+    env: Dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("extra_args", mode="before")
+    @classmethod
+    def _string_extra_args(cls, value):
+        if not isinstance(value, list):
+            return value
+        return [
+            _as_string_tokens(
+                item, field_name="managed_local.capture_servers[].extra_args"
+            )
+            for item in value
+        ]
+
+    @field_validator("env", mode="before")
+    @classmethod
+    def _string_env_values(cls, value):
+        if not isinstance(value, dict):
+            return value
+        return {
+            name: _as_string_tokens(
+                item, field_name="managed_local.capture_servers[].env"
+            )
+            for name, item in value.items()
+        }
 
     @model_validator(mode="after")
     def _validate_devices(self):
@@ -340,6 +697,32 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
                 "managed_local capture server tp_size must equal the number of "
                 "cuda_visible_devices"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_passthrough(self):
+        # Rendered model-level flags are checked by Config, which sees both.
+        _validate_sglang_extra_args(
+            self.extra_args,
+            field_name="managed_local.capture_servers[].extra_args",
+            reserved=_with_aliases(SGLANG_LAUNCHER_OWNED_FLAGS),
+        )
+        for name in self.env:
+            if not _ENV_NAME.fullmatch(name):
+                raise ValueError(
+                    "managed_local.capture_servers[].env keys must be "
+                    f"environment variable names, got {name!r}"
+                )
+            owner = _OWNED_SERVER_ENV.get(name) or (
+                "the managed Mooncake/transport settings"
+                if name.startswith(_OWNED_SERVER_ENV_PREFIXES)
+                else None
+            )
+            if owner is not None:
+                raise ValueError(
+                    f"managed_local.capture_servers[].env must not set {name}; "
+                    f"it is set from {owner}"
+                )
         return self
 
 
@@ -371,6 +754,23 @@ class ManagedLocalStackConfig(StrictConfigModel):
         capture_ports = [server.port for server in self.capture_servers]
         if len(set(capture_ports)) != len(capture_ports):
             raise ValueError("managed_local capture server ports must be unique")
+        # An unset protocol can still resolve to tcp; the launch plan repeats
+        # this check after resolving it.
+        if any(server.gpu_put for server in self.capture_servers) and (
+            self.mooncake.protocol == "tcp"
+        ):
+            raise ValueError(
+                "managed_local capture_servers[].gpu_put needs mooncake.protocol "
+                f"'rdma' or 'nvlink'; the {self.mooncake.protocol!r} transport "
+                "cannot read device memory"
+            )
+        if self.mooncake.protocol == "nvlink" and any(
+            server.gpu_put is False for server in self.capture_servers
+        ):
+            raise ValueError(
+                "managed_local mooncake.protocol 'nvlink' publishes device "
+                "memory; capture_servers[].gpu_put cannot be false"
+            )
         overlap = mooncake_ports.intersection(capture_ports)
         if overlap:
             raise ValueError(
@@ -415,6 +815,11 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     store_root: Optional[str] = None
     store_id: Optional[str] = None
     server_urls: List[str] = Field(default_factory=list)
+    #: How the SGLang capture servers implement spec capture: ``patch`` is the
+    #: versioned source patch under ``patches/sglang``; ``plugin`` is the
+    #: ``specforge-sglang-capture`` plugin on an SGLang build with forward
+    #: observers, deferred outputs and ``--enable-return-aux-hidden-states``.
+    server_capture: Literal["patch", "plugin"] = "patch"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None
@@ -426,9 +831,25 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: zero for both SpecForge roles.
     producer_segment_size: Optional[int] = Field(default=None, gt=0)
     client_buffer_size: int = Field(default=256 << 20, gt=0)
+    #: Consumer receive buffers for Mooncake ``get_into``: ``pageable`` allocates
+    #: a fresh host tensor per feature (registered and unregistered around each
+    #: read, then copied to the device on the training stream); ``pinned`` keeps
+    #: a bounded pool of page-locked, once-registered host buffers and copies to
+    #: the device on a side stream; ``cuda`` keeps the pool on the trainer device
+    #: for device reads (Mooncake 0.3.x stages these through its client buffer).
+    receive_buffers: Literal["pageable", "pinned", "cuda"] = "pinned"
+    #: Retained receive-pool budget per rank; excludes output copies and overflow.
+    receive_pool_bytes: int = Field(default=8 << 30, gt=0)
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
     producer_hold_s: Optional[float] = Field(default=None, gt=0)
+    #: Online consumer: run each optimizer boundary's durable ack (ledger
+    #: commit, feature removes, DP ack collectives over a dedicated Gloo group)
+    #: on a background thread while the next step computes. The durable marker
+    #: lags by at most one optimizer step and is flushed before every
+    #: checkpoint. Exported as ``DISAGG_ASYNC_ACK``; an explicit env value wins.
+    #: Off keeps acks synchronous on the default group (no Gloo group).
+    async_ack: bool = True
     #: SIGTERM-to-SIGKILL grace for a plain (non-managed) supervisor teardown.
     #: Workers translate SIGTERM into cleanup (Mooncake drains, checkpoint
     #: flush, failure sentinels), so this window must cover that work.
@@ -440,6 +861,13 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     def _validate_store(self):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
+        if self.managed_local is not None:
+            # External deployments resolve environment overrides in the launch
+            # plan. An unset managed protocol is checked after resolution.
+            if self.managed_local.mooncake.protocol is not None:
+                validate_receive_buffers(
+                    self.receive_buffers, self.managed_local.mooncake.protocol
+                )
         if self.consumer_state_dir is not None and (
             not self.consumer_state_dir
             or self.consumer_state_dir.strip() != self.consumer_state_dir
@@ -557,6 +985,8 @@ class TrainingConfig(StrictConfigModel):
     #: prompt-heavy data. Falls back to the full-length path for batch > 1 or when
     #: an lk_loss objective is used.
     trim_loss_positions: bool = False
+    #: MTP token positions per lm_head + CE chunk (0 disables chunking).
+    mtp_objective_chunk_size: int = Field(default=4096, ge=0)
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None
@@ -578,6 +1008,13 @@ class TrainingConfig(StrictConfigModel):
     #: Stop selector gradients at the unary/backbone boundary while preserving
     #: the primary DFlash/D-PACE/LK gradient path.
     dflash2_selector_stop_gradient: bool = False
+    #: Online DFlash/DFlash2 only: capture the target's final hidden state for
+    #: the teacher-agreement diagnostics (``dflash/teacher/*`` and
+    #: ``dflash2/selector/self_conditioned_teacher_argmax_agreement``). The
+    #: objective never reads it; ``false`` stops the capture server from
+    #: writing it and the trainer from fetching it (one ``hidden_size`` row per
+    #: token next to the ``len(target_layer_ids) * hidden_size`` aux row).
+    dflash_teacher_metrics: bool = True
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1
@@ -858,6 +1295,16 @@ class Config(StrictConfigModel):
                 )
             if self.training.resume_from is not None:
                 raise ValueError("managed_local does not support resume")
+            mooncake = managed_local.mooncake
+            if mooncake.protocol == "nvlink":
+                arenas = mooncake.arena_bytes * len(managed_local.capture_servers)
+                watermark = self.runtime.resident_high_watermark_bytes
+                if watermark is None or watermark > arenas:
+                    raise ValueError(
+                        f"NVLink capture keeps objects in {arenas} bytes of "
+                        "capture-server HBM (arena_bytes per server); set "
+                        "runtime.resident_high_watermark_bytes no higher"
+                    )
             minimum_context_length = (
                 self.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
             )
@@ -906,6 +1353,22 @@ class Config(StrictConfigModel):
                     "model.sglang_ep_size must be no larger than and evenly "
                     "divide every managed capture-server tp_size; incompatible "
                     f"tp sizes: {incompatible_tp_sizes}"
+                )
+            # A flag is set in exactly one place on each server command line.
+            rendered = self.model.rendered_sglang_flags()
+            reserved = dict(rendered)
+            global_flags = {
+                token.split("=", 1)[0]: "model.sglang_extra_args"
+                for token in self.model.sglang_extra_args
+                if token.startswith("--")
+            }
+            for flag, owner in _with_aliases(global_flags).items():
+                reserved.setdefault(flag, owner)
+            for index, server in enumerate(managed_local.capture_servers):
+                _validate_sglang_extra_args(
+                    server.extra_args,
+                    field_name=f"managed_local.capture_servers[{index}].extra_args",
+                    reserved=reserved,
                 )
         if self.training.role == "producer" and self.training.resume_from is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")

@@ -283,6 +283,11 @@ class TestTemplatePreprocessing(unittest.TestCase):
     def test_deepseek_v32(self):
         self._run_template_test("deepseek-ai/DeepSeek-V3.2", "deepseek-v32")
 
+    def test_deepseek_r1_distill(self):
+        self._run_template_test(
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", "deepseek-r1-distill"
+        )
+
     def test_qwen3_thinking(self):
         self._run_template_test(
             "Qwen/Qwen3-0.6B",
@@ -320,6 +325,16 @@ class TestTemplatePreprocessing(unittest.TestCase):
 
     def test_ling_flash_2_0(self):
         self._run_template_test("inclusionAI/Ling-flash-2.0", "ling-flash-2.0")
+
+    def test_ling_3_0(self):
+        self._run_template_test("inclusionAI/Ling-3.0-tiny", "ling-3.0")
+
+    def test_ling_3_0_thinking(self):
+        self._run_template_test(
+            "inclusionAI/Ling-3.0-tiny",
+            "ling-3.0-thinking",
+            messages=self.reasoning_multi_turn_messages,
+        )
 
     def test_qwen3_instruct_with_tools(self):
         self._run_template_test(

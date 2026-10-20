@@ -180,9 +180,9 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
     """Build the method-specific composite model and frozen target pieces."""
     import torch
 
+    from specforge.modeling.target.target_utils import load_target_config
     from specforge.modeling.target.target_utils import (
-        load_target_config,
-        target_text_config,
+        target_hidden_size as resolve_target_hidden_size,
     )
     from specforge.modeling.target.target_utils import (
         target_vocab_size as resolve_target_vocab_size,
@@ -197,8 +197,7 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
-    text_config = target_text_config(target_config)
-    target_hidden_size = int(text_config.hidden_size)
+    target_hidden_size = resolve_target_hidden_size(target_config)
     target_vocab_size = resolve_target_vocab_size(target_config)
     draft_vocab_size = int(
         getattr(draft_config, "draft_vocab_size", draft_config.vocab_size)
@@ -606,6 +605,7 @@ def build_training_run(
 
     if cfg.deployment.mode == "disaggregated":
         from specforge.training.disaggregated import build_disaggregated_run
+        from specforge.training.model_loading import preflight_draft_kernels
 
         run_logger = _configured_logger(cfg)
         try:
@@ -613,6 +613,9 @@ def build_training_run(
                 cfg,
                 algorithm=algorithm,
                 build_model_bundle=lambda run_cfg: build_model_bundle(
+                    run_cfg, algorithm=algorithm
+                ),
+                preflight_model_bundle=lambda run_cfg: preflight_draft_kernels(
                     run_cfg, algorithm=algorithm
                 ),
                 prepare_prompts=lambda run_cfg, tokenizer, **kwargs: _prepare_prompts(

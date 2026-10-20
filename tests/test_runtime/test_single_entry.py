@@ -24,7 +24,9 @@ from specforge.config import Config
 from specforge.training.assembly import TrainingRun
 from specforge.training.disaggregated import (
     _ONLINE_CONTROL_SUFFIXES,
+    _build_online,
     _claim_fresh_control_path,
+    _mooncake_store,
     build_disaggregated_run,
 )
 
@@ -59,6 +61,133 @@ class _FakeTrainer:
 
 
 class TestTrainingRunLifecycle(unittest.TestCase):
+    def test_online_consumer_closes_its_store_after_fit_on_success_and_failure(self):
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"prompts_path": "prompts.jsonl"},
+                "training": {"strategy": "dflash", "role": "consumer", "max_steps": 1},
+                "deployment": _disaggregated_deployment(
+                    "/shared/close-test", server_urls=["http://capture:30000"]
+                ),
+            }
+        )
+        for error in (None, RuntimeError("fit failed")):
+            with self.subTest(error=error):
+                events = []
+                store = mock.Mock()
+                store.close.side_effect = lambda: events.append("store.close")
+                trainer = _FakeTrainer(error=error, events=events)
+                bundle = types.SimpleNamespace(
+                    model=object(), target_head=None, strategy_kwargs={}
+                )
+                preflight = mock.Mock(
+                    side_effect=lambda _cfg: events.append("preflight")
+                )
+
+                def open_store(*_args, **_kwargs):
+                    events.append("store.open")
+                    return store
+
+                with (
+                    mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": "/shared/refs"}),
+                    mock.patch(
+                        "specforge.runtime.data_plane.streaming_ref_channel."
+                        "StreamingRefChannel"
+                    ),
+                    mock.patch(
+                        "specforge.training.disaggregated._mooncake_store",
+                        side_effect=open_store,
+                    ),
+                    mock.patch(
+                        "specforge.launch.build_disagg_online_consumer",
+                        return_value=trainer,
+                    ),
+                ):
+                    run = _build_online(
+                        cfg,
+                        algorithm=ALGORITHM,
+                        build_model_bundle=lambda _cfg: bundle,
+                        prepare_prompts=mock.Mock(),
+                        optimizer_factory=mock.Mock(),
+                        logger=None,
+                        preflight_model_bundle=preflight,
+                    )
+                    if error is None:
+                        self.assertEqual(run.run(), 3)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "fit failed"):
+                            run.run()
+                preflight.assert_called_once_with(cfg)
+                self.assertEqual(
+                    events, ["preflight", "store.open", "fit", "store.close"]
+                )
+
+    def test_online_producer_requests_the_config_selected_capture_layout(self):
+        import tempfile
+
+        for teacher_metrics, last_hidden in (
+            (True, "target_last_hidden_states"),
+            (False, None),
+        ):
+            with self.subTest(dflash_teacher_metrics=teacher_metrics):
+                root = tempfile.mkdtemp(prefix="producer_layout_")
+                cfg = Config.model_validate(
+                    {
+                        "model": {"target_model_path": "t", "draft_model_config": "d"},
+                        "data": {"prompts_path": "prompts.jsonl"},
+                        "training": {
+                            "strategy": "dflash",
+                            "role": "producer",
+                            "max_steps": 1,
+                            "dflash_teacher_metrics": teacher_metrics,
+                        },
+                        "deployment": _disaggregated_deployment(
+                            root, server_urls=["http://capture:30000"]
+                        ),
+                    }
+                )
+                prompt = {"task_id": "p0", "payload": {"input_ids": [1, 2, 3]}}
+                preflight = mock.Mock(side_effect=AssertionError("consumer-only check"))
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"DISAGG_REF_CHANNEL": os.path.join(root, "refs.jsonl")},
+                    ),
+                    mock.patch(
+                        "specforge.runtime.data_plane.streaming_ref_channel."
+                        "StreamingRefChannel"
+                    ),
+                    mock.patch("specforge.training.disaggregated._mooncake_store"),
+                    mock.patch("specforge.training.assembly._load_input_tools"),
+                    mock.patch("specforge.training.model_loading.resolve_draft_config"),
+                    mock.patch(
+                        "specforge.training.disaggregated._producer_capture_metadata",
+                        return_value=([1, 2], 8, 32, 32),
+                    ),
+                    mock.patch(
+                        "specforge.inference.adapters.server_capture."
+                        "SGLangServerCaptureAdapter"
+                    ) as adapter_cls,
+                    mock.patch(
+                        "specforge.launch.build_disagg_online_producer",
+                        return_value=([], mock.Mock()),
+                    ),
+                ):
+                    _build_online(
+                        cfg,
+                        algorithm=ALGORITHM,
+                        build_model_bundle=mock.Mock(),
+                        prepare_prompts=lambda *_args, **_kwargs: [prompt],
+                        optimizer_factory=mock.Mock(),
+                        logger=None,
+                        preflight_model_bundle=preflight,
+                    )
+                preflight.assert_not_called()
+                schema = adapter_cls.call_args.kwargs["schema"]
+                self.assertEqual("hidden_states", schema.aux_feature)
+                self.assertEqual(last_hidden, schema.last_hidden_feature)
+
     def test_training_run_delegates_to_the_one_trainer_entry(self):
         trainer = _FakeTrainer(fit_step=3)
         self.assertEqual(TrainingRun(trainer=trainer).run(), 3)
@@ -106,6 +235,33 @@ class TestTrainingRunLifecycle(unittest.TestCase):
     def test_producer_executor_cannot_take_trainer_hooks(self):
         with self.assertRaisesRegex(ValueError, "hooks belong to trainer-bearing"):
             TrainingRun(execute=lambda: 1, on_finally=lambda: None)
+
+    def test_mooncake_quarantine_budget_comes_from_typed_runtime(self):
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"hidden_states_path": "/features"},
+                "runtime": {"feature_store_max_quarantined_bytes": 1234},
+            }
+        )
+        feature_store = object()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "MOONCAKE_METADATA_SERVER": "http://metadata",
+                    "MOONCAKE_MASTER_SERVER_ADDR": "127.0.0.1:50051",
+                },
+                clear=False,
+            ),
+            mock.patch(
+                "specforge.runtime.data_plane.mooncake_store.MooncakeFeatureStore",
+                return_value=feature_store,
+            ) as constructor,
+        ):
+            self.assertIs(_mooncake_store(cfg), feature_store)
+
+        self.assertEqual(constructor.call_args.kwargs["max_quarantined_bytes"], 1234)
 
     def test_disaggregated_producer_requires_fresh_attempt_path(self):
         import tempfile
@@ -184,6 +340,86 @@ class TestTrainingRunLifecycle(unittest.TestCase):
 
                 with open(channel + suffix, encoding="utf-8") as stream:
                     self.assertIn("RuntimeError: assembly exploded", stream.read())
+
+    def test_consumer_preflight_fails_before_opening_store_or_waiting(self):
+        import tempfile
+
+        for mode in ("offline", "online"):
+            with self.subTest(mode=mode):
+                root = tempfile.mkdtemp(prefix=f"preflight_{mode}_")
+                control = os.path.join(root, "control")
+                cfg = Config.model_validate(
+                    {
+                        "model": {"target_model_path": "t", "draft_model_config": "d"},
+                        "data": (
+                            {"hidden_states_path": "/features"}
+                            if mode == "offline"
+                            else {"prompts_path": "/prompts.jsonl"}
+                        ),
+                        "training": {"strategy": "dflash", "role": "consumer"},
+                        "deployment": _disaggregated_deployment(root),
+                    }
+                )
+                env_name = (
+                    "DISAGG_MANIFEST" if mode == "offline" else "DISAGG_REF_CHANNEL"
+                )
+                build_model_bundle = mock.Mock()
+                preflight = mock.Mock(side_effect=ImportError("liger missing"))
+                with (
+                    mock.patch.dict(os.environ, {env_name: control}),
+                    mock.patch(
+                        "specforge.training.disaggregated._mooncake_store"
+                    ) as store,
+                    mock.patch(
+                        "specforge.runtime.data_plane.streaming_ref_channel."
+                        "StreamingRefChannel"
+                    ) as channel,
+                    mock.patch("specforge.training.disaggregated._wait_for") as wait,
+                    mock.patch(
+                        "specforge.training.disaggregated._read_online_total_steps"
+                    ) as read_total_steps,
+                    self.assertRaisesRegex(ImportError, "liger missing"),
+                ):
+                    build_disaggregated_run(
+                        cfg,
+                        algorithm=ALGORITHM,
+                        build_model_bundle=build_model_bundle,
+                        prepare_prompts=mock.Mock(),
+                        optimizer_factory=mock.Mock(),
+                        logger=mock.Mock(),
+                        preflight_model_bundle=preflight,
+                    )
+                preflight.assert_called_once_with(cfg)
+                store.assert_not_called()
+                channel.assert_not_called()
+                wait.assert_not_called()
+                read_total_steps.assert_not_called()
+                build_model_bundle.assert_not_called()
+                with open(control + ".consumer_failed", encoding="utf-8") as stream:
+                    self.assertIn("ImportError: liger missing", stream.read())
+
+    def test_disaggregated_run_preflights_the_resolved_draft_kernels(self):
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "data": {"hidden_states_path": "/features"},
+                "training": {"strategy": "dflash", "role": "consumer"},
+                "deployment": _disaggregated_deployment("/shared/attempt"),
+            }
+        )
+        with (
+            mock.patch(
+                "specforge.training.disaggregated.build_disaggregated_run"
+            ) as build,
+            mock.patch(
+                "specforge.training.model_loading.preflight_draft_kernels"
+            ) as preflight,
+        ):
+            from specforge.training.assembly import build_training_run
+
+            build_training_run(cfg, algorithm=ALGORITHM)
+            build.call_args.kwargs["preflight_model_bundle"](cfg)
+        preflight.assert_called_once_with(cfg, algorithm=ALGORITHM)
 
     def test_failed_claim_does_not_poison_an_existing_attempt(self):
         import tempfile
