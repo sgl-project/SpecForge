@@ -84,6 +84,15 @@ def _normalize_dspark(config: Dict[str, Any], method_config: Dict[str, Any]) -> 
     config["markov_rank"] = markov_rank
     config["markov_head_type"] = markov_head_type.lower()
     config["architectures"] = ["Qwen3DSparkModel"]
+    if config.get("moe_preset"):
+        # Served by specforge.serving.sglang_models (SGLANG_EXTERNAL_MODEL_PACKAGE).
+        for key in ("num_experts", "num_experts_per_tok", "moe_intermediate_size"):
+            if not _positive_integer(config.get(key)):
+                raise ValueError(
+                    f"DSpark MoE export requires a positive integer {key}, "
+                    f"got {config.get(key)!r}"
+                )
+        config["architectures"] = ["Qwen3MoeDSparkModel"]
 
 
 def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, Any]:
