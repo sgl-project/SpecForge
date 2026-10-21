@@ -1,8 +1,7 @@
-import json
 import tempfile
 import unittest
+from copy import deepcopy
 from datetime import timedelta
-from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -42,12 +41,10 @@ def _count_allreduce(state, bucket):
 
 
 def _input(rank, micro_step):
-    return torch.arange(1, 9, dtype=torch.float32).reshape(2, 4) / (
-        rank + micro_step + 2
-    )
+    return torch.arange(1, 9, dtype=torch.float32).reshape(2, 4) / (rank + micro_step + 2)
 
 
-def _worker(rank, directory, replay=False):
+def _worker(rank, directory):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -59,8 +56,7 @@ def _worker(rank, directory, replay=False):
     try:
         torch.manual_seed(77)
         model = nn.Linear(4, 2, bias=False)
-        reference = nn.Linear(4, 2, bias=False)
-        reference.load_state_dict(model.state_dict())
+        reference = deepcopy(model)
         backend = FSDPTrainingBackend(
             ParallelConfig(world_size=2, sharding_strategy="NO_SHARD"),
             optimizer_factory=lambda target: _Optimizer(target.parameters(), lr=0.01),
@@ -68,10 +64,9 @@ def _worker(rank, directory, replay=False):
         wrapped = backend.prepare_model(model)
         state = {"calls": 0}
         wrapped.register_comm_hook(state, _count_allreduce)
-        strategy = _Strategy(wrapped)
-        core = TrainerCore(strategy, backend, accumulation_steps=2)
+        core = TrainerCore(_Strategy(wrapped), backend, accumulation_steps=2)
         reference_optimizer = _Optimizer(reference.parameters(), lr=0.01)
-        counts, differences = [], []
+        check = unittest.TestCase()
         for micro_step in range(4):
             batch = TrainBatch(
                 sample_ids=[str(micro_step)],
@@ -79,49 +74,30 @@ def _worker(rank, directory, replay=False):
                 tensors={"input": _input(rank, micro_step)},
             )
             core.train_step(batch)
-            counts.append(state["calls"])
+            check.assertEqual(state["calls"], (micro_step + 1) // 2)
+            check.assertTrue(wrapped.require_backward_grad_sync)
             if micro_step % 2 == 1:
-                for reference_rank in range(2):
-                    for reference_micro in (micro_step - 1, micro_step):
-                        loss = (
-                            reference(_input(reference_rank, reference_micro))
-                            .square()
-                            .mean()
-                            / 4
-                        )
-                        loss.backward()
-                reference_optimizer.step()
-                differences.append(
-                    float((model.weight - reference.weight).abs().max().detach())
+                # One effective batch spans both ranks and both microsteps.
+                inputs = torch.cat(
+                    [
+                        _input(r, step)
+                        for r in range(2)
+                        for step in (micro_step - 1, micro_step)
+                    ]
                 )
-        Path(directory, f"rank{rank}.json").write_text(
-            json.dumps(
-                {
-                    "collective_counts": counts,
-                    "weight_differences": differences,
-                    "sync_restored": wrapped.require_backward_grad_sync,
-                }
-            )
-        )
+                reference(inputs).square().mean().backward()
+                reference_optimizer.step()
+                torch.testing.assert_close(
+                    model.weight, reference.weight, rtol=0, atol=1e-6
+                )
     finally:
         dist.destroy_process_group()
 
 
 class DDPAccumulationTest(unittest.TestCase):
     def test_reduces_only_at_optimizer_boundaries(self):
-        self._check_accumulation(False)
-
-    def _check_accumulation(self, replay):
         with tempfile.TemporaryDirectory() as directory:
-            multiprocessing.spawn(
-                _worker, args=(directory, replay), nprocs=2, join=True
-            )
-            for rank in range(2):
-                result = json.loads(Path(directory, f"rank{rank}.json").read_text())
-                with self.subTest(rank=rank):
-                    self.assertEqual(result["collective_counts"], [0, 1, 1, 2])
-                    self.assertLess(max(result["weight_differences"]), 1e-6)
-                    self.assertTrue(result["sync_restored"])
+            multiprocessing.spawn(_worker, args=(directory,), nprocs=2, join=True)
 
 
 if __name__ == "__main__":
