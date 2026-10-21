@@ -26,6 +26,7 @@ import re
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
+from sglang.srt.distributed import moe_tensor_model_parallel_all_reduce
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -37,6 +38,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.models.dflash import DFlashDecoderLayer, DFlashDraftModel
 from sglang.srt.models.dspark import Qwen3DSparkModel
+from sglang.srt.runtime_context import get_parallel
 from torch import nn
 
 logger = logging.getLogger(__name__)
@@ -110,6 +112,7 @@ class QwenMoESparseBlock(nn.Module):
         self.norm_topk_prob = bool(_cfg(config, "norm_topk_prob", True))
         self.router_bias = bool(_cfg(config, "moe_router_bias", False))
         shared_size = int(_cfg(config, "shared_expert_intermediate_size", 0) or 0)
+        self.tp_size = int(get_parallel().moe_tp_size)
 
         # The router runs in fp32 like the trainer; ReplicatedLinear for its loader.
         self.gate = ReplicatedLinear(
@@ -174,6 +177,9 @@ class QwenMoESparseBlock(nn.Module):
                 gate = torch.sigmoid(self.shared_expert_gate(x).float())
                 shared = gate.to(shared.dtype) * shared
             y = y + shared
+        # Experts and shared expert are TP-sharded without reduce_results; one all-reduce for their sum.
+        if self.tp_size > 1:
+            y = moe_tensor_model_parallel_all_reduce(y)
         return y.view(shape)
 
     # -- loading ---------------------------------------------------------
