@@ -14,14 +14,18 @@ from torch import nn
 from transformers import Qwen3Config
 
 from scripts.convert_dspine_checkpoint import convert_checkpoint
+from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.dflash_family_model import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
 from specforge.algorithms.dspine.model import OnlineDSpineModel
+from specforge.config import Config
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dspine import DSpineConfig, DSpineDraftModel
+from specforge.runtime.contracts import TrainBatch
+from specforge.training.strategies.base import StepContext
 
 
 def tiny_config(head_dim=4, **options):
@@ -115,6 +119,22 @@ class DSpineTest(unittest.TestCase):
         config.is_causal = False
         with self.assertRaisesRegex(ValueError, "DSpine requires causal"):
             DSpineDraftModel(config)
+
+    def test_registration_does_not_inherit_dspark_providers(self):
+        from unittest.mock import patch
+
+        from specforge.algorithms.dspine.providers import create_registration
+
+        with patch(
+            "specforge.algorithms.dspark.providers.create_registration",
+            side_effect=AssertionError("DSpine must own its registration"),
+        ):
+            registration = create_registration()
+        self.assertEqual(registration.name, "dspine")
+        self.assertEqual(
+            registration.providers.model.build_draft.__module__,
+            "specforge.algorithms.dspine.providers",
+        )
 
     def test_zero_writes_are_identity_against_the_shared_causal_backbone(self):
         (model, _) = initialized_model()
@@ -423,6 +443,110 @@ class DSpineTest(unittest.TestCase):
         )
         self.assertEqual(terms[2].item(), 0)
         self.assertTrue(all((torch.isfinite(term) for term in terms)))
+
+    def test_strategy_runs_an_optimizer_step_and_exports_the_fixed_codes(self):
+        model = training_model(chunk_size=2)
+        registration = builtin_algorithm_registry().resolve("dspine")
+        strategy = registration.providers.step.build(model)
+        inputs = training_inputs()
+        batch = TrainBatch(["first", "second"], "dspine", inputs)
+        before = model.draft_model.injection.writes[0].weight.detach().clone()
+        output = strategy.forward_loss(
+            batch, StepContext(global_step=100, total_steps=600)
+        )
+        (numerator, denominator) = output.loss_terms
+        torch.testing.assert_close(output.loss, numerator / denominator)
+        output.loss.backward()
+        optimizer = torch.optim.SGD(model.draft_model.parameters(), lr=0.01)
+        optimizer.step()
+        self.assertFalse(
+            torch.equal(before, model.draft_model.injection.writes[0].weight)
+        )
+        exported = strategy.checkpoint_state_filter(model.state_dict())
+        self.assertEqual(set(exported), set(model.draft_model.state_dict()))
+        self.assertTrue(exported["transfer_ready"].item())
+        torch.testing.assert_close(
+            exported["transfer_codes"], model.draft_model.transfer_codes
+        )
+        with self.assertRaisesRegex(ValueError, "target_last_hidden_states"):
+            strategy.forward_loss(
+                TrainBatch(
+                    ["missing"],
+                    "dspine",
+                    {
+                        key: value
+                        for (key, value) in inputs.items()
+                        if key != "target_last_hidden_states"
+                    },
+                )
+            )
+
+    def test_provider_loads_real_target_tensors_and_does_not_reset_a_resumed_transfer_space(
+        self,
+    ):
+        with TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            target = tiny_config()
+            target.save_pretrained(tmp_path)
+            save_file(
+                {
+                    "model.embed_tokens.weight": torch.randn(32, 16),
+                    "lm_head.weight": torch.randn(32, 16),
+                },
+                tmp_path / "model.safetensors",
+            )
+            config = Config.model_validate(
+                dict(
+                    model=dict(
+                        target_model_path=str(tmp_path),
+                        torch_dtype="float32",
+                        mask_token_id=31,
+                    ),
+                    data=dict(hidden_states_path=str(tmp_path / "features")),
+                    training=dict(
+                        strategy="dspine", attention_backend="sdpa", num_anchors=2
+                    ),
+                )
+            )
+            draft = DSpineDraftModel(tiny_config())
+            provider = builtin_algorithm_registry().resolve("dspine").providers
+            parts = provider.model.build_training_model(
+                config, draft, draft.config, target, None
+            )
+            self.assertTrue(draft.transfer_ready.item())
+            with torch.no_grad():
+                draft.injection.readouts[0].weight.add_(1)
+            learned = draft.injection.readouts[0].weight.detach().clone()
+            codes = draft.transfer_codes.clone()
+            again = provider.model.build_training_model(
+                config, draft, draft.config, target, None
+            )
+            torch.testing.assert_close(
+                draft.injection.readouts[0].weight, learned, atol=0, rtol=0
+            )
+            torch.testing.assert_close(draft.transfer_codes, codes, atol=0, rtol=0)
+            self.assertTrue(parts.capture_layers == again.capture_layers == [1, 4, 6])
+            contract = provider.step.resume_contract(config, draft, again.model)
+            self.assertEqual(dict(contract["dspine_options"])["transfer_rank"], 8)
+
+    def test_offline_provider_retains_dspine_identity_and_teacher_features(self):
+        with TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            inputs = {name: value[:1] for (name, value) in training_inputs().items()}
+            torch.save(inputs, tmp_path / "sample.ckpt")
+            registration = builtin_algorithm_registry().resolve("dspine")
+            provider = registration.providers.offline_for("text")
+            reader = provider.build_reader(
+                str(tmp_path), run_id="dspine-test", ttt_length=4, max_len=12
+            )
+            records = reader.read()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].strategy, "dspine")
+            self.assertIn("target_last_hidden_states", records[0].feature_keys)
+            self.assertEqual(
+                registration.providers.server_streaming_for("text").capture_method,
+                "dspark",
+            )
 
     def test_bf16_training_keeps_frozen_state_and_gradients_finite(self):
         model = training_model(chunk_size=2).to(dtype=torch.bfloat16)
