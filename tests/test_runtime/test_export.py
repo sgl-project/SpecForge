@@ -414,7 +414,7 @@ class TestExporters(unittest.TestCase):
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
 
@@ -451,7 +451,7 @@ class TestExporters(unittest.TestCase):
         opt = BF16Optimizer(
             dm, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
         )
-        backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+        backend = FSDP1TrainingBackend(ParallelConfig.from_distributed())
         backend.prepare_model(model, wrap=False)
         backend.set_optimizer(opt)
         strategy = Eagle3TrainStrategy(model, target_head=head)

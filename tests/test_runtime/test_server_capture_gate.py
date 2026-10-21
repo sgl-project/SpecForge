@@ -396,7 +396,7 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
         from tests.test_runtime import _fixtures as fx
@@ -414,7 +414,7 @@ class TestServerCaptureGate(unittest.TestCase):
         )
         dm.freeze_embedding()
         model = OnlineEagle3Model(dm, length=3, attention_backend="sdpa").cuda()
-        backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+        backend = FSDP1TrainingBackend(ParallelConfig.from_distributed())
         backend.prepare_model(model, wrap=False)
         backend.set_optimizer(
             BF16Optimizer(

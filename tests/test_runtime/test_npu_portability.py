@@ -9,7 +9,7 @@ from unittest import mock
 import torch
 
 import specforge.distributed as sf_dist
-from specforge.training.backend import FSDPTrainingBackend
+from specforge.training.backend import FSDP1TrainingBackend
 
 
 class _Mesh:
@@ -188,7 +188,7 @@ class NPURNGTest(unittest.TestCase):
             mock.patch("specforge.utils.get_device_type", return_value="npu"),
             mock.patch.object(torch, "get_rng_state", return_value=cpu_state),
         ):
-            state = FSDPTrainingBackend._rng_state()
+            state = FSDP1TrainingBackend._rng_state()
 
         self.assertEqual(state["device_type"], "npu")
         self.assertIs(state["npu"], accelerator_state)
@@ -202,7 +202,7 @@ class NPURNGTest(unittest.TestCase):
             mock.patch.object(torch, "npu", accelerator, create=True),
             mock.patch.object(torch, "set_rng_state") as set_cpu_rng,
         ):
-            FSDPTrainingBackend._set_rng_state(state)
+            FSDP1TrainingBackend._set_rng_state(state)
         set_cpu_rng.assert_called_once_with(cpu_state)
         accelerator.set_rng_state.assert_called_once_with(accelerator_state, 2)
 
@@ -217,7 +217,7 @@ class NPURNGTest(unittest.TestCase):
             mock.patch.object(torch, "cuda", accelerator),
             mock.patch.object(torch, "set_rng_state"),
         ):
-            FSDPTrainingBackend._set_rng_state(legacy)
+            FSDP1TrainingBackend._set_rng_state(legacy)
         accelerator.set_rng_state.assert_called_once_with(cuda_state, 1)
 
 

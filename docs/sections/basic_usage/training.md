@@ -660,7 +660,11 @@ checkpoint; rank 0 verifies that the durable optimizer marker equals the
 checkpoint step, skips acknowledged refs, and requeues the unacknowledged tail.
 The producer itself is not restarted or resumed. Optimizer/FSDP checkpoints
 currently require the same trainer world size; control-plane ref redistribution
-does not imply optimizer-state resharding.
+does not imply optimizer-state resharding. `training.fsdp_version: 2` selects
+the `fully_shard` (FSDP2) implementation with the same sharding modes and
+checkpoint layout; its rank-local optimizer shards differ from FSDP1's, so the
+resume contract records `training_backend` and a checkpoint written by one
+implementation cannot resume the other (switch with a weights-only warm start).
 
 Training metrics are printed every `training.log_interval` steps and forwarded
 to the configured tracking backend.

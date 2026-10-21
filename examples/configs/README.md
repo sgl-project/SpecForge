@@ -288,6 +288,7 @@ Common fields:
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
+| `training.fsdp_version` | `1` | FSDP implementation: `1` = `FullyShardedDataParallel`, `2` = `fully_shard` (per-parameter DTensor sharding; validated on CUDA). Same sharding modes, devices and checkpoint layout; a checkpoint cannot resume across implementations. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |

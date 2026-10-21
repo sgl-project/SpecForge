@@ -55,7 +55,11 @@ def _build_model(workdir: str, attention_backend: str):
     ).cuda()
 
 
-def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
+def _worker(
+    rank: int, world_size: int, port: int, workdir: str, fsdp_version: int = 1
+) -> None:
+    # the trainer picks the FSDP implementation from this seam (cli sets it)
+    os.environ["FSDP_VERSION"] = str(fsdp_version)
     fx.init_rank_distributed(
         rank,
         world_size,
@@ -180,6 +184,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             "reference_loss": float(expected_loss.item()),
             "usp_loss": float(logged[0][1]["loss"]),
             "grad_norm": float(logged[0][1]["grad_norm"]),
+            "backend": trainer.backend.name,
         }
         with open(os.path.join(workdir, "results", f"rank{rank}.json"), "w") as out:
             json.dump(result, out)
@@ -194,7 +199,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     "requires four CUDA devices and the standard flash-attn USP interfaces",
 )
 class TestEquiv4Rank(unittest.TestCase):
-    def test_dp2_sp2_trainer_loss_matches_full_sequence_reference(self):
+    def _run(self, fsdp_version: int, expected_backend: str) -> None:
         import torch.multiprocessing as mp
 
         from tests.utils import get_available_port
@@ -209,7 +214,7 @@ class TestEquiv4Rank(unittest.TestCase):
             mp.spawn(
                 _worker,
                 nprocs=WORLD_SIZE,
-                args=(WORLD_SIZE, get_available_port(), work),
+                args=(WORLD_SIZE, get_available_port(), work, fsdp_version),
                 join=True,
             )
 
@@ -218,6 +223,7 @@ class TestEquiv4Rank(unittest.TestCase):
                     result = json.load(src)
                 self.assertEqual(result["rank"], rank)
                 self.assertEqual(result["step"], 1)
+                self.assertEqual(result["backend"], expected_backend)
                 self.assertEqual(result["world_size"], WORLD_SIZE)
                 self.assertEqual(result["tp_size"], 1)
                 self.assertEqual(result["sp_size"], 2)
@@ -234,6 +240,13 @@ class TestEquiv4Rank(unittest.TestCase):
                 )
                 self.assertTrue(math.isfinite(result["grad_norm"]))
                 self.assertGreater(result["grad_norm"], 0.0)
+
+    def test_dp2_sp2_trainer_loss_matches_full_sequence_reference(self):
+        self._run(1, "fsdp1")
+
+    def test_dp2_sp2_trainer_loss_matches_full_sequence_reference_fsdp2(self):
+        # USP (Ulysses SP2) works on activations; the FSDP2 groups span WORLD
+        self._run(2, "fsdp2")
 
 
 if __name__ == "__main__":

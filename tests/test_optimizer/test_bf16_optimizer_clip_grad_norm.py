@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from specforge.optimizer import BF16Optimizer
-from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.backend import FSDP1TrainingBackend, ParallelConfig
 
 
 def _make_optimizer(seed=0, **kwargs):
@@ -216,7 +216,7 @@ class TestClipGradNormSingleProcess(unittest.TestCase):
                 self.config = kwargs
 
         process_group = object()
-        backend = FSDPTrainingBackend(
+        backend = FSDP1TrainingBackend(
             ParallelConfig(
                 sharding_strategy="SHARD_GRAD_OP",
                 fsdp_process_group=process_group,
@@ -409,7 +409,7 @@ class TestBF16OptimizerCuda(unittest.TestCase):
             torch.nn.Linear(64, 128), torch.nn.Linear(128, 16, bias=False)
         ).cuda()
         model[0].to(torch.bfloat16)
-        backend = FSDPTrainingBackend(ParallelConfig())
+        backend = FSDP1TrainingBackend(ParallelConfig())
         backend.prepare_model(model, wrap=False)
         for param in model.parameters():
             param.grad = torch.randn_like(param).mul_(7)

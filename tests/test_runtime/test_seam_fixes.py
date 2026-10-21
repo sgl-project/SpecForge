@@ -15,7 +15,7 @@ import torch.nn as nn
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.control_plane import DataFlowController, InMemoryMetadataStore
 from specforge.training.backend import (
-    FSDPTrainingBackend,
+    FSDP1TrainingBackend,
     ParallelConfig,
     TrainingBackend,
 )
@@ -102,13 +102,13 @@ class TestParallelConfigHandles(unittest.TestCase):
                 self.embed_tokens.requires_grad_(False)
 
         model = Composite()
-        ignored = FSDPTrainingBackend._frozen_target_modules(model)
+        ignored = FSDP1TrainingBackend._frozen_target_modules(model)
 
         self.assertEqual(ignored, (model.lm_head, model.embed_tokens))
 
     def test_backend_scales_gradients_before_optimizer_step(self):
         model = nn.Linear(2, 1, bias=False)
-        backend = FSDPTrainingBackend(ParallelConfig())
+        backend = FSDP1TrainingBackend(ParallelConfig())
         backend.prepare_model(model, wrap=False)
         model.weight.grad = torch.tensor([[4.0, 8.0]])
 

@@ -151,6 +151,8 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
         torch.manual_seed(0)
         fx.build_single_rank_distributed(port="29577")
 
+        from torch.distributed.fsdp import FSDPModule  # fsdp_version=2 wraps in place
+
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         from specforge.launch import build_disagg_offline_runtime
@@ -199,7 +201,7 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(
-            module, FSDP, "strategy must hold the FSDP-wrapped module"
+            module, (FSDP, FSDPModule), "strategy must hold the FSDP-wrapped module"
         )
 
         step = trainer.fit()

@@ -479,3 +479,229 @@ def build_dspark(
     ).cuda()
     width = len(draft_model.target_layer_ids) * hidden
     return dspark_model, width
+
+
+# ---- P-EAGLE / MTP / DFlash2 fixtures for the FSDP layout and parity matrix ----
+
+TINY_PEAGLE_CONFIG = {
+    "architectures": ["PEagleDraftModel"],
+    "model_type": "llama",
+    "hidden_act": "silu",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "num_hidden_layers": 2,
+    "max_position_embeddings": 64,
+    "vocab_size": 32,
+    "draft_vocab_size": 32,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-5,
+    "tie_word_embeddings": False,
+    "norm_before_residual": True,
+}
+PEAGLE_MASK_TOKEN_ID = 31
+
+
+def build_peagle(workdir, *, num_depths=4):
+    """Build a tiny OnlinePEagleModel on CUDA (batch size 1, COD depths)."""
+    from specforge.algorithms.peagle.model import OnlinePEagleModel
+    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+
+    os.makedirs(workdir, exist_ok=True)
+    path = os.path.join(workdir, "peagle.json")
+    with open(path, "w") as f:
+        json.dump(TINY_PEAGLE_CONFIG, f)
+    config = AutoDraftModelConfig.from_file(path)
+    draft_model = AutoDraftModel.from_config(config, torch_dtype=torch.bfloat16).cuda()
+    return OnlinePEagleModel(
+        draft_model=draft_model,
+        mask_token_id=PEAGLE_MASK_TOKEN_ID,
+        num_depths=num_depths,
+        down_sample_ratio=1.0,
+        down_sample_ratio_min=1.0,
+    ).cuda()
+
+
+def peagle_batch(seed, seq=8):
+    """One batch-size-1 P-EAGLE sample with random target logits."""
+    from specforge.runtime.contracts import TrainBatch
+
+    g = torch.Generator().manual_seed(seed)
+    hidden = TINY_PEAGLE_CONFIG["hidden_size"]
+    vocab = TINY_PEAGLE_CONFIG["vocab_size"]
+    # keep the mask token out of the inputs (the model inserts it itself)
+    input_ids = torch.randint(1, vocab - 1, (1, seq), generator=g)
+    return TrainBatch(
+        sample_ids=[f"peagle-{seed}"],
+        strategy="peagle",
+        tensors={
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "loss_mask": torch.ones_like(input_ids),
+            "hidden_state": torch.randn(1, seq, 3 * hidden, generator=g).to(
+                torch.bfloat16
+            ),
+            "target": torch.randn(1, seq, vocab, generator=g).to(torch.bfloat16),
+        },
+    )
+
+
+def mtp_config():
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
+
+    config = Qwen3Config(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        vocab_size=128,
+        max_position_embeddings=512,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        rms_norm_eps=1e-6,
+        attn_output_gate=True,
+        partial_rotary_factor=0.25,
+        mtp_config={"share_lm_head": True},
+        tie_word_embeddings=False,
+    )
+    config._attn_implementation = "eager"
+    return config
+
+
+def build_mtp(*, tie_frozen_tables=True):
+    """Build a tiny OnlineMTPModel on CUDA.
+
+    With ``tie_frozen_tables`` the frozen target embedding and ``mtp.lm_head``
+    are ONE Parameter inside the draft, as ``target_utils`` builds them for a
+    tied target: the sharding backend must keep both in one unit.
+    """
+    from specforge.core.mtp import OnlineMTPModel
+    from specforge.modeling.draft.mtp import Qwen3_5MTPDraftModel
+
+    config = mtp_config()
+    draft = Qwen3_5MTPDraftModel(config).to(device="cuda", dtype=torch.bfloat16)
+    if tie_frozen_tables:
+        table = torch.nn.Parameter(
+            torch.randn(
+                config.vocab_size,
+                config.hidden_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            * 0.02,
+            requires_grad=False,
+        )
+        draft.share_target_embeddings(table, table)
+    return OnlineMTPModel(draft).cuda()
+
+
+def mtp_batch(seed, *, batch=2, seq=16):
+    from specforge.runtime.contracts import TrainBatch
+
+    config = mtp_config()
+    g = torch.Generator().manual_seed(seed)
+    return TrainBatch(
+        sample_ids=[f"mtp-{seed}-{i}" for i in range(batch)],
+        strategy="mtp",
+        tensors={
+            "input_ids": torch.randint(0, config.vocab_size, (batch, seq), generator=g),
+            "loss_mask": torch.ones(batch, seq),
+            "target_last_hidden_states": torch.randn(
+                batch, seq, config.hidden_size, generator=g
+            ).to(torch.bfloat16),
+        },
+    )
+
+
+def build_dflash2(*, hidden=64, vocab=512, block_size=4, num_anchors=12):
+    """Tiny OnlineDFlashModel over DFlash2DraftModel, fused Triton head eligible.
+
+    Returns (model, hidden_states_width).
+    """
+    from transformers import Qwen3Config
+
+    from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+    from specforge.modeling.draft.dflash2 import DFlash2DraftModel
+
+    config = Qwen3Config(
+        architectures=["DFlash2DraftModel"],
+        hidden_size=hidden,
+        intermediate_size=2 * hidden,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        num_target_layers=4,
+        head_dim=16,
+        max_position_embeddings=256,
+        vocab_size=vocab,
+        layer_types=["full_attention", "full_attention"],
+        dflash_config={
+            "block_size": block_size,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "mask_token_id": vocab - 1,
+            "selector_rank": 8,
+            "selector_top_k": 16,
+            "target_layer_ids": [1, 2],
+        },
+    )
+    config._attn_implementation = "sdpa"
+    draft = DFlash2DraftModel(config)
+    with torch.no_grad():
+        # A fresh selector is a unary no-op; give it a transition to train.
+        draft.candidate_selector.successor_codebook.normal_(std=0.2)
+    head = torch.nn.Linear(hidden, vocab, bias=False)
+    embed = torch.nn.Embedding(vocab, hidden)
+    with torch.no_grad():
+        head.weight.normal_(std=0.3)
+    head.requires_grad_(False)
+    embed.requires_grad_(False)
+    model = OnlineDFlashModel(
+        draft_model=draft,
+        target_lm_head=head,
+        target_embed_tokens=embed,
+        mask_token_id=vocab - 1,
+        block_size=block_size,
+        attention_backend="sdpa",
+        num_anchors=num_anchors,
+    )
+    width = len(draft.target_layer_ids) * hidden
+    return model.to(device="cuda", dtype=torch.bfloat16), width
+
+
+def dflash_family_batch(
+    strategy,
+    seed,
+    *,
+    width,
+    batch=2,
+    seq=32,
+    vocab=V,
+    hidden=H,
+    with_target_last=False,
+):
+    """Synthetic DFlash / Domino / DSpark batch (``hidden_states`` schema)."""
+    from specforge.runtime.contracts import TrainBatch
+
+    g = torch.Generator().manual_seed(seed)
+    tensors = {
+        "input_ids": torch.randint(0, vocab, (batch, seq), generator=g),
+        "loss_mask": torch.ones(batch, seq, dtype=torch.long),
+        "hidden_states": torch.randn(batch, seq, width, generator=g).to(
+            torch.bfloat16
+        ),
+    }
+    if with_target_last:
+        tensors["target_last_hidden_states"] = torch.randn(
+            batch, seq, hidden, generator=g
+        ).to(torch.bfloat16)
+    return TrainBatch(
+        sample_ids=[f"{strategy}-{seed}-{i}" for i in range(batch)],
+        strategy=strategy,
+        tensors=tensors,
+    )
