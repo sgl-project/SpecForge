@@ -84,6 +84,10 @@ def export_to_hf(
             if not (vocab_mapping_path and key in {"t2d", "d2t"})
         }
     )
+    # MoE drafts: router centering becomes gate.bias, so serving needs no centering.
+    from specforge.modeling.draft.moe.util import fold_router_centering
+
+    full_state = fold_router_centering(model, full_state)
     model.save_pretrained(output_dir, state_dict=full_state)
     apply_legacy_rope_scaling(output_dir)
     return output_dir

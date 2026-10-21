@@ -10,6 +10,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
 from specforge.modeling.draft import DFlashDraftModel
 from specforge.modeling.draft.moe import MoELayer, build_ffn
+from specforge.modeling.draft.moe.util import fold_router_centering
 
 TINY_DFLASH = {
     "architectures": ["DFlashDraftModel"],
@@ -74,6 +75,24 @@ class BuildFfnTest(unittest.TestCase):
         dense = DFlashDraftModel(Qwen3Config(**TINY_DFLASH))
         dense.gradient_checkpointing_enable()
         self.assertTrue(all(layer.gradient_checkpointing for layer in dense.layers))
+
+    def test_fold_router_centering_moves_the_running_mean_into_gate_bias(self):
+        torch.manual_seed(0)
+        model = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE)).eval()
+        for layer in model.layers:
+            layer.mlp.centering.running_mean.normal_()
+        x = torch.randn(2, 5, 64)
+        want = [layer.mlp(x) for layer in model.layers]
+        state = fold_router_centering(model, model.state_dict())
+        self.assertFalse(any("centering" in key for key in state))
+        self.assertEqual(state["layers.0.mlp.gate.bias"].dtype, torch.float32)
+        self.assertTrue(model.config.moe_router_bias)
+        self.assertFalse(model.config.dflash_config["moe_router_centering"])
+        folded = DFlashDraftModel(model.config).eval()
+        folded.load_state_dict(state)  # strict: gate.bias in, running_mean out
+        self.assertIsNone(folded.layers[0].mlp.centering)
+        for layer, out in zip(folded.layers, want):
+            torch.testing.assert_close(layer.mlp(x), out)
 
     def test_from_pretrained_inits_missing_moe_weights_and_keeps_loaded_ones(self):
         model = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE))

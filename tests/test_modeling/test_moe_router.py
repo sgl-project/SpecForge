@@ -83,6 +83,20 @@ class TopKRouterTest(unittest.TestCase):
         torch.testing.assert_close(weights, want_weights)
         self.assertIn("selection_bias", router.state_dict())
 
+    def test_optional_bias_adds_to_the_logits_and_resets_to_zero(self):
+        plain = TopKRouter(E, H, K, norm_topk_prob=True, initializer_range=0.5)
+        self.assertIsNone(plain.bias)
+        router = TopKRouter(
+            E, H, K, norm_topk_prob=True, initializer_range=0.5, bias=True
+        )
+        with torch.no_grad():
+            router.bias.copy_(torch.randn(E))
+        scores, _, _ = router(self.x)
+        want = (self.x @ router.weight.T + router.bias).softmax(dim=-1)
+        torch.testing.assert_close(scores, want)
+        router.reset_parameters(0.02)
+        self.assertTrue(torch.all(router.bias == 0))
+
     def test_bf16_inputs_return_fp32_scores_and_weights(self):
         router = TopKRouter(E, H, K, norm_topk_prob=True, initializer_range=0.5)
         scores, indices, weights = router.bfloat16()(self.x.bfloat16())

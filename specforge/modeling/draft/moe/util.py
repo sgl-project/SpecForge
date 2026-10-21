@@ -2,7 +2,7 @@
 """MoE training helpers: the Switch aux loss and router centering."""
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -99,6 +99,31 @@ def include_moe_aux_loss(model: nn.Module, out: "StepOutput") -> "StepOutput":
         loss_terms=(numerator + aux * denominator.detach(), denominator),
         ratio_metrics=ratio_metrics,
     )
+
+
+def fold_router_centering(
+    model: nn.Module, state: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    """Export fold: ``W(x - mean) = Wx + b`` with ``gate.bias = -W @ mean``."""
+    from specforge.modeling.draft.moe.layer import MoELayer
+
+    state = dict(state)
+    folded = False
+    for name, layer in model.named_modules():
+        mean = state.pop(f"{name}.centering.running_mean", None)
+        if not isinstance(layer, MoELayer) or mean is None:
+            continue
+        bias = -(state[f"{name}.gate.weight"].float() @ mean.float())
+        if state.get(f"{name}.gate.bias") is not None:
+            bias = bias + state[f"{name}.gate.bias"].float()
+        state[f"{name}.gate.bias"] = bias  # fp32: bf16 rounding could flip a pick
+        folded = True
+    if folded:
+        # The exported draft routes with the bias instead of centering.
+        model.config.moe_router_bias = True
+        dflash_config = dict(getattr(model.config, "dflash_config", None) or {})
+        model.config.dflash_config = {**dflash_config, "moe_router_centering": False}
+    return state
 
 
 def _moe_layers(model: nn.Module) -> List["MoELayer"]:

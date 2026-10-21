@@ -31,6 +31,7 @@ def build_moe(config: PretrainedConfig) -> MoELayer:
             # Qwen3.8's config omits it; transformers always renormalizes.
             norm_topk_prob=getattr(config, "norm_topk_prob", True),
             initializer_range=std,
+            bias=getattr(config, "moe_router_bias", False),  # from the export fold
         ),
         experts=RoutedExperts(
             config.num_experts,

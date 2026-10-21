@@ -563,5 +563,64 @@ class TestExporters(unittest.TestCase):
             _serving_state({"fc.weight": torch.zeros(1)}, {})
 
 
+class TestMoEExportFold(unittest.TestCase):
+    """to_hf folds router centering into gate.bias; the export reloads and routes alike."""
+
+    TINY_MOE_DRAFT = {
+        "architectures": ["DFlashDraftModel"],
+        "model_type": "qwen3",
+        "block_size": 4,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "num_hidden_layers": 2,
+        "num_target_layers": 4,
+        "head_dim": 16,
+        "max_position_embeddings": 512,
+        "vocab_size": 256,
+        "moe_preset": "qwen3_5_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "shared_expert_intermediate_size": 48,
+        "norm_topk_prob": False,
+        "dflash_config": {"moe_router_centering": True},
+    }
+
+    def test_to_hf_folds_router_centering_into_gate_bias(self):
+        from safetensors.torch import load_file
+
+        from specforge.export import export_to_hf
+        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+
+        with tempfile.TemporaryDirectory(prefix="export_moe_") as workdir:
+            cfg_path = os.path.join(workdir, "draft.json")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(self.TINY_MOE_DRAFT, f)
+            torch.manual_seed(0)
+            model = AutoDraftModel.from_config(AutoDraftModelConfig.from_file(cfg_path))
+            for layer in model.layers:
+                layer.mlp.centering.running_mean.normal_()
+            checkpoint = os.path.join(workdir, "training_state.pt")
+            torch.save(
+                {"strategy": "dflash", "draft_state_dict": model.state_dict()},
+                checkpoint,
+            )
+            out = export_to_hf(checkpoint, cfg_path, os.path.join(workdir, "export"))
+
+            saved = load_file(os.path.join(out, "model.safetensors"))
+            self.assertFalse(any("centering" in key for key in saved))
+            self.assertEqual(saved["layers.0.mlp.gate.bias"].dtype, torch.float32)
+            reloaded, info = AutoDraftModel.from_pretrained(
+                out, output_loading_info=True
+            )
+            self.assertFalse(info["missing_keys"] or info["unexpected_keys"])
+            self.assertIsNone(reloaded.layers[0].mlp.centering)
+            x = torch.randn(2, 5, 64)
+            for original, folded in zip(model.eval().layers, reloaded.eval().layers):
+                torch.testing.assert_close(folded.mlp(x), original.mlp(x))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
