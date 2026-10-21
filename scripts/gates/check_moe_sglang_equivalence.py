@@ -1,12 +1,13 @@
-"""Served vs trained MoE FFN: SGLang's ``QwenMoESparseBlock`` against SpecForge's ``MoELayer``.
+"""Served vs trained MoE FFN: SGLang's sparse block against SpecForge's ``MoELayer``.
 
 Loads every layer's FFN from one normalized HF export twice: into the block
-``specforge.serving.sglang_models`` serves (``TopK`` + ``FusedMoE``) and into
-the training layer in eval mode (the export already folded router centering
-into ``gate.bias``). Feeds both the same inputs and compares the chosen experts
-and the outputs. Needs one GPU and the SGLang the draft will be served with.
+``specforge.serving.sglang_models`` serves for the export's ``moe_preset``
+(``TopK`` + ``FusedMoE``) and into the training layer of that preset in eval
+mode (the export already folded router centering into ``gate.bias``). Feeds
+both the same inputs and compares the chosen expert sets and the outputs.
+Needs one GPU and the SGLang the draft will be served with.
 
-    python scripts/gates/check_dspark_moe_sglang_equivalence.py --export <normalized export dir>
+    python scripts/gates/check_moe_sglang_equivalence.py --export <normalized export dir>
 """
 
 from __future__ import annotations
@@ -53,19 +54,24 @@ def main() -> int:
 
     sglang_runtime()
     from safetensors.torch import load_file
-    from transformers import Qwen3Config
+    from transformers import PretrainedConfig
 
-    from specforge.modeling.draft.moe.families.qwen3_5_moe import build_moe
-    from specforge.serving.sglang_models.dflash_moe import QwenMoESparseBlock
+    from specforge.modeling.draft.moe.families import FAMILIES
+    from specforge.serving.sglang_models.dflash_moe import SPARSE_BLOCKS
+
+    with open(os.path.join(args.export, "config.json"), encoding="utf-8") as handle:
+        config = PretrainedConfig.from_dict(json.load(handle))
+    preset = getattr(config, "moe_preset", None)
+    if preset not in FAMILIES or preset not in SPARSE_BLOCKS:
+        print(f"RESULT: FAIL (moe_preset={preset!r} is not both trained and served)")
+        return 1
+    build_moe, sparse_block = FAMILIES[preset], SPARSE_BLOCKS[preset]
 
     device, dtype = "cuda", torch.bfloat16
     state = {}
     for name in sorted(os.listdir(args.export)):
         if name.endswith(".safetensors"):
             state.update(load_file(os.path.join(args.export, name)))
-    config = Qwen3Config.from_dict(
-        json.load(open(os.path.join(args.export, "config.json")))
-    )
 
     ok = True
     for layer in range(int(config.num_hidden_layers)):
@@ -81,7 +87,7 @@ def main() -> int:
         torch.set_default_dtype(dtype)
         try:
             with torch.device(device):
-                served = QwenMoESparseBlock(config, layer_id=layer, prefix=prefix[:-1])
+                served = sparse_block(config, layer_id=layer, prefix=prefix[:-1])
         finally:
             torch.set_default_dtype(previous)
         served.load_weights([(k, v.to(device)) for k, v in ffn_state.items()])
@@ -96,20 +102,22 @@ def main() -> int:
         with torch.no_grad():
             y_trained = trained(x.unsqueeze(0)).squeeze(0).float()
             y_served = served(x).float()
-            picks_trained = trained.gate(x)[1][:, 0]
-            picks_served = served.router_logits(x).argmax(dim=-1)
-        agree = (picks_trained == picks_served).float().mean().item()
-        same = picks_trained == picks_served
+            picks_trained = trained.gate(x)[1].sort(dim=-1).values
+            picks_served = served.selected_experts(x).sort(dim=-1).values
+        same = (picks_trained == picks_served).all(dim=-1)
+        agree = same.float().mean().item()
         scale = y_trained.norm(dim=-1).clamp_min(1e-6)
         rel = (y_trained - y_served).norm(dim=-1) / scale
         rel_same = rel[same].mean().item() if same.any() else float("nan")
-        load = torch.bincount(picks_served, minlength=served.num_experts).tolist()
+        load = torch.bincount(
+            picks_served.flatten(), minlength=served.num_experts
+        ).tolist()
         layer_ok = agree >= 0.995 and rel_same < 0.02
         ok &= layer_ok
         print(
-            f"layer {layer}: top-1 agreement {agree:.4f}, mean relative |dy| on agreeing "
-            f"tokens {rel_same:.2e}, expert load (served) {load} -> "
-            f"{'ok' if layer_ok else 'FAIL'}"
+            f"layer {layer}: top-{picks_served.shape[-1]} set agreement {agree:.4f}, "
+            f"mean relative |dy| on agreeing tokens {rel_same:.2e}, expert load "
+            f"(served) {load} -> {'ok' if layer_ok else 'FAIL'}"
         )
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

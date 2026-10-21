@@ -158,6 +158,10 @@ class QwenMoESparseBlock(nn.Module):
         logits, _ = self.gate(x.float())
         return logits
 
+    def selected_experts(self, x: torch.Tensor) -> torch.Tensor:
+        """Expert ids the router picks, ``[tokens, top_k]``; compared by the gate."""
+        return self.router_logits(x).topk(self.top_k, dim=-1).indices
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.hidden_size)
@@ -294,5 +298,8 @@ class DFlashMoEDraftModel(_QwenMoEDraftMixin, DFlashDraftModel):
 class Qwen3MoeDSparkModel(_QwenMoEDraftMixin, Qwen3DSparkModel):
     """DSpark draft with the ``qwen3_5_moe`` FFN: the architecture SpecForge's MoE exports name."""
 
+
+# The served MoE FFN per moe_preset; the equivalence gate builds one layer through it.
+SPARSE_BLOCKS = {"qwen3_5_moe": QwenMoESparseBlock}
 
 EntryClass = [DFlashMoEDraftModel, Qwen3MoeDSparkModel]
