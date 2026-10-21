@@ -199,6 +199,12 @@ class GeneralParser(Parser):
                 + "|$))"
             )
 
+    def _select_matches(self, matches, conversation, train_only_last_turn):
+        del conversation
+        if train_only_last_turn and matches:
+            return [matches[-1]]
+        return matches
+
     def _end_of_turn_token(self) -> str:
         end_of_turn_token = self.chat_template.end_of_turn_token
         if not end_of_turn_token:
@@ -306,8 +312,7 @@ class GeneralParser(Parser):
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
 
         matches = list(re.finditer(self.assistant_pattern, conversation, re.DOTALL))
-        if train_only_last_turn and matches:
-            matches = [matches[-1]]  # Only keep the last match
+        matches = self._select_matches(matches, conversation, train_only_last_turn)
 
         for match in matches:
             content_start_char = match.start(1)
@@ -633,6 +638,10 @@ class MuseParser(ThinkingParser):
     Each of those interiors is supervised, and so is its closing token. The
     ``<|start|>assistant to=…<|message|>`` prefix is not. System, user, and
     tool-result turns stay unsupervised.
+
+    ``train_only_last_turn`` keeps every span of the last assistant turn.
+    Reasoning and the answer are separate spans of that turn. A user, tool,
+    or system message ends the previous turn and leaves it as context.
     """
 
     allow_chat_template_fallback = False
@@ -656,6 +665,21 @@ class MuseParser(ThinkingParser):
         self.assistant_pattern = (
             r"<\|start\|>assistant to=.*?<\|message\|>([\s\S]*?(?:<\|eom\|>|<\|eot\|>))"
         )
+
+    def _select_matches(self, matches, conversation, train_only_last_turn):
+        if not train_only_last_turn or not matches:
+            return matches
+        # One Muse assistant turn renders as several spans. Keep the whole
+        # trailing run; the next user, tool, or system message starts a new one.
+        start = 0
+        boundary = re.compile(
+            r"<\|start\|>(?:user|system|developer)<\|message\|>|<\|start\|>tool "
+        )
+        for index in range(1, len(matches)):
+            between = conversation[matches[index - 1].end() : matches[index].start()]
+            if boundary.search(between):
+                start = index
+        return matches[start:]
 
 
 class GLMParser(ThinkingParser):
