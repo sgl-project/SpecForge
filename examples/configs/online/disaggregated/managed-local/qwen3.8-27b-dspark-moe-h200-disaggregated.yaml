@@ -1,0 +1,112 @@
+# Qwen3.8-27B DSpark with a Qwen3.5-MoE FFN (512 experts x 512, top-10, one
+# sigmoid-gated 2048-wide shared expert; configs/qwen3.8-27b-dspark-moe.json)
+# on one 8x H200 node: four TP=1 FP8 capture servers on GPUs 0-3 and a 4-rank
+# FSDP trainer on GPUs 4-7, all owned by `specforge train`.
+#
+# The drafter has about 21B parameters, 20B of them routed experts (about 1B
+# are active per token), so the trainer shards everything (FULL_SHARD) and
+# offloads optimizer state to the host. The draft trains from scratch: the target is dense.
+# Router centering (moe_router_center: sample) and the aux loss (0.001) keep
+# the router from collapsing onto a few experts; watch moe/experts_unused_frac
+# and moe/route_entropy_frac.
+#
+# Launch with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. The trainer
+# ranks run at the H200 memory limit (each micro-step all-gathers a layer's
+# 2.5 GiB stacked experts while no_sync() holds the 41.6 GB unsharded
+# gradient), and without expandable segments the caching allocator fragments
+# and retries failed allocations on every micro-step.
+model:
+  target_model_path: Qwen/Qwen3.8-27B-FP8
+  draft_model_config: configs/qwen3.8-27b-dspark-moe.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  load_target_embedding: true
+  torch_dtype: bfloat16
+  mask_token_id: 248070
+  # FA3 for the hybrid target's full-attention layers on Hopper; the GDN
+  # layers use SGLang's default linear-attention kernels.
+  sglang_attention_backend: fa3
+  sglang_disable_radix_cache: true
+  # data.max_length + 7 tokens of request headroom for the capture endpoint.
+  sglang_context_length: 8199
+data:
+  train_data_path: ./cache/dataset/qwen3.8-27b-regen-train.jsonl
+  max_length: 8192
+  chat_template: qwen3.5
+  build_dataset_num_proc: 32
+  dataloader_num_workers: 8
+  cache_dir: cache/qwen3.8-27b-dspark-moe
+training:
+  strategy: dspark
+  num_epochs: 1
+  # 4 ranks x 2 x 64 = 512 samples per optimizer step. On B200 the same run
+  # used batch_size 4 x accumulation 32; H200 ranks have less memory, so this
+  # recipe halves the micro-batch and doubles the accumulation.
+  batch_size: 2
+  accumulation_steps: 64
+  fsdp_sharding: FULL_SHARD
+  optimizer_cpu_offload: true
+  learning_rate: 0.0005
+  lr_scheduler: constant
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 500
+  max_checkpoints: 3
+  log_interval: 10
+  dist_timeout: 15
+  seed: 42
+  prompt_seed: 42
+tracking:
+  report_to: none
+runtime:
+  producer_lease: 8
+  producer_concurrency: 8
+  in_flight_high_watermark: 768
+  in_flight_low_watermark: 512
+run_id: qwen3.8-27b-dspark-moe-h200-disaggregated
+output_dir: outputs/qwen3.8-27b-dspark-moe-h200-disaggregated
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/qwen3.8-27b-dspark-moe-h200-disaggregated/control
+    consumer_state_dir: outputs/qwen3.8-27b-dspark-moe-h200-disaggregated/consumer-state
+    backend: mooncake
+    client_buffer_size: 1073741824
+    managed_local:
+      trainer_cuda_visible_devices: ["4", "5", "6", "7"]
+      mooncake:
+        # TCP works everywhere; RDMA loopback (protocol: rdma plus
+        # rdma_devices) removes the CPU copies of every captured byte.
+        protocol: tcp
+        global_segment_size_bytes: 107374182400
+        local_buffer_size_bytes: 1073741824
+        default_kv_lease_ttl_ms: 300000
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30001
+          cuda_visible_devices: ["1"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30002
+          cuda_visible_devices: ["2"]
+          tp_size: 1
+          mem_fraction_static: 0.85
+        - port: 30003
+          cuda_visible_devices: ["3"]
+          tp_size: 1
+          mem_fraction_static: 0.85

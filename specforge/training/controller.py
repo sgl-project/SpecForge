@@ -427,7 +427,9 @@ class TrainerCore:
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
+        out: StepOutput = self.strategy.finalize_step_output(
+            self.strategy.forward_loss(batch, ctx)
+        )
         loss = out.loss
         ratio_metrics = dict(out.ratio_metrics)
         if out.loss_terms is not None:

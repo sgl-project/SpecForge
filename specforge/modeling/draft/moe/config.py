@@ -1,0 +1,255 @@
+# coding=utf-8
+"""MoE config: the keys a draft JSON can set, and the preset registry.
+
+Architecture keys live at the top level of the draft JSON and decide the
+checkpoint's weights and how serving routes; ``moe_preset`` names a target
+family's recipe, which supplies their defaults, and explicit keys override it.
+Training-only keys live under ``dflash_config`` with an ``moe_`` prefix. A
+draft is MoE when it names a ``moe_preset``; see ``DESIGN.md``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, fields
+from typing import Any, Dict, Mapping, Optional
+
+from .base import Registry
+
+_MISSING = object()
+
+#: Draft-JSON top-level key -> ``MoEConfig`` field (architecture keys).
+ARCHITECTURE_KEYS: Dict[str, str] = {
+    key: key
+    for key in (
+        "n_routed_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "n_shared_experts",
+        "shared_expert_intermediate_size",
+        "scoring_func",
+        "norm_topk_prob",
+        "routed_scaling_factor",
+        "n_group",
+        "topk_group",
+        "swiglu_limit",
+        "router",
+        "balance",
+        "experts_backend",
+        "shared_expert",
+        "shared_expert_gate",
+    )
+}
+ARCHITECTURE_KEYS["moe_layout"] = "layout"
+ARCHITECTURE_KEYS["moe_router_bias"] = "router_bias"
+
+#: ``dflash_config`` key (training-only) -> ``MoEConfig`` field.
+TRAINING_KEYS: Dict[str, str] = {
+    "moe_bias_update_rate": "bias_update_rate",
+    "moe_aux_loss_coeff": "aux_loss_coeff",
+    "moe_dispatch": "dispatch",
+    "moe_router_center": "router_center",
+    "moe_router_center_momentum": "router_center_momentum",
+}
+
+#: Fields a draft JSON must state explicitly (a preset may not default them).
+PER_RUN_FIELDS = ("n_routed_experts", "num_experts_per_tok", "moe_intermediate_size")
+
+
+def _positive_int(name: str, value: Any) -> int:
+    """``value`` as an ``int`` > 0; integral floats are accepted, bools are not."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if int(value) <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return int(value)
+
+
+@dataclass(frozen=True)
+class MoEConfig:
+    """Resolved MoE configuration for one draft model (all layers share it)."""
+
+    preset: str
+    n_routed_experts: int
+    num_experts_per_tok: int
+    moe_intermediate_size: int
+    n_shared_experts: int = 1
+    shared_expert_intermediate_size: Optional[int] = None
+    # Routing recipe. ``scoring_func``, ``router`` and ``balance`` name
+    # registered implementations.
+    scoring_func: str = "softmax"
+    norm_topk_prob: bool = True
+    routed_scaling_factor: float = 1.0
+    n_group: int = 1
+    topk_group: int = 1
+    router: str = "topk"
+    balance: str = "none"
+    #: A fixed fp32 router logit bias (``gate.bias``). Exports of centered
+    #: routers set it: router centering folds into this bias.
+    router_bias: bool = False
+    #: Registered implementations of the routed and the shared experts.
+    experts_backend: str = "grouped"
+    shared_expert: str = "swiglu"
+    # Expert MLPs: the SwiGLU clamp (0 = off) and the shared expert's gate
+    # (``"none"`` or a per-token ``"sigmoid"``).
+    swiglu_limit: float = 0.0
+    shared_expert_gate: str = "none"
+    #: Checkpoint file naming (a registered :mod:`.checkpoint` layout).
+    layout: str = "native"
+    # ---- training-only (never part of the checkpoint's architecture) ----
+    bias_update_rate: float = 0.0
+    aux_loss_coeff: float = 0.0
+    dispatch: str = "sorted_loop"
+    #: ``"sample"`` centers the router input on each sample's token mean in
+    #: training and on a running mean (``router_center_momentum``) in eval and
+    #: export. From-scratch DFlash-family drafters otherwise feed every router
+    #: a token-independent common mode and route every token alike.
+    router_center: str = "none"
+    router_center_momentum: float = 0.99
+
+    def __post_init__(self) -> None:
+        for name in PER_RUN_FIELDS:
+            object.__setattr__(self, name, _positive_int(name, getattr(self, name)))
+        if not self.num_experts_per_tok <= self.n_routed_experts:
+            raise ValueError(
+                "num_experts_per_tok must be in [1, n_routed_experts], got "
+                f"{self.num_experts_per_tok} with {self.n_routed_experts} experts"
+            )
+        if self.n_shared_experts not in (0, 1):
+            raise ValueError(
+                "n_shared_experts must be 0 or 1 (one shared expert of "
+                "shared_expert_intermediate_size width), got "
+                f"{self.n_shared_experts}"
+            )
+        if self.shared_expert_intermediate_size is None:
+            object.__setattr__(
+                self, "shared_expert_intermediate_size", self.moe_intermediate_size
+            )
+        object.__setattr__(
+            self,
+            "shared_expert_intermediate_size",
+            _positive_int(
+                "shared_expert_intermediate_size", self.shared_expert_intermediate_size
+            ),
+        )
+        if self.n_group <= 0 or self.n_routed_experts % self.n_group:
+            raise ValueError(
+                f"n_group={self.n_group} must divide n_routed_experts="
+                f"{self.n_routed_experts}"
+            )
+        if not 0 < self.topk_group <= self.n_group:
+            raise ValueError(
+                f"topk_group={self.topk_group} must be in [1, n_group={self.n_group}]"
+            )
+        if self.swiglu_limit < 0:
+            raise ValueError("swiglu_limit must be >= 0 (0 disables the clamp)")
+        if self.shared_expert_gate not in ("none", "sigmoid"):
+            raise ValueError(
+                f"unknown shared_expert_gate {self.shared_expert_gate!r}; "
+                "choose 'none' or 'sigmoid'"
+            )
+        if self.bias_update_rate < 0 or self.aux_loss_coeff < 0:
+            raise ValueError("bias_update_rate and aux_loss_coeff must be >= 0")
+        if self.router_center not in ("none", "sample"):
+            raise ValueError(
+                f"unknown router_center {self.router_center!r}; "
+                "choose 'none' or 'sample'"
+            )
+        if not 0 <= self.router_center_momentum < 1:
+            raise ValueError("router_center_momentum must be in [0, 1)")
+
+    @property
+    def group_limited(self) -> bool:
+        """Whether routing restricts top-k to ``topk_group`` of ``n_group``."""
+        return self.topk_group < self.n_group
+
+
+#: Preset name -> one target family's architecture defaults.
+MOE_PRESETS: Registry[Dict[str, Any]] = Registry("MoE preset")
+
+_FIELD_NAMES = {f.name for f in fields(MoEConfig)}
+
+
+def register_moe_preset(name: str, **defaults: Any) -> None:
+    """Register the architecture defaults of one target family.
+
+    A preset may set any ``MoEConfig`` architecture field, including the
+    default ``layout``, but not the training-only fields or the per-run sizes
+    (``n_routed_experts``, ``num_experts_per_tok``, ``moe_intermediate_size``),
+    which the draft JSON must state explicitly.
+    """
+    forbidden = set(TRAINING_KEYS.values()) | set(PER_RUN_FIELDS) | {"preset"}
+    bad = sorted(set(defaults) - _FIELD_NAMES)
+    if bad:
+        raise ValueError(f"preset {name!r} sets unknown MoEConfig fields: {bad}")
+    bad = sorted(set(defaults) & forbidden)
+    if bad:
+        raise ValueError(f"preset {name!r} may not set per-run/training fields: {bad}")
+    MOE_PRESETS.register(name, dict(defaults))
+
+
+def _get(config: Any, key: str, default: Any = _MISSING) -> Any:
+    if isinstance(config, Mapping):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def is_moe_config(config: Any) -> bool:
+    """True when a draft config names a ``moe_preset``.
+
+    Detection keys on the preset alone: configs copied from an MoE target
+    (an MTP draft, say) carry ``n_routed_experts`` without asking this package
+    for anything. A DFlash-family layer that sees ``n_routed_experts`` without
+    a preset refuses to build (see :func:`.layer.build_ffn`).
+    """
+    return bool(_get(config, "moe_preset", None))
+
+
+def requests_routed_experts(config: Any) -> bool:
+    """True when ``n_routed_experts`` is set to anything but ``0``/``None``."""
+    value = _get(config, "n_routed_experts", None)
+    if value is None:
+        return False
+    return isinstance(value, bool) or not (
+        isinstance(value, (int, float)) and value == 0
+    )
+
+
+def resolve_moe_config(config: Any) -> Optional[MoEConfig]:
+    """Resolve a draft config (HF ``PretrainedConfig`` or dict) to ``MoEConfig``.
+
+    Returns ``None`` when the config names no ``moe_preset``. Otherwise every
+    architecture key gets the preset's default unless the config sets it, and
+    the result is validated (positive integer expert counts, known layout).
+    """
+    if not is_moe_config(config):
+        return None
+    name = _get(config, "moe_preset")
+    values: Dict[str, Any] = dict(MOE_PRESETS.get(name))
+    for key, field_name in ARCHITECTURE_KEYS.items():
+        explicit = _get(config, key, _MISSING)
+        if explicit is not _MISSING and explicit is not None:
+            values[field_name] = explicit
+    missing = [f for f in PER_RUN_FIELDS if f not in values]
+    if missing:
+        raise ValueError(f"MoE draft config (preset {name!r}) must set {missing}")
+    dflash_config = _get(config, "dflash_config", None) or {}
+    unknown = sorted(
+        key
+        for key in dflash_config
+        if key.startswith("moe_") and key not in TRAINING_KEYS
+    )
+    if unknown:
+        raise ValueError(
+            f"unknown MoE training keys in dflash_config: {unknown}; "
+            f"known: {sorted(TRAINING_KEYS)}"
+        )
+    for json_key, field_name in TRAINING_KEYS.items():
+        if json_key in dflash_config:
+            values[field_name] = dflash_config[json_key]
+    cfg = MoEConfig(preset=name, **values)
+    from .checkpoint import LAYOUTS  # local: checkpoint imports this module
+
+    LAYOUTS.get(cfg.layout)  # unknown layouts fail at model build, not at save
+    return cfg

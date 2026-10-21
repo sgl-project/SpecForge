@@ -411,25 +411,35 @@ class FSDPTrainingBackend(TrainingBackend):
         )
 
     def _module_state_dict(self) -> dict:
+        # Checkpoint FILES use the draft's checkpoint layout (MoE file naming);
+        # the conversion happens here because FSDP's full-state-dict hooks need
+        # the module's own FQNs.
+        from specforge.modeling.draft.moe import to_checkpoint_state_dict
+
         if self._wrapper_kind == "ddp":
             if dist.is_initialized() and dist.get_rank() != 0:
                 return {}
-            return self.module.module.state_dict()
+            module = self.module.module
+            return to_checkpoint_state_dict(module.state_dict(), module)
         if self._wrapper_kind != "fsdp":
-            return self.module.state_dict()
+            return to_checkpoint_state_dict(self.module.state_dict(), self.module)
         from torch.distributed.fsdp import FullStateDictConfig
 
         # gather to rank0 CPU only — materializing the full model on every
         # rank's GPU is wasted memory when only rank0 writes it.
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with self._full_state_ctx(cfg):
-            return self.module.state_dict()
+            return to_checkpoint_state_dict(self.module.state_dict(), self.module)
 
     def _load_module_state_dict(self, model_state: dict) -> None:
+        from specforge.modeling.draft.moe import from_checkpoint_state_dict
+
         # every rank loads the full state dict read from the shared file.
         if self._wrapper_kind == "ddp":
-            self.module.module.load_state_dict(model_state)
+            module = self.module.module
+            module.load_state_dict(from_checkpoint_state_dict(model_state, module))
             return
+        model_state = from_checkpoint_state_dict(model_state, self.module)
         with self._full_state_ctx():
             self.module.load_state_dict(model_state)
 

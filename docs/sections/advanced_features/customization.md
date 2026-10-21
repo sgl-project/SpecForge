@@ -128,6 +128,64 @@ drafts currently implements the GQA/MHA layout only, so plan benchmarks
 accordingly. DFlash2 otherwise follows the same mode selection; its convolution
 and selector do not change the attention projection contract.
 
+## MoE FFN for DFlash-family drafts
+
+Any DFlash-family draft (DFlash, DFlash2, DSpark, Domino) swaps its dense MLP
+for a sparse MoE FFN when the draft JSON names a `moe_preset`. The MoE is one
+configurable layer (`specforge/modeling/draft/moe/`, see its `DESIGN.md`): the
+preset is a target family's routing recipe, registered by that family's
+module under `moe/families/`, and the JSON states the per-run sizes:
+
+```json
+{
+  "moe_preset": "<family preset>",
+  "n_routed_experts": 64,
+  "num_experts_per_tok": 6,
+  "moe_intermediate_size": 2048,
+  "dflash_config": {"moe_dispatch": "grouped_mm"}
+}
+```
+
+- **Architecture keys** at the top level override the preset for ablations
+  (`scoring_func`, `norm_topk_prob`, `routed_scaling_factor`, `balance`,
+  `n_shared_experts`, `shared_expert_intermediate_size`, `shared_expert_gate`,
+  `swiglu_limit`, `moe_router_bias`, ...). `moe_layout` overrides the
+  checkpoint file naming the preset selects. Expert counts must be positive
+  integers, and `n_routed_experts` without a `moe_preset` is an error, never a
+  silent dense fallback.
+- **Training-only keys** live under `dflash_config` with an `moe_` prefix and
+  never change the checkpoint's architecture: `moe_bias_update_rate` and
+  `moe_aux_loss_coeff` (balancing), `moe_dispatch` (`sorted_loop` or
+  `grouped_mm`), and router centering `moe_router_center` (`"sample"`) with
+  `moe_router_center_momentum`. From-scratch drafters whose routers collapse
+  onto a few experts need `moe_router_center`.
+- **Losses and metrics** need no strategy code: the trainer adds every MoE
+  layer's auxiliary loss to the objective and logs layer-averaged `moe/*`
+  load metrics for every strategy.
+- **Checkpoints and exports** name MoE tensors through the preset's layout.
+  `export --to hf` also folds training-only router state into the gate
+  (router centering becomes a fixed router logit bias, `moe_router_bias`),
+  rewrites `config.json` to describe the folded draft so the export reloads
+  as is, and adds the routing fields the family's serving engine reads.
+  Serving an MoE draft requires that engine to implement the draft
+  architecture with an MoE FFN; check the family's documentation.
+- **New families and components** register by name: a module under
+  `moe/families/` registers a family's preset and layout, and a score
+  function, router, balance controller, experts backend or shared expert
+  registers from its own module (see `DESIGN.md`).
+
+### Drafters with their own architecture
+
+A drafter that does not use the DFlash decoder layers, such as a target's
+official drafter, uses the same layer directly:
+
+- build each FFN as `MoELayer(resolve_moe_config(config), config.hidden_size)`;
+- call `apply_pending_balance_updates(self)` at the top of the training
+  forward, outside activation-checkpoint regions;
+- call `MoELayer.reset_parameters(std)` from `_init_weights`;
+- let the preset name the family's layout, so checkpoints and exports keep the
+  official tensor names.
+
 ## Draft architectures
 
 Draft classes register through `@register_draft`. The key defaults to the

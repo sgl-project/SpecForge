@@ -17,7 +17,7 @@ code, so it is imported by training entry points, not at package load.
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -115,6 +115,47 @@ class DraftTrainStrategy(abc.ABC):
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Select the keys this strategy persists as draft weights."""
         return state_dict
+
+    def finalize_step_output(self, out: StepOutput) -> StepOutput:
+        """Add the model-level terms every strategy shares to a training step.
+
+        Today these are the draft's MoE auxiliary loss and ``moe/*`` metrics;
+        ``out`` is returned unchanged when the draft has no MoE layers.
+        ``TrainerCore`` calls this after ``forward_loss`` on every training
+        micro-step. Evaluation calls ``forward_loss`` alone, so eval losses
+        never include the auxiliary term.
+
+        With ``loss_terms`` the numerator is what backpropagates, and it is
+        divided by the window's summed denominator at the optimizer boundary,
+        so the auxiliary loss enters it scaled by this micro-batch's
+        denominator: the same weighting the objective gets.
+        """
+        from specforge.modeling.draft.moe import (
+            collect_moe_aux_loss,
+            collect_moe_metrics,
+        )
+
+        module = self.trainable_module()
+        moe_metrics = collect_moe_metrics(module)
+        aux = collect_moe_aux_loss(module)
+        if aux is None and not moe_metrics:
+            return out
+        metrics = {**out.metrics, **moe_metrics}
+        if aux is None:
+            return replace(out, metrics=metrics)
+        loss_terms = out.loss_terms
+        if loss_terms is not None:
+            numerator, denominator = loss_terms
+            loss_terms = (
+                numerator + aux.to(numerator.dtype) * denominator,
+                denominator,
+            )
+        return replace(
+            out,
+            loss=out.loss + aux.to(out.loss.dtype),
+            loss_terms=loss_terms,
+            metrics=metrics,
+        )
 
 
 def _prepare_eagle_target(
