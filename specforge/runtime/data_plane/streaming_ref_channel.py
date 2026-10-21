@@ -354,7 +354,16 @@ class StreamingRefChannel:
                     if max_n is not None and len(out) >= max_n:
                         break
                     if line.strip():
-                        out.append(ref_from_dict(json.loads(line.decode("utf-8"))))
+                        raw = json.loads(line.decode("utf-8"))
+                        try:
+                            ref = ref_from_dict(raw)
+                        except (KeyError, TypeError, AttributeError) as exc:
+                            raise ValueError(
+                                f"StreamingRefChannel {self.path}: "
+                                f"invalid SampleRef at byte offset {next_offset}: {exc}"
+                            ) from exc
+
+                        out.append(ref)
                     next_offset += len(line) + 1
             except FileNotFoundError:
                 return []
