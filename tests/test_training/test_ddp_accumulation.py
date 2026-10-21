@@ -41,7 +41,9 @@ def _count_allreduce(state, bucket):
 
 
 def _input(rank, micro_step):
-    return torch.arange(1, 9, dtype=torch.float32).reshape(2, 4) / (rank + micro_step + 2)
+    return torch.arange(1, 9, dtype=torch.float32).reshape(2, 4) / (
+        rank + micro_step + 2
+    )
 
 
 def _worker(rank, directory):
