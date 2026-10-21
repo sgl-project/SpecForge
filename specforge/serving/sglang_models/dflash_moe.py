@@ -42,10 +42,12 @@ from torch import nn
 logger = logging.getLogger(__name__)
 
 _EXPERT_TENSOR = re.compile(
-    r"^experts\.(?P<idx>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+    r"^experts\.(?P<idx>\d+)\.(?P<proj>gate_proj|up_proj|down_proj|w1|w2|w3)\.weight$"
 )
 _LAYER_FFN = re.compile(r"^(?:model\.)?layers\.(?P<idx>\d+)\.mlp\.(?P<key>.+)$")
+# Qwen names, and the DeepSeek-style w1 (gate) / w2 (down) / w3 (up) some exports use.
 _SHARD = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+_SHARD.update({shard: shard for shard in ("w1", "w2", "w3")})
 
 
 def _cfg(config, key: str, default):
