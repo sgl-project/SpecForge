@@ -2,6 +2,7 @@
 
 import copy
 import json
+import math
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +10,7 @@ from tempfile import TemporaryDirectory
 import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
+from torch import nn
 from transformers import Qwen3Config
 
 from scripts.convert_dspine_checkpoint import convert_checkpoint
@@ -16,6 +18,7 @@ from specforge.algorithms.common.dflash_family_model import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
+from specforge.algorithms.dspine.model import OnlineDSpineModel
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dspine import DSpineConfig, DSpineDraftModel
@@ -73,6 +76,36 @@ def forward_inputs(model):
         noise_embedding=torch.randn(2, 8, 16),
         target_hidden=torch.randn(2, length, 48),
         block_token_ids=token_ids,
+    )
+
+
+def training_model(chunk_size=0, head_dim=4):
+    draft, head_weight = initialized_model(head_dim=head_dim)
+    head = nn.Linear(16, 32, bias=False)
+    head.weight.data.copy_(head_weight)
+    with torch.no_grad():
+        for write in draft.injection.writes:
+            write.weight.normal_(std=0.05)
+    return OnlineDSpineModel(
+        draft_model=draft,
+        target_lm_head=head,
+        target_embed_tokens=nn.Embedding(32, 16),
+        mask_token_id=31,
+        block_size=4,
+        num_anchors=4,
+        attention_backend="sdpa",
+        objective_chunk_blocks=chunk_size,
+    )
+
+
+def training_inputs():
+    return dict(
+        input_ids=torch.randint(0, 30, (2, 12)),
+        hidden_states=torch.randn(2, 12, 48),
+        target_last_hidden_states=torch.randn(2, 12, 16),
+        loss_mask=torch.tensor(
+            [[0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1]]
+        ),
     )
 
 
@@ -325,6 +358,132 @@ class DSpineTest(unittest.TestCase):
         self.assertEqual(options.schedule(200, 600)[1], 0)
         self.assertEqual(options.schedule(146, 600)[0], 0.5)
         self.assertEqual(options.schedule(0, None)[1], 0)
+
+    def test_chunked_objective_matches_full_loss_and_all_parameter_gradients(self):
+        for chunk_size in [1, 3]:
+            with self.subTest(chunk_size=chunk_size):
+                full = training_model()
+                chunked = copy.deepcopy(full)
+                chunked.objective_chunk_blocks = chunk_size
+                inputs = training_inputs()
+                torch.manual_seed(42)
+                (expected, _, _) = full(**inputs, global_step=100, total_steps=600)
+                expected.backward()
+                torch.manual_seed(42)
+                (actual, _, _) = chunked(**inputs, global_step=100, total_steps=600)
+                actual.backward()
+                torch.testing.assert_close(actual, expected)
+                for name, parameter in full.draft_model.named_parameters():
+                    compared = dict(chunked.draft_model.named_parameters())[name]
+                    self.assertTrue(
+                        parameter.grad is not None and compared.grad is not None, name
+                    )
+                    self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+                    torch.testing.assert_close(
+                        compared.grad, parameter.grad, atol=2e-05, rtol=0.0002
+                    )
+                self.assertIs(full.lm_head.weight.grad, None)
+                self.assertIs(full.embed_tokens.weight.grad, None)
+                self.assertIs(full.draft_model.transfer_codes.grad, None)
+
+    def test_tail_after_a_mask_gap_does_not_contribute_teacher_loss(self):
+        model = training_model()
+        inputs = training_inputs()
+        inputs = {name: value[:1] for (name, value) in inputs.items()}
+        inputs["loss_mask"] = torch.tensor([[0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]])
+        model._sample_anchor_positions = lambda *args, **kwargs: (
+            torch.tensor([[1]]),
+            torch.tensor([[True]]),
+        )
+        (expected, _, metrics) = model(**inputs, global_step=300, total_steps=600)
+        torch.testing.assert_close(
+            metrics["loss_terms"][1], torch.tensor(1 + math.exp(-1 / 7))
+        )
+        inputs["target_last_hidden_states"][:, 3:] += 100
+        (actual, _, _) = model(**inputs, global_step=300, total_steps=600)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_refinement_ignores_missing_labels_and_negligible_teacher_mass(self):
+        model = training_model()
+        with torch.no_grad():
+            model.lm_head.weight.zero_()
+            model.lm_head.weight[:, 0] = torch.arange(32)
+        hidden = torch.zeros(1, 3, 16)
+        hidden[..., 0] = 10
+        teacher = -hidden
+        terms = model._objective_terms(
+            hidden,
+            torch.randn_like(hidden),
+            torch.randn(1, 3, 3, 8),
+            torch.zeros(1, 3, dtype=torch.long),
+            torch.zeros(1, 3, dtype=torch.long),
+            teacher,
+            torch.ones(1, 3),
+            torch.ones(1, 3, dtype=torch.bool),
+        )
+        self.assertEqual(terms[2].item(), 0)
+        self.assertTrue(all((torch.isfinite(term) for term in terms)))
+
+    def test_bf16_training_keeps_frozen_state_and_gradients_finite(self):
+        model = training_model(chunk_size=2).to(dtype=torch.bfloat16)
+        inputs = training_inputs()
+        for name in ("hidden_states", "target_last_hidden_states"):
+            inputs[name] = inputs[name].to(torch.bfloat16)
+        (loss, _, _) = model(**inputs, global_step=150, total_steps=600)
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(
+            all(
+                (
+                    parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                    for parameter in model.draft_model.parameters()
+                )
+            )
+        )
+        self.assertFalse(model.draft_model.transfer_codes.requires_grad)
+
+    def test_bf16_injection_and_refinement_accept_fp32_transfer_buffers(self):
+        for step in [100, 300]:
+            with self.subTest(step=step):
+                model = training_model(chunk_size=2).to(dtype=torch.bfloat16)
+                model.draft_model.transfer_codes = (
+                    model.draft_model.transfer_codes.float()
+                )
+                inputs = training_inputs()
+                for name in ("hidden_states", "target_last_hidden_states"):
+                    inputs[name] = inputs[name].to(torch.bfloat16)
+                (loss, _, _) = model(**inputs, global_step=step, total_steps=600)
+                loss.backward()
+                self.assertTrue(torch.isfinite(loss))
+                self.assertEqual(model.draft_model.transfer_codes.dtype, torch.float32)
+                self.assertTrue(
+                    all(
+                        (
+                            parameter.grad is not None
+                            and torch.isfinite(parameter.grad).all()
+                            for parameter in model.draft_model.parameters()
+                        )
+                    )
+                )
+
+    def test_gradient_checkpointing_preserves_the_complete_training_objective(self):
+        model = training_model(chunk_size=2)
+        checkpointed = copy.deepcopy(model)
+        checkpointed.draft_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        inputs = training_inputs()
+        torch.manual_seed(100)
+        (expected, _, _) = model(**inputs, global_step=146, total_steps=600)
+        expected.backward()
+        torch.manual_seed(100)
+        (actual, _, _) = checkpointed(**inputs, global_step=146, total_steps=600)
+        actual.backward()
+        torch.testing.assert_close(actual, expected)
+        for original, checked in zip(
+            model.draft_model.parameters(), checkpointed.draft_model.parameters()
+        ):
+            torch.testing.assert_close(checked.grad, original.grad)
 
 
 if __name__ == "__main__":
