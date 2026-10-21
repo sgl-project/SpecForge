@@ -86,6 +86,27 @@ gradients or reporting a checkpoint as successful. Queue-mode loaders
 terminally settle and clean a short `drop_last` batch without emitting it;
 fixed offline refs keep normal `drop_last` semantics.
 
+## DSpine kernel controls
+
+DSpine honors `model.use_liger_kernel` through its registered draft provider and
+the existing DFlash kernel factories. The opt-in replaces backbone RMSNorm and
+SwiGLU modules without global Transformers patching or checkpoint-key changes.
+The adjacent injection, transfer space, CE/L1 objectives, alignment schedule,
+last-write refinement and optimizer-window replay remain unchanged. In particular,
+the generic fused linear cross-entropy kernel does not replace DSpine's composite
+objective or remove the logits required for candidate selection and distillation.
+The default remains false and missing optional Liger dependencies fail explicitly.
+
+DSpine projects flattened proposal rows through the frozen vocabulary head with
+2D GEMM, including noncontiguous slices that exclude anchor tokens. The output
+shape and autograd path are preserved. Accumulation prepasses compute only the
+backbone CE and its denominator, skipping teacher projection, L1, top-k,
+refinement and alignment objectives. The detached alignment CE is reduced once
+per optimizer window and shared by all replays. Full objectives and metrics are
+computed during replay; intermediate prepass loss is only CE. Sampling and
+curriculum RNG replay, global denominator normalization and final-step metrics
+are unchanged. GEMM kernel changes may introduce floating-point differences.
+
 ## Domino and DSpark performance controls
 
 Both methods honor `model.use_liger_kernel` through their draft providers and

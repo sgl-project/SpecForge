@@ -46,6 +46,11 @@ def build_step(wrapped_model, **_options):
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
+    if config.model.use_liger_kernel:
+        from specforge.algorithms.model_providers import build_dflash_draft
+        from specforge.modeling.draft.dflash_kernels import load_liger_dflash_kernels
+
+        return build_dflash_draft(config, draft_config, load_liger_dflash_kernels())
     return build_registered_draft(config, draft_config)
 
 

@@ -59,7 +59,21 @@ class OnlineDSpineModel(OnlineDFlashModel):
         return masks
 
     def _project_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(hidden)
+        return self.lm_head(hidden.reshape(-1, hidden.shape[-1])).reshape(
+            *hidden.shape[:-1], -1
+        )
+
+    def _ce_terms(
+        self,
+        hidden: torch.Tensor,
+        labels: torch.Tensor,
+        weights: torch.Tensor,
+        supervised: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = self._project_logits(hidden).float()
+        ce = -logits.log_softmax(dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+        correct = ((logits.argmax(dim=-1) == labels) * supervised).sum()
+        return (ce * weights).sum(), correct.float()
 
     def _objective_terms(
         self,
@@ -124,8 +138,11 @@ class OnlineDSpineModel(OnlineDFlashModel):
         total_steps: int | None = None,
         collect_detailed_metrics: bool = True,
         alignment_ce: torch.Tensor | None = None,
+        ce_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
         del collect_detailed_metrics
+        if ce_only and torch.is_grad_enabled():
+            raise ValueError("DSpine CE prepass requires gradients to be disabled")
         batch, length = input_ids.shape
         anchors, keep = self._sample_anchor_positions(
             length, loss_mask, input_ids.device, max_valid_anchors
@@ -178,6 +195,27 @@ class OnlineDSpineModel(OnlineDFlashModel):
             **draft_kwargs,
         )
         tokens = self.block_size - 1
+        if ce_only:
+            ce, correct = checkpointed_chunk_reduce(
+                self._ce_terms,
+                output.hidden_states[..., 1:, :].reshape(
+                    -1, tokens, output.hidden_states.shape[-1]
+                ),
+                labels[..., 1:].reshape(-1, tokens),
+                weights.reshape(-1, tokens),
+                supervised.reshape(-1, tokens),
+                chunk_size=self.objective_chunk_blocks,
+            )
+            count = supervised.sum().float()
+            return (
+                ce / denominator.clamp_min(1),
+                correct / count.clamp_min(1),
+                dict(
+                    ratio_metrics={"dspine/backbone_ce": (ce, denominator)},
+                    accuracy_denom=count,
+                    loss_terms=(ce, denominator),
+                ),
+            )
         target_indices = (safe_indices[..., 1:] - 1).clamp_min(0)
         target_hidden = target_last_hidden_states.detach().gather(
             1,

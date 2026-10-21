@@ -42,7 +42,7 @@ class DSpineTrainStrategy(DFlashTrainStrategy):
         cpu_rng = torch.get_rng_state()
         device_rng = [device_module.get_rng_state(index) for index in devices]
         with torch.no_grad():
-            output = self._forward_loss(batch, ctx)
+            output = self._forward_loss(batch, ctx, ce_only=True)
         # Keep replay inputs on the host, not activations for the whole window.
         replay_batch = replace(
             batch,
@@ -77,6 +77,7 @@ class DSpineTrainStrategy(DFlashTrainStrategy):
         batch: TrainBatch,
         ctx: StepContext | None,
         alignment_ce: torch.Tensor | None = None,
+        ce_only: bool = False,
     ) -> StepOutput:
         self.validate_batch(batch)
         tensors = batch.tensors
@@ -93,6 +94,7 @@ class DSpineTrainStrategy(DFlashTrainStrategy):
                 ctx.collect_detailed_metrics if ctx is not None else True
             ),
             alignment_ce=alignment_ce,
+            ce_only=ce_only,
         )
         return StepOutput(
             loss=loss,
