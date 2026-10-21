@@ -32,6 +32,7 @@ TINY_MOE = {
     "moe_intermediate_size": 32,
     "shared_expert_intermediate_size": 48,
     "norm_topk_prob": False,
+    "dflash_config": {"moe_router_centering": True},
 }
 
 
@@ -66,20 +67,34 @@ class BuildFfnTest(unittest.TestCase):
         moe = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE))
         self.assertTrue(all(isinstance(layer.mlp, MoELayer) for layer in moe.layers))
 
+    def test_moe_drafts_reject_activation_checkpointing(self):
+        moe = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE))
+        with self.assertRaisesRegex(ValueError, "checkpointing"):
+            moe.gradient_checkpointing_enable()
+        dense = DFlashDraftModel(Qwen3Config(**TINY_DFLASH))
+        dense.gradient_checkpointing_enable()
+        self.assertTrue(all(layer.gradient_checkpointing for layer in dense.layers))
+
     def test_from_pretrained_inits_missing_moe_weights_and_keeps_loaded_ones(self):
         model = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE))
+        for layer in model.layers:
+            layer.mlp.centering.running_mean.fill_(0.5)
         state = model.state_dict()
         missing = {"layers.0.mlp.experts.gate_up_proj", "layers.1.mlp.gate.weight"}
-        kept = "layers.0.mlp.experts.down_proj"
+        missing_mean = "layers.1.mlp.centering.running_mean"
+        kept = ["layers.0.mlp.experts.down_proj", "layers.0.mlp.centering.running_mean"]
+        dropped = missing | {missing_mean}
         with tempfile.TemporaryDirectory() as tmp:
             model.save_pretrained(
-                tmp, state_dict={k: v for k, v in state.items() if k not in missing}
+                tmp, state_dict={k: v for k, v in state.items() if k not in dropped}
             )
             loaded = DFlashDraftModel.from_pretrained(tmp).state_dict()
         for key in missing:
             self.assertTrue(torch.isfinite(loaded[key]).all(), key)
             self.assertTrue(0 < loaded[key].std() < 0.1, key)
-        torch.testing.assert_close(loaded[kept], state[kept])
+        torch.testing.assert_close(loaded[missing_mean], torch.zeros(64))
+        for key in kept:
+            torch.testing.assert_close(loaded[key], state[key])
 
 
 if __name__ == "__main__":

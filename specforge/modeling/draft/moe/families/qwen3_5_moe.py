@@ -7,6 +7,7 @@ from transformers import PretrainedConfig
 from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert
 from specforge.modeling.draft.moe.layer import MoELayer
 from specforge.modeling.draft.moe.router import TopKRouter
+from specforge.modeling.draft.moe.util import RouterCentering
 
 
 def build_moe(config: PretrainedConfig) -> MoELayer:
@@ -17,6 +18,11 @@ def build_moe(config: PretrainedConfig) -> MoELayer:
         )
     hidden_size, std = config.hidden_size, config.initializer_range
     shared_size = getattr(config, "shared_expert_intermediate_size", 0)
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    centering = None
+    if dflash_config.get("moe_router_centering", False):
+        momentum = dflash_config.get("moe_router_centering_momentum", 0.99)
+        centering = RouterCentering(hidden_size, momentum)
     return MoELayer(
         gate=TopKRouter(
             config.num_experts,
@@ -36,4 +42,6 @@ def build_moe(config: PretrainedConfig) -> MoELayer:
         shared_expert_gate=(
             nn.Linear(hidden_size, 1, bias=False) if shared_size else None
         ),
+        centering=centering,
+        aux_loss_coef=getattr(config, "router_aux_loss_coef", 0.0),
     )

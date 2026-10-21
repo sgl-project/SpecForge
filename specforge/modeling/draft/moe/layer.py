@@ -9,6 +9,7 @@ from transformers import PretrainedConfig
 
 from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert
 from specforge.modeling.draft.moe.router import TopKRouter
+from specforge.modeling.draft.moe.util import RouterCentering, switch_aux_loss
 
 
 class MoELayer(nn.Module):
@@ -20,21 +21,38 @@ class MoELayer(nn.Module):
         experts: RoutedExperts,
         shared_expert: Optional[SharedExpert] = None,
         shared_expert_gate: Optional[nn.Linear] = None,
+        centering: Optional[RouterCentering] = None,
+        aux_loss_coef: float = 0.0,
     ) -> None:
         super().__init__()
         self.gate = gate
         self.experts = experts
         self.shared_expert = shared_expert
         self.shared_expert_gate = shared_expert_gate
+        self.centering = centering
+        self.aux_loss_coef = aux_loss_coef
+        # Per-batch state for set_moe_token_mask and include_moe_aux_loss (util.py).
+        self.token_mask: Optional[torch.Tensor] = None
+        self.aux_loss: Optional[torch.Tensor] = None
 
     def reset_parameters(self, std: float) -> None:
-        # Only the router and experts hold bare Parameters that HF's init skips.
+        # HF's init skips bare Parameters and buffers; reset them here.
         self.gate.reset_parameters(std)
         self.experts.reset_parameters(std)
+        if self.centering is not None:
+            nn.init.zeros_(self.centering.running_mean)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        x = hidden_states.reshape(-1, hidden_states.shape[-1])
-        _, indices, weights = self.gate(x)
+        hidden_size = hidden_states.shape[-1]
+        mask = self.token_mask if self.training else None
+        router_input = hidden_states
+        if self.centering is not None:
+            router_input = self.centering(hidden_states, mask)
+        x = hidden_states.reshape(-1, hidden_size)
+        scores, indices, weights = self.gate(router_input.reshape(-1, hidden_size))
+        if self.training and self.aux_loss_coef > 0:
+            flat_mask = None if mask is None else mask.reshape(-1)
+            self.aux_loss = switch_aux_loss(scores, indices, flat_mask)
         out = self.experts(x, indices, weights)
         if self.shared_expert is not None:
             shared = self.shared_expert(x)

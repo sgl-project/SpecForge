@@ -427,7 +427,11 @@ class TrainerCore:
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
+        from specforge.modeling.draft.moe.util import include_moe_aux_loss
+
+        out: StepOutput = include_moe_aux_loss(
+            self.strategy.trainable_module(), self.strategy.forward_loss(batch, ctx)
+        )
         loss = out.loss
         ratio_metrics = dict(out.ratio_metrics)
         if out.loss_terms is not None:

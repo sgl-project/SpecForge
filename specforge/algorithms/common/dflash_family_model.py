@@ -18,6 +18,7 @@ from specforge.modeling.draft.dflash_mask import (
     create_dflash_sdpa_mask,
 )
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+from specforge.modeling.draft.moe.util import set_moe_token_mask
 
 try:
     from torch.nn.attention.flex_attention import BlockMask
@@ -676,6 +677,10 @@ class OnlineDFlashModel(nn.Module):
                 draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
             else:
                 draft_kwargs["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}
+        # MoE layers keep padding blocks out of their aux loss and router centering.
+        set_moe_token_mask(
+            self.draft_model, block_keep_mask.repeat_interleave(self.block_size, dim=1)
+        )
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
