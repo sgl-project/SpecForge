@@ -403,6 +403,7 @@ def build_dflash_model(
             kl_scale=cfg.training.kl_scale,
             kl_decay=cfg.training.kl_decay,
             teacher_metrics=cfg.training.dflash_teacher_metrics,
+            fused_logits_loss=cfg.training.fused_logits_loss,
         ),
     )
 
@@ -444,6 +445,7 @@ def build_dspark_model(
             **common,
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
+            fused_logits_loss=cfg.training.fused_logits_loss,
             dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
         ),
     )

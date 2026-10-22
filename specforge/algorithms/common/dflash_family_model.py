@@ -274,6 +274,7 @@ class OnlineDFlashModel(nn.Module):
         kl_decay: float = 1.0,
         metric_top_k: int = 16,
         teacher_metrics: bool = True,
+        fused_logits_loss: bool = False,
     ):
         super().__init__()
         if metric_top_k <= 0:
@@ -319,11 +320,11 @@ class OnlineDFlashModel(nn.Module):
         self.metric_top_k = int(metric_top_k)
         # Diagnostics-only: compare against target_last_hidden_states when fed.
         self.teacher_metrics = bool(teacher_metrics)
-        self._fused_unary_head_requested = (
-            os.environ.get(_FUSED_UNARY_HEAD_ENV, "1") != "0"
-        )
-
         candidate_selector = getattr(self.draft_model, "candidate_selector", None)
+        # Keep DFlash2's default and the legacy environment override.
+        self.fused_logits_loss = (
+            fused_logits_loss or candidate_selector is not None
+        ) and os.environ.get(_FUSED_UNARY_HEAD_ENV, "1") != "0"
         self._selector_objective_enabled = (
             candidate_selector is not None and self.selector_loss_alpha > 0
         )
@@ -688,14 +689,13 @@ class OnlineDFlashModel(nn.Module):
     def _selector_chunk_terms(
         self,
         candidate_selector: nn.Module,
-        objective_logits: Optional[torch.Tensor],
         hidden: torch.Tensor,
         target_ids: torch.Tensor,
         predecessor_ids: torch.Tensor,
         loss_weights: torch.Tensor,
         weight_mask: torch.Tensor,
-        topk_values: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None,
+        topk_values: torch.Tensor,
+        topk_ids: torch.Tensor,
     ) -> SelectorTerms:
         """Return additive selector terms for one enabled objective chunk.
 
@@ -706,29 +706,20 @@ class OnlineDFlashModel(nn.Module):
         The caller flattens these fields into ``DFlashObjectiveTerms`` to preserve
         ``checkpointed_chunk_reduce``'s flat tuple contract.
 
-        ``topk_values`` and ``topk_ids`` supply a precomputed strict unary top-k
-        (the fused head); otherwise it is taken from ``objective_logits``.
+        ``topk_values`` and ``topk_ids`` are the strict unary top-k returned by
+        the eager or fused logits loss.
         """
 
         if self.selector_stop_gradient:
             # Isolate only the selector objective. The caller still uses the
             # original tensors for the primary DFlash/D-PACE/LK objective.
-            if objective_logits is not None:
-                objective_logits = objective_logits.detach()
-            if topk_values is not None:
-                topk_values = topk_values.detach()
+            topk_values = topk_values.detach()
             hidden = hidden.detach()
 
         # Match serving exactly: train only against the strict unary top-k.
         # Candidate misses are a backbone/recall failure, not a selector
         # classification example, so they carry no selector gradient.
-        if topk_ids is None:
-            unary_logits, candidate_ids = objective_logits.topk(
-                candidate_selector.top_k,
-                dim=-1,
-            )
-        else:
-            unary_logits, candidate_ids = topk_values, topk_ids
+        unary_logits, candidate_ids = topk_values, topk_ids
         target_matches = candidate_ids.eq(target_ids.unsqueeze(-1))
         target_is_candidate = target_matches.any(dim=-1)
         target_candidate_index = target_matches.long().argmax(dim=-1)
@@ -779,38 +770,15 @@ class OnlineDFlashModel(nn.Module):
             .expand(-1, weight_mask.shape[1], -1)
         )
 
-    def _use_fused_unary_head(self, hidden: torch.Tensor) -> bool:
-        """Whether the objective can use the fused Triton DFlash2 unary head.
-
-        The fused head covers DFlash2's identity unary transform over a frozen
-        BF16 ``nn.Linear`` target head on CUDA. Plain DFlash, transformed or
-        trainable heads, other devices, and ``SPECFORGE_DFLASH_FUSED_HEAD=0``
-        keep the reference PyTorch objective.
-        """
-
-        if not self._fused_unary_head_requested or self.block_size <= 1:
-            return False
-        if getattr(self.draft_model, "candidate_selector", None) is None:
-            return False
-        is_identity = getattr(
-            self.draft_model, "unary_logits_transform_is_identity", None
+    def _use_fused_logits(self, hidden: torch.Tensor) -> bool:
+        """Select the logits loss independently of the projection implementation."""
+        return (
+            self.fused_logits_loss
+            and self.block_size > 1
+            and hidden.is_cuda
+            and hidden.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and _triton_available()
         )
-        if is_identity is None or not is_identity():
-            return False
-        head = self.lm_head
-        if not isinstance(head, nn.Linear) or head.bias is not None:
-            return False
-        weight = head.weight
-        if (
-            weight.requires_grad
-            or weight.dtype != torch.bfloat16
-            or not weight.is_cuda
-            or type(weight.data) is not torch.Tensor
-        ):
-            return False
-        if hidden.dtype != torch.bfloat16 or not hidden.is_cuda:
-            return False
-        return _triton_available()
 
     def _dflash_objective_chunk_terms(
         self,
@@ -819,52 +787,44 @@ class OnlineDFlashModel(nn.Module):
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
         sequence_anchor_scale: Optional[torch.Tensor] = None,
-        *,
-        fused_head: bool = False,
     ) -> DFlashObjectiveTerms:
-        """Return a flat tuple of additive objective and metric tensors.
-
-        ``fused_head=True`` (see ``_use_fused_unary_head``) takes the unary CE,
-        strict top-k, and argmax from the fused Triton head. Its inputs omit
-        block slot 0, so decay positions start at 1.
-        """
+        """Return additive objective/metric terms, optionally omitting anchor slot 0."""
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         candidate_selector = getattr(self.draft_model, "candidate_selector", None)
-        objective_logits = None
-        topk_values = topk_ids = fused_predicted_ids = None
-        if fused_head:
-            from specforge.core.dflash_head_triton import dflash_unary_head_fused
-
-            neg_log_q, topk_values, topk_ids, fused_predicted_ids = (
-                dflash_unary_head_fused(
-                    hidden,
-                    self.lm_head.weight,
-                    target_ids,
-                    candidate_selector.top_k if self._selector_objective_enabled else 0,
-                )
-            )
-        else:
-            logits = self.lm_head(
-                hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
-            ).reshape(batch_size, num_blocks, block_size, -1)
-            objective_logits = (
-                self.draft_model.transform_unary_logits(logits)
-                if candidate_selector is not None
-                else logits
-            )
-            neg_log_q = F.cross_entropy(
-                objective_logits.reshape(-1, objective_logits.shape[-1]),
-                target_ids.reshape(-1),
-                reduction="none",
-            ).reshape_as(target_ids)
+        logits = self.lm_head(
+            hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
+        ).reshape(batch_size, num_blocks, block_size, -1)
+        # Identity transforms need no full-vocabulary FP32 copy: the loss
+        # normalizes in FP32 directly from the original logits.
+        is_identity = getattr(
+            self.draft_model, "unary_logits_transform_is_identity", None
+        )
+        objective_logits = (
+            self.draft_model.transform_unary_logits(logits)
+            if candidate_selector is not None
+            and (is_identity is None or not is_identity())
+            else logits
+        )
+        loss_fn = (
+            fused_loss.fused_ce_l1_loss
+            if self._use_fused_logits(hidden)
+            else fused_loss.ce_l1_loss
+        )
+        terms = loss_fn(
+            objective_logits,
+            target_ids,
+            top_k=candidate_selector.top_k if self._selector_objective_enabled else 0,
+        )
+        neg_log_q = terms.cross_entropy
+        topk_values, topk_ids = terms.topk_values, terms.topk_ids
 
         target_probability = torch.exp(-neg_log_q)
         loss_weights = weight_mask
         if self.loss_type == "dflash":
             if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
                 positions = torch.arange(
-                    1 if fused_head else 0,
+                    self.block_size - block_size,
                     self.block_size,
                     device=hidden.device,
                 ).view(1, 1, -1)
@@ -910,7 +870,6 @@ class OnlineDFlashModel(nn.Module):
         if self._selector_objective_enabled:
             selector_terms = self._selector_chunk_terms(
                 candidate_selector=candidate_selector,
-                objective_logits=objective_logits,
                 hidden=hidden,
                 target_ids=target_ids,
                 predecessor_ids=predecessor_ids,
@@ -921,9 +880,7 @@ class OnlineDFlashModel(nn.Module):
             )
 
         with torch.no_grad():
-            predicted_ids = (
-                fused_predicted_ids if fused_head else objective_logits.argmax(dim=-1)
-            )
+            predicted_ids = terms.argmax_ids
             correct_num = (
                 ((predicted_ids == target_ids) & (weight_mask > 0.5)).sum().float()
             )
@@ -1471,7 +1428,7 @@ class OnlineDFlashModel(nn.Module):
         if collect_detailed_metrics:
             # Reduce the detached diagnostics first: their full-vocabulary
             # temporaries are released before the objective keeps state for
-            # backward (the fused head keeps its BF16 logits).
+            # backward (the fused logits loss keeps its BF16 logits).
             metric_terms = DFlashMetricTerms(
                 *checkpointed_chunk_reduce(
                     partial(
@@ -1489,7 +1446,6 @@ class OnlineDFlashModel(nn.Module):
                     dim=1,
                 )
             )
-        objective_function = self._dflash_objective_chunk_terms
         objective_inputs = (
             hidden_4d,
             target_ids,
@@ -1497,15 +1453,10 @@ class OnlineDFlashModel(nn.Module):
             predecessor_ids,
             sequence_anchor_scale,
         )
-        fused_head = self._use_fused_unary_head(hidden_4d)
-        if fused_head:
-            # Block slot 0 holds the clean anchor. ``weight_mask`` zeroes it in
-            # every objective, selector, and accuracy term, and D-PACE treats it
-            # as a multiplicative no-op, so the fused head skips its rows. The
-            # fused head saves only its BF16 logits, which replaces activation
-            # checkpointing's second LM-head projection.
-            # ``sequence_anchor_scale`` is per anchor ([B, N, 1]) and broadcasts.
-            objective_function = partial(objective_function, fused_head=True)
+        fused_logits = self._use_fused_logits(hidden_4d)
+        if fused_logits:
+            # The clean anchor has zero weight in every objective and metric.
+            # Skip its projection; sequence_anchor_scale still broadcasts per anchor.
             objective_inputs = (
                 *(tensor[:, :, 1:] for tensor in objective_inputs[:4]),
                 sequence_anchor_scale,
@@ -1523,11 +1474,12 @@ class OnlineDFlashModel(nn.Module):
             selector_weight_den,
             selector_covered_num,
         ) = checkpointed_chunk_reduce(
-            objective_function,
+            self._dflash_objective_chunk_terms,
             *objective_inputs,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
-            checkpoint=not fused_head,
+            # Fused backward saves logits, avoiding projection recomputation.
+            checkpoint=not fused_logits,
         )
         token_loss_num = self._compose_token_objective(
             ce_loss_num,
@@ -2024,6 +1976,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
         objective_chunk_blocks: int = 128,
+        fused_logits_loss: bool = False,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -2036,6 +1989,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_decay_gamma=loss_decay_gamma,
             objective_chunk_blocks=objective_chunk_blocks,
             loss_type="dflash",
+            fused_logits_loss=fused_logits_loss,
         )
         if dspark_ce_loss_alpha < 0:
             raise ValueError("dspark_ce_loss_alpha must be >= 0")
@@ -2139,65 +2093,63 @@ class OnlineDSparkModel(OnlineDFlashModel):
             prev_token_ids=prev_token_ids,
             hidden_states=hidden,
         )
-        vocab_size = draft_logits.shape[-1]
-        cross_entropy = F.cross_entropy(
-            draft_logits.reshape(-1, vocab_size),
-            target_ids.reshape(-1),
-            reduction="none",
-        ).reshape_as(target_ids)
-        ce_num = (cross_entropy * loss_weights).sum()
-
-        zero = ce_num.new_zeros(())
-        l1_num = zero
-        confidence_num = zero
-        confidence_error_num = zero
-        teacher_agreement_num = zero
-        teacher_top1_num = zero
-        draft_top1_num = zero
-        tau_num = zero
-        tau_den = zero
-        accept_probability = None
-
-        teacher_ids = None
         target_logits = None
         if aligned_target_hidden is not None:
             with torch.no_grad():
                 target_logits = self.lm_head(
                     aligned_target_hidden.reshape(
-                        batch_size,
-                        num_blocks * block_size,
-                        hidden_size,
+                        batch_size, num_blocks * block_size, hidden_size
                     )
                 ).reshape_as(draft_logits)
+        use_joint_loss = self._use_fused_logits(hidden)
+        # Preserve main's BF16 fused-TV default when joint fusion is not enabled.
+        use_fused_tv = (
+            not use_joint_loss
+            and target_logits is not None
+            and os.environ.get(
+                "SPECFORGE_DSPARK_FUSED_LOSS",
+                "1" if draft_logits.dtype == torch.bfloat16 else "0",
+            )
+            == "1"
+        )
+        loss_fn = (
+            fused_loss.fused_ce_l1_loss if use_joint_loss else fused_loss.ce_l1_loss
+        )
+        terms = loss_fn(
+            draft_logits,
+            target_ids,
+            teacher_logits=None if use_fused_tv else target_logits,
+        )
+        cross_entropy, l1_per_token = terms.cross_entropy, terms.teacher_l1
+        predicted_ids, draft_top1 = terms.argmax_ids, terms.top1_probability
+        teacher_ids, teacher_top1 = (
+            terms.teacher_argmax_ids,
+            terms.teacher_top1_probability,
+        )
+        if use_fused_tv:
+            vocab_size = draft_logits.shape[-1]
+            l1_per_token = 2.0 * fused_loss.fused_tv_loss(
+                draft_logits.reshape(batch_size, num_blocks * block_size, vocab_size),
+                target_logits.reshape(batch_size, num_blocks * block_size, vocab_size),
+            ).reshape_as(target_ids)
+            with torch.no_grad():
                 teacher_ids = target_logits.argmax(dim=-1)
-            # BF16 benefits from fusion; FP32 stays eager unless explicitly enabled.
-            if (
-                os.environ.get(
-                    "SPECFORGE_DSPARK_FUSED_LOSS",
-                    "1" if draft_logits.dtype == torch.bfloat16 else "0",
+                teacher_top1 = torch.exp(
+                    target_logits.max(dim=-1).values
+                    - target_logits.float().logsumexp(dim=-1)
                 )
-                == "1"
-            ):
-                # Fused TV: l1 = 2 * tv and accept = 1 - tv for normalized
-                # softmax pairs; no [B, T, V] probability tensor materialized.
-                tv_per_token = fused_loss.fused_tv_loss(
-                    draft_logits.reshape(
-                        batch_size, num_blocks * block_size, vocab_size
-                    ),
-                    target_logits.reshape(
-                        batch_size, num_blocks * block_size, vocab_size
-                    ),
-                ).reshape_as(target_ids)
-                l1_per_token = 2.0 * tv_per_token
-                accept_probability = (1.0 - tv_per_token).clamp(0.0, 1.0)
-            else:
-                with torch.no_grad():
-                    target_probabilities = torch.softmax(target_logits.float(), dim=-1)
-                draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
-                l1_per_token = (
-                    (draft_probabilities - target_probabilities).abs().sum(dim=-1)
+                draft_top1 = torch.exp(
+                    draft_logits.max(dim=-1).values
+                    - draft_logits.float().logsumexp(dim=-1)
                 )
-                accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+        ce_num = (cross_entropy * loss_weights).sum()
+        zero = ce_num.new_zeros(())
+        l1_num = confidence_num = confidence_error_num = zero
+        teacher_agreement_num = teacher_top1_num = draft_top1_num = zero
+        tau_num = tau_den = zero
+        accept_probability = None
+        if l1_per_token is not None:
+            accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
 
@@ -2222,7 +2174,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             ).sum()
 
         with torch.no_grad():
-            predicted_ids = draft_logits.argmax(dim=-1)
             correct = ((predicted_ids == target_ids) & eval_mask).float()
             correct_num = correct.sum()
             eval_den = eval_mask.float().sum()
@@ -2233,26 +2184,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 predicted_ids, target_ids, eval_mask, block_index, total_blocks
             )
             if aligned_target_hidden is not None:
-                assert teacher_ids is not None and target_logits is not None
                 teacher_agreement_num = (
                     (predicted_ids == teacher_ids).float() * eval_mask
                 ).sum()
-                # Top-1 softmax probability without materializing probabilities:
-                # p_max = exp(max_logit - logsumexp(logits)), in fp32.
-                teacher_top1_num = (
-                    torch.exp(
-                        target_logits.max(dim=-1).values
-                        - target_logits.float().logsumexp(dim=-1)
-                    )
-                    * eval_mask
-                ).sum()
-                draft_top1_num = (
-                    torch.exp(
-                        draft_logits.max(dim=-1).values
-                        - draft_logits.float().logsumexp(dim=-1)
-                    )
-                    * eval_mask
-                ).sum()
+                teacher_top1_num = (teacher_top1 * eval_mask).sum()
+                draft_top1_num = (draft_top1 * eval_mask).sum()
                 valid_blocks = eval_mask.any(dim=-1).float()
                 accepted_expectation = (
                     accept_probability.detach() * eval_mask
@@ -2331,6 +2267,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             ),
             chunk_size=self.objective_chunk_blocks,
             dim=1,
+            checkpoint=not self._use_fused_logits(hidden_4d),
         )
 
         (

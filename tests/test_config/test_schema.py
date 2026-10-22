@@ -565,6 +565,39 @@ class ConfigSchemaTest(unittest.TestCase):
                     build_training_model(config, None, None, None, None)
                 self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
 
+    def test_fused_logits_loss_reaches_dflash_and_dspark(self):
+        from unittest import mock
+
+        from specforge.algorithms import model_providers
+
+        for strategy in ("dflash", "dspark"):
+            for enabled in (False, True):
+                with self.subTest(strategy=strategy, enabled=enabled):
+                    payload = _online_payload(strategy)
+                    payload["training"]["fused_logits_loss"] = enabled
+                    config = Config.model_validate(payload)
+                    model_name = (
+                        "OnlineDFlashModel"
+                        if strategy == "dflash"
+                        else "OnlineDSparkModel"
+                    )
+                    with (
+                        mock.patch(
+                            f"specforge.algorithms.common.dflash_family_model.{model_name}"
+                        ) as model_cls,
+                        mock.patch.object(
+                            model_providers,
+                            "_build_dflash_family_model",
+                            side_effect=lambda _cfg, _draft, _tok, factory: factory({}),
+                        ),
+                    ):
+                        getattr(model_providers, f"build_{strategy}_model")(
+                            config, None, None, None, None
+                        )
+                    self.assertIs(
+                        model_cls.call_args.kwargs["fused_logits_loss"], enabled
+                    )
+
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
         payload["training"]["lk_loss_type"] = "tv"

@@ -289,6 +289,7 @@ Common fields:
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.ddp_bucket_cap_mb` | unset | Optional DDP bucket target in MiB for `NO_SHARD`; unset keeps PyTorch's default. Benchmark changes because larger buckets trade launch overhead for later overlap. |
+| `training.fused_logits_loss` | `false` | Opt-in CUDA logits loss for DFlash and DSpark: FP32 CE plus optional teacher L1 (TV = L1/2), with shared normalization and backward. Projection and logit transforms stay in ordinary autograd. Saves logits instead of checkpoint-recomputing the projection; memory therefore grows with total objective rows, even when chunked. DFlash2 keeps its existing default fast path; `SPECFORGE_DFLASH_FUSED_HEAD=0` disables logits fusion. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
