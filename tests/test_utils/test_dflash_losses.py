@@ -61,6 +61,9 @@ with patch.dict(
     },
 ):
     _spec.loader.exec_module(_dflash_module)
+    # The shared token objective the wrappers bind; the fused TV kernel is
+    # looked up through this module instance, so tests patch it here.
+    _token_objective_module = sys.modules["specforge.core.token_objective"]
 OnlineDFlashModel = _dflash_module.OnlineDFlashModel
 OnlineDSparkModel = _dflash_module.OnlineDSparkModel
 
@@ -1071,7 +1074,7 @@ class TestDSparkFusedLoss(unittest.TestCase):
                     with (
                         patch.dict(os.environ),
                         patch.object(
-                            _dflash_module.fused_loss,
+                            _token_objective_module.fused_loss,
                             "fused_tv_loss",
                             side_effect=eager_tv,
                         ) as fused_call,
@@ -1154,7 +1157,7 @@ class TestDSparkFusedLoss(unittest.TestCase):
         fused_model = build()
         fused_model.load_state_dict(eager_model.state_dict())
 
-        fused_loss_module = _dflash_module.fused_loss
+        fused_loss_module = _token_objective_module.fused_loss
 
         def exact_eager_tv(logits, targets):
             draft_p = torch.softmax(logits.float(), dim=-1)
@@ -1254,9 +1257,9 @@ class TestDSparkFusedLoss(unittest.TestCase):
         with (
             patch.dict(os.environ),
             patch.object(
-                _dflash_module.fused_loss,
+                _token_objective_module.fused_loss,
                 "fused_tv_loss",
-                wraps=_dflash_module.fused_loss.fused_tv_loss,
+                wraps=_token_objective_module.fused_loss.fused_tv_loss,
             ) as fused_call,
         ):
             os.environ.pop("SPECFORGE_DSPARK_FUSED_LOSS", None)
