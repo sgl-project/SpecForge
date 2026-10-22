@@ -227,21 +227,48 @@ class TestNormalizeDFlashExport(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "selector_top_k"):
                 self.module.normalize_export(str(path), 8)
 
-    def test_rejects_mla_before_rewriting_the_export(self):
+    def test_accepts_dflash_mla_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "architectures": ["DFlashDraftModel"],
+                        "auto_map": {"AutoModel": "dflash.DFlashDraftModel"},
+                        "block_size": 16,
+                        "dflash_config": {
+                            "projector_type": "dflash",
+                            "attention_mode": "mla",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            normalized = self.module.normalize_export(str(path), 16)
+
+            self.assertEqual(normalized["architectures"], ["DFlashDraftModel"])
+            self.assertEqual(normalized["dflash_config"]["attention_mode"], "mla")
+            self.assertNotIn("auto_map", normalized)
+
+    def test_rejects_dspark_mla_before_rewriting_the_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             original = {
                 "architectures": ["DFlashDraftModel"],
                 "auto_map": {"AutoModel": "dflash.DFlashDraftModel"},
                 "block_size": 16,
+                "model_type": "qwen3",
                 "dflash_config": {
-                    "projector_type": "dflash",
+                    "projector_type": "dspark",
                     "attention_mode": "mla",
+                    "markov_rank": 4,
+                    "markov_head_type": "vanilla",
                 },
             }
             path.write_text(json.dumps(original), encoding="utf-8")
 
-            with self.assertRaisesRegex(ValueError, "only GQA/MHA"):
+            with self.assertRaisesRegex(ValueError, "DSpark serving does not support"):
                 self.module.normalize_export(str(path), 16)
 
             self.assertEqual(json.loads(path.read_text()), original)
