@@ -1,0 +1,22 @@
+{
+  "architectures": ["LongSparkDraftModel"],
+  "model_type": "longspark",
+  "hidden_size": 4096,
+  "intermediate_size": 12288,
+  "num_hidden_layers": 5,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "vocab_size": 151936,
+  "target_layer_ids": [0, 9, 18, 26, 35],
+  "block_size": 7,
+  "mask_token_id": 151669,
+  "global_memory_slots": 16,
+  "recent_kv_window": 256,
+  "markov_rank": 256,
+  "rope_theta": 1000000.0,
+  "rms_norm_eps": 0.000001,
+  "gradient_checkpointing": true,
+  "initializer_range": 0.02,
+  "tie_word_embeddings": false
+}

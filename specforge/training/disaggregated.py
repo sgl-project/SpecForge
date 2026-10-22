@@ -691,6 +691,7 @@ def _build_online(
             last_hidden_feature=layout.last_hidden_feature,
             passthrough=layout.passthrough,
             attention_mask_feature=layout.attention_mask_feature,
+            extra_artifacts=layout.extra_artifacts,
         )
         adapters = [
             SGLangServerCaptureAdapter(

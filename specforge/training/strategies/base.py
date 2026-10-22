@@ -54,6 +54,8 @@ class StepContext:
     global_step: int = 0
     total_steps: Optional[int] = None
     collect_detailed_metrics: bool = True
+    epoch: int = 0
+    epoch_microstep: Optional[int] = None
 
 
 def linear_lambda_base(

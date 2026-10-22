@@ -1,5 +1,5 @@
 diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
-index 1f310d82a5..ff972fdf1a 100644
+index 1f310d82a5..22d1746fd1 100644
 --- a/python/sglang/kernels/ops/layernorm/mhc.py
 +++ b/python/sglang/kernels/ops/layernorm/mhc.py
 @@ -583,6 +583,9 @@ def prewarm_mhc_pre(
@@ -13,10 +13,10 @@ index 1f310d82a5..ff972fdf1a 100644
          max_num_tokens, hc_mult * hidden_size
      )
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index 2487072b63..1a7d91a329 100644
+index 2487072b63..02b62cc429 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
-@@ -102,6 +102,11 @@ class LogitsProcessorOutput:
+@@ -102,6 +102,15 @@ class LogitsProcessorOutput:
      # Used by speculative decoding (EAGLE)
      # The last hidden layers
      hidden_states: Optional[torch.Tensor] = None
@@ -25,10 +25,14 @@ index 2487072b63..1a7d91a329 100644
 +    last_hidden_states: Optional[torch.Tensor] = None
 +    spec_capture_aux_gpu: Optional[torch.Tensor] = None
 +    spec_capture_last_hidden_gpu: Optional[torch.Tensor] = None
++    target_keys: Optional[torch.Tensor] = None
++    target_values: Optional[torch.Tensor] = None
++    spec_capture_target_keys_gpu: Optional[torch.Tensor] = None
++    spec_capture_target_values_gpu: Optional[torch.Tensor] = None
  
      ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
      # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
-@@ -391,6 +396,30 @@ class LogitsProcessor(nn.Module):
+@@ -391,6 +400,30 @@ class LogitsProcessor(nn.Module):
              sample_indices,
              logits_metadata,
          )
@@ -59,7 +63,7 @@ index 2487072b63..1a7d91a329 100644
          del hidden_states
  
          if not logits_metadata.extend_return_logprob:
-@@ -404,6 +433,7 @@ class LogitsProcessor(nn.Module):
+@@ -404,6 +437,7 @@ class LogitsProcessor(nn.Module):
              return LogitsProcessorOutput(
                  next_token_logits=sampled_logits,
                  hidden_states=hidden_states_to_store,
@@ -67,7 +71,7 @@ index 2487072b63..1a7d91a329 100644
                  mm_input_embeds=logits_metadata.mm_input_embeds,
              )
  
-@@ -421,6 +449,7 @@ class LogitsProcessor(nn.Module):
+@@ -421,6 +455,7 @@ class LogitsProcessor(nn.Module):
          logits_output = LogitsProcessorOutput(
              next_token_logits=sampled_logits,
              hidden_states=hidden_states_to_store,
@@ -75,7 +79,7 @@ index 2487072b63..1a7d91a329 100644
              mm_input_embeds=logits_metadata.mm_input_embeds,
          )
          logprobs_result.write_input_to(logits_output)
-@@ -608,10 +637,12 @@ class LogitsProcessor(nn.Module):
+@@ -608,10 +643,12 @@ class LogitsProcessor(nn.Module):
          if logits_metadata.capture_hidden_mode.need_capture():
              if logits_metadata.capture_hidden_mode.is_full():
                  if aux_hidden_states is not None:
@@ -185,7 +189,7 @@ index 736642c7fe..5b4f46c8f2 100644
      token_steps: Optional[List[List[int]]] = None
  
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 3ff2a29f3f..ad8ef20dc9 100755
+index 3ff2a29f3f..d95dbc014e 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
 @@ -846,6 +846,7 @@ class Req(ReqDllmMixin):
@@ -196,7 +200,7 @@ index 3ff2a29f3f..ad8ef20dc9 100755
          multi_item_delimiter_indices: Optional[List[int]] = None,
          session_id: Optional[str] = None,
          cache_salt: Optional[str] = None,
-@@ -914,10 +915,18 @@ class Req(ReqDllmMixin):
+@@ -914,10 +915,21 @@ class Req(ReqDllmMixin):
              }
          self.sampling_params = sampling_params
          self.custom_logit_processor = custom_logit_processor
@@ -211,6 +215,9 @@ index 3ff2a29f3f..ad8ef20dc9 100755
          )
 +        self.spec_capture_aux: List[torch.Tensor] = []
 +        self.spec_capture_last_hidden: List[torch.Tensor] = []
++        self.spec_capture_target_keys: List[torch.Tensor] = []
++        self.spec_capture_target_values: List[torch.Tensor] = []
++        self.spec_capture_extra: Dict[str, torch.Tensor] = {}
 +        self.spec_capture_result = None  # per-request sink result -> output field
  
          # Extra key for caller-defined request classification.
@@ -386,7 +393,7 @@ index 7dc5be833f..8212d4efe4 100644
          return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 024781c37e..31defd0da1 100644
+index 024781c37e..df1c1f6286 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -1,7 +1,9 @@
@@ -507,7 +514,7 @@ index 024781c37e..31defd0da1 100644
  
          can_run_cuda_graph = result.can_run_cuda_graph
          self.metrics_reporter.report_prefill_stats(
-@@ -496,6 +531,192 @@ class SchedulerBatchResultProcessor:
+@@ -496,6 +531,215 @@ class SchedulerBatchResultProcessor:
                      f"Placeholder zeros would be appended to output_ids."
                  )
  
@@ -542,6 +549,20 @@ index 024781c37e..31defd0da1 100644
 +                "spec_capture_last_hidden_gpu",
 +                "_spec_capture_last_hidden_cpu",
 +                req.spec_capture_last_hidden,
++            ),
++            (
++                "target_keys",
++                "target_keys",
++                "spec_capture_target_keys_gpu",
++                "_spec_capture_target_keys_cpu",
++                getattr(req, "spec_capture_target_keys", []),
++            ),
++            (
++                "target_values",
++                "target_values",
++                "spec_capture_target_values_gpu",
++                "_spec_capture_target_values_cpu",
++                getattr(req, "spec_capture_target_values", []),
 +            ),
 +        ):
 +            if artifact not in features:
@@ -594,6 +615,13 @@ index 024781c37e..31defd0da1 100644
 +        cat_ms = (time.perf_counter() - cat_start) * 1000.0
 +        req.spec_capture_aux = []
 +        req.spec_capture_last_hidden = []
++        extras = {}
++        for name in ("target_keys", "target_values"):
++            chunks = getattr(req, f"spec_capture_{name}", None)
++            if chunks:
++                extras[name] = self._coalesce_spec_capture_chunks(chunks)
++            setattr(req, f"spec_capture_{name}", [])
++        req.spec_capture_extra = extras
 +        return req, req.spec_capture, aux, last_hidden, timing_enabled, cat_ms
 +
 +    def _queue_spec_captures(self, pending, *, return_logprob: bool) -> None:
@@ -603,10 +631,12 @@ index 024781c37e..31defd0da1 100644
 +        from sglang.srt import spec_capture_sink
 +
 +        sink = spec_capture_sink.get_sink()
-+        samples = [
-+            (spec, aux, last_hidden)
-+            for _, spec, aux, last_hidden, _, _ in pending
-+        ]
++        samples = []
++        for req, spec, aux, last_hidden, _, _ in pending:
++            samples.append(
++                (spec, aux, last_hidden, getattr(req, "spec_capture_extra", {}))
++            )
++            req.spec_capture_extra = {}
 +        self._spec_capture_batches.append(
 +            (
 +                pending,
@@ -768,10 +798,10 @@ index 41c9cd212e..b01fd9e64b 100644
                  val = recv_obj.routed_experts[i]
                  if val is not None:
 diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
-index 69d00c9af9..3b4f7956f5 100644
+index 69d00c9af9..be6fa30c0e 100644
 --- a/python/sglang/srt/managers/utils.py
 +++ b/python/sglang/srt/managers/utils.py
-@@ -115,11 +115,35 @@ class GenerationBatchResult:
+@@ -115,11 +115,44 @@ class GenerationBatchResult:
          return isinstance(self.next_token_ids, torch.Tensor)
  
      @torch.profiler.record_function("copy_result_to_cpu")
@@ -790,8 +820,10 @@ index 69d00c9af9..3b4f7956f5 100644
 +            for source_name, snapshot_name in (
 +                ("hidden_states", "spec_capture_aux_gpu"),
 +                ("last_hidden_states", "spec_capture_last_hidden_gpu"),
++                ("target_keys", "spec_capture_target_keys_gpu"),
++                ("target_values", "spec_capture_target_values_gpu"),
 +            ):
-+                source = getattr(self.logits_output, source_name)
++                source = getattr(self.logits_output, source_name, None)
 +                if source is not None:
 +                    # Snapshot before a later forward can overwrite graph outputs.
 +                    setattr(self.logits_output, snapshot_name, source.detach().clone())
@@ -805,14 +837,21 @@ index 69d00c9af9..3b4f7956f5 100644
 +            self.logits_output.last_hidden_states = (
 +                self.logits_output.last_hidden_states.to("cpu", non_blocking=True)
 +            )
++        if return_hidden_states:
++            for name in ("target_keys", "target_values"):
++                value = getattr(self.logits_output, name, None)
++                if value is not None:
++                    setattr(
++                        self.logits_output, name, value.to("cpu", non_blocking=True)
++                    )
          if return_logprob:
              if self.logits_output.next_token_logprobs is not None:
                  self.logits_output.next_token_logprobs = _async_d2h(
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 017198c76a..32a601fb5d 100644
+index 017198c76a..40586333e2 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -362,6 +362,42 @@ class ModelRunner:
+@@ -362,6 +362,48 @@ class ModelRunner:
          # auxiliary hidden capture mode. TODO: expose this to server args?
          self.init_spec_aux_hidden_state()
  
@@ -821,8 +860,14 @@ index 017198c76a..32a601fb5d 100644
 +            # capture method (they wire different submodules — e.g. VL models
 +            # only populate layers_to_capture via the dflash path).
 +            capture_method = getattr(server_args, "spec_capture_method", "eagle3")
-+            if capture_method in ("dflash", "dspark"):
-+                # Both methods share the dflash-named aux config.  The
++            if capture_method in ("dflash", "dspark", "longspark"):
++                if capture_method == "longspark":
++                    from sglang.srt.spec_capture_longspark import (
++                        validate_longspark_capture,
++                    )
++
++                    validate_longspark_capture(self)
++                # These methods share the dflash-named aux config.  The
 +                # capture-only DSpark override in init_attention_backends
 +                # below still selects the target's native DSpark hook.
 +                self.dflash_use_aux_hidden_state = True
@@ -848,14 +893,14 @@ index 017198c76a..32a601fb5d 100644
 +                    )
 +            else:
 +                raise ValueError(
-+                    "--spec-capture-method must be one of: eagle3, dflash, dspark; "
-+                    f"got {capture_method!r}"
++                    "--spec-capture-method must be one of: eagle3, dflash, dspark, "
++                    f"longspark; got {capture_method!r}"
 +                )
 +
          # Apply the rank zero filter to logger
          if server_args.show_time_cost:
              enable_show_time_cost()
-@@ -926,7 +962,13 @@ class ModelRunner:
+@@ -926,7 +968,13 @@ class ModelRunner:
              eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
              dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
              dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
@@ -870,8 +915,22 @@ index 017198c76a..32a601fb5d 100644
          )
          # Resolve before building: backends read the pair off the runner while
          # they construct (the FlashInfer KV-access check).
+@@ -1554,6 +1602,13 @@ class ModelRunner:
+                     split_forward_count,
+                 )
+         output.expert_distribution_metrics = recorder_outputs.get("metrics")
++        if (
++            self.server_args.enable_spec_capture
++            and self.server_args.spec_capture_method == "longspark"
++        ):
++            from sglang.srt.spec_capture_longspark import capture_longspark_features
++
++            capture_longspark_features(self, forward_batch, output)
+ 
+         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
+         if (
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 5c4f3ff44a..c40bcc6c42 100644
+index 5c4f3ff44a..109ee4e172 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -3511,6 +3511,29 @@ class ServerArgs:
@@ -895,8 +954,8 @@ index 5c4f3ff44a..c40bcc6c42 100644
 +    ] = None
 +    spec_capture_method: A[
 +        str,
-+        "Capture method for --enable-spec-capture: 'eagle3', 'dflash', or "
-+        "'dspark'. Must match the draft strategy being trained; they wire "
++        "Capture method for --enable-spec-capture: 'eagle3', 'dflash', "
++        "'dspark', or 'longspark'. Must match the draft strategy being trained; they wire "
 +        "capture onto different submodules (VL targets only populate the "
 +        "dflash path; dspark rides the dflash aux plumbing).",
 +        NS("exec.features"),
@@ -904,12 +963,73 @@ index 5c4f3ff44a..c40bcc6c42 100644
      enable_return_routed_experts: A[
          bool,
          "Enable returning routed experts of each layer with responses.",
+diff --git a/python/sglang/srt/spec_capture_longspark.py b/python/sglang/srt/spec_capture_longspark.py
+new file mode 100644
+index 0000000000..3502d7b84a
+--- /dev/null
++++ b/python/sglang/srt/spec_capture_longspark.py
+@@ -0,0 +1,55 @@
++"""LongSpark feature capture: selected target K/V and hidden states.
++
++K/V rows are gathered out of the KV pool during the forward pass, before the
++pool can reuse their slots. The regular capture sink then handles lifetime
++and transport.
++"""
++
++import torch
++
++
++def validate_longspark_capture(runner):
++    config = runner.model_config.hf_config
++    layers = runner.server_args.spec_capture_aux_layer_ids
++    if config.model_type != "qwen3":
++        raise ValueError("LongSpark capture supports Qwen3 target models only")
++    if runner.ps.tp_size != 1 or runner.ps.pp_size != 1:
++        raise ValueError("LongSpark capture requires --tp-size 1 and --pp-size 1")
++    if not layers or not all(0 <= layer < config.num_hidden_layers for layer in layers):
++        raise ValueError(
++            "LongSpark capture requires --spec-capture-aux-layer-ids within "
++            f"[0, {config.num_hidden_layers})"
++        )
++
++
++def capture_longspark_features(runner, batch, output):
++    """Attach selected-layer post-RoPE K/V and hidden states to the output."""
++    if not batch.forward_mode.is_extend():
++        return
++    logits = output.logits_output
++    if logits is None or logits.last_hidden_states is None:
++        return
++    layers = runner.server_args.spec_capture_aux_layer_ids
++    locations = batch.out_cache_loc.to(dtype=torch.long)
++    pool = runner.token_to_kv_pool_allocator.get_kvcache()
++    logits.target_keys = torch.stack(
++        [pool.get_key_buffer(layer).index_select(0, locations) for layer in layers],
++        dim=1,
++    )
++    logits.target_values = torch.stack(
++        [pool.get_value_buffer(layer).index_select(0, locations) for layer in layers],
++        dim=1,
++    )
++    last = logits.last_hidden_states
++    aux = logits.hidden_states
++    width = runner.model_config.hf_config.hidden_size
++    # The aux hook for layer k fires at the input of layer k + 1, so the final
++    # layer has no aux entry; LongSpark uses the post-norm final state instead.
++    if aux is None:
++        raise RuntimeError("LongSpark selected hidden states were not captured")
++    if aux.shape == (last.shape[0], (len(layers) - 1) * width):
++        logits.hidden_states = torch.cat([aux, last], dim=-1)
++    elif aux.shape != (last.shape[0], len(layers) * width):
++        raise RuntimeError("LongSpark selected hidden-state layout is invalid")
++    if locations.numel() != last.shape[0]:
++        raise RuntimeError("LongSpark KV/hidden capture token counts disagree")
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000..2deff06ff0
+index 0000000000..6a18e1ae83
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,791 @@
+@@ -0,0 +1,812 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -986,6 +1106,15 @@ index 0000000..2deff06ff0
 +
 +_ARTIFACT_AUX = "aux"
 +_ARTIFACT_LAST_HIDDEN = "last_hidden"
++
++# ``(spec, aux, last_hidden)`` or ``(spec, aux, last_hidden, extra_artifacts)``.
++CaptureSample = Tuple[Any, ...]
++
++
++def _unpack_sample(sample: CaptureSample):
++    """Return ``spec, aux, last_hidden, extra_artifacts`` for one sample."""
++    spec, aux, last_hidden, *rest = sample
++    return spec, aux, last_hidden, (rest[0] if rest else {})
 +
 +
 +_NVLINK = "nvlink"
@@ -1380,17 +1509,15 @@ index 0000000..2deff06ff0
 +    # -- the batch entry point ------------------------------------------------
 +    def submit_samples(
 +        self,
-+        samples: List[
-+            Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]]
-+        ],
++        samples: List[CaptureSample],
 +    ) -> Future[List[Dict[str, Any]]]:
 +        """Queue one scheduler batch without blocking the scheduler thread."""
-+        devices = {
-+            tensor.device
-+            for _, aux, last_hidden in samples
-+            for tensor in (aux, last_hidden)
-+            if tensor is not None and tensor.is_cuda
-+        }
++        devices = set()
++        for sample in samples:
++            _, aux, last_hidden, extras = _unpack_sample(sample)
++            for tensor in (aux, last_hidden, *extras.values()):
++                if tensor is not None and tensor.is_cuda:
++                    devices.add(tensor.device)
 +        ready = []
 +        for device in devices:
 +            event = torch.cuda.Event()
@@ -1405,9 +1532,7 @@ index 0000000..2deff06ff0
 +
 +    def put_samples(
 +        self,
-+        samples: List[
-+            Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]]
-+        ],
++        samples: List[CaptureSample],
 +    ) -> List[Dict[str, Any]]:
 +        """Publish a scheduler batch with one native Mooncake batch RPC.
 +
@@ -1462,7 +1587,8 @@ index 0000000..2deff06ff0
 +            }
 +            feature_meta.append(result_feats[name])
 +
-+        for spec, aux, last_hidden in samples:
++        for sample in samples:
++            spec, aux, last_hidden, extras = _unpack_sample(sample)
 +            store_id = str(spec["store_id"])
 +            sample_id = str(spec["sample_id"])
 +            gen = int(spec.get("gen", 1))
@@ -1502,6 +1628,21 @@ index 0000000..2deff06ff0
 +                    replace=replace,
 +                    name=lh_name,
 +                    tensor=last_hidden.unsqueeze(0),
++                )
++            for artifact in set(features) - {_ARTIFACT_AUX, _ARTIFACT_LAST_HIDDEN}:
++                tensor = extras.get(artifact)
++                if tensor is None:
++                    raise RuntimeError(
++                        f"spec_capture requested {artifact!r} but it was not captured"
++                    )
++                _stage(
++                    result_feats,
++                    store_id=store_id,
++                    sample_id=sample_id,
++                    gen=gen,
++                    replace=replace,
++                    name=features[artifact],
++                    tensor=tensor.unsqueeze(0),
 +                )
 +            for item in spec.get("passthrough") or []:
 +                dtype = _STR_DTYPE.get(str(item.get("dtype", "int64")))

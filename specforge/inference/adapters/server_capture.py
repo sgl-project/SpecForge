@@ -63,6 +63,7 @@ class ServerCaptureSchema:
     last_hidden_feature: Optional[str]
     passthrough: Tuple[Tuple[str, str, Tuple[int, ...]], ...]
     attention_mask_feature: Optional[str] = None
+    extra_artifacts: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -250,6 +251,10 @@ class SGLangServerCaptureAdapter:
             features["aux"] = self.schema.aux_feature
         if self.schema.last_hidden_feature is not None:
             features["last_hidden"] = self.schema.last_hidden_feature
+        for artifact, feature in self.schema.extra_artifacts:
+            if artifact in features:
+                raise ValueError(f"duplicate capture artifact: {artifact}")
+            features[artifact] = feature
         passthrough: List[Dict[str, Any]] = []
         for feature_name, payload_key, trailing in self.schema.passthrough:
             if payload_key == "input_ids":
