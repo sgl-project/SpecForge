@@ -272,6 +272,7 @@ def build_dflash(
     num_anchors=8,
     mask_token_id=0,
     attention_backend="sdpa",
+    draft_config_overrides=None,
 ):
     """Build a tiny OnlineDFlashModel on CUDA through the package model pieces.
 
@@ -308,6 +309,8 @@ def build_dflash(
     draft_config.block_size = block_size
     draft_config.num_target_layers = target_layers
     draft_config.dflash_config = {"mask_token_id": mask_token_id}
+    for key, value in (draft_config_overrides or {}).items():  # e.g. an MoE FFN
+        setattr(draft_config, key, value)
     draft_config._attn_implementation = attention_backend
 
     draft_model = DFlashDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
