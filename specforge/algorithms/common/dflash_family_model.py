@@ -1,5 +1,5 @@
 # coding=utf-8
-"""DFlash-family training models and shared masking helpers."""
+"""DFlash-family training models."""
 
 import os
 from functools import partial
@@ -10,18 +10,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
+from specforge.core import fused_loss
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.dflash_mask import (
+    create_dflash_block_mask,
+    create_dflash_sdpa_mask,
+)
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 try:
-    from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+    from torch.nn.attention.flex_attention import BlockMask
 
     FLEX_ATTENTION_AVAILABLE = True
 except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
     BlockMask = None
-    create_block_mask = None
 
 # NPU workaround: flex_attention is not available on Ascend NPU.
 if hasattr(torch, "npu") and torch.npu.is_available():
@@ -243,111 +247,6 @@ def compute_walk_accepted_length_terms(
                 visited_count += 1
                 resume_at = position + count + 1
     return accepted.new_tensor((accepted_total, visited_count)).unbind()
-
-
-def create_dflash_sdpa_mask(
-    anchor_positions,
-    block_keep_mask,
-    S,
-    block_size,
-    device,
-    sliding_window: Optional[int] = None,
-):
-    """Construct a full or sliding dense boolean DFlash mask."""
-
-    if sliding_window is not None and sliding_window <= 0:
-        raise ValueError("sliding_window must be > 0")
-    B, N = anchor_positions.shape
-    Q_LEN = N * block_size
-    KV_LEN = S + N * block_size
-
-    q_indices = torch.arange(Q_LEN, device=device).view(1, 1, -1, 1)  # (1, 1, Q_LEN, 1)
-    kv_indices = torch.arange(KV_LEN, device=device).view(
-        1, 1, 1, -1
-    )  # (1, 1, 1, KV_LEN)
-
-    q_block_ids = q_indices // block_size
-    q_block_offsets = q_indices % block_size
-
-    anchor_expanded = anchor_positions.view(B, 1, N, 1).repeat_interleave(
-        block_size, dim=2
-    )
-
-    mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
-    if sliding_window is not None:
-        # The current draft token occupies one slot in the window.
-        context_lower_bound = anchor_expanded + q_block_offsets - (sliding_window - 1)
-        mask_context = mask_context & (kv_indices >= context_lower_bound)
-
-    is_draft = kv_indices >= S
-    kv_block_ids = (kv_indices - S) // block_size
-    mask_draft = is_draft & (q_block_ids == kv_block_ids)
-    if sliding_window is not None:
-        kv_block_offsets = (kv_indices - S) % block_size
-        mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
-
-    valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
-
-    final_mask = (mask_context | mask_draft) & valid_block
-    return final_mask
-
-
-def create_dflash_block_mask(
-    anchor_positions: torch.Tensor,
-    block_keep_mask: torch.Tensor,
-    S: int,
-    block_size: int,
-    device: torch.device,
-    flex_block_size=None,
-    sliding_window: Optional[int] = None,
-):
-    """Construct a full or sliding Flex Attention mask for DFlash training."""
-
-    if sliding_window is not None and sliding_window <= 0:
-        raise ValueError("sliding_window must be > 0")
-
-    def dflash_mask_mod(b, h, q_idx, kv_idx):
-        q_block_id = q_idx // block_size
-        q_block_offset = q_idx % block_size
-        safe_q_block_id = q_block_id.clamp(max=N - 1)
-        anchor_pos = anchor_positions[b, safe_q_block_id]
-
-        is_context = kv_idx < S
-        # Strictly less than: matches inference where target_hidden[anchor_pos]
-        # is not available as context.
-        mask_context = is_context & (kv_idx < anchor_pos)
-        if sliding_window is not None:
-            # The current draft token occupies one slot in the window.
-            context_lower_bound = anchor_pos + q_block_offset - (sliding_window - 1)
-            mask_context = mask_context & (kv_idx >= context_lower_bound)
-
-        is_draft = kv_idx >= S
-        kv_block_id = (kv_idx - S) // block_size
-        mask_draft = is_draft & (q_block_id == kv_block_id)
-        if sliding_window is not None:
-            kv_block_offset = (kv_idx - S) % block_size
-            mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
-
-        is_valid_block = block_keep_mask[b, safe_q_block_id]
-        in_bounds = q_block_id < N
-        return (mask_context | mask_draft) & is_valid_block & in_bounds
-
-    B, N = anchor_positions.shape
-    Q_LEN = N * block_size
-    KV_LEN = S + N * block_size
-
-    kwargs = {}
-    if flex_block_size is not None:
-        kwargs["BLOCK_SIZE"] = flex_block_size
-    return create_block_mask(
-        dflash_mask_mod,
-        B=B,
-        H=None,
-        Q_LEN=Q_LEN,
-        KV_LEN=KV_LEN,
-        device=device,
-        **kwargs,
-    )
 
 
 class OnlineDFlashModel(nn.Module):
@@ -732,13 +631,16 @@ class OnlineDFlashModel(nn.Module):
             "S": seq_len,
             "block_size": self.block_size,
             "device": device,
+            "is_causal": getattr(
+                getattr(self.draft_model, "config", None), "is_causal", None
+            ),
         }
         if (
             self.attention_backend == "flex_attention"
             and flex_attention_backend() == "FLASH"
         ):
             # FLASH requires a minimum of this block size.
-            mask_args["flex_block_size"] = (256, 128)
+            mask_args["BLOCK_SIZE"] = (256, 128)
         sliding_window = self.draft_model.sliding_window
         if sliding_window is None:
             dflash_attn_mask = mask_builder(**mask_args)
@@ -2256,8 +2158,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         tau_den = zero
         accept_probability = None
 
-        draft_probabilities = None
         teacher_ids = None
+        target_logits = None
         if aligned_target_hidden is not None:
             with torch.no_grad():
                 target_logits = self.lm_head(
@@ -2267,13 +2169,35 @@ class OnlineDSparkModel(OnlineDFlashModel):
                         hidden_size,
                     )
                 ).reshape_as(draft_logits)
-                target_probabilities = torch.softmax(target_logits.float(), dim=-1)
                 teacher_ids = target_logits.argmax(dim=-1)
-            draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
-            l1_per_token = (
-                (draft_probabilities - target_probabilities).abs().sum(dim=-1)
-            )
-            accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+            # BF16 benefits from fusion; FP32 stays eager unless explicitly enabled.
+            if (
+                os.environ.get(
+                    "SPECFORGE_DSPARK_FUSED_LOSS",
+                    "1" if draft_logits.dtype == torch.bfloat16 else "0",
+                )
+                == "1"
+            ):
+                # Fused TV: l1 = 2 * tv and accept = 1 - tv for normalized
+                # softmax pairs; no [B, T, V] probability tensor materialized.
+                tv_per_token = fused_loss.fused_tv_loss(
+                    draft_logits.reshape(
+                        batch_size, num_blocks * block_size, vocab_size
+                    ),
+                    target_logits.reshape(
+                        batch_size, num_blocks * block_size, vocab_size
+                    ),
+                ).reshape_as(target_ids)
+                l1_per_token = 2.0 * tv_per_token
+                accept_probability = (1.0 - tv_per_token).clamp(0.0, 1.0)
+            else:
+                with torch.no_grad():
+                    target_probabilities = torch.softmax(target_logits.float(), dim=-1)
+                draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
+                l1_per_token = (
+                    (draft_probabilities - target_probabilities).abs().sum(dim=-1)
+                )
+                accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
 
@@ -2309,15 +2233,25 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 predicted_ids, target_ids, eval_mask, block_index, total_blocks
             )
             if aligned_target_hidden is not None:
-                assert draft_probabilities is not None and teacher_ids is not None
+                assert teacher_ids is not None and target_logits is not None
                 teacher_agreement_num = (
                     (predicted_ids == teacher_ids).float() * eval_mask
                 ).sum()
+                # Top-1 softmax probability without materializing probabilities:
+                # p_max = exp(max_logit - logsumexp(logits)), in fp32.
                 teacher_top1_num = (
-                    target_probabilities.max(dim=-1).values * eval_mask
+                    torch.exp(
+                        target_logits.max(dim=-1).values
+                        - target_logits.float().logsumexp(dim=-1)
+                    )
+                    * eval_mask
                 ).sum()
                 draft_top1_num = (
-                    draft_probabilities.max(dim=-1).values * eval_mask
+                    torch.exp(
+                        draft_logits.max(dim=-1).values
+                        - draft_logits.float().logsumexp(dim=-1)
+                    )
+                    * eval_mask
                 ).sum()
                 valid_blocks = eval_mask.any(dim=-1).float()
                 accepted_expectation = (

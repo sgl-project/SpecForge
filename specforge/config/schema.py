@@ -43,6 +43,11 @@ SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
     "--enable-spec-capture": "the capture launcher",
     "--spec-capture-method": "the algorithm's capture contract",
     "--spec-capture-aux-layer-ids": "the algorithm's capture contract",
+    "--speculative-algorithm": "the algorithm's capture contract (plugin backend)",
+    "--enable-return-aux-hidden-states": "the algorithm's capture contract",
+    "--return-aux-hidden-state-layer-ids": "the algorithm's capture contract",
+    "--return-hidden-states-mode": "the capture launcher (full prefill capture)",
+    "--enable-return-hidden-states": "the capture launcher (full prefill capture)",
     "--host": "the capture launcher (loopback)",
     "--port": "capture_servers[].port",
     "--context-length": "model.sglang_context_length",
@@ -150,6 +155,8 @@ _OWNED_SERVER_ENV = {
     "HIP_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "ROCR_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "SGLANG_SPEC_CAPTURE_GPU_PUT": "capture_servers[].gpu_put",
+    "SPECFORGE_SPEC_CAPTURE": "deployment.disaggregated.server_capture",
+    "SGLANG_SPEC_CAPTURE_ARENA_BYTES": "mooncake.arena_bytes",
     "FLASHINFER_DISABLE_VERSION_CHECK": "the capture launcher",
 }
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -286,8 +293,12 @@ class ModelConfig(StrictConfigModel):
     #: text only; unsupported modalities fail during application resolution.
     input_modality: str = "text"
     trust_remote_code: bool = False
-    #: Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash. Requires ``specforge[liger]``.
-    use_liger_kernel: bool = False
+    #: Liger RMSNorm/SwiGLU kernels for DFlash/DFlash2 drafts. ``None`` (auto)
+    #: enables them for training.strategy=dflash on a CUDA/ROCm trainer with a
+    #: silu/swish draft and keeps the native Qwen3 modules otherwise; ``true``
+    #: fails when they cannot be used; ``false`` disables them. Resolved kernels
+    #: that cannot be imported are an error in both the auto and explicit cases.
+    use_liger_kernel: Optional[bool] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).
@@ -541,6 +552,23 @@ class TrainerDeploymentConfig(StrictConfigModel):
         return self
 
 
+def validate_receive_buffers(receive_buffers: str, protocol: str) -> None:
+    """Device receive buffers need a transport that writes device memory.
+
+    NVLink reads only into device memory, so it also requires them.
+    """
+    if receive_buffers == "cuda" and protocol not in ("rdma", "nvlink"):
+        raise ValueError(
+            "deployment.disaggregated.receive_buffers=cuda needs an RDMA or NVLink "
+            f"Mooncake transport; the effective MOONCAKE_PROTOCOL is {protocol!r}"
+        )
+    if protocol == "nvlink" and receive_buffers != "cuda":
+        raise ValueError(
+            "MOONCAKE_PROTOCOL=nvlink reads into device memory; set "
+            "deployment.disaggregated.receive_buffers=cuda"
+        )
+
+
 def _validate_cuda_devices(devices: List[str], *, field_name: str) -> None:
     for device in devices:
         if not device or device.strip() != device or "," in device:
@@ -559,9 +587,18 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metadata_port: int = Field(default=35880, gt=0, le=65535)
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
-    protocol: Literal["tcp", "rdma"] = "tcp"
+    #: Transport for every owned Mooncake client. None is resolved once when
+    #: the launch plan is built: tcp on Ascend hosts and rdma everywhere else;
+    #: the launch fails when no usable HCA is found. tcp opts out of RDMA.
+    protocol: Optional[Literal["tcp", "rdma", "nvlink"]] = None
+    #: nvlink keeps captures in server GPU arenas; see arena_bytes.
+    #: Comma-separated HCAs for rdma. None selects every usable HCA of one link
+    #: layer; a listed device that is not usable is an error.
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
+    #: Arena size: HBM each capture server reserves for capture objects.
+    #: Required with ``nvlink``. Leave room for it below ``mem_fraction_static``.
+    arena_bytes: Optional[int] = Field(default=None, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
     #: Budget for one readiness probe, capped by the remaining startup timeout.
@@ -578,6 +615,13 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
         ports = (self.rpc_port, self.metadata_port, self.metrics_port)
         if len(set(ports)) != len(ports):
             raise ValueError("managed_local Mooncake ports must be unique")
+        # Currently only online NVLink capture uses the arena.
+        if (self.protocol == "nvlink") != (self.arena_bytes is not None):
+            raise ValueError(
+                "managed_local.mooncake.arena_bytes is required with protocol "
+                "'nvlink', the only protocol that uses the arena, and applies "
+                "only to it"
+            )
         if (
             not self.local_hostname
             or self.local_hostname.strip() != self.local_hostname
@@ -604,7 +648,9 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
-    #: None selects CUDA publication on RDMA in the capture worker.
+    #: None selects CUDA publication in the capture worker when
+    #: mooncake.protocol is rdma explicitly, and host publication when the
+    #: protocol is left unset (CUDA publication also needs GPUDirect RDMA).
     gpu_put: Optional[bool] = None
     #: SGLang's generation-based /health waits at least one second internally.
     probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
@@ -708,13 +754,22 @@ class ManagedLocalStackConfig(StrictConfigModel):
         capture_ports = [server.port for server in self.capture_servers]
         if len(set(capture_ports)) != len(capture_ports):
             raise ValueError("managed_local capture server ports must be unique")
+        # An unset protocol can still resolve to tcp; the launch plan repeats
+        # this check after resolving it.
         if any(server.gpu_put for server in self.capture_servers) and (
-            self.mooncake.protocol != "rdma"
+            self.mooncake.protocol == "tcp"
         ):
             raise ValueError(
                 "managed_local capture_servers[].gpu_put needs mooncake.protocol "
-                f"'rdma'; the {self.mooncake.protocol!r} transport cannot read "
-                "device memory"
+                f"'rdma' or 'nvlink'; the {self.mooncake.protocol!r} transport "
+                "cannot read device memory"
+            )
+        if self.mooncake.protocol == "nvlink" and any(
+            server.gpu_put is False for server in self.capture_servers
+        ):
+            raise ValueError(
+                "managed_local mooncake.protocol 'nvlink' publishes device "
+                "memory; capture_servers[].gpu_put cannot be false"
             )
         overlap = mooncake_ports.intersection(capture_ports)
         if overlap:
@@ -760,6 +815,11 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     store_root: Optional[str] = None
     store_id: Optional[str] = None
     server_urls: List[str] = Field(default_factory=list)
+    #: How the SGLang capture servers implement spec capture: ``patch`` is the
+    #: versioned source patch under ``patches/sglang``; ``plugin`` is the
+    #: ``specforge-sglang-capture`` plugin on an SGLang build with forward
+    #: observers, deferred outputs and ``--enable-return-aux-hidden-states``.
+    server_capture: Literal["patch", "plugin"] = "patch"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None
@@ -801,15 +861,12 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     def _validate_store(self):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
-        if self.receive_buffers == "cuda" and self.managed_local is not None:
+        if self.managed_local is not None:
             # External deployments resolve environment overrides in the launch
-            # plan. Managed-local transport is authoritative over the environment.
-            if self.managed_local.mooncake.protocol != "rdma":
-                raise ValueError(
-                    "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
-                    "Mooncake transport (mooncake_protocol or "
-                    "managed_local.mooncake.protocol = rdma); the TCP transport "
-                    "cannot write into device memory"
+            # plan. An unset managed protocol is checked after resolution.
+            if self.managed_local.mooncake.protocol is not None:
+                validate_receive_buffers(
+                    self.receive_buffers, self.managed_local.mooncake.protocol
                 )
         if self.consumer_state_dir is not None and (
             not self.consumer_state_dir
@@ -1239,6 +1296,16 @@ class Config(StrictConfigModel):
                 )
             if self.training.resume_from is not None:
                 raise ValueError("managed_local does not support resume")
+            mooncake = managed_local.mooncake
+            if mooncake.protocol == "nvlink":
+                arenas = mooncake.arena_bytes * len(managed_local.capture_servers)
+                watermark = self.runtime.resident_high_watermark_bytes
+                if watermark is None or watermark > arenas:
+                    raise ValueError(
+                        f"NVLink capture keeps objects in {arenas} bytes of "
+                        "capture-server HBM (arena_bytes per server); set "
+                        "runtime.resident_high_watermark_bytes no higher"
+                    )
             minimum_context_length = (
                 self.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
             )

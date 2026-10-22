@@ -182,12 +182,15 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# DeepSeek-R1-Distill renders every assistant turn as
+# '<｜Assistant｜>' + answer + '<｜end▁of▁sentence｜>'; the end-of-sentence token
+# closes each supervised span, as it does for DeepSeek-V3.
 TEMPLATE_REGISTRY.register(
     name="deepseek-r1-distill",
     template=ChatTemplate(
         assistant_header="<｜Assistant｜>",
         user_header="<｜User｜>",
-        end_of_turn_token=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
         system_prompt=None,
     ),
 )
@@ -364,6 +367,23 @@ TEMPLATE_REGISTRY.register(
 
 TEMPLATE_REGISTRY.register(
     name="glm-5.2",
+    template=ChatTemplate(
+        assistant_header="<|assistant|><think>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+        parser_type="glm",
+        assistant_pattern_type="glm",
+        ignore_token=["<|user|>"],
+    ),
+)
+
+# GLM-5.3 renders the same role/think tokens as GLM-5.2 (verified against
+# the zai-org chat_template.jinja: user/assistant headers with a
+# think opener and the user tag as the turn separator), so the field
+# set matches glm-5.2; a separate entry lets 5.3-specific drift diverge.
+TEMPLATE_REGISTRY.register(
+    name="glm-5.3",
     template=ChatTemplate(
         assistant_header="<|assistant|><think>",
         user_header="<|user|>",

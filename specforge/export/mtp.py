@@ -21,8 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from specforge.modeling.target.checkpoint import (
-    load_selected_tensors,
-    load_tensors_by_keys,
+    load_checkpoint_tensors,
     merge_state_into_checkpoint,
 )
 
@@ -219,18 +218,6 @@ def _patch_text_config(base_config: dict, draft_config: dict) -> dict:
     return base_config
 
 
-def _load_first_checkpoint(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
-    """Load every tensor of a single-file checkpoint directory."""
-
-    safetensors = glob.glob(os.path.join(checkpoint_dir, "*.safetensors"))
-    bins = glob.glob(os.path.join(checkpoint_dir, "*.bin"))
-    if safetensors:
-        return load_selected_tensors(checkpoint_dir, lambda _key: True)
-    if bins:
-        return torch.load(bins[0], map_location="cpu", weights_only=True)
-    raise FileNotFoundError(f"No safetensors/bin weights found in {checkpoint_dir}")
-
-
 def _has_model_weights(path: str) -> bool:
     """Return whether ``path`` is already an exported model directory."""
 
@@ -255,7 +242,7 @@ def _load_mtp_source(
     if path.startswith("file://"):
         path = path[len("file://") :]
     if _has_model_weights(path):
-        return _load_first_checkpoint(path), path, path
+        return load_checkpoint_tensors(path), path, path
 
     from specforge.export.checkpoint_io import resolve_training_state
 
@@ -323,8 +310,10 @@ def merge_mtp_into_base(
     if embed_target not in mtp_state or (
         not tie_word_embeddings and head_target not in mtp_state
     ):
-        base_state = load_tensors_by_keys(
-            base_model_path, embed_key_candidates + head_key_candidates
+        candidate_keys = set(embed_key_candidates + head_key_candidates)
+        base_state = load_checkpoint_tensors(
+            base_model_path,
+            key_filter=lambda key: key in candidate_keys,
         )
         mtp_state = _copy_shared_embeddings(
             base_state,
