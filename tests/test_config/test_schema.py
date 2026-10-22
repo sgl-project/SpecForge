@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 from pydantic import ValidationError
 
@@ -138,6 +139,35 @@ class ConfigSchemaTest(unittest.TestCase):
                     Config.model_validate(payload)
                 payload["runtime"]["in_flight_low_watermark"] = 8
                 Config.model_validate(payload)
+
+    def test_watermark_overrides_are_applied_before_config_validation(self):
+        from specforge.training.disaggregated import _online_flow_window
+
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            payload = _online_payload("dflash")
+            payload["training"].update(batch_size=4, accumulation_steps=1)
+            payload["runtime"] = dict(
+                consumer_dispatch=policy,
+                in_flight_high_watermark=14,
+                in_flight_low_watermark=4,
+            )
+            for overrides, expected in (
+                ({"DISAGG_IN_FLIGHT_LOW_WATERMARK": "8"}, (14, 8)),
+                ({"DISAGG_IN_FLIGHT_HIGH_WATERMARK": "8"}, (8, None)),
+                ({"DISAGG_IN_FLIGHT_LOW_WATERMARK": "4"}, None),
+            ):
+                with (
+                    self.subTest(policy=policy, overrides=overrides),
+                    mock.patch.dict(os.environ, overrides, clear=True),
+                ):
+                    if expected is None:
+                        with self.assertRaisesRegex(ValueError, "low watermark"):
+                            Config.model_validate(payload)
+                    else:
+                        self.assertEqual(
+                            _online_flow_window(Config.model_validate(payload)),
+                            expected,
+                        )
 
     def test_ddp_bucket_limit_is_optional_and_positive(self):
         from specforge.config.schema import TrainingConfig

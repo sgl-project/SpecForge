@@ -135,6 +135,12 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 _, _, distributor = self._build(batch_size=4, consumer_dispatch=policy)
                 self.assertEqual(self.channel.consumer_quantum(), 8)
                 self.assertEqual(distributor.kwargs["refs_per_rank_step"], 4)
+                self._build(
+                    resume_from=self._checkpoint(0),
+                    batch_size=4,
+                    consumer_dispatch=policy,
+                )
+                self.assertEqual(self.channel.consumer_quantum(), 8)
 
     def test_idle_timeout_is_unbounded_unless_explicitly_configured(self):
         _trainer, captured, distributor = self._build()

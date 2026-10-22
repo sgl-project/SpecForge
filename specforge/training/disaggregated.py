@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.config.schema import resolve_ref_watermarks
 from specforge.runtime.contracts import consumer_dispatch_quantum
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
@@ -263,17 +264,8 @@ def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
     """
     from specforge.runtime.control_plane.flow_control import FlowControlLimits
 
-    high_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
-    high = int(high_override or cfg.runtime.in_flight_high_watermark)
-    low_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
-    # Preserve the legacy one-watermark environment override: when only the
-    # old high value is supplied, resume at that same threshold.
-    low = (
-        int(low_override)
-        if low_override is not None
-        else (
-            None if high_override is not None else cfg.runtime.in_flight_low_watermark
-        )
+    high, low = resolve_ref_watermarks(
+        cfg.runtime.in_flight_high_watermark, cfg.runtime.in_flight_low_watermark
     )
     limits = FlowControlLimits(
         high_watermark_refs=high,

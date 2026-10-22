@@ -31,8 +31,9 @@ full-window capture latency, not a single round.
 The consumed counter on the source channel (the producer's backpressure signal)
 mirrors optimizer-durable work: each rank acknowledges its OWN inbox only after
 the gathered SQLite ack/marker succeeds, and the distributor forwards the sum
-of the inbox sidecars to the source counter. The consumer publishes the global
-dispatch quantum before capture begins, and the producer rejects a watermark
+of the inbox sidecars and their actual ref bytes to the source counter. The
+consumer publishes the global dispatch quantum before capture begins, and the
+producer rejects a watermark
 smaller than that dispatch group. Dispatch itself does not count as consumption.
 
 If the distributor dies it drops a ``.failed`` sentinel (with the traceback)
@@ -48,7 +49,8 @@ import os
 import threading
 import time
 import traceback
-from collections import Counter
+from collections import Counter, deque
+from itertools import islice
 from typing import Iterable, List, Optional
 
 from specforge.runtime.contracts import SampleRef, consumer_dispatch_quantum
@@ -171,14 +173,22 @@ class RefDistributor:
             StreamingRefChannel(self.inbox_path(inbox_dir, rank))
             for rank in range(dp_size)
         ]
-        # Continue the producer-visible counter instead of rewinding it after a
-        # consumer restart. A crash can occur after SQLite commit/feature abort
-        # but before the rank-local inbox ack; repair that narrow window from
-        # the durable released prefix before the producer applies backpressure.
-        consumed = self.source.seed_consumed()
-        if len(self._skip) > consumed:
-            self.source.mark_consumed(len(self._skip) - consumed)
-        self._inbox_consumed = 0  # last forwarded sum of the inbox sidecars
+        # Rebuild exact release totals from durable IDs, not a publication prefix.
+        # Duplicate publications are already settled in this snapshot and must
+        # not be charged again when pump replays it into the transient queue.
+        replay = self.source.poll() if self._skip or self._requeued else []
+        seen = set()
+        released = []
+        for ref in replay:
+            if ref.sample_id in self._skip or ref.sample_id in seen:
+                released.append(ref)
+            seen.add(ref.sample_id)
+        self.source.restore_consumed(
+            len(released), sum(max(0, ref.estimated_bytes) for ref in released)
+        )
+        self._replay_refs = replay or None
+        self._inbox_consumed = {inbox: 0 for inbox in self._inboxes}
+        self._pending_bytes = {inbox: deque() for inbox in self._inboxes}
         self._window: List[SampleRef] = []
         self._window_dispatched = 0
         self._stop = threading.Event()
@@ -196,14 +206,31 @@ class RefDistributor:
     def inbox_path(inbox_dir: str, dp_rank: int) -> str:
         return os.path.join(inbox_dir, f"inbox-rank{dp_rank}.jsonl")
 
+    def _publish(self, inbox: StreamingRefChannel, refs: List[SampleRef]) -> None:
+        inbox.publish_batch(refs)
+        self._pending_bytes[inbox].extend(max(0, ref.estimated_bytes) for ref in refs)
+
     def _forward_consumed(self) -> bool:
-        """Mirror optimizer-durable inbox acks onto source backpressure."""
-        consumed = sum(inbox.consumed_remote() for inbox in self._inboxes)
-        delta = consumed - self._inbox_consumed
-        if delta <= 0:
+        """Forward the count and bytes of the actual acknowledged inbox refs."""
+        deltas = {
+            inbox: inbox.consumed_remote() - self._inbox_consumed[inbox]
+            for inbox in self._inboxes
+        }
+        for inbox, delta in deltas.items():
+            if not 0 <= delta <= len(self._pending_bytes[inbox]):
+                raise RuntimeError("inbox acknowledgement exceeds dispatched refs")
+        count = sum(deltas.values())
+        if not count:
             return False
-        self._inbox_consumed = consumed
-        self.source.mark_consumed(delta)
+        num_bytes = sum(
+            sum(islice(self._pending_bytes[inbox], delta))
+            for inbox, delta in deltas.items()
+        )
+        self.source.mark_consumed(count, num_bytes=num_bytes)
+        for inbox, delta in deltas.items():
+            for _ in range(delta):
+                self._pending_bytes[inbox].popleft()
+            self._inbox_consumed[inbox] += delta
         return True
 
     def _sample_cost(self, ref: SampleRef) -> tuple[int, int]:
@@ -290,7 +317,9 @@ class RefDistributor:
             raise RuntimeError(f"source producer failed: {source_failure}")
         progress = False
 
-        raw = self.source.poll()
+        replaying = self._replay_refs is not None
+        raw = self._replay_refs if replaying else self.source.poll()
+        self._replay_refs = None
         source_drained = False
         if not raw and self.source.is_closed():
             # The producer can append its final ref and close after the first
@@ -303,15 +332,10 @@ class RefDistributor:
             candidates = []
             for ref in raw:
                 if ref.sample_id in self._skip:
-                    # Released samples stay skip-listed for the whole replay:
-                    # the prior attempt settled EVERY publication it polled
-                    # (ack for the fresh one, immediate settle for duplicates)
-                    # into the persisted consumed sidecar this attempt seeded
-                    # from. Settling a re-polled duplicate again would advance
-                    # consumed past the producer's published accounting and
-                    # crash its reconciliation; a duplicate the prior attempt
-                    # never polled merely under-counts, which only tightens
-                    # backpressure and is safe.
+                    if not replaying:
+                        self.source.mark_consumed(
+                            1, num_bytes=max(0, ref.estimated_bytes)
+                        )
                     self.stats["skipped"] += 1
                     continue
                 candidates.append(ref)
@@ -329,10 +353,9 @@ class RefDistributor:
                     # transient queue. Its inbox ack will settle the original
                     # publication exactly once.
                     self._requeued.discard(ref.sample_id)
-                else:
-                    # A same-attempt duplicate never reaches an inbox, so
-                    # settle that extra publication immediately.
-                    self.source.mark_consumed(1)
+                elif not replaying:
+                    # Snapshot duplicates were accounted for during restore.
+                    self.source.mark_consumed(1, num_bytes=max(0, ref.estimated_bytes))
 
         # Release complete DP micro-batch rounds while tracking the surrounding
         # optimizer window. Round-robin assignment keeps every rank in lockstep;
@@ -366,7 +389,7 @@ class RefDistributor:
                     ]
                 for window in windows:
                     for inbox, batch in zip(self._inboxes, window):
-                        inbox.publish_batch(batch)
+                        self._publish(inbox, batch)
                 self.stats["dispatched"] += count
                 progress = True
                 continue
@@ -375,7 +398,7 @@ class RefDistributor:
                     break
                 refs = queue.get(self.dispatch_quantum, timeout_s=0.0)
                 for inbox, batch in zip(self._inboxes, self._balanced_batches(refs)):
-                    inbox.publish_batch(batch)
+                    self._publish(inbox, batch)
                 self.stats["dispatched"] += self.dispatch_quantum
                 progress = True
                 continue
@@ -398,7 +421,7 @@ class RefDistributor:
             for index, ref in enumerate(self._window):
                 rank_batches[index % self.dp_size].append(ref)
             for inbox, refs in zip(self._inboxes, rank_batches):
-                inbox.publish_batch(refs)
+                self._publish(inbox, refs)
             self.stats["dispatched"] += self.dispatch_round_quantum
             self._window_dispatched += self.dispatch_round_quantum
             self._window = []
@@ -453,7 +476,10 @@ class RefDistributor:
                     self.feature_store.abort(ref.sample_id, reason=reason)
                 except Exception as exc:  # best effort before the loud failure
                     cleanup_errors.append(f"{ref.sample_id}: {exc}")
-            self.source.mark_consumed(len(leftover))
+            self.source.mark_consumed(
+                len(leftover),
+                num_bytes=sum(max(0, ref.estimated_bytes) for ref in leftover),
+            )
             if cleanup_errors:
                 reason += f"; cleanup errors={cleanup_errors}"
                 raise RuntimeError(reason)

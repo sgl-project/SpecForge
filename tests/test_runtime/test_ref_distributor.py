@@ -598,7 +598,7 @@ class TestRefDistributor(unittest.TestCase):
         ledger_path = os.path.join(self.dir, "resume-dup.sqlite")
         store = SQLiteMetadataStore(ledger_path)
         original = DataFlowController("run0", metadata_store=store)
-        ref = _ref("s0")
+        ref = replace(_ref("s0"), estimated_bytes=9)
         self.producer.publish(ref)
         self.producer.publish(ref)  # at-least-once duplicate record
         original.commit_samples("old-distributor", [ref])
@@ -606,7 +606,7 @@ class TestRefDistributor(unittest.TestCase):
             "trainer", ["s0"], global_step=1, optimizer_durable=True
         )
         # The prior attempt settled the ack AND its polled duplicate.
-        self.source.mark_consumed(2)
+        self.source.mark_consumed(2, num_bytes=18)
 
         restarted = DataFlowController("run0", metadata_store=store)
         report = restarted.reconcile_on_restart(self.feature_store)
@@ -621,7 +621,7 @@ class TestRefDistributor(unittest.TestCase):
 
         self.assertEqual(dist.stats["skipped"], 2)
         # published == consumed: nothing over-advanced, in-flight is exactly 0.
-        self.assertEqual(self.producer.consumed_remote(), 2)
+        self.assertEqual(self.producer.consumed_state_remote(), (2, 18))
         self.assertEqual(self.producer.in_flight_remote(), 0)
         self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
         store.close()
@@ -630,12 +630,15 @@ class TestRefDistributor(unittest.TestCase):
         ledger_path = os.path.join(self.dir, "resume-counter.sqlite")
         store = SQLiteMetadataStore(ledger_path)
         original = DataFlowController("run0", metadata_store=store)
-        refs = [_ref("s0"), _ref("s1")]
+        refs = [
+            replace(_ref("s0"), estimated_bytes=1),
+            replace(_ref("s1"), estimated_bytes=10),
+        ]
         for ref in refs:
             self.producer.publish(ref)
         original.commit_samples("old-distributor", refs)
         original.ack_train_refs(
-            "trainer", ["s0"], global_step=1, optimizer_durable=True
+            "trainer", ["s1"], global_step=1, optimizer_durable=True
         )
         # Crash here: the SQLite marker exists, but the rank-local inbox ack did
         # not yet advance the source sidecar.
@@ -649,9 +652,15 @@ class TestRefDistributor(unittest.TestCase):
             skip_ids=report["released"],
             requeued_ids=report["requeued"],
         )
-        self.assertEqual(self.producer.consumed_remote(), 1)
+        self.assertEqual(self.producer.consumed_state_remote(), (1, 10))
         _pump_until_quiet(dist)
-        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s1"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0"])
+        queue = StreamingRefQueue(
+            StreamingRefChannel(dist.inbox_path(self.inbox_dir, 0))
+        )
+        queue.ack(queue.get(1))
+        dist._forward_consumed()
+        self.assertEqual(self.producer.consumed_state_remote(), (2, 11))
         store.close()
 
     def test_reconciled_unacked_refs_redistribute_across_consumer_dp_sizes(self):

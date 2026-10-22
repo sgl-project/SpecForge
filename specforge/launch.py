@@ -1080,6 +1080,7 @@ def build_disagg_online_producer(
             "first_ref_logged": False,
             "accounted_consumed": channel.consumed_remote(),
             "resident_bytes": 0,
+            "published_bytes": 0,
         }
         published_sizes = deque()
         last_publish_log = {"t": time.perf_counter()}
@@ -1114,7 +1115,17 @@ def build_disagg_online_producer(
             return st["prompts_pending"] == 0 and st["prompts_leased"] == 0
 
         def reconcile_consumed_locked() -> int:
-            consumed = channel.consumed_remote()
+            consumed, released_bytes = channel.consumed_state_remote()
+            if released_bytes is not None:
+                resident = state["published_bytes"] - released_bytes
+                if resident < 0:
+                    raise RuntimeError("released bytes exceed published bytes")
+                state["resident_bytes"] = resident
+                state["accounted_consumed"] = consumed
+                published_sizes.clear()
+                return resident
+            # Integer-only channels acknowledge FIFO; source distributors publish
+            # exact bytes, including after a consumer restart.
             delta = consumed - state["accounted_consumed"]
             if delta < 0 or delta > len(published_sizes):
                 raise RuntimeError(
@@ -1128,9 +1139,8 @@ def build_disagg_online_producer(
             return state["resident_bytes"]
 
         def resident_bytes() -> int:
-            # Mooncake health is process-local and cannot observe deletes made by
-            # a remote consumer. Track the published-but-unacknowledged prefix
-            # from SampleRef.estimated_bytes and the channel's durable counter.
+            # The distributor reports bytes for the actual released refs;
+            # consumption order may differ from publication order.
             with publish_lock:
                 return reconcile_consumed_locked()
 
@@ -1169,7 +1179,9 @@ def build_disagg_online_producer(
                     feature_store=feature_store,
                     refs=refs,
                 )
-                published_sizes.extend(ref_sizes)
+                if channel.consumed_state_remote()[1] is None:
+                    published_sizes.extend(ref_sizes)
+                state["published_bytes"] += sum(ref_sizes)
                 state["resident_bytes"] = projected_bytes
                 state["produced"] += len(refs)
                 now = time.perf_counter()

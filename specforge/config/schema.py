@@ -480,6 +480,25 @@ class ProfilingConfig(StrictConfigModel):
     record_shapes: bool = False
 
 
+def resolve_ref_watermarks(high: int, low: Optional[int]) -> tuple[int, Optional[int]]:
+    """Apply producer environment overrides before validating ref watermarks."""
+    high_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
+    low_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
+    high = int(high_override) if high_override is not None else high
+    # The legacy high-only override resumes at the same threshold.
+    low = (
+        int(low_override)
+        if low_override is not None
+        else (None if high_override is not None else low)
+    )
+    resolved_low = high if low is None else low
+    if high < 1 or not 0 <= resolved_low <= high:
+        raise ValueError(
+            "effective ref watermarks require high >= 1 and 0 <= low <= high"
+        )
+    return high, low
+
+
 class RuntimeConfig(StrictConfigModel):
     """Streaming bounds shared by unified disaggregated producer roles."""
 
@@ -500,11 +519,9 @@ class RuntimeConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_watermarks(self):
-        if self.in_flight_low_watermark > self.in_flight_high_watermark:
-            raise ValueError(
-                "runtime.in_flight_low_watermark must be <= "
-                "runtime.in_flight_high_watermark"
-            )
+        resolve_ref_watermarks(
+            self.in_flight_high_watermark, self.in_flight_low_watermark
+        )
         if (
             self.resident_high_watermark_bytes is None
             and self.resident_low_watermark_bytes is not None
@@ -1194,8 +1211,12 @@ class Config(StrictConfigModel):
                 * self.training.accumulation_steps
             )
             required = consumer_dispatch_quantum(dispatch, window)
-            for level in ("high", "low"):
-                if getattr(self.runtime, f"in_flight_{level}_watermark") < required:
+            high, low = resolve_ref_watermarks(
+                self.runtime.in_flight_high_watermark,
+                self.runtime.in_flight_low_watermark,
+            )
+            for level, value in (("high", high), ("low", high if low is None else low)):
+                if value < required:
                     raise ValueError(
                         f"{dispatch} requires a {level} watermark of at least two "
                         f"global batches (dispatch quantum {required})"
