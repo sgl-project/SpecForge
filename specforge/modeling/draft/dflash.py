@@ -27,6 +27,7 @@ from .dflash_mask import (
 )
 from .flex_attention import compile_friendly_flex_attention
 from .flex_attention_backend import flex_attention_backend
+from .moe import MoELayer, apply_pending_balance_updates, build_ffn
 from .registry import register_draft
 
 FULL_ATTENTION = "full_attention"
@@ -566,7 +567,8 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             layer_idx=layer_idx,
             kernels=kernels,
         )
-        self.mlp = kernels.make_mlp(config)
+        # Dense MLP, or an MoELayer when the draft JSON names a moe_preset.
+        self.mlp = build_ffn(config, dense=kernels.make_mlp)
         self.input_layernorm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -741,6 +743,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         return self.decoder_layer_class(config, layer_idx, kernels)
 
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, MoELayer):
+            # MoE layers hold bare Parameters the inherited Qwen3 init never visits.
+            module.reset_parameters(std=self.config.initializer_range)
+            return
+        super()._init_weights(module)
+
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config
 
@@ -869,6 +878,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
+        if self.training:
+            # Stashed routing statistics, outside checkpoint regions; see moe/DESIGN.md.
+            apply_pending_balance_updates(self)
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         attention_mask = self._prepare_attention_mask(

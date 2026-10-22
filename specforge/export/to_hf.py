@@ -24,6 +24,11 @@ from specforge.export.checkpoint_io import (
     materialize_draft,
     resolve_training_state,
 )
+from specforge.modeling.draft.moe import (
+    exported_config_updates,
+    from_checkpoint_state_dict,
+    to_serving_state_dict,
+)
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
 
@@ -75,15 +80,23 @@ def export_to_hf(
             embedding_source,
             keys=[embedding_key],
         )[embedding_key]
-    # Preserve checkpoint weights at their original precision, but keep the
-    # mapping explicitly loaded by materialize_draft when one was requested.
+    # Trained keys win at their original precision; keep a requested vocab mapping.
     full_state.update(
         {
             key: value
-            for key, value in state["draft_state_dict"].items()
+            for key, value in from_checkpoint_state_dict(
+                state["draft_state_dict"], model
+            ).items()
             if not (vocab_mapping_path and key in {"t2d", "d2t"})
         }
     )
+    # MoE drafts: fold centering, use the family's naming, update config.json to match.
+    updates = exported_config_updates(model)
+    full_state = to_serving_state_dict(full_state, model)
+    for key, value in updates.items():
+        if key == "dflash_config":
+            value = {**(getattr(model.config, key, None) or {}), **value}
+        setattr(model.config, key, value)
     model.save_pretrained(output_dir, state_dict=full_state)
     apply_legacy_rope_scaling(output_dir)
     return output_dir
