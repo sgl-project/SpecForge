@@ -97,6 +97,15 @@ servers. Its
 [runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
+`deepseek-v4-flash-dspark-official-2node-h200.yaml` trains the official
+DeepSeek-V4 DSpark drafter architecture (`DSparkV4DraftModel`,
+`training.attention_backend: native`) on a two-node H200 stack
+([runbook](../../docs/recipes/deepseek-v4-flash-dspark-official-2node-h200.md));
+initialize its warm-start dir with `scripts/dspark_v4_official_weights.py`
+and `scripts/init_dspark_v4_from_target.py`, and export a servable drafter
+with `scripts/bundle_dspark_v4_official.py`. The drafter's FFN is the shared
+MoE layer with the `deepseek_v4` preset; check it against DeepSeek's
+reference code with `scripts/gates/dspark_v4_parity_check.py`.
 
 `qwen3.8-27b-dflash2.yaml` (external services, two nodes) and
 its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4.yaml`
@@ -109,6 +118,19 @@ Qwen3.8-27B. Their
 server/trainer splits, Mooncake lease, in-flight watermarks and throughput
 measured on B300 and H200 nodes, and the two-node launcher that starts eight
 capture servers.
+
+`qwen3.8-27b-dspark-moe-h200-disaggregated.yaml` (one 8x H200 node, four FP8
+capture servers plus a 4-rank FULL_SHARD trainer with optimizer offload)
+trains the DSpark drafter with a Qwen3.5-MoE FFN in
+`configs/qwen3.8-27b-dspark-moe.json` (`moe_preset: qwen3_5_moe`, 512 experts
+of width 512, top-10, router centering) from scratch. See "MoE FFN for
+DFlash-family drafts" in the
+[customization guide](../../docs/sections/advanced_features/customization.md)
+for the MoE keys; serving this drafter needs an SGLang `Qwen3MoeDSparkModel`.
+Launch it with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: its trainer
+ranks run at the H200 memory limit, where the caching allocator otherwise
+fragments (see "Late OOM or non-finite hidden states on online runs" in the
+[training guide](../../docs/sections/basic_usage/training.md)).
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes

@@ -23,7 +23,8 @@ Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;
 `TrainerCore` owns one branch-free train step and the accumulation boundary;
 `DraftTrainStrategy` owns model-specific validation, forward/loss, target
-projection, and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
+projection, model-level step terms (`finalize_step_output`, e.g. the MoE
+auxiliary loss), and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
 backward, optimizer steps, distributed gradient norms, and full training state.
 Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
@@ -40,7 +41,7 @@ flowchart TD
   PUB -->|final unsaved step| CKPT[save_checkpoint collective]
   FIT -->|for batch in loader| TS[TrainerCore train_step]
   FIT -->|append sample_ids| PA[pending_ack accumulator]
-  TS -->|forward_loss| ST[DraftTrainStrategy projection plus loss]
+  TS -->|forward_loss then finalize_step_output| ST[DraftTrainStrategy projection plus loss]
   TS -->|backward| BK[FSDPTrainingBackend]
   TS -->|step at accum boundary| BK
   TS -->|StepResult optimizer_stepped| FIT
