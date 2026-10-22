@@ -1,0 +1,61 @@
+# LongSpark Qwen3-8B; see docs/sections/basic_usage/longspark.md.
+# Start Mooncake and eight patched TP1 capture servers before training.
+# 8 ranks x micro-batch 1 x accumulation 64 = global batch 512.
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-longspark.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  torch_dtype: bfloat16
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-8b_regen.jsonl
+  max_length: 4096
+  chat_template: qwen
+  train_only_last_turn: false
+  build_dataset_num_proc: 16
+  cache_dir: cache/longspark-8b
+training:
+  strategy: longspark
+  fsdp_sharding: NO_SHARD
+  num_epochs: 10
+  batch_size: 1
+  accumulation_steps: 64
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  save_interval: 2776
+  log_interval: 1
+  seed: 0
+tracking:
+  report_to: none
+run_id: qwen3-8b-longspark
+output_dir: outputs/qwen3-8b-longspark
+runtime:
+  in_flight_high_watermark: 512
+  in_flight_low_watermark: 512
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/qwen3-8b-longspark/control
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+      - http://127.0.0.1:30001
+      - http://127.0.0.1:30002
+      - http://127.0.0.1:30003
+      - http://127.0.0.1:30004
+      - http://127.0.0.1:30005
+      - http://127.0.0.1:30006
+      - http://127.0.0.1:30007
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp

@@ -517,6 +517,7 @@ class ServerCaptureLayout:
     last_hidden_feature: str | None
     passthrough: Tuple[Tuple[str, str, Tuple[int, ...]], ...]
     attention_mask_feature: str | None = None
+    extra_artifacts: Tuple[Tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -539,6 +540,15 @@ class ServerCaptureLayout:
                     "passthrough trailing shapes must contain non-negative integers"
                 )
         object.__setattr__(self, "passthrough", passthrough)
+        extras = tuple(self.extra_artifacts)
+        for artifact, feature in extras:
+            _non_empty(artifact, field_name="extra artifact")
+            _non_empty(feature, field_name="extra artifact feature")
+            if artifact in {"aux", "last_hidden"}:
+                raise ValueError("extra artifacts cannot override aux or last_hidden")
+        if len({artifact for artifact, _ in extras}) != len(extras):
+            raise ValueError("extra artifact names must be unique")
+        object.__setattr__(self, "extra_artifacts", extras)
 
     @property
     def emitted_features(self) -> FrozenSet[str]:
@@ -556,6 +566,7 @@ class ServerCaptureLayout:
                     if feature is not None
                 ),
                 *(feature for feature, _payload, _shape in self.passthrough),
+                *(feature for _artifact, feature in self.extra_artifacts),
             )
         )
 

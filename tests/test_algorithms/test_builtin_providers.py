@@ -24,7 +24,7 @@ from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "eagle3", "longspark", "mtp", "peagle")
 
 
 def _teacher_metrics_config(enabled: bool):
@@ -265,7 +265,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             },
         }
 
-        for name in BUILTINS:
+        for name in models:
             with self.subTest(algorithm=name):
                 step = self.registry.resolve(name).providers.step
                 contract = step.resume_contract(config, draft, models[name])
@@ -573,7 +573,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==6; "
+            "r=builtin_algorithm_registry(); assert len(r)==7; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

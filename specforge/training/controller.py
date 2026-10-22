@@ -972,6 +972,8 @@ class TrainerController:
                     ctx=StepContext(
                         global_step=self.global_step,
                         total_steps=self.total_steps,
+                        epoch=epoch,
+                        epoch_microstep=self._epoch_batch - 1,
                         collect_detailed_metrics=(
                             self.logger is not None
                             and (self.global_step + 1) % max(1, self.log_interval) == 0
