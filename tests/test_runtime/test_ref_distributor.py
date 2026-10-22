@@ -107,6 +107,9 @@ class TestRefDistributor(unittest.TestCase):
             dp_size,
             feature_store=self.feature_store,
             refs_per_rank_step=refs_per_rank_step,
+            dispatch_policy=kwargs.pop("dispatch_policy", "round_robin"),
+            num_anchors=kwargs.pop("num_anchors", 512),
+            block_size=kwargs.pop("block_size", 16),
             **kwargs,
         )
 
