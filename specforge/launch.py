@@ -15,7 +15,7 @@ import os
 from typing import Any, Callable, List, Mapping, Optional, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
-from specforge.runtime.contracts import SampleRef
+from specforge.runtime.contracts import SampleRef, consumer_dispatch_quantum
 from specforge.runtime.control_plane import DataFlowController
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
@@ -1031,7 +1031,7 @@ def build_disagg_online_producer(
                 consumer_failure = channel.consumer_failure()
                 if consumer_failure is not None:
                     raise RuntimeError(
-                        "consumer failed before publishing its optimizer window: "
+                        "consumer failed before publishing its dispatch requirement: "
                         f"{consumer_failure}"
                     )
                 if (
@@ -1039,7 +1039,7 @@ def build_disagg_online_producer(
                     and time.monotonic() - quantum_wait_start > peer_wait_timeout_s
                 ):
                     raise TimeoutError(
-                        "producer timed out waiting for the consumer optimizer "
+                        "producer timed out waiting for the consumer dispatch "
                         f"window after {peer_wait_timeout_s:.0f}s"
                     )
                 sleep(backpressure_poll_s)
@@ -1047,23 +1047,23 @@ def build_disagg_online_producer(
                 raise ValueError(
                     "producer in-flight high watermark "
                     f"{in_flight_high_watermark} is smaller than the consumer's "
-                    f"global optimizer-step quantum {consumer_quantum}; set "
+                    f"dispatch quantum {consumer_quantum}; set "
                     "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
                 )
             resolved_low_watermark = flow_control.limits.resolved_low_watermark_refs
             if resolved_low_watermark < consumer_quantum:
-                # The consumer dispatches only whole optimizer windows, so a
+                # The consumer dispatches only complete groups of windows, so a
                 # paused producer must be resumable while the consumer still
-                # needs up to one full window: a low watermark below the
+                # needs a full dispatch group: a low watermark below the
                 # quantum could leave both sides waiting on each other.
                 raise ValueError(
                     "producer in-flight low watermark "
                     f"{resolved_low_watermark} is smaller than the consumer's "
-                    f"global optimizer-step quantum {consumer_quantum}; set "
+                    f"dispatch quantum {consumer_quantum}; set "
                     "DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
                 )
             producer_timing(
-                f"consumer optimizer window ready quantum={consumer_quantum}"
+                f"consumer dispatch requirement ready quantum={consumer_quantum}"
             )
         except BaseException as exc:
             try:
@@ -1233,10 +1233,10 @@ def build_disagg_online_producer(
 
                         in_flight = channel.in_flight_remote()
                         current_resident_bytes = resident_bytes()
-                        # The consumer cannot acknowledge anything until one
-                        # complete optimizer window is available. Byte
+                        # The consumer cannot acknowledge anything until a
+                        # complete dispatch group is available. Byte
                         # backpressure below that ref quantum would deadlock
-                        # both roles; allow the required window to fill while
+                        # both roles; allow the required group to fill while
                         # the explicit hard byte cap remains enforced by
                         # publish_refs().
                         policy_paused = flow_control.should_pause(
@@ -1746,7 +1746,9 @@ def build_disagg_online_consumer(
                     ),
                 ).start()
             channel.publish_consumer_quantum(
-                dp_size * batch_size * accumulation_steps,
+                consumer_dispatch_quantum(
+                    consumer_dispatch, dp_size * batch_size * accumulation_steps
+                ),
                 allow_existing=resume_from is not None,
             )
         except BaseException as exc:

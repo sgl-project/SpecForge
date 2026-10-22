@@ -33,7 +33,7 @@ mirrors optimizer-durable work: each rank acknowledges its OWN inbox only after
 the gathered SQLite ack/marker succeeds, and the distributor forwards the sum
 of the inbox sidecars to the source counter. The consumer publishes the global
 dispatch quantum before capture begins, and the producer rejects a watermark
-smaller than that first window. Dispatch itself does not count as consumption.
+smaller than that dispatch group. Dispatch itself does not count as consumption.
 
 If the distributor dies it drops a ``.failed`` sentinel (with the traceback)
 into every inbox; :class:`InboxChannel` readers raise on it at the next poll —
@@ -51,7 +51,7 @@ import traceback
 from collections import Counter
 from typing import Iterable, List, Optional
 
-from specforge.runtime.contracts import SampleRef
+from specforge.runtime.contracts import SampleRef, consumer_dispatch_quantum
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
 logger = logging.getLogger(__name__)
@@ -343,7 +343,9 @@ class RefDistributor:
                 "two_window_bucketed",
                 "two_window_joint_balanced",
             ):
-                count = 2 * self.dispatch_quantum
+                count = consumer_dispatch_quantum(
+                    self.dispatch_policy, self.dispatch_quantum
+                )
                 if source_drained:
                     count = min(
                         count,

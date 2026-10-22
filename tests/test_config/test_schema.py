@@ -117,9 +117,27 @@ class ConfigSchemaTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "at least two global batches"):
                     Config.model_validate(payload)
                 payload["runtime"]["in_flight_high_watermark"] = 256
+                with self.assertRaisesRegex(ValueError, "low watermark"):
+                    Config.model_validate(payload)
+                payload["runtime"]["in_flight_low_watermark"] = 256
                 self.assertEqual(
                     Config.model_validate(payload).runtime.consumer_dispatch, policy
                 )
+
+    def test_two_window_dispatch_rejects_stranded_remainder(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            with self.subTest(policy=policy):
+                payload = _online_payload("dflash")
+                payload["training"].update(batch_size=4, accumulation_steps=1)
+                payload["runtime"] = {
+                    "consumer_dispatch": policy,
+                    "in_flight_high_watermark": 14,
+                    "in_flight_low_watermark": 4,
+                }
+                with self.assertRaisesRegex(ValueError, "low watermark.*quantum 8"):
+                    Config.model_validate(payload)
+                payload["runtime"]["in_flight_low_watermark"] = 8
+                Config.model_validate(payload)
 
     def test_ddp_bucket_limit_is_optional_and_positive(self):
         from specforge.config.schema import TrainingConfig

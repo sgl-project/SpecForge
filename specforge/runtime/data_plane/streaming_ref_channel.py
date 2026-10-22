@@ -231,17 +231,17 @@ class StreamingRefChannel:
 
     def publish_consumer_quantum(
         self,
-        refs_per_optimizer_step: int,
+        refs_per_dispatch: int,
         *,
         allow_existing: bool = False,
     ) -> None:
-        """Claim and publish the consumer's global optimizer-step ref quantum.
+        """Claim and publish the refs required for the consumer's next dispatch.
 
         Rank 0 calls this exactly once for a fresh attempt. The producer waits
         for the value before capture so its in-flight watermark cannot deadlock
-        below the number of refs needed for one lockstep optimizer step.
+        below the dispatch requirement (one or two optimizer windows).
         """
-        quantum = int(refs_per_optimizer_step)
+        quantum = int(refs_per_dispatch)
         if quantum < 1:
             raise ValueError(f"consumer quantum must be >= 1, got {quantum}")
         path = self.path + _CONSUMER_QUANTUM_SUFFIX
@@ -273,7 +273,7 @@ class StreamingRefChannel:
             os.unlink(tmp)
 
     def consumer_quantum(self) -> Optional[int]:
-        """Return the consumer's global optimizer-step ref quantum, if ready."""
+        """Return the consumer's minimum dispatch ref count, if ready."""
         path = self.path + _CONSUMER_QUANTUM_SUFFIX
         try:
             with open(path, encoding="utf-8") as stream:

@@ -92,7 +92,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
             )
         store.close()
 
-    def _build(self, *, resume_from=None, idle_timeout_s=None):
+    def _build(self, *, resume_from=None, idle_timeout_s=None, **kwargs):
         from specforge.launch import build_disagg_online_consumer
 
         captured = {}
@@ -124,8 +124,17 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 inbox_dir=os.path.join(self.work, "inboxes"),
                 resume_from=resume_from,
                 idle_timeout_s=idle_timeout_s,
+                **kwargs,
             )
         return trainer, captured, _FakeDistributor.latest
+
+    def test_two_window_consumer_publishes_dispatch_requirement(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            with self.subTest(policy=policy):
+                self.channel = StreamingRefChannel(os.path.join(self.work, policy))
+                _, _, distributor = self._build(batch_size=4, consumer_dispatch=policy)
+                self.assertEqual(self.channel.consumer_quantum(), 8)
+                self.assertEqual(distributor.kwargs["refs_per_rank_step"], 4)
 
     def test_idle_timeout_is_unbounded_unless_explicitly_configured(self):
         _trainer, captured, distributor = self._build()

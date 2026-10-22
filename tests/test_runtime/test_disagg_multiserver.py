@@ -264,24 +264,30 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertEqual(by_server.get("http://server0:30000"), seen0)
         self.assertEqual(by_server.get("http://server1:30001"), seen1)
 
-    def test_watermark_must_cover_one_consumer_optimizer_window(self):
-        backend = _FakeMooncakeStore()
-        stub = _StubCaptureServer(backend)
-        store = MooncakeFeatureStore(store=backend, store_id="run0")
-        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
-        _workers, drive = _build(
-            [_adapter(store, stub)],
-            _prompts(4),
-            store,
-            channel,
-            consumer_quantum=4,
-            in_flight_high_watermark=2,
-        )
-
-        with self.assertRaisesRegex(ValueError, "optimizer-step quantum 4"):
-            drive()
-        self.assertEqual(channel.published, 0)
-        self.assertIn("high watermark", channel.failure())
+    def test_watermarks_must_cover_consumer_dispatch_requirement(self):
+        for high, low, error in ((2, 2, "high"), (14, 4, "low")):
+            with self.subTest(high=high, low=low):
+                backend = _FakeMooncakeStore()
+                stub = _StubCaptureServer(backend)
+                store = MooncakeFeatureStore(store=backend, store_id="run0")
+                channel = StreamingRefChannel(
+                    os.path.join(self._workdir(), "refs.jsonl")
+                )
+                _workers, drive = _build(
+                    [_adapter(store, stub)],
+                    _prompts(8),
+                    store,
+                    channel,
+                    consumer_quantum=8,
+                    in_flight_high_watermark=high,
+                    in_flight_low_watermark=low,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, f"{error} watermark.*dispatch quantum 8"
+                ):
+                    drive()
+                self.assertEqual(channel.published, 0)
+                self.assertIn(f"{error} watermark", channel.failure())
 
     def test_byte_watermark_resumes_after_durable_consumer_ack(self):
         backend = _FakeMooncakeStore()
@@ -346,17 +352,17 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertGreaterEqual(snapshot["pause_transitions"], 1)
         self.assertGreaterEqual(snapshot["resume_transitions"], 1)
 
-    def test_byte_watermark_cannot_block_the_first_optimizer_window(self):
+    def test_byte_watermark_cannot_block_the_dispatch_group(self):
         backend = _FakeMooncakeStore()
         stub = _StubCaptureServer(backend)
         store = MooncakeFeatureStore(store=backend, store_id="run0")
         channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
         _workers, drive = _build(
             [_adapter(store, stub)],
-            _prompts(3),
+            _prompts(8),
             store,
             channel,
-            consumer_quantum=3,
+            consumer_quantum=8,
             lease=1,
             resident_high_watermark_bytes=1,
             resident_low_watermark_bytes=0,
@@ -373,7 +379,7 @@ class TestMultiServerProducer(unittest.TestCase):
         thread = threading.Thread(target=run_producer, daemon=True)
         thread.start()
         deadline = time.monotonic() + 2
-        while channel.published < 3 and time.monotonic() < deadline:
+        while channel.published < 8 and time.monotonic() < deadline:
             time.sleep(0.001)
         published_before_ack = channel.published
 
@@ -388,10 +394,10 @@ class TestMultiServerProducer(unittest.TestCase):
             time.sleep(0.001)
         thread.join(2)
 
-        self.assertEqual(published_before_ack, 3)
+        self.assertEqual(published_before_ack, 8)
         self.assertFalse(thread.is_alive())
         self.assertNotIn("error", outcome)
-        self.assertEqual(outcome.get("produced"), 3)
+        self.assertEqual(outcome.get("produced"), 8)
 
     def test_hard_byte_cap_aborts_unpublished_capture_and_fails_channel(self):
         backend = _FakeMooncakeStore()

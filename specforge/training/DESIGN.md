@@ -84,8 +84,8 @@ fixed offline refs keep normal `drop_last` semantics.
 - `two_window_joint_balanced`: balance two windows jointly, falling back to independent
   balancing unless the estimated total critical-path cost decreases.
 
-Two-window policies require `in_flight_high_watermark` to cover two global optimizer
-windows and can change optimizer-step sample membership and the training trajectory.
+Two-window policies require both high and low ref watermarks to cover two global
+optimizer windows and can change optimizer-step sample membership and the training trajectory.
 All policies preserve sample coverage, per-rank accumulation counts, deduplication,
 durable acknowledgements, and incomplete-tail handling. Cost estimates are heuristics,
 not guarantees of throughput improvement.

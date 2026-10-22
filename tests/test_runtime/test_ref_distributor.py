@@ -13,6 +13,10 @@ from unittest import mock
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.dp_ack import DPAckController, gather_id_union
+from specforge.runtime.control_plane.flow_control import (
+    FlowControlLimits,
+    ProducerFlowControl,
+)
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
 from specforge.runtime.data_plane.ref_distributor import InboxChannel, RefDistributor
 from specforge.runtime.data_plane.streaming_ref_channel import (
@@ -112,6 +116,30 @@ class TestRefDistributor(unittest.TestCase):
             block_size=kwargs.pop("block_size", 16),
             **kwargs,
         )
+
+    def test_two_window_backpressure_resumes_with_six_refs_remaining(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            with self.subTest(policy=policy):
+                self.producer = StreamingRefChannel(os.path.join(self.dir, policy))
+                self.source = StreamingRefChannel(self.producer.path)
+                dist = self._distributor(refs_per_rank_step=2, dispatch_policy=policy)
+                flow = ProducerFlowControl(FlowControlLimits(14, 8))
+                self.producer.publish_batch([_ref(str(i)) for i in range(14)])
+                self.assertTrue(flow.should_pause(in_flight_refs=14))
+                _pump_until_quiet(dist)
+                self.assertEqual(dist.stats["dispatched"], 8)
+                # Simulate the inbox acknowledgements after two durable steps.
+                for rank in range(2):
+                    StreamingRefChannel(
+                        dist.inbox_path(self.inbox_dir, rank)
+                    ).mark_consumed(4)
+                _pump_until_quiet(dist)
+                remaining = self.producer.in_flight_remote()
+                self.assertEqual(remaining, 6)
+                self.assertFalse(flow.should_pause(in_flight_refs=remaining))
+                self.producer.publish_batch([_ref("14"), _ref("15")])
+                _pump_until_quiet(dist)
+                self.assertEqual(dist.stats["dispatched"], 16)
 
     def test_cost_balancing_preserves_windows_and_balances_accumulation(self):
         dist = self._distributor(

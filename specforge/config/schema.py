@@ -25,6 +25,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from specforge.runtime.contracts import consumer_dispatch_quantum
+
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
@@ -1191,10 +1193,13 @@ class Config(StrictConfigModel):
                 * self.training.batch_size
                 * self.training.accumulation_steps
             )
-            if self.runtime.in_flight_high_watermark < 2 * window:
-                raise ValueError(
-                    f"{dispatch} requires a high watermark of at least two global batches"
-                )
+            required = consumer_dispatch_quantum(dispatch, window)
+            for level in ("high", "low"):
+                if getattr(self.runtime, f"in_flight_{level}_watermark") < required:
+                    raise ValueError(
+                        f"{dispatch} requires a {level} watermark of at least two "
+                        f"global batches (dispatch quantum {required})"
+                    )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
