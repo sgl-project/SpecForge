@@ -79,15 +79,17 @@ def build_offline_normalizer(
     )
 
 
-def build_offline_collator():
+def build_offline_collator(pad_to=None):
     # This retained collator owns USP-aware padding.  It can move here once the
     # distributed helper contracts are independent of specforge.data.
     from specforge.data.utils import DataCollatorWithPadding
 
-    return DataCollatorWithPadding()
+    return DataCollatorWithPadding(pad_to=pad_to)
 
 
-def build_server_collator():
+def build_server_collator(pad_to=None):
+    # Server-streamed EAGLE3 batches already arrive with equal shapes (the
+    # concatenate contract), so a static length needs no extra padding here.
     from specforge.algorithms.common.collation import concatenate_features
 
     return concatenate_features
