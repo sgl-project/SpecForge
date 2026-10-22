@@ -341,6 +341,30 @@ class OnlineDFlashModel(nn.Module):
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
+    def _projection_checkpoint_contexts(self):
+        from torch.utils.checkpoint import (
+            CheckpointPolicy,
+            create_selective_checkpoint_contexts,
+        )
+
+        head = self.lm_head
+        eligible = isinstance(head, nn.Linear) and not head.weight.requires_grad
+
+        def policy(context, operation, *arguments, **kwargs):
+            if eligible and operation in (
+                torch.ops.aten.mm.default,
+                torch.ops.aten.bmm.default,
+            ):
+                weight = arguments[1]
+                if (
+                    weight.shape[-2:] == (head.in_features, head.out_features)
+                    and not weight.requires_grad
+                ):
+                    return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+
+        return create_selective_checkpoint_contexts(policy)
+
     def _sample_anchor_positions(
         self,
         seq_len: int,
