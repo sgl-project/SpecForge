@@ -62,7 +62,12 @@ def build_training_model(config, draft_model, draft_config, target_config, token
     from .model import OnlineDSpineModel
 
     return _build_dflash_family_model(
-        config, draft_model, tokenizer, lambda common: OnlineDSpineModel(**common)
+        config,
+        draft_model,
+        tokenizer,
+        lambda common: OnlineDSpineModel(
+            **common, warmup_ratio=config.training.warmup_ratio
+        ),
     )
 
 
