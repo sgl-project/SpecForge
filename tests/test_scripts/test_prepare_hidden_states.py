@@ -75,6 +75,25 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
         )
         self.assertFalse(hasattr(args, "capture_layers"))
 
+    def test_mtp_capture_plan_uses_a_supported_attention_backend(self):
+        args = SimpleNamespace(
+            strategy="mtp",
+            target_model_path="target",
+            draft_model_config=str(REPO_ROOT / "configs/qwen3.5-4b-mtp.json"),
+            trust_remote_code=False,
+            cache_dir=None,
+            output_path="offline-features",
+            max_length=128,
+        )
+        plan = resolve_offline_capture_plan(args, SimpleNamespace(num_hidden_layers=40))
+        self.assertEqual("mtp", plan.strategy)
+        self.assertEqual("dflash", plan.capture_method)
+        self.assertEqual((1,), plan.capture_layers)
+        self.assertEqual(
+            {"input_ids", "loss_mask", "target_last_hidden_states"},
+            set(plan.layout.output_names),
+        )
+
     def test_strategy_capture_plans_use_draft_owned_layers_and_schemas(self):
         expected = {
             "eagle3": (

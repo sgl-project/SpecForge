@@ -341,7 +341,12 @@ def resolve_offline_capture_plan(
             "hidden_states_path": args.output_path or "__offline_capture__",
             "max_length": args.max_length,
         },
-        training={"strategy": strategy},
+        # MTP supports eager/sdpa rather than the schema's flex_attention
+        # default. Other strategies keep their own default backend.
+        training={
+            "strategy": strategy,
+            **({"attention_backend": "sdpa"} if strategy == "mtp" else {}),
+        },
     )
     resolved = resolve_offline_capture(cfg, target_config=target_config)
     return OfflineCapturePlan(
