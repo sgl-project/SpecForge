@@ -1,6 +1,8 @@
 # coding=utf-8
 """Tests for StreamingRefChannel: the cross-process online ref stream."""
 
+import io
+import json
 import os
 import tempfile
 import threading
@@ -11,6 +13,7 @@ from contextlib import contextmanager
 from unittest import mock
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
+from specforge.runtime.data_plane.ref_serialization import ref_to_dict
 from specforge.runtime.data_plane.streaming_ref_channel import (
     StreamingRefChannel,
     StreamingRefQueue,
@@ -215,6 +218,186 @@ class TestStreamingRefChannel(unittest.TestCase):
         self.assertEqual(len(first), 2)
         rest = r.poll()
         self.assertEqual(len(rest), 3)
+
+    def test_poll_rereads_transient_invalid_snapshot_without_losing_prefix(self):
+        producer = StreamingRefChannel(self.path)
+        producer.publish_batch([_ref("s0"), _ref("s1")])
+        with open(self.path, "rb") as stream:
+            complete = stream.read()
+        prefix = complete[: complete.index(b"\n") + 1]
+        snapshots = iter([prefix + b"\x00invalid\n", complete])
+
+        def open_snapshot(path, mode):
+            self.assertEqual(path, self.path)
+            payload = next(snapshots)
+            return io.BytesIO(payload) if "b" in mode else io.StringIO(payload.decode())
+
+        reader = StreamingRefChannel(self.path)
+        with mock.patch(
+            "specforge.runtime.data_plane.streaming_ref_channel.open", open_snapshot
+        ):
+            refs = reader.poll()
+        self.assertEqual([ref.sample_id for ref in refs], ["s0", "s1"])
+        self.assertEqual(reader._read_offset, len(complete))
+        self.assertEqual(reader.poll(), [])
+
+    def test_poll_persistent_corruption_is_bounded_and_does_not_advance(self):
+        reader = StreamingRefChannel(self.path)
+        producer = StreamingRefChannel(self.path)
+        producer.publish(_ref("s0"))
+        with open(self.path, "rb") as stream:
+            prefix = stream.read()
+        with open(self.path, "ab") as stream:
+            stream.write(b"not-json\n")
+        with mock.patch(
+            "specforge.runtime.data_plane.streaming_ref_channel.time.sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(ValueError, "byte offset.*after 3 attempts"):
+                reader.poll()
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(reader._read_offset, 0)
+        with open(self.path, "wb") as stream:
+            stream.write(prefix)
+        producer.publish(_ref("s1"))
+        self.assertEqual([ref.sample_id for ref in reader.poll()], ["s0", "s1"])
+
+    def test_poll_retry_preserves_previously_committed_offset(self):
+        producer = StreamingRefChannel(self.path)
+        producer.publish(_ref("s0"))
+        reader = StreamingRefChannel(self.path)
+        self.assertEqual([ref.sample_id for ref in reader.poll()], ["s0"])
+        boundary = reader._read_offset
+        producer.publish(_ref("s1"))
+        with open(self.path, "rb") as stream:
+            complete = stream.read()
+        snapshots = iter([complete[:boundary] + b"\xff\n", complete])
+
+        def open_snapshot(path, mode):
+            self.assertEqual(path, self.path)
+            self.assertEqual(mode, "rb")
+            return io.BytesIO(next(snapshots))
+
+        with mock.patch(
+            "specforge.runtime.data_plane.streaming_ref_channel.open", open_snapshot
+        ):
+            refs = reader.poll()
+        self.assertEqual([ref.sample_id for ref in refs], ["s1"])
+        self.assertEqual(reader._read_offset, len(complete))
+        self.assertEqual(reader.poll(), [])
+
+    def test_poll_invalidates_cached_snapshot_before_retry(self):
+        producer = StreamingRefChannel(self.path)
+        producer.publish(_ref("s0"))
+        with open(self.path, "rb") as stream:
+            complete = stream.read()
+        reader = StreamingRefChannel(self.path)
+        cached_reads = []
+
+        class CachedStream(io.BytesIO):
+            def fileno(self):
+                return 17
+
+            def read(self, size=-1):
+                cached_reads.append(invalidate.called)
+                if not invalidate.called:
+                    return b"\x00" * (len(complete) - 1) + b"\n"
+                return super().read(size)
+
+        def open_snapshot(path, mode):
+            self.assertEqual(path, self.path)
+            self.assertEqual(mode, "rb")
+            return CachedStream(complete)
+
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.streaming_ref_channel.open", open_snapshot
+            ),
+            mock.patch.object(os, "posix_fadvise", create=True) as invalidate,
+            mock.patch.object(os, "POSIX_FADV_DONTNEED", 4, create=True),
+        ):
+            self.assertEqual([ref.sample_id for ref in reader.poll()], ["s0"])
+            invalidate.assert_called_once_with(17, 0, 0, 4)
+        self.assertEqual(cached_reads, [False, True])
+        self.assertEqual(reader.poll(), [])
+
+    def test_poll_does_not_follow_concurrent_append_beyond_snapshot(self):
+        producer = StreamingRefChannel(self.path)
+        producer.publish(_ref("s0"))
+        with open(self.path, "rb") as stream:
+            complete = stream.read()
+
+        class AppendingStream(io.BytesIO):
+            def read(self, size=-1):
+                position = self.tell()
+                self.seek(0, os.SEEK_END)
+                self.write(b"invalid\n")
+                self.seek(position)
+                return super().read(size)
+
+        reader = StreamingRefChannel(self.path)
+        with mock.patch(
+            "specforge.runtime.data_plane.streaming_ref_channel.open",
+            return_value=AppendingStream(complete),
+        ):
+            self.assertEqual([ref.sample_id for ref in reader.poll()], ["s0"])
+        self.assertEqual(reader._read_offset, len(complete))
+
+    def test_poll_rereads_uncommitted_partial_record(self):
+        producer = StreamingRefChannel(self.path)
+        producer.publish(_ref("s0"))
+        with open(self.path, "rb") as stream:
+            complete = stream.read()
+        reader = StreamingRefChannel(self.path)
+        with open(self.path, "wb") as stream:
+            stream.write(b"\x00" * 30)
+        self.assertEqual(reader.poll(), [])
+        self.assertEqual(reader._read_offset, 0)
+        with open(self.path, "wb") as stream:
+            stream.write(complete)
+        self.assertEqual([ref.sample_id for ref in reader.poll()], ["s0"])
+
+    def test_poll_buffers_split_utf8_until_newline(self):
+        payload = (
+            json.dumps(ref_to_dict(_ref("样本")), ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        split = payload.index("样".encode("utf-8")) + 1
+        reader = StreamingRefChannel(self.path)
+        with open(self.path, "wb") as stream:
+            stream.write(payload[:split])
+        self.assertEqual(reader.poll(), [])
+        with open(self.path, "ab") as stream:
+            stream.write(payload[split:])
+        self.assertEqual([ref.sample_id for ref in reader.poll()], ["样本"])
+        self.assertEqual(reader._read_offset, len(payload))
+        self.assertEqual(reader.poll(), [])
+
+    def test_poll_max_n_leaves_invalid_tail_unconsumed(self):
+        producer = StreamingRefChannel(self.path)
+        producer.publish(_ref("s0"))
+        boundary = os.path.getsize(self.path)
+        with open(self.path, "ab") as stream:
+            stream.write(b"invalid\n")
+        reader = StreamingRefChannel(self.path)
+        self.assertEqual([ref.sample_id for ref in reader.poll(max_n=1)], ["s0"])
+        self.assertEqual(reader._read_offset, boundary)
+        with mock.patch(
+            "specforge.runtime.data_plane.streaming_ref_channel.time.sleep"
+        ):
+            with self.assertRaises(ValueError):
+                reader.poll()
+        self.assertEqual(reader._read_offset, boundary)
+
+    def test_poll_closed_corrupt_stream_does_not_silently_drain(self):
+        producer = StreamingRefChannel(self.path)
+        with open(self.path, "wb") as stream:
+            stream.write(b"invalid\n")
+        producer.close()
+        reader = StreamingRefChannel(self.path)
+        with mock.patch(
+            "specforge.runtime.data_plane.streaming_ref_channel.time.sleep"
+        ):
+            with self.assertRaises(ValueError):
+                list(reader.stream(poll_s=0.0))
 
     def test_stream_drains_then_stops_on_close(self):
         w = StreamingRefChannel(self.path)
