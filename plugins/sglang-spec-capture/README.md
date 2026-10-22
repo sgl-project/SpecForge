@@ -12,16 +12,52 @@ generic extension points it uses:
   aux concatenation.
 - `ModelRunner.forward_observer`: reads each prefill's hidden states and hands
   them to the auxiliary-output path.
-- `DeferredOutputSource`: holds a finished request's response until its
-  objects are written.
+- `Scheduler.defer_response(req, completion)`: SGLang holds a finished
+  request until its objects are written, then reads the completion on the
+  scheduler thread before returning capture metadata. Cancelling one request
+  does not cancel a shared write needed by other requests.
 
 ## Install
 
-Install into the SGLang server's environment. It declares no dependencies, so
-the server's pins stay intact:
+This version requires SGLang's [aux-capture changes in PR #43449](https://github.com/sgl-project/sglang/pull/43449)
+and the completion-based `defer_response` revision of
+[PR #43450](https://github.com/sgl-project/sglang/pull/43450), or a branch containing
+both. These extension points are not available in stock SGLang 0.5.18.
+
+Use separate environments for the SGLang server and SpecForge training.
+SpecForge currently pins SGLang 0.5.18 and different Torch/Transformers versions;
+installing the main SpecForge package into the server environment would replace
+the server's dependencies. The server only needs this plugin, its SGLang build,
+and Mooncake; the plugin does not import the main SpecForge package.
+
+Install into the SGLang server's environment. The plugin declares no
+dependencies, so the server's pins stay intact:
 
 ```bash
 pip install --no-deps plugins/sglang-spec-capture
+```
+
+Install a Mooncake wheel compatible with the server's CUDA version separately.
+For a live store test, it must provide both `mooncake.store` and the
+`mooncake_master` executable (for example, `mooncake-transfer-engine-cuda13`
+on CUDA 13).
+
+Source installation requires the Rust toolchain pinned by SGLang, a C/C++
+compiler, and CUDA development tools. An existing compatible SGLang server
+environment can also be used.
+
+For example, from the SpecForge checkout on a CUDA 13 host, with an SGLang
+checkout containing both changes:
+
+```bash
+python3.12 -m venv .venv-sglang .venv-training
+.venv-sglang/bin/python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+.venv-sglang/bin/python -m pip install -e /path/to/sglang/python mooncake-transfer-engine-cuda13
+.venv-sglang/bin/python -m pip install --no-deps plugins/sglang-spec-capture
+.venv-training/bin/python -m pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+.venv-training/bin/python -m pip install -e . mooncake-transfer-engine-cuda13
+.venv-sglang/bin/python -m pip check
+.venv-training/bin/python -m pip check
 ```
 
 SGLang discovers the plugin through the `sglang.srt.plugins` entry point. If
@@ -33,7 +69,7 @@ SGLang discovers the plugin through the `sglang.srt.plugins` entry point. If
 SPECFORGE_SPEC_CAPTURE=1 \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:50051 \
 MOONCAKE_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-python -m sglang.launch_server --model-path <target> --skip-tokenizer-init \
+.venv-sglang/bin/python -m sglang.launch_server --model-path <target> --skip-tokenizer-init \
   --chunked-prefill-size -1 \
   --speculative-algorithm DFLASH --enable-return-aux-hidden-states \
   --return-aux-hidden-state-layer-ids 1 16 31 46 61 \
@@ -45,6 +81,21 @@ SpecForge's managed launcher renders them when
 `deployment.disaggregated.server_capture: plugin` is set. For an external
 server, set that config field or `DISAGG_SERVER_CAPTURE=plugin` so the
 producer sends specs the plugin's way.
+
+For managed servers in a separate environment, set the server's Python
+executable explicitly while launching SpecForge from its training environment:
+
+```yaml
+deployment:
+  disaggregated:
+    server_capture: plugin
+    managed_local:
+      capture_servers:
+        - port: 32000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          python_executable: /path/to/sglang-venv/bin/python
+```
 
 ## Requests
 

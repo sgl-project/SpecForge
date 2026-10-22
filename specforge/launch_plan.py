@@ -710,7 +710,7 @@ def _managed_local_services(
     capture_services = []
     for index, server in enumerate(managed.capture_servers):
         argv = [
-            sys.executable,
+            server.python_executable or sys.executable,
             "-m",
             "sglang.launch_server",
             "--model-path",
@@ -764,7 +764,13 @@ def _managed_local_services(
         argv.extend(cfg.model.sglang_extra_args)
         argv.extend(server.extra_args)
         gpu_put = server.gpu_put if server.gpu_put is not None else default_gpu_put
+        python_env: dict[str, Optional[str]] = {}
+        if server.python_executable:
+            python_env = {"PYTHONPATH": None, "VIRTUAL_ENV": None}
+            if directory := os.path.dirname(server.python_executable):
+                python_env["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
         service_env = {
+            **python_env,
             # Validated not to overlap the keys below, which win regardless.
             **server.env,
             **shared_env,
@@ -1245,6 +1251,49 @@ def _module_available(name: str) -> bool:
         return False
 
 
+def _missing_capture_modules(command: CommandSpec, modules: Sequence[str]) -> list[str]:
+    if command.argv[0] == sys.executable and "PYTHONPATH" not in command.env:
+        return [module for module in modules if not _module_available(module)]
+    # Probe the server's environment without enabling its plugin.
+    env = {
+        name: value
+        for name, value in {**os.environ, **command.env}.items()
+        if value is not None
+    }
+    env.update(
+        SPECFORGE_SPEC_CAPTURE="0", CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES=""
+    )
+    env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+    env.pop("ASCEND_VISIBLE_DEVICES", None)
+    probe = """import importlib.util, json, sys
+missing = []
+for name in sys.argv[1:]:
+    try:
+        found = importlib.util.find_spec(name)
+    except ModuleNotFoundError:
+        found = None
+    if found is None:
+        missing.append(name)
+print(json.dumps(missing))
+"""
+    try:
+        result = subprocess.run(
+            [command.argv[0], "-c", probe, "mooncake.store", *modules],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        detail = getattr(exc, "stderr", None) or str(exc)
+        raise RuntimeError(
+            f"Cannot inspect {command.label} Python {command.argv[0]!r}: {detail}. "
+            "Check capture_servers[].python_executable and install its capture dependencies."
+        ) from exc
+
+
 def _managed_rdma_preflight(plan: LaunchPlan) -> None:
     """Refuse an RDMA stack that would fall back to TCP or fail to register."""
     if plan.managed_rdma_error is not None:
@@ -1306,28 +1355,31 @@ def _managed_preflight(plan: LaunchPlan) -> None:
         mooncake_available = False
     if not mooncake_available:
         raise RuntimeError("managed_local requires the mooncake Python package")
-    if plan.server_capture == "plugin":
-        missing = [
-            module
-            for module in (
-                "specforge_sglang_capture",
-                "sglang.srt.model_executor.forward_observer",
-                "sglang.srt.managers.deferred_output",
-            )
-            if not _module_available(module)
-        ]
-        if missing:
-            raise RuntimeError(
-                "managed_local server_capture=plugin requires the "
-                "specforge-sglang-capture plugin (pip install --no-deps "
-                "plugins/sglang-spec-capture) on an SGLang build with forward "
-                f"observers and deferred outputs; missing {missing}"
-            )
-    elif not _module_available("sglang.srt.spec_capture_sink"):
-        raise RuntimeError(
-            "managed_local requires patched SGLang spec capture; run "
-            "scripts/apply_sglang_spec_capture_patch.sh"
+    modules = (
+        (
+            "specforge_sglang_capture",
+            "sglang.srt.model_executor.forward_observer",
+            "sglang.srt.managers.deferred_output",
         )
+        if plan.server_capture == "plugin"
+        else ("sglang.srt.spec_capture_sink",)
+    )
+    for service in plan.services:
+        if not service.command.label.startswith("capture-server-"):
+            continue
+        missing = _missing_capture_modules(service.command, modules)
+        if missing:
+            requirement = (
+                "the specforge-sglang-capture plugin (pip install --no-deps "
+                "plugins/sglang-spec-capture) on an SGLang build with forward "
+                "observers and deferred outputs"
+                if plan.server_capture == "plugin"
+                else "patched SGLang spec capture; run scripts/apply_sglang_spec_capture_patch.sh"
+            )
+            raise RuntimeError(
+                f"managed_local requires {requirement} for {service.command.label} "
+                f"using {service.command.argv[0]!r}; missing {missing}"
+            )
     _managed_rdma_preflight(plan)
 
     for port in plan.managed_ports:

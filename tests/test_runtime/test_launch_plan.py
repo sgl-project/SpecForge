@@ -6,12 +6,14 @@ from __future__ import annotations
 import functools
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError
@@ -27,6 +29,7 @@ from specforge.launch_plan import (
     ReadinessSpec,
     ServiceSpec,
     _http_ready,
+    _managed_preflight,
     _managed_rdma_preflight,
     _spawn_command,
 )
@@ -178,7 +181,9 @@ def _managed_plan(root):
                 0,
             ),
             ServiceSpec(
-                CommandSpec("capture-server-0", ("capture",)),
+                CommandSpec(
+                    "capture-server-0", (sys.executable, "-m", "sglang.launch_server")
+                ),
                 ReadinessSpec("http", "http://127.0.0.1:30000/health", 1),
                 os.path.join(log_dir, "capture.log"),
                 1,
@@ -967,6 +972,33 @@ class LaunchPlanTest(unittest.TestCase):
                 plan = build_launch_plan(validated, config_path="run.yaml", env={})
 
         self.assertNotIn("--disable-radix-cache", plan.services[1].command.argv)
+
+    def test_managed_capture_servers_can_use_separate_python(self):
+        cfg = _managed_config(
+            "/fresh/managed-attempt",
+            servers=[
+                {"port": 30000, "cuda_visible_devices": ["0"]},
+                {
+                    "port": 30001,
+                    "cuda_visible_devices": ["1"],
+                    "python_executable": "/capture-venv/bin/python",
+                },
+            ],
+        )
+        plan = _build_managed(cfg.model_dump())
+
+        self.assertEqual(plan.services[1].command.argv[0], sys.executable)
+        self.assertEqual(
+            plan.services[2].command.argv[:3],
+            ("/capture-venv/bin/python", "-m", "sglang.launch_server"),
+        )
+        env = plan.services[2].command.env
+        self.assertIsNone(env["PYTHONPATH"])
+        self.assertIsNone(env["VIRTUAL_ENV"])
+        self.assertTrue(env["PATH"].startswith("/capture-venv/bin" + os.pathsep))
+        self.assertTrue(
+            all(command.argv[0] == sys.executable for command in plan.commands)
+        )
 
     def test_managed_local_gpu_put_override_can_disable_rdma_publication(self):
         servers = [
@@ -2296,6 +2328,70 @@ class LaunchPlanTest(unittest.TestCase):
                     self.assertRaisesRegex(RuntimeError, message),
                 ):
                     run_commands(plan, popen=mock.Mock())
+
+    def test_managed_preflight_checks_the_capture_python_environment(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            python = root / "capture-python"
+            python.symlink_to(sys.executable)
+            packages = root / "packages"
+            for name in (
+                "mooncake/store",
+                "specforge_sglang_capture",
+                "sglang/srt/model_executor/forward_observer",
+                "sglang/srt/managers/deferred_output",
+            ):
+                package = packages / name
+                package.mkdir(parents=True, exist_ok=True)
+                (package / "__init__.py").touch()
+            (packages / "sglang" / "__init__.py").write_text(
+                "import os\n"
+                "assert os.environ['SPECFORGE_SPEC_CAPTURE'] == '0'\n"
+                "assert os.environ['CUDA_VISIBLE_DEVICES'] == ''\n"
+            )
+            plan = _managed_plan(str(root / "attempt"))
+            mooncake, capture = plan.services
+            capture = replace(
+                capture,
+                command=CommandSpec(
+                    capture.command.label,
+                    (str(python), "-m", "sglang.launch_server"),
+                    {
+                        "PYTHONPATH": str(packages),
+                        "SPECFORGE_SPEC_CAPTURE": "1",
+                        "CUDA_VISIBLE_DEVICES": "0",
+                    },
+                ),
+            )
+            plan = replace(
+                plan,
+                services=(mooncake, capture),
+                managed_ports=(),
+                server_capture="plugin",
+            )
+            with (
+                mock.patch(
+                    "specforge.launch_plan.shutil.which", return_value="mooncake_master"
+                ),
+                mock.patch(
+                    "specforge.launch_plan.importlib.util.find_spec",
+                    return_value=object(),
+                ),
+                mock.patch(
+                    "specforge.launch_plan._module_available",
+                    side_effect=AssertionError("must inspect the capture interpreter"),
+                ),
+            ):
+                _managed_preflight(plan)
+                missing = packages / "sglang/srt/managers/deferred_output"
+                shutil.rmtree(missing)
+                with self.assertRaisesRegex(
+                    RuntimeError, "capture-python.*deferred_output"
+                ):
+                    _managed_preflight(plan)
+                python.unlink()
+                with self.assertRaisesRegex(RuntimeError, "python_executable"):
+                    _managed_preflight(plan)
 
     def _rdma_plan(self, root, *, server_env=None, memlock_bytes=None, protocol="rdma"):
         plan = _managed_plan(root)

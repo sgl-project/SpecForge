@@ -107,7 +107,7 @@ a plugin instead of a source patch:
   (`--enable-return-aux-hidden-states` with `--speculative-algorithm` naming
   the convention, `--return-aux-hidden-state-layer-ids`);
 - `ModelRunner.forward_observer`;
-- `DeferredOutputSource`.
+- `Scheduler.defer_response(req, completion)`.
 
 The plugin is
 [`plugins/sglang-spec-capture`](../../plugins/sglang-spec-capture). Install it

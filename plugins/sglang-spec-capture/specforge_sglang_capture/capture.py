@@ -23,11 +23,11 @@ Per scheduler process, on the attention-TP writer rank:
 2. ``CaptureDeviceOutput.copy_to_host`` copies them to pinned host memory with
    the generation result, or keeps device tensors for device publication (RDMA,
    or the NVLink arena under ``MOONCAKE_PROTOCOL=nvlink``).
-3. ``CaptureHostOutput.consume`` hands each finished request's rows to the
-   Mooncake sink and holds the request's response (``Req.defer_output``).
-4. ``PendingCaptures`` (an SGLang ``DeferredOutputSource``) releases requests in
-   order once their objects are written; the streamer subclass then returns
-   the result in ``meta_info["spec_capture"]``.
+3. ``CaptureHostOutput.consume`` publishes each finished request's rows and
+   passes its completion to ``Scheduler.defer_response``.
+4. SGLang holds the request until ``CaptureCompletion`` is ready, then reads
+   its result on the scheduler thread before streaming. The streamer subclass
+   returns the result in ``meta_info["spec_capture"]``.
 
 The module imports SGLang lazily so its logic is testable without a server.
 """
@@ -41,7 +41,7 @@ import os
 from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import wait as wait_futures
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from specforge_sglang_capture.sink import (
@@ -303,51 +303,78 @@ class CaptureHostOutput:
             held.append(req)
         if not samples:
             return
-        for req in held:
-            req.defer_output = True
-        self.runtime.pending.submit(held, samples, ready_event=self.ready_event)
+        future = self.runtime.pending.submit(samples, ready_event=self.ready_event)
+        for index, (req, (spec, _, _)) in enumerate(zip(held, samples, strict=True)):
+            self.runtime.defer_response(
+                req,
+                CaptureCompletion(
+                    future, index, len(samples), req.rid, spec, self.runtime.results
+                ),
+            )
+
+
+@dataclasses.dataclass
+class CaptureCompletion:
+    """One response's metadata, backed by a shared batch publication future.
+
+    SGLang calls these methods on the scheduler thread. Cancelling one request
+    leaves the shared write running for its siblings and suppresses its metadata.
+    """
+
+    future: Future
+    index: int
+    batch_size: int
+    rid: str
+    spec: Dict[str, Any]
+    results: Dict[str, Dict[str, Any]]
+    _cancelled: bool = False
+    _resolved: bool = False
+
+    def done(self) -> bool:
+        return self._cancelled or self.future.done()
+
+    def result(self) -> None:
+        if self._cancelled or self._resolved:
+            return
+        try:
+            results = self.future.result()
+            if len(results) != self.batch_size:
+                raise RuntimeError(
+                    f"spec-capture sink returned {len(results)} results for "
+                    f"{self.batch_size} requests"
+                )
+            result = results[self.index]
+        except Exception as exc:
+            logger.error("spec-capture failed for %s: %s", self.rid, exc)
+            result = error_result(self.spec, str(exc))
+        self.results[self.rid] = result
+        self._resolved = True
+
+    def cancel(self) -> bool:
+        if self._resolved:
+            return False
+        self._cancelled = True
+        return True
 
 
 class PendingCaptures:
-    """DeferredOutputSource: release held requests once their batch is written."""
+    """Bound in-flight publication batches without retaining SGLang requests."""
 
     def __init__(self, runtime: CaptureRuntime, max_pending_batches: int) -> None:
         if max_pending_batches < 1:
             raise ValueError(f"{MAX_PENDING_BATCHES_ENV} must be >= 1")
         self.runtime = runtime
         self.max_pending_batches = max_pending_batches
-        self._batches: Deque[Tuple[List[Any], List[Dict[str, Any]], Future]] = deque()
+        self._futures: Deque[Future] = deque()
 
-    def submit(self, reqs, samples: List[Sample], *, ready_event=None) -> None:
+    def submit(self, samples: List[Sample], *, ready_event=None) -> Future:
+        while self._futures and self._futures[0].done():
+            self._futures.popleft()
         future = self.runtime.sink.submit_samples(samples, ready_event=ready_event)
-        self._batches.append((reqs, [spec for spec, _, _ in samples], future))
-        if len(self._batches) > self.max_pending_batches:
-            # Bound the retained rows: the next poll releases the oldest batch.
-            wait_futures([self._batches[0][2]])
-
-    def poll(self) -> List[Any]:
-        released = []
-        while self._batches and self._batches[0][2].done():
-            reqs, specs, future = self._batches.popleft()
-            try:
-                results = future.result()
-                if len(results) != len(reqs):
-                    raise RuntimeError(
-                        f"spec-capture sink returned {len(results)} results for "
-                        f"{len(reqs)} requests"
-                    )
-            except Exception as exc:
-                logger.error(
-                    "spec-capture batch failed for %d requests: %s", len(reqs), exc
-                )
-                results = [error_result(spec, str(exc)) for spec in specs]
-            for req, result in zip(reqs, results):
-                self.runtime.results[req.rid] = result
-            released.extend(reqs)
-        return released
-
-    def has_pending(self) -> bool:
-        return bool(self._batches)
+        self._futures.append(future)
+        if len(self._futures) > self.max_pending_batches:
+            wait_futures([self._futures.popleft()])
+        return future
 
 
 def capture_streamer_class(base: type) -> type:
@@ -388,11 +415,13 @@ class CaptureRuntime:
         is_writer: bool,
         gpu_put: bool,
         max_pending_batches: int,
+        defer_response: Callable[[Any, CaptureCompletion], None],
         last_hidden_scale: Optional[float] = None,
     ) -> None:
         self.sink = sink
         self.is_writer = is_writer
         self.gpu_put = gpu_put
+        self.defer_response = defer_response
         # The target's logits_mup_width_multiplier, if it declares one.
         self.last_hidden_scale = last_hidden_scale
         # rid -> result dict, read by the streamer when the request streams.
@@ -414,13 +443,16 @@ def logits_mup_width_multiplier(model_runner) -> Optional[float]:
 
 def install(scheduler) -> CaptureRuntime:
     """Validate the server configuration and wire capture into ``scheduler``."""
+    from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 
+    if scheduler.disaggregation_mode != DisaggregationMode.NULL:
+        raise RuntimeError("SPECFORGE_SPEC_CAPTURE does not support PD disaggregation")
     model_runner = scheduler.tp_worker.model_runner
     features = get_exec().features
     if not (
         hasattr(type(model_runner), "forward_observer")
-        and hasattr(scheduler, "register_deferred_output_source")
+        and hasattr(scheduler, "defer_response")
         and hasattr(features, "aux_hidden_state_capture")
     ):
         raise RuntimeError(
@@ -455,10 +487,10 @@ def install(scheduler) -> CaptureRuntime:
         is_writer=get_parallel().attn_tp_rank == 0,
         gpu_put=gpu_put_enabled(),
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
+        defer_response=scheduler.defer_response,
         last_hidden_scale=logits_mup_width_multiplier(model_runner),
     )
     model_runner.forward_observer = runtime.observer
-    scheduler.register_deferred_output_source(runtime.pending)
     scheduler.output_streamer.spec_capture_results = runtime.results
     scheduler._specforge_capture_runtime = runtime
     logger.info(

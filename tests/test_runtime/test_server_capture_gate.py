@@ -28,6 +28,12 @@ capture-capable SGLang: either patched with
 observer extension points plus the installed ``specforge-sglang-capture``
 plugin. ``SPECFORGE_SERVER_CAPTURE=patch|plugin`` selects one; otherwise the
 installed one is used. Opt in locally with ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
+``SPECFORGE_CAPTURE_GATE_PORT``, ``SPECFORGE_CAPTURE_GATE_TRAIN_PORT`` and
+``SPECFORGE_CAPTURE_GATE_TP_SIZE`` isolate concurrent runs. Set
+``SPECFORGE_CAPTURE_GATE_WORKDIR`` to retain the generated model and logs in
+that directory; an existing ``target`` subdirectory is rejected. Set
+``SPECFORGE_CAPTURE_GATE_SERVER_PYTHON`` to launch the server from a separate
+SGLang environment; the tests themselves run in the SpecForge environment.
 """
 
 import importlib.util
@@ -45,7 +51,7 @@ from tests.utils import terminate_process_trees
 
 CUDA = torch.cuda.is_available()
 ENABLED = os.environ.get("SPECFORGE_RUN_SERVER_CAPTURE_TESTS") == "1"
-PORT = 30989
+PORT = int(os.environ.get("SPECFORGE_CAPTURE_GATE_PORT", "30989"))
 AUX_LAYER_IDS = [1, 3, 4]
 H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
 
@@ -151,8 +157,16 @@ class TestServerCaptureGate(unittest.TestCase):
 
         from transformers import LlamaConfig, LlamaForCausalLM
 
-        cls.workdir = tempfile.mkdtemp(prefix="spec_capture_gate_")
-        cls.addClassCleanup(shutil.rmtree, cls.workdir, True)
+        cls.workdir = os.environ.get("SPECFORGE_CAPTURE_GATE_WORKDIR")
+        if cls.workdir:
+            os.makedirs(cls.workdir, exist_ok=True)
+            if os.path.exists(os.path.join(cls.workdir, "target")):
+                raise RuntimeError(
+                    f"capture gate target already exists in {cls.workdir}"
+                )
+        else:
+            cls.workdir = tempfile.mkdtemp(prefix="spec_capture_gate_")
+            cls.addClassCleanup(shutil.rmtree, cls.workdir, True)
         # Class cleanups still run when setUpClass raises. Register process
         # cleanup last so it runs before the temporary log directory is removed.
         cls.addClassCleanup(cls._cleanup_processes)
@@ -183,9 +197,17 @@ class TestServerCaptureGate(unittest.TestCase):
         )
         if SERVER_CAPTURE == "plugin":
             env["SPECFORGE_SPEC_CAPTURE"] = "1"
+        server_python = os.environ.get("SPECFORGE_CAPTURE_GATE_SERVER_PYTHON")
+        if server_python:
+            server_bin = os.path.dirname(
+                os.path.abspath(shutil.which(server_python) or server_python)
+            )
+            env["PATH"] = server_bin + os.pathsep + env.get("PATH", "")
+            env.pop("PYTHONPATH", None)
+            env.pop("VIRTUAL_ENV", None)
         cls.server = subprocess.Popen(
             [
-                sys.executable,
+                server_python or sys.executable,
                 "-m",
                 "sglang.launch_server",
                 "--model-path",
@@ -195,8 +217,18 @@ class TestServerCaptureGate(unittest.TestCase):
                 "triton",
                 "--mem-fraction-static",
                 "0.3",
+                "--max-total-tokens",
+                "4096",
+                (
+                    "--cuda-graph-max-bs-decode"
+                    if SERVER_CAPTURE == "plugin"
+                    else "--cuda-graph-max-bs"
+                ),
+                "4",
                 "--chunked-prefill-size",
                 "-1",
+                "--tp-size",
+                os.environ.get("SPECFORGE_CAPTURE_GATE_TP_SIZE", "1"),
                 *_capture_server_flags(),
                 "--port",
                 str(PORT),
@@ -401,7 +433,9 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.training.strategies.base import Eagle3TrainStrategy
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(port="29576")
+        fx.build_single_rank_distributed(
+            port=os.environ.get("SPECFORGE_CAPTURE_GATE_TRAIN_PORT", "29576")
+        )
         torch.manual_seed(0)
         draft_cfg = AutoDraftModelConfig.from_file(
             fx.write_draft_config(os.path.join(self.workdir, "draft.json"))

@@ -667,6 +667,8 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
 
     port: int = Field(gt=0, le=65535)
     cuda_visible_devices: List[str] = Field(min_length=1)
+    #: Python from a separate SGLang environment; None uses the trainer's Python.
+    python_executable: Optional[str] = Field(default=None, min_length=1)
     tp_size: int = Field(default=1, gt=0)
     #: Optional server-specific override. When omitted, inherit the canonical
     #: model.sglang_mem_fraction_static setting instead of silently shadowing it.
