@@ -171,8 +171,9 @@ class DFlashGroupedConv(nn.Module):
             hidden_states.dtype == delta.dtype == base_kernel.dtype
         ):
             return None
-        if torch.compiler.is_compiling():
-            return None
+        # Keep the same FP32-accumulating kernel under Dynamo and make_fx.
+        # Falling back only under torch.compile changes BF16 intermediate
+        # rounding in both the convolution and its parameter gradients.
         fused = _load_fused_grouped_conv()
         if fused is None:
             return None

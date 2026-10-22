@@ -23,7 +23,16 @@ host stream, which keeps the result deterministic.
 import torch
 import triton
 import triton.language as tl
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.autograd.function import once_differentiable
+from torch.library import wrap_triton
+
+
+def _traceable_kernel(kernel, tensor):
+    # Raw launches preserve eager performance; make_fx needs dispatcher-visible
+    # kernel writes so GraphTrainer can functionalize their dependencies.
+    return wrap_triton(kernel) if isinstance(tensor, FakeTensor) else kernel
+
 
 __all__ = ["dflash2_grouped_conv_fused", "supports_group_size"]
 
@@ -95,7 +104,7 @@ class _DFlash2GroupedConv(torch.autograd.Function):
             group_size, _FORWARD_BLOCK_H
         )
         grid = (triton.cdiv(num_rows, block_m), triton.cdiv(hidden_size, block_h))
-        _dflash2_grouped_conv_forward_kernel[grid](
+        _traceable_kernel(_dflash2_grouped_conv_forward_kernel, rows)[grid](
             rows,
             dynamic,
             base,
@@ -150,7 +159,7 @@ class _DFlash2GroupedConv(torch.autograd.Function):
         )
 
         grid = (num_row_tiles, triton.cdiv(hidden_size, block_h))
-        _dflash2_grouped_conv_backward_kernel[grid](
+        _traceable_kernel(_dflash2_grouped_conv_backward_kernel, rows)[grid](
             rows,
             dynamic,
             base,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Callable, List, Mapping, Optional, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
@@ -1517,32 +1518,33 @@ def build_disagg_online_producer(
     return workers, drive_producer
 
 
-def build_disagg_online_consumer(
+@dataclass
+class OnlineConsumerResources:
+    """Shared inbox, durable ledger and lifecycle for an online consumer."""
+
+    queue: Any
+    controller: Any
+    distributor: Any
+    async_ack: bool
+    on_success: Callable[[int], None]
+    on_failure: Callable[[BaseException], None]
+    close: Callable[[], None]
+
+    def start(self) -> None:
+        if self.distributor is not None:
+            self.distributor.start()
+
+
+def build_online_consumer_resources(
     *,
-    algorithm: AlgorithmRegistration,
-    modality: str = "text",
+    run_id: str,
     feature_store: FeatureStore,
     channel,
-    draft_model,
-    optimizer_factory,
-    run_id: str,
-    output_dir: str,
-    target_head=None,
     batch_size: int = 1,
     accumulation_steps: int = 1,
-    max_steps: Optional[int] = None,
-    total_steps: Optional[int] = None,
-    save_interval: int = 0,
-    eval_interval: int = 0,
-    eval_data_factory=None,
-    collate_fn=None,
     idle_timeout_s: Optional[float] = None,
     metadata_store: Optional[MetadataStore] = None,
     metadata_db_path: Optional[str] = None,
-    logger=None,
-    log_interval: int = 50,
-    strategy_kwargs: Optional[Mapping[str, Any]] = None,
-    max_checkpoints: int = 0,
     tp_size: int = 1,
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
@@ -1550,28 +1552,14 @@ def build_disagg_online_consumer(
     dp_size: Optional[int] = None,
     inbox_dir: Optional[str] = None,
     resume_from: Optional[str] = None,
-    dataloader_num_workers: int = 0,
-    profiling_options=None,
+    resume_step: Optional[int] = None,
     async_ack: Optional[bool] = None,
-):
-    """Consumer (trainer) side of an ONLINE disaggregated run.
+) -> OnlineConsumerResources:
+    """Prepare the existing consumer control plane without building a trainer.
 
-    Rank 0 always runs the :class:`RefDistributor`, including for ``dp_size=1``.
-    It is the only reader of ``channel`` and the only writer to the
-    ``metadata_store``/``metadata_db_path`` ledger, then dispatches refs into one
-    inbox per rank. Every rank consumes the same inbox-based path and durable
-    acknowledgements gather to rank 0 through :class:`DPAckController`.
-
-    ``resume_from`` is consumer-only. Rank 0 reconciles the retained SQLite
-    ledger, skips optimizer-durable refs, requeues the unacked tail, and requires
-    the durable marker to match the checkpoint step. The producer and original
-    data plane must still be available; this does not restart a producer.
-
-    ``async_ack`` (default: ``DISAGG_ASYNC_ACK``, on unless ``0``) runs each
-    optimizer boundary's durable ack on a background thread over a dedicated
-    Gloo group while the next step computes; see :class:`TrainerController`.
-    It is on only when every rank enables it; otherwise acks stay synchronous
-    on the default process group and no Gloo group is created.
+    Native engines pass their restored optimizer step explicitly. Legacy callers
+    retain the existing checkpoint reader when ``resume_step`` is omitted.
+    The caller owns start, success/failure signaling, and final close.
     """
     import torch.distributed as dist
 
@@ -1585,7 +1573,6 @@ def build_disagg_online_consumer(
     )
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
-    algorithm.providers.server_streaming_for(modality)
     distributed = dist.is_available() and dist.is_initialized()
     world = dist.get_world_size() if distributed else 1
     actual_rank = dist.get_rank() if distributed else 0
@@ -1694,7 +1681,11 @@ def build_disagg_online_consumer(
                 # every rank, rather than carrying a hidden leak into training.
                 drain_feature_store_removals(feature_store)
                 marker_step = reconciled["global_step"]
-                checkpoint_step = _checkpoint_global_step(resume_from)
+                checkpoint_step = (
+                    _checkpoint_global_step(resume_from)
+                    if resume_step is None
+                    else resume_step
+                )
                 if marker_step is not None and not reconciled["optimizer_durable"]:
                     raise RuntimeError(
                         f"durable marker at global_step={marker_step} is not marked "
@@ -1859,13 +1850,115 @@ def build_disagg_online_consumer(
                     )
                 logging.getLogger(__name__).error("%s", combined)
 
+    resources_closed = False
+
+    def close_resources() -> None:
+        nonlocal resources_closed
+        if resources_closed:
+            return
+        resources_closed = True
+        try:
+            stop_distributor_and_drain()
+        finally:
+            # Close only the ledger this factory opened, never caller-owned state.
+            if metadata_store is None and store is not None:
+                close = getattr(store, "close", None)
+                if close is not None:
+                    close()
+
+    return OnlineConsumerResources(
+        queue=queue,
+        controller=controller,
+        distributor=distributor,
+        async_ack=async_ack,
+        on_success=mark_consumer_done,
+        on_failure=mark_consumer_failed,
+        close=close_resources,
+    )
+
+
+def build_disagg_online_consumer(
+    *,
+    algorithm: AlgorithmRegistration,
+    modality: str = "text",
+    feature_store: FeatureStore,
+    channel,
+    draft_model,
+    optimizer_factory,
+    run_id: str,
+    output_dir: str,
+    target_head=None,
+    batch_size: int = 1,
+    accumulation_steps: int = 1,
+    max_steps: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    save_interval: int = 0,
+    eval_interval: int = 0,
+    eval_data_factory=None,
+    collate_fn=None,
+    idle_timeout_s: Optional[float] = None,
+    metadata_store: Optional[MetadataStore] = None,
+    metadata_db_path: Optional[str] = None,
+    logger=None,
+    log_interval: int = 50,
+    strategy_kwargs: Optional[Mapping[str, Any]] = None,
+    max_checkpoints: int = 0,
+    tp_size: int = 1,
+    sp_ulysses_size: int = 1,
+    sp_ring_size: int = 1,
+    dp_rank: Optional[int] = None,
+    dp_size: Optional[int] = None,
+    inbox_dir: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    dataloader_num_workers: int = 0,
+    profiling_options=None,
+    async_ack: Optional[bool] = None,
+):
+    """Consumer (trainer) side of an ONLINE disaggregated run.
+
+    Rank 0 always runs the :class:`RefDistributor`, including for ``dp_size=1``.
+    It is the only reader of ``channel`` and the only writer to the
+    ``metadata_store``/``metadata_db_path`` ledger, then dispatches refs into one
+    inbox per rank. Every rank consumes the same inbox-based path and durable
+    acknowledgements gather to rank 0 through :class:`DPAckController`.
+
+    ``resume_from`` is consumer-only. Rank 0 reconciles the retained SQLite
+    ledger, skips optimizer-durable refs, requeues the unacked tail, and requires
+    the durable marker to match the checkpoint step. The producer and original
+    data plane must still be available; this does not restart a producer.
+
+    ``async_ack`` (default: ``DISAGG_ASYNC_ACK``, on unless ``0``) runs each
+    optimizer boundary's durable ack on a background thread over a dedicated
+    Gloo group while the next step computes; see :class:`TrainerController`.
+    It is on only when every rank enables it; otherwise acks stay synchronous
+    on the default process group and no Gloo group is created.
+    """
+    algorithm.providers.server_streaming_for(modality)
+    resources = build_online_consumer_resources(
+        run_id=run_id,
+        feature_store=feature_store,
+        channel=channel,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        idle_timeout_s=idle_timeout_s,
+        metadata_store=metadata_store,
+        metadata_db_path=metadata_db_path,
+        tp_size=tp_size,
+        sp_ulysses_size=sp_ulysses_size,
+        sp_ring_size=sp_ring_size,
+        dp_rank=dp_rank,
+        dp_size=dp_size,
+        inbox_dir=inbox_dir,
+        resume_from=resume_from,
+        async_ack=async_ack,
+    )
     try:
         trainer = _assemble_trainer(
             algorithm=algorithm,
-            controller=controller,
+            controller=resources.controller,
             store=feature_store,
             ref_source={
-                "queue": queue,
+                "queue": resources.queue,
                 "prepositioned": resume_from is not None,
                 "defer_ack_until_durable": True,
             },
@@ -1898,22 +1991,21 @@ def build_disagg_online_consumer(
             resume_from=resume_from,
             dataloader_num_workers=dataloader_num_workers,
             profiling_options=profiling_options,
-            async_ack=async_ack,
-            on_fit_success=mark_consumer_done,
-            on_fit_failure=mark_consumer_failed,
-            on_fit_finally=stop_distributor_and_drain,
+            async_ack=resources.async_ack,
+            on_fit_success=resources.on_success,
+            on_fit_failure=resources.on_failure,
+            on_fit_finally=resources.close,
         )
         #: Rank 0's lifecycle-owned RefDistributor handle (None elsewhere), exposed
         #: for runtime observability. ``Trainer.fit()`` always stops it.
-        trainer.ref_distributor = distributor
-        if distributor is not None:
-            distributor.start()
+        trainer.ref_distributor = resources.distributor
+        resources.start()
         return trainer
     except BaseException as exc:
         # The canonical builder also owns failures before ``Trainer.fit`` can
         # take over, so a direct Python caller cannot strand its producer.
-        mark_consumer_failed(exc)
-        stop_distributor_and_drain()
+        resources.on_failure(exc)
+        resources.close()
         raise
 
 
