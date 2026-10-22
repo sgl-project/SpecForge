@@ -42,6 +42,12 @@ DraftStrategyName = Literal["eagle3", "dflash", "domino", "dspark", "peagle", "m
 TargetRepr = Literal["logits", "pruned_logits", "hidden_state"]
 
 
+def consumer_dispatch_quantum(policy: str, refs_per_optimizer_step: int) -> int:
+    """Refs needed to dispatch while the producer is open, before any ack."""
+    windows = 2 if policy in ("two_window_bucketed", "two_window_joint_balanced") else 1
+    return windows * refs_per_optimizer_step
+
+
 @dataclass(frozen=True)
 class PromptTask:
     """A unit of work handed to a rollout worker. Metadata only."""
@@ -205,4 +211,5 @@ __all__ = [
     "FeatureHandle",
     "TrainBatch",
     "assert_no_tensors",
+    "consumer_dispatch_quantum",
 ]
