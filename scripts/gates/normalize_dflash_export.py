@@ -27,6 +27,7 @@ _MOE_SERVED = {
     "qwen3_5_moe": {
         "dspark": "Qwen3MoeDSparkModel",
         "dflash": "DFlashMoEDraftModel",
+        "dflash2": "DFlash2MoEDraftModel",  # needs SGLang >= 0.5.19 (DFlash2 serving)
         "fields": ("num_experts", "num_experts_per_tok", "moe_intermediate_size"),
     },
 }

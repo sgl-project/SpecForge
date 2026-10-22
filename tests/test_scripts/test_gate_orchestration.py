@@ -230,8 +230,9 @@ class TestNormalizeDFlashExport(unittest.TestCase):
                 **moe,
             }
             path.write_text(json.dumps(dflash2), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "no SGLang model serves a dflash2"):
-                self.module.normalize_export(str(path), 8)
+            normalized = self.module.normalize_export(str(path), 8)
+            self.assertEqual(normalized["architectures"], ["DFlash2MoEDraftModel"])
+            self.assertEqual(normalized["dflash_config"]["block_size"], 8)
 
             unknown = {**dflash, "moe_preset": "deepseek_v4"}
             path.write_text(json.dumps(unknown), encoding="utf-8")

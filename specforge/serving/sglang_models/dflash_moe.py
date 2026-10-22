@@ -1,12 +1,14 @@
 # coding=utf-8
 """SGLang draft classes for DFlash-family drafters with the ``qwen3_5_moe`` FFN.
 
-``Qwen3MoeDSparkModel`` and ``DFlashMoEDraftModel`` are SGLang's
-``Qwen3DSparkModel`` / ``DFlashDraftModel`` with every decoder layer's dense
-MLP replaced by the modules SGLang's Qwen MoE targets run: a ``TopK`` router
-step, a ``FusedMoE`` holding the routed experts and a sigmoid-gated shared
-expert. Expert weights load through ``FusedMoE``'s own loader, so kernel
-layouts, quantisation and tensor-parallel sharding stay SGLang's business.
+``Qwen3MoeDSparkModel``, ``DFlashMoEDraftModel`` and ``DFlash2MoEDraftModel``
+are SGLang's ``Qwen3DSparkModel`` / ``DFlashDraftModel`` / ``DFlash2DraftModel``
+with every decoder layer's dense MLP replaced by the modules SGLang's Qwen MoE
+targets run: a ``TopK`` router step, a ``FusedMoE`` holding the routed experts
+and a sigmoid-gated shared expert. Expert weights load through ``FusedMoE``'s
+own loader, so kernel layouts, quantisation and tensor-parallel sharding stay
+SGLang's business. The DFlash2 class exists where SGLang serves DFlash2
+(0.5.19 and later); SGLang 0.5.18 serves the other two.
 
 The recipe comes from the export's ``config.json`` as SpecForge writes it:
 ``num_experts``, ``num_experts_per_tok``, ``moe_intermediate_size``,
@@ -26,7 +28,10 @@ import re
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
-from sglang.srt.distributed import moe_tensor_model_parallel_all_reduce
+from sglang.srt.distributed.communication_op import (
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -40,6 +45,11 @@ from sglang.srt.models.dflash import DFlashDecoderLayer, DFlashDraftModel
 from sglang.srt.models.dspark import Qwen3DSparkModel
 from sglang.srt.runtime_context import get_parallel
 from torch import nn
+
+try:  # SGLang >= 0.5.19 (DFlash2 serving)
+    from sglang.srt.models.dflash import DFlash2DraftModel
+except ImportError:  # pragma: no cover - SGLang 0.5.18
+    DFlash2DraftModel = None
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +122,9 @@ class QwenMoESparseBlock(nn.Module):
         self.norm_topk_prob = bool(_cfg(config, "norm_topk_prob", True))
         self.router_bias = bool(_cfg(config, "moe_router_bias", False))
         shared_size = int(_cfg(config, "shared_expert_intermediate_size", 0) or 0)
-        self.tp_size = int(get_parallel().moe_tp_size)
+        parallel = get_parallel()
+        self.tp_size = int(parallel.moe_tp_size)
+        self.ep_size = int(getattr(parallel, "moe_ep_size", 1))
 
         # The router runs in fp32 like the trainer; ReplicatedLinear for its loader.
         self.gate = ReplicatedLinear(
@@ -177,7 +189,9 @@ class QwenMoESparseBlock(nn.Module):
                 gate = torch.sigmoid(self.shared_expert_gate(x).float())
                 shared = gate.to(shared.dtype) * shared
             y = y + shared
-        # Experts and shared expert are TP-sharded without reduce_results; one all-reduce for their sum.
+        # Experts and shared expert are sharded without reduce_results; reduce their sum once, as Qwen3Moe does.
+        if self.ep_size > 1:
+            y = moe_expert_parallel_all_reduce(y)
         if self.tp_size > 1:
             y = moe_tensor_model_parallel_all_reduce(y)
         return y.view(shape)
@@ -254,8 +268,11 @@ class QwenMoESparseBlock(nn.Module):
 class QwenMoEDecoderLayer(DFlashDecoderLayer):
     """``DFlashDecoderLayer`` with the dense MLP replaced by :class:`QwenMoESparseBlock`."""
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
-        super().__init__(config, layer_id, quant_config)
+    def __init__(
+        self, config, layer_id: int, quant_config=None, **layer_kwargs
+    ) -> None:
+        # Newer SGLang also passes attention_conv / mlp_conv / prefix; hand this version's kwargs through.
+        super().__init__(config, layer_id, quant_config=quant_config, **layer_kwargs)
         # Drop the dense MLP the base layer built; the export has no weights for it.
         del self.mlp
         self.mlp = QwenMoESparseBlock(
@@ -309,3 +326,10 @@ class Qwen3MoeDSparkModel(_QwenMoEDraftMixin, Qwen3DSparkModel):
 SPARSE_BLOCKS = {"qwen3_5_moe": QwenMoESparseBlock}
 
 EntryClass = [DFlashMoEDraftModel, Qwen3MoeDSparkModel]
+
+if DFlash2DraftModel is not None:
+
+    class DFlash2MoEDraftModel(_QwenMoEDraftMixin, DFlash2DraftModel):
+        """DFlash2 draft with the ``qwen3_5_moe`` FFN; the convolutions and selector stay SGLang's."""
+
+    EntryClass.append(DFlash2MoEDraftModel)
