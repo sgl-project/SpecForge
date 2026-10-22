@@ -1553,7 +1553,7 @@ def build_disagg_online_consumer(
     dataloader_num_workers: int = 0,
     profiling_options=None,
     async_ack: Optional[bool] = None,
-    consumer_dispatch: str = "round_robin",
+    consumer_dispatch: str = "cost_balanced",
     dispatch_num_anchors: int = 512,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
