@@ -500,7 +500,7 @@ unless tuning throughput or memory pressure.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `runtime.producer_lease` | `8` | Prompts leased to a rollout worker at once. |
-| `runtime.consumer_dispatch` | `round_robin` | Online consumer distribution: `round_robin` or experimental `cost_balanced`. The latter balances padded anchor/context costs within each complete optimizer window. `two_window_bucketed` buckets across two windows; `two_window_joint_balanced` jointly balances two windows and falls back to single-window balancing unless the estimated total critical path improves. Both policies are independent of the training strategy, can change sample grouping, and require a high watermark of at least two global batches. All preserve per-rank batch counts, durable acknowledgements and tail handling. Server capture includes valid-anchor counts; older refs fall back to token length. |
+| `runtime.consumer_dispatch` | `round_robin` | Use `cost_balanced` within each optimizer window, or `two_window_bucketed` / `two_window_joint_balanced` across two windows. Two-window policies can change sample grouping and require `in_flight_high_watermark` to cover two global optimizer windows. |
 | `runtime.producer_concurrency` | `1` | Concurrent capture calls maintained by each server's logical producer. Increase to keep ingress full without duplicating producers. |
 | `runtime.in_flight_high_watermark` | `256` | Pause production at this many committed, unacknowledged refs. |
 | `runtime.in_flight_low_watermark` | `192` | Resume production at or below this count; it cannot exceed the high watermark. |
