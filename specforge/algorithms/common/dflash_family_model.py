@@ -594,6 +594,51 @@ class OnlineDFlashModel(nn.Module):
                     counts, f"dflash2/selector/greedy_{name}", values
                 )
 
+    def _attention_mask(
+        self,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        sequence_length: int,
+    ):
+        """Build training masks from the draft's layout and causal configuration."""
+        mask_builder = (
+            create_dflash_block_mask
+            if self.attention_backend == "flex_attention"
+            else create_dflash_sdpa_mask
+        )
+        mask_args = {
+            "anchor_positions": anchor_positions,
+            "block_keep_mask": block_keep_mask,
+            "S": sequence_length,
+            "block_size": self.block_size,
+            "device": anchor_positions.device,
+            "is_causal": getattr(
+                getattr(self.draft_model, "config", None), "is_causal", None
+            ),
+        }
+        if (
+            self.attention_backend == "flex_attention"
+            and flex_attention_backend() == "FLASH"
+        ):
+            # FLASH requires a minimum of this block size.
+            mask_args["BLOCK_SIZE"] = (256, 128)
+        sliding_window = self.draft_model.sliding_window
+        if sliding_window is None:
+            dflash_attn_mask = mask_builder(**mask_args)
+        else:
+            # Build only the masks the draft's layers consume; an all-sliding
+            # draft never reads the full mask. Drafts that do not expose their
+            # layer layout receive both.
+            layer_types = getattr(self.draft_model, "layer_types", None)
+            dflash_attn_mask = {}
+            if layer_types is None or "full_attention" in layer_types:
+                dflash_attn_mask["full_attention"] = mask_builder(**mask_args)
+            dflash_attn_mask["sliding_attention"] = mask_builder(
+                **mask_args,
+                sliding_window=sliding_window,
+            )
+        return dflash_attn_mask
+
     def _forward_draft_blocks(
         self,
         input_ids: torch.Tensor,
@@ -621,42 +666,9 @@ class OnlineDFlashModel(nn.Module):
         draft_position_ids = self._create_position_ids(anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
-        mask_builder = (
-            create_dflash_block_mask
-            if self.attention_backend == "flex_attention"
-            else create_dflash_sdpa_mask
+        dflash_attn_mask = self._attention_mask(
+            anchor_positions, block_keep_mask, seq_len
         )
-        mask_args = {
-            "anchor_positions": anchor_positions,
-            "block_keep_mask": block_keep_mask,
-            "S": seq_len,
-            "block_size": self.block_size,
-            "device": device,
-            "is_causal": getattr(
-                getattr(self.draft_model, "config", None), "is_causal", None
-            ),
-        }
-        if (
-            self.attention_backend == "flex_attention"
-            and flex_attention_backend() == "FLASH"
-        ):
-            # FLASH requires a minimum of this block size.
-            mask_args["BLOCK_SIZE"] = (256, 128)
-        sliding_window = self.draft_model.sliding_window
-        if sliding_window is None:
-            dflash_attn_mask = mask_builder(**mask_args)
-        else:
-            # Build only the masks the draft's layers consume; an all-sliding
-            # draft never reads the full mask. Drafts that do not expose their
-            # layer layout receive both.
-            layer_types = getattr(self.draft_model, "layer_types", None)
-            dflash_attn_mask = {}
-            if layer_types is None or "full_attention" in layer_types:
-                dflash_attn_mask["full_attention"] = mask_builder(**mask_args)
-            dflash_attn_mask["sliding_attention"] = mask_builder(
-                **mask_args,
-                sliding_window=sliding_window,
-            )
 
         draft_kwargs = {}
         if self.attention_backend == "flex_attention":

@@ -316,7 +316,7 @@ def preflight_draft_kernels(
         cfg.model.use_liger_kernel is False
         or (
             cfg.model.use_liger_kernel is None
-            and cfg.training.strategy in ("domino", "dspark")
+            and cfg.training.strategy in ("domino", "dspark", "dspine")
         )
         or not algorithm.spec.capabilities.supports_liger_kernel
     ):
