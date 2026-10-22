@@ -110,14 +110,15 @@ def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
             cache_dir=cfg.model.cache_dir,
         )
     draft_model.freeze_embedding()
-    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+    return draft_model.to(device=_device())
 
 
 def build_peagle_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.draft.peagle import PEagleDraftModel
 
-    draft_model = PEagleDraftModel(
+    draft_model = PEagleDraftModel._from_config(
         draft_config,
+        dtype=_torch_dtype(cfg),
         norm_before_residual=cfg.training.norm_before_residual,
     )
     if cfg.model.load_target_embedding:
@@ -133,7 +134,7 @@ def build_peagle_draft(cfg: Config, draft_config: PretrainedConfig):
         allow_missing_embedding=True,
     )
     _load_vocab_mapping(cfg, draft_model)
-    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+    return draft_model.to(device=_device())
 
 
 def peagle_resume_contract(
@@ -157,7 +158,7 @@ def _finish_registered_draft(
     draft_model: Any,
 ):
     _warm_start(cfg, draft_model, draft_config)
-    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+    return draft_model.to(device=_device())
 
 
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
@@ -273,7 +274,7 @@ def build_eagle3_model(
         lk_loss_type=cfg.training.lk_loss_type,
         kl_scale=cfg.training.kl_scale,
         kl_decay=cfg.training.kl_decay,
-    ).to(device=_device(), dtype=_torch_dtype(cfg))
+    ).to(device=_device())
     needs_target_head = cfg.mode == "offline" or (
         cfg.deployment.mode == "disaggregated" and cfg.training.role == "consumer"
     )
@@ -310,7 +311,7 @@ def build_peagle_model(
         num_depths=cfg.training.num_depths,
         down_sample_ratio=cfg.training.down_sample_ratio,
         down_sample_ratio_min=cfg.training.down_sample_ratio_min,
-    ).to(device=_device(), dtype=_torch_dtype(cfg))
+    ).to(device=_device())
     # Server capture transports the final target hidden state instead of full
     # vocabulary logits.  The consumer resolves that representation through the
     # same frozen target head used by offline EAGLE3; no target model is loaded
@@ -371,7 +372,7 @@ def _build_dflash_family_model(
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
         "objective_chunk_blocks": cfg.training.objective_chunk_blocks,
     }
-    model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
+    model = model_factory(common).to(device=_device())
     return AlgorithmModelParts(
         model=model,
         capture_layers=list(draft_model.target_layer_ids),
@@ -442,6 +443,10 @@ def build_dspark_model(
         tokenizer,
         lambda common: OnlineDSparkModel(
             **common,
+            dspark_objective=cfg.training.dspark_objective,
+            dspark_dpard_rho=cfg.training.dspark_dpard_rho,
+            loss_type=cfg.training.loss_type,
+            dpace_alpha=cfg.training.dpace_alpha,
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
             dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),

@@ -1,0 +1,127 @@
+# DeepSeek-V4-Flash-0731 / DSpark online training on one 8x H20 96GB node.
+# GPUs 0-3: one TP4 target capture server; GPUs 4-7: four trainer ranks.
+# This is a starting configuration, not a measured throughput recipe.
+# Finish regeneration and release GPUs 0-3 before launching this managed stack.
+# The supervisor starts its own patched SGLang and Mooncake processes.
+#
+# From the SpecForge root:
+#   specforge train -c examples/configs/online/disaggregated/managed-local/deepseek-v4-flash-dspark-h20-tp4-dp4.yaml --plan
+# Remove --plan only when ready to train. Use a new run_id/output/control/store
+# namespace for a fresh run; do not delete previous checkpoints to restart.
+
+model:
+  target_model_path: /disk3/models/DeepSeek-V4-Flash-0731
+  draft_model_config: configs/deepseek-v4-flash-dspark.json
+  target_backend: sglang
+  trust_remote_code: true
+  # Native DeepSeek checkpoint keys, not the Transformers model.* layout.
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_attention_backend: dsv4
+  # Official 0731 weights contain FP4 routed experts; do not force FP8 loading.
+  sglang_moe_runner_backend: flashinfer_mxfp4
+  sglang_mem_fraction_static: 0.85
+  sglang_disable_radix_cache: true
+  # A full capture sample must fit; context includes headroom beyond max_length.
+  sglang_context_length: 8704
+  sglang_max_prefill_tokens: 8704
+  sglang_max_running_requests: 1
+  sglang_disable_cuda_graph: true
+  sglang_page_size: 256
+  sglang_swa_full_tokens_ratio: 0.1
+  sglang_extra_args:
+    - --kv-cache-dtype
+    - fp8_e4m3
+
+data:
+  # Use completed, validated responses regenerated at temperature=0, including
+  # reasoning_content. The question-only input is not the training corpus.
+  # Online capture consumes these tokenized conversations; it does not regen
+  # answers, so generation temperature/reasoning-parser flags do not belong here.
+  train_data_path: /disk3/wjp/datasets/perfectblend/deepseek-v4-flash-0731/perfectblend_question_over_1k_regen_temp0.jsonl
+  # Longer conversations are truncated by preprocessing; check the retained
+  # assistant spans before raising max_length and the matching context limit.
+  max_length: 8192
+  # Preserve the latest assistant reasoning; historical reasoning follows
+  # the official encoder policy (dropped for ordinary multi-turn chat).
+  chat_template: deepseek-v4-thinking
+  # Separate cache from the previous non-thinking template.
+  cache_dir: cache/deepseek-v4-flash-0731-dspark-temp0-thinking-h20
+  build_dataset_num_proc: 16
+  dataloader_num_workers: 2
+
+training:
+  # DSpark uses the target's native mHC-aware capture hook. Do not substitute
+  # generic DFlash capture. The existing draft JSON selects layers 1/11/21/31/41.
+  strategy: dspark
+  # DPACE weights CE per sequence; L1/confidence retain token-pooled losses.
+  loss_type: dpace
+  dpace_alpha: 0.5
+  num_epochs: 1000
+  tp_size: 1
+  # Four ranks x batch_size 1 x accumulation 8 = global batch 32.
+  batch_size: 1
+  accumulation_steps: 1
+  learning_rate: 0.0006
+  lr_scheduler: constant
+  warmup_ratio: 0
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  # Conservative objective sizes for the initial H20 run; tune after profiling.
+  num_anchors: 128
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 32
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 128
+  # max_checkpoints is intentionally omitted: default 0 retains all checkpoints.
+  log_interval: 1
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: tensorboard
+
+runtime:
+  producer_lease: 1
+  producer_concurrency: 1
+  # Allow two complete 32-sample optimizer windows to be in flight.
+  in_flight_high_watermark: 64
+  in_flight_low_watermark: 32
+  resident_high_watermark_bytes: 34359738368
+  resident_low_watermark_bytes: 25769803776
+  feature_store_max_resident_bytes: 51539607552
+
+run_id: deepseek-v4-flash-0731-dspark-temp0-h20-tp4-dp4
+output_dir: outputs/deepseek-v4-flash-0731-dspark-temp0-h20-tp4-dp4
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/deepseek-v4-flash-0731-dspark-temp0-h20-tp4-dp4/control
+    consumer_state_dir: outputs/deepseek-v4-flash-0731-dspark-temp0-h20-tp4-dp4/consumer-state
+    store_id: deepseek-v4-flash-0731-dspark-temp0-h20-tp4-dp4
+    backend: mooncake
+    client_buffer_size: 1073741824
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200
+    managed_local:
+      trainer_cuda_visible_devices: ["4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        # Host-memory feature store; these sizes are not GPU KV-cache allocations.
+        global_segment_size_bytes: 68719476736
+        local_buffer_size_bytes: 1073741824
+        default_kv_lease_ttl_ms: 300000
+      capture_servers:
+        - port: 30010
+          cuda_visible_devices: ["0", "1", "2", "3"]
+          tp_size: 4
+          startup_timeout_s: 7200

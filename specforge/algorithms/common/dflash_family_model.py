@@ -2020,10 +2020,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
         dspark_ce_loss_alpha: float = 0.1,
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
         objective_chunk_blocks: int = 128,
+        dspark_objective: str = "ce_l1",
+        dspark_dpard_rho: float = 0.5,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -2035,7 +2039,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
             objective_chunk_blocks=objective_chunk_blocks,
-            loss_type="dflash",
+            loss_type=loss_type,
+            dpace_alpha=dpace_alpha,
         )
         if dspark_ce_loss_alpha < 0:
             raise ValueError("dspark_ce_loss_alpha must be >= 0")
@@ -2043,10 +2048,17 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError("dspark_l1_loss_alpha must be >= 0")
         if dspark_confidence_head_alpha < 0:
             raise ValueError("dspark_confidence_head_alpha must be >= 0")
-        self.loss_type = "dspark"
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        if dspark_objective not in ("ce_l1", "dpard"):
+            raise ValueError("dspark_objective must be 'ce_l1' or 'dpard'")
+        if not 0.0 <= dspark_dpard_rho <= 1.0:
+            raise ValueError("dspark_dpard_rho must be in [0, 1]")
+        if dspark_objective == "dpard" and loss_type != "dflash":
+            raise ValueError("D-PARD cannot be combined with DPaCE objectives")
+        self.dspark_objective = dspark_objective
+        self.dspark_dpard_rho = float(dspark_dpard_rho)
 
     def _build_dspark_labels_and_mask(
         self,
@@ -2127,6 +2139,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         block_index: Optional[torch.Tensor] = None,
         *,
         total_blocks: int = 0,
+        sequence_anchor_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive loss and telemetry numerators for one block slice."""
 
@@ -2140,12 +2153,33 @@ class OnlineDSparkModel(OnlineDFlashModel):
             hidden_states=hidden,
         )
         vocab_size = draft_logits.shape[-1]
+        # SGLang's dense DSpark path adds Markov bias in the native logits
+        # dtype. Promote only after that rounding boundary for probabilities
+        # and CE/DPACE; preserve FP64 when used for numerical diagnostics.
+        loss_logits = (
+            draft_logits.float()
+            if draft_logits.dtype in (torch.float16, torch.bfloat16)
+            else draft_logits
+        )
         cross_entropy = F.cross_entropy(
-            draft_logits.reshape(-1, vocab_size),
+            loss_logits.reshape(-1, vocab_size),
             target_ids.reshape(-1),
             reduction="none",
         ).reshape_as(target_ids)
-        ce_num = (cross_entropy * loss_weights).sum()
+        ce_weights = loss_weights
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            # DPACE credits use all predicted slots (DSpark has no anchor slot).
+            # Detach credits and normalize per sequence, as in DFlash DPACE.
+            # Exponential decay still applies to the auxiliary losses only.
+            with torch.no_grad():
+                credits = self._dpace_weight(
+                    torch.exp(-cross_entropy.detach()),
+                    eval_mask.float(),
+                    eval_mask,
+                    self.loss_type,
+                )
+                ce_weights = eval_mask * credits * sequence_anchor_scale
+        ce_num = (cross_entropy * ce_weights).sum()
 
         zero = ce_num.new_zeros(())
         l1_num = zero
@@ -2200,6 +2234,17 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
+
+        dpard_num = zero
+        if self.dspark_objective == "dpard":
+            from specforge.core.dpard import dpard_token_terms
+
+            if aligned_target_hidden is None:
+                raise ValueError("D-PARD requires target_last_hidden_states")
+            renyi, credit = dpard_token_terms(
+                draft_logits, target_logits, eval_mask, self.dspark_dpard_rho
+            )
+            dpard_num = (renyi * credit).sum()
 
         confidence_pred = self.draft_model.predict_confidence(
             hidden,
@@ -2276,6 +2321,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             tau_num,
             tau_den,
             walk_accepted,
+            dpard_num,
         )
 
     def _compute_dspark_loss(
@@ -2301,15 +2347,26 @@ class OnlineDSparkModel(OnlineDFlashModel):
         )
         loss_weights = self._dspark_loss_weight_mask(eval_mask)
         local_loss_den = loss_weights.sum()
-        need_target = self.dspark_l1_loss_alpha > 0 or (
-            self.dspark_confidence_head_alpha > 0
-            and getattr(self.draft_model, "confidence_head", None) is not None
+        sequence_anchor_scale = None
+        local_ce_den = local_loss_den
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            valid_anchors = eval_mask.any(dim=-1).sum(dim=-1)
+            sequence_anchor_scale = valid_anchors.clamp_min(1).float().reciprocal()
+            sequence_anchor_scale = sequence_anchor_scale[:, None, None]
+            local_ce_den = (valid_anchors > 0).float().sum()
+        need_target = (
+            self.dspark_objective == "dpard"
+            or self.dspark_l1_loss_alpha > 0
+            or (
+                self.dspark_confidence_head_alpha > 0
+                and getattr(self.draft_model, "confidence_head", None) is not None
+            )
         )
         aligned_target_hidden = None
         if need_target:
             if target_last_hidden_states is None:
                 raise ValueError(
-                    "DSpark L1/confidence loss requires target_last_hidden_states"
+                    "DSpark L1/confidence/D-PARD loss requires target_last_hidden_states"
                 )
             aligned_target_hidden = self._aligned_target_hidden(
                 target_last_hidden_states,
@@ -2317,7 +2374,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
             )
 
         totals = checkpointed_chunk_reduce(
-            partial(self._dspark_objective_chunk_terms, total_blocks=num_blocks),
+            partial(
+                self._dspark_objective_chunk_terms,
+                total_blocks=num_blocks,
+                sequence_anchor_scale=sequence_anchor_scale,
+            ),
             hidden_4d,
             prev_token_ids,
             target_ids,
@@ -2349,35 +2410,45 @@ class OnlineDSparkModel(OnlineDFlashModel):
             tau_num,
             tau_den,
             walk_accepted,
+            dpard_num,
         ) = totals
 
-        global_loss_den = local_loss_den.detach().clone()
+        global_den = torch.stack((local_ce_den, local_loss_den)).detach()
         world_size = 1
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
             world_size = dist.get_world_size()
             if world_size > 1:
-                dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
+                dist.all_reduce(global_den, op=dist.ReduceOp.SUM)
+        global_ce_den, global_loss_den = global_den.unbind()
         # Device-side assert: a host-side float() here drains the stream per
         # microbatch right after a collective, serializing all ranks.
         torch._assert_async(
             (global_loss_den > 0).any(),
             "DSpark objective has no supervised target tokens",
         )
-        loss = (
-            world_size
-            * (
-                self.dspark_ce_loss_alpha * ce_num
-                + self.dspark_l1_loss_alpha * l1_num
+        loss = world_size * (
+            self.dspark_ce_loss_alpha * ce_num / global_ce_den
+            + (
+                self.dspark_l1_loss_alpha * l1_num
                 + self.dspark_confidence_head_alpha * confidence_num
-            )
-            / global_loss_den
+            ) / global_loss_den
         )
+
+        if self.dspark_objective == "dpard":
+            # PR #973 normalizes by valid tokens, not credit mass or sequences.
+            global_dpard_den = eval_den.detach().clone()
+            if world_size > 1:
+                dist.all_reduce(global_dpard_den, op=dist.ReduceOp.SUM)
+            loss = world_size * (
+                dpard_num / global_dpard_den.clamp_min(1.0)
+                + self.dspark_confidence_head_alpha * confidence_num / global_loss_den
+            )
 
         ratio_metrics = {
             "acc": (correct_num, eval_den),
-            "ce_loss": (ce_num.detach(), local_loss_den.detach()),
+            "ce_loss": (ce_num.detach(), local_ce_den.detach()),
             "l1_loss": (l1_num.detach(), local_loss_den.detach()),
             "confidence_loss": (
                 confidence_num.detach(),
@@ -2390,6 +2461,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             "ce_position": (ce_position_num, position_den),
             "accuracy_position": (correct_position_num, position_den),
         }
+        if self.dspark_objective == "dpard":
+            ratio_metrics["dpard_loss"] = (dpard_num.detach(), eval_den)
         if aligned_target_hidden is not None:
             ratio_metrics.update(
                 {

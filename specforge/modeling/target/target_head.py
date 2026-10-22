@@ -12,6 +12,7 @@ from specforge.modeling.target.target_utils import (
     target_vocab_size,
 )
 from specforge.utils import get_local_device, padding
+from specforge.modeling.precision import NativeDtypeLinear, copy_parameter_preserving_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class TargetHead(nn.Module):
         self.hidden_size = target_hidden_size(self.config)
         self.vocab_size = target_vocab_size(self.config)
 
-        self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
+        self.fc = NativeDtypeLinear(self.hidden_size, self.vocab_size, bias=False)
 
     @classmethod
     def from_pretrained(
@@ -54,7 +55,7 @@ class TargetHead(nn.Module):
             cache_dir=cache_dir,
         )
         instance.freeze_weights()
-        instance = instance.eval().to(device=get_local_device(), dtype=dtype)
+        instance = instance.eval().to(device=get_local_device())
         return instance
 
     @torch.no_grad()
@@ -93,7 +94,6 @@ class TargetHead(nn.Module):
                     f"Shape mismatch for {key}. Expected {self.fc.weight.shape}, "
                     f"got {tensor.shape}"
                 )
-            tensors[key] = tensor.to(dtype=self.fc.weight.dtype)
 
         if tie_weights and len(tensors) > 1:
             tie_weights = torch.equal(tensors[embedding_key], tensors[lm_head_key])
@@ -107,14 +107,16 @@ class TargetHead(nn.Module):
         head_key = (
             embedding_key if tie_weights and embedding_key in tensors else lm_head_key
         )
-        self.fc.weight.copy_(tensors[head_key])
+        copy_parameter_preserving_dtype(self.fc.weight, tensors[head_key])
 
     def freeze_weights(self):
         for param in self.fc.parameters():
             param.requires_grad = False
 
     def forward(self, hidden_states):
-        return self.fc(hidden_states)
+        # Match SGLang's default logits path: native-weight projection first,
+        # then FP32 logits. This is not an FP32 GEMM with upcast weights.
+        return self.fc(hidden_states).float()
 
     def preprocess(self, input_ids, target, loss_mask):
         # Shift loss_mask with input_ids and final target states; auxiliary hidden

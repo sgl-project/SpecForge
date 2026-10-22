@@ -3,7 +3,7 @@
   "attention_bias": false,
   "attention_dropout": 0.0,
   "auto_map": {"AutoModel": "dspark.DSparkDraftModel"},
-  "block_size": 7,
+  "block_size": 15,
   "bos_token_id": 0,
   "dflash_config": {
     "attention_mode": "gqa",
@@ -49,5 +49,6 @@
   "tie_word_embeddings": false,
   "use_cache": true,
   "use_sliding_window": false,
-  "vocab_size": 129280
+  "vocab_size": 129280,
+  "is_causal": true
 }

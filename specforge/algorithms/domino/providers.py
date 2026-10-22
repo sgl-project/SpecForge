@@ -62,6 +62,7 @@ def step_options(config):
 def resume_contract(config, draft_model, training_model):
     """Persist resolved Domino model, sampling, and objective semantics."""
 
+
     return {
         "domino_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "domino_target_layer_ids": tuple(

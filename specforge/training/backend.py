@@ -286,14 +286,23 @@ class FSDPTrainingBackend(TrainingBackend):
                 fsdp_kwargs = dict(
                     use_orig_params=True,
                     mixed_precision=MixedPrecision(
-                        param_dtype=pc.param_dtype, buffer_dtype=torch.float32
+                        param_dtype=None, buffer_dtype=None, cast_root_forward_inputs=False
                     ),
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
                 )
                 if ignored_frozen_modules:
                     fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
-                if block_classes:
+                from specforge.modeling.precision import mixed_dtype_wrap_modules
+
+                dtype_boundaries = mixed_dtype_wrap_modules(model, ignored_frozen_modules)
+                if dtype_boundaries:
+                    from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+
+                    fsdp_kwargs["auto_wrap_policy"] = functools.partial(
+                        lambda_auto_wrap_policy, lambda_fn=lambda module: module in dtype_boundaries
+                    )
+                elif block_classes:
                     fsdp_kwargs.update(
                         auto_wrap_policy=functools.partial(
                             transformer_auto_wrap_policy,

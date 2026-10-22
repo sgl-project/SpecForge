@@ -1017,6 +1017,8 @@ class TrainingConfig(StrictConfigModel):
     dflash_teacher_metrics: bool = True
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
+    dspark_objective: Literal["ce_l1", "dpard"] = "ce_l1"
+    dspark_dpard_rho: float = Field(default=0.5, ge=0.0, le=1.0)
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
@@ -1172,6 +1174,15 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+
+        if self.training.dspark_objective == "dpard":
+            if self.training.strategy != "dspark":
+                raise ValueError("D-PARD requires training.strategy=dspark")
+            if (
+                self.training.loss_type != "dflash"
+                or self.training.lk_loss_type is not None
+            ):
+                raise ValueError("D-PARD cannot be combined with DPaCE or LK objectives")
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

@@ -28,10 +28,11 @@ from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
 
 from specforge.modeling._mask_utils import prepare_decoder_attention_mask
+from specforge.modeling.precision import CheckpointDtypeMixin, copy_parameter_preserving_dtype
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
 
-class Eagle3DraftModel(PreTrainedModel, ABC):
+class Eagle3DraftModel(CheckpointDtypeMixin, PreTrainedModel, ABC):
     """
     This is the base class for the Eagle3 draft model implementation. The child class needs to implement
     the abstract methods to support training with TTT.
@@ -133,7 +134,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
             keys=[embedding_key],
             cache_dir=cache_dir,
         )
-        self.embed_tokens.weight.copy_(tensors[embedding_key])
+        copy_parameter_preserving_dtype(self.embed_tokens.weight, tensors[embedding_key])
 
     def load_vocab_mapping(self, file_path: str) -> None:
         """

@@ -88,6 +88,9 @@ def target_hidden_size(config) -> int:
     return int(text_config.hidden_size)
 
 
+from specforge.modeling.precision import NativeDtypeLinear, copy_parameter_preserving_dtype
+
+
 class TargetEmbeddingsAndHead(nn.Module):
     """
     Efficiently loads only the embedding layer and lm_head from a pretrained model.
@@ -105,7 +108,7 @@ class TargetEmbeddingsAndHead(nn.Module):
             hidden_size,
             padding_idx=getattr(text_config, "pad_token_id", None),
         )
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.lm_head = NativeDtypeLinear(hidden_size, vocab_size, bias=False)
 
     @classmethod
     def from_pretrained(
@@ -160,7 +163,7 @@ class TargetEmbeddingsAndHead(nn.Module):
             instance.lm_head_mup_folded = float(mup_multiplier)
 
         # 4. Move to Device & Freeze
-        instance.to(device=device, dtype=dtype)
+        instance.to(device=device)
         instance.eval()
         instance.requires_grad_(False)
 
@@ -200,7 +203,6 @@ class TargetEmbeddingsAndHead(nn.Module):
                     f"Shape mismatch for {key}. Expected {self.embed_tokens.weight.shape}, "
                     f"got {tensor.shape}"
                 )
-            tensors[key] = tensor.to(dtype=self.embed_tokens.weight.dtype)
 
         if tie_weights and len(tensors) > 1:
             tie_weights = torch.equal(tensors[embed_key], tensors[lm_head_key])
@@ -218,11 +220,11 @@ class TargetEmbeddingsAndHead(nn.Module):
                 self.lm_head.weight.clone(),
                 requires_grad=self.lm_head.weight.requires_grad,
             )
-        self.embed_tokens.weight.copy_(embedding)
+        copy_parameter_preserving_dtype(self.embed_tokens.weight, embedding)
         if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
         else:
-            self.lm_head.weight.copy_(lm_head)
+            copy_parameter_preserving_dtype(self.lm_head.weight, lm_head)
 
         return set(tensors)
 
