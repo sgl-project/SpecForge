@@ -85,6 +85,48 @@ specforge train \
 Unknown config fields and unknown override paths are errors. This keeps a
 misspelled or retired option from being silently ignored.
 
+## Hybrid Muon optimizer
+
+Set `training.optimizer: muon` to train the draft's decoder-layer matrices
+with Muon. Every 2-D `nn.Linear` weight inside `layers.<i>.` (DFlash, DFlash 2,
+Domino, DSpark, P-EAGLE, MTP) or `midlayer.` (EAGLE3) is on Muon: attention
+q/k/v/o, MLP gate/up/down, and DFlash 2's per-layer convolution kernel
+projections. Everything else stays on AdamW at
+`training.learning_rate`, including `fc`, embedding projections, norms,
+biases, and the selector, Markov, confidence, and LM heads. AdamW remains the
+default, so existing recipes are unchanged.
+
+```yaml
+training:
+  optimizer: muon
+  learning_rate: 1.0e-3       # AdamW group
+  muon_learning_rate: 3.0e-2  # required; original Muon scale
+  max_grad_norm: 1.0
+```
+
+The default `muon_adjust_lr_fn: original` is `torch.optim.Muon`'s update
+(`lr * sqrt(max(1, rows / cols))`), so `muon_learning_rate` is on Muon's own
+scale, not AdamW's. In a one-epoch Qwen3.8-27B Domino ablation with AdamW at
+`1e-3`, Muon rates from `0.015` to `0.06` gave the same gain and `0.0075` gave
+less. `match_rms_adamw` (`lr * 0.2 * sqrt(max(rows, cols))`) puts the Muon rate
+on AdamW's scale instead.
+
+Both groups share the global gradient clip and one learning-rate schedule
+(warmup and decay multiply both peak rates). Tracking reports `lr_adamw` and
+`lr_muon` next to the primary `lr`, which stays the AdamW rate. At startup,
+rank 0 logs every tensor's group and logical shape.
+
+Under FSDP the FP32 masters and momentum stay sharded. Each Muon matrix has
+one owner rank, chosen once to balance the Newton–Schulz work. Per update, one
+`all_to_all` sends the BF16 momentum slices to the owners and a second returns
+the orthogonalized slices, so each matrix is orthogonalized once per update
+and every rank applies the same values as an unsharded run. Optimizer CPU
+offload is not supported in Muon mode.
+
+Muon checkpoints record each tensor's group and logical shape and the Muon
+hyperparameters; a resume that changes any of them, or switches between AdamW
+and Muon, is rejected. AdamW checkpoints keep their existing layout.
+
 ## Run config
 
 A run config has seven typed sections (`model`, `data`, `training`, `tracking`,

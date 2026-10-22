@@ -1005,6 +1005,11 @@ class TrainerController:
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
+                    # Muon runs: lr_adamw / lr_muon (empty for AdamW).
+                    rates_by_group = getattr(optimizer, "learning_rates_by_group", None)
+                    if callable(rates_by_group):
+                        for group_name, rate in rates_by_group().items():
+                            log_metrics[f"lr_{group_name}"] = float(rate)
                     perf_elapsed_s = max(
                         time.perf_counter() - perf_window_started,
                         1e-12,

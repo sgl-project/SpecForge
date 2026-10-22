@@ -235,6 +235,13 @@ class FSDPTrainingBackend(TrainingBackend):
 
         Replicated ``NO_SHARD`` recipes use DDP; sharded recipes use FSDP.
         """
+        # Muon needs each matrix's logical shape: capture it before FSDP turns
+        # the parameters into flat local shards (a no-op for AdamW factories).
+        capture_layout = getattr(
+            self._optimizer_factory, "capture_parameter_layout", None
+        )
+        if callable(capture_layout):
+            capture_layout(optimizer_target if optimizer_target is not None else model)
         if not wrap:
             self.module = model
             self._wrapped = False
