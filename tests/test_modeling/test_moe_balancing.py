@@ -44,7 +44,7 @@ from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 E, K, B, S, H, V = 8, 2, 2, 6, 16, 32
 
 
-def _moe(coef=0.5, selection_bias=False):
+def _moe(coef=0.5, selection_bias=False, **dflash_config):
     config = Qwen3_5MoeTextConfig(
         num_experts=E,
         num_experts_per_tok=K,
@@ -52,7 +52,7 @@ def _moe(coef=0.5, selection_bias=False):
         moe_intermediate_size=8,
         shared_expert_intermediate_size=8,
         router_aux_loss_coef=coef,
-        dflash_config={"moe_router_selection_bias": selection_bias},
+        dflash_config={"moe_router_selection_bias": selection_bias, **dflash_config},
     )
     return build_moe(config)
 
@@ -66,6 +66,18 @@ def _router(top_k=1):
         initializer_range=0.5,
         selection_bias=True,
         bias_update_rate=0.001,
+    )
+
+
+def _batch_wise_router(top_k=K, selection_bias=False):
+    return TopKRouter(
+        E,
+        H,
+        top_k,
+        norm_topk_prob=False,
+        initializer_range=0.5,
+        selection_bias=selection_bias,
+        aux_loss_type="batch_wise",
     )
 
 
@@ -409,6 +421,71 @@ class SelectionBiasTest(unittest.TestCase):
         gate = _moe(selection_bias=True).gate
         self.assertIsNotNone(gate.selection_bias)
         self.assertEqual(gate.bias_update_rate, 0.001)
+
+
+class BatchWiseLossTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        self.x = torch.randn(B * S, H)
+        self.mask = _real_token_mask().reshape(-1)
+
+    def test_the_first_micro_batch_matches_the_micro_batch_wise_loss(self):
+        router = _batch_wise_router()
+        scores, indices, _ = router(self.x, self.mask)
+        torch.testing.assert_close(router.aux_loss, _loss(scores, indices, self.mask))
+
+    def test_later_micro_batches_balance_the_step_so_far(self):
+        router = _batch_wise_router()
+        _, first, _ = router(self.x, self.mask)
+        scores, second, _ = router(torch.randn(B * S, H))
+        counts = count_tokens_per_expert(second, None, E)
+        pooled = count_tokens_per_expert(first, self.mask, E) + counts
+        load = pooled * (counts.sum() / pooled.sum())
+        torch.testing.assert_close(router.aux_loss, load_balance_loss(scores, load))
+        # The loss reaches the gate weight through this micro-batch's scores.
+        (grad,) = torch.autograd.grad(router.aux_loss, router.weight)
+        self.assertTrue(torch.any(grad != 0))
+
+    def test_the_load_pools_the_counts_of_every_rank(self):
+        router = _batch_wise_router()
+        other = torch.tensor([9.0, 0, 0, 0, 0, 0, 0, 3.0])  # another rank's counts
+        with mock.patch.object(dist, "is_initialized", return_value=True):
+            with mock.patch.object(dist, "all_reduce", lambda t: t.add_(other)):
+                scores, indices, _ = router(self.x)
+        counts = count_tokens_per_expert(indices, None, E)
+        load = (counts + other) * (counts.sum() / (counts + other).sum())
+        torch.testing.assert_close(router.aux_loss, load_balance_loss(scores, load))
+        # The buffer stays rank-local: the bias update pools it once per step.
+        torch.testing.assert_close(router.tokens_per_expert, counts)
+
+    def test_the_step_boundary_starts_a_new_window_without_a_bias(self):
+        router = _batch_wise_router()
+        self.assertIsNone(router.selection_bias)
+        router(self.x)
+        self.assertTrue(torch.any(router.tokens_per_expert != 0))
+        step_moe_balancing(router)
+        self.assertTrue(torch.all(router.tokens_per_expert == 0))
+
+    def test_with_a_bias_the_same_counts_serve_both(self):
+        router = _batch_wise_router(selection_bias=True)
+        _, indices, _ = router(self.x)
+        counts = count_tokens_per_expert(indices, None, E)
+        step_moe_balancing(router)
+        torch.testing.assert_close(router.selection_bias, _zero_mean_sign_step(counts))
+        self.assertTrue(torch.all(router.tokens_per_expert == 0))
+
+    def test_unknown_types_are_refused(self):
+        with self.assertRaises(ValueError):
+            TopKRouter(
+                E, H, K, norm_topk_prob=False, initializer_range=0.5, aux_loss_type="x"
+            )
+
+    def test_family_reads_the_aux_loss_type(self):
+        self.assertEqual(_moe().gate.aux_loss_type, "microbatch_wise")
+        self.assertIsNone(_moe().gate.tokens_per_expert)
+        gate = _moe(moe_router_aux_loss_type="batch_wise").gate
+        self.assertEqual(gate.aux_loss_type, "batch_wise")
+        self.assertIsNotNone(gate.tokens_per_expert)
 
 
 class _RecordingBackend(TrainingBackend):

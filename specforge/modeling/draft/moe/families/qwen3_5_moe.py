@@ -27,6 +27,10 @@ def build_moe(config: PretrainedConfig) -> MoELayer:
             norm_topk_prob=getattr(config, "norm_topk_prob", True),
             initializer_range=std,
             aux_loss_coef=getattr(config, "router_aux_loss_coef", 0.0),
+            # torchtitan's aux_loss_type: microbatch_wise (default) or batch_wise.
+            aux_loss_type=dflash_config.get(
+                "moe_router_aux_loss_type", "microbatch_wise"
+            ),
             # DeepSeek-style aux-loss-free balancing, moved once per optimizer step.
             selection_bias=bool(dflash_config.get("moe_router_selection_bias", False)),
             bias_update_rate=dflash_config.get("moe_router_bias_update_rate", 0.001),

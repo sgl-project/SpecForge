@@ -4,6 +4,7 @@
 from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -55,6 +56,7 @@ class TopKRouter(nn.Module):
         selection_bias: bool = False,
         route_scale: float = 1.0,
         aux_loss_coef: float = 0.0,
+        aux_loss_type: str = "microbatch_wise",
         bias_update_rate: float = 0.001,
     ) -> None:
         super().__init__()
@@ -62,6 +64,8 @@ class TopKRouter(nn.Module):
             raise ValueError(
                 f"top_k={top_k} must be between 1 and num_experts={num_experts}"
             )
+        if aux_loss_type not in ("microbatch_wise", "batch_wise"):
+            raise ValueError(f"unknown aux_loss_type {aux_loss_type!r}")
         self.num_experts = num_experts
         self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
         self.top_k = top_k
@@ -72,14 +76,16 @@ class TopKRouter(nn.Module):
             "selection_bias",
             torch.zeros(num_experts, dtype=torch.float32) if selection_bias else None,
         )
-        # The optimizer step's kept-slot counts behind the bias update; not saved.
+        # The step's kept-slot counts: bias update and batch-wise loss; not saved.
+        track_counts = selection_bias or aux_loss_type == "batch_wise"
         self.register_buffer(
             "tokens_per_expert",
-            torch.zeros(num_experts, dtype=torch.float32) if selection_bias else None,
+            torch.zeros(num_experts, dtype=torch.float32) if track_counts else None,
             persistent=False,
         )
         self.route_scale = route_scale
         self.aux_loss_coef = aux_loss_coef
+        self.aux_loss_type = aux_loss_type
         self.bias_update_rate = bias_update_rate
         # This micro-batch's load-balance (aux) loss, kept in training for the trainer.
         self.aux_loss: Optional[torch.Tensor] = None
@@ -117,11 +123,21 @@ class TopKRouter(nn.Module):
             weights = weights / weights.sum(dim=-1, keepdim=True)
         if self.training:
             counts = count_tokens_per_expert(indices, mask, self.num_experts)
-            # Always kept in training: with coefficient 0 it is the balance metric.
-            self.aux_loss = load_balance_loss(scores, counts, mask)
             if self.tokens_per_expert is not None:
                 self.tokens_per_expert += counts
+            # Always kept in training: with coefficient 0 it is the balance metric.
+            self.aux_loss = load_balance_loss(scores, self._aux_loss_load(counts), mask)
         return scores, indices, weights * self.route_scale
+
+    def _aux_loss_load(self, counts: torch.Tensor) -> torch.Tensor:
+        """The load the aux loss balances: this micro-batch's counts, or the step's."""
+        if self.aux_loss_type != "batch_wise":
+            return counts
+        # Batch-wise: the step's pooled counts so far, scaled to this batch's slots.
+        load = self.tokens_per_expert.clone()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(load)
+        return load * (counts.sum() / load.sum().clamp(min=1))
 
     @torch.no_grad()
     def update_expert_bias(self, tokens_per_expert: torch.Tensor) -> None:

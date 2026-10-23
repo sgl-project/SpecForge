@@ -98,8 +98,9 @@ def take_moe_aux_loss(
 
 def update_moe_expert_bias(model: nn.Module) -> None:
     """Pool the routers' kept-slot counts over ranks once, then move every bias."""
-    routers = [m for m in model.modules() if isinstance(m, TopKRouter)]
-    routers = [router for router in routers if router.selection_bias is not None]
+    routers = [
+        router for router in _routers(model) if router.selection_bias is not None
+    ]
     if not routers:
         return
     # One collective for every layer; all ranks ran the same forwards, so it lines up.
@@ -113,6 +114,14 @@ def update_moe_expert_bias(model: nn.Module) -> None:
 def step_moe_balancing(model: nn.Module) -> None:
     """Optimizer step boundary: every per-step balancing update, in one place."""
     update_moe_expert_bias(model)
+    # The batch-wise loss without a bias: start the next step's count window.
+    for router in _routers(model):
+        if router.tokens_per_expert is not None:
+            router.tokens_per_expert.zero_()
+
+
+def _routers(model: nn.Module) -> List[TopKRouter]:
+    return [module for module in model.modules() if isinstance(module, TopKRouter)]
 
 
 def _moe_layers(model: nn.Module) -> List[MoELayer]:
