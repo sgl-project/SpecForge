@@ -17,6 +17,7 @@ def build_moe(config: PretrainedConfig) -> MoELayer:
         )
     hidden_size, std = config.hidden_size, config.initializer_range
     shared_size = getattr(config, "shared_expert_intermediate_size", 0)
+    dflash_config = getattr(config, "dflash_config", None) or {}
     return MoELayer(
         gate=TopKRouter(
             config.num_experts,
@@ -26,6 +27,9 @@ def build_moe(config: PretrainedConfig) -> MoELayer:
             norm_topk_prob=getattr(config, "norm_topk_prob", True),
             initializer_range=std,
             aux_loss_coef=getattr(config, "router_aux_loss_coef", 0.0),
+            # DeepSeek-style aux-loss-free balancing, moved once per optimizer step.
+            selection_bias=bool(dflash_config.get("moe_router_selection_bias", False)),
+            bias_update_rate=dflash_config.get("moe_router_bias_update_rate", 0.001),
         ),
         experts=RoutedExperts(
             config.num_experts,

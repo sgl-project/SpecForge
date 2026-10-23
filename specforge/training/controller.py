@@ -476,6 +476,7 @@ class TrainerCore:
         if stepped:
             self._ratio_totals = {}
             self._sum_totals = {}
+            self.strategy.on_optimizer_step()
         return result
 
     def _accumulate_ratio_metrics(self, values: Dict[str, Any]) -> None:

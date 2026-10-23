@@ -18,7 +18,11 @@ from specforge.modeling.draft.dflash_mask import (
     create_dflash_sdpa_mask,
 )
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
-from specforge.modeling.draft.moe.layer import set_moe_token_mask, take_moe_aux_loss
+from specforge.modeling.draft.moe.layer import (
+    set_moe_token_mask,
+    step_moe_balancing,
+    take_moe_aux_loss,
+)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask
@@ -700,6 +704,10 @@ class OnlineDFlashModel(nn.Module):
         weighted_aux, raw_aux = terms
         ratio_metrics["moe/aux_loss"] = (raw_aux.detach(), torch.ones_like(raw_aux))
         return weighted_aux
+
+    def on_optimizer_step(self) -> None:
+        """The trainer's per-step hook: move the draft's MoE balancing state once."""
+        step_moe_balancing(self.draft_model)
 
     def _selector_chunk_terms(
         self,

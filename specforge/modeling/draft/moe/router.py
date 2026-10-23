@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Top-k routers for draft MoE layers, with the load-balance loss they own."""
+"""Top-k routers for draft MoE layers, with the load-balancing pieces they own."""
 
 from typing import Callable, Optional
 
@@ -55,6 +55,7 @@ class TopKRouter(nn.Module):
         selection_bias: bool = False,
         route_scale: float = 1.0,
         aux_loss_coef: float = 0.0,
+        bias_update_rate: float = 0.001,
     ) -> None:
         super().__init__()
         if not 1 <= top_k <= num_experts:
@@ -66,19 +67,41 @@ class TopKRouter(nn.Module):
         self.top_k = top_k
         self.norm_topk_prob = norm_topk_prob
         self.score_fn = score_fn
-        # Slot for DeepSeek-V4's selection bias: shifts top-k picks, not weights.
+        # DeepSeek's selection bias: shifts the top-k picks, not the weights; fp32.
         self.register_buffer(
-            "selection_bias", torch.zeros(num_experts) if selection_bias else None
+            "selection_bias",
+            torch.zeros(num_experts, dtype=torch.float32) if selection_bias else None,
+        )
+        # The optimizer step's kept-slot counts behind the bias update; not saved.
+        self.register_buffer(
+            "tokens_per_expert",
+            torch.zeros(num_experts, dtype=torch.float32) if selection_bias else None,
+            persistent=False,
         )
         self.route_scale = route_scale
         self.aux_loss_coef = aux_loss_coef
+        self.bias_update_rate = bias_update_rate
         # This micro-batch's load-balance (aux) loss, kept in training for the trainer.
         self.aux_loss: Optional[torch.Tensor] = None
         self.reset_parameters(initializer_range)
 
+    def _apply(self, fn, recurse=True):
+        # Keep both buffers fp32, values included, through casts like .to(bfloat16).
+        names = ("selection_bias", "tokens_per_expert")
+        kept = {name: getattr(self, name) for name in names}
+        super()._apply(fn, recurse)
+        for name, old in kept.items():
+            if old is not None:
+                new = getattr(self, name)
+                setattr(self, name, new.float() if old.is_meta else old.to(new.device))
+        return self
+
     def reset_parameters(self, std: float) -> None:
-        # HF's default _init_weights skips bare Parameters.
+        # HF's default _init_weights skips bare Parameters and buffers.
         nn.init.normal_(self.weight, std=std)
+        for buffer in (self.selection_bias, self.tokens_per_expert):
+            if buffer is not None:
+                nn.init.zeros_(buffer)
 
     def forward(
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -96,4 +119,15 @@ class TopKRouter(nn.Module):
             counts = count_tokens_per_expert(indices, mask, self.num_experts)
             # Always kept in training: with coefficient 0 it is the balance metric.
             self.aux_loss = load_balance_loss(scores, counts, mask)
+            if self.tokens_per_expert is not None:
+                self.tokens_per_expert += counts
         return scores, indices, weights * self.route_scale
+
+    @torch.no_grad()
+    def update_expert_bias(self, tokens_per_expert: torch.Tensor) -> None:
+        """One DeepSeek-V3 aux-loss-free step from the pooled kept-slot counts."""
+        gap = tokens_per_expert.mean() - tokens_per_expert
+        delta = self.bias_update_rate * torch.sign(gap)
+        # Zero-mean delta: the same top-k picks, and the bias never drifts.
+        self.selection_bias += delta - delta.mean()
+        self.tokens_per_expert.zero_()

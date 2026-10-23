@@ -4,6 +4,7 @@
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -93,6 +94,25 @@ def take_moe_aux_loss(
     aux = torch.stack([coef * loss for coef, loss in terms]).mean()
     raw = torch.stack([loss for _, loss in terms]).mean()
     return aux, raw
+
+
+def update_moe_expert_bias(model: nn.Module) -> None:
+    """Pool the routers' kept-slot counts over ranks once, then move every bias."""
+    routers = [m for m in model.modules() if isinstance(m, TopKRouter)]
+    routers = [router for router in routers if router.selection_bias is not None]
+    if not routers:
+        return
+    # One collective for every layer; all ranks ran the same forwards, so it lines up.
+    counts = torch.stack([router.tokens_per_expert for router in routers])
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(counts)
+    for router, pooled in zip(routers, counts):
+        router.update_expert_bias(pooled)
+
+
+def step_moe_balancing(model: nn.Module) -> None:
+    """Optimizer step boundary: every per-step balancing update, in one place."""
+    update_moe_expert_bias(model)
 
 
 def _moe_layers(model: nn.Module) -> List[MoELayer]:
