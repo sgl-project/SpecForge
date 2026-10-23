@@ -115,9 +115,12 @@ class FusedHeadGateTest(unittest.TestCase):
             (plain, False, True, "eager"),
             (plain, True, True, "fused"),
         ):
-            with self.subTest(requested=requested, expected=expected), mock.patch.dict(
-                "sys.modules",
-                {"triton": object() if triton else None},
+            with (
+                self.subTest(requested=requested, expected=expected),
+                mock.patch.dict(
+                    "sys.modules",
+                    {"triton": object() if triton else None},
+                ),
             ):
                 wrapper.fused_logits_loss = requested
                 self.assertEqual(wrapper._logits_loss_backend(probe), expected)
