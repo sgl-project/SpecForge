@@ -148,10 +148,19 @@ class TestDisaggDataEquivalence(unittest.TestCase):
 @unittest.skipUnless(CUDA, "disagg launcher FSDP path requires CUDA")
 class TestDisaggLaunchFSDP(unittest.TestCase):
     def test_build_disagg_runtime_trains_through_fsdp(self):
+        self._check_backend("fsdp")
+
+    def test_fsdp2_trains_through_the_same_launcher(self):
+        self._check_backend("fsdp2")
+
+    def _check_backend(self, training_backend):
         torch.manual_seed(0)
         fx.build_single_rank_distributed(port="29577")
 
+        from torch.distributed.fsdp import FSDPModule
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        expected_wrapper = FSDPModule if training_backend == "fsdp2" else FSDP
 
         from specforge.launch import build_disagg_offline_runtime
         from specforge.optimizer import BF16Optimizer
@@ -188,6 +197,7 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
             draft_model=eagle3_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
+            training_backend=training_backend,
             run_id="e2e",
             output_dir=os.path.join(work, "out"),
             max_len=512,
@@ -199,7 +209,7 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
 
         module = trainer.core.strategy.trainable_module()
         self.assertIsInstance(
-            module, FSDP, "strategy must hold the FSDP-wrapped module"
+            module, expected_wrapper, "strategy must hold the FSDP-wrapped module"
         )
 
         step = trainer.fit()
