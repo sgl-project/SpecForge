@@ -1,7 +1,6 @@
 # coding=utf-8
 """Tests for the fused Triton DFlash2 unary head."""
 
-import os
 import unittest
 from unittest import mock
 
@@ -11,6 +10,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash2 import DFlash2DraftModel
 
 try:
@@ -51,30 +51,29 @@ def _draft_config(vocab_size=512, block_size=4, **dflash_overrides):
     return config
 
 
-def _online_model(device, dtype, *, env="1", **kwargs):
+def _online_model(device, dtype, *, plain=False, draft_overrides=None, **kwargs):
     torch.manual_seed(11)
-    config = _draft_config()
-    draft = DFlash2DraftModel(config)
-    with torch.no_grad():
-        # A fresh selector is a unary no-op; give it a transition to train.
-        draft.candidate_selector.successor_codebook.normal_(std=0.2)
+    config = _draft_config(**(draft_overrides or {}))
+    draft = DFlashDraftModel(config) if plain else DFlash2DraftModel(config)
+    if not plain:
+        with torch.no_grad():
+            draft.candidate_selector.successor_codebook.normal_(std=0.2)
     head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
     embed = nn.Embedding(config.vocab_size, config.hidden_size)
     with torch.no_grad():
         head.weight.normal_(std=0.3)
     head.requires_grad_(False)
     embed.requires_grad_(False)
-    with mock.patch.dict(os.environ, {"SPECFORGE_DFLASH_FUSED_HEAD": env}):
-        model = OnlineDFlashModel(
-            draft_model=draft,
-            target_lm_head=head,
-            target_embed_tokens=embed,
-            mask_token_id=config.vocab_size - 1,
-            block_size=4,
-            attention_backend="sdpa",
-            num_anchors=12,
-            **kwargs,
-        )
+    model = OnlineDFlashModel(
+        draft_model=draft,
+        target_lm_head=head,
+        target_embed_tokens=embed,
+        mask_token_id=config.vocab_size - 1,
+        block_size=4,
+        attention_backend="sdpa",
+        num_anchors=12,
+        **kwargs,
+    )
     return model.to(device=device, dtype=dtype)
 
 
@@ -88,7 +87,7 @@ class FusedHeadGateTest(unittest.TestCase):
         self.assertEqual(actual.dtype, torch.float32)
         self.assertTrue(torch.equal(actual, logits.float()))
 
-    def test_non_identity_transform_disables_the_fast_path(self):
+    def test_non_identity_transform_requires_logit_transformation(self):
         for overrides in (
             {"output_multiplier": 0.5},
             {"final_logit_softcapping": 30.0},
@@ -97,14 +96,44 @@ class FusedHeadGateTest(unittest.TestCase):
                 model = DFlash2DraftModel(_draft_config(**overrides))
                 self.assertFalse(model.unary_logits_transform_is_identity())
 
-    def test_cpu_and_env_off_models_use_the_reference_head(self):
-        model = _online_model("cpu", torch.bfloat16)
-        hidden = torch.zeros(1, 1, 4, 64, dtype=torch.bfloat16)
-        self.assertFalse(model._use_fused_unary_head(hidden))
+    def test_backend_defaults_configuration_and_capabilities(self):
+        from types import SimpleNamespace
 
-        disabled = _online_model("cpu", torch.bfloat16, env="0")
-        self.assertFalse(disabled._fused_unary_head_requested)
-        self.assertTrue(model._fused_unary_head_requested)
+        model = _online_model("cpu", torch.float32)
+        plain = _online_model("cpu", torch.float32, plain=True)
+        self.assertTrue(model.fused_logits_loss)
+        self.assertTrue(plain.fused_logits_loss)
+        # Adding a selector must not override explicit backend configuration.
+        plain.draft_model.candidate_selector = nn.Identity()
+        probe = SimpleNamespace(
+            is_cuda=True, device=torch.device("cuda"), dtype=torch.bfloat16
+        )
+        for wrapper, requested, triton, expected in (
+            (model, True, True, "fused"),
+            (model, False, True, "eager"),
+            (model, True, False, "eager"),
+            (plain, False, True, "eager"),
+            (plain, True, True, "fused"),
+        ):
+            with (
+                self.subTest(requested=requested, expected=expected),
+                mock.patch.dict(
+                    "sys.modules",
+                    {"triton": object() if triton else None},
+                ),
+            ):
+                wrapper.fused_logits_loss = requested
+                self.assertEqual(wrapper._logits_loss_backend(probe), expected)
+        self.assertEqual(model._logits_loss_backend(torch.zeros(2, 64)), "eager")
+        probe.dtype = torch.float64
+        self.assertEqual(model._logits_loss_backend(probe), "eager")
+
+
+def _project_loss(hidden, weight, targets, top_k):
+    from specforge.core.fused_loss import fused_ce_l1_loss
+
+    terms = fused_ce_l1_loss(F.linear(hidden, weight), targets, top_k=top_k)
+    return terms.cross_entropy, terms.topk_values, terms.topk_ids, terms.argmax_ids
 
 
 def _reference_head(hidden, weight, targets, topk_ids, grad_nlq, grad_topv):
@@ -133,7 +162,6 @@ def _reference_head(hidden, weight, targets, topk_ids, grad_nlq, grad_topv):
 @unittest.skipUnless(CUDA_TRITON, "fused DFlash2 head requires CUDA and Triton")
 class FusedHeadKernelTest(unittest.TestCase):
     def _compare(self, vocab_size, top_k=16, rows=37, hidden_size=64):
-        from specforge.core.dflash_head_triton import dflash_unary_head_fused
 
         torch.manual_seed(vocab_size)
         device = torch.device("cuda")
@@ -156,7 +184,7 @@ class FusedHeadKernelTest(unittest.TestCase):
         grad_topv[1::4] = 0
 
         actual_hidden = hidden.clone().requires_grad_(True)
-        neg_log_q, topv, topi, argmax = dflash_unary_head_fused(
+        neg_log_q, topv, topi, argmax = _project_loss(
             actual_hidden, weight, targets, top_k
         )
         torch.autograd.backward((neg_log_q, topv), (grad_nlq, grad_topv))
@@ -199,10 +227,7 @@ class FusedHeadKernelTest(unittest.TestCase):
                 self._compare(vocab_size, top_k=top_k)
 
     def test_wide_candidate_sets_and_retained_graphs(self):
-        from specforge.core.dflash_head_triton import (
-            MAX_FUSED_TOP_K,
-            dflash_unary_head_fused,
-        )
+        from specforge.core._fused_logits_loss_triton import MAX_FUSED_TOP_K
 
         torch.manual_seed(4)
         device = torch.device("cuda")
@@ -213,9 +238,7 @@ class FusedHeadKernelTest(unittest.TestCase):
                 hidden = torch.randn(
                     19, 32, device=device, dtype=torch.bfloat16, requires_grad=True
                 )
-                neg_log_q, topv, topi, _ = dflash_unary_head_fused(
-                    hidden, weight, targets, top_k
-                )
+                neg_log_q, topv, topi, _ = _project_loss(hidden, weight, targets, top_k)
                 reference_values, reference_ids = (
                     F.linear(hidden.detach(), weight).float().topk(top_k, dim=-1)
                 )
@@ -227,11 +250,12 @@ class FusedHeadKernelTest(unittest.TestCase):
                 )
                 loss = neg_log_q.sum() + topv.sum()
                 loss.backward(retain_graph=True)
-                with self.assertRaisesRegex(RuntimeError, "modified by an inplace"):
-                    loss.backward()
+                first_gradient = hidden.grad.clone()
+                hidden.grad = None
+                loss.backward()
+                torch.testing.assert_close(hidden.grad, first_gradient)
 
     def test_argmax_and_neg_log_q_without_topk(self):
-        from specforge.core.dflash_head_triton import dflash_unary_head_fused
 
         torch.manual_seed(3)
         device = torch.device("cuda")
@@ -241,9 +265,7 @@ class FusedHeadKernelTest(unittest.TestCase):
         weight = torch.randn(777, 32, device=device, dtype=torch.bfloat16)
         targets = torch.randint(777, (2, 5), device=device)
 
-        neg_log_q, topv, topi, argmax = dflash_unary_head_fused(
-            hidden, weight, targets, 0
-        )
+        neg_log_q, topv, topi, argmax = _project_loss(hidden, weight, targets, 0)
         neg_log_q.sum().backward()
 
         reference = hidden.detach().clone().requires_grad_(True)
@@ -260,7 +282,7 @@ class FusedHeadKernelTest(unittest.TestCase):
 
     def test_topk_matches_fp32_topk_at_full_vocabulary(self):
         """Random and peaked BF16 rows over the 248k Qwen3.8 vocabulary."""
-        from specforge.core.dflash_head_triton import _launch_stats
+        from specforge.core._fused_logits_loss_triton import _launch_stats
 
         torch.manual_seed(5)
         device = torch.device("cuda")
@@ -328,6 +350,93 @@ def _run_model(model, batch, seed):
 
 @unittest.skipUnless(CUDA_TRITON, "fused DFlash2 head requires CUDA and Triton")
 class FusedHeadModelParityTest(unittest.TestCase):
+    def test_checkpoint_and_anchor_policy_are_independent_of_backend(self):
+        reference = None
+        for fused in (False, True):
+            for chunk, checkpoint in ((0, False), (0, True), (2, False), (2, True)):
+                with self.subTest(fused=fused, chunk=chunk, checkpoint=checkpoint):
+                    model = _online_model(
+                        "cuda",
+                        torch.float32,
+                        fused_logits_loss=fused,
+                        objective_chunk_blocks=chunk,
+                        objective_checkpointing=checkpoint,
+                    )
+                    batch = self._batch("cuda", 128)
+                    batch["hidden_states"] = batch["hidden_states"].float()
+                    batch.update(
+                        collect_detailed_metrics=False, selector_loss_alpha=0.0
+                    )
+                    projections = []
+                    hook = model.lm_head.register_forward_pre_hook(
+                        lambda _module, args: projections.append(args[0].shape[1])
+                    )
+                    torch.manual_seed(5)
+                    loss = model(**batch)[0]
+                    forward_calls = len(projections)
+                    loss.backward()
+                    hook.remove()
+                    self.assertEqual(
+                        len(projections), forward_calls * (2 if checkpoint else 1)
+                    )
+                    # Each block projects only its three supervised slots.
+                    expected_width = (chunk or model.num_anchors) * 3
+                    self.assertTrue(
+                        all(width == expected_width for width in projections)
+                    )
+                    grads = {
+                        n: p.grad.detach().clone()
+                        for n, p in model.draft_model.named_parameters()
+                    }
+                    for name, grad in grads.items():
+                        if "candidate_selector" in name:
+                            self.assertEqual(grad.count_nonzero().item(), 0, name)
+                    if reference is None:
+                        reference = (loss.detach(), grads)
+                    else:
+                        torch.testing.assert_close(
+                            (loss.detach(), grads), reference, rtol=1e-4, atol=1e-5
+                        )
+
+    def test_plain_dflash_full_model_parity(self):
+        for chunks in (0, 2):
+            for detailed in (False, True):
+                with self.subTest(chunks=chunks, detailed=detailed):
+                    kwargs = dict(
+                        plain=True,
+                        loss_decay_gamma=7.0,
+                        objective_chunk_blocks=chunks,
+                    )
+                    fused = _online_model(
+                        "cuda", torch.bfloat16, fused_logits_loss=True, **kwargs
+                    )
+                    reference = _online_model(
+                        "cuda", torch.bfloat16, fused_logits_loss=False, **kwargs
+                    )
+                    batch = self._batch("cuda", 128)
+                    batch["collect_detailed_metrics"] = detailed
+                    probe = torch.zeros(
+                        1, 1, 4, 64, device="cuda", dtype=torch.bfloat16
+                    )
+                    self.assertEqual(fused._logits_loss_backend(probe), "fused")
+                    self.assertEqual(reference._logits_loss_backend(probe), "eager")
+                    actual_loss, actual_acc, _, actual_grads = _run_model(
+                        fused, batch, 5
+                    )
+                    expected_loss, expected_acc, _, expected_grads = _run_model(
+                        reference, batch, 5
+                    )
+                    torch.testing.assert_close(
+                        actual_loss, expected_loss, rtol=1e-4, atol=1e-4
+                    )
+                    torch.testing.assert_close(actual_acc, expected_acc)
+                    self.assertEqual(actual_grads.keys(), expected_grads.keys())
+                    for name in actual_grads:
+                        relative = (
+                            actual_grads[name] - expected_grads[name]
+                        ).norm() / expected_grads[name].norm().clamp_min(1e-6)
+                        self.assertLess(relative.item(), 0.01, name)
+
     def _batch(self, device, width):
         torch.manual_seed(21)
         input_ids = torch.randint(0, 500, (2, 48), device=device)
@@ -345,6 +454,15 @@ class FusedHeadModelParityTest(unittest.TestCase):
     def test_fused_head_matches_reference_objective(self):
         device = torch.device("cuda")
         cases = [
+            (
+                {
+                    "draft_overrides": {
+                        "output_multiplier": 0.5,
+                        "final_logit_softcapping": 30.0,
+                    }
+                },
+                1e-3,
+            ),
             ({"loss_type": "dflash", "loss_decay_gamma": 7.0}, 1e-3),
             ({"loss_type": "dpace"}, 1e-3),
             ({"loss_type": "dflash", "lk_loss_type": "lambda"}, 1e-3),
@@ -370,28 +488,32 @@ class FusedHeadModelParityTest(unittest.TestCase):
                         self._compare(device, kwargs, grad_tolerance)
 
     def _compare(self, device, kwargs, grad_tolerance):
-        fused = _online_model(device, torch.bfloat16, env="1", **kwargs)
-        reference = _online_model(device, torch.bfloat16, env="0", **kwargs)
-        batch = self._batch(device, 2 * 64)
-        self.assertTrue(
-            fused._use_fused_unary_head(
-                torch.zeros(1, 1, 4, 64, device=device, dtype=torch.bfloat16)
-            )
+        fused = _online_model(device, torch.bfloat16, fused_logits_loss=True, **kwargs)
+        reference = _online_model(
+            device, torch.bfloat16, fused_logits_loss=False, **kwargs
         )
-        self.assertFalse(
-            reference._use_fused_unary_head(
+        batch = self._batch(device, 2 * 64)
+        self.assertEqual(
+            fused._logits_loss_backend(
                 torch.zeros(1, 1, 4, 64, device=device, dtype=torch.bfloat16)
-            )
+            ),
+            "fused",
+        )
+        self.assertEqual(
+            reference._logits_loss_backend(
+                torch.zeros(1, 1, 4, 64, device=device, dtype=torch.bfloat16)
+            ),
+            "eager",
         )
 
-        from specforge.core import dflash_head_triton
+        from specforge.core import fused_loss
 
         # The gate above only inspects a probe tensor; also require that the
         # objective really dispatches to (or bypasses) the fused head.
         with mock.patch.object(
-            dflash_head_triton,
-            "dflash_unary_head_fused",
-            wraps=dflash_head_triton.dflash_unary_head_fused,
+            fused_loss,
+            "fused_ce_l1_loss",
+            wraps=fused_loss.fused_ce_l1_loss,
         ) as fused_head:
             fused_loss, fused_acc, fused_metrics, fused_grads = _run_model(
                 fused, batch, seed=5
