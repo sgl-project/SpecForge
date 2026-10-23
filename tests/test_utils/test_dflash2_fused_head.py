@@ -1,7 +1,6 @@
 # coding=utf-8
 """Tests for the fused Triton DFlash2 unary head."""
 
-import os
 import unittest
 from unittest import mock
 
@@ -52,9 +51,7 @@ def _draft_config(vocab_size=512, block_size=4, **dflash_overrides):
     return config
 
 
-def _online_model(
-    device, dtype, *, env="1", plain=False, draft_overrides=None, **kwargs
-):
+def _online_model(device, dtype, *, plain=False, draft_overrides=None, **kwargs):
     torch.manual_seed(11)
     config = _draft_config(**(draft_overrides or {}))
     draft = DFlashDraftModel(config) if plain else DFlash2DraftModel(config)
@@ -67,17 +64,16 @@ def _online_model(
         head.weight.normal_(std=0.3)
     head.requires_grad_(False)
     embed.requires_grad_(False)
-    with mock.patch.dict(os.environ, {"SPECFORGE_DFLASH_FUSED_HEAD": env}):
-        model = OnlineDFlashModel(
-            draft_model=draft,
-            target_lm_head=head,
-            target_embed_tokens=embed,
-            mask_token_id=config.vocab_size - 1,
-            block_size=4,
-            attention_backend="sdpa",
-            num_anchors=12,
-            **kwargs,
-        )
+    model = OnlineDFlashModel(
+        draft_model=draft,
+        target_lm_head=head,
+        target_embed_tokens=embed,
+        mask_token_id=config.vocab_size - 1,
+        block_size=4,
+        attention_backend="sdpa",
+        num_anchors=12,
+        **kwargs,
+    )
     return model.to(device=device, dtype=dtype)
 
 
@@ -100,14 +96,37 @@ class FusedHeadGateTest(unittest.TestCase):
                 model = DFlash2DraftModel(_draft_config(**overrides))
                 self.assertFalse(model.unary_logits_transform_is_identity())
 
-    def test_cpu_and_env_off_models_use_the_reference_head(self):
-        model = _online_model("cpu", torch.bfloat16)
-        hidden = torch.zeros(1, 1, 4, 64, dtype=torch.bfloat16)
-        self.assertFalse(model._use_fused_logits(hidden))
+    def test_backend_defaults_configuration_and_capabilities(self):
+        from types import SimpleNamespace
 
-        disabled = _online_model("cpu", torch.bfloat16, env="0")
-        self.assertFalse(disabled.fused_logits_loss)
+        model = _online_model("cpu", torch.float32)
+        plain = _online_model("cpu", torch.float32, plain=True)
         self.assertTrue(model.fused_logits_loss)
+        self.assertTrue(plain.fused_logits_loss)
+        # Adding a selector must not override explicit backend configuration.
+        plain.draft_model.candidate_selector = nn.Identity()
+        probe = SimpleNamespace(
+            is_cuda=True, device=torch.device("cuda"), dtype=torch.bfloat16
+        )
+        for wrapper, requested, triton, expected in (
+            (model, True, True, "fused"),
+            (model, False, True, "eager"),
+            (model, True, False, "eager"),
+            (plain, False, True, "eager"),
+            (plain, True, True, "fused"),
+        ):
+            with (
+                self.subTest(requested=requested, expected=expected),
+                mock.patch.dict(
+                    "sys.modules",
+                    {"triton": object() if triton else None},
+                ),
+            ):
+                wrapper.fused_logits_loss = requested
+                self.assertEqual(wrapper._logits_loss_backend(probe), expected)
+        self.assertEqual(model._logits_loss_backend(torch.zeros(2, 64)), "eager")
+        probe.dtype = torch.float64
+        self.assertEqual(model._logits_loss_backend(probe), "eager")
 
 
 def _project_loss(hidden, weight, targets, top_k):
@@ -331,6 +350,54 @@ def _run_model(model, batch, seed):
 
 @unittest.skipUnless(CUDA_TRITON, "fused DFlash2 head requires CUDA and Triton")
 class FusedHeadModelParityTest(unittest.TestCase):
+    def test_checkpoint_and_anchor_policy_are_independent_of_backend(self):
+        reference = None
+        for fused in (False, True):
+            for chunk, checkpoint in ((0, False), (0, True), (2, False), (2, True)):
+                with self.subTest(fused=fused, chunk=chunk, checkpoint=checkpoint):
+                    model = _online_model(
+                        "cuda",
+                        torch.float32,
+                        fused_logits_loss=fused,
+                        objective_chunk_blocks=chunk,
+                        objective_checkpointing=checkpoint,
+                    )
+                    batch = self._batch("cuda", 128)
+                    batch["hidden_states"] = batch["hidden_states"].float()
+                    batch.update(
+                        collect_detailed_metrics=False, selector_loss_alpha=0.0
+                    )
+                    projections = []
+                    hook = model.lm_head.register_forward_pre_hook(
+                        lambda _module, args: projections.append(args[0].shape[1])
+                    )
+                    torch.manual_seed(5)
+                    loss = model(**batch)[0]
+                    forward_calls = len(projections)
+                    loss.backward()
+                    hook.remove()
+                    self.assertEqual(
+                        len(projections), forward_calls * (2 if checkpoint else 1)
+                    )
+                    # Each block projects only its three supervised slots.
+                    expected_width = (chunk or model.num_anchors) * 3
+                    self.assertTrue(
+                        all(width == expected_width for width in projections)
+                    )
+                    grads = {
+                        n: p.grad.detach().clone()
+                        for n, p in model.draft_model.named_parameters()
+                    }
+                    for name, grad in grads.items():
+                        if "candidate_selector" in name:
+                            self.assertEqual(grad.count_nonzero().item(), 0, name)
+                    if reference is None:
+                        reference = (loss.detach(), grads)
+                    else:
+                        torch.testing.assert_close(
+                            (loss.detach(), grads), reference, rtol=1e-4, atol=1e-5
+                        )
+
     def test_plain_dflash_full_model_parity(self):
         for chunks in (0, 2):
             for detailed in (False, True):
@@ -351,8 +418,8 @@ class FusedHeadModelParityTest(unittest.TestCase):
                     probe = torch.zeros(
                         1, 1, 4, 64, device="cuda", dtype=torch.bfloat16
                     )
-                    self.assertTrue(fused._use_fused_logits(probe))
-                    self.assertFalse(reference._use_fused_logits(probe))
+                    self.assertEqual(fused._logits_loss_backend(probe), "fused")
+                    self.assertEqual(reference._logits_loss_backend(probe), "eager")
                     actual_loss, actual_acc, _, actual_grads = _run_model(
                         fused, batch, 5
                     )
@@ -421,18 +488,22 @@ class FusedHeadModelParityTest(unittest.TestCase):
                         self._compare(device, kwargs, grad_tolerance)
 
     def _compare(self, device, kwargs, grad_tolerance):
-        fused = _online_model(device, torch.bfloat16, env="1", **kwargs)
-        reference = _online_model(device, torch.bfloat16, env="0", **kwargs)
-        batch = self._batch(device, 2 * 64)
-        self.assertTrue(
-            fused._use_fused_logits(
-                torch.zeros(1, 1, 4, 64, device=device, dtype=torch.bfloat16)
-            )
+        fused = _online_model(device, torch.bfloat16, fused_logits_loss=True, **kwargs)
+        reference = _online_model(
+            device, torch.bfloat16, fused_logits_loss=False, **kwargs
         )
-        self.assertFalse(
-            reference._use_fused_logits(
+        batch = self._batch(device, 2 * 64)
+        self.assertEqual(
+            fused._logits_loss_backend(
                 torch.zeros(1, 1, 4, 64, device=device, dtype=torch.bfloat16)
-            )
+            ),
+            "fused",
+        )
+        self.assertEqual(
+            reference._logits_loss_backend(
+                torch.zeros(1, 1, 4, 64, device=device, dtype=torch.bfloat16)
+            ),
+            "eager",
         )
 
         from specforge.core import fused_loss

@@ -370,6 +370,7 @@ def _build_dflash_family_model(
         "num_anchors": cfg.training.num_anchors,
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
         "objective_chunk_blocks": cfg.training.objective_chunk_blocks,
+        "objective_checkpointing": cfg.training.objective_checkpointing,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
     return AlgorithmModelParts(
@@ -424,6 +425,7 @@ def build_domino_model(
         lambda common: OnlineDominoModel(
             **common,
             shift_label=bool(getattr(draft_model, "shift_label", False)),
+            fused_logits_loss=cfg.training.fused_logits_loss,
         ),
     )
 
