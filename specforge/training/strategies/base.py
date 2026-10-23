@@ -116,13 +116,12 @@ class DraftTrainStrategy(abc.ABC):
         """Select the keys this strategy persists as draft weights."""
         return state_dict
 
-    def on_optimizer_step(self) -> None:
-        """After each optimizer step: run the model's own hook when it has one."""
+    def on_optimizer_step(self) -> Optional[Dict[str, Any]]:
+        """After the optimizer step: the model's hook, which may return step metrics."""
         module = self.trainable_module()
         # DDP and FSDP keep the model under ``.module``.
         hook = getattr(getattr(module, "module", module), "on_optimizer_step", None)
-        if hook is not None:
-            hook()
+        return None if hook is None else hook()
 
 
 def _prepare_eagle_target(

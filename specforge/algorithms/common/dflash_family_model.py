@@ -705,9 +705,9 @@ class OnlineDFlashModel(nn.Module):
         ratio_metrics["moe/aux_loss"] = (raw_aux.detach(), torch.ones_like(raw_aux))
         return weighted_aux
 
-    def on_optimizer_step(self) -> None:
+    def on_optimizer_step(self) -> Dict[str, torch.Tensor]:
         """The trainer's per-step hook: move the draft's MoE balancing state once."""
-        step_moe_balancing(self.draft_model)
+        return step_moe_balancing(self.draft_model)
 
     def _selector_chunk_terms(
         self,

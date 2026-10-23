@@ -1,7 +1,7 @@
 # coding=utf-8
 """MoELayer, the FFN switch between dense MLP and MoE, and the model-facing glue."""
 
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -9,7 +9,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert
-from specforge.modeling.draft.moe.router import TopKRouter
+from specforge.modeling.draft.moe.router import TopKRouter, dispatch_balance
 
 
 class MoELayer(nn.Module):
@@ -96,28 +96,22 @@ def take_moe_aux_loss(
     return aux, raw
 
 
-def update_moe_expert_bias(model: nn.Module) -> None:
-    """Pool the routers' kept-slot counts over ranks once, then move every bias."""
-    routers = [
-        router for router in _routers(model) if router.selection_bias is not None
-    ]
+def step_moe_balancing(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Optimizer step boundary: pool counts once, move the biases, score the step."""
+    routers = _routers(model)
     if not routers:
-        return
+        return {}
     # One collective for every layer; all ranks ran the same forwards, so it lines up.
     counts = torch.stack([router.tokens_per_expert for router in routers])
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(counts)
     for router, pooled in zip(routers, counts):
-        router.update_expert_bias(pooled)
-
-
-def step_moe_balancing(model: nn.Module) -> None:
-    """Optimizer step boundary: every per-step balancing update, in one place."""
-    update_moe_expert_bias(model)
-    # The batch-wise loss without a bias: start the next step's count window.
-    for router in _routers(model):
-        if router.tokens_per_expert is not None:
-            router.tokens_per_expert.zero_()
+        if router.selection_bias is not None:
+            router.update_expert_bias(pooled)
+        router.tokens_per_expert.zero_()  # the next step's count window
+    # The step's pooled load: the collapse signal, unlike the per-micro-batch loss.
+    balance = [dispatch_balance(c, router.top_k) for router, c in zip(routers, counts)]
+    return {"moe/step_balance": torch.stack(balance).mean()}
 
 
 def _routers(model: nn.Module) -> List[TopKRouter]:

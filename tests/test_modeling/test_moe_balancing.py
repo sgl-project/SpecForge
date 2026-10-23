@@ -29,11 +29,11 @@ from specforge.modeling.draft.moe.layer import (
     set_moe_token_mask,
     step_moe_balancing,
     take_moe_aux_loss,
-    update_moe_expert_bias,
 )
 from specforge.modeling.draft.moe.router import (
     TopKRouter,
     count_tokens_per_expert,
+    dispatch_balance,
     load_balance_loss,
 )
 from specforge.runtime.contracts import TrainBatch
@@ -185,6 +185,27 @@ class LoadBalanceLossTest(unittest.TestCase):
         scores = torch.full((E, E), 1 / E)
         indices = torch.stack([torch.arange(E), torch.arange(E).roll(1)], dim=1)
         torch.testing.assert_close(_loss(scores, indices), torch.tensor(float(K)))
+
+
+class DispatchBalanceTest(unittest.TestCase):
+    def test_uniform_scores_top_k_and_collapse_scores_num_experts(self):
+        uniform = torch.full((E,), 3.0)
+        torch.testing.assert_close(dispatch_balance(uniform, 1), torch.tensor(1.0))
+        torch.testing.assert_close(dispatch_balance(uniform, K), torch.tensor(2.0))
+        one = torch.tensor([24.0, 0, 0, 0, 0, 0, 0, 0])
+        torch.testing.assert_close(dispatch_balance(one, 1), torch.tensor(8.0))
+        two = torch.tensor([12.0, 12.0, 0, 0, 0, 0, 0, 0])  # top-2 stuck on two
+        torch.testing.assert_close(dispatch_balance(two, K), torch.tensor(8.0))
+
+    def test_equals_the_loss_when_the_router_agrees_with_its_dispatch(self):
+        counts = torch.tensor([5.0, 3, 2, 1, 1, 0, 0, 0])  # 12 tokens, top-1
+        probs = (counts / counts.sum()).expand(12, E)
+        torch.testing.assert_close(
+            dispatch_balance(counts, 1), load_balance_loss(probs, counts)
+        )
+
+    def test_an_empty_step_scores_zero(self):
+        self.assertEqual(dispatch_balance(torch.zeros(E), K).item(), 0.0)
 
 
 class RouterAuxLossTest(unittest.TestCase):
@@ -385,7 +406,7 @@ class SelectionBiasTest(unittest.TestCase):
         other = torch.tensor([9.0, 0, 0, 0, 0, 0, 0, 3.0])  # another rank's counts
         with mock.patch.object(dist, "is_initialized", return_value=True):
             with mock.patch.object(dist, "all_reduce", lambda t: t.add_(other)):
-                update_moe_expert_bias(router)
+                step_moe_balancing(router)
         want = _zero_mean_sign_step(counts + other)
         torch.testing.assert_close(router.selection_bias, want)
 
@@ -393,14 +414,19 @@ class SelectionBiasTest(unittest.TestCase):
         router = _router(top_k=K)
         router(torch.randn(B * S, H), torch.zeros(B * S, dtype=torch.bool))
         self.assertTrue(torch.all(router.tokens_per_expert == 0))
-        update_moe_expert_bias(router)
+        step_moe_balancing(router)
         self.assertTrue(torch.all(router.selection_bias == 0))
 
-    def test_without_a_selection_bias_nothing_is_tracked(self):
+    def test_without_a_selection_bias_the_counts_still_score_the_step(self):
         router = TopKRouter(E, H, K, norm_topk_prob=True, initializer_range=0.5)
-        router(torch.randn(B * S, H))
-        self.assertIsNone(router.tokens_per_expert)
-        update_moe_expert_bias(router)  # no routers to update: a no-op
+        _, indices, _ = router(torch.randn(B * S, H))
+        counts = count_tokens_per_expert(indices, None, E)
+        metrics = step_moe_balancing(router)
+        self.assertIsNone(router.selection_bias)
+        torch.testing.assert_close(
+            metrics["moe/step_balance"], dispatch_balance(counts, K)
+        )
+        self.assertTrue(torch.all(router.tokens_per_expert == 0))
         self.assertNotIn("tokens_per_expert", router.state_dict())
 
     def test_buffers_keep_fp32_values_when_cast_to_bf16(self):
@@ -482,10 +508,8 @@ class BatchWiseLossTest(unittest.TestCase):
 
     def test_family_reads_the_aux_loss_type(self):
         self.assertEqual(_moe().gate.aux_loss_type, "microbatch_wise")
-        self.assertIsNone(_moe().gate.tokens_per_expert)
         gate = _moe(moe_router_aux_loss_type="batch_wise").gate
         self.assertEqual(gate.aux_loss_type, "batch_wise")
-        self.assertIsNotNone(gate.tokens_per_expert)
 
 
 class _RecordingBackend(TrainingBackend):
@@ -549,26 +573,36 @@ class StepHookTest(unittest.TestCase):
         strategy = _MoEStrategy(_Wrapped(_online(draft)))
         _, indices, _ = draft.moe.gate(torch.randn(B * S, H))
         counts = count_tokens_per_expert(indices, None, E)
-        strategy.on_optimizer_step()
+        metrics = strategy.on_optimizer_step()
         torch.testing.assert_close(
             draft.moe.gate.selection_bias, _zero_mean_sign_step(counts)
         )
+        torch.testing.assert_close(
+            metrics["moe/step_balance"], dispatch_balance(counts, K)
+        )
 
     def test_a_model_without_a_hook_is_a_no_op(self):
-        _MoEStrategy(nn.Linear(2, 2)).on_optimizer_step()
+        self.assertIsNone(_MoEStrategy(nn.Linear(2, 2)).on_optimizer_step())
 
     def test_the_bias_moves_at_the_optimizer_step_boundary_only(self):
         draft, x = _MaskRecordingDraft(_moe(selection_bias=True)), torch.randn(B, S, H)
         core = TrainerCore(
             _MoEStrategy(_online(draft)), _RecordingBackend(), accumulation_steps=2
         )
-        core.train_step(_batch(x))
+        first = core.train_step(_batch(x))
         counts = draft.moe.gate.tokens_per_expert.clone()
         self.assertTrue(torch.all(draft.moe.gate.selection_bias == 0))
-        core.train_step(_batch(x))  # the same routing again: the counts double
+        self.assertNotIn("moe/step_balance", first.metrics)
+        second = core.train_step(_batch(x))  # the same routing again: counts double
         want = _zero_mean_sign_step(2 * counts)
         torch.testing.assert_close(draft.moe.gate.selection_bias, want)
         self.assertTrue(torch.all(draft.moe.gate.tokens_per_expert == 0))
+        # The step's pooled balance is reported with the boundary step's metrics.
+        self.assertAlmostEqual(
+            second.metrics["moe/step_balance"],
+            dispatch_balance(2 * counts, K).item(),
+            places=5,
+        )
 
 
 if __name__ == "__main__":

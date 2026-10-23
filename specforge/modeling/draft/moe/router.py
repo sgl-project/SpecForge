@@ -42,6 +42,13 @@ def load_balance_loss(
     return probs.shape[-1] * (tokens_per_expert / tokens * mean_prob).sum()
 
 
+def dispatch_balance(tokens_per_expert: torch.Tensor, top_k: int) -> torch.Tensor:
+    """A dispatch's balance against itself: ``K`` when uniform, ``E`` when collapsed."""
+    # load_balance_loss with the load standing in for the probabilities.
+    share = tokens_per_expert / tokens_per_expert.sum().clamp(min=1)
+    return top_k * share.shape[-1] * share.square().sum()
+
+
 class TopKRouter(nn.Module):
     """Top-k router; ``weight`` [E, H] matches Qwen3.5-MoE's ``gate``."""
 
@@ -76,11 +83,10 @@ class TopKRouter(nn.Module):
             "selection_bias",
             torch.zeros(num_experts, dtype=torch.float32) if selection_bias else None,
         )
-        # The step's kept-slot counts: bias update and batch-wise loss; not saved.
-        track_counts = selection_bias or aux_loss_type == "batch_wise"
+        # The step's kept-slot counts: bias update, batch-wise loss, step balance.
         self.register_buffer(
             "tokens_per_expert",
-            torch.zeros(num_experts, dtype=torch.float32) if track_counts else None,
+            torch.zeros(num_experts, dtype=torch.float32),
             persistent=False,
         )
         self.route_scale = route_scale
@@ -123,8 +129,7 @@ class TopKRouter(nn.Module):
             weights = weights / weights.sum(dim=-1, keepdim=True)
         if self.training:
             counts = count_tokens_per_expert(indices, mask, self.num_experts)
-            if self.tokens_per_expert is not None:
-                self.tokens_per_expert += counts
+            self.tokens_per_expert += counts
             # Always kept in training: with coefficient 0 it is the balance metric.
             self.aux_loss = load_balance_loss(scores, self._aux_loss_load(counts), mask)
         return scores, indices, weights * self.route_scale
@@ -146,4 +151,3 @@ class TopKRouter(nn.Module):
         delta = self.bias_update_rate * torch.sign(gap)
         # Zero-mean delta: the same top-k picks, and the bias never drifts.
         self.selection_bias += delta - delta.mean()
-        self.tokens_per_expert.zero_()
