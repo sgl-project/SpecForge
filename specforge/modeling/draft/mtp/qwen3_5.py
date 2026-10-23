@@ -94,19 +94,31 @@ class PartialRotaryEmbedding(nn.Module):
 
     def __init__(self, config, head_dim):
         super().__init__()
-        rope_theta = getattr(config, "rope_theta", 10000.0)
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-        dim = int(head_dim * partial_rotary_factor)
-        inv_freq = 1.0 / (
-            rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim)
+        # transformers 5 moves rope_theta into config.rope_parameters.
+        rope_parameters = getattr(config, "rope_parameters", None) or {}
+        rope_theta = getattr(config, "rope_theta", None) or rope_parameters.get(
+            "rope_theta", 10000.0
         )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        self.rope_theta = float(rope_theta)
+        self.rotary_dim = int(head_dim * partial_rotary_factor)
+        self.register_buffer(
+            "inv_freq", self._inv_freq(torch.device("cpu")), persistent=False
+        )
+
+    def _inv_freq(self, device) -> torch.Tensor:
+        dim = self.rotary_dim
+        return 1.0 / (
+            self.rope_theta
+            ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim)
+        )
 
     @torch.no_grad()
     def forward(self, x, position_ids):
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        )
+        # Recompute in fp32: model.to(bfloat16) also casts the inv_freq buffer,
+        # and bf16 frequencies are off by radians at long positions.
+        inv_freq = self._inv_freq(position_ids.device)
+        inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -231,8 +243,9 @@ class Qwen3MTPAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, -1)
+        # transformers attention interfaces already return [b, s, heads, d];
+        # another transpose here would mix heads and positions.
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
 
         if self.attn_output_gate:
             attn_output = attn_output * torch.sigmoid(gate)
