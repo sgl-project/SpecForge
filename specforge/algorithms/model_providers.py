@@ -427,6 +427,11 @@ def build_domino_model(
     )
 
 
+def resolve_dspark_loss_normalization(training) -> str:
+    """``step`` under cost-aware scheduling, whose regrouping would bias ``round``."""
+    return "step" if getattr(training, "cost_aware_scheduling", False) else "round"
+
+
 def build_dspark_model(
     cfg: Config,
     draft_model: Any,
@@ -445,6 +450,7 @@ def build_dspark_model(
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
             dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
+            loss_normalization=resolve_dspark_loss_normalization(cfg.training),
         ),
     )
 
