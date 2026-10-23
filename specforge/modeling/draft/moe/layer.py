@@ -1,7 +1,7 @@
 # coding=utf-8
-"""MoELayer, and the FFN switch between a draft layer's dense MLP and MoE."""
+"""MoELayer, the FFN switch between dense MLP and MoE, and the model-facing glue."""
 
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import torch
 from torch import nn
@@ -26,6 +26,8 @@ class MoELayer(nn.Module):
         self.experts = experts
         self.shared_expert = shared_expert
         self.shared_expert_gate = shared_expert_gate
+        # This batch's [B, S] kept-slot mask, from set_moe_token_mask.
+        self.token_mask: Optional[torch.Tensor] = None
 
     def reset_parameters(self, std: float) -> None:
         # Only the router and experts hold bare Parameters that HF's init skips.
@@ -34,7 +36,8 @@ class MoELayer(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
-        _, indices, weights = self.gate(x)
+        mask = self.token_mask if self.training else None
+        _, indices, weights = self.gate(x, None if mask is None else mask.reshape(-1))
         out = self.experts(x, indices, weights)
         if self.shared_expert is not None:
             shared = self.shared_expert(x)
@@ -63,3 +66,13 @@ def build_ffn(
             f"unknown moe_preset={moe_preset!r}; expected one of {sorted(FAMILIES)}"
         )
     return FAMILIES[moe_preset](config)
+
+
+def set_moe_token_mask(model: nn.Module, mask: Optional[torch.Tensor]) -> None:
+    """Hand every MoE layer this batch's ``[B, S]`` kept-slot mask."""
+    for layer in _moe_layers(model):
+        layer.token_mask = mask
+
+
+def _moe_layers(model: nn.Module) -> List[MoELayer]:
+    return [module for module in model.modules() if isinstance(module, MoELayer)]

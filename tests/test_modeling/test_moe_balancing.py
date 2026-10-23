@@ -1,9 +1,11 @@
 # coding=utf-8
-"""MoE balancing: the router's load-balance (aux) loss."""
+"""MoE balancing: the router's load-balance (aux) loss and the kept-token mask."""
 
 import unittest
 
 import torch
+from torch import nn
+from transformers import Qwen3Config
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
 )
@@ -11,14 +13,17 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     load_balancing_loss_func,
 )
 
+from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.moe.families.qwen3_5_moe import build_moe
+from specforge.modeling.draft.moe.layer import set_moe_token_mask
 from specforge.modeling.draft.moe.router import (
     TopKRouter,
     count_tokens_per_expert,
     load_balance_loss,
 )
 
-E, K, B, S, H = 8, 2, 2, 6, 16
+E, K, B, S, H, V = 8, 2, 2, 6, 16, 32
 
 
 def _moe(coef=0.5):
@@ -41,6 +46,61 @@ def _real_token_mask():
 
 def _loss(scores, indices, mask=None):
     return load_balance_loss(scores, count_tokens_per_expert(indices, mask, E), mask)
+
+
+def _tiny_moe_draft(coef=0.5):
+    """A one-layer DFlash draft whose FFN is a 4-expert MoE, on CPU."""
+    config = Qwen3Config(
+        architectures=["DFlashDraftModel"],
+        hidden_size=H,
+        intermediate_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=1,
+        num_target_layers=4,
+        head_dim=4,
+        max_position_embeddings=64,
+        vocab_size=V,
+        layer_types=["full_attention"],
+        block_size=2,
+        dflash_config={"target_layer_ids": [1]},
+        moe_preset="qwen3_5_moe",
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=0,
+        norm_topk_prob=False,
+        router_aux_loss_coef=coef,
+    )
+    config._attn_implementation = "eager"
+    return DFlashDraftModel(config)
+
+
+class _MaskRecordingDraft(nn.Module):
+    """A stand-in draft: one MoE layer over the noise embedding."""
+
+    def __init__(self, moe):
+        super().__init__()
+        self.moe = moe
+        self.sliding_window = None
+        self.seen_mask = None
+
+    def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
+        self.seen_mask = self.moe.token_mask
+        return self.moe(noise_embedding)
+
+
+def _online(draft, **overrides):
+    kwargs = dict(
+        draft_model=draft,
+        target_lm_head=nn.Linear(H, V, bias=False),
+        target_embed_tokens=nn.Embedding(V, H),
+        mask_token_id=V - 1,
+        block_size=2,
+        attention_backend="eager",
+        num_anchors=2,
+    )
+    return OnlineDFlashModel(**{**kwargs, **overrides})
 
 
 class LoadBalanceLossTest(unittest.TestCase):
@@ -114,6 +174,45 @@ class RouterAuxLossTest(unittest.TestCase):
         self.assertEqual(layer.gate.aux_loss_coef, 0.25)
         layer(torch.randn(B, S, H))
         self.assertIsNotNone(layer.gate.aux_loss)
+
+
+class TokenMaskTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        self.x, self.mask = torch.randn(B, S, H), _real_token_mask()
+
+    def test_set_moe_token_mask_reaches_every_layer_and_masks_the_loss(self):
+        layers = nn.ModuleList([_moe(), _moe()])
+        set_moe_token_mask(layers, self.mask)
+        for layer in layers:
+            self.assertIs(layer.token_mask, self.mask)
+            layer(self.x)
+            got = layer.gate.aux_loss
+            scores, indices, _ = layer.gate.eval()(self.x.reshape(-1, H))
+            want = _loss(scores, indices, self.mask.reshape(-1))
+            torch.testing.assert_close(got, want)
+
+    def test_eval_ignores_the_mask(self):
+        layer = _moe().eval()
+        set_moe_token_mask(layer, self.mask)
+        layer(self.x)
+        self.assertIsNone(layer.gate.aux_loss)
+
+    def test_draft_blocks_hand_moe_layers_the_kept_block_mask(self):
+        block_size = 3
+        draft = _MaskRecordingDraft(_moe())
+        model = _online(draft, block_size=block_size)
+        keep = torch.tensor([[True, True], [True, False]])
+        anchors = torch.tensor([[1, 3], [2, 0]])
+        model._sample_anchor_positions = lambda *args, **kwargs: (anchors, keep)
+        input_ids = torch.randint(1, V, (2, 6))
+        model._forward_draft_blocks(input_ids, torch.randn(2, 6, H), torch.ones(2, 6))
+        want = keep.repeat_interleave(block_size, dim=1)
+        torch.testing.assert_close(draft.seen_mask, want)
+
+    def test_moe_drafts_refuse_activation_checkpointing(self):
+        with self.assertRaisesRegex(ValueError, "activation checkpointing"):
+            _tiny_moe_draft().gradient_checkpointing_enable()
 
 
 if __name__ == "__main__":
