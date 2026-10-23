@@ -18,7 +18,7 @@ from specforge.modeling.draft.dflash_mask import (
     create_dflash_sdpa_mask,
 )
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
-from specforge.modeling.draft.moe.layer import set_moe_token_mask
+from specforge.modeling.draft.moe.layer import set_moe_token_mask, take_moe_aux_loss
 
 try:
     from torch.nn.attention.flex_attention import BlockMask
@@ -689,6 +689,17 @@ class OnlineDFlashModel(nn.Module):
             **draft_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
+
+    def _take_moe_aux_loss_and_log(
+        self, ratio_metrics: Dict[str, object]
+    ) -> Optional[torch.Tensor]:
+        """Take the draft's MoE aux loss: log the raw mean, return the weighted mean."""
+        terms = take_moe_aux_loss(self.draft_model)
+        if terms is None:
+            return None
+        weighted_aux, raw_aux = terms
+        ratio_metrics["moe/aux_loss"] = (raw_aux.detach(), torch.ones_like(raw_aux))
+        return weighted_aux
 
     def _selector_chunk_terms(
         self,
@@ -1709,6 +1720,10 @@ class OnlineDFlashModel(nn.Module):
                     terms.selector_ce_num,
                     terms.selector_weight_den,
                 )
+        weighted_aux = self._take_moe_aux_loss_and_log(ratio_metrics)
+        if weighted_aux is not None:
+            # Into the numerator the trainer backpropagates and normalizes globally.
+            loss_num = loss_num + weighted_aux * loss_denominator.detach()
         metrics: Dict[str, object] = {
             "accuracy_denom": accuracy_denom.detach(),
             "ratio_metrics": ratio_metrics,
@@ -2009,6 +2024,15 @@ class OnlineDominoModel(OnlineDFlashModel):
                 )
             }
 
+        weighted_aux = self._take_moe_aux_loss_and_log(
+            metrics.setdefault("ratio_metrics", {})
+        )
+        if weighted_aux is not None:
+            # Keep the loss and the numerator the trainer backpropagates in step.
+            loss = loss + weighted_aux
+            numerator, denominator = metrics["loss_terms"]
+            numerator = numerator + weighted_aux * denominator
+            metrics["loss_terms"] = (numerator, denominator)
         return loss, accuracy, metrics
 
 
@@ -2410,6 +2434,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     walk_accepted, anchor_positions, eval_mask.any(dim=-1)
                 )
             )
+        weighted_aux = self._take_moe_aux_loss_and_log(ratio_metrics)
+        if weighted_aux is not None:
+            # A plain loss: the trainer averages it over micro-batches and ranks.
+            loss = loss + weighted_aux
         metrics: Dict[str, object] = {
             "ratio_metrics": {
                 name: (numerator.detach(), denominator.detach())

@@ -1,7 +1,7 @@
 # coding=utf-8
 """MoELayer, the FFN switch between dense MLP and MoE, and the model-facing glue."""
 
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -72,6 +72,27 @@ def set_moe_token_mask(model: nn.Module, mask: Optional[torch.Tensor]) -> None:
     """Hand every MoE layer this batch's ``[B, S]`` kept-slot mask."""
     for layer in _moe_layers(model):
         layer.token_mask = mask
+
+
+def take_moe_aux_loss(
+    model: nn.Module,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Pop this forward's load-balance loss: (coefficient-weighted mean, raw mean)."""
+    # Weighted like its objective: by denominator under loss_terms, equally otherwise.
+    layers = _moe_layers(model)
+    terms = [
+        (layer.gate.aux_loss_coef, layer.gate.aux_loss)
+        for layer in layers
+        if layer.gate.aux_loss is not None
+    ]
+    for layer in layers:
+        layer.gate.aux_loss = None
+        layer.token_mask = None
+    if not terms:
+        return None
+    aux = torch.stack([coef * loss for coef, loss in terms]).mean()
+    raw = torch.stack([loss for _, loss in terms]).mean()
+    return aux, raw
 
 
 def _moe_layers(model: nn.Module) -> List[MoELayer]:

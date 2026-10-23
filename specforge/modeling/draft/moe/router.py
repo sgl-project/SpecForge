@@ -84,6 +84,7 @@ class TopKRouter(nn.Module):
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``x`` [T, H] -> fp32 scores [T, E], indices [T, K], fp32 weights [T, K]."""
+        self.aux_loss = None  # per-forward state: never carry a stale loss into eval
         # Logits in x's dtype as in Qwen; DeepSeek-V4 projects in fp32.
         scores = self.score_fn(F.linear(x, self.weight).float())
         choice = scores if self.selection_bias is None else scores + self.selection_bias
