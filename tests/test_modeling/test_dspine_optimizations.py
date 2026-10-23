@@ -1,9 +1,12 @@
 import unittest
+from itertools import product
 from unittest.mock import patch
 
 import torch
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from specforge.algorithms.dspine.strategy import DSpineTrainStrategy
+from specforge.core import fused_loss
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import StepContext
 from tests.test_modeling.test_dspine import training_inputs, training_model
@@ -15,9 +18,10 @@ class DSpineOptimizationsTest(unittest.TestCase):
         cases = [("cpu", torch.float32)]
         if torch.cuda.is_available():
             cases += [("cuda", torch.float32), ("cuda", torch.bfloat16)]
-        for device, dtype in cases:
-            with self.subTest(device=device, dtype=dtype):
+        for (device, dtype), fused in product(cases, (False, True)):
+            with self.subTest(device=device, dtype=dtype, fused=fused):
                 model = training_model().to(device=device, dtype=dtype)
+                model.fused_logits_loss = fused
                 hidden = torch.randn(
                     2, 3, 16, device=device, dtype=dtype, requires_grad=True
                 )
@@ -70,10 +74,14 @@ class DSpineOptimizationsTest(unittest.TestCase):
                     )
 
     def test_ce_prepass_matches_full_without_teacher_or_refinement(self):
-        for step in [100, 300]:
-            with self.subTest(step=step):
-                model = training_model(chunk_size=1)
-                inputs = training_inputs()
+        devices = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
+        for step, device, fused in product((100, 300), devices, (False, True)):
+            with self.subTest(step=step, device=device, fused=fused):
+                model = training_model(chunk_size=1).to(device)
+                model.fused_logits_loss = fused
+                inputs = {
+                    name: value.to(device) for name, value in training_inputs().items()
+                }
                 torch.manual_seed(39)
                 with torch.no_grad():
                     (_, accuracy, metrics) = model(
@@ -106,6 +114,43 @@ class DSpineOptimizationsTest(unittest.TestCase):
                     metrics["ratio_metrics"]["dspine/backbone_ce"],
                 ):
                     torch.testing.assert_close(got, want)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Fused loss requires CUDA")
+    def test_fusion_and_checkpointing_are_independent(self):
+        model = training_model().cuda()
+        inputs = {name: value.cuda() for name, value in training_inputs().items()}
+
+        def forward_backward():
+            model.zero_grad(set_to_none=True)
+            torch.manual_seed(39)
+            loss, _, _ = model(**inputs, global_step=100, total_steps=600)
+            loss.backward()
+            return loss.detach(), {
+                name: p.grad.clone()
+                for name, p in model.named_parameters()
+                if p.requires_grad and p.grad is not None
+            }
+
+        model.fused_logits_loss = model.objective_checkpointing = False
+        reference = forward_backward()
+        for fused, checkpoint, chunk in product((False, True), (False, True), (0, 1)):
+            with self.subTest(fused=fused, checkpoint=checkpoint, chunk=chunk):
+                model.fused_logits_loss = fused
+                model.objective_checkpointing = checkpoint
+                model.objective_chunk_blocks = chunk
+                with (
+                    patch(
+                        "torch.utils.checkpoint.checkpoint", wraps=activation_checkpoint
+                    ) as checkpoint_call,
+                    patch(
+                        "specforge.core.fused_loss.fused_ce_l1_loss",
+                        wraps=fused_loss.fused_ce_l1_loss,
+                    ) as fused_call,
+                ):
+                    actual = forward_backward()
+                self.assertEqual(fused_call.called, fused)
+                self.assertEqual(checkpoint_call.called, checkpoint)
+                torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-5)
 
     def test_ce_prepass_rejects_autograd(self):
         with self.assertRaisesRegex(ValueError, "gradients to be disabled"):

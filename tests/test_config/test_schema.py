@@ -585,16 +585,20 @@ class ConfigSchemaTest(unittest.TestCase):
             ("dflash", "OnlineDFlashModel"),
             ("dspark", "OnlineDSparkModel"),
             ("domino", "OnlineDominoModel"),
+            ("dspine", "OnlineDSpineModel"),
         ):
             for enabled in (False, True):
                 with self.subTest(strategy=strategy, enabled=enabled):
                     payload = _online_payload(strategy)
                     payload["training"]["fused_logits_loss"] = enabled
                     config = Config.model_validate(payload)
+                    model_module = (
+                        "specforge.algorithms.dspine.model"
+                        if strategy == "dspine"
+                        else "specforge.algorithms.common.dflash_family_model"
+                    )
                     with (
-                        mock.patch(
-                            f"specforge.algorithms.common.dflash_family_model.{model_name}"
-                        ) as model_cls,
+                        mock.patch(f"{model_module}.{model_name}") as model_cls,
                         mock.patch.object(
                             model_providers,
                             "_build_dflash_family_model",
