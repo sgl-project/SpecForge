@@ -1,18 +1,15 @@
 """Check EAGLE3 LK zero-acceptance rows through backward and an optimizer step."""
 
-import argparse
 import math
+import unittest
 
 import torch
 
 from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", default="cpu")
-    args = parser.parse_args()
-    device = torch.device(args.device)
+def check_zero_acceptance_optimizer_steps(device):
+    device = torch.device(device)
 
     # The supervised row has q=(sigmoid(2), 1-sigmoid(2)) and acceptance=0.8+q1.
     q0 = 1 / (1 + math.exp(-2))
@@ -66,8 +63,16 @@ def main():
         (-next_log_rate).backward()
         if not bool(torch.isfinite(logits.grad).all()):
             raise RuntimeError(f"{name}: nonfinite gradients on the next step")
-        print(f"PASS: {name}")
+
+
+class TestLKLossGradients(unittest.TestCase):
+    def test_cpu_optimizer_steps(self):
+        check_zero_acceptance_optimizer_steps("cpu")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_optimizer_steps(self):
+        check_zero_acceptance_optimizer_steps("cuda")
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main(verbosity=2)
