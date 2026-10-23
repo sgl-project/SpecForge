@@ -56,7 +56,7 @@ class DSpineOptimizationsTest(unittest.TestCase):
                             weights,
                             supervised,
                         )
-                        loss, correct = terms[0] + terms[1], terms[4]
+                        loss, correct = terms[0] + terms[1], terms[7]
                         if identical_teacher:
                             # Equal distributions use the zero subgradient of abs.
                             torch.testing.assert_close(

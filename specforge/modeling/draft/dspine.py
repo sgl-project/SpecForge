@@ -21,7 +21,7 @@ class DSpineConfig:
     top_k: int = 16
     ce_weight: float = 0.1
     alignment_weight: float = 0.5
-    alignment_warmup_steps: int = 146
+    alignment_warmup_steps: int | None = None
     replacement_layers: int = 3
     replacement_probability: float = 0.5
     replacement_hold_ratio: float = 1 / 6
@@ -37,10 +37,12 @@ class DSpineConfig:
             "replacement_layers",
         ):
             value = getattr(self, name)
+            if name == "alignment_warmup_steps" and value is None:
+                continue
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(f"DSpine {name} must be an integer")
         for name, value in asdict(self).items():
-            if not math.isfinite(value):
+            if value is not None and not math.isfinite(value):
                 raise ValueError(f"DSpine {name} must be finite")
         if not 0 < self.transfer_rank <= min(hidden_size, vocab_size - 1):
             raise ValueError(
@@ -54,7 +56,7 @@ class DSpineConfig:
             raise ValueError(
                 "DSpine requires ce_weight in [0, 1] and alignment_weight >= 0"
             )
-        if self.alignment_warmup_steps < 0 or self.replacement_layers < 0:
+        if (self.alignment_warmup_steps or 0) < 0 or self.replacement_layers < 0:
             raise ValueError(
                 "DSpine warmup steps and replacement layers must be nonnegative"
             )
@@ -67,8 +69,17 @@ class DSpineConfig:
         if not 0 <= self.candidate_mass_threshold < 1:
             raise ValueError("DSpine candidate_mass_threshold must be in [0, 1)")
 
-    def schedule(self, step: int, total_steps: int | None) -> tuple[float, float]:
+    def schedule(
+        self, step: int, total_steps: int | None, warmup_ratio: float | None = None
+    ) -> tuple[float, float]:
         warmup = self.alignment_warmup_steps
+        if warmup is None:
+            if warmup_ratio is None or not total_steps or total_steps <= 0:
+                raise ValueError(
+                    "DSpine alignment warmup follows the LR warmup and needs "
+                    "warmup_ratio and a positive total_steps"
+                )
+            warmup = int(warmup_ratio * total_steps)
         beta = self.alignment_weight * (min(max(step, 0) / warmup, 1) if warmup else 1)
         if not total_steps or total_steps <= 0:
             return beta, 0.0
