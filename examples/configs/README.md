@@ -288,6 +288,7 @@ Common fields:
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
+| `training.ddp_bucket_cap_mb` | unset | Optional DDP bucket target in MiB for `NO_SHARD`; unset keeps PyTorch's default. Benchmark changes because larger buckets trade launch overhead for later overlap. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
@@ -499,6 +500,7 @@ unless tuning throughput or memory pressure.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `runtime.producer_lease` | `8` | Prompts leased to a rollout worker at once. |
+| `runtime.consumer_dispatch` | `round_robin` | Use `cost_balanced` within each optimizer window, or `two_window_bucketed` / `two_window_joint_balanced` across two windows. Two-window policies can change sample grouping and require both `in_flight_high_watermark` and `in_flight_low_watermark` to cover two global optimizer windows. |
 | `runtime.producer_concurrency` | `1` | Concurrent capture calls maintained by each server's logical producer. Increase to keep ingress full without duplicating producers. |
 | `runtime.in_flight_high_watermark` | `256` | Pause production at this many committed, unacknowledged refs. |
 | `runtime.in_flight_low_watermark` | `192` | Resume production at or below this count; it cannot exceed the high watermark. |

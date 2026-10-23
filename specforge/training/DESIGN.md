@@ -58,6 +58,9 @@ The training plane is the only tensor-carrying side besides the data plane; it
 consumes `TrainBatch.tensors`. `TrainerCore.train_step` divides the loss by
 `accumulation_steps`, uses `no_sync()` only for non-boundary micro-batches, and
 returns `optimizer_stepped` as the single authoritative boundary signal.
+For DDP, the backend accumulation context encloses both forward and backward;
+wrapping backward alone does not disable DDP gradient synchronization. FSDP
+retains its backward-only deferral.
 `TrainerController` increments `global_step` only at that boundary, commits the
 pending sample acknowledgements, emits metrics, and performs configured
 interval saves. The outer `Trainer` owns topology cleanup and the guarded final
@@ -70,6 +73,24 @@ backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
 gradients or reporting a checkpoint as successful. Queue-mode loaders
 terminally settle and clean a short `drop_last` batch without emitting it;
 fixed offline refs keep normal `drop_last` semantics.
+
+## Consumer dispatch
+
+`runtime.consumer_dispatch` controls sample assignment to consumer ranks:
+
+- `round_robin` (default): assign samples in source order.
+- `cost_balanced`: balance estimated anchor/context costs within each optimizer window.
+- `two_window_bucketed`: sort samples across two windows, then balance each window.
+- `two_window_joint_balanced`: balance two windows jointly, falling back to independent
+  balancing unless the estimated total critical-path cost decreases.
+
+Two-window policies require both high and low ref watermarks to cover two global
+optimizer windows and can change optimizer-step sample membership and the training trajectory.
+Producer byte accounting follows the acknowledged refs, including reordered windows;
+resume rebuilds release totals from the durable ledger and publication stream.
+All policies preserve sample coverage, per-rank accumulation counts, deduplication,
+durable acknowledgements, and incomplete-tail handling. Cost estimates are heuristics,
+not guarantees of throughput improvement.
 
 ## Endpoints
 

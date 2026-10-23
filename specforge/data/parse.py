@@ -264,6 +264,16 @@ class GeneralParser(Parser):
                 messages.append(sentence)
             try:
                 conversation = self.apply_chat_template(messages, tool=tool, **kwargs)
+            except IndexError:
+                # HF chat templates index messages[0] and fail on an empty list,
+                # which happens when the conversation has no 'user' turn and the
+                # template has no default system prompt.
+                if messages:
+                    raise
+                warnings.warn(
+                    "Skipping conversation with no 'user' turn: nothing to render."
+                )
+                return None
             except (ValueError, TypeError):
                 if not self.allow_chat_template_fallback:
                     raise

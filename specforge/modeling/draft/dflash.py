@@ -32,6 +32,46 @@ from .registry import register_draft
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
 _VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
+_ATTENTION_MASK_SEMANTICS_VERSION = 2
+_LEGACY_CAUSAL_ARCHITECTURES = {"DSparkDraftModel", "DSpineDraftModel"}
+
+
+def resolve_dflash_causal_block(config) -> Optional[bool]:
+    """Read the direction override; None preserves the legacy per-layout defaults."""
+
+    value = getattr(config, "is_causal", None)
+    if value is not None and not isinstance(value, bool):
+        raise ValueError("DFlash config.is_causal must be a boolean or null")
+    return value
+
+
+def dflash_attention_resume_contract(draft_model) -> dict:
+    """Version only settings whose interpretation differs from legacy checkpoints.
+
+    Global bidirectional attention is unchanged. DSpark and DSpine already
+    supported global causal attention before independent window directions.
+    """
+
+    is_causal = resolve_dflash_causal_block(draft_model.config)
+    if is_causal is None:
+        return {}
+
+    sliding_window = getattr(draft_model, "sliding_window", None)
+    if sliding_window is None:
+        if not is_causal:
+            return {}
+        architectures = getattr(draft_model.config, "architectures", None) or []
+        if _LEGACY_CAUSAL_ARCHITECTURES.intersection(architectures):
+            return {}
+
+    return {
+        "draft_attention_mask_semantics": (
+            _ATTENTION_MASK_SEMANTICS_VERSION,
+            tuple(draft_model.layer_types),
+            sliding_window,
+            is_causal,
+        )
+    }
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -688,6 +728,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> None:
         super().__init__(config)
         self.config = config
+        resolve_dflash_causal_block(config)
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
         self.attention_mode = validate_dflash_attention_config(config)
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS

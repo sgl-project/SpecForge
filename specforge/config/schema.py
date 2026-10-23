@@ -25,6 +25,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from specforge.runtime.contracts import consumer_dispatch_quantum
+
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
@@ -478,10 +480,35 @@ class ProfilingConfig(StrictConfigModel):
     record_shapes: bool = False
 
 
+def resolve_ref_watermarks(high: int, low: Optional[int]) -> tuple[int, Optional[int]]:
+    """Apply producer environment overrides before validating ref watermarks."""
+    high_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
+    low_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
+    high = int(high_override) if high_override is not None else high
+    # The legacy high-only override resumes at the same threshold.
+    low = (
+        int(low_override)
+        if low_override is not None
+        else (None if high_override is not None else low)
+    )
+    resolved_low = high if low is None else low
+    if high < 1 or not 0 <= resolved_low <= high:
+        raise ValueError(
+            "effective ref watermarks require high >= 1 and 0 <= low <= high"
+        )
+    return high, low
+
+
 class RuntimeConfig(StrictConfigModel):
     """Streaming bounds shared by unified disaggregated producer roles."""
 
     producer_lease: int = Field(default=8, gt=0)
+    consumer_dispatch: Literal[
+        "round_robin",
+        "cost_balanced",
+        "two_window_bucketed",
+        "two_window_joint_balanced",
+    ] = "round_robin"
     producer_concurrency: int = Field(default=1, gt=0)
     in_flight_high_watermark: int = Field(default=256, gt=0)
     in_flight_low_watermark: int = Field(default=192, ge=0)
@@ -492,11 +519,9 @@ class RuntimeConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_watermarks(self):
-        if self.in_flight_low_watermark > self.in_flight_high_watermark:
-            raise ValueError(
-                "runtime.in_flight_low_watermark must be <= "
-                "runtime.in_flight_high_watermark"
-            )
+        resolve_ref_watermarks(
+            self.in_flight_high_watermark, self.in_flight_low_watermark
+        )
         if (
             self.resident_high_watermark_bytes is None
             and self.resident_low_watermark_bytes is not None
@@ -957,6 +982,7 @@ class TrainingConfig(StrictConfigModel):
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
@@ -1172,6 +1198,29 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+
+        if self.runtime.consumer_dispatch in (
+            "two_window_bucketed",
+            "two_window_joint_balanced",
+        ):
+            dispatch = self.runtime.consumer_dispatch
+            window = (
+                self.deployment.trainer.nnodes
+                * self.deployment.trainer.nproc_per_node
+                * self.training.batch_size
+                * self.training.accumulation_steps
+            )
+            required = consumer_dispatch_quantum(dispatch, window)
+            high, low = resolve_ref_watermarks(
+                self.runtime.in_flight_high_watermark,
+                self.runtime.in_flight_low_watermark,
+            )
+            for level, value in (("high", high), ("low", high if low is None else low)):
+                if value < required:
+                    raise ValueError(
+                        f"{dispatch} requires a {level} watermark of at least two "
+                        f"global batches (dispatch quantum {required})"
+                    )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

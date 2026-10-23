@@ -1,6 +1,7 @@
 import unittest
 
 from specforge.data.parse import GeneralParser, ThinkingParser
+from specforge.data.preprocessing import preprocess_conversations
 from specforge.data.template import ChatTemplate
 
 
@@ -84,6 +85,68 @@ class TestParserNormalization(unittest.TestCase):
                 {"role": "assistant", "content": "answer"},
             ],
         )
+
+    def test_general_parser_skips_conversation_without_user_turn(self):
+        # HF tokenizers raise IndexError from apply_chat_template([]).
+        class HFLikeTokenizer(DummyTokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                messages[0]
+                return super().apply_chat_template(messages, **kwargs)
+
+        template = ChatTemplate(
+            assistant_header="<assistant>",
+            user_header="<user>",
+            system_prompt=None,
+            end_of_turn_token="</eot>",
+        )
+        no_user_turn = [
+            {"from": "bing", "value": "hi"},
+            {"from": "chatgpt", "value": "hello"},
+        ]
+        valid = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ]
+
+        parser = GeneralParser(HFLikeTokenizer(), template)
+        with self.assertWarnsRegex(Warning, "no 'user' turn"):
+            self.assertIsNone(parser.parse(no_user_turn, max_length=512))
+
+        results = preprocess_conversations(
+            HFLikeTokenizer(),
+            [no_user_turn, valid],
+            template,
+            max_length=512,
+            tools=[[], []],
+        )
+        self.assertEqual(len(results["input_ids"]), 1)
+        self.assertEqual(
+            results["input_ids"][0][0].tolist(),
+            parser.parse(valid, max_length=512)[0].tolist(),
+        )
+
+    def test_general_parser_reraises_index_error_for_non_empty_messages(self):
+        class BrokenTokenizer(DummyTokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                raise IndexError("template bug")
+
+        parser = GeneralParser(
+            BrokenTokenizer(),
+            ChatTemplate(
+                assistant_header="<assistant>",
+                user_header="<user>",
+                system_prompt=None,
+                end_of_turn_token="</eot>",
+            ),
+        )
+        with self.assertRaisesRegex(IndexError, "template bug"):
+            parser.parse(
+                [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                max_length=512,
+            )
 
     def test_thinking_mode_defaults_to_tokenizer_behavior(self):
         self.assertIsNone(ChatTemplate().enable_thinking)
