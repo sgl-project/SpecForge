@@ -87,6 +87,13 @@ def resume_contract(config, draft_model, training_model):
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
+    if config.model.use_liger_kernel:
+        from specforge.algorithms.dflash.providers import resolve_dflash_kernels
+        from specforge.algorithms.model_providers import build_dflash_draft
+
+        return build_dflash_draft(
+            config, draft_config, resolve_dflash_kernels(config, draft_config)
+        )
     return build_registered_draft(config, draft_config)
 
 
@@ -147,6 +154,7 @@ def algorithm_spec() -> AlgorithmSpec:
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
+            supports_liger_kernel=True,
         ),
     )
 
