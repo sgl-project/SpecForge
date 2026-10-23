@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.core.chunking import checkpointed_chunk_reduce
-from specforge.core.fused_loss import ce_l1_loss
 
 
 class OnlineDSpineModel(OnlineDFlashModel):
@@ -37,7 +36,7 @@ class OnlineDSpineModel(OnlineDFlashModel):
         weights: torch.Tensor,
         supervised: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        terms = ce_l1_loss(self.lm_head(hidden), labels)
+        terms = self._logits_loss_terms(self.lm_head(hidden), labels)
         correct = ((terms.argmax_ids == labels) * supervised).sum()
         return (terms.cross_entropy * weights).sum(), correct.float()
 
@@ -54,9 +53,9 @@ class OnlineDSpineModel(OnlineDFlashModel):
     ) -> tuple[torch.Tensor, ...]:
         config = self.dspine_config
         with torch.no_grad():
-            teacher_logits = self.lm_head(teacher_hidden).float()
-        terms = ce_l1_loss(
-            self.lm_head(hidden).float(),
+            teacher_logits = self.lm_head(teacher_hidden)
+        terms = self._logits_loss_terms(
+            self.lm_head(hidden),
             labels,
             teacher_logits=teacher_logits,
             top_k=config.top_k,
@@ -67,7 +66,9 @@ class OnlineDSpineModel(OnlineDFlashModel):
             "bmh,bmkh->bmk", refined, F.embedding(candidates, self.lm_head.weight)
         ).float()
         refined_log_probabilities = scores.log_softmax(dim=-1)
-        target_candidates = teacher_logits.softmax(dim=-1).gather(-1, candidates)
+        target_candidates = teacher_logits.softmax(dim=-1, dtype=torch.float32).gather(
+            -1, candidates
+        )
         mass = target_candidates.sum(dim=-1)
         target_candidates = target_candidates / mass.unsqueeze(-1).clamp_min(1e-30)
         covered = candidates == labels.unsqueeze(-1)
@@ -178,6 +179,7 @@ class OnlineDSpineModel(OnlineDFlashModel):
                 weights.reshape(-1, tokens),
                 supervised.reshape(-1, tokens),
                 chunk_size=self.objective_chunk_blocks,
+                checkpoint=self.objective_checkpointing,
             )
             count = supervised.sum().float()
             return (
@@ -224,6 +226,7 @@ class OnlineDSpineModel(OnlineDFlashModel):
             weights.reshape(-1, tokens),
             supervised.reshape(-1, tokens),
             chunk_size=self.objective_chunk_blocks,
+            checkpoint=self.objective_checkpointing,
         )
         if alignment_ce is None:
             scale_terms = torch.stack((ce.detach(), denominator.detach()))

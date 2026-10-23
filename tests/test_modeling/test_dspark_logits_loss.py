@@ -1,6 +1,4 @@
-import os
 import unittest
-from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -54,7 +52,41 @@ def build_model(device="cpu"):
 class DSparkLogitsLossTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-    @patch.dict(os.environ, {"SPECFORGE_DSPARK_FUSED_LOSS": "0"})
+    def test_eager_and_fused_return_matching_terms(self):
+        from specforge.core.fused_loss import ce_l1_loss
+
+        torch.manual_seed(31)
+        model = build_model("cuda")
+        self.assertTrue(model.fused_logits_loss)
+        logits = torch.randn(2, 3, 64, device="cuda", requires_grad=True)
+        teacher = torch.randn_like(logits, requires_grad=True)
+        labels = torch.randint(64, (2, 3), device="cuda")
+        reference = ce_l1_loss(logits, labels, teacher_logits=teacher, top_k=3)
+        reference_grad = torch.autograd.grad(
+            (reference.cross_entropy + reference.teacher_l1).sum()
+            + reference.topk_values.sum(),
+            logits,
+        )[0]
+        for enabled, expected in ((False, "eager"), (True, "fused")):
+            with self.subTest(backend=expected):
+                model.fused_logits_loss = enabled
+                self.assertEqual(model._logits_loss_backend(logits), expected)
+                actual = model._logits_loss_terms(
+                    logits, labels, teacher_logits=teacher, top_k=3
+                )
+                torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-5)
+                grad, teacher_grad = torch.autograd.grad(
+                    (actual.cross_entropy + actual.teacher_l1).sum()
+                    + actual.topk_values.sum(),
+                    (logits, teacher),
+                    allow_unused=True,
+                )
+                torch.testing.assert_close(grad, reference_grad, rtol=1e-4, atol=1e-5)
+                self.assertIsNone(teacher_grad)
+        # Unsupported devices fall back to eager, including BF16.
+        self.assertEqual(model._logits_loss_backend(logits.cpu().bfloat16()), "eager")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_fused_logits_preserves_markov_and_confidence_gradients(self):
         from specforge.modeling.draft.dspark import AcceptRatePredictor
 
@@ -73,10 +105,13 @@ class DSparkLogitsLossTest(unittest.TestCase):
             ),
         )
         for l1_alpha in (0.0, 0.9):
-            for chunk in (0, 1):
-                with self.subTest(l1_alpha=l1_alpha, chunk=chunk):
+            for chunk, checkpoint in ((0, False), (0, True), (1, False), (1, True)):
+                with self.subTest(
+                    l1_alpha=l1_alpha, chunk=chunk, checkpoint=checkpoint
+                ):
                     model.dspark_l1_loss_alpha = l1_alpha
                     model.objective_chunk_blocks = chunk
+                    model.objective_checkpointing = checkpoint
                     outputs = []
                     for fused in (False, True):
                         model.fused_logits_loss = fused

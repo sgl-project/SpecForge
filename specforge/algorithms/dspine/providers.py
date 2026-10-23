@@ -57,17 +57,14 @@ def build_draft(config, draft_config):
 
 
 def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
-    from specforge.algorithms.model_providers import _build_dflash_family_model
+    from specforge.algorithms.model_providers import build_dspine_model
 
-    from .model import OnlineDSpineModel
-
-    return _build_dflash_family_model(
+    return build_dspine_model(
         config,
         draft_model,
+        draft_config,
+        target_config,
         tokenizer,
-        lambda common: OnlineDSpineModel(
-            **common, warmup_ratio=config.training.warmup_ratio
-        ),
     )
 
 

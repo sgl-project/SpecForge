@@ -303,6 +303,7 @@ class TestDominoDraftModel(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "Triton loss requires CUDA")
     def test_fused_loss_matches_standard_model_path(self):
         from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
+        from specforge.core.domino_loss import domino_weighted_cross_entropy
 
         torch.manual_seed(19)
         hidden_size, vocab_size, block_size = 4, 7, 4
@@ -349,8 +350,14 @@ class TestDominoDraftModel(unittest.TestCase):
             "loss_mask": torch.ones(1, 2 * block_size, device="cuda"),
             "lambda_base": 0.25,
         }
-        model._use_fused_domino_ce = False
-        standard = model(**inputs)
+        self.assertTrue(model.fused_logits_loss)
+        model.fused_logits_loss = False
+        with patch(
+            "specforge.core.domino_loss.domino_weighted_cross_entropy",
+            wraps=domino_weighted_cross_entropy,
+        ) as loss_fn:
+            standard = model(**inputs)
+            self.assertFalse(loss_fn.call_args.kwargs["use_fused"])
         standard[0].backward()
         standard_hidden_grad = fixed_hidden.grad.clone()
         standard_parameter_grads = {
@@ -360,8 +367,13 @@ class TestDominoDraftModel(unittest.TestCase):
         fixed_hidden.grad = None
         model.zero_grad(set_to_none=True)
 
-        model._use_fused_domino_ce = True
-        fused = model(**inputs)
+        model.fused_logits_loss = True
+        with patch(
+            "specforge.core.domino_loss.domino_weighted_cross_entropy",
+            wraps=domino_weighted_cross_entropy,
+        ) as loss_fn:
+            fused = model(**inputs)
+            self.assertTrue(loss_fn.call_args.kwargs["use_fused"])
         fused[0].backward()
 
         torch.testing.assert_close(fused[0], standard[0])
