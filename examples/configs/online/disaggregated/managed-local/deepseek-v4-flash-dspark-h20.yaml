@@ -1,0 +1,99 @@
+# DeepSeek-V4-Flash DSpark: target TP4 on GPUs 0-3, trainers on GPUs 4-7.
+# Update model/data paths before launching.
+model:
+  target_model_path: /disk3/models/DeepSeek-V4-Flash-0731
+  draft_model_config: configs/deepseek-v4-flash-dspark.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  sglang_attention_backend: dsv4
+  sglang_moe_runner_backend: marlin
+  sglang_mem_fraction_static: 0.85
+  sglang_disable_radix_cache: true
+  sglang_context_length: 8704
+  sglang_max_prefill_tokens: 8704
+  sglang_max_running_requests: 1
+  sglang_disable_cuda_graph: true
+  sglang_page_size: 256
+  sglang_swa_full_tokens_ratio: 0.1
+  sglang_extra_args:
+    - --kv-cache-dtype
+    - fp8_e4m3
+
+data:
+  train_data_path: /disk3/wjp/datasets/perfectblend/deepseek-v4-flash-0731/perfectblend_question_over_1k_regen_temp0.jsonl
+  max_length: 8192
+  chat_template: deepseek-v4-thinking
+  cache_dir: cache/deepseek-v4-flash-0731-dspark-temp0-thinking-h20
+  build_dataset_num_proc: 16
+  dataloader_num_workers: 2
+
+training:
+  strategy: dspark
+  loss_type: dflash
+  fused_logits_loss: true
+  objective_checkpointing: true
+  num_epochs: 1000
+  tp_size: 1
+  batch_size: 1
+  accumulation_steps: 1
+  learning_rate: 0.0006
+  lr_scheduler: constant
+  warmup_ratio: 0
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 128
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 32
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 128
+  log_interval: 1
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: tensorboard
+
+runtime:
+  producer_lease: 1
+  producer_concurrency: 1
+  in_flight_high_watermark: 64
+  in_flight_low_watermark: 32
+  resident_high_watermark_bytes: 34359738368
+  resident_low_watermark_bytes: 25769803776
+  feature_store_max_resident_bytes: 51539607552
+
+run_id: deepseek-v4-flash-dspark-basic-h20
+output_dir: outputs/deepseek-v4-flash-dspark-basic-h20
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/deepseek-v4-flash-dspark-basic-h20/control
+    consumer_state_dir: outputs/deepseek-v4-flash-dspark-basic-h20/consumer-state
+    store_id: deepseek-v4-flash-dspark-basic-h20
+    backend: mooncake
+    client_buffer_size: 1073741824
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200
+    managed_local:
+      trainer_cuda_visible_devices: ["4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 68719476736
+        local_buffer_size_bytes: 1073741824
+        default_kv_lease_ttl_ms: 300000
+      capture_servers:
+        - port: 30010
+          cuda_visible_devices: ["0", "1", "2", "3"]
+          tp_size: 4
+          startup_timeout_s: 7200
