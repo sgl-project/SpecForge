@@ -27,6 +27,11 @@ from specforge.algorithms.mtp.providers import _init_from_native_mtp
 from specforge.core.mtp import OnlineMTPModel
 from specforge.modeling.draft import available_drafts, resolve_draft
 from specforge.modeling.draft.mtp import Qwen3_5MTPDraftModel
+from specforge.modeling.draft.mtp.qwen3_5 import (
+    PartialRotaryEmbedding,
+    Qwen3MTPAttention,
+    apply_rotary_pos_emb,
+)
 from specforge.training.strategies.base import MTPTrainStrategy
 
 
@@ -245,6 +250,51 @@ class OnlineMTPModelTest(unittest.TestCase):
         # x[t+1] is fused with h[t], but RoPE must use x[t+1]'s serving
         # position. The synthetic final token is assigned the next position.
         self.assertEqual([[5, 6, 7, 8]], draft.position_ids.tolist())
+
+
+class Qwen3MTPAttentionTest(unittest.TestCase):
+    def test_matches_reference_attention(self):
+        """Heads are merged per position before o_proj, as SGLang serves it."""
+        for impl in ("eager", "sdpa"):
+            with self.subTest(attn_implementation=impl):
+                config = _tiny_config()
+                config._attn_implementation = impl
+                torch.manual_seed(0)
+                attn = Qwen3MTPAttention(config, layer_idx=0).double().eval()
+                bsz, seq_len = 2, 7
+                num_heads, num_kv_heads = 4, 2
+                head_dim = config.head_dim
+                hidden = torch.randn(bsz, seq_len, config.hidden_size).double()
+                position_ids = torch.arange(seq_len).expand(bsz, -1)
+                cos, sin = PartialRotaryEmbedding(config, head_dim)(
+                    hidden, position_ids
+                )
+                causal = torch.full((seq_len, seq_len), float("-inf")).triu(1)
+                mask = causal.double().expand(bsz, 1, seq_len, seq_len)
+
+                out, _ = attn(
+                    hidden, attention_mask=mask, position_embeddings=(cos, sin)
+                )
+
+                q, gate = torch.chunk(
+                    attn.q_proj(hidden).view(bsz, seq_len, num_heads, 2 * head_dim),
+                    2,
+                    dim=-1,
+                )
+                q = attn.q_norm(q).transpose(1, 2)
+                k = attn.k_proj(hidden).view(bsz, seq_len, num_kv_heads, head_dim)
+                k = attn.k_norm(k).transpose(1, 2)
+                v = attn.v_proj(hidden).view(bsz, seq_len, num_kv_heads, head_dim)
+                v = v.transpose(1, 2)
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
+                v = v.repeat_interleave(num_heads // num_kv_heads, dim=1)
+                probs = torch.softmax(q @ k.transpose(-1, -2) * attn.scaling + mask, -1)
+                merged = (probs @ v).transpose(1, 2).reshape(bsz, seq_len, -1)
+                gate = torch.sigmoid(gate.reshape(bsz, seq_len, -1))
+                expected = attn.o_proj(merged * gate)
+
+                torch.testing.assert_close(out, expected)
 
 
 class MTPTrainStrategyTest(unittest.TestCase):
