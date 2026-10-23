@@ -418,6 +418,7 @@ def _prepare_prompts(
         min_loss_tokens=min_loss_tokens,
         max_prompts=cfg.data.max_prompts,
         loss_mask_filter=algorithm.providers.model.loss_mask_filter,
+        index_path=cfg.data.prompts_index_path,
     )
 
 
