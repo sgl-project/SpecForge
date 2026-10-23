@@ -11,9 +11,6 @@ import torch
 
 from specforge_tpu import hooks, shapes
 
-# One TPU core per torchrun rank: every rank sees its core as tpu:0.
-TPU_DEVICE = torch.device("tpu", 0)
-
 
 def _pick_ports(count: int) -> list[int]:
     sockets = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)]
@@ -71,7 +68,8 @@ def _bind_local_device(original: Callable[[str], int], device_type: str) -> int:
 
 
 def _get_local_device() -> torch.device:
-    return TPU_DEVICE
+    # One TPU core per torchrun rank: every rank sees its core as tpu:0.
+    return torch.device("tpu", 0)
 
 
 def apply() -> None:
