@@ -23,6 +23,8 @@ import logging
 import os
 import re
 import shutil
+import threading
+from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple
 
 import torch
@@ -30,6 +32,29 @@ import torch
 logger = logging.getLogger(__name__)
 
 STATE_FILE = "training_state.pt"
+
+
+def _staged_copy(obj: Any) -> Any:
+    """Detach accelerator tensors to host copies so a background writer never
+    races the training step; host tensors are referenced, not copied, because
+    every caller hands over a freshly materialized state dict."""
+    if isinstance(obj, torch.Tensor):
+        if obj.device.type == "cpu":
+            return obj
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {key: _staged_copy(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_staged_copy(value) for value in obj)
+    return obj
+
+
+@dataclass
+class _PendingSave:
+    step: int
+    ckpt_dir: str
+    thread: threading.Thread
+    error: str = ""
 
 
 class CheckpointManager:
@@ -41,10 +66,18 @@ class CheckpointManager:
         max_checkpoints: int = 0,
         best_metric: str = "eval/simulated_acc_len",
         best_min_delta: float = 0.0,
+        async_write: bool = False,
     ) -> None:
         self.output_dir = output_dir
         self.run_id = run_id
         self.max_checkpoints = max_checkpoints
+        #: Write the files on a background thread. The step loop only pays for
+        #: staging accelerator tensors to the host; ``wait()`` (run by every
+        #: rank at the next save and at the end of ``fit``) completes the
+        #: collective outcome check, repoints ``{run_id}-latest`` and rotates,
+        #: so an interrupted write never becomes the latest checkpoint.
+        self.async_write = async_write
+        self._pending: Optional[_PendingSave] = None
         self.best_metric = best_metric
         self.best_min_delta = best_min_delta
         self.best_score: Optional[float] = None
@@ -79,6 +112,7 @@ class CheckpointManager:
         ``state`` is the shared payload (rank0 writes it); ``rank_state`` is
         written by every rank. Collective: any rank's failure raises on all ranks.
         """
+        self.wait()  # finish an in-flight asynchronous save first (collective)
         ckpt_dir = self.checkpoint_dir(step)
         err = ""
         try:
@@ -90,21 +124,66 @@ class CheckpointManager:
         if not err:
             try:
                 os.makedirs(ckpt_dir, exist_ok=True)
-                if rank_state is not None:
-                    self._atomic_save(
-                        rank_state,
-                        os.path.join(ckpt_dir, self._rank_file(self._rank())),
+                rank_payload = rank_state
+                shared_payload = state if self.is_rank0() else None
+                if self.async_write:
+                    rank_payload = _staged_copy(rank_payload)
+                    shared_payload = _staged_copy(shared_payload)
+                    pending = _PendingSave(step, ckpt_dir, thread=None)  # type: ignore[arg-type]
+                    pending.thread = threading.Thread(
+                        target=self._write_payloads,
+                        args=(pending, ckpt_dir, shared_payload, rank_payload),
+                        name=f"checkpoint-save-step{step}",
+                        daemon=True,
                     )
-                if self.is_rank0() and state is not None:
-                    self._atomic_save(state, self._state_path(ckpt_dir))
+                    self._pending = pending
+                    pending.thread.start()
+                    return ckpt_dir
+                self._write_files(ckpt_dir, shared_payload, rank_payload)
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
+        self._finalize(step, ckpt_dir, err)
+        return ckpt_dir
+
+    def _write_files(self, ckpt_dir: str, shared_payload, rank_payload) -> None:
+        if rank_payload is not None:
+            self._atomic_save(
+                rank_payload, os.path.join(ckpt_dir, self._rank_file(self._rank()))
+            )
+        if shared_payload is not None:
+            self._atomic_save(shared_payload, self._state_path(ckpt_dir))
+
+    def _write_payloads(self, pending, ckpt_dir, shared_payload, rank_payload):
+        try:
+            self._write_files(ckpt_dir, shared_payload, rank_payload)
+        except Exception as exc:  # noqa: BLE001 - reported by wait()
+            pending.error = f"{type(exc).__name__}: {exc}"
+
+    def _finalize(self, step: int, ckpt_dir: str, err: str) -> None:
         self._all_ok(err)
         if self.is_rank0():
             self._point(f"{self.run_id}-latest", ckpt_dir)
             self._rotate(keep_step=step)
         self._barrier()  # no rank proceeds before the checkpoint is complete
-        return ckpt_dir
+
+    @property
+    def has_pending_save(self) -> bool:
+        return self._pending is not None
+
+    def wait(self) -> None:
+        """Complete an in-flight asynchronous save. Collective, like ``save``."""
+        pending = self._pending
+        if pending is None:
+            return
+        pending.thread.join()
+        self._pending = None
+        self._finalize(pending.step, pending.ckpt_dir, pending.error)
+
+    def drain(self) -> None:
+        """Join a background writer without collectives (failure cleanup)."""
+        pending = self._pending
+        if pending is not None:
+            pending.thread.join()
 
     def _rewind(self, step: int) -> None:
         # Fork semantics: saving step S invalidates on-disk steps >= S, including
