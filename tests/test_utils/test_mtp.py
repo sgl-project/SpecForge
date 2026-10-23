@@ -297,6 +297,30 @@ class Qwen3MTPAttentionTest(unittest.TestCase):
                 torch.testing.assert_close(out, expected)
 
 
+class PartialRotaryEmbeddingTest(unittest.TestCase):
+    def test_reads_rope_theta_from_config(self):
+        config = _tiny_config(rope_theta=1e7)
+        rope = PartialRotaryEmbedding(config, config.head_dim)
+
+        dim = int(config.head_dim * config.partial_rotary_factor)
+        expected = 1.0 / (1e7 ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        torch.testing.assert_close(rope.inv_freq, expected)
+
+    def test_bf16_cast_keeps_fp32_frequencies(self):
+        """build_draft casts the draft to bf16; long positions must not drift."""
+        config = _tiny_config(rope_theta=1e7)
+        rope = PartialRotaryEmbedding(config, config.head_dim)
+        rope_bf16 = copy.deepcopy(rope).to(dtype=torch.bfloat16)
+        x = torch.zeros(1)
+        position_ids = torch.tensor([[100, 1000, 10000, 30000]])
+
+        cos, sin = rope(x, position_ids)
+        cos_bf16, sin_bf16 = rope_bf16(x, position_ids)
+
+        torch.testing.assert_close(cos_bf16, cos)
+        torch.testing.assert_close(sin_bf16, sin)
+
+
 class MTPTrainStrategyTest(unittest.TestCase):
     def test_forward_loss_adapts_model_outputs(self):
         loss = torch.tensor(1.5, requires_grad=True)
