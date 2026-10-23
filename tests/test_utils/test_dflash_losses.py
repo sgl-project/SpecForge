@@ -9,7 +9,6 @@ output, and LM head output are made deterministic.
 
 import copy
 import importlib.util
-import os
 import sys
 import types
 import unittest
@@ -139,7 +138,14 @@ class _FixedHead(nn.Module):
         self.register_buffer("fixed_logits", logits)
 
     def forward(self, hidden_states):
-        return self.fixed_logits.to(device=hidden_states.device)
+        logits = self.fixed_logits
+        if logits.ndim == 4:
+            # DFlash objectives omit the anchor; diagnostics keep the full block.
+            _, blocks, slots, _ = logits.shape
+            if hidden_states.shape[1] == blocks * (slots - 1):
+                logits = logits[:, :, 1:]
+            logits = logits.flatten(1, 2)
+        return logits.to(device=hidden_states.device)
 
 
 class _DualFixedHead(nn.Module):
@@ -182,8 +188,7 @@ def _make_model(logits, anchors, keep_mask, draft_model=None, lm_head=None, **kw
     bsz, n_blocks, block_size, vocab_size = logits.shape
     model = OnlineDFlashModel(
         draft_model=draft_model or _FixedDraft(hidden_size=4),
-        target_lm_head=lm_head
-        or _FixedHead(logits.reshape(bsz, n_blocks * block_size, vocab_size)),
+        target_lm_head=lm_head or _FixedHead(logits),
         target_embed_tokens=nn.Embedding(vocab_size, 4).double(),
         mask_token_id=0,
         block_size=block_size,
@@ -207,6 +212,8 @@ def _make_dspark_model(
     dtype=torch.double,
     **kwargs,
 ):
+    # Exercise the eager/legacy-TV formulas independently of joint fusion.
+    kwargs.setdefault("fused_logits_loss", False)
     bsz, n_blocks, block_size, vocab_size = logits.shape
     model = OnlineDSparkModel(
         draft_model=draft_model or _FixedDraft(hidden_size=4),
@@ -999,39 +1006,15 @@ def _triton_available() -> bool:
     return hasattr(triton, "jit")
 
 
-def _npu_available() -> bool:
-    # torch.npu is only bound once torch_npu has been imported; nothing on the
-    # pytest collection path imports it, so probe explicitly here.
-    try:
-        import torch_npu  # noqa: F401
-    except ImportError:
-        return False
-    npu = getattr(torch, "npu", None)
-    return npu is not None and npu.is_available()
-
-
-def _accelerator_device():
-    """Pick the accelerator the fused kernels can run on, or None to skip."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if _npu_available():
-        return "npu"
-    return None
-
-
-_ACCELERATOR_DEVICE = _accelerator_device()
+_ACCELERATOR_DEVICE = "cuda" if torch.cuda.is_available() else None
 _REQUIRES_FUSED = unittest.skipUnless(
     _ACCELERATOR_DEVICE is not None and _triton_available(),
-    "fused DSpark loss requires Triton plus a CUDA or Ascend NPU accelerator",
+    "fused DSpark loss requires Triton and CUDA",
 )
 
 
 class TestDSparkFusedLoss(unittest.TestCase):
-    """OnlineDSparkModel fused TV loss gating (CPU) and eager parity (device).
-
-    The selection test mocks the kernel so it runs on CPU. Real-kernel parity
-    tests require an accelerator and Triton.
-    """
+    """DSpark loss, telemetry and gradient parity across supported accelerators."""
 
     def setUp(self):
         (
@@ -1050,42 +1033,6 @@ class TestDSparkFusedLoss(unittest.TestCase):
             loss_mask=self.loss_mask,
             target_last_hidden_states=torch.zeros_like(self.hidden_states),
         )
-
-    def test_fused_selection_defaults_to_bf16_and_honors_overrides(self):
-        def eager_tv(logits, targets):
-            return 0.5 * (
-                logits.float().softmax(-1) - targets.float().softmax(-1)
-            ).abs().sum(-1)
-
-        for dtype in (torch.bfloat16, torch.float32, torch.float16):
-            model = _make_dspark_model(
-                self.logits,
-                self.anchors,
-                self.keep_mask,
-                lm_head=_DualFixedHead(self.logits, torch.randn_like(self.logits)),
-                dtype=dtype,
-            )
-            # Reuse the model to verify selection happens at the loss call site.
-            for env_value in (None, "0", "1"):
-                with self.subTest(dtype=dtype, env=env_value):
-                    with (
-                        patch.dict(os.environ),
-                        patch.object(
-                            _dflash_module.fused_loss,
-                            "fused_tv_loss",
-                            side_effect=eager_tv,
-                        ) as fused_call,
-                    ):
-                        os.environ.pop("SPECFORGE_DSPARK_FUSED_LOSS", None)
-                        if env_value is not None:
-                            os.environ["SPECFORGE_DSPARK_FUSED_LOSS"] = env_value
-                        loss, accuracy, _ = self._forward_with_target(model)
-                    expected = env_value == "1" or (
-                        env_value is None and dtype == torch.bfloat16
-                    )
-                    self.assertEqual(fused_call.called, expected)
-                    self.assertTrue(torch.isfinite(loss))
-                    self.assertTrue(torch.isfinite(accuracy))
 
     def test_top1_telemetry_matches_softmax_reference(self):
         """Pin p_max = exp(max_logit - logsumexp) to the softmax reference."""
@@ -1127,96 +1074,17 @@ class TestDSparkFusedLoss(unittest.TestCase):
             check_dtype=False,
         )
 
-    def test_fused_path_wiring_matches_eager_loss_and_gradient(self):
-        """CPU wiring check: route the fused call site to an exact eager TV.
-
-        The mock computes tv = 0.5 * l1 in fp32 with the same op order as the
-        eager branch, so l1 = 2 * tv and accept = 1 - tv are bit-identical to
-        the eager path; any mismatch means the fused call site is miswired
-        (shape, dtype, weight application, or gradient plumbing through the
-        checkpointed chunk recompute).
-        """
-        torch.manual_seed(77)
-        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
-        target_hidden = torch.randn_like(self.hidden_states)
-
-        def build():
-            return _make_dspark_model(
-                self.logits,
-                self.anchors,
-                self.keep_mask,
-                draft_model=_LearnableDSparkDraft(4).double(),
-                lm_head=copy.deepcopy(head),
-                objective_chunk_blocks=1,
-            )
-
-        eager_model = build()
-        fused_model = build()
-        fused_model.load_state_dict(eager_model.state_dict())
-
-        fused_loss_module = _dflash_module.fused_loss
-
-        def exact_eager_tv(logits, targets):
-            draft_p = torch.softmax(logits.float(), dim=-1)
-            target_p = torch.softmax(targets.float(), dim=-1)
-            return 0.5 * (draft_p - target_p).abs().sum(dim=-1)
-
-        with (
-            patch.dict(os.environ, {"SPECFORGE_DSPARK_FUSED_LOSS": "1"}),
-            patch.object(
-                fused_loss_module, "fused_tv_loss", side_effect=exact_eager_tv
-            ) as fused_mock,
-        ):
-            fused_value, _fused_acc, fused_metrics = fused_model(
-                input_ids=self.input_ids,
-                hidden_states=self.hidden_states,
-                loss_mask=self.loss_mask,
-                target_last_hidden_states=target_hidden,
-            )
-            self.assertTrue(fused_mock.called)
-            # Checkpoint recompute re-enters the chunk function during backward,
-            # so the fused patch must still be active here.
-            fused_value.backward()
-        with patch.dict(os.environ, {"SPECFORGE_DSPARK_FUSED_LOSS": "0"}):
-            eager_value, _eager_acc, eager_metrics = eager_model(
-                input_ids=self.input_ids,
-                hidden_states=self.hidden_states,
-                loss_mask=self.loss_mask,
-                target_last_hidden_states=target_hidden,
-            )
-            eager_value.backward()
-        torch.testing.assert_close(fused_value, eager_value, rtol=1e-6, atol=1e-9)
-        for name, eager_pair in eager_metrics["ratio_metrics"].items():
-            fused_pair = fused_metrics["ratio_metrics"][name]
-            torch.testing.assert_close(
-                fused_pair[0], eager_pair[0], rtol=1e-6, atol=1e-9, check_dtype=False
-            )
-            torch.testing.assert_close(fused_pair[1], eager_pair[1])
-
-        torch.testing.assert_close(
-            fused_model.draft_model.signal.grad,
-            eager_model.draft_model.signal.grad,
-            rtol=1e-6,
-            atol=1e-9,
-        )
-        torch.testing.assert_close(
-            fused_model.lm_head.weight.grad,
-            eager_model.lm_head.weight.grad,
-            rtol=1e-6,
-            atol=1e-9,
-        )
-
     @_REQUIRES_FUSED
     def test_fused_kernel_matches_eager_on_accelerator(self):
-        """Real fused TV kernel vs the eager path: loss, telemetry, gradients."""
-        self._check_fused_kernel_matches_eager("1", torch.float32)
+        """Fused loss vs the eager path: loss, telemetry, gradients."""
+        self._check_fused_kernel_matches_eager(torch.float32)
 
     @_REQUIRES_FUSED
     def test_default_bf16_kernel_matches_eager_on_accelerator(self):
         """The default BF16 route must execute the kernel and preserve gradients."""
-        self._check_fused_kernel_matches_eager(None, torch.bfloat16)
+        self._check_fused_kernel_matches_eager(torch.bfloat16)
 
-    def _check_fused_kernel_matches_eager(self, fused_env, dtype):
+    def _check_fused_kernel_matches_eager(self, dtype):
         torch.manual_seed(2024)
         device = torch.device(_ACCELERATOR_DEVICE)
         bsz, n_blocks, block_size, vocab_size = 2, 3, 4, 100
@@ -1251,23 +1119,17 @@ class TestDSparkFusedLoss(unittest.TestCase):
             loss_mask=loss_mask.to(device),
             target_last_hidden_states=target_hidden.to(device=device, dtype=dtype),
         )
-        with (
-            patch.dict(os.environ),
-            patch.object(
-                _dflash_module.fused_loss,
-                "fused_tv_loss",
-                wraps=_dflash_module.fused_loss.fused_tv_loss,
-            ) as fused_call,
-        ):
-            os.environ.pop("SPECFORGE_DSPARK_FUSED_LOSS", None)
-            if fused_env is not None:
-                os.environ["SPECFORGE_DSPARK_FUSED_LOSS"] = fused_env
+        fused_model.fused_logits_loss = True
+        with patch.object(
+            _dflash_module.fused_loss,
+            "fused_ce_l1_loss",
+            wraps=_dflash_module.fused_loss.fused_ce_l1_loss,
+        ) as fused_call:
             fused_value, _fused_acc, fused_metrics = fused_model(**inputs)
             fused_value.backward()
         fused_call.assert_called()
-        with patch.dict(os.environ, {"SPECFORGE_DSPARK_FUSED_LOSS": "0"}):
-            eager_value, _eager_acc, eager_metrics = eager_model(**inputs)
-            eager_value.backward()
+        eager_value, _eager_acc, eager_metrics = eager_model(**inputs)
+        eager_value.backward()
         torch.testing.assert_close(fused_value, eager_value, rtol=1e-3, atol=1e-5)
         for name, eager_pair in eager_metrics["ratio_metrics"].items():
             fused_pair = fused_metrics["ratio_metrics"][name]

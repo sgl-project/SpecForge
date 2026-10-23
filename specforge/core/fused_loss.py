@@ -54,6 +54,7 @@ __all__ = [
     "fused_nla_loss",
     "fused_lk_hybrid_loss",
     "fused_ce_l1_loss",
+    "supports_fused_ce_l1_loss",
     "CEL1Loss",
     # Eager reference/fallback implementations (pure PyTorch, CPU-safe)
     "kl_div_loss",
@@ -452,6 +453,21 @@ class CEL1Loss(NamedTuple):
     teacher_top1_probability: torch.Tensor | None
 
 
+def supports_fused_ce_l1_loss(logits: torch.Tensor) -> bool:
+    """Whether an optimized CE/L1 implementation supports this device and dtype."""
+    if logits.device.type != "cuda" or logits.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        return False
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def fused_ce_l1_loss(
     logits: torch.Tensor,
     target_ids: torch.Tensor,
@@ -459,11 +475,11 @@ def fused_ce_l1_loss(
     teacher_logits: torch.Tensor | None = None,
     top_k: int = 0,
 ) -> CEL1Loss:
-    """Joint hard-label CE and optional teacher L1; fused twin of ``ce_l1_loss``.
+    """Hard-label CE and optional teacher L1; optimized twin of ``ce_l1_loss``.
 
     For draft ``p = softmax(logits)`` and teacher ``q = softmax(teacher_logits)``,
     returns ``CE = -log(p[target_ids])`` and ``L1 = sum_v |p_v - q_v|``.
-    TV is ``L1 / 2``. CE and L1 share normalization and one logits backward;
+    TV is ``L1 / 2``. CE and L1 share normalization and backward;
     optional top-k gradients join that backward before its final dtype cast.
 
     Args:
@@ -512,7 +528,16 @@ def fused_ce_l1_loss(
             "fused_ce_l1_loss requires Triton; use ce_l1_loss instead"
         ) from exc
     shape, vocab = logits.shape[:-1], logits.shape[-1]
-    values = _FusedCEL1Loss.apply(
+    (
+        cross_entropy,
+        teacher_l1,
+        topk_values,
+        topk_ids,
+        argmax_ids,
+        top1_probability,
+        teacher_argmax_ids,
+        teacher_top1_probability,
+    ) = _FusedCEL1Loss.apply(
         logits.reshape(-1, vocab).contiguous(),
         target_ids.reshape(-1).contiguous(),
         (
@@ -522,14 +547,24 @@ def fused_ce_l1_loss(
         ),
         int(top_k),
     )
-    outputs = []
-    for index, value in enumerate(values):
-        if value is not None:
-            value = value.reshape((*shape, top_k) if index in (2, 3) else shape)
-        outputs.append(value)
-    if teacher_logits is None:
-        outputs[5] = None
-    return CEL1Loss(*outputs)
+    return CEL1Loss(
+        cross_entropy=cross_entropy.reshape(shape),
+        teacher_l1=None if teacher_l1 is None else teacher_l1.reshape(shape),
+        topk_values=topk_values.reshape(*shape, top_k),
+        topk_ids=topk_ids.reshape(*shape, top_k),
+        argmax_ids=argmax_ids.reshape(shape),
+        top1_probability=(
+            None if teacher_logits is None else top1_probability.reshape(shape)
+        ),
+        teacher_argmax_ids=(
+            None if teacher_argmax_ids is None else teacher_argmax_ids.reshape(shape)
+        ),
+        teacher_top1_probability=(
+            None
+            if teacher_top1_probability is None
+            else teacher_top1_probability.reshape(shape)
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -782,5 +817,12 @@ def ce_l1_loss(
         l1 = (p - q).abs().sum(-1)
         top1 = p.detach().max(-1).values
     return CEL1Loss(
-        ce, l1, topv, topi, logits.argmax(-1), top1, teacher_ids, teacher_top1
+        cross_entropy=ce,
+        teacher_l1=l1,
+        topk_values=topv,
+        topk_ids=topi,
+        argmax_ids=logits.argmax(-1),
+        top1_probability=top1,
+        teacher_argmax_ids=teacher_ids,
+        teacher_top1_probability=teacher_top1,
     )
