@@ -719,6 +719,8 @@ class TestPackageArchitecture(unittest.TestCase):
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
                 "qwen3.6-27b-dspark.json",
+                "qwen3.8-flash-next-dspark-moe512.json",
+                "qwen3.8-flash-next-dspark-moe64.json",
             },
         )
         for name, payload in dspark_configs.items():

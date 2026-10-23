@@ -1,0 +1,75 @@
+# Qwen3.8-Flash-Next DSpark draft training on Ascend NPUs from offline features.
+#
+# The target is MoE (512 routed experts of width 640, top-10, one sigmoid-gated
+# shared expert), so the drafter is MoE too, in two arms that differ only in
+# the routed-expert count:
+#
+#   configs/qwen3.8-flash-next-dspark-moe64.json   2.0B, this file's default:
+#       fits every rank whole, so plain data parallel (DDP) on eight cards.
+#   configs/qwen3.8-flash-next-dspark-moe512.json  13.0B, 12.6B of it routed
+#       experts. It needs expert parallelism to train at speed, which this
+#       repository does not have yet; the config is shipped so the MTP warm
+#       start and serving can already target it.
+#
+# Both drafters mirror the target's MTP layer -- 24 query / 2 KV heads of 256,
+# gated attention output, RoPE on 64 of the 256 channels -- so it can warm-start
+# them (scripts/warm_start_from_mtp.py). They read five full-attention layers,
+# [3, 15, 23, 35, 43]; each tap is the next layer's own gated read of the
+# 4-stream residual (layers[i + 1].attn_hyper_connection(streams)[0]), which
+# the serving engine has to reproduce.
+#
+# Features come from scripts/prepare_hidden_states.py with --target-backend hf
+# (the Transformers reference model, transformers>=5.16.1 in the capture
+# environment only) or --target-backend vllm (a running vLLM / vLLM-Ascend
+# hidden-state server). Use the same tokenizer, chat template and max_length
+# there as here.
+model:
+  target_model_path: Qwen/Qwen3.8-Flash-Next
+  draft_model_config: configs/qwen3.8-flash-next-dspark-moe64.json
+  target_backend: sglang
+  trust_remote_code: true
+  # A VL checkpoint: the text embeddings sit under language_model.
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  mask_token_id: 248070
+
+data:
+  hidden_states_path: ./cache/hidden_states/qwen3.8-flash-next-dspark
+  max_length: 4096
+  # Flash-Next ships Qwen3.8-27B's chat_template.jinja and tokenizer byte for
+  # byte; like the other Qwen3.8 recipes it uses the qwen3.5 entry.
+  chat_template: qwen3.5
+  cache_dir: cache
+  build_dataset_num_proc: 64
+
+training:
+  strategy: dspark
+  num_epochs: 10
+  # Global batch 512 on eight data-parallel ranks.
+  batch_size: 1
+  accumulation_steps: 64
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  objective_chunk_blocks: 128
+  attention_backend: sdpa
+  # Replicated DDP rather than FSDP: the 64-expert drafter fits each rank.
+  fsdp_sharding: NO_SHARD
+  save_interval: 125
+  log_interval: 20
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+run_id: qwen3.8-flash-next-dspark-offline-npu
+output_dir: outputs/qwen3.8-flash-next-dspark-offline-npu
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
