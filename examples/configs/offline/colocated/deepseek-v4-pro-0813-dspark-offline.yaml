@@ -1,0 +1,35 @@
+model:
+  target_model_path: /path/to/DeepSeek-V4-Pro-0813
+  draft_model_config: configs/deepseek-v4-pro-0813-dspark.json
+  draft_checkpoint_path: ./models/deepseek-v4-pro-0813-dspark
+  trust_remote_code: true
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/deepseek-v4-pro-0813-dspark
+  max_length: 2048
+  chat_template: deepseek-v4
+
+training:
+  strategy: dspark
+  batch_size: 1
+  learning_rate: 1.0e-5
+  attention_backend: sdpa
+  fsdp_sharding: FULL_SHARD
+  num_anchors: 32
+  objective_chunk_blocks: 2
+  save_interval: 1000
+  log_interval: 10
+  dist_timeout: 30
+
+run_id: deepseek-v4-pro-0813-dspark-offline
+output_dir: ./outputs/deepseek-v4-pro-0813-dspark-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

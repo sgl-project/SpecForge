@@ -1,0 +1,53 @@
+model:
+  target_model_path: /path/to/DeepSeek-V4-Pro-0813
+  target_backend: sglang
+  draft_model_config: configs/deepseek-v4-pro-0813-dspark.json
+  draft_checkpoint_path: ./models/deepseek-v4-pro-0813-dspark
+  trust_remote_code: true
+  embedding_key: embed.weight
+  lm_head_key: head.weight
+  mask_token_id: 128799
+  torch_dtype: bfloat16
+  tokenizer_pad_token_id: 1
+
+data:
+  train_data_path: ./cache/dataset/regenerate_train.jsonl
+  max_length: 2048
+  chat_template: deepseek-v4
+  dataloader_num_workers: 0
+
+training:
+  strategy: dspark
+  role: auto
+  batch_size: 1
+  learning_rate: 1.0e-5
+  attention_backend: sdpa
+  fsdp_sharding: FULL_SHARD
+  num_anchors: 32
+  objective_chunk_blocks: 2
+  save_interval: 1000
+  log_interval: 10
+  dist_timeout: 30
+
+run_id: deepseek-v4-pro-0813-dspark-disaggregated
+output_dir: ./outputs/deepseek-v4-pro-0813-dspark-disaggregated
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: ./outputs/deepseek-v4-pro-0813-dspark-disaggregated/control
+    consumer_state_dir: ./outputs/deepseek-v4-pro-0813-dspark-disaggregated/consumer-state
+    backend: mooncake
+    store_id: deepseek-v4-pro-0813-dspark
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_local_hostname: 127.0.0.1
+    mooncake_protocol: tcp
+    client_buffer_size: 1073741824
+    receive_buffers: pinned
+    receive_pool_bytes: 1073741824
