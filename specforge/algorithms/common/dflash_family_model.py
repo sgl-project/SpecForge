@@ -262,6 +262,7 @@ class OnlineDFlashModel(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        loss_decay_gamma_warmup_step: float = 0.0,
         objective_chunk_blocks: int = 128,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
@@ -305,6 +306,8 @@ class OnlineDFlashModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.loss_decay_gamma_warmup_step = float(loss_decay_gamma_warmup_step)
+        self._warmup_epoch = 0
         self.objective_chunk_blocks = int(objective_chunk_blocks)
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
@@ -340,6 +343,15 @@ class OnlineDFlashModel(nn.Module):
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
+
+    def _effective_loss_decay_gamma(self) -> Optional[float]:
+        """Position-decay gamma for the current epoch."""
+        if self.loss_decay_gamma is None:
+            return None
+        return (
+            self.loss_decay_gamma
+            + self.loss_decay_gamma_warmup_step * self._warmup_epoch
+        )
 
     def _sample_anchor_positions(
         self,
@@ -862,14 +874,15 @@ class OnlineDFlashModel(nn.Module):
         target_probability = torch.exp(-neg_log_q)
         loss_weights = weight_mask
         if self.loss_type == "dflash":
-            if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+            gamma = self._effective_loss_decay_gamma()
+            if gamma is not None and gamma > 0:
                 positions = torch.arange(
                     1 if fused_head else 0,
                     self.block_size,
                     device=hidden.device,
                 ).view(1, 1, -1)
                 decay_weights = torch.exp(
-                    -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
+                    -(positions - 1).clamp(min=0).float() / gamma
                 )
                 loss_weights = loss_weights * decay_weights
             loss_den = loss_weights.sum()
@@ -1070,14 +1083,15 @@ class OnlineDFlashModel(nn.Module):
         """Reconstruct effective objective weights for position-share metrics."""
 
         if self.loss_type == "dflash":
-            if self.loss_decay_gamma is None or self.loss_decay_gamma <= 0:
+            gamma = self._effective_loss_decay_gamma()
+            if gamma is None or gamma <= 0:
                 return weight_mask
             positions = torch.arange(
                 weight_mask.shape[-1],
                 device=weight_mask.device,
             ).view(1, 1, -1)
             decay_weights = torch.exp(
-                -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
+                -(positions - 1).clamp(min=0).float() / gamma
             )
             return weight_mask * decay_weights
 
@@ -1397,9 +1411,11 @@ class OnlineDFlashModel(nn.Module):
         max_valid_anchors: Optional[int] = None,
         selector_loss_alpha: Optional[float] = None,
         collect_detailed_metrics: bool = True,
+        epoch: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
+        self._warmup_epoch = int(epoch)
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
@@ -1733,6 +1749,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        loss_decay_gamma_warmup_step: float = 0.0,
         objective_chunk_blocks: int = 128,
         shift_label: bool = False,
     ):
@@ -1745,6 +1762,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
+            loss_decay_gamma_warmup_step=loss_decay_gamma_warmup_step,
             objective_chunk_blocks=objective_chunk_blocks,
             loss_type="dflash",
         )
@@ -1876,8 +1894,10 @@ class OnlineDominoModel(OnlineDFlashModel):
         lambda_base: float = 0.0,
         max_valid_anchors: Optional[int] = None,
         collect_detailed_metrics: bool = True,
+        epoch: int = 0,
     ):
         """Parallel Domino training forward pass."""
+        self._warmup_epoch = int(epoch)
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
@@ -1931,12 +1951,11 @@ class OnlineDominoModel(OnlineDFlashModel):
 
         eval_weight_mask = weight_mask.clone()
 
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+        gamma = self._effective_loss_decay_gamma()
+        if gamma is not None and gamma > 0:
             k = torch.arange(self.block_size, device=device).view(1, 1, -1)
             offset = 0 if self.shift_label else 1
-            decay_weights = torch.exp(
-                -(k - offset).clamp(min=0).float() / self.loss_decay_gamma
-            )
+            decay_weights = torch.exp(-(k - offset).clamp(min=0).float() / gamma)
             weight_mask = weight_mask * decay_weights
 
         (
@@ -2020,6 +2039,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        loss_decay_gamma_warmup_step: float = 0.0,
         dspark_ce_loss_alpha: float = 0.1,
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
@@ -2034,6 +2054,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
+            loss_decay_gamma_warmup_step=loss_decay_gamma_warmup_step,
             objective_chunk_blocks=objective_chunk_blocks,
             loss_type="dflash",
         )
@@ -2089,11 +2110,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
         eval_mask: torch.Tensor,
     ) -> torch.Tensor:
         loss_weight_mask = eval_mask.to(torch.float32)
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+        gamma = self._effective_loss_decay_gamma()
+        if gamma is not None and gamma > 0:
             positions = torch.arange(self.block_size, device=eval_mask.device).view(
                 1, 1, -1
             )
-            decay_weights = torch.exp(-positions.float() / float(self.loss_decay_gamma))
+            decay_weights = torch.exp(-positions.float() / float(gamma))
             loss_weight_mask = loss_weight_mask * decay_weights
         return loss_weight_mask
 
@@ -2423,8 +2445,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
         target_last_hidden_states: Optional[torch.Tensor] = None,
         max_valid_anchors: Optional[int] = None,
         collect_detailed_metrics: bool = True,
+        epoch: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
+        self._warmup_epoch = int(epoch)
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."

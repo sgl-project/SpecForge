@@ -369,6 +369,7 @@ def _build_dflash_family_model(
         "attention_backend": cfg.training.attention_backend,
         "num_anchors": cfg.training.num_anchors,
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
+        "loss_decay_gamma_warmup_step": cfg.training.loss_decay_gamma_warmup_step,
         "objective_chunk_blocks": cfg.training.objective_chunk_blocks,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))

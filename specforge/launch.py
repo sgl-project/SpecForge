@@ -77,6 +77,7 @@ def _assemble_trainer(
     on_fit_success: Optional[Callable[[int], None]] = None,
     on_fit_failure: Optional[Callable[[BaseException], None]] = None,
     on_fit_finally: Optional[Callable[[], None]] = None,
+    steps_per_epoch: Optional[float] = None,
 ):
     """Delegate to the domain ``Trainer`` (``specforge.training``) — the one
     assembly (FSDP wrap, optimizer-after-wrap, per-step strategy, loader, acks)
@@ -128,6 +129,7 @@ def _assemble_trainer(
         num_epochs=num_epochs,
         max_steps=max_steps,
         total_steps=total_steps,
+        steps_per_epoch=steps_per_epoch,
         save_interval=save_interval,
         eval_interval=eval_interval,
         eval_data_factory=eval_data_factory,
@@ -1544,6 +1546,7 @@ def build_disagg_online_consumer(
     accumulation_steps: int = 1,
     max_steps: Optional[int] = None,
     total_steps: Optional[int] = None,
+    steps_per_epoch: Optional[float] = None,
     save_interval: int = 0,
     eval_interval: int = 0,
     eval_data_factory=None,
@@ -1902,6 +1905,7 @@ def build_disagg_online_consumer(
             num_epochs=1,
             max_steps=max_steps,
             total_steps=total_steps,
+            steps_per_epoch=steps_per_epoch,
             save_interval=save_interval,
             eval_interval=eval_interval,
             eval_data_factory=eval_data_factory,
