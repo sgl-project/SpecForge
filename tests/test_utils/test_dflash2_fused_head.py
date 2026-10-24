@@ -78,6 +78,58 @@ def _online_model(device, dtype, *, plain=False, draft_overrides=None, **kwargs)
 
 
 class FusedHeadGateTest(unittest.TestCase):
+    def test_objective_and_diagnostics_share_weights_and_selector_terms(self):
+        for loss_type in (
+            "dflash",
+            "dpace",
+            "dpace-cumulative-confidence-only",
+            "dpace-continuation-value-only",
+        ):
+            with self.subTest(loss_type=loss_type):
+                model = _online_model(
+                    "cpu", torch.float32, loss_type=loss_type, loss_decay_gamma=2.0
+                )
+                hidden = torch.randn(2, 3, 4, 64, requires_grad=True)
+                with torch.no_grad():
+                    candidates = model._dflash_logits(hidden).topk(17, dim=-1).indices
+                    targets = candidates[..., 0].clone()
+                    # Include a candidate miss, a masked tail, and an empty block.
+                    targets[0, 0, 2] = candidates[0, 0, 2, -1]
+                mask = torch.ones_like(targets, dtype=torch.float32)
+                mask[..., 0] = 0
+                mask[0, 1, -1] = 0
+                mask[1, 2] = 0
+                predecessors = torch.zeros_like(targets)
+                scale = model._sequence_anchor_scale(mask)
+                metrics = model._dflash_metric_chunk_terms(
+                    hidden,
+                    targets,
+                    mask,
+                    predecessors,
+                    aligned_target_hidden=hidden,
+                    sequence_anchor_scale=scale,
+                )
+                objective = model._dflash_objective_chunk_terms(
+                    hidden[:, :, 1:],
+                    targets[:, :, 1:],
+                    mask[:, :, 1:],
+                    predecessors[:, :, 1:],
+                    scale,
+                )
+                self.assertTrue(objective.selector_ce_num.requires_grad)
+                self.assertTrue(all(not term.requires_grad for term in metrics))
+                self.assertEqual(metrics.loss_weight_num[0].item(), 0.0)
+                torch.testing.assert_close(
+                    objective.selector_ce_num, metrics.selector_ce_num.sum()
+                )
+                torch.testing.assert_close(
+                    objective.selector_weight_den, metrics.selector_weight_den.sum()
+                )
+                if loss_type == "dflash":
+                    torch.testing.assert_close(
+                        objective.loss_den, metrics.loss_weight_num.sum()
+                    )
+
     def test_identity_transform_is_a_bitwise_upcast(self):
         model = DFlash2DraftModel(_draft_config())
         logits = torch.randn(3, 7, dtype=torch.bfloat16)
