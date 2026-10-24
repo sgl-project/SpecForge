@@ -178,6 +178,66 @@ class TestNormalizeDFlashExport(unittest.TestCase):
             )
             self.assertEqual(json.loads(path.read_text()), normalized)
 
+    def test_normalizes_moe_dspark_to_the_specforge_served_architecture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            config = {
+                "architectures": ["DSparkDraftModel"],
+                "block_size": 16,
+                "model_type": "qwen3",
+                "moe_preset": "qwen3_5_moe",
+                "num_experts": 8,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 1536,
+                "dflash_config": {
+                    "projector_type": "dspark",
+                    "markov_rank": 256,
+                    "markov_head_type": "vanilla",
+                },
+            }
+            path.write_text(json.dumps(config), encoding="utf-8")
+            normalized = self.module.normalize_export(str(path), 16)
+            self.assertEqual(normalized["architectures"], ["Qwen3MoeDSparkModel"])
+
+            config["num_experts"] = 0
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "num_experts"):
+                self.module.normalize_export(str(path), 16)
+
+    def test_moe_exports_name_the_served_class_of_each_draft_kind(self):
+        moe = {
+            "moe_preset": "qwen3_5_moe",
+            "num_experts": 8,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 1536,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            dflash = {"architectures": ["DFlashDraftModel"], "block_size": 16, **moe}
+            path.write_text(json.dumps(dflash), encoding="utf-8")
+            normalized = self.module.normalize_export(str(path), 16)
+            self.assertEqual(normalized["architectures"], ["DFlashMoEDraftModel"])
+
+            dflash2 = {
+                "architectures": ["DFlash2DraftModel"],
+                "dflash_config": {
+                    "block_size": 8,
+                    "conv_group_size": 16,
+                    "conv_kernel_size": 2,
+                    "selector_rank": 256,
+                    "selector_top_k": 16,
+                },
+                **moe,
+            }
+            path.write_text(json.dumps(dflash2), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "no SGLang model serves a dflash2"):
+                self.module.normalize_export(str(path), 8)
+
+            unknown = {**dflash, "moe_preset": "deepseek_v4"}
+            path.write_text(json.dumps(unknown), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "moe_preset='deepseek_v4'"):
+                self.module.normalize_export(str(path), 16)
+
     def test_preserves_dflash2_architecture_and_nested_block_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

@@ -140,6 +140,14 @@ python scripts/gates/normalize_dflash_export.py \
 The normalizer preserves DFlash/Domino exports as ``DFlashDraftModel``. For a
 DSpark export it selects SGLang's ``Qwen3DSparkModel`` architecture and promotes
 the Markov/confidence settings required by the SGLang loader to the top level.
+For an MoE draft (``moe_preset`` set) it names the class in
+``specforge.serving.sglang_models`` that serves it (``Qwen3MoeDSparkModel`` for
+DSpark, ``DFlashMoEDraftModel`` for DFlash) and refuses exports nothing serves.
+Start SGLang with ``SGLANG_EXTERNAL_MODEL_PACKAGE=specforge.serving.sglang_models``
+so it finds those classes; a trained ``gate.expert_bias`` is applied to the
+routing as in training. ``python scripts/gates/check_moe_sglang_equivalence.py
+--export <normalized export>`` compares the served MoE FFN with the trained one
+layer by layer on one GPU.
 
 Start SGLang in the first terminal:
 
