@@ -391,6 +391,23 @@ class TestDFlashLosses(unittest.TestCase):
         want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=None)
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
+    def test_public_dpace_weights_are_detached_and_match_reference(self):
+        from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
+
+        probability = self.q.detach().requires_grad_(True)
+        mask = self.binary_mask.clone()
+        mask[..., 1] = 0  # A gap must not reset the survival prefix.
+        mask[0, 0] = 0
+        for mode in sorted(DPACE_LOSS_TYPES):
+            for alpha in (0.0, 0.5, 1.0):
+                with self.subTest(mode=mode, alpha=alpha):
+                    weights = dpace_weights(probability, mask, alpha=alpha, mode=mode)
+                    expected = _naive_dpace_weight(probability, mask, alpha, mode)
+                    torch.testing.assert_close(weights, expected)
+                    self.assertFalse(weights.requires_grad)
+        with self.assertRaisesRegex(ValueError, "unknown D-PACE mode"):
+            dpace_weights(probability, mask, alpha=0.5, mode="unsupported")
+
     def test_dflash_decay_gamma_is_preserved(self):
         gamma = 7.0
         got = self._forward_loss(loss_type="dflash", loss_decay_gamma=gamma)

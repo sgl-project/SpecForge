@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core import fused_loss
 from specforge.core.chunking import checkpointed_chunk_reduce
+from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash_mask import (
     create_dflash_block_mask,
@@ -30,13 +31,7 @@ except ImportError:
 if hasattr(torch, "npu") and torch.npu.is_available():
     FLEX_ATTENTION_AVAILABLE = False
 
-_VALID_LOSS_TYPES = {
-    "dflash",
-    "dpace",
-    "dpace-cumulative-confidence-only",
-    "dpace-continuation-value-only",
-}
-_DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
+_VALID_LOSS_TYPES = {"dflash", *DPACE_LOSS_TYPES}
 _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
 
 
@@ -151,7 +146,6 @@ class _DFlashUnaryDiagnostics(NamedTuple):
     topk_logits: torch.Tensor
     candidate_ids: torch.Tensor
     target_is_candidate: torch.Tensor
-    target_candidate_index: torch.Tensor
 
 
 class _DFlashSelectorDiagnostics(NamedTuple):
@@ -412,38 +406,6 @@ class OnlineDFlashModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
-    def _dpace_weight(
-        self,
-        prob: torch.Tensor,
-        binary_mask: torch.Tensor,
-        binary_mask_b: torch.Tensor,
-        loss_type: str,
-    ) -> torch.Tensor:
-        """Compute detached D-PACE position weights.
-
-        ``prob`` is the draft probability on the target token at each draft
-        position. Invalid positions are treated as multiplicative no-ops inside
-        prefix products and excluded from suffix sums; the caller still
-        multiplies the returned weights by ``binary_mask`` before reduction.
-        """
-        smooth = (1.0 - self.dpace_alpha) * prob + self.dpace_alpha
-        smooth = torch.where(binary_mask_b, smooth, torch.ones_like(smooth))
-        prefix = torch.cumprod(smooth, dim=-1)
-
-        if loss_type == "dpace-cumulative-confidence-only":
-            return prefix
-
-        suffix = torch.flip(
-            torch.cumsum(torch.flip(prefix * binary_mask, dims=[-1]), dim=-1),
-            dims=[-1],
-        )
-
-        if loss_type == "dpace":
-            return suffix
-        if loss_type == "dpace-continuation-value-only":
-            return suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
-        raise ValueError(f"unknown D-PACE loss_type {loss_type!r}")
-
     def _aligned_target_hidden(
         self,
         target_last_hidden_states: torch.Tensor,
@@ -682,8 +644,8 @@ class OnlineDFlashModel(nn.Module):
         )
         return anchor_positions, block_keep_mask, output_hidden
 
+    @staticmethod
     def _selector_token_terms(
-        self,
         candidate_selector: nn.Module,
         hidden: torch.Tensor,
         target_ids: torch.Tensor,
@@ -691,16 +653,7 @@ class OnlineDFlashModel(nn.Module):
         topk_values: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> SelectorTokenTerms:
-        """Score candidates and compute selector CE outside the logits operator.
-
-        Selector gradients reach the backbone through both hidden states and
-        top-k values. Only the latter join the fused logits backward. Detaching
-        both inputs isolates selector training without detaching the token loss.
-        """
-        if self.selector_stop_gradient:
-            topk_values = topk_values.detach()
-            hidden = hidden.detach()
-
+        """Return teacher-forced selector terms; callers control gradients and weights."""
         target_matches = topk_ids.eq(target_ids.unsqueeze(-1))
         target_is_candidate = target_matches.any(dim=-1)
         target_candidate_index = target_matches.long().argmax(dim=-1)
@@ -715,10 +668,9 @@ class OnlineDFlashModel(nn.Module):
             target_candidate_index.reshape(-1),
             reduction="none",
         ).reshape_as(target_ids)
-        with torch.no_grad():
-            selected_ids = topk_ids.gather(
-                -1, selector_logits.argmax(dim=-1, keepdim=True)
-            ).squeeze(-1)
+        selected_ids = topk_ids.gather(
+            -1, selector_logits.argmax(dim=-1, keepdim=True)
+        ).squeeze(-1)
         return SelectorTokenTerms(
             cross_entropy=selector_ce,
             target_is_candidate=target_is_candidate,
@@ -777,6 +729,44 @@ class OnlineDFlashModel(nn.Module):
             return transform(logits)
         return logits
 
+    @torch.no_grad()
+    def _dflash_loss_weights(
+        self,
+        target_probability: torch.Tensor,
+        weight_mask: torch.Tensor,
+        *,
+        slot_positions: torch.Tensor,
+        sequence_anchor_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Detached token weights; slot positions refer to the original full block.
+
+        Training can omit anchor slot 0 while diagnostics retain it. D-PACE
+        uses full-sequence anchor counts; callers keep their own reductions.
+        """
+        if self.loss_type == "dflash":
+            if self.loss_decay_gamma is None or self.loss_decay_gamma <= 0:
+                return weight_mask
+            decay_weights = torch.exp(
+                -(slot_positions - 1).clamp(min=0).float() / self.loss_decay_gamma
+            )
+            return weight_mask * decay_weights
+
+        if self.loss_type in DPACE_LOSS_TYPES:
+            if sequence_anchor_scale is None:
+                raise ValueError(
+                    "precomputed full-sequence sequence_anchor_scale is required "
+                    "for D-PACE weights"
+                )
+            position_weights = dpace_weights(
+                target_probability,
+                weight_mask,
+                alpha=self.dpace_alpha,
+                mode=self.loss_type,
+            )
+            return weight_mask * position_weights * sequence_anchor_scale
+
+        raise ValueError(f"unknown loss_type {self.loss_type!r}")
+
     def _dflash_objective_chunk_terms(
         self,
         hidden: torch.Tensor,
@@ -797,35 +787,19 @@ class OnlineDFlashModel(nn.Module):
         neg_log_q = terms.cross_entropy
 
         target_probability = torch.exp(-neg_log_q)
-        loss_weights = weight_mask
+        slot_positions = torch.arange(
+            self.block_size - block_size, self.block_size, device=hidden.device
+        )
+        loss_weights = self._dflash_loss_weights(
+            target_probability,
+            weight_mask,
+            slot_positions=slot_positions,
+            sequence_anchor_scale=sequence_anchor_scale,
+        )
         if self.loss_type == "dflash":
-            if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-                positions = torch.arange(
-                    self.block_size - block_size,
-                    self.block_size,
-                    device=hidden.device,
-                ).view(1, 1, -1)
-                decay_weights = torch.exp(
-                    -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
-                )
-                loss_weights = loss_weights * decay_weights
             loss_den = loss_weights.sum()
-        elif self.loss_type in _DPACE_LOSS_TYPES:
-            if sequence_anchor_scale is None:
-                raise ValueError(
-                    "precomputed full-sequence sequence_anchor_scale is required "
-                    "for D-PACE chunk reduction"
-                )
-            with torch.no_grad():
-                dpace_weights = self._dpace_weight(
-                    target_probability.detach(),
-                    weight_mask,
-                    weight_mask > 0,
-                    self.loss_type,
-                )
-            loss_weights = weight_mask * dpace_weights
+        elif self.loss_type in DPACE_LOSS_TYPES:
             valid_anchors = (weight_mask > 0).any(dim=-1)
-            loss_weights = loss_weights * sequence_anchor_scale
             # Each valid anchor contributes 1 / A_b to the denominator, so
             # reducing all chunks yields the number of valid sequences. This
             # preserves D-PACE's total credit mass while balancing sequences
@@ -847,12 +821,20 @@ class OnlineDFlashModel(nn.Module):
         if self._selector_objective_enabled:
             # Gate on static configuration only: zero-scaled warmup must retain
             # the selector graph for DDP(find_unused_parameters=False).
+            # Hidden states provide a direct backbone gradient; top-k values
+            # provide the path through logits (and the fused loss backward).
+            selector_hidden = hidden.detach() if self.selector_stop_gradient else hidden
+            selector_values = (
+                terms.topk_values.detach()
+                if self.selector_stop_gradient
+                else terms.topk_values
+            )
             selector = self._selector_token_terms(
                 candidate_selector=candidate_selector,
-                hidden=hidden,
+                hidden=selector_hidden,
                 target_ids=target_ids,
                 predecessor_ids=predecessor_ids,
-                topk_values=terms.topk_values,
+                topk_values=selector_values,
                 topk_ids=terms.topk_ids,
             )
             # A candidate miss has no selector target and carries no selector CE.
@@ -906,6 +888,7 @@ class OnlineDFlashModel(nn.Module):
         vocab_size = getattr(self.embed_tokens, "num_embeddings", None)
         return top_k if vocab_size is None else min(top_k, int(vocab_size))
 
+    @torch.no_grad()
     def _dflash_metric_chunk_terms(
         self,
         hidden: torch.Tensor,
@@ -931,10 +914,11 @@ class OnlineDFlashModel(nn.Module):
             target_ids,
             top_k=self._metric_top_k(),
         )
-        loss_weights = self._dflash_metric_loss_weights(
+        loss_weights = self._dflash_loss_weights(
             unary.hard_label_probability,
             weight_mask,
-            sequence_anchor_scale,
+            slot_positions=torch.arange(weight_mask.shape[-1], device=hidden.device),
+            sequence_anchor_scale=sequence_anchor_scale,
         )
         selector = None
         if candidate_selector is not None:
@@ -942,6 +926,7 @@ class OnlineDFlashModel(nn.Module):
                 candidate_selector=candidate_selector,
                 unary=unary,
                 hidden=hidden,
+                target_ids=target_ids,
                 predecessor_ids=predecessor_ids,
                 loss_weights=loss_weights,
                 weight_mask=weight_mask,
@@ -1001,73 +986,34 @@ class OnlineDFlashModel(nn.Module):
             topk_logits=topk_logits,
             candidate_ids=candidate_ids,
             target_is_candidate=target_matches.any(dim=-1),
-            target_candidate_index=target_matches.long().argmax(dim=-1),
         )
 
-    def _dflash_metric_loss_weights(
-        self,
-        hard_label_probability: torch.Tensor,
-        weight_mask: torch.Tensor,
-        sequence_anchor_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Reconstruct effective objective weights for position-share metrics."""
-
-        if self.loss_type == "dflash":
-            if self.loss_decay_gamma is None or self.loss_decay_gamma <= 0:
-                return weight_mask
-            positions = torch.arange(
-                weight_mask.shape[-1],
-                device=weight_mask.device,
-            ).view(1, 1, -1)
-            decay_weights = torch.exp(
-                -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
-            )
-            return weight_mask * decay_weights
-
-        if sequence_anchor_scale is None:
-            raise ValueError(
-                "precomputed full-sequence sequence_anchor_scale is required "
-                "for D-PACE metric reduction"
-            )
-        dpace_weights = self._dpace_weight(
-            hard_label_probability,
-            weight_mask,
-            weight_mask > 0,
-            self.loss_type,
-        )
-        return weight_mask * dpace_weights * sequence_anchor_scale
-
-    @staticmethod
     def _dflash2_selector_diagnostics(
+        self,
         *,
         candidate_selector: nn.Module,
         unary: _DFlashUnaryDiagnostics,
         hidden: torch.Tensor,
+        target_ids: torch.Tensor,
         predecessor_ids: torch.Tensor,
         loss_weights: torch.Tensor,
         weight_mask: torch.Tensor,
     ) -> _DFlashSelectorDiagnostics:
         """Evaluate the selector with ground-truth predecessor tokens."""
 
-        selector_logits = candidate_selector.score_candidates(
-            candidate_ids=unary.candidate_ids,
-            unary_logits=unary.topk_logits,
-            hidden_states=hidden,
+        selector = self._selector_token_terms(
+            candidate_selector=candidate_selector,
+            hidden=hidden,
+            target_ids=target_ids,
             predecessor_ids=predecessor_ids,
+            topk_values=unary.topk_logits,
+            topk_ids=unary.candidate_ids,
         )
-        selector_ce = F.cross_entropy(
-            selector_logits.float().reshape(-1, selector_logits.shape[-1]),
-            unary.target_candidate_index.reshape(-1),
-            reduction="none",
-        ).reshape_as(unary.target_candidate_index)
-        target_is_candidate = unary.target_is_candidate.float()
+        target_is_candidate = selector.target_is_candidate.float()
         return _DFlashSelectorDiagnostics(
-            cross_entropy=selector_ce,
+            cross_entropy=selector.cross_entropy,
             loss_weights=loss_weights * target_is_candidate,
-            selected_ids=unary.candidate_ids.gather(
-                -1,
-                selector_logits.argmax(dim=-1, keepdim=True),
-            ).squeeze(-1),
+            selected_ids=selector.selected_ids,
             covered_mask=weight_mask * target_is_candidate,
         )
 
@@ -1165,14 +1111,8 @@ class OnlineDFlashModel(nn.Module):
         if aligned_target_hidden is None:
             return _DFlashTeacherTerms.zeros(position_den)
 
-        batch_size, num_blocks, block_size, hidden_size = aligned_target_hidden.shape
-        teacher_logits = self.lm_head(
-            aligned_target_hidden.reshape(
-                batch_size,
-                num_blocks * block_size,
-                hidden_size,
-            )
-        ).reshape_as(unary.probabilities)
+        block_size = aligned_target_hidden.shape[2]
+        teacher_logits = self._project_logits(aligned_target_hidden)
         teacher_probabilities = torch.softmax(teacher_logits.float(), dim=-1)
         teacher_ids = teacher_logits.argmax(dim=-1)
         expected_acceptance = (
@@ -1408,7 +1348,7 @@ class OnlineDFlashModel(nn.Module):
             else None
         )
         sequence_anchor_scale = None
-        if self.loss_type in _DPACE_LOSS_TYPES:
+        if self.loss_type in DPACE_LOSS_TYPES:
             sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
         metric_terms = None
         if collect_detailed_metrics:
@@ -1734,10 +1674,8 @@ class OnlineDominoModel(OnlineDFlashModel):
         """Return additive Domino loss and telemetry terms for one block slice."""
         from specforge.core.domino_loss import domino_weighted_cross_entropy
 
-        batch_size, num_blocks, block_size, hidden_size = hidden.shape
-        base_logits = self.lm_head(
-            hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
-        ).reshape(batch_size, num_blocks, block_size, -1)
+        block_size = hidden.shape[2]
+        base_logits = self._project_logits(hidden)
         head_token_ids = prev_ids if self.shift_label else target_ids
         head_token_embeddings = self.embed_tokens(head_token_ids)
         correction_logits = self.draft_model.compute_correction_logits(
@@ -2042,25 +1980,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             decay_weights = torch.exp(-positions.float() / float(self.loss_decay_gamma))
             loss_weight_mask = loss_weight_mask * decay_weights
         return loss_weight_mask
-
-    def _aligned_target_hidden(
-        self,
-        target_last_hidden_states: torch.Tensor,
-        safe_label_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Gather the target state that predicts each DSpark label token."""
-
-        target_pred_indices = (safe_label_indices - 1).clamp(min=0)
-        batch_size = target_last_hidden_states.shape[0]
-        hidden_size = target_last_hidden_states.shape[-1]
-        gather_indices = target_pred_indices.reshape(batch_size, -1, 1).expand(
-            -1, -1, hidden_size
-        )
-        return torch.gather(
-            target_last_hidden_states,
-            1,
-            gather_indices,
-        ).reshape(*safe_label_indices.shape, hidden_size)
 
     def _dspark_objective_chunk_terms(
         self,
