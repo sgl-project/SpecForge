@@ -13,7 +13,7 @@
     "markov_head_type": "vanilla",
     "markov_rank": 256,
     "mask_token_id": 151669,
-    "moe_router_aux_loss_coef": 0.01,
+    "moe_router_aux_loss_coef": 0.005,
     "moe_router_aux_loss_type": "batch_wise",
     "moe_router_bias_update_rate": 0.001,
     "moe_router_selection_bias": true,
