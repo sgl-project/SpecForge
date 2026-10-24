@@ -13,11 +13,12 @@ def count_tokens_per_expert(
     indices: torch.Tensor, mask: Optional[torch.Tensor], num_experts: int
 ) -> torch.Tensor:
     """Kept slots per expert, fp32 [E]; ``mask`` [T] marks the kept tokens."""
-    weights = None
+    slots = indices.reshape(-1)
+    weights = torch.ones_like(slots, dtype=torch.float32)
     if mask is not None:
         weights = mask.to(torch.float32).repeat_interleave(indices.shape[-1])
-    counts = torch.bincount(indices.reshape(-1), weights=weights, minlength=num_experts)
-    return counts.float()
+    # scatter_add_, not bincount: bincount reads the indices' range on the host.
+    return weights.new_zeros(num_experts).scatter_add_(0, slots, weights)
 
 
 def load_balance_loss(
