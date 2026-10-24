@@ -1,6 +1,6 @@
 model:
   target_model_path: "Qwen/Qwen3-8B"
-  draft_model_config: "configs/qwen-8b-moe.json"
+  draft_model_config: "configs/qwen-8b-moe-dspark.json"
   target_backend: "sglang"
   trust_remote_code: true
   embedding_key: "model.embed_tokens.weight"
@@ -52,7 +52,7 @@ training:
 tracking:
   report_to: "none"
   wandb_project: "specforge-qwen3-8b-dspark"
-  wandb_name: "qwen-8b-moe"
+  wandb_name: "qwen-8b-moe-dspark"
 
 runtime:
   producer_lease: 8
@@ -63,8 +63,8 @@ runtime:
   resident_low_watermark_bytes: 128849018880
   feature_store_max_resident_bytes: 274877906944
 
-run_id: "qwen-8b-moe"
-output_dir: "./outputs/qwen-8b-moe"
+run_id: "qwen-8b-moe-dspark"
+output_dir: "./outputs/qwen-8b-moe-dspark"
 
 deployment:
   mode: disaggregated
@@ -72,7 +72,7 @@ deployment:
     nnodes: 1
     nproc_per_node: 6
   disaggregated:
-    control_dir: outputs/qwen-8b-moe/control
+    control_dir: outputs/qwen-8b-moe-dspark/control
     backend: mooncake
     client_buffer_size: 1073741824
     managed_local:
