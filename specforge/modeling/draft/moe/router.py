@@ -32,21 +32,22 @@ def load_balance_loss(
     tokens_per_expert: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``E * sum_e load_e * mean_prob_e`` over the kept tokens; ``K`` when balanced."""
-    # The MoE "aux loss": Switch-style load balancing, stored per router as aux_loss.
+    """``E * sum_e share_e * P_e`` over the kept tokens; ``1`` when balanced."""
+    # The MoE "aux loss" in torchtitan's, Megatron's and DeepSeek-V3's units:
+    # share_e is expert e's part of the kept slots (K per token), so f = E * share.
     # Per-token L1 normalization: a no-op for softmax, needed for sigmoid scores.
     probs = F.normalize(scores, p=1, dim=-1)
     kept = probs.new_ones(probs.shape[0]) if mask is None else mask.to(probs.dtype)
-    tokens = kept.sum().clamp(min=1)
-    mean_prob = (probs * kept.unsqueeze(-1)).sum(dim=0) / tokens
-    return probs.shape[-1] * (tokens_per_expert / tokens * mean_prob).sum()
+    mean_prob = (probs * kept.unsqueeze(-1)).sum(dim=0) / kept.sum().clamp(min=1)
+    share = tokens_per_expert / tokens_per_expert.sum().clamp(min=1)
+    return probs.shape[-1] * (share * mean_prob).sum()
 
 
-def dispatch_balance(tokens_per_expert: torch.Tensor, top_k: int) -> torch.Tensor:
-    """A dispatch's balance against itself: ``K`` when uniform, ``E`` when collapsed."""
+def dispatch_balance(tokens_per_expert: torch.Tensor) -> torch.Tensor:
+    """A dispatch's balance against itself: 1 when uniform, E / K when collapsed."""
     # load_balance_loss with the load standing in for the probabilities.
     share = tokens_per_expert / tokens_per_expert.sum().clamp(min=1)
-    return top_k * share.shape[-1] * share.square().sum()
+    return share.shape[-1] * share.square().sum()
 
 
 class TopKRouter(nn.Module):
@@ -138,11 +139,11 @@ class TopKRouter(nn.Module):
         """The load the aux loss balances: this micro-batch's counts, or the step's."""
         if self.aux_loss_type != "batch_wise":
             return counts
-        # Batch-wise: the step's pooled counts so far, scaled to this batch's slots.
+        # Batch-wise: the step's counts so far, pooled over ranks; the loss uses shares.
         load = self.tokens_per_expert.clone()
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(load)
-        return load * (counts.sum() / load.sum().clamp(min=1))
+        return load
 
     @torch.no_grad()
     def update_expert_bias(self, tokens_per_expert: torch.Tensor) -> None:

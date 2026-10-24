@@ -26,7 +26,8 @@ def build_moe(config: PretrainedConfig) -> MoELayer:
             # Qwen3.8's config omits it; transformers always renormalizes.
             norm_topk_prob=getattr(config, "norm_topk_prob", True),
             initializer_range=std,
-            aux_loss_coef=getattr(config, "router_aux_loss_coef", 0.0),
+            # torchtitan's units: 1 when balanced, one coefficient per layer.
+            aux_loss_coef=dflash_config.get("moe_router_aux_loss_coef", 0.0),
             # torchtitan's aux_loss_type: microbatch_wise (default) or batch_wise.
             aux_loss_type=dflash_config.get(
                 "moe_router_aux_loss_type", "microbatch_wise"

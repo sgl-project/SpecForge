@@ -78,7 +78,7 @@ def set_moe_token_mask(model: nn.Module, mask: Optional[torch.Tensor]) -> None:
 def take_moe_aux_loss(
     model: nn.Module,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Pop this forward's load-balance loss: (coefficient-weighted mean, raw mean)."""
+    """Pop this forward's load-balance loss: (weighted sum over layers, raw mean)."""
     # Weighted like its objective: by denominator under loss_terms, equally otherwise.
     layers = _moe_layers(model)
     terms = [
@@ -91,7 +91,8 @@ def take_moe_aux_loss(
         layer.token_mask = None
     if not terms:
         return None
-    aux = torch.stack([coef * loss for coef, loss in terms]).mean()
+    # One coefficient per layer, as in torchtitan and Megatron; the metric stays a mean.
+    aux = torch.stack([coef * loss for coef, loss in terms]).sum()
     raw = torch.stack([loss for _, loss in terms]).mean()
     return aux, raw
 
@@ -110,8 +111,8 @@ def step_moe_balancing(model: nn.Module) -> Dict[str, torch.Tensor]:
             router.update_expert_bias(pooled)
         router.tokens_per_expert.zero_()  # the next step's count window
     # The step's pooled load: the collapse signal, unlike the per-micro-batch loss.
-    balance = [dispatch_balance(c, router.top_k) for router, c in zip(routers, counts)]
-    return {"moe/step_balance": torch.stack(balance).mean()}
+    balance = torch.stack([dispatch_balance(c) for c in counts]).mean()
+    return {"moe/step_balance": balance}
 
 
 def _routers(model: nn.Module) -> List[TopKRouter]:

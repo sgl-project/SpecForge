@@ -51,8 +51,11 @@ def _moe(coef=0.5, selection_bias=False, **dflash_config):
         hidden_size=H,
         moe_intermediate_size=8,
         shared_expert_intermediate_size=8,
-        router_aux_loss_coef=coef,
-        dflash_config={"moe_router_selection_bias": selection_bias, **dflash_config},
+        dflash_config={
+            "moe_router_aux_loss_coef": coef,
+            "moe_router_selection_bias": selection_bias,
+            **dflash_config,
+        },
     )
     return build_moe(config)
 
@@ -111,14 +114,17 @@ def _tiny_moe_draft(coef=0.5, cls=DFlashDraftModel, **dflash_config):
         vocab_size=V,
         layer_types=["full_attention"],
         block_size=2,
-        dflash_config={"target_layer_ids": [1], **dflash_config},
+        dflash_config={
+            "target_layer_ids": [1],
+            "moe_router_aux_loss_coef": coef,
+            **dflash_config,
+        },
         moe_preset="qwen3_5_moe",
         num_experts=4,
         num_experts_per_tok=2,
         moe_intermediate_size=8,
         shared_expert_intermediate_size=0,
         norm_topk_prob=False,
-        router_aux_loss_coef=coef,
     )
     config._attn_implementation = "eager"
     return cls(config)
@@ -161,7 +167,8 @@ class LoadBalanceLossTest(unittest.TestCase):
             with self.subTest(masked=mask is not None):
                 want = load_balancing_loss_func((logits,), E, K, mask)
                 flat = None if mask is None else mask.reshape(-1)
-                torch.testing.assert_close(_loss(scores, indices, flat), want)
+                # transformers sums the K slots per token: K times our per-token form.
+                torch.testing.assert_close(K * _loss(scores, indices, flat), want)
 
     def test_sigmoid_scores_are_normalized_per_token(self):
         torch.manual_seed(0)
@@ -169,7 +176,7 @@ class LoadBalanceLossTest(unittest.TestCase):
         indices = scores.topk(K, dim=-1).indices
         probs = scores / scores.sum(dim=-1, keepdim=True)
         counts = count_tokens_per_expert(indices, None, E)
-        want = E * (counts / (B * S) * probs.mean(dim=0)).sum()
+        want = E * (counts / (K * B * S) * probs.mean(dim=0)).sum()
         torch.testing.assert_close(_loss(scores, indices), want)
 
     def test_no_kept_slots_gives_a_zero_on_the_graph(self):
@@ -181,31 +188,30 @@ class LoadBalanceLossTest(unittest.TestCase):
         loss.backward()
         self.assertTrue(torch.all(logits.grad == 0))
 
-    def test_balanced_routing_gives_top_k(self):
+    def test_balanced_routing_gives_one(self):
         scores = torch.full((E, E), 1 / E)
         indices = torch.stack([torch.arange(E), torch.arange(E).roll(1)], dim=1)
-        torch.testing.assert_close(_loss(scores, indices), torch.tensor(float(K)))
+        torch.testing.assert_close(_loss(scores, indices), torch.tensor(1.0))
 
 
 class DispatchBalanceTest(unittest.TestCase):
-    def test_uniform_scores_top_k_and_collapse_scores_num_experts(self):
+    def test_uniform_scores_one_and_collapse_scores_experts_per_slot(self):
         uniform = torch.full((E,), 3.0)
-        torch.testing.assert_close(dispatch_balance(uniform, 1), torch.tensor(1.0))
-        torch.testing.assert_close(dispatch_balance(uniform, K), torch.tensor(2.0))
-        one = torch.tensor([24.0, 0, 0, 0, 0, 0, 0, 0])
-        torch.testing.assert_close(dispatch_balance(one, 1), torch.tensor(8.0))
-        two = torch.tensor([12.0, 12.0, 0, 0, 0, 0, 0, 0])  # top-2 stuck on two
-        torch.testing.assert_close(dispatch_balance(two, K), torch.tensor(8.0))
+        torch.testing.assert_close(dispatch_balance(uniform), torch.tensor(1.0))
+        one = torch.tensor([24.0, 0, 0, 0, 0, 0, 0, 0])  # top-1 stuck on one: E
+        torch.testing.assert_close(dispatch_balance(one), torch.tensor(8.0))
+        two = torch.tensor([12.0, 12.0, 0, 0, 0, 0, 0, 0])  # top-2 stuck on two: E/K
+        torch.testing.assert_close(dispatch_balance(two), torch.tensor(4.0))
 
     def test_equals_the_loss_when_the_router_agrees_with_its_dispatch(self):
         counts = torch.tensor([5.0, 3, 2, 1, 1, 0, 0, 0])  # 12 tokens, top-1
         probs = (counts / counts.sum()).expand(12, E)
         torch.testing.assert_close(
-            dispatch_balance(counts, 1), load_balance_loss(probs, counts)
+            dispatch_balance(counts), load_balance_loss(probs, counts)
         )
 
     def test_an_empty_step_scores_zero(self):
-        self.assertEqual(dispatch_balance(torch.zeros(E), K).item(), 0.0)
+        self.assertEqual(dispatch_balance(torch.zeros(E)).item(), 0.0)
 
 
 class RouterAuxLossTest(unittest.TestCase):
@@ -245,7 +251,7 @@ class RouterAuxLossTest(unittest.TestCase):
         router(self.x)
         self.assertIsNotNone(router.aux_loss)
 
-    def test_family_reads_router_aux_loss_coef(self):
+    def test_family_reads_the_aux_loss_coefficient(self):
         layer = _moe(coef=0.25)
         self.assertEqual(layer.gate.aux_loss_coef, 0.25)
         layer(torch.randn(B, S, H))
@@ -296,14 +302,14 @@ class TakeAuxLossTest(unittest.TestCase):
         torch.manual_seed(0)
         self.x, self.mask = torch.randn(B, S, H), _real_token_mask()
 
-    def test_take_returns_the_layer_means_and_clears_layer_state(self):
+    def test_take_returns_the_layer_sum_and_mean_and_clears_layer_state(self):
         layers = nn.ModuleList([_moe(coef=0.5), _moe(coef=0.25)])
         set_moe_token_mask(layers, self.mask)
         for layer in layers:
             layer(self.x)
         losses = [layer.gate.aux_loss for layer in layers]
         aux, raw = take_moe_aux_loss(layers)
-        torch.testing.assert_close(aux, (0.5 * losses[0] + 0.25 * losses[1]) / 2)
+        torch.testing.assert_close(aux, 0.5 * losses[0] + 0.25 * losses[1])
         torch.testing.assert_close(raw, (losses[0] + losses[1]) / 2)
         for layer in layers:
             self.assertIsNone(layer.gate.aux_loss)
@@ -424,7 +430,7 @@ class SelectionBiasTest(unittest.TestCase):
         metrics = step_moe_balancing(router)
         self.assertIsNone(router.selection_bias)
         torch.testing.assert_close(
-            metrics["moe/step_balance"], dispatch_balance(counts, K)
+            metrics["moe/step_balance"], dispatch_balance(counts)
         )
         self.assertTrue(torch.all(router.tokens_per_expert == 0))
         self.assertNotIn("tokens_per_expert", router.state_dict())
@@ -466,8 +472,7 @@ class BatchWiseLossTest(unittest.TestCase):
         scores, second, _ = router(torch.randn(B * S, H))
         counts = count_tokens_per_expert(second, None, E)
         pooled = count_tokens_per_expert(first, self.mask, E) + counts
-        load = pooled * (counts.sum() / pooled.sum())
-        torch.testing.assert_close(router.aux_loss, load_balance_loss(scores, load))
+        torch.testing.assert_close(router.aux_loss, load_balance_loss(scores, pooled))
         # The loss reaches the gate weight through this micro-batch's scores.
         (grad,) = torch.autograd.grad(router.aux_loss, router.weight)
         self.assertTrue(torch.any(grad != 0))
@@ -479,7 +484,7 @@ class BatchWiseLossTest(unittest.TestCase):
             with mock.patch.object(dist, "all_reduce", lambda t: t.add_(other)):
                 scores, indices, _ = router(self.x)
         counts = count_tokens_per_expert(indices, None, E)
-        load = (counts + other) * (counts.sum() / (counts + other).sum())
+        load = counts + other
         torch.testing.assert_close(router.aux_loss, load_balance_loss(scores, load))
         # The buffer stays rank-local: the bias update pools it once per step.
         torch.testing.assert_close(router.tokens_per_expert, counts)
@@ -578,7 +583,7 @@ class StepHookTest(unittest.TestCase):
             draft.moe.gate.selection_bias, _zero_mean_sign_step(counts)
         )
         torch.testing.assert_close(
-            metrics["moe/step_balance"], dispatch_balance(counts, K)
+            metrics["moe/step_balance"], dispatch_balance(counts)
         )
 
     def test_a_model_without_a_hook_is_a_no_op(self):
@@ -600,7 +605,7 @@ class StepHookTest(unittest.TestCase):
         # The step's pooled balance is reported with the boundary step's metrics.
         self.assertAlmostEqual(
             second.metrics["moe/step_balance"],
-            dispatch_balance(2 * counts, K).item(),
+            dispatch_balance(2 * counts).item(),
             places=5,
         )
 
