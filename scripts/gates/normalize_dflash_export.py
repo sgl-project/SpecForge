@@ -21,10 +21,39 @@ _DFLASH2_FIELDS = (
     "selector_rank",
     "selector_top_k",
 )
+# Per moe_preset: the specforge.serving.sglang_models class that serves each
+# draft kind, and the config fields that class builds its MoE FFN from.
+_MOE_SERVED = {
+    "qwen3_5_moe": {
+        "dspark": "Qwen3MoeDSparkModel",
+        "dflash": "DFlashMoEDraftModel",
+        "fields": ("num_experts", "num_experts_per_tok", "moe_intermediate_size"),
+    },
+}
 
 
 def _positive_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _normalize_moe(config: Dict[str, Any], kind: str) -> None:
+    """Name the class that serves ``kind`` MoE drafts; refuse exports nothing serves."""
+    preset = config.get("moe_preset")
+    if not preset:
+        return
+    served = _MOE_SERVED.get(preset, {})
+    if kind not in served:
+        raise ValueError(
+            f"no SGLang model serves a {kind} draft with moe_preset={preset!r}"
+        )
+    for key in served["fields"]:
+        if not _positive_integer(config.get(key)):
+            raise ValueError(
+                f"moe_preset={preset!r} export requires a positive integer {key}, "
+                f"got {config.get(key)!r}"
+            )
+    # Loaded through SGLANG_EXTERNAL_MODEL_PACKAGE=specforge.serving.sglang_models.
+    config["architectures"] = [served[kind]]
 
 
 def _normalize_dflash2(config: Dict[str, Any], method_config: Dict[str, Any]) -> None:
@@ -136,10 +165,13 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
 
     if projector_type == "dspark":
         _normalize_dspark(config, method_config)
+        _normalize_moe(config, "dspark")
     elif _DFLASH2_ARCHITECTURE in (config.get("architectures") or []):
         _normalize_dflash2(config, method_config)
+        _normalize_moe(config, "dflash2")
     else:
         config["architectures"] = ["DFlashDraftModel"]
+        _normalize_moe(config, "dflash")
     config.pop("auto_map", None)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
