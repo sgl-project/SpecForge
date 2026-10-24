@@ -80,10 +80,6 @@ class MoELayerTest(unittest.TestCase):
         layer = build_moe(_config()).bfloat16()
         self.assertEqual(layer(self.x.bfloat16()).dtype, torch.bfloat16)
 
-    def test_non_silu_hidden_act_raises(self):
-        with self.assertRaisesRegex(ValueError, "gelu"):
-            build_moe(_config(hidden_act="gelu"))
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

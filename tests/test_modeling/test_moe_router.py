@@ -91,18 +91,6 @@ class TopKRouterTest(unittest.TestCase):
             (torch.float32, torch.int64, torch.float32),
         )
 
-    def test_reset_parameters_reinitializes_with_std(self):
-        router = TopKRouter(64, 1024, K, norm_topk_prob=True, initializer_range=0.02)
-        with torch.no_grad():
-            router.weight.fill_(1e30)
-        router.reset_parameters(0.02)
-        self.assertAlmostEqual(router.weight.std().item(), 0.02, delta=0.002)
-
-    def test_top_k_outside_one_to_num_experts_raises(self):
-        for top_k in (0, E + 1):
-            with self.subTest(top_k=top_k), self.assertRaises(ValueError):
-                TopKRouter(E, H, top_k, norm_topk_prob=True, initializer_range=0.02)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

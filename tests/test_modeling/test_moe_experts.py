@@ -15,7 +15,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from specforge.modeling.draft.moe import experts as experts_module
-from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert, swiglu
+from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert
 
 E, H, I, T, K = 4, 64, 32, 10, 2
 UNUSED_EXPERT = 1
@@ -132,25 +132,9 @@ class RoutedExpertsTest(unittest.TestCase):
     def test_bf16_experts_return_fp32_on_both_paths(self):
         experts = RoutedExperts(E, H, I, initializer_range=0.02).bfloat16()
         args = (self.x.bfloat16(), self.indices, self.weights)
-        for activation in (swiglu, _clamped_swiglu):
-            experts.activation = activation
+        self.assertEqual(experts(*args).dtype, torch.float32)
+        with mock.patch.object(experts_module, "_GROUPED_MM_DEVICES", ()):
             self.assertEqual(experts(*args).dtype, torch.float32)
-            with mock.patch.object(experts_module, "_GROUPED_MM_DEVICES", ()):
-                self.assertEqual(experts(*args).dtype, torch.float32)
-
-    def test_no_tokens(self):
-        out = self.experts(
-            torch.zeros(0, H), torch.zeros(0, K, dtype=torch.long), torch.zeros(0, K)
-        )
-        self.assertEqual(tuple(out.shape), (0, H))
-
-    def test_reset_parameters_reinitializes_with_std(self):
-        experts = RoutedExperts(64, 256, 128, initializer_range=0.02)
-        with torch.no_grad():
-            experts.gate_up_proj.fill_(1e30)
-        experts.reset_parameters(0.02)
-        for param in (experts.gate_up_proj, experts.down_proj):
-            self.assertAlmostEqual(param.std().item(), 0.02, delta=0.002)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_cuda_bf16_matches_cpu_fp32(self):

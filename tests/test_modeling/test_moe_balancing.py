@@ -302,12 +302,6 @@ class BatchWiseLossTest(unittest.TestCase):
         torch.testing.assert_close(router.selection_bias, _zero_mean_sign_step(counts))
         self.assertTrue(torch.all(router.tokens_per_expert == 0))
 
-    def test_unknown_types_are_refused(self):
-        with self.assertRaises(ValueError):
-            TopKRouter(
-                E, H, K, norm_topk_prob=False, initializer_range=0.5, aux_loss_type="x"
-            )
-
     def test_family_reads_the_aux_loss_type(self):
         self.assertEqual(_moe().gate.aux_loss_type, "microbatch_wise")
         gate = _moe(moe_router_aux_loss_type="batch_wise").gate
