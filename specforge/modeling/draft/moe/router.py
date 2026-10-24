@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Top-k routers for draft MoE layers, with the load-balancing pieces they own."""
+"""Top-k routers for draft MoE layers: selection, the selection bias, the counts."""
 
 from typing import Callable, Optional
 
@@ -8,46 +8,17 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from specforge.modeling.draft.moe.balance import (
+    count_tokens_per_expert,
+    load_balance_loss,
+)
+
 ScoreFn = Callable[[torch.Tensor], torch.Tensor]
 
 
 def softmax_scores(logits: torch.Tensor) -> torch.Tensor:
     """``softmax(logits)`` over experts: the default router scores."""
     return logits.softmax(dim=-1)
-
-
-def count_tokens_per_expert(
-    indices: torch.Tensor, mask: Optional[torch.Tensor], num_experts: int
-) -> torch.Tensor:
-    """Kept slots per expert, fp32 [E]; ``mask`` [T] marks the kept tokens."""
-    weights = None
-    if mask is not None:
-        weights = mask.to(torch.float32).repeat_interleave(indices.shape[-1])
-    counts = torch.bincount(indices.reshape(-1), weights=weights, minlength=num_experts)
-    return counts.float()
-
-
-def load_balance_loss(
-    scores: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """``E * sum_e share_e * P_e`` over the kept tokens; ``1`` when balanced."""
-    # The MoE "aux loss" in torchtitan's, Megatron's and DeepSeek-V3's units:
-    # share_e is expert e's part of the kept slots (K per token), so f = E * share.
-    # Per-token L1 normalization: a no-op for softmax, needed for sigmoid scores.
-    probs = F.normalize(scores, p=1, dim=-1)
-    kept = probs.new_ones(probs.shape[0]) if mask is None else mask.to(probs.dtype)
-    mean_prob = (probs * kept.unsqueeze(-1)).sum(dim=0) / kept.sum().clamp(min=1)
-    share = tokens_per_expert / tokens_per_expert.sum().clamp(min=1)
-    return probs.shape[-1] * (share * mean_prob).sum()
-
-
-def dispatch_balance(tokens_per_expert: torch.Tensor) -> torch.Tensor:
-    """A dispatch's balance against itself: 1 when uniform, E / K when collapsed."""
-    # load_balance_loss with the load standing in for the probabilities.
-    share = tokens_per_expert / tokens_per_expert.sum().clamp(min=1)
-    return share.shape[-1] * share.square().sum()
 
 
 class TopKRouter(nn.Module):

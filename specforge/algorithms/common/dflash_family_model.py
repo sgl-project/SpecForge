@@ -18,7 +18,7 @@ from specforge.modeling.draft.dflash_mask import (
     create_dflash_sdpa_mask,
 )
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
-from specforge.modeling.draft.moe.layer import (
+from specforge.modeling.draft.moe.balance import (
     set_moe_token_mask,
     step_moe_balancing,
     take_moe_aux_loss,

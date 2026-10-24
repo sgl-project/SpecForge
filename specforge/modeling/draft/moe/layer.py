@@ -1,15 +1,14 @@
 # coding=utf-8
-"""MoELayer, the FFN switch between dense MLP and MoE, and the model-facing glue."""
+"""MoELayer and build_ffn, the FFN switch between a dense MLP and an MoE layer."""
 
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Optional
 
 import torch
-import torch.distributed as dist
 from torch import nn
 from transformers import PretrainedConfig
 
 from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert
-from specforge.modeling.draft.moe.router import TopKRouter, dispatch_balance
+from specforge.modeling.draft.moe.router import TopKRouter
 
 
 class MoELayer(nn.Module):
@@ -67,57 +66,3 @@ def build_ffn(
             f"unknown moe_preset={moe_preset!r}; expected one of {sorted(FAMILIES)}"
         )
     return FAMILIES[moe_preset](config)
-
-
-def set_moe_token_mask(model: nn.Module, mask: Optional[torch.Tensor]) -> None:
-    """Hand every MoE layer this batch's ``[B, S]`` kept-slot mask."""
-    for layer in _moe_layers(model):
-        layer.token_mask = mask
-
-
-def take_moe_aux_loss(
-    model: nn.Module,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Pop this forward's load-balance loss: (weighted sum over layers, raw mean)."""
-    # Weighted like its objective: by denominator under loss_terms, equally otherwise.
-    layers = _moe_layers(model)
-    terms = [
-        (layer.gate.aux_loss_coef, layer.gate.aux_loss)
-        for layer in layers
-        if layer.gate.aux_loss is not None
-    ]
-    for layer in layers:
-        layer.gate.aux_loss = None
-        layer.token_mask = None
-    if not terms:
-        return None
-    # One coefficient per layer, as in torchtitan and Megatron; the metric stays a mean.
-    aux = torch.stack([coef * loss for coef, loss in terms]).sum()
-    raw = torch.stack([loss for _, loss in terms]).mean()
-    return aux, raw
-
-
-def step_moe_balancing(model: nn.Module) -> Dict[str, torch.Tensor]:
-    """Optimizer step boundary: pool counts once, move the biases, score the step."""
-    routers = _routers(model)
-    if not routers:
-        return {}
-    # One collective for every layer; all ranks ran the same forwards, so it lines up.
-    counts = torch.stack([router.tokens_per_expert for router in routers])
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(counts)
-    for router, pooled in zip(routers, counts):
-        if router.selection_bias is not None:
-            router.update_expert_bias(pooled)
-        router.tokens_per_expert.zero_()  # the next step's count window
-    # The step's pooled load: the collapse signal, unlike the per-micro-batch loss.
-    balance = torch.stack([dispatch_balance(c) for c in counts]).mean()
-    return {"moe/step_balance": balance}
-
-
-def _routers(model: nn.Module) -> List[TopKRouter]:
-    return [module for module in model.modules() if isinstance(module, TopKRouter)]
-
-
-def _moe_layers(model: nn.Module) -> List[MoELayer]:
-    return [module for module in model.modules() if isinstance(module, MoELayer)]
