@@ -21,6 +21,7 @@ from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import (
     DFlashTrainStrategy,
     DominoTrainStrategy,
+    DraftTrainStrategy,
     DSparkTrainStrategy,
     StepContext,
     StepOutput,
@@ -262,10 +263,11 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
             torch.cuda.set_sync_debug_mode("default")
 
 
-class _WeightedStrategy:
+class _WeightedStrategy(DraftTrainStrategy):
     """Scalar-loss strategy with ``loss_terms`` and a host schedule metric."""
 
     name = "weighted"
+    required_features = {"x"}
 
     def __init__(self, model, denominator):
         self.model = model
