@@ -28,10 +28,8 @@ def build_moe(config: PretrainedConfig) -> MoELayer:
             initializer_range=std,
             # torchtitan's units: 1 when balanced, one coefficient per layer.
             aux_loss_coef=dflash_config.get("moe_router_aux_loss_coef", 0.0),
-            # torchtitan's aux_loss_type: microbatch_wise (default) or batch_wise.
-            aux_loss_type=dflash_config.get(
-                "moe_router_aux_loss_type", "microbatch_wise"
-            ),
+            # torchtitan's aux_loss_type: batch_wise (the default here) or microbatch_wise.
+            aux_loss_type=dflash_config.get("moe_router_aux_loss_type", "batch_wise"),
             # DeepSeek-style aux-loss-free balancing, moved once per optimizer step.
             selection_bias=bool(dflash_config.get("moe_router_selection_bias", False)),
             bias_update_rate=dflash_config.get("moe_router_bias_update_rate", 0.001),

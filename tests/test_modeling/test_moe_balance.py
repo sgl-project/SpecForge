@@ -181,12 +181,12 @@ class BalancingHooksTest(unittest.TestCase):
         torch.manual_seed(0)
         layers = nn.ModuleList(
             [
-                _moe(coef=0.5, selection_bias=True),
                 _moe(
-                    coef=0.25,
+                    coef=0.5,
                     selection_bias=True,
-                    moe_router_aux_loss_type="batch_wise",
+                    moe_router_aux_loss_type="microbatch_wise",
                 ),
+                _moe(coef=0.25, selection_bias=True),  # the default: batch-wise
             ]
         )
         gates = [layer.gate for layer in layers]
