@@ -223,6 +223,35 @@ The SGLang normalization gate rejects bidirectional sliding-window exports
 until that external serving path is validated; it does not silently fall back
 to a causal mask. These settings do not change CE/L1 losses or kernel optimizations.
 
+### D-PAL (DFlash1)
+
+[D-PAL](https://arxiv.org/abs/2610.28355) uses detached target-draft overlap
+weights with four local losses. Keep `training.strategy: dflash` and select
+`training.loss_type` from `dpal-renyi`, `dpal-kl`, `dpal-la`, or `dpal-ce-tv`.
+The last option uses `0.1 CE + 0.9 TV`, where TV is half the L1 distance.
+`training.dpal_rho` sets the overlap smoothing floor in `[0, 1]` and defaults
+to `0.3`; it is independent of `training.dpace_alpha`.
+
+```yaml
+training:
+  strategy: dflash
+  loss_type: dpal-renyi
+  dpal_rho: 0.3
+  dflash_teacher_metrics: false
+```
+
+D-PAL requires `target_last_hidden_states` on every training step, including
+quiet steps with diagnostics disabled. For offline training, prepare the
+[four-field capture](data_preparation.md) with a D-PAL `--loss-type`; do not
+reuse a three-field DFlash cache. The example's `dflash_teacher_metrics: false`
+disables teacher diagnostics but keeps the states required by the objective.
+
+This path supports selector-free DFlash1, not DFlash2 selectors, Domino,
+DSpark, or additional LK mixing. See the [D-PAL recipe](/recipes/dpal)
+for the loss formulas, capture commands, normalization and citation. The
+three-layer Qwen3-4B config at
+`examples/configs/offline/colocated/qwen3-4b-dpal.yaml` defines a complete run.
+
 ### DFlash2
 
 DFlash2 is a draft-architecture variant of DFlash, not a separate capture

@@ -35,6 +35,8 @@ def bind_run(cfg: Config, algorithm: AlgorithmRegistration) -> ResolvedRun:
 
     from specforge.application.planning import validate_resolved_run
 
+    if algorithm.providers.resolve_for_config is not None:
+        algorithm = algorithm.providers.resolve_for_config(cfg, algorithm)
     validate_resolved_run(cfg, algorithm)
     return ResolvedRun(config=cfg, algorithm=algorithm)
 

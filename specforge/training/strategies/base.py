@@ -530,12 +530,13 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         if ctx is not None:
             model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
         target_last_hidden_states = t.get("target_last_hidden_states")
-        # Teacher hidden states only feed diagnostics; skip the copy when the
-        # run disabled them (training.dflash_teacher_metrics=false).
-        if (
-            target_last_hidden_states is not None
-            and collect_detailed_metrics
-            and bool(self._draft_attr("teacher_metrics", 1.0))
+        # D-PAL consumes teacher states on every step, even without diagnostics.
+        if target_last_hidden_states is not None and (
+            bool(self._draft_attr("requires_target_hidden_states", 0.0))
+            or (
+                collect_detailed_metrics
+                and bool(self._draft_attr("teacher_metrics", 1.0))
+            )
         ):
             model_inputs["target_last_hidden_states"] = target_last_hidden_states.to(
                 device, non_blocking=True

@@ -403,6 +403,7 @@ def build_dflash_model(
             kl_scale=cfg.training.kl_scale,
             kl_decay=cfg.training.kl_decay,
             teacher_metrics=cfg.training.dflash_teacher_metrics,
+            dpal_rho=cfg.training.dpal_rho,
         ),
     )
 

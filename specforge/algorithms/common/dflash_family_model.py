@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core import fused_loss
 from specforge.core.chunking import checkpointed_chunk_reduce
+from specforge.core.dpal import DPAL_LOSS_TYPES, dpal_actor_and_acceptance
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash_mask import (
     create_dflash_block_mask,
@@ -38,6 +39,7 @@ _VALID_LOSS_TYPES = {
     "dpace-continuation-value-only",
 }
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
+_VALID_LOSS_TYPES |= DPAL_LOSS_TYPES
 _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
 # "0" forces DFlash2's reference PyTorch unary head for A/B comparisons.
 _FUSED_UNARY_HEAD_ENV = "SPECFORGE_DFLASH_FUSED_HEAD"
@@ -274,6 +276,7 @@ class OnlineDFlashModel(nn.Module):
         kl_decay: float = 1.0,
         metric_top_k: int = 16,
         teacher_metrics: bool = True,
+        dpal_rho: float = 0.3,
     ):
         super().__init__()
         if metric_top_k <= 0:
@@ -284,6 +287,15 @@ class OnlineDFlashModel(nn.Module):
             )
         if not 0.0 <= dpace_alpha <= 1.0:
             raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
+        if not 0.0 <= dpal_rho <= 1.0:
+            raise ValueError(f"dpal_rho must be in [0, 1], got {dpal_rho}")
+        if loss_type in DPAL_LOSS_TYPES and (
+            lk_loss_type is not None
+            or getattr(draft_model, "candidate_selector", None) is not None
+        ):
+            raise ValueError(
+                "D-PAL requires selector-free DFlash1 and lk_loss_type=None"
+            )
         if objective_chunk_blocks < 0:
             raise ValueError("objective_chunk_blocks must be >= 0")
         if selector_loss_alpha < 0:
@@ -308,6 +320,8 @@ class OnlineDFlashModel(nn.Module):
         self.objective_chunk_blocks = int(objective_chunk_blocks)
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        self.dpal_rho = float(dpal_rho)
+        self.requires_target_hidden_states = loss_type in DPAL_LOSS_TYPES
         self.selector_loss_alpha = float(selector_loss_alpha)
         self.selector_warmup_ratio = float(selector_warmup_ratio)
         self.selector_ramp_ratio = float(selector_ramp_ratio)
@@ -429,7 +443,8 @@ class OnlineDFlashModel(nn.Module):
         prefix products and excluded from suffix sums; the caller still
         multiplies the returned weights by ``binary_mask`` before reduction.
         """
-        smooth = (1.0 - self.dpace_alpha) * prob + self.dpace_alpha
+        rho = self.dpal_rho if self.requires_target_hidden_states else self.dpace_alpha
+        smooth = (1.0 - rho) * prob + rho
         smooth = torch.where(binary_mask_b, smooth, torch.ones_like(smooth))
         prefix = torch.cumprod(smooth, dim=-1)
 
@@ -819,8 +834,10 @@ class OnlineDFlashModel(nn.Module):
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
         sequence_anchor_scale: Optional[torch.Tensor] = None,
+        target_pred_indices: Optional[torch.Tensor] = None,
         *,
         fused_head: bool = False,
+        target_logits: Optional[torch.Tensor] = None,
     ) -> DFlashObjectiveTerms:
         """Return a flat tuple of additive objective and metric tensors.
 
@@ -860,6 +877,22 @@ class OnlineDFlashModel(nn.Module):
             ).reshape_as(target_ids)
 
         target_probability = torch.exp(-neg_log_q)
+        credit_probability = target_probability.detach()
+        if self.requires_target_hidden_states:
+            if target_logits is None or target_pred_indices is None:
+                raise ValueError(
+                    "D-PAL requires cached target logits and prediction indices"
+                )
+            with torch.no_grad():
+                indices = target_pred_indices.reshape(batch_size, -1, 1).expand(
+                    -1, -1, target_logits.shape[-1]
+                )
+                aligned_logits = target_logits.gather(1, indices).reshape_as(
+                    objective_logits
+                )
+            neg_log_q, credit_probability = dpal_actor_and_acceptance(
+                objective_logits, aligned_logits, self.loss_type, target_ids
+            )
         loss_weights = weight_mask
         if self.loss_type == "dflash":
             if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
@@ -873,7 +906,7 @@ class OnlineDFlashModel(nn.Module):
                 )
                 loss_weights = loss_weights * decay_weights
             loss_den = loss_weights.sum()
-        elif self.loss_type in _DPACE_LOSS_TYPES:
+        elif self.loss_type in _DPACE_LOSS_TYPES or self.requires_target_hidden_states:
             if sequence_anchor_scale is None:
                 raise ValueError(
                     "precomputed full-sequence sequence_anchor_scale is required "
@@ -881,10 +914,10 @@ class OnlineDFlashModel(nn.Module):
                 )
             with torch.no_grad():
                 dpace_weights = self._dpace_weight(
-                    target_probability.detach(),
+                    credit_probability,
                     weight_mask,
                     weight_mask > 0,
-                    self.loss_type,
+                    "dpace" if self.requires_target_hidden_states else self.loss_type,
                 )
             loss_weights = weight_mask * dpace_weights
             valid_anchors = (weight_mask > 0).any(dim=-1)
@@ -967,8 +1000,10 @@ class OnlineDFlashModel(nn.Module):
         aligned_target_hidden: Optional[torch.Tensor] = None,
         sequence_anchor_scale: Optional[torch.Tensor] = None,
         block_index: Optional[torch.Tensor] = None,
+        target_pred_indices: Optional[torch.Tensor] = None,
         *,
         total_blocks: int = 0,
+        target_logits: Optional[torch.Tensor] = None,
     ) -> DFlashMetricTerms:
         """Return additive unary, selector, and teacher diagnostics for one chunk.
 
@@ -983,8 +1018,25 @@ class OnlineDFlashModel(nn.Module):
             target_ids,
             top_k=self._metric_top_k(),
         )
+        credit_probability = unary.hard_label_probability
+        aligned_target_logits = None
+        if self.requires_target_hidden_states:
+            if target_logits is None or target_pred_indices is None:
+                raise ValueError(
+                    "D-PAL metrics require cached target logits and prediction indices"
+                )
+            indices = target_pred_indices.reshape(hidden.shape[0], -1, 1).expand(
+                -1, -1, target_logits.shape[-1]
+            )
+            aligned_target_logits = target_logits.gather(1, indices).reshape_as(
+                unary.probabilities
+            )
+            p = aligned_target_logits.float().softmax(-1)
+            credit_probability = (
+                torch.minimum(p, unary.probabilities).sum(-1).clamp(0.0, 1.0)
+            )
         loss_weights = self._dflash_metric_loss_weights(
-            unary.hard_label_probability,
+            credit_probability,
             weight_mask,
             sequence_anchor_scale,
         )
@@ -1013,6 +1065,9 @@ class OnlineDFlashModel(nn.Module):
             aligned_target_hidden=aligned_target_hidden,
             weight_mask=weight_mask,
             position_den=position_den,
+            aligned_target_logits=(
+                aligned_target_logits if self.teacher_metrics else None
+            ),
         )
         return self._reduce_dflash_metric_terms(
             unary=unary,
@@ -1090,7 +1145,7 @@ class OnlineDFlashModel(nn.Module):
             hard_label_probability,
             weight_mask,
             weight_mask > 0,
-            self.loss_type,
+            "dpace" if self.requires_target_hidden_states else self.loss_type,
         )
         return weight_mask * dpace_weights * sequence_anchor_scale
 
@@ -1216,20 +1271,26 @@ class OnlineDFlashModel(nn.Module):
         aligned_target_hidden: Optional[torch.Tensor],
         weight_mask: torch.Tensor,
         position_den: torch.Tensor,
+        aligned_target_logits: Optional[torch.Tensor] = None,
     ) -> _DFlashTeacherTerms:
         """Compare unary and greedy predictions with the frozen target head."""
 
-        if aligned_target_hidden is None:
+        if aligned_target_hidden is None and aligned_target_logits is None:
             return _DFlashTeacherTerms.zeros(position_den)
 
-        batch_size, num_blocks, block_size, hidden_size = aligned_target_hidden.shape
-        teacher_logits = self.lm_head(
-            aligned_target_hidden.reshape(
-                batch_size,
-                num_blocks * block_size,
-                hidden_size,
+        if aligned_target_logits is None:
+            batch_size, num_blocks, block_size, hidden_size = (
+                aligned_target_hidden.shape
             )
-        ).reshape_as(unary.probabilities)
+            aligned_target_logits = self.lm_head(
+                aligned_target_hidden.reshape(
+                    batch_size,
+                    num_blocks * block_size,
+                    hidden_size,
+                )
+            ).reshape_as(unary.probabilities)
+        block_size = weight_mask.shape[-1]
+        teacher_logits = aligned_target_logits
         teacher_probabilities = torch.softmax(teacher_logits.float(), dim=-1)
         teacher_ids = teacher_logits.argmax(dim=-1)
         expected_acceptance = (
@@ -1406,6 +1467,10 @@ class OnlineDFlashModel(nn.Module):
             )
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+        if self.requires_target_hidden_states and target_last_hidden_states is None:
+            raise ValueError(
+                "D-PAL requires target_last_hidden_states; recapture with --loss-type"
+            )
 
         anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
             input_ids=input_ids,
@@ -1461,12 +1526,19 @@ class OnlineDFlashModel(nn.Module):
                 target_last_hidden_states is not None
                 and collect_detailed_metrics
                 and self.teacher_metrics
+                and not self.requires_target_hidden_states
             )
             else None
         )
         sequence_anchor_scale = None
-        if self.loss_type in _DPACE_LOSS_TYPES:
+        if self.loss_type in _DPACE_LOSS_TYPES or self.requires_target_hidden_states:
             sequence_anchor_scale = self._sequence_anchor_scale(weight_mask)
+        target_logits = target_pred_indices = None
+        if self.requires_target_hidden_states:
+            # Cache one teacher projection per forward, outside checkpoint replay.
+            with torch.no_grad():
+                target_logits = self.lm_head(target_last_hidden_states)
+            target_pred_indices = (safe_label_indices - 1).clamp(min=0)
         metric_terms = None
         if collect_detailed_metrics:
             # Reduce the detached diagnostics first: their full-vocabulary
@@ -1477,6 +1549,7 @@ class OnlineDFlashModel(nn.Module):
                     partial(
                         self._dflash_metric_chunk_terms,
                         total_blocks=anchor_positions.shape[1],
+                        target_logits=target_logits,
                     ),
                     hidden_4d.detach(),
                     target_ids,
@@ -1485,6 +1558,7 @@ class OnlineDFlashModel(nn.Module):
                     aligned_target_hidden,
                     sequence_anchor_scale,
                     torch.arange(anchor_positions.shape[1], device=device).unsqueeze(0),
+                    target_pred_indices,
                     chunk_size=self.objective_chunk_blocks,
                     dim=1,
                 )
@@ -1497,6 +1571,11 @@ class OnlineDFlashModel(nn.Module):
             predecessor_ids,
             sequence_anchor_scale,
         )
+        if self.requires_target_hidden_states:
+            objective_function = partial(
+                objective_function, target_logits=target_logits
+            )
+            objective_inputs += (target_pred_indices,)
         fused_head = self._use_fused_unary_head(hidden_4d)
         if fused_head:
             # Block slot 0 holds the clean anchor. ``weight_mask`` zeroes it in
@@ -1559,7 +1638,11 @@ class OnlineDFlashModel(nn.Module):
                 target_probability_num.detach(),
                 accuracy_denom.detach(),
             ),
-            "lk_loss" if self.lk_loss_type is not None else "ce_loss": (
+            (
+                "dpal_loss"
+                if self.requires_target_hidden_states
+                else "lk_loss" if self.lk_loss_type is not None else "ce_loss"
+            ): (
                 token_loss_num.detach(),
                 loss_denominator.detach(),
             ),
@@ -1631,7 +1714,7 @@ class OnlineDFlashModel(nn.Module):
                 top_k,
                 has_selector=candidate_selector is not None,
             )
-            if aligned_target_hidden is not None:
+            if self.teacher_metrics and target_last_hidden_states is not None:
                 ratio_metrics["dflash/teacher/unary_overlap_chain_length"] = (
                     terms.teacher_expected_accepted_length_num.detach(),
                     terms.block_den.detach(),
