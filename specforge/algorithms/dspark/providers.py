@@ -67,6 +67,7 @@ def resume_contract(_config, draft_model, training_model):
         "dspark_confidence_head_alpha": float(
             training_model.dspark_confidence_head_alpha
         ),
+        "dspark_loss_normalization": str(training_model.loss_normalization),
     }
     contract.update(dflash_attention_resume_contract(draft_model))
     if getattr(draft_model.config, "is_causal", None) is True:

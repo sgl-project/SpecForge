@@ -2024,6 +2024,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
         objective_chunk_blocks: int = 128,
+        loss_normalization: str = "round",
     ):
         super().__init__(
             draft_model=draft_model,
@@ -2047,6 +2048,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        if loss_normalization not in ("round", "step"):
+            raise ValueError(
+                f"loss_normalization must be 'round' or 'step', got {loss_normalization!r}"
+            )
+        #: ``round``: per DP round (historical); ``step``: global per optimizer step.
+        self.loss_normalization = str(loss_normalization)
 
     def _build_dspark_labels_and_mask(
         self,
@@ -2351,29 +2358,39 @@ class OnlineDSparkModel(OnlineDFlashModel):
             walk_accepted,
         ) = totals
 
-        global_loss_den = local_loss_den.detach().clone()
-        world_size = 1
-        import torch.distributed as dist
+        loss_num = (
+            self.dspark_ce_loss_alpha * ce_num
+            + self.dspark_l1_loss_alpha * l1_num
+            + self.dspark_confidence_head_alpha * confidence_num
+        )
+        loss_terms = None
+        if self.loss_normalization == "round":
+            # Historical: each DP round averaged by its own all-reduced token weight.
+            global_loss_den = local_loss_den.detach().clone()
+            world_size = 1
+            import torch.distributed as dist
 
-        if dist.is_available() and dist.is_initialized():
-            world_size = dist.get_world_size()
-            if world_size > 1:
-                dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
-        # Device-side assert: a host-side float() here drains the stream per
-        # microbatch right after a collective, serializing all ranks.
-        torch._assert_async(
-            (global_loss_den > 0).any(),
-            "DSpark objective has no supervised target tokens",
-        )
-        loss = (
-            world_size
-            * (
-                self.dspark_ce_loss_alpha * ce_num
-                + self.dspark_l1_loss_alpha * l1_num
-                + self.dspark_confidence_head_alpha * confidence_num
+            if dist.is_available() and dist.is_initialized():
+                world_size = dist.get_world_size()
+                if world_size > 1:
+                    dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
+            # Device-side assert: a host-side float() here drains the stream
+            # per microbatch right after a collective, serializing all ranks.
+            torch._assert_async(
+                (global_loss_den > 0).any(),
+                "DSpark objective has no supervised target tokens",
             )
-            / global_loss_den
-        )
+            loss = world_size * loss_num / global_loss_den
+        else:
+            # ``step``: the trainer scales by the global step denominator (like
+            # DFlash), so token weights no longer depend on the round split.
+            denominator_floor = (
+                torch.finfo(local_loss_den.dtype).tiny
+                if local_loss_den.is_floating_point()
+                else 1
+            )
+            loss = loss_num / local_loss_den.clamp_min(denominator_floor)
+            loss_terms = (loss_num, local_loss_den.detach())
 
         ratio_metrics = {
             "acc": (correct_num, eval_den),
@@ -2412,6 +2429,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             },
             "accuracy_denom": eval_den.detach(),
         }
+        if loss_terms is not None:
+            metrics["loss_terms"] = loss_terms
         accuracy = correct_num / eval_den.clamp_min(1.0)
         return loss, {"accuracy": accuracy.detach(), **metrics}
 
