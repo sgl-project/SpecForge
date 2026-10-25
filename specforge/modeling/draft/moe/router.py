@@ -102,8 +102,11 @@ class TopKRouter(nn.Module):
         if self.training:
             counts = count_tokens_per_expert(indices, mask, self.num_experts)
             self.tokens_per_expert += counts
-            # Always kept in training: with coefficient 0 it is the balance metric.
-            self.aux_loss = load_balance_loss(scores, self._aux_loss_load(counts), mask)
+            load = self._aux_loss_load(counts)
+            # Always kept in training; at coefficient 0 it is a graph-free metric.
+            graph = self.aux_loss_coef != 0 and torch.is_grad_enabled()
+            with torch.set_grad_enabled(graph):
+                self.aux_loss = load_balance_loss(scores, load, mask)
         return scores, indices, weights * self.route_scale
 
     def _aux_loss_load(self, counts: torch.Tensor) -> torch.Tensor:
