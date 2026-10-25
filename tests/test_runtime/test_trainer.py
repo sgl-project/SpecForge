@@ -55,6 +55,18 @@ class FakeStrategy(DraftTrainStrategy):
         return StepOutput(loss=loss, metrics={"accuracy": torch.tensor(0.5)})
 
 
+class EpochRecordingStrategy(FakeStrategy):
+    """Records the step and epoch seen by each forward."""
+
+    def __init__(self):
+        super().__init__()
+        self.epochs = []
+
+    def forward_loss(self, batch, ctx=None):
+        self.epochs.append((ctx.global_step, ctx.epoch))
+        return super().forward_loss(batch, ctx)
+
+
 class RecordingStrategy(FakeStrategy):
     def __init__(self):
         super().__init__()
@@ -1071,6 +1083,41 @@ class TestStepContextThreading(unittest.TestCase):
     def test_total_steps_none_when_unbounded(self):
         ctx = self._last_ctx()  # neither total_steps nor max_steps set
         self.assertIsNone(ctx.total_steps)
+
+
+class TestStepsPerEpochLogicalEpoch(unittest.TestCase):
+    def test_logical_epoch_derived_from_step_when_epoch_agnostic(self):
+        strat = EpochRecordingStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                num_epochs=1,
+                max_steps=6,
+                save_interval=0,
+                steps_per_epoch=2,
+            )
+            ctrl.fit([_batch() for _ in range(6)])
+        self.assertTrue(strat.epochs)
+        for step, epoch in strat.epochs:
+            self.assertEqual(epoch, step // 2)
+        self.assertGreater(max(epoch for _, epoch in strat.epochs), 0)
+
+    def test_epoch_counter_used_when_steps_per_epoch_unset(self):
+        strat = EpochRecordingStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                num_epochs=2,
+                save_interval=0,
+            )
+            ctrl.fit([_batch() for _ in range(2)])
+        self.assertEqual(sorted({epoch for _, epoch in strat.epochs}), [0, 1])
 
 
 if __name__ == "__main__":

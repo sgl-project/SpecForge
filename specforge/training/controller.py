@@ -759,6 +759,7 @@ class TrainerController:
         max_steps: Optional[int] = None,
         total_steps: Optional[int] = None,
         num_epochs: int = 1,
+        steps_per_epoch: Optional[float] = None,
         logger: Optional[Callable[[Dict[str, Any], int], None]] = None,
         ack_fn: Optional[Callable[[List[str], int], None]] = None,
         start_step: int = 0,
@@ -795,6 +796,9 @@ class TrainerController:
         # max_steps; None means schedule-reading strategies decay nothing.
         self.total_steps = total_steps if total_steps is not None else max_steps
         self.num_epochs = num_epochs
+        # Optimizer-step length of one epoch (total_steps / num_epochs).
+        # None uses the fit-loop epoch.
+        self._steps_per_epoch = float(steps_per_epoch) if steps_per_epoch else None
         self.logger = logger
         # ack_fn(sample_ids, global_step) records the durable ack transaction at
         # the optimizer-step boundary; None = the loader acks (simple runs).
@@ -972,6 +976,7 @@ class TrainerController:
                     ctx=StepContext(
                         global_step=self.global_step,
                         total_steps=self.total_steps,
+                        epoch=self._effective_epoch(),
                         collect_detailed_metrics=(
                             self.logger is not None
                             and (self.global_step + 1) % max(1, self.log_interval) == 0
@@ -1162,7 +1167,11 @@ class TrainerController:
         module.eval()
         # Use the train path's live context so schedule-dependent losses (for
         # example Domino's lambda_base) are not evaluated as if at step zero.
-        ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
+        ctx = StepContext(
+            global_step=self.global_step,
+            total_steps=self.total_steps,
+            epoch=self._effective_epoch(),
+        )
         try:
             return Evaluator().run(
                 lambda batch: self.core.strategy.forward_loss(batch, ctx), data
@@ -1182,6 +1191,12 @@ class TrainerController:
         box = [bool(flag)] if torch.distributed.get_rank() == 0 else [False]
         torch.distributed.broadcast_object_list(box, src=0)
         return bool(box[0])
+
+    def _effective_epoch(self) -> int:
+        """Logical epoch from the step stride, or the fit-loop epoch when unset."""
+        if self._steps_per_epoch:
+            return int(self.global_step // self._steps_per_epoch)
+        return self.epoch
 
     def _checkpoint_manager(self):
         # Lazily built in its S-home so the runtime seam does not import the domain
