@@ -116,11 +116,14 @@ class DPALTest(unittest.TestCase):
     def test_real_forward_backward_projects_teacher_once(self):
         self._check_forward("cpu", torch.float32)
 
+    def test_teacher_diagnostics_reuse_cached_logits(self):
+        self._check_forward("cpu", torch.float32, teacher_metrics=True)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_bf16_cuda_forward_backward(self):
         self._check_forward("cuda", torch.bfloat16)
 
-    def _check_forward(self, device, dtype):
+    def _check_forward(self, device, dtype, teacher_metrics=False):
         for kind in LOSSES:
             torch.manual_seed(42)
             cfg = Qwen3Config(
@@ -147,7 +150,7 @@ class DPALTest(unittest.TestCase):
                 attention_backend="sdpa",
                 loss_type=kind,
                 dpal_rho=0.3,
-                teacher_metrics=False,
+                teacher_metrics=teacher_metrics,
             ).to(device=device, dtype=dtype)
             contract = resume_contract(None, model.draft_model, model)
             self.assertEqual(contract["dflash_dpal_rho"], 0.3)
@@ -157,6 +160,9 @@ class DPALTest(unittest.TestCase):
             teacher = torch.randn(
                 2, 48, 32, device=device, dtype=dtype, requires_grad=True
             )
+            if teacher_metrics:
+                with torch.no_grad():
+                    teacher.fill_(7.0)
             mask = torch.ones_like(ids, dtype=torch.float)
             mask[1] = 0
             reference = None
@@ -168,6 +174,10 @@ class DPALTest(unittest.TestCase):
                             lambda module, args: (
                                 projections.append(tuple(args[0].shape))
                                 if args[0] is teacher
+                                or (
+                                    teacher_metrics
+                                    and args[0].detach().eq(7).all().item()
+                                )
                                 else None
                             )
                         )

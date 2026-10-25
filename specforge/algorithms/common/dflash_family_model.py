@@ -1019,6 +1019,7 @@ class OnlineDFlashModel(nn.Module):
             top_k=self._metric_top_k(),
         )
         credit_probability = unary.hard_label_probability
+        aligned_target_logits = None
         if self.requires_target_hidden_states:
             if target_logits is None or target_pred_indices is None:
                 raise ValueError(
@@ -1027,12 +1028,10 @@ class OnlineDFlashModel(nn.Module):
             indices = target_pred_indices.reshape(hidden.shape[0], -1, 1).expand(
                 -1, -1, target_logits.shape[-1]
             )
-            p = (
-                target_logits.gather(1, indices)
-                .reshape_as(unary.probabilities)
-                .float()
-                .softmax(-1)
+            aligned_target_logits = target_logits.gather(1, indices).reshape_as(
+                unary.probabilities
             )
+            p = aligned_target_logits.float().softmax(-1)
             credit_probability = (
                 torch.minimum(p, unary.probabilities).sum(-1).clamp(0.0, 1.0)
             )
@@ -1066,6 +1065,9 @@ class OnlineDFlashModel(nn.Module):
             aligned_target_hidden=aligned_target_hidden,
             weight_mask=weight_mask,
             position_den=position_den,
+            aligned_target_logits=(
+                aligned_target_logits if self.teacher_metrics else None
+            ),
         )
         return self._reduce_dflash_metric_terms(
             unary=unary,
@@ -1269,20 +1271,26 @@ class OnlineDFlashModel(nn.Module):
         aligned_target_hidden: Optional[torch.Tensor],
         weight_mask: torch.Tensor,
         position_den: torch.Tensor,
+        aligned_target_logits: Optional[torch.Tensor] = None,
     ) -> _DFlashTeacherTerms:
         """Compare unary and greedy predictions with the frozen target head."""
 
-        if aligned_target_hidden is None:
+        if aligned_target_hidden is None and aligned_target_logits is None:
             return _DFlashTeacherTerms.zeros(position_den)
 
-        batch_size, num_blocks, block_size, hidden_size = aligned_target_hidden.shape
-        teacher_logits = self.lm_head(
-            aligned_target_hidden.reshape(
-                batch_size,
-                num_blocks * block_size,
-                hidden_size,
+        if aligned_target_logits is None:
+            batch_size, num_blocks, block_size, hidden_size = (
+                aligned_target_hidden.shape
             )
-        ).reshape_as(unary.probabilities)
+            aligned_target_logits = self.lm_head(
+                aligned_target_hidden.reshape(
+                    batch_size,
+                    num_blocks * block_size,
+                    hidden_size,
+                )
+            ).reshape_as(unary.probabilities)
+        block_size = weight_mask.shape[-1]
+        teacher_logits = aligned_target_logits
         teacher_probabilities = torch.softmax(teacher_logits.float(), dim=-1)
         teacher_ids = teacher_logits.argmax(dim=-1)
         expected_acceptance = (
@@ -1518,6 +1526,7 @@ class OnlineDFlashModel(nn.Module):
                 target_last_hidden_states is not None
                 and collect_detailed_metrics
                 and self.teacher_metrics
+                and not self.requires_target_hidden_states
             )
             else None
         )
@@ -1705,7 +1714,7 @@ class OnlineDFlashModel(nn.Module):
                 top_k,
                 has_selector=candidate_selector is not None,
             )
-            if aligned_target_hidden is not None:
+            if self.teacher_metrics and target_last_hidden_states is not None:
                 ratio_metrics["dflash/teacher/unary_overlap_chain_length"] = (
                     terms.teacher_expected_accepted_length_num.detach(),
                     terms.block_den.detach(),
