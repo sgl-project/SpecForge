@@ -1023,8 +1023,14 @@ class TrainingConfig(StrictConfigModel):
         "dpace",
         "dpace-cumulative-confidence-only",
         "dpace-continuation-value-only",
+        "dpal-renyi",
+        "dpal-kl",
+        "dpal-la",
+        "dpal-ce-tv",
     ] = "dflash"
     dpace_alpha: float = 0.5
+    #: Smoothing floor for D-PAL's detached overlap-based position weights.
+    dpal_rho: float = Field(default=0.3, ge=0.0, le=1.0)
     #: Weight of the top-k path-selector objective for DFlash2 drafts.
     dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
     #: Fraction of optimizer steps that train only the DFlash2 base objective.
@@ -1037,7 +1043,8 @@ class TrainingConfig(StrictConfigModel):
     #: Online DFlash/DFlash2 only: capture the target's final hidden state for
     #: the teacher-agreement diagnostics (``dflash/teacher/*`` and
     #: ``dflash2/selector/self_conditioned_teacher_argmax_agreement``). The
-    #: objective never reads it; ``false`` stops the capture server from
+    #: D-PAL objectives require it regardless of this diagnostics flag.
+    #: For other objectives, ``false`` stops the capture server from
     #: writing it and the trainer from fetching it (one ``hidden_size`` row per
     #: token next to the ``len(target_layer_ids) * hidden_size`` aux row).
     dflash_teacher_metrics: bool = True
@@ -1074,6 +1081,9 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.loss_type.startswith("dpal-"):
+            if self.strategy != "dflash" or self.lk_loss_type is not None:
+                raise ValueError("D-PAL requires strategy=dflash and lk_loss_type=None")
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:

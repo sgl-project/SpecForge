@@ -307,12 +307,18 @@ Common fields:
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
-| `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
+| `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 teacher-agreement diagnostics. `false` drops diagnostic-only final hidden states; D-PAL still captures and consumes them for its objective. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
 
 Strategy-specific fields should be written only when tuning that objective:
+
+DFlash1 also supports [D-PAL](../../docs/recipes/dpal.md) with
+`training.loss_type: dpal-renyi`, `dpal-kl`, `dpal-la`, or `dpal-ce-tv`, and
+`training.dpal_rho` (default `0.3`). The [Qwen3-4B recipe](offline/colocated/qwen3-4b-dpal.yaml)
+uses three draft layers and a final-teacher-state capture. Other objectives keep
+their existing defaults.
 
 | Strategy | Fields and defaults |
 | --- | --- |

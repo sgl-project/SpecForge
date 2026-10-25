@@ -10,8 +10,12 @@ from specforge.algorithms.common.defaults import (
     no_missing_checkpoint_keys,
 )
 from specforge.algorithms.common.hidden_states_data import (
+    DSPARK_NORMALIZER_ID,
     NORMALIZER_ID,
     build_collator,
+    build_dspark_collator,
+    build_dspark_offline_normalizer,
+    build_dspark_offline_reader,
     build_offline_normalizer,
     build_offline_reader,
 )
@@ -43,8 +47,8 @@ DFLASH2_DRAFT_ARCHITECTURE = "DFlash2DraftModel"
 COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
     {DRAFT_ARCHITECTURE, DFLASH2_DRAFT_ARCHITECTURE}
 )
-# The objective reads only the aux hidden states. The final hidden state feeds
-# teacher-agreement diagnostics and is optional for every consumer.
+# D-PAL needs final teacher states for its objective; other losses use them
+# only for optional teacher-agreement diagnostics.
 SERVER_CAPTURE_LAYOUT = ServerCaptureLayout(
     aux_feature="hidden_states",
     last_hidden_feature="target_last_hidden_states",
@@ -84,6 +88,8 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_kl_scale": float(training_model.kl_scale),
         "dflash_kl_decay": float(training_model.kl_decay),
     }
+    if training_model.loss_type.startswith("dpal-"):
+        contract["dflash_dpal_rho"] = float(training_model.dpal_rho)
     if getattr(draft_model, "candidate_selector", None) is not None:
         method_config = dict(getattr(draft_model.config, "dflash_config", None) or {})
         contract.update(
@@ -188,11 +194,51 @@ def needs_input_tools(config, draft_model):
 
 
 def select_server_capture_layout(config):
-    """Stop requesting the final hidden state when teacher metrics are off."""
+    """Keep objective-required teacher states even when diagnostics are off."""
 
-    if config.training.dflash_teacher_metrics:
+    if config.training.dflash_teacher_metrics or getattr(
+        config.training, "loss_type", ""
+    ).startswith("dpal-"):
         return SERVER_CAPTURE_LAYOUT
     return replace(SERVER_CAPTURE_LAYOUT, last_hidden_feature=None)
+
+
+def resolve_for_config(config, registration):
+    """Reuse the four-field reader for D-PAL without changing legacy captures."""
+    if not config.training.loss_type.startswith("dpal-"):
+        return registration
+    contracts = []
+    for contract in registration.spec.feature_contracts:
+        required = contract.required_tensors | {"target_last_hidden_states"}
+        if contract.mode is FeatureMode.OFFLINE:
+            contract = replace(
+                contract,
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
+                storage=replace(
+                    contract.storage,
+                    required_tensors=required,
+                    normalizer=DSPARK_NORMALIZER_ID,
+                ),
+            )
+        contracts.append(replace(contract, required_tensors=required))
+    offline = tuple(
+        replace(
+            provider,
+            normalizer_id=DSPARK_NORMALIZER_ID,
+            capture_layout=replace(
+                provider.capture_layout, last_hidden_feature="target_last_hidden_states"
+            ),
+            build_reader=partial(build_dspark_offline_reader, ALGORITHM_NAME),
+            build_normalizer=build_dspark_offline_normalizer,
+            build_collator=build_dspark_collator,
+        )
+        for provider in registration.providers.offline
+    )
+    return make_registration(
+        replace(registration.spec, feature_contracts=tuple(contracts)),
+        replace(registration.providers, offline=offline),
+    )
 
 
 def algorithm_spec() -> AlgorithmSpec:
@@ -233,6 +279,7 @@ def algorithm_providers() -> AlgorithmProviders:
     collator = build_collator
     return AlgorithmProviders(
         algorithm_name=ALGORITHM_NAME,
+        resolve_for_config=resolve_for_config,
         step=StepProvider(
             build=build_step,
             options=empty_options,

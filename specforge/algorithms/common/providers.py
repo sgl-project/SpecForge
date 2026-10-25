@@ -633,6 +633,8 @@ class AlgorithmProviders:
     offline: Tuple[OfflineDataProvider, ...] = ()
     server_streaming: Tuple[ServerStreamingProvider, ...] = ()
     vocab_mapping_modes: FrozenSet[FeatureMode] = frozenset()
+    # Resolve objective-dependent feature contracts before planning any role.
+    resolve_for_config: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.algorithm_name, field_name="algorithm_name")
@@ -640,6 +642,10 @@ class AlgorithmProviders:
             raise TypeError("step must be a StepProvider")
         if not isinstance(self.model, ModelProvider):
             raise TypeError("model must be a ModelProvider")
+        if self.resolve_for_config is not None and not callable(
+            self.resolve_for_config
+        ):
+            raise TypeError("resolve_for_config must be callable or None")
         offline = tuple(self.offline)
         streaming = tuple(self.server_streaming)
         self._validate_unique_modalities(offline, field_name="offline")

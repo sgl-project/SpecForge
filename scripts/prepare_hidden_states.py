@@ -118,6 +118,11 @@ def parse_args():
         ),
     )
     model_group.add_argument(
+        "--loss-type",
+        default="dflash",
+        help="DFlash objective; D-PAL losses also capture final teacher states",
+    )
+    model_group.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading models",
@@ -331,7 +336,10 @@ def resolve_offline_capture_plan(
             "hidden_states_path": args.output_path or "__offline_capture__",
             "max_length": args.max_length,
         },
-        training={"strategy": strategy},
+        training={
+            "strategy": strategy,
+            "loss_type": getattr(args, "loss_type", "dflash"),
+        },
     )
     resolved = resolve_offline_capture(cfg, target_config=target_config)
     return OfflineCapturePlan(

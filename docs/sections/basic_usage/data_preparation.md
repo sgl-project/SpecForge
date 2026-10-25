@@ -284,6 +284,7 @@ Use these strategy/model pairs for the checked-in offline colocated recipes:
 | --- | --- | --- | --- |
 | EAGLE3 | `Qwen/Qwen3-8B` | `configs/qwen3-8b-eagle3.json` | `cache/hidden_states/qwen3-8b-sharegpt` |
 | DFlash | `Qwen/Qwen3-8B` | `configs/qwen3-8b-dflash.json` | `cache/hidden_states/qwen3-8b-dflash-sharegpt` |
+| DFlash1 with D-PAL | `Qwen/Qwen3-4B` | `configs/qwen3-4b-dpal-b16.json` | `cache/hidden_states/qwen3-4b-dpal` |
 | Domino | `Qwen/Qwen3-8B` | `configs/qwen3-8b-domino.json` | `cache/hidden_states/qwen3-8b-domino-sharegpt` |
 | DSpark | `Qwen/Qwen3-4B` | `configs/qwen3-4b-dspark.json` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
 
@@ -299,7 +300,8 @@ Each output record contains the strategy's exact offline feature contract:
 | Strategy | Tensors in each `.ckpt` or `.ckpt.gz` record |
 | --- | --- |
 | EAGLE3 | `input_ids`, `loss_mask`, `hidden_state`, `aux_hidden_state` |
-| DFlash, DFlash2, and Domino | `input_ids`, `loss_mask`, `hidden_states` |
+| DFlash without D-PAL, DFlash2, and Domino | `input_ids`, `loss_mask`, `hidden_states` |
+| DFlash1 with D-PAL | `input_ids`, `loss_mask`, `hidden_states`, `target_last_hidden_states` |
 | DSpark | `input_ids`, `loss_mask`, `hidden_states`, `target_last_hidden_states` |
 
 For the DFlash family, `hidden_states` concatenates the target layers selected
@@ -317,6 +319,14 @@ record.
 D-PACE uses `training.strategy: dflash` and the DFlash feature schema. DTA also
 uses `--strategy dflash`, but feature preparation must receive its DTA draft
 config so the captured layer contract matches the training run.
+
+[D-PAL](/recipes/dpal) also uses `--strategy dflash`, with
+`--loss-type dpal-renyi`, `dpal-kl`, `dpal-la`, or `dpal-ce-tv` during feature
+preparation. Each option selects the same four-field capture, including the
+final teacher states needed to compute the target distribution. An existing
+three-field DFlash cache is insufficient: recapture into a new output directory.
+The `training.dflash_teacher_metrics` flag controls diagnostics only and does
+not remove this required field from D-PAL training or online capture.
 
 For preformatted input, add `--is-preformatted` to the same command and keep
 `--chat-template` aligned with the template already applied to the text:
