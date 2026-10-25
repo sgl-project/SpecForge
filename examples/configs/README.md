@@ -316,7 +316,7 @@ Strategy-specific fields should be written only when tuning that objective:
 
 DFlash1 also supports [D-PAL](../../docs/recipes/dpal.md) with
 `training.loss_type: dpal-renyi`, `dpal-kl`, `dpal-la`, or `dpal-ce-tv`, and
-`training.dpal_rho: 0.3`. The [Qwen3-4B recipe](offline/colocated/qwen3-4b-dpal.yaml)
+`training.dpal_rho` (default `0.3`). The [Qwen3-4B recipe](offline/colocated/qwen3-4b-dpal.yaml)
 uses three draft layers and a final-teacher-state capture. Other objectives keep
 their existing defaults.
 
