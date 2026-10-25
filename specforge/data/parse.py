@@ -426,6 +426,7 @@ class HarmonyParser(Parser):
         preformatted: bool = False,
         train_only_last_turn: bool = False,
         tool: List[Dict] = [],
+        **kwargs,
     ) -> List[torch.Tensor]:
         if not preformatted:
             prompt_text = ""
