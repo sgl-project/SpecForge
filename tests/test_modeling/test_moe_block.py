@@ -198,14 +198,14 @@ class FamilyConfigTest(unittest.TestCase):
             (gate.aux_loss_coef, gate.aux_loss_type, gate.bias_update_rate),
             (0.25, "batch_wise", 0.01),
         )
-        # Defaults: no bias, micro-batch-wise loss at coefficient 0, renormalized top-k.
+        # Defaults: no bias, batch-wise loss at coefficient 0, renormalized top-k.
         config = _config()
         del config.norm_topk_prob  # Qwen3.8's config omits it
         plain = build_moe(config).gate
         self.assertIsNone(plain.selection_bias)
         self.assertEqual(
             (plain.aux_loss_coef, plain.aux_loss_type, plain.norm_topk_prob),
-            (0.0, "microbatch_wise", True),
+            (0.0, "batch_wise", True),
         )
         # Width 0 drops the shared expert: the block is the routed experts alone.
         routed_only = build_moe(_config(shared_expert_intermediate_size=0))

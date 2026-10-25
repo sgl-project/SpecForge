@@ -35,7 +35,7 @@ class TopKRouter(nn.Module):
         selection_bias: bool = False,
         route_scale: float = 1.0,
         aux_loss_coef: float = 0.0,
-        aux_loss_type: str = "microbatch_wise",
+        aux_loss_type: str = "batch_wise",
         bias_update_rate: float = 0.001,
     ) -> None:
         super().__init__()
