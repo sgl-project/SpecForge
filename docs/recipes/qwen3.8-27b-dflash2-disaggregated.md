@@ -160,7 +160,9 @@ What moved each side:
   unary head (the 248k-vocabulary objective ran three GEMMs and about 330 GB of
   fp32 traffic per micro-batch; now 3.4x faster), the fused grouped
   convolution, one host sync per optimizer step instead of one per micro-step,
-  and Liger RMSNorm/SwiGLU.
+  and Liger RMSNorm/SwiGLU. These numbers keep the objective logits for
+  backward, so the recipes set `training.objective_checkpointing: false`; the
+  default recomputes the projection to save memory.
 - RDMA loopback takes the per-byte CPU copies out of the SGLang and trainer
   processes: at 4+4 the trainer step fell from 1.42 s to 1.22 s. The capture
   servers publish from GPU memory on RDMA, which needs GPUDirect RDMA
