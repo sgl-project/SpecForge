@@ -57,27 +57,23 @@ def dispatch_balance(tokens_per_expert: torch.Tensor) -> torch.Tensor:
     return share.shape[-1] * share.square().sum()
 
 
-# Hooks the DFlash-family model calls; routers and layers are found by their state.
+# Hooks the DFlash-family model calls; routers are found by their state.
 
 
 class _RouterLike(Protocol):
     tokens_per_expert: torch.Tensor
     selection_bias: Optional[torch.Tensor]
+    token_mask: Optional[torch.Tensor]
     aux_loss: Optional[torch.Tensor]
     aux_loss_coef: float
 
     def update_expert_bias(self, tokens_per_expert: torch.Tensor) -> None: ...
 
 
-class _MoELayerLike(Protocol):
-    gate: _RouterLike
-    token_mask: Optional[torch.Tensor]
-
-
 def set_moe_token_mask(model: nn.Module, mask: Optional[torch.Tensor]) -> None:
-    """Hand every MoE layer this batch's ``[B, S]`` kept-slot mask."""
-    for layer in _moe_layers(model):
-        layer.token_mask = mask
+    """Hand every MoE router this batch's ``[B, S]`` kept-slot mask."""
+    for router in _routers(model):
+        router.token_mask = mask
 
 
 def take_moe_aux_loss(
@@ -85,15 +81,15 @@ def take_moe_aux_loss(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Pop this forward's load-balance loss: (weighted sum over layers, raw mean)."""
     # Weighted like its objective: by denominator under loss_terms, equally otherwise.
-    layers = _moe_layers(model)
+    routers = _routers(model)
     terms = [
-        (layer.gate.aux_loss_coef, layer.gate.aux_loss)
-        for layer in layers
-        if layer.gate.aux_loss is not None
+        (router.aux_loss_coef, router.aux_loss)
+        for router in routers
+        if router.aux_loss is not None
     ]
-    for layer in layers:
-        layer.gate.aux_loss = None
-        layer.token_mask = None
+    for router in routers:
+        router.aux_loss = None
+        router.token_mask = None
     if not terms:
         return None
     # One coefficient per layer, as in torchtitan and Megatron; the metric stays a mean.
@@ -122,7 +118,3 @@ def step_moe_balancing(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 def _routers(model: nn.Module) -> List[_RouterLike]:
     return [m for m in model.modules() if hasattr(m, "tokens_per_expert")]
-
-
-def _moe_layers(model: nn.Module) -> List[_MoELayerLike]:
-    return [m for m in model.modules() if hasattr(m, "token_mask")]

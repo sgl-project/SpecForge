@@ -67,6 +67,8 @@ class TopKRouter(nn.Module):
         self.bias_update_rate = bias_update_rate
         # This micro-batch's load-balance (aux) loss, kept in training for the trainer.
         self.aux_loss: Optional[torch.Tensor] = None
+        # This batch's [B, S] kept-slot mask, from set_moe_token_mask.
+        self.token_mask: Optional[torch.Tensor] = None
         self.reset_parameters(initializer_range)
 
     def _apply(self, fn, recurse=True):
@@ -88,7 +90,7 @@ class TopKRouter(nn.Module):
                 nn.init.zeros_(buffer)
 
     def forward(
-        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+        self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``x`` [T, H] -> fp32 scores [T, E], indices [T, K], fp32 weights [T, K]."""
         self.aux_loss = None  # per-forward state: never carry a stale loss into eval
@@ -100,6 +102,7 @@ class TopKRouter(nn.Module):
         if self.norm_topk_prob:
             weights = weights / weights.sum(dim=-1, keepdim=True)
         if self.training:
+            mask = None if self.token_mask is None else self.token_mask.reshape(-1)
             counts = count_tokens_per_expert(indices, mask, self.num_experts)
             self.tokens_per_expert += counts
             load = aux_loss_tokens_per_expert(

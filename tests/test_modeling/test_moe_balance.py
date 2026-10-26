@@ -121,7 +121,7 @@ class _MaskRecordingDraft(nn.Module):
         self.seen_mask = None
 
     def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
-        self.seen_mask = self.moe.token_mask
+        self.seen_mask = self.moe.gate.token_mask
         return self.moe(noise_embedding)
 
 
@@ -195,7 +195,7 @@ class BalancingHooksTest(unittest.TestCase):
         with self.subTest(phase="first micro-batch, masked"):
             set_moe_token_mask(layers, mask)
             for layer in layers:
-                self.assertIs(layer.token_mask, mask)
+                self.assertIs(layer.gate.token_mask, mask)
                 layer(x)
             losses = [gate.aux_loss for gate in gates]
             first = [gate.tokens_per_expert.clone() for gate in gates]
@@ -204,7 +204,7 @@ class BalancingHooksTest(unittest.TestCase):
             torch.testing.assert_close(raw, (losses[0] + losses[1]) / 2)
             for layer in layers:
                 self.assertIsNone(layer.gate.aux_loss)
-                self.assertIsNone(layer.token_mask)
+                self.assertIsNone(layer.gate.token_mask)
             # On the step's first forward both loss types read this micro-batch alone.
             for gate, loss in zip(gates, losses):
                 scores, indices = _scores_and_indices(gate, x)
@@ -288,7 +288,7 @@ class ObjectiveTest(unittest.TestCase):
             self.assertNotIn("loss_terms", metrics)
         # The per-forward state is consumed.
         self.assertIsNone(with_aux.draft_model.layers[0].mlp.gate.aux_loss)
-        self.assertIsNone(with_aux.draft_model.layers[0].mlp.token_mask)
+        self.assertIsNone(with_aux.draft_model.layers[0].mlp.gate.token_mask)
 
     def test_each_objective_folds_the_loss_and_hands_the_block_mask(self):
         with self.subTest(family="dflash"):
