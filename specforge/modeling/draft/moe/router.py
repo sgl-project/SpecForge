@@ -4,11 +4,11 @@
 from typing import Callable, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
 from specforge.modeling.draft.moe.balance import (
+    aux_loss_tokens_per_expert,
     count_tokens_per_expert,
     load_balance_loss,
 )
@@ -103,18 +103,11 @@ class TopKRouter(nn.Module):
             counts = count_tokens_per_expert(indices, mask, self.num_experts)
             self.tokens_per_expert += counts
             # Always kept in training: with coefficient 0 it is the balance metric.
-            self.aux_loss = load_balance_loss(scores, self._aux_loss_load(counts), mask)
+            load = aux_loss_tokens_per_expert(
+                self.aux_loss_type, counts, self.tokens_per_expert
+            )
+            self.aux_loss = load_balance_loss(scores, load, mask)
         return scores, indices, weights * self.route_scale
-
-    def _aux_loss_load(self, counts: torch.Tensor) -> torch.Tensor:
-        """The load the aux loss balances: this micro-batch's counts, or the step's."""
-        if self.aux_loss_type != "batch_wise":
-            return counts
-        # Batch-wise: the step's counts so far, pooled over ranks; the loss uses shares.
-        load = self.tokens_per_expert.clone()
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(load)
-        return load
 
     @torch.no_grad()
     def update_expert_bias(self, tokens_per_expert: torch.Tensor) -> None:

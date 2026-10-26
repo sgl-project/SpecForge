@@ -21,6 +21,19 @@ def count_tokens_per_expert(
     return weights.new_zeros(num_experts).scatter_add_(0, slots, weights)
 
 
+def aux_loss_tokens_per_expert(
+    aux_loss_type: str, counts: torch.Tensor, step_counts: torch.Tensor
+) -> torch.Tensor:
+    """Counts the aux loss balances: this micro-batch's, or the step's pooled over ranks."""
+    if aux_loss_type != "batch_wise":
+        return counts
+    # Batch-wise: the step's counts so far, pooled over ranks; the loss uses shares.
+    load = step_counts.clone()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(load)
+    return load
+
+
 def load_balance_loss(
     scores: torch.Tensor,
     tokens_per_expert: torch.Tensor,
