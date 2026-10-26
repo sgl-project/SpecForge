@@ -347,6 +347,88 @@ specforge train --config examples/configs/offline/colocated/qwen3-8b-dflash.yaml
 See the [Training](training.md) guide for the complete run schema and supported
 combinations.
 
+### Targets without a local SGLang engine
+
+`--target-backend` selects what runs the target during capture. The default,
+`sglang`, is described above. Two more backends exist for targets that a local
+SGLang build cannot run yet, currently Qwen3.8-Flash-Next (`qwen4_exp`); both
+support the DFlash and DSpark capture methods and keep the rendering, loss
+masks, record layout and resumption of the SGLang path.
+
+**`hf`: the Transformers reference model.** One process drives the whole node
+(`torchrun --nproc_per_node 1`, `--tp-size 1`): consecutive decoder layers are
+spread over the visible accelerators (`--hf-num-devices`), so only one device
+computes at a time. Flash-Next's ~95 GiB n-gram embedding stays in host memory,
+where its lookup runs; load the BF16 checkpoint with at least ~400 GiB of host
+memory. It needs `transformers>=5.16.1` in the capture environment only. Rows
+run one at a time over their real tokens and are saved at their real length,
+so `--batch-size` only sets how many rows a step reads. Two reference paths are
+replaced for speed (a vectorized QSA indexer and one-readback expert
+dispatch), and the capture is bit-identical to the reference model running the
+same paths.
+
+**`vllm`: a running vLLM / vLLM-Ascend hidden-state server.** Start the server
+with the `extract_hidden_states` speculative method and
+`ExampleHiddenStatesConnector`, keeping the connector's
+`use_synchronization_lock` on (its default): the connector writes each file
+asynchronously and its lock is the only sign the file is complete, so the
+backend refuses a capture without one. The backend sends each row's real token
+ids to `/v1/completions` with `max_tokens=1`, waits on the connector's file
+lock and converts the `[T, K, H]` capture into the strategy's record. It loads no model
+(`SPECFORGE_DEVICE=cpu` is enough) and only reads the target's `config.json`;
+when the installed Transformers does not know the model type, the raw file is
+read instead, as training does, so the repository's pinned release is enough.
+
+- The server's layer ids are the draft's `target_layer_ids` plus one, followed
+  by `num_hidden_layers`: vLLM numbers a layer's *input*, SpecForge a layer's
+  *output*, and the last slot is the state `lm_head` reads. For Flash-Next that
+  is `[4, 16, 24, 36, 44, 48]`. The backend prints the expected value and
+  refuses a capture with the wrong layer count.
+- Echoed and saved token ids, sequence length and finiteness are checked per
+  row. Rows are sent unpadded and saved at their real length, so set
+  `--batch-size` equal to `--vllm-concurrency`, at most the server's
+  `--max-num-seqs`; keep `--max-length` below its `--max-model-len`.
+- `--vllm-path-map SERVER_PREFIX=LOCAL_PREFIX` translates capture paths when the
+  server writes them in another container; `--vllm-keep-captures` keeps the
+  server's files for debugging.
+
+Upstream vLLM and vLLM-Ascend cannot yet serve Qwen3.8-Flash-Next this way:
+vLLM's Qwen4Exp config check admits only its native MTP and n-gram proposers,
+and the model does not emit auxiliary hidden states. The
+[`qwen38-capture`](https://github.com/fg11991/vllm-ascend/tree/qwen38-capture)
+branch of `fg11991/vllm-ascend` carries the changes, chiefly
+[`8cc7129`](https://github.com/fg11991/vllm-ascend/commit/8cc712978334a47c670aeb82dc3ef0d091c53553)
+(allow `extract_hidden_states` for Qwen4Exp) and
+[`1de1b0b`](https://github.com/fg11991/vllm-ascend/commit/1de1b0b5ae6e39f13674a08ac4975c197bfb475c)
+(serve the auxiliary hidden states), plus KV-cache sizing fixes for the
+capture path. It has been run on one Atlas 800 A3 node: W8A8 weights, TP8,
+`--enforce-eager`, native MTP off, `--max-model-len 2304`.
+
+```bash
+SPECFORGE_DEVICE=cpu torchrun --nproc_per_node=1 \
+    scripts/prepare_hidden_states.py \
+    --strategy dspark \
+    --target-model-path /models/Qwen3.8-Flash-Next \
+    --draft-model-config configs/qwen3.8-flash-next-dspark-moe64.json \
+    --data-path ./cache/dataset/train.jsonl \
+    --output-path ./cache/hidden_states/qwen3.8-flash-next-dspark \
+    --chat-template qwen3.5 \
+    --max-length 2048 \
+    --tp-size 1 \
+    --target-backend vllm \
+    --vllm-url http://127.0.0.1:8000 \
+    --vllm-served-model-name qwen3.8-flash-next \
+    --vllm-concurrency 4 \
+    --batch-size 4
+```
+
+The MoE drafter in `configs/qwen3.8-flash-next-dspark-moe{64,512}.json` mirrors
+the target's MTP layer, so it can start from it:
+`scripts/warm_start_from_mtp.py` writes a pretrained draft directory (gated
+attention, router, routed and shared experts copied; the rest freshly
+initialized) for `model.draft_checkpoint_path`. The 64-expert arm names the
+MTP experts it starts from with `--expert-ids` or `--expert-selection stride`.
+
 
 ## Handling Multiple Datasets
 

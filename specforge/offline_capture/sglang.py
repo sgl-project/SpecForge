@@ -26,6 +26,9 @@ class OfflineSGLangCapture:
         self._backend = backend
         self.capture_layers: Optional[List[int]] = None
         self.capture_method = "eagle3"
+        # Backends that capture only a row's real tokens; the preparation
+        # script then saves each record at its attention-mask length.
+        self.unpadded_rows = bool(getattr(backend, "unpadded_rows", False))
 
     @classmethod
     def from_pretrained(
@@ -93,10 +96,35 @@ def load_offline_capture(
     *,
     torch_dtype: Optional[torch.dtype] = None,
     trust_remote_code: bool = False,
+    backend: str = "sglang",
     **kwargs,
 ) -> OfflineSGLangCapture:
-    """Load the local SGLang target for offline hidden-state preparation."""
+    """Load the local target for offline hidden-state preparation.
 
+    ``backend="hf"`` runs the Transformers reference model instead of SGLang;
+    ``backend="vllm"`` asks a running vLLM hidden-state server. The wrapper and
+    the captured layout are the same either way.
+    """
+
+    if backend == "hf":
+        from .hf_backend import OfflineHFCaptureBackend
+
+        return OfflineSGLangCapture(
+            OfflineHFCaptureBackend.build(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            )
+        )
+    if backend == "vllm":
+        from .vllm_backend import OfflineVLLMCaptureBackend
+
+        return OfflineSGLangCapture(
+            OfflineVLLMCaptureBackend.build(pretrained_model_name_or_path, **kwargs)
+        )
+    if backend != "sglang":
+        raise ValueError(f"unknown offline capture backend {backend!r}")
     return OfflineSGLangCapture.from_pretrained(
         pretrained_model_name_or_path,
         torch_dtype=torch_dtype,
