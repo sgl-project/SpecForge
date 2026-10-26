@@ -79,8 +79,9 @@ def _reduce_acceptance_rows(
         eps=eps,
         reduce_fn=reduce_fn,
     )
-    log_acceptance_rate_per_token = torch.where(
-        acceptance_rate_per_token > 0, torch.log(acceptance_rate_per_token), 0
+    # Select before log so zero-acceptance rows also have a zero gradient.
+    log_acceptance_rate_per_token = torch.log(
+        torch.where(acceptance_rate_per_token > 0, acceptance_rate_per_token, 1)
     )
     log_acceptance_rate = _masked_mean(
         values_per_token=log_acceptance_rate_per_token,

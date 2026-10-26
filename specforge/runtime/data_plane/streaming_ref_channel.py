@@ -18,10 +18,11 @@ that control-plane channel.
   publish); the feature tensors go through the ``FeatureStore`` (Mooncake), so a
   shared *data* mount is never required -- only this small control file.
 * **Append-only JSONL.** ``publish()`` appends one ref per line and fsyncs;
-  ``poll()`` tail-reads complete lines from the last offset, buffering a partial
-  trailing line so a reader never parses a half-written record.
+  ``poll()`` advances its byte offset only after validating complete records.
+  Partial trailing records are reread on the next poll.
 * **Consume-once friendly.** The reader marks how many refs it has consumed
-  (``mark_consumed``) in a sidecar counter the writer reads back, so the producer
+  (``mark_consumed``) in a sidecar counter; source distributors also include the
+  released bytes in that atomic record, so the producer
   can apply backpressure (``in_flight_remote``) without any shared in-process
   state -- the same split-process model as the rest of disaggregation.
 * **Explicit outcome.** ``close()`` drops an EOF sentinel only for a successful
@@ -38,16 +39,18 @@ slots in behind the same publish/poll API later.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Sequence
 
 from specforge.runtime.contracts import SampleRef, assert_no_tensors
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
+
+logger = logging.getLogger(__name__)
 
 _CLOSED_SUFFIX = ".closed"
 _CONSUMED_SUFFIX = ".consumed_count"
@@ -116,9 +119,8 @@ class StreamingRefChannel:
         self._published = 0
         # consumer-side
         self._read_offset = 0
-        self._partial_line = ""
-        self._complete_lines = deque[str]()
         self._consumed = 0
+        self._consumed_bytes: Optional[int] = None
         # ``mark_consumed`` is called from both the trainer thread (batch acks)
         # and the prefetch worker (failure settlement), so the increment and
         # the sidecar publish must be one atomic section.
@@ -231,17 +233,17 @@ class StreamingRefChannel:
 
     def publish_consumer_quantum(
         self,
-        refs_per_optimizer_step: int,
+        refs_per_dispatch: int,
         *,
         allow_existing: bool = False,
     ) -> None:
-        """Claim and publish the consumer's global optimizer-step ref quantum.
+        """Claim and publish the refs required for the consumer's next dispatch.
 
         Rank 0 calls this exactly once for a fresh attempt. The producer waits
         for the value before capture so its in-flight watermark cannot deadlock
-        below the number of refs needed for one lockstep optimizer step.
+        below the dispatch requirement (one or two optimizer windows).
         """
-        quantum = int(refs_per_optimizer_step)
+        quantum = int(refs_per_dispatch)
         if quantum < 1:
             raise ValueError(f"consumer quantum must be >= 1, got {quantum}")
         path = self.path + _CONSUMER_QUANTUM_SUFFIX
@@ -273,7 +275,7 @@ class StreamingRefChannel:
             os.unlink(tmp)
 
     def consumer_quantum(self) -> Optional[int]:
-        """Return the consumer's global optimizer-step ref quantum, if ready."""
+        """Return the consumer's minimum dispatch ref count, if ready."""
         path = self.path + _CONSUMER_QUANTUM_SUFFIX
         try:
             with open(path, encoding="utf-8") as stream:
@@ -305,13 +307,20 @@ class StreamingRefChannel:
     def published(self) -> int:
         return self._published
 
+    def consumed_state_remote(self) -> tuple[int, Optional[int]]:
+        """Read one atomic count/byte snapshot; integer-only inbox counters omit bytes."""
+        try:
+            with open(self.path + _CONSUMED_SUFFIX) as stream:
+                value = json.load(stream)
+        except (FileNotFoundError, ValueError):
+            return 0, None
+        if isinstance(value, int):
+            return value, None
+        return int(value["count"]), int(value["bytes"])
+
     def consumed_remote(self) -> int:
         """How many refs the consumer reports having consumed (cross-process)."""
-        try:
-            with open(self.path + _CONSUMED_SUFFIX) as f:
-                return int(f.read() or "0")
-        except (FileNotFoundError, ValueError):
-            return 0
+        return self.consumed_state_remote()[0]
 
     def in_flight_remote(self) -> int:
         """published - consumed: the producer's backpressure signal."""
@@ -325,50 +334,98 @@ class StreamingRefChannel:
     def poll(self, max_n: Optional[int] = None) -> List[SampleRef]:
         """Return refs appended since the last poll (complete lines only).
 
-        Non-blocking: returns whatever is available now (possibly empty). A
-        partially written trailing line is buffered until its newline arrives, so
-        a ref is never parsed half-written.
+        Does not wait for new records. An incomplete trailing record stays on
+        disk until its newline arrives. Invalid complete records trigger bounded
+        reopen/reread attempts, invalidating file cache where supported, without
+        committing any progress from this poll. Persistent corruption raises
+        rather than silently skipping a sample.
         """
-        try:
-            with open(self.path, "r") as f:
-                f.seek(self._read_offset)
-                chunk = f.read()
-                self._read_offset = f.tell()
-        except FileNotFoundError:
-            chunk = ""
-        if chunk:
-            lines = (self._partial_line + chunk).split("\n")
-            self._partial_line = lines.pop()
-            self._complete_lines.extend(lines)
-        # Parse queued lines even when no new bytes arrived -- a previous max_n
-        # call may have left complete lines buffered.
-        out: List[SampleRef] = []
-        while self._complete_lines:
-            if max_n is not None and len(out) >= max_n:
-                break
-            line = self._complete_lines.popleft().strip()
-            if line:
-                out.append(ref_from_dict(json.loads(line)))
-        return out
+        for attempt in range(3):
+            out: List[SampleRef] = []
+            next_offset = self._read_offset
+            try:
+                with open(self.path, "rb") as stream:
+                    if attempt and hasattr(os, "posix_fadvise"):
+                        try:
+                            os.posix_fadvise(
+                                stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED
+                            )
+                        except OSError as cache_error:
+                            logger.warning(
+                                "ref-channel: cache invalidation failed path=%s: %s",
+                                self.path,
+                                cache_error,
+                            )
+                    end_offset = stream.seek(0, os.SEEK_END)
+                    stream.seek(self._read_offset)
+                    chunk = stream.read(max(0, end_offset - self._read_offset))
+                for line in chunk.split(b"\n")[:-1]:
+                    if max_n is not None and len(out) >= max_n:
+                        break
+                    if line.strip():
+                        raw = json.loads(line.decode("utf-8"))
+                        try:
+                            ref = ref_from_dict(raw)
+                        except (KeyError, TypeError, AttributeError) as exc:
+                            raise ValueError(
+                                f"StreamingRefChannel {self.path}: "
+                                f"invalid SampleRef at byte offset {next_offset}: {exc}"
+                            ) from exc
 
-    def mark_consumed(self, n: int) -> None:
-        """Record n more consumed refs in the sidecar the producer reads back."""
-        with self._consumed_lock:
-            self._consumed += n
-            # Thread-unique tmp name: a concurrent writer must never observe
-            # (or os.replace away) another writer's half-written counter file.
-            tmp = (
-                f"{self.path}{_CONSUMED_SUFFIX}"
-                f".tmp.{os.getpid()}.{threading.get_ident()}"
+                        out.append(ref)
+                    next_offset += len(line) + 1
+            except FileNotFoundError:
+                return []
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                if attempt == 2:
+                    raise ValueError(
+                        f"StreamingRefChannel {self.path}: invalid record at "
+                        f"byte offset {next_offset} after 3 attempts: {error}"
+                    ) from error
+                logger.warning(
+                    "ref-channel: retrying invalid record path=%s byte_offset=%d "
+                    "attempt=%d/3 error=%s",
+                    self.path,
+                    next_offset,
+                    attempt + 1,
+                    error,
+                )
+                time.sleep(0.05)
+                continue
+            self._read_offset = next_offset
+            return out
+
+    def _store_consumed(self, count: int, num_bytes: Optional[int]) -> None:
+        # Caller holds _consumed_lock. Publish count and bytes together so a
+        # producer cannot observe half an acknowledgement, including on resume.
+        tmp = f"{self.path}{_CONSUMED_SUFFIX}.tmp.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "w") as stream:
+            json.dump(
+                count if num_bytes is None else {"count": count, "bytes": num_bytes},
+                stream,
             )
-            with open(tmp, "w") as f:
-                f.write(str(self._consumed))
-            os.replace(tmp, self.path + _CONSUMED_SUFFIX)  # atomic counter publish
+        os.replace(tmp, self.path + _CONSUMED_SUFFIX)
+        self._consumed, self._consumed_bytes = count, num_bytes
+
+    def mark_consumed(self, n: int, *, num_bytes: Optional[int] = None) -> None:
+        """Record released refs; source distributors also supply their actual bytes."""
+        with self._consumed_lock:
+            if self._consumed_bytes is not None and num_bytes is None:
+                raise ValueError("byte-aware acknowledgements require num_bytes")
+            total_bytes = (
+                None if num_bytes is None else (self._consumed_bytes or 0) + num_bytes
+            )
+            self._store_consumed(self._consumed + n, total_bytes)
+
+    def restore_consumed(self, count: int, num_bytes: int) -> None:
+        """Restore source accounting from the durable ledger and publication stream."""
+        with self._consumed_lock:
+            self._store_consumed(count, num_bytes)
 
     def seed_consumed(self) -> int:
         """Continue an existing consumed counter after a consumer restart."""
         with self._consumed_lock:
-            self._consumed = self.consumed_remote()
+            self._consumed, self._consumed_bytes = self.consumed_state_remote()
             return self._consumed
 
     def stream(
