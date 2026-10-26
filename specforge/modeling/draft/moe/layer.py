@@ -26,8 +26,6 @@ class MoELayer(nn.Module):
         self.experts = experts
         self.shared_expert = shared_expert
         self.shared_expert_gate = shared_expert_gate
-        # This batch's [B, S] kept-slot mask, from set_moe_token_mask.
-        self.token_mask: Optional[torch.Tensor] = None
 
     def reset_parameters(self, std: float) -> None:
         # Only the router and experts hold bare Parameters that HF's init skips.
@@ -36,8 +34,7 @@ class MoELayer(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
-        mask = self.token_mask if self.training else None
-        _, indices, weights = self.gate(x, None if mask is None else mask.reshape(-1))
+        _, indices, weights = self.gate(x)
         out = self.experts(x, indices, weights)
         if self.shared_expert is not None:
             shared = self.shared_expert(x)
