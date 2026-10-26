@@ -694,16 +694,24 @@ class OnlineDFlashModel(nn.Module):
         )
         return anchor_positions, block_keep_mask, output_hidden
 
-    def _take_moe_aux_loss_and_log(
-        self, ratio_metrics: Dict[str, object]
-    ) -> Optional[torch.Tensor]:
-        """Take the draft's MoE aux loss: log the raw mean, return the weighted mean."""
+    def if_add_moe_aux_loss(
+        self, loss: torch.Tensor, metrics: Dict[str, object]
+    ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        """Fold the draft's MoE balance loss into the loss; log its raw mean."""
         terms = take_moe_aux_loss(self.draft_model)
         if terms is None:
-            return None
+            return loss, metrics
         weighted_aux, raw_aux = terms
+        ratio_metrics = metrics.setdefault("ratio_metrics", {})
         ratio_metrics["moe/aux_loss"] = (raw_aux.detach(), torch.ones_like(raw_aux))
-        return weighted_aux
+        if "loss_terms" in metrics:
+            # Into the numerator the trainer backpropagates and normalizes globally.
+            numerator, denominator = metrics["loss_terms"]
+            metrics["loss_terms"] = (
+                numerator + weighted_aux * denominator,
+                denominator,
+            )
+        return loss + weighted_aux, metrics
 
     def on_optimizer_step(self) -> Dict[str, torch.Tensor]:
         """The trainer's per-step hook: move the draft's MoE balancing state once."""
@@ -1728,10 +1736,6 @@ class OnlineDFlashModel(nn.Module):
                     terms.selector_ce_num,
                     terms.selector_weight_den,
                 )
-        weighted_aux = self._take_moe_aux_loss_and_log(ratio_metrics)
-        if weighted_aux is not None:
-            # Into the numerator the trainer backpropagates and normalizes globally.
-            loss_num = loss_num + weighted_aux * loss_denominator.detach()
         metrics: Dict[str, object] = {
             "accuracy_denom": accuracy_denom.detach(),
             "ratio_metrics": ratio_metrics,
@@ -1745,6 +1749,7 @@ class OnlineDFlashModel(nn.Module):
         loss = loss_num / loss_denominator.clamp_min(denominator_floor)
         metrics["loss_terms"] = (loss_num, loss_denominator.detach())
         accuracy = correct_num / accuracy_denom
+        loss, metrics = self.if_add_moe_aux_loss(loss, metrics)
         return loss, accuracy, metrics
 
 
@@ -2032,15 +2037,7 @@ class OnlineDominoModel(OnlineDFlashModel):
                 )
             }
 
-        weighted_aux = self._take_moe_aux_loss_and_log(
-            metrics.setdefault("ratio_metrics", {})
-        )
-        if weighted_aux is not None:
-            # Keep the loss and the numerator the trainer backpropagates in step.
-            loss = loss + weighted_aux
-            numerator, denominator = metrics["loss_terms"]
-            numerator = numerator + weighted_aux * denominator
-            metrics["loss_terms"] = (numerator, denominator)
+        loss, metrics = self.if_add_moe_aux_loss(loss, metrics)
         return loss, accuracy, metrics
 
 
@@ -2442,10 +2439,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     walk_accepted, anchor_positions, eval_mask.any(dim=-1)
                 )
             )
-        weighted_aux = self._take_moe_aux_loss_and_log(ratio_metrics)
-        if weighted_aux is not None:
-            # A plain loss: the trainer averages it over micro-batches and ranks.
-            loss = loss + weighted_aux
         metrics: Dict[str, object] = {
             "ratio_metrics": {
                 name: (numerator.detach(), denominator.detach())
@@ -2503,4 +2496,5 @@ class OnlineDSparkModel(OnlineDFlashModel):
             collect_detailed_metrics=collect_detailed_metrics,
         )
         accuracy = metrics.pop("accuracy")
+        loss, metrics = self.if_add_moe_aux_loss(loss, metrics)
         return loss, accuracy, metrics
