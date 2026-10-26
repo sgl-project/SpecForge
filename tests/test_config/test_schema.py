@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 from pydantic import ValidationError
 
@@ -76,7 +77,107 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
-    def test_liger_kernel_flag_is_tri_state_and_defaults_to_auto(self):
+    def test_consumer_dispatch_defaults_and_validation(self):
+        from specforge.config.schema import RuntimeConfig
+
+        self.assertEqual(RuntimeConfig().consumer_dispatch, "round_robin")
+        self.assertEqual(
+            RuntimeConfig(consumer_dispatch="cost_balanced").consumer_dispatch,
+            "cost_balanced",
+        )
+        with self.assertRaises(ValidationError):
+            RuntimeConfig(consumer_dispatch="random")
+
+    def test_two_window_dispatch_is_independent_of_training_strategy(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            for strategy in ("dflash", "domino", "dspark", "eagle3"):
+                with self.subTest(policy=policy, strategy=strategy):
+                    payload = _online_payload(strategy)
+                    payload["runtime"] = {"consumer_dispatch": policy}
+                    self.assertEqual(
+                        Config.model_validate(payload).runtime.consumer_dispatch, policy
+                    )
+
+    def test_two_window_dispatch_checks_global_window_capacity(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            with self.subTest(policy=policy):
+                payload = _online_payload("dflash")
+                payload["training"].update(batch_size=2, accumulation_steps=2)
+                payload["deployment"]["disaggregated"][
+                    "consumer_state_dir"
+                ] = "/tmp/consumer-state"
+                payload["deployment"]["trainer"] = {
+                    "nnodes": 4,
+                    "nproc_per_node": 8,
+                    "master_addr": "localhost",
+                }
+                payload["runtime"] = {
+                    "consumer_dispatch": policy,
+                    "in_flight_high_watermark": 255,
+                }
+                with self.assertRaisesRegex(ValueError, "at least two global batches"):
+                    Config.model_validate(payload)
+                payload["runtime"]["in_flight_high_watermark"] = 256
+                with self.assertRaisesRegex(ValueError, "low watermark"):
+                    Config.model_validate(payload)
+                payload["runtime"]["in_flight_low_watermark"] = 256
+                self.assertEqual(
+                    Config.model_validate(payload).runtime.consumer_dispatch, policy
+                )
+
+    def test_two_window_dispatch_rejects_stranded_remainder(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            with self.subTest(policy=policy):
+                payload = _online_payload("dflash")
+                payload["training"].update(batch_size=4, accumulation_steps=1)
+                payload["runtime"] = {
+                    "consumer_dispatch": policy,
+                    "in_flight_high_watermark": 14,
+                    "in_flight_low_watermark": 4,
+                }
+                with self.assertRaisesRegex(ValueError, "low watermark.*quantum 8"):
+                    Config.model_validate(payload)
+                payload["runtime"]["in_flight_low_watermark"] = 8
+                Config.model_validate(payload)
+
+    def test_watermark_overrides_are_applied_before_config_validation(self):
+        from specforge.training.disaggregated import _online_flow_window
+
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            payload = _online_payload("dflash")
+            payload["training"].update(batch_size=4, accumulation_steps=1)
+            payload["runtime"] = dict(
+                consumer_dispatch=policy,
+                in_flight_high_watermark=14,
+                in_flight_low_watermark=4,
+            )
+            for overrides, expected in (
+                ({"DISAGG_IN_FLIGHT_LOW_WATERMARK": "8"}, (14, 8)),
+                ({"DISAGG_IN_FLIGHT_HIGH_WATERMARK": "8"}, (8, None)),
+                ({"DISAGG_IN_FLIGHT_LOW_WATERMARK": "4"}, None),
+            ):
+                with (
+                    self.subTest(policy=policy, overrides=overrides),
+                    mock.patch.dict(os.environ, overrides, clear=True),
+                ):
+                    if expected is None:
+                        with self.assertRaisesRegex(ValueError, "low watermark"):
+                            Config.model_validate(payload)
+                    else:
+                        self.assertEqual(
+                            _online_flow_window(Config.model_validate(payload)),
+                            expected,
+                        )
+
+    def test_ddp_bucket_limit_is_optional_and_positive(self):
+        from specforge.config.schema import TrainingConfig
+
+        self.assertIsNone(TrainingConfig().ddp_bucket_cap_mb)
+        self.assertEqual(TrainingConfig(ddp_bucket_cap_mb=128).ddp_bucket_cap_mb, 128)
+        with self.assertRaises(ValidationError):
+            TrainingConfig(ddp_bucket_cap_mb=0)
+
+    def test_liger_kernel_flag_is_typed_and_defaults_off(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertIsNone(default.model.use_liger_kernel)
 
@@ -91,14 +192,17 @@ class ConfigSchemaTest(unittest.TestCase):
             Config.model_validate(payload)
 
     def test_explicit_liger_kernel_is_rejected_for_strategies_that_ignore_it(self):
-        dflash = _online_payload("dflash")
-        dflash["model"]["use_liger_kernel"] = True
-        self.assertIs(
-            resolve_run(Config.model_validate(dflash)).config.model.use_liger_kernel,
-            True,
-        )
+        for strategy in ("dflash", "domino", "dspark"):
+            payload = _online_payload(strategy)
+            payload["model"]["use_liger_kernel"] = True
+            self.assertIs(
+                resolve_run(
+                    Config.model_validate(payload)
+                ).config.model.use_liger_kernel,
+                True,
+            )
 
-        for strategy in ("domino", "dspark", "eagle3", "mtp", "peagle"):
+        for strategy in ("eagle3", "mtp", "peagle"):
             for value in (None, False, True):
                 with self.subTest(strategy=strategy, use_liger_kernel=value):
                     payload = _online_payload(strategy)
@@ -427,9 +531,11 @@ class ConfigSchemaTest(unittest.TestCase):
         for strategy in ("dflash", "domino", "dspark"):
             payload = _online_payload(strategy)
             payload["training"]["objective_chunk_blocks"] = 0
+            payload["training"]["objective_checkpointing"] = False
             with self.subTest(strategy=strategy):
                 config = Config.model_validate(payload)
                 self.assertEqual(config.training.objective_chunk_blocks, 0)
+                self.assertFalse(config.training.objective_checkpointing)
 
         payload = _online_payload("dflash")
         payload["training"]["objective_chunk_blocks"] = -1
@@ -556,6 +662,44 @@ class ConfigSchemaTest(unittest.TestCase):
                 ):
                     build_training_model(config, None, None, None, None)
                 self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
+
+    def test_fused_logits_loss_reaches_dflash_family(self):
+        from unittest import mock
+
+        from specforge.algorithms import model_providers
+
+        payload = _online_payload("dflash")
+        self.assertTrue(Config.model_validate(payload).training.fused_logits_loss)
+        payload["training"]["fused_logits_loss"] = None
+        with self.assertRaisesRegex(ValidationError, "fused_logits_loss"):
+            Config.model_validate(payload)
+
+        for strategy, model_name in (
+            ("dflash", "OnlineDFlashModel"),
+            ("dspark", "OnlineDSparkModel"),
+            ("domino", "OnlineDominoModel"),
+        ):
+            for enabled in (False, True):
+                with self.subTest(strategy=strategy, enabled=enabled):
+                    payload = _online_payload(strategy)
+                    payload["training"]["fused_logits_loss"] = enabled
+                    config = Config.model_validate(payload)
+                    with (
+                        mock.patch(
+                            f"specforge.algorithms.common.dflash_family_model.{model_name}"
+                        ) as model_cls,
+                        mock.patch.object(
+                            model_providers,
+                            "_build_dflash_family_model",
+                            side_effect=lambda _cfg, _draft, _tok, factory: factory({}),
+                        ),
+                    ):
+                        getattr(model_providers, f"build_{strategy}_model")(
+                            config, None, None, None, None
+                        )
+                    self.assertIs(
+                        model_cls.call_args.kwargs["fused_logits_loss"], enabled
+                    )
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")

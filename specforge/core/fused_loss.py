@@ -7,6 +7,12 @@ and losses/eager.py), derived in turn from specforge/core/loss.py
 Changes for SpecForge: lazy Triton import so the module loads on hosts
 without Triton; eager reference co-located in the same module.
 
+The explicit-label CE/L1 pair (ce_l1_loss / fused_ce_l1_loss) adds a joint
+reduction and optional top-k outputs. Its specialized kernels live in the
+private _fused_logits_loss_triton module; callers use this public module for both
+implementations. The documentation below describes the upstream single-loss
+kernel pair, whose existing APIs remain unchanged.
+
 Upstream kernel documentation (speculators losses/fused.py):
 
 One kernel pair serves every fused loss: forward streams the selected
@@ -34,6 +40,8 @@ treated as constant), L the row loss:
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
 __all__ = [
@@ -45,6 +53,9 @@ __all__ = [
     "fused_tv_loss",
     "fused_nla_loss",
     "fused_lk_hybrid_loss",
+    "fused_ce_l1_loss",
+    "supports_fused_ce_l1_loss",
+    "CEL1Loss",
     # Eager reference/fallback implementations (pure PyTorch, CPU-safe)
     "kl_div_loss",
     "reverse_kl_div_loss",
@@ -53,6 +64,7 @@ __all__ = [
     "tv_loss",
     "neg_log_acceptance_loss",
     "lk_hybrid_loss",
+    "ce_l1_loss",
 ]
 
 MAX_FUSED_SIZE = 131072
@@ -423,6 +435,138 @@ def fused_lk_hybrid_loss(logits, targets, eta: float = 3.0):
     return weight * kl + (1.0 - weight) * tv
 
 
+class CEL1Loss(NamedTuple):
+    """Unreduced CE/L1 losses plus optional candidate and detached diagnostics.
+
+    Losses and IDs have shape ``logits.shape[:-1]``; top-k outputs append a
+    ``top_k`` dimension. ``teacher_l1`` and both top-1 probabilities/teacher IDs
+    are None without teacher logits. Only CE, L1 and top-k values carry gradients.
+    """
+
+    cross_entropy: torch.Tensor
+    teacher_l1: torch.Tensor | None
+    topk_values: torch.Tensor
+    topk_ids: torch.Tensor
+    argmax_ids: torch.Tensor
+    top1_probability: torch.Tensor | None
+    teacher_argmax_ids: torch.Tensor | None
+    teacher_top1_probability: torch.Tensor | None
+
+
+def supports_fused_ce_l1_loss(logits: torch.Tensor) -> bool:
+    """Whether an optimized CE/L1 implementation supports this device and dtype."""
+    if logits.device.type != "cuda" or logits.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        return False
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def fused_ce_l1_loss(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    *,
+    teacher_logits: torch.Tensor | None = None,
+    top_k: int = 0,
+) -> CEL1Loss:
+    """Hard-label CE and optional teacher L1; optimized twin of ``ce_l1_loss``.
+
+    For draft ``p = softmax(logits)`` and teacher ``q = softmax(teacher_logits)``,
+    returns ``CE = -log(p[target_ids])`` and ``L1 = sum_v |p_v - q_v|``.
+    TV is ``L1 / 2``. CE and L1 share normalization and backward;
+    optional top-k gradients join that backward before its final dtype cast.
+
+    Args:
+        logits: FP16/BF16/FP32 CUDA logits, shape ``[..., vocab]``. The caller
+            applies the LM-head projection and any logit transforms first.
+        target_ids: Int64 labels, shape ``[...]``, on the same device, with
+            values in ``[0, vocab)``. No ignore_index is supported: apply masks
+            to the returned losses. Labels are NOT inferred from the teacher.
+        teacher_logits: Optional same-shaped logits, not probabilities. Always
+            stop-gradient; omitted for CE-only training.
+        top_k: Number of draft-logit candidates to return; zero skips selection.
+
+    Returns:
+        ``CEL1Loss`` with FP32 per-position CE/L1 and candidate values. Apply
+        coefficients, masks and reduction outside this function. Input logits
+        are retained without mutation; gradients have their original dtype.
+        Argmax/top-1 diagnostics and candidate IDs are non-differentiable.
+
+    This specialized backend supports CUDA/ROCm, not the upstream NPU path.
+    Use ``ce_l1_loss`` for the CPU-safe reference. Saving logits does not itself
+    disable a caller's checkpoint; that remains a separate memory policy.
+    """
+    # Triton reads raw pointers; reject incompatible layouts before launch.
+    if logits.ndim < 2 or logits.shape[-1] == 0:
+        raise ValueError(
+            "logits must have shape [..., vocab] with a nonempty vocabulary"
+        )
+    if target_ids.shape != logits.shape[:-1] or not 0 <= top_k <= logits.shape[-1]:
+        raise ValueError("target_ids shape or top_k does not match logits")
+    if target_ids.dtype != torch.long or target_ids.device != logits.device:
+        raise ValueError("target_ids must be int64 on the logits device")
+    if teacher_logits is not None and (
+        teacher_logits.shape != logits.shape or teacher_logits.device != logits.device
+    ):
+        raise ValueError("teacher_logits must match the draft shape and device")
+    if logits.device.type != "cuda" or logits.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        raise ValueError("fused_ce_l1_loss requires FP16/BF16/FP32 CUDA logits")
+    try:
+        from specforge.core._fused_logits_loss_triton import _FusedCEL1Loss
+    except ImportError as exc:
+        raise RuntimeError(
+            "fused_ce_l1_loss requires Triton; use ce_l1_loss instead"
+        ) from exc
+    shape, vocab = logits.shape[:-1], logits.shape[-1]
+    (
+        cross_entropy,
+        teacher_l1,
+        topk_values,
+        topk_ids,
+        argmax_ids,
+        top1_probability,
+        teacher_argmax_ids,
+        teacher_top1_probability,
+    ) = _FusedCEL1Loss.apply(
+        logits.reshape(-1, vocab).contiguous(),
+        target_ids.reshape(-1).contiguous(),
+        (
+            None
+            if teacher_logits is None
+            else teacher_logits.detach().reshape(-1, vocab).contiguous()
+        ),
+        int(top_k),
+    )
+    return CEL1Loss(
+        cross_entropy=cross_entropy.reshape(shape),
+        teacher_l1=None if teacher_l1 is None else teacher_l1.reshape(shape),
+        topk_values=topk_values.reshape(*shape, top_k),
+        topk_ids=topk_ids.reshape(*shape, top_k),
+        argmax_ids=argmax_ids.reshape(shape),
+        top1_probability=(
+            None if teacher_logits is None else top1_probability.reshape(shape)
+        ),
+        teacher_argmax_ids=(
+            None if teacher_argmax_ids is None else teacher_argmax_ids.reshape(shape)
+        ),
+        teacher_top1_probability=(
+            None
+            if teacher_top1_probability is None
+            else teacher_top1_probability.reshape(shape)
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Eager reference implementations (verbatim from speculators losses/eager.py).
 # They are the numerical-validation reference for the fused kernels and the
@@ -640,3 +784,45 @@ def lk_hybrid_loss(
     elementwise_loss = weight * kl + (1.0 - weight) * tv
 
     return elementwise_loss  # noqa: RET504
+
+
+def ce_l1_loss(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    *,
+    teacher_logits: torch.Tensor | None = None,
+    top_k: int = 0,
+) -> CEL1Loss:
+    """CPU-safe reference for ``fused_ce_l1_loss``, with the same input/result API.
+
+    CE uses explicit token IDs, unlike ``ce_loss(logits, targets)`` which uses
+    the teacher argmax. Low-precision CE is promoted to FP32; explicit FP64
+    inputs retain FP64 for numerical references. Teacher L1 uses FP32 softmax.
+    Teacher logits and diagnostics are detached on both implementations.
+    """
+    ce_logits = logits.to(torch.promote_types(logits.dtype, torch.float32))
+    ce = torch.nn.functional.cross_entropy(
+        ce_logits.reshape(-1, logits.shape[-1]),
+        target_ids.reshape(-1),
+        reduction="none",
+    ).reshape_as(target_ids)
+    topv, topi = ce_logits.topk(top_k, dim=-1)
+    l1 = top1 = teacher_ids = teacher_top1 = None
+    if teacher_logits is not None:
+        with torch.no_grad():
+            q = teacher_logits.float().softmax(-1)
+            teacher_ids = teacher_logits.argmax(-1)
+            teacher_top1 = q.max(-1).values
+        p = ce_logits.float().softmax(-1)
+        l1 = (p - q).abs().sum(-1)
+        top1 = p.detach().max(-1).values
+    return CEL1Loss(
+        cross_entropy=ce,
+        teacher_l1=l1,
+        topk_values=topv,
+        topk_ids=topi,
+        argmax_ids=logits.argmax(-1),
+        top1_probability=top1,
+        teacher_argmax_ids=teacher_ids,
+        teacher_top1_probability=teacher_top1,
+    )

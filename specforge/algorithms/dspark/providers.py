@@ -50,7 +50,9 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
-    return {
+    from specforge.modeling.draft.dflash import dflash_attention_resume_contract
+
+    contract = {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -66,11 +68,22 @@ def resume_contract(_config, draft_model, training_model):
             training_model.dspark_confidence_head_alpha
         ),
     }
+    contract.update(dflash_attention_resume_contract(draft_model))
+    if getattr(draft_model.config, "is_causal", None) is True:
+        contract["dspark_causal_block"] = True
+    return contract
 
 
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
+    if config.model.use_liger_kernel:
+        from specforge.algorithms.dflash.providers import resolve_dflash_kernels
+        from specforge.algorithms.model_providers import build_dflash_draft
+
+        return build_dflash_draft(
+            config, draft_config, resolve_dflash_kernels(config, draft_config)
+        )
     return build_registered_draft(config, draft_config)
 
 
@@ -140,6 +153,7 @@ def algorithm_spec() -> AlgorithmSpec:
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
+            supports_liger_kernel=True,
         ),
     )
 

@@ -177,3 +177,73 @@ step provider may construct a `DraftTrainStrategy`, while its model and data
 providers own algorithm-specific assembly. Add builtin registrations to the
 explicit catalog used by the application composition root; do not add a
 method-specific launcher or a second mutable registry.
+
+## Fused token losses
+
+Import losses from `specforge.core.fused_loss`. Unprefixed functions are eager.
+
+| API pair (eager / fused) | Label input | Per-token objective |
+| --- | --- | --- |
+| `ce_loss` / `fused_ce_loss` | Teacher logits `[B, T, V]` | CE against the teacher argmax |
+| `tv_loss` / `fused_tv_loss` | Teacher logits `[B, T, V]` | `1 - sum(min(p, q))` |
+| `ce_l1_loss` / `fused_ce_l1_loss` | Explicit token IDs `[...]`; optional teacher logits `[..., V]` | CE and optional `sum(abs(p - q))`, returned separately |
+
+Here `p = softmax(draft_logits)` and `q = softmax(teacher_logits)`.
+The joint CE/L1 API uses the supplied token IDs even when they differ from the
+teacher argmax. For normalized distributions, `TV = L1 / 2`. Its backward shares
+draft normalization and combines both loss gradients before casting to the
+input dtype. This is useful when CE and teacher L1/TV train the same logits.
+
+```python
+from specforge.core.fused_loss import fused_ce_l1_loss
+
+logits = lm_head(hidden)                    # [..., V], BF16/FP16/FP32 on CUDA
+terms = fused_ce_l1_loss(
+    logits,
+    target_ids,                             # [...], int64, values in [0, V)
+    teacher_logits=teacher_logits,          # optional [..., V], not probabilities
+)
+per_token_loss = 0.1 * terms.cross_entropy + 0.9 * terms.teacher_l1
+loss = (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp_min(1)
+loss.backward()
+```
+
+The returned `CEL1Loss` contains unreduced FP32 losses. Without teacher logits,
+`teacher_l1` is `None`; use `terms.cross_entropy` alone. Both inputs use the same
+device and vocabulary. There is no `ignore_index`: masked positions still need
+valid token IDs. Teacher logits never receive gradients. Masks, coefficients
+and reduction belong to the caller; use `0.5 * terms.teacher_l1` for TV.
+
+DFlash and DSpark share the weighting and composition helpers in
+`specforge.core.token_objective`. They consume per-token losses with explicit,
+independent hard-label and teacher weights. Models retain their normalization,
+selector/confidence objectives and execution policy; D-PACE weights come from
+`specforge.core.position_weights`. Teacher data may be required by the token
+objective, confidence head or diagnostics independently.
+
+`top_k=K` additionally returns differentiable `topk_values` and integer
+`topk_ids` with shape `[..., K]`, for DFlash2's selector. `argmax_ids` and the
+optional draft/teacher top-1 probabilities are detached diagnostics. The
+fused implementation requires CUDA and Triton; use `ce_l1_loss` on CPU.
+Importing the public module does not require Triton. The eager reference promotes low-precision
+CE to FP32 and preserves explicitly supplied FP64 inputs for numerical checks.
+
+`training.fused_logits_loss` is a boolean, defaulting to `true` for all supported
+models, including DFlash2 and Domino. Set `false` to use eager losses.
+Unsupported devices and dtypes fall back to eager. Domino uses its specialized
+CE kernel under the same flag.
+
+`training.objective_chunk_blocks` sets the chunk size, and
+`training.objective_checkpointing` (default `true`) independently controls
+recomputation of each chunk's projection and objective. A zero chunk size treats
+the whole objective as one chunk; checkpointing still follows its own flag.
+Without checkpointing, all chunks can retain
+logits until backward: smaller chunks do not bound total saved-logits memory.
+DFlash always skips its zero-weight anchor projection in multi-slot objectives;
+DSpark supervises every slot. Detailed diagnostics retain the full blocks.
+
+The selector consumes top-k candidates and hidden states, computes its own CE,
+and joins the logits backward only through candidate values. Its direct hidden
+state gradient is separate; `training.dflash2_selector_stop_gradient` detaches
+both inputs.
+Weights, masks and loss coefficients are applied outside the logits operators.
