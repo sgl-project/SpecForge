@@ -11,12 +11,18 @@ from torch import nn
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.controller import TrainerCore
-from specforge.training.strategies.base import StepOutput
+from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 
 
-class _Strategy:
+class _Strategy(DraftTrainStrategy):
+    name = "ddp"
+    required_features = {"input"}
+
     def __init__(self, model):
         self.model = model
+
+    def trainable_module(self):
+        return self.model
 
     def forward_loss(self, batch, ctx=None):
         return StepOutput(
