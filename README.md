@@ -9,6 +9,8 @@
 [![slack badge](https://img.shields.io/badge/Slack-join-blueviolet?logo=slack&amp)](https://sgl-fru7574.slack.com/archives/C09784E3EN6)
 [![license](https://img.shields.io/badge/License-MIT%202.0-blue)](./LICENSE)
 
+**English** | [简体中文](https://github.com/sgl-project/SpecForge/blob/main/README.zh.md)
+
 </div>
 
 ## 📍 Overview
