@@ -528,9 +528,11 @@ class ConfigSchemaTest(unittest.TestCase):
         for strategy in ("dflash", "domino", "dspark"):
             payload = _online_payload(strategy)
             payload["training"]["objective_chunk_blocks"] = 0
+            payload["training"]["objective_checkpointing"] = False
             with self.subTest(strategy=strategy):
                 config = Config.model_validate(payload)
                 self.assertEqual(config.training.objective_chunk_blocks, 0)
+                self.assertFalse(config.training.objective_checkpointing)
 
         payload = _online_payload("dflash")
         payload["training"]["objective_chunk_blocks"] = -1
@@ -657,6 +659,44 @@ class ConfigSchemaTest(unittest.TestCase):
                 ):
                     build_training_model(config, None, None, None, None)
                 self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
+
+    def test_fused_logits_loss_reaches_dflash_family(self):
+        from unittest import mock
+
+        from specforge.algorithms import model_providers
+
+        payload = _online_payload("dflash")
+        self.assertTrue(Config.model_validate(payload).training.fused_logits_loss)
+        payload["training"]["fused_logits_loss"] = None
+        with self.assertRaisesRegex(ValidationError, "fused_logits_loss"):
+            Config.model_validate(payload)
+
+        for strategy, model_name in (
+            ("dflash", "OnlineDFlashModel"),
+            ("dspark", "OnlineDSparkModel"),
+            ("domino", "OnlineDominoModel"),
+        ):
+            for enabled in (False, True):
+                with self.subTest(strategy=strategy, enabled=enabled):
+                    payload = _online_payload(strategy)
+                    payload["training"]["fused_logits_loss"] = enabled
+                    config = Config.model_validate(payload)
+                    with (
+                        mock.patch(
+                            f"specforge.algorithms.common.dflash_family_model.{model_name}"
+                        ) as model_cls,
+                        mock.patch.object(
+                            model_providers,
+                            "_build_dflash_family_model",
+                            side_effect=lambda _cfg, _draft, _tok, factory: factory({}),
+                        ),
+                    ):
+                        getattr(model_providers, f"build_{strategy}_model")(
+                            config, None, None, None, None
+                        )
+                    self.assertIs(
+                        model_cls.call_args.kwargs["fused_logits_loss"], enabled
+                    )
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")

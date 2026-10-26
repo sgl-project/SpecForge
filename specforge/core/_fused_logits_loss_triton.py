@@ -1,153 +1,253 @@
-"""Triton implementation of the DFlash2 unary head objective.
+"""Internal CUDA kernels for core.fused_loss.fused_ce_l1_loss.
 
-The reference DFlash2 objective projects draft states through the frozen target
-LM head, upcasts the BF16 logits to FP32, and derives cross-entropy, the strict
-selector top-k, and the accuracy argmax from that FP32 copy. Under activation
-checkpointing the whole projection then runs a second time in backward.
-
-This path keeps a single BF16 logit buffer per objective chunk:
-
-* forward runs the same cuBLAS projection and one Triton pass for the FP32
-  online log-sum-exp, target logit, first-index argmax, and strict top-k
-  (BF16 -> FP32 is exact, so the candidate values are identical). The top-k
-  selects ``torch.topk``'s candidate set, lowest index first on ties, and
-  orders equal values by ascending index; wider candidate sets than
-  ``MAX_FUSED_TOP_K`` fall back to ``torch.topk`` on the BF16 logits;
-* backward writes the FP32 logit gradient
-  ``g * (softmax - one_hot(target)) + scatter(top-k grads)`` with one BF16
-  rounding, the same rounding point as the reference, in place into the saved
-  logits, then runs the input-gradient GEMM. The target head is frozen, so no
-  weight gradient is formed.
+The public loss contract, validation and eager reference live in fused_loss.py.
+This module is imported lazily only when the fused CE/L1 backend is selected.
 """
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-__all__ = ["MAX_FUSED_TOP_K", "dflash_unary_head_fused"]
-
-# The in-kernel selection keeps one register list per row split and is tuned
-# for the selector's small candidate sets; wider sets use ``torch.topk``.
 MAX_FUSED_TOP_K = 64
 
 
-def dflash_unary_head_fused(hidden, weight, targets, top_k):
-    """Return ``(neg_log_q, topk_values, topk_ids, argmax_ids)`` for ``hidden``.
-
-    ``hidden`` is ``[..., hidden_size]`` BF16, ``weight`` the frozen
-    ``[vocab_size, hidden_size]`` BF16 head, and ``targets`` has ``hidden``'s
-    leading shape. ``neg_log_q`` is the FP32 per-row cross-entropy and
-    ``topk_values`` the FP32 strict top-k logits; both are differentiable with
-    respect to ``hidden``. Candidates hold ``torch.topk``'s set in descending
-    value order; up to ``MAX_FUSED_TOP_K`` of them, equal values are ordered
-    by ascending id. ``top_k=0`` skips the top-k selection and returns empty
-    candidate tensors.
-    """
-    leading_shape = hidden.shape[:-1]
-    neg_log_q, topk_values, topk_ids, argmax_ids = _DFlash2UnaryHead.apply(
-        hidden.reshape(-1, hidden.shape[-1]),
-        weight,
-        targets.reshape(-1),
-        int(top_k),
-    )
-    return (
-        neg_log_q.reshape(leading_shape),
-        topk_values.reshape(*leading_shape, topk_values.shape[-1]),
-        topk_ids.reshape(*leading_shape, topk_ids.shape[-1]),
-        argmax_ids.reshape(leading_shape),
-    )
+def _statistics(logits, targets, top_k=0):
+    rows = logits.shape[0]
+    lse = torch.empty(rows, device=logits.device, dtype=torch.float32)
+    target = torch.empty_like(lse)
+    top1 = torch.empty_like(lse)
+    ids = torch.empty(rows, device=logits.device, dtype=torch.long)
+    fused_k = top_k if top_k <= MAX_FUSED_TOP_K else 0
+    topv = torch.empty(rows, fused_k, device=logits.device, dtype=torch.float32)
+    topi = torch.empty(rows, fused_k, device=logits.device, dtype=torch.long)
+    if rows:
+        _launch_stats(logits, targets, lse, target, ids, topv, topi, top1)
+    if fused_k != top_k:
+        topv, topi = torch.topk(logits, top_k, dim=-1)
+        topv = topv.float()
+    return lse, target, ids, top1, topv, topi
 
 
-class _DFlash2UnaryHead(torch.autograd.Function):
-    """Frozen-head projection with fused FP32 cross-entropy statistics.
-
-    Saves the BF16 logits, the FP32 row log-sum-exp, targets, and the top-k
-    values and ids. Backward reuses the saved logits as its gradient buffer, so
-    a second backward through a retained graph raises instead of recomputing.
-    """
-
+class _FusedCEL1Loss(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, targets, top_k):
-        logits = F.linear(hidden, weight)
-        num_rows, vocab_size = logits.shape
-        targets = targets.contiguous()
-        device = logits.device
-
-        lse = torch.empty(num_rows, device=device, dtype=torch.float32)
-        target_logit = torch.empty_like(lse)
-        argmax_ids = torch.empty(num_rows, device=device, dtype=torch.long)
-        fused_top_k = top_k if top_k <= MAX_FUSED_TOP_K else 0
-        topk_values = torch.empty(
-            num_rows, fused_top_k, device=device, dtype=torch.float32
-        )
-        topk_ids = torch.empty(num_rows, fused_top_k, device=device, dtype=torch.long)
-        if num_rows > 0:
-            _launch_stats(
-                logits,
-                targets,
-                lse,
-                target_logit,
-                argmax_ids,
-                topk_values,
-                topk_ids,
+    def forward(ctx, logits, targets, teacher, top_k):
+        lse, target, ids, top1, topv, topi = _statistics(logits, targets, top_k)
+        teacher_lse = teacher_ids = teacher_top1 = l1_dot = l1 = None
+        rows, vocab = logits.shape
+        if teacher is not None:
+            teacher_lse, _, teacher_ids, teacher_top1, _, _ = _statistics(
+                teacher, targets
             )
-        if top_k > fused_top_k:
-            topk_values, topk_ids = torch.topk(logits, top_k, dim=-1)
-            topk_values = topk_values.float()
-        neg_log_q = lse - target_logit
-
-        ctx.save_for_backward(weight, logits, lse, targets, topk_values, topk_ids)
-        ctx.mark_non_differentiable(topk_ids, argmax_ids)
-        return neg_log_q, topk_values, topk_ids, argmax_ids
+            tiles = triton.cdiv(vocab, 4096)
+            partial = torch.empty(
+                2, rows, tiles, device=logits.device, dtype=torch.float32
+            )
+            if rows:
+                _l1_stats_kernel[(rows, tiles)](
+                    logits,
+                    teacher,
+                    lse,
+                    teacher_lse,
+                    partial,
+                    vocab,
+                    rows * tiles,
+                    TILES=tiles,
+                    BLOCK=4096,
+                )
+            l1, l1_dot = partial.sum(-1).unbind(0)
+        ctx.save_for_backward(logits, targets, lse, teacher, teacher_lse, l1_dot, topi)
+        ctx.set_materialize_grads(False)
+        diagnostics = [topi, ids, top1]
+        if teacher is not None:
+            diagnostics.extend([teacher_ids, teacher_top1])
+        ctx.mark_non_differentiable(*diagnostics)
+        return lse - target, l1, topv, topi, ids, top1, teacher_ids, teacher_top1
 
     @staticmethod
-    def backward(ctx, grad_neg_log_q, grad_topk_values, _grad_topk_ids, _grad_argmax):
+    def backward(ctx, grad_ce, grad_l1, grad_topv, *_diagnostics):
         if not ctx.needs_input_grad[0]:
             return None, None, None, None
-        weight, logits, lse, targets, topk_values, topk_ids = ctx.saved_tensors
-        num_rows, vocab_size = logits.shape
-        if grad_neg_log_q is None:
-            grad_neg_log_q = lse.new_zeros(num_rows)
-        grad_neg_log_q = grad_neg_log_q.float().contiguous()
-
-        # ``logits`` is internal to this node and dead after this point; it
-        # becomes the BF16 logit-gradient buffer.
-        grad_logits = logits
-        if num_rows > 0:
-            vocab_block, num_warps = _grad_settings(vocab_size)
-            _unary_head_grad_kernel[(num_rows, triton.cdiv(vocab_size, vocab_block))](
+        logits, targets, lse, teacher, teacher_lse, l1_dot, topi = ctx.saved_tensors
+        grad_ce = torch.zeros_like(lse) if grad_ce is None else grad_ce.contiguous()
+        has_l1 = teacher is not None and grad_l1 is not None
+        grad_l1 = None if grad_l1 is None else grad_l1.contiguous()
+        grad_logits = torch.empty_like(logits)
+        rows, vocab = logits.shape
+        if rows:
+            block, warps = _grad_settings(vocab)
+            _logits_grad_kernel[(rows, triton.cdiv(vocab, block))](
+                logits,
                 grad_logits,
-                grad_logits.stride(0),
                 targets,
                 lse,
-                grad_neg_log_q,
-                vocab_size,
-                VOCAB_BLOCK=vocab_block,
-                num_warps=num_warps,
+                grad_ce,
+                teacher,
+                teacher_lse,
+                l1_dot,
+                grad_l1,
+                vocab,
+                BLOCK=block,
+                HAS_L1=has_l1,
+                num_warps=warps,
             )
-            top_k = topk_ids.shape[-1]
-            if grad_topk_values is not None and top_k > 0:
-                # Top-k ids are distinct within a row, so every candidate
-                # rewrites one gradient entry with its complete FP32 value.
-                _unary_head_topk_grad_kernel[(num_rows,)](
+            if grad_topv is not None and topi.shape[-1]:
+                _topk_grad_kernel[(rows,)](
+                    logits,
                     grad_logits,
-                    grad_logits.stride(0),
                     targets,
                     lse,
-                    grad_neg_log_q,
-                    topk_values,
-                    topk_ids,
-                    grad_topk_values.float().contiguous(),
-                    top_k,
-                    BLOCK_K=triton.next_power_of_2(top_k),
-                    num_warps=1,
+                    grad_ce,
+                    teacher,
+                    teacher_lse,
+                    l1_dot,
+                    grad_l1,
+                    topi,
+                    grad_topv.contiguous(),
+                    vocab,
+                    topi.shape[-1],
+                    BLOCK=triton.next_power_of_2(topi.shape[-1]),
+                    HAS_L1=has_l1,
                 )
-            # Triton writes do not bump the version counter; do it so a
-            # retained graph fails loudly instead of reusing the gradients.
-            torch.autograd.graph.increment_version(grad_logits)
-        grad_hidden = torch.matmul(grad_logits, weight)
-        return grad_hidden, None, None, None
+        return grad_logits, None, None, None
+
+
+@triton.jit
+def _l1_stats_kernel(
+    logits,
+    teacher,
+    lse,
+    teacher_lse,
+    partial,
+    vocab,
+    plane,
+    TILES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    cols = tile * BLOCK + tl.arange(0, BLOCK)
+    p = tl.exp(
+        tl.load(logits + row * vocab + cols, cols < vocab, other=float("-inf")).to(
+            tl.float32
+        )
+        - tl.load(lse + row)
+    )
+    q = tl.exp(
+        tl.load(teacher + row * vocab + cols, cols < vocab, other=float("-inf")).to(
+            tl.float32
+        )
+        - tl.load(teacher_lse + row)
+    )
+    sign = (p > q).to(tl.float32) - (p < q).to(tl.float32)
+    tl.store(partial + row * TILES + tile, tl.sum(tl.abs(p - q), 0))
+    tl.store(partial + plane + row * TILES + tile, tl.sum(p * sign, 0))
+
+
+@triton.jit
+def _loss_gradient(
+    logits,
+    targets,
+    lse,
+    grad_ce,
+    teacher,
+    teacher_lse,
+    l1_dot,
+    grad_l1,
+    row,
+    cols,
+    mask,
+    vocab,
+    HAS_L1: tl.constexpr,
+):
+    x = tl.load(logits + row * vocab + cols, mask, other=float("-inf")).to(tl.float32)
+    p = tl.exp(x - tl.load(lse + row))
+    grad = tl.load(grad_ce + row) * (
+        p - (cols == tl.load(targets + row)).to(tl.float32)
+    )
+    if HAS_L1:
+        y = tl.load(teacher + row * vocab + cols, mask, other=float("-inf")).to(
+            tl.float32
+        )
+        q = tl.exp(y - tl.load(teacher_lse + row))
+        sign = (p > q).to(tl.float32) - (p < q).to(tl.float32)
+        # d sum|p-q| / dx_i = p_i * (sign_i - sum_j p_j * sign_j).
+        grad += tl.load(grad_l1 + row) * p * (sign - tl.load(l1_dot + row))
+    return grad
+
+
+@triton.jit
+def _logits_grad_kernel(
+    logits,
+    grad_logits,
+    targets,
+    lse,
+    grad_ce,
+    teacher,
+    teacher_lse,
+    l1_dot,
+    grad_l1,
+    vocab,
+    BLOCK: tl.constexpr,
+    HAS_L1: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    grad = _loss_gradient(
+        logits,
+        targets,
+        lse,
+        grad_ce,
+        teacher,
+        teacher_lse,
+        l1_dot,
+        grad_l1,
+        row,
+        cols,
+        cols < vocab,
+        vocab,
+        HAS_L1,
+    )
+    tl.store(grad_logits + row * vocab + cols, grad, cols < vocab)
+
+
+@triton.jit
+def _topk_grad_kernel(
+    logits,
+    grad_logits,
+    targets,
+    lse,
+    grad_ce,
+    teacher,
+    teacher_lse,
+    l1_dot,
+    grad_l1,
+    topi,
+    grad_topv,
+    vocab,
+    top_k,
+    BLOCK: tl.constexpr,
+    HAS_L1: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    k = tl.arange(0, BLOCK)
+    cols = tl.load(topi + row * top_k + k, k < top_k, other=0)
+    grad = _loss_gradient(
+        logits,
+        targets,
+        lse,
+        grad_ce,
+        teacher,
+        teacher_lse,
+        l1_dot,
+        grad_l1,
+        row,
+        cols,
+        k < top_k,
+        vocab,
+        HAS_L1,
+    )
+    grad += tl.load(grad_topv + row * top_k + k, k < top_k, other=0)
+    tl.store(grad_logits + row * vocab + cols, grad, k < top_k)
 
 
 def _num_warps_for_backend(num_warps):
@@ -203,9 +303,12 @@ def _launch_stats(
     argmax_ids,
     topk_values,
     topk_ids,
+    top1=None,
 ):
     """Write each row's FP32 log-sum-exp, target logit, argmax, and top-k."""
     num_rows, vocab_size = logits.shape
+    if top1 is None:
+        top1 = torch.empty_like(lse)
     top_k = topk_ids.shape[-1]
     vocab_block, num_splits, num_warps = _stats_settings(num_rows, vocab_size, top_k)
     split_size = triton.cdiv(triton.cdiv(vocab_size, num_splits), vocab_block)
@@ -224,7 +327,7 @@ def _launch_stats(
     partial_topk_ids = torch.empty(
         num_rows, num_splits, top_k, device=logits.device, dtype=torch.int32
     )
-    _unary_head_partial_stats_kernel[(num_rows, num_splits)](
+    _logits_partial_stats_kernel[(num_rows, num_splits)](
         logits,
         logits.stride(0),
         partial_max,
@@ -240,7 +343,7 @@ def _launch_stats(
         BLOCK_K=triton.next_power_of_2(max(top_k, 1)),
         num_warps=num_warps,
     )
-    _unary_head_combine_stats_kernel[(num_rows,)](
+    _logits_combine_stats_kernel[(num_rows,)](
         logits,
         logits.stride(0),
         targets,
@@ -254,6 +357,7 @@ def _launch_stats(
         argmax_ids,
         topk_values,
         topk_ids,
+        top1,
         vocab_size,
         NUM_SPLITS=num_splits,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
@@ -264,7 +368,7 @@ def _launch_stats(
 
 
 @triton.jit
-def _unary_head_partial_stats_kernel(
+def _logits_partial_stats_kernel(
     logits_ptr,
     logits_stride,
     partial_max_ptr,
@@ -359,7 +463,7 @@ def _unary_head_partial_stats_kernel(
 
 
 @triton.jit
-def _unary_head_combine_stats_kernel(
+def _logits_combine_stats_kernel(
     logits_ptr,
     logits_stride,
     targets_ptr,
@@ -373,6 +477,7 @@ def _unary_head_combine_stats_kernel(
     argmax_ptr,
     topk_values_ptr,
     topk_ids_ptr,
+    top1_ptr,
     vocab_size,
     NUM_SPLITS: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
@@ -421,6 +526,7 @@ def _unary_head_combine_stats_kernel(
         mask=target_in_bounds,
         other=float("nan"),
     ).to(tl.float32)
+    tl.store(top1_ptr + row, 1.0 / exp_sum)
     tl.store(lse_ptr + row, row_max + tl.log(exp_sum))
     tl.store(target_logit_ptr + row, target_logit)
     tl.store(argmax_ptr + row, argmax.to(tl.int64))
@@ -445,77 +551,3 @@ def _unary_head_combine_stats_kernel(
             tl.store(topk_values_ptr + row * TOP_K + rank, value)
             tl.store(topk_ids_ptr + row * TOP_K + rank, best_id.to(tl.int64))
             values = tl.where(ids == best_id, float("-inf"), values)
-
-
-@triton.jit
-def _unary_head_grad_kernel(
-    logits_ptr,
-    logits_stride,
-    targets_ptr,
-    lse_ptr,
-    grad_neg_log_q_ptr,
-    vocab_size,
-    VOCAB_BLOCK: tl.constexpr,
-):
-    """Overwrite one logit tile with ``g * (softmax - one_hot(target))``.
-
-    The value is formed in FP32 and rounded to the logit dtype once. Rows with
-    zero upstream gradient write exact zeros.
-    """
-    row = tl.program_id(0).to(tl.int64)
-    tile = tl.program_id(1)
-    offsets = tile * VOCAB_BLOCK + tl.arange(0, VOCAB_BLOCK)
-    mask = offsets < vocab_size
-    pointers = logits_ptr + row * logits_stride + offsets
-    logits = tl.load(pointers, mask=mask, other=0.0).to(tl.float32)
-    grad = tl.load(grad_neg_log_q_ptr + row)
-    lse = tl.load(lse_ptr + row)
-    target = tl.load(targets_ptr + row)
-    logit_grad = grad * tl.exp(logits - lse)
-    logit_grad = tl.where(offsets == target, logit_grad - grad, logit_grad)
-    tl.store(pointers, logit_grad.to(logits_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.jit
-def _unary_head_topk_grad_kernel(
-    logits_ptr,
-    logits_stride,
-    targets_ptr,
-    lse_ptr,
-    grad_neg_log_q_ptr,
-    topk_values_ptr,
-    topk_ids_ptr,
-    grad_topk_values_ptr,
-    top_k,
-    BLOCK_K: tl.constexpr,
-):
-    """Rewrite a row's top-k gradient entries with the selector contribution.
-
-    Runs after ``_unary_head_grad_kernel`` overwrote the logits, so the saved
-    top-k values (exact copies of those logits) supply ``x``. Each entry is
-    recomputed as ``g * (softmax - one_hot) + g_topk`` in FP32 and rounded once.
-    """
-    row = tl.program_id(0).to(tl.int64)
-    candidates = tl.arange(0, BLOCK_K)
-    mask = candidates < top_k
-    ids = tl.load(topk_ids_ptr + row * top_k + candidates, mask=mask, other=0)
-    logits = tl.load(
-        topk_values_ptr + row * top_k + candidates,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    grad_topk = tl.load(
-        grad_topk_values_ptr + row * top_k + candidates,
-        mask=mask,
-        other=0.0,
-    )
-    grad = tl.load(grad_neg_log_q_ptr + row)
-    lse = tl.load(lse_ptr + row)
-    target = tl.load(targets_ptr + row)
-    logit_grad = grad * tl.exp(logits - lse)
-    logit_grad = tl.where(ids == target, logit_grad - grad, logit_grad) + grad_topk
-    tl.store(
-        logits_ptr + row * logits_stride + ids,
-        logit_grad.to(logits_ptr.dtype.element_ty),
-        mask=mask,
-    )

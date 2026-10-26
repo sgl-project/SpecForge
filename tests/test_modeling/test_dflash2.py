@@ -10,6 +10,7 @@ from transformers import Qwen3Config
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.algorithms.dflash.providers import resume_contract
 from specforge.core.chunking import checkpointed_chunk_reduce
+from specforge.core.position_weights import dpace_weights
 from specforge.modeling.draft.dflash import Qwen3DFlashDecoderLayer
 from specforge.modeling.draft.dflash2 import (
     CandidateSelector,
@@ -843,11 +844,10 @@ class CandidateSelectorTest(unittest.TestCase):
         )
         expected_loss_weights = (
             weights
-            * model._dpace_weight(
+            * dpace_weights(
                 gold_probability.unsqueeze(0),
                 weights,
-                weights > 0,
-                "dpace",
+                alpha=model.dpace_alpha,
             )
             / 2.0
         )

@@ -2,7 +2,6 @@
 """Tests for reusable memory-bounded objective reductions."""
 
 import unittest
-from unittest import mock
 
 import torch
 
@@ -53,26 +52,27 @@ class CheckpointedChunkReduceTest(unittest.TestCase):
         self.assertEqual(calls, [(5,)])
         self.assertEqual(total.item(), 10)
 
-    def test_checkpoint_false_keeps_chunks_without_recompute(self):
-        calls = []
-        values = torch.arange(6, dtype=torch.double).requires_grad_()
+    def test_chunking_and_checkpointing_are_independent(self):
+        for chunk_size in (0, 4):
+            for checkpoint in (False, True):
+                with self.subTest(chunk_size=chunk_size, checkpoint=checkpoint):
+                    calls = []
+                    values = torch.arange(6, dtype=torch.double).requires_grad_()
 
-        def terms(chunk):
-            calls.append(tuple(chunk.shape))
-            return (chunk.square().sum(),)
+                    def terms(chunk):
+                        calls.append(tuple(chunk.shape))
+                        return (chunk.square().sum(),)
 
-        with mock.patch("torch.utils.checkpoint.checkpoint") as checkpoint:
-            (total,) = checkpointed_chunk_reduce(
-                terms,
-                values,
-                chunk_size=4,
-                checkpoint=False,
-            )
-            total.backward()
-
-        checkpoint.assert_not_called()
-        self.assertEqual(calls, [(4,), (2,)])
-        torch.testing.assert_close(values.grad, 2 * values.detach())
+                    (total,) = checkpointed_chunk_reduce(
+                        terms, values, chunk_size=chunk_size, checkpoint=checkpoint
+                    )
+                    forward_shapes = [(6,)] if chunk_size == 0 else [(4,), (2,)]
+                    self.assertEqual(calls, forward_shapes)
+                    torch.testing.assert_close(total, values.detach().square().sum())
+                    total.backward()
+                    expected_calls = len(forward_shapes) * (2 if checkpoint else 1)
+                    self.assertEqual(len(calls), expected_calls)
+                    torch.testing.assert_close(values.grad, 2 * values.detach())
 
     def test_rejects_misaligned_inputs(self):
         with self.assertRaisesRegex(ValueError, "must be aligned"):
