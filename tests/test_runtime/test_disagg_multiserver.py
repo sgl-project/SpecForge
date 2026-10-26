@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
@@ -35,7 +36,9 @@ from specforge.inference.adapters.server_capture import (
     SGLangServerCaptureAdapter,
 )
 from specforge.launch import _epoch_online_prompts, build_disagg_online_producer
+from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+from specforge.runtime.data_plane.ref_distributor import RefDistributor
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from tests.test_runtime.test_server_capture import (
     AUX_LAYERS,
@@ -264,24 +267,30 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertEqual(by_server.get("http://server0:30000"), seen0)
         self.assertEqual(by_server.get("http://server1:30001"), seen1)
 
-    def test_watermark_must_cover_one_consumer_optimizer_window(self):
-        backend = _FakeMooncakeStore()
-        stub = _StubCaptureServer(backend)
-        store = MooncakeFeatureStore(store=backend, store_id="run0")
-        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
-        _workers, drive = _build(
-            [_adapter(store, stub)],
-            _prompts(4),
-            store,
-            channel,
-            consumer_quantum=4,
-            in_flight_high_watermark=2,
-        )
-
-        with self.assertRaisesRegex(ValueError, "optimizer-step quantum 4"):
-            drive()
-        self.assertEqual(channel.published, 0)
-        self.assertIn("high watermark", channel.failure())
+    def test_watermarks_must_cover_consumer_dispatch_requirement(self):
+        for high, low, error in ((2, 2, "high"), (14, 4, "low")):
+            with self.subTest(high=high, low=low):
+                backend = _FakeMooncakeStore()
+                stub = _StubCaptureServer(backend)
+                store = MooncakeFeatureStore(store=backend, store_id="run0")
+                channel = StreamingRefChannel(
+                    os.path.join(self._workdir(), "refs.jsonl")
+                )
+                _workers, drive = _build(
+                    [_adapter(store, stub)],
+                    _prompts(8),
+                    store,
+                    channel,
+                    consumer_quantum=8,
+                    in_flight_high_watermark=high,
+                    in_flight_low_watermark=low,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, f"{error} watermark.*dispatch quantum 8"
+                ):
+                    drive()
+                self.assertEqual(channel.published, 0)
+                self.assertIn(f"{error} watermark", channel.failure())
 
     def test_byte_watermark_resumes_after_durable_consumer_ack(self):
         backend = _FakeMooncakeStore()
@@ -346,17 +355,17 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertGreaterEqual(snapshot["pause_transitions"], 1)
         self.assertGreaterEqual(snapshot["resume_transitions"], 1)
 
-    def test_byte_watermark_cannot_block_the_first_optimizer_window(self):
+    def test_byte_watermark_cannot_block_the_dispatch_group(self):
         backend = _FakeMooncakeStore()
         stub = _StubCaptureServer(backend)
         store = MooncakeFeatureStore(store=backend, store_id="run0")
         channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
         _workers, drive = _build(
             [_adapter(store, stub)],
-            _prompts(3),
+            _prompts(8),
             store,
             channel,
-            consumer_quantum=3,
+            consumer_quantum=8,
             lease=1,
             resident_high_watermark_bytes=1,
             resident_low_watermark_bytes=0,
@@ -373,7 +382,7 @@ class TestMultiServerProducer(unittest.TestCase):
         thread = threading.Thread(target=run_producer, daemon=True)
         thread.start()
         deadline = time.monotonic() + 2
-        while channel.published < 3 and time.monotonic() < deadline:
+        while channel.published < 8 and time.monotonic() < deadline:
             time.sleep(0.001)
         published_before_ack = channel.published
 
@@ -388,10 +397,106 @@ class TestMultiServerProducer(unittest.TestCase):
             time.sleep(0.001)
         thread.join(2)
 
-        self.assertEqual(published_before_ack, 3)
+        self.assertEqual(published_before_ack, 8)
         self.assertFalse(thread.is_alive())
         self.assertNotIn("error", outcome)
-        self.assertEqual(outcome.get("produced"), 3)
+        self.assertEqual(outcome.get("produced"), 8)
+
+    def test_reordered_window_releases_actual_bytes_before_next_capture(self):
+        for policy, sizes, next_size in (
+            ("two_window_bucketed", [1, 1, 1, 1, 10, 10, 10, 10], 6),
+            ("two_window_joint_balanced", [4, 1, 8, 13, 14, 9, 17, 11], 28),
+        ):
+            with self.subTest(policy=policy):
+                backend = _FakeMooncakeStore()
+                store = MooncakeFeatureStore(store=backend, store_id="run0")
+                channel = StreamingRefChannel(
+                    os.path.join(self._workdir(), "refs.jsonl")
+                )
+                workers, drive = _build(
+                    [_adapter(store, _StubCaptureServer(backend))],
+                    _prompts(9),
+                    store,
+                    channel,
+                    consumer_quantum=8,
+                    lease=1,
+                    in_flight_high_watermark=8,
+                    in_flight_low_watermark=8,
+                    resident_high_watermark_bytes=sum(sizes),
+                    resident_low_watermark_bytes=0,
+                    feature_store_max_resident_bytes=sum(sizes) + 1,
+                )
+                amounts = iter(sizes + [next_size])
+                capture = workers[0].run_once
+
+                def capture_with_sizes(max_tasks):
+                    refs = []
+                    for ref in capture(max_tasks):
+                        size = next(amounts)
+                        refs.append(
+                            replace(
+                                ref,
+                                estimated_bytes=size,
+                                num_tokens=size,
+                                metadata={**ref.metadata, "valid_anchor_count": size},
+                            )
+                        )
+                    return refs
+
+                workers[0].run_once = capture_with_sizes
+                distributor = RefDistributor(
+                    StreamingRefChannel(channel.path),
+                    DataFlowController("run0"),
+                    os.path.join(self._workdir(), "inboxes"),
+                    2,
+                    feature_store=store,
+                    refs_per_rank_step=2,
+                    refs_per_rank_batch=1,
+                    dispatch_policy=policy,
+                    num_anchors=512,
+                    block_size=16,
+                )
+                outcome = {}
+                stop = threading.Event()
+
+                def produce():
+                    try:
+                        outcome["produced"] = drive(should_stop=stop.is_set)
+                    except BaseException as exc:
+                        outcome["error"] = exc
+
+                thread = threading.Thread(target=produce, daemon=True)
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 5
+                    while (
+                        channel.published < 8
+                        and thread.is_alive()
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.001)
+                    self.assertEqual(channel.published, 8)
+                    distributor.pump()
+                    released_bytes = 0
+                    for inbox in distributor._inboxes:
+                        reader = StreamingRefChannel(inbox.path)
+                        released = reader.poll()[:2]
+                        released_bytes += sum(ref.estimated_bytes for ref in released)
+                        for ref in released:
+                            store.abort(ref.sample_id, reason="test-durable-ack")
+                        reader.mark_consumed(2)
+                    distributor.pump()
+                    self.assertEqual(
+                        channel.consumed_state_remote(), (4, released_bytes)
+                    )
+                    thread.join(5)
+                    self.assertFalse(thread.is_alive())
+                    self.assertNotIn("error", outcome)
+                    self.assertEqual(outcome.get("produced"), 9)
+                finally:
+                    if thread.is_alive():
+                        stop.set()
+                        thread.join(5)
 
     def test_hard_byte_cap_aborts_unpublished_capture_and_fails_channel(self):
         backend = _FakeMooncakeStore()

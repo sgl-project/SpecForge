@@ -427,7 +427,12 @@ class TrainerCore:
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
+        is_boundary = (self._micro + 1) % self.accumulation_steps == 0
+        with self.backend.accumulation_context(is_boundary=is_boundary):
+            out: StepOutput = self.strategy.forward_loss(batch, ctx)
+            return self._backward_step(out)
+
+    def _backward_step(self, out: StepOutput) -> StepResult:
         loss = out.loss
         ratio_metrics = dict(out.ratio_metrics)
         if out.loss_terms is not None:
