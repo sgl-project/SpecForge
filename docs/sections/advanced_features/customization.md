@@ -214,13 +214,6 @@ device and vocabulary. There is no `ignore_index`: masked positions still need
 valid token IDs. Teacher logits never receive gradients. Masks, coefficients
 and reduction belong to the caller; use `0.5 * terms.teacher_l1` for TV.
 
-DFlash and DSpark share the weighting and composition helpers in
-`specforge.core.token_objective`. They consume per-token losses with explicit,
-independent hard-label and teacher weights. Models retain their normalization,
-selector/confidence objectives and execution policy; D-PACE weights come from
-`specforge.core.position_weights`. Teacher data may be required by the token
-objective, confidence head or diagnostics independently.
-
 `top_k=K` additionally returns differentiable `topk_values` and integer
 `topk_ids` with shape `[..., K]`, for DFlash2's selector. `argmax_ids` and the
 optional draft/teacher top-1 probabilities are detached diagnostics. The
