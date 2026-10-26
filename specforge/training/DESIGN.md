@@ -81,13 +81,23 @@ gradients or reporting a checkpoint as successful. Queue-mode loaders
 terminally settle and clean a short `drop_last` batch without emitting it;
 fixed offline refs keep normal `drop_last` semantics.
 
-## Domino, DSpark and DSpine Liger kernels
+## Consumer dispatch
 
-Domino, DSpark and DSpine support `model.use_liger_kernel: true` through their draft
-providers and constructors; `null` (auto) and `false` keep native kernels.
-This reuses the existing RMSNorm/SwiGLU kernel bundle without global patching
-or changes to parameter layouts. Explicit opt-in uses the same platform,
-activation, and dependency validation as DFlash.
+`runtime.consumer_dispatch` controls sample assignment to consumer ranks:
+
+- `round_robin` (default): assign samples in source order.
+- `cost_balanced`: balance estimated anchor/context costs within each optimizer window.
+- `two_window_bucketed`: sort samples across two windows, then balance each window.
+- `two_window_joint_balanced`: balance two windows jointly, falling back to independent
+  balancing unless the estimated total critical-path cost decreases.
+
+Two-window policies require both high and low ref watermarks to cover two global
+optimizer windows and can change optimizer-step sample membership and the training trajectory.
+Producer byte accounting follows the acknowledged refs, including reordered windows;
+resume rebuilds release totals from the durable ledger and publication stream.
+All policies preserve sample coverage, per-rank accumulation counts, deduplication,
+durable acknowledgements, and incomplete-tail handling. Cost estimates are heuristics,
+not guarantees of throughput improvement.
 
 ## Endpoints
 

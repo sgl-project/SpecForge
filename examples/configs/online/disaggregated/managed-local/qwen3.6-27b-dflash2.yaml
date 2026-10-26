@@ -32,6 +32,9 @@ training:
   lk_loss_type: lambda
   loss_type: dpace
   objective_chunk_blocks: 128
+  # Measured without objective checkpointing: keep each chunk's logits for
+  # backward instead of recomputing the 248k-vocabulary projection.
+  objective_checkpointing: false
   dflash2_selector_loss_alpha: 1.0
   dflash2_selector_warmup_ratio: 0.0005
   dflash2_selector_ramp_ratio: 0.0005

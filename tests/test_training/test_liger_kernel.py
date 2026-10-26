@@ -19,6 +19,8 @@ from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm
 
 from specforge.algorithms.dflash import providers
+from specforge.algorithms.domino import providers as domino_providers
+from specforge.algorithms.dspark import providers as dspark_providers
 from specforge.modeling.draft import dflash_kernels
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash2 import DFlash2DraftModel
@@ -28,6 +30,8 @@ from specforge.modeling.draft.dflash_kernels import (
     DFlashKernels,
     resolve_liger_kernel_choice,
 )
+from specforge.modeling.draft.domino import DominoDraftModel
+from specforge.modeling.draft.dspark import DSparkDraftModel
 from specforge.training.checkpoint import CheckpointManager
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -386,6 +390,52 @@ class TestLigerKernelIntegration(unittest.TestCase):
         build.assert_called_once_with(cfg, draft_config, kernels)
 
 
+class TestDominoDSparkLigerOptIn(unittest.TestCase):
+    def test_constructors_forward_injected_kernels(self):
+        """Verify Domino and DSpark pass factories to the DFlash backbone."""
+        for draft_cls in (DominoDraftModel, DSparkDraftModel):
+            with self.subTest(draft=draft_cls.__name__):
+                draft = draft_cls(
+                    _dflash_family_config(draft_cls),
+                    dflash_kernels=_injected_kernels(),
+                )
+                self.assertIsInstance(draft.norm, _InjectedRMSNorm)
+                self.assertIsInstance(draft.hidden_norm, _InjectedRMSNorm)
+                self.assertIsInstance(draft.layers[0].mlp, _InjectedMLP)
+
+    def test_only_explicit_true_resolves_liger(self):
+        """Verify auto and false keep native modules for Domino and DSpark."""
+        draft_config = object()
+        for algorithm in (domino_providers, dspark_providers):
+            for requested in (True, None, False):
+                cfg = _cfg(requested)
+                with (
+                    self.subTest(algorithm=algorithm.__name__, requested=requested),
+                    mock.patch.object(
+                        providers,
+                        "resolve_dflash_kernels",
+                        return_value=mock.sentinel.kernels,
+                    ) as resolve,
+                    mock.patch(
+                        "specforge.algorithms.model_providers.build_dflash_draft"
+                    ) as liger_build,
+                    mock.patch(
+                        "specforge.algorithms.model_providers.build_registered_draft"
+                    ) as native_build,
+                ):
+                    algorithm.build_draft(cfg, draft_config)
+                    if requested is True:
+                        resolve.assert_called_once_with(cfg, draft_config)
+                        liger_build.assert_called_once_with(
+                            cfg, draft_config, mock.sentinel.kernels
+                        )
+                        native_build.assert_not_called()
+                    else:
+                        resolve.assert_not_called()
+                        liger_build.assert_not_called()
+                        native_build.assert_called_once_with(cfg, draft_config)
+
+
 @unittest.skipUnless(
     importlib.util.find_spec("liger_kernel") is not None,
     "requires liger-kernel",
@@ -598,6 +648,20 @@ def _draft_config():
         vocab_size=32,
     )
     config._attn_implementation = "eager"
+    return config
+
+
+def _dflash_family_config(draft_cls) -> Qwen3Config:
+    config = _draft_config()
+    config.architectures = [draft_cls.__name__]
+    config.dflash_config = {
+        "projector_type": draft_cls.expected_projector_type,
+        "mask_token_id": 31,
+        "markov_rank": 4,
+        "enable_confidence_head": False,
+        "emb_dim": 4,
+        "gru_hidden_dim": 8,
+    }
     return config
 
 
