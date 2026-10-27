@@ -4,7 +4,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from .attention.base import Attention
-from .config import AttentionConfig, LayerKernels
+from .config import AttentionConfig, LayerKernels, ResidualConfig
+from .residual.base import Residual
+from .residual.standard import StandardResidual
 
 
 def build_attention(
@@ -31,3 +33,30 @@ def build_ffn(config: PretrainedConfig, kernels: LayerKernels) -> nn.Module:
     # Return the provider's module directly: adding a wrapper changes checkpoint
     # paths and can change optimizer parameter ordering.
     return kernels.make_mlp(config)
+
+
+def build_residual(
+    options: ResidualConfig = ResidualConfig(),
+    *,
+    hidden_size: int | None = None,
+    norm_eps: float = 1e-6,
+) -> Residual:
+    if options.kind == "standard":
+        return StandardResidual()
+    if hidden_size is None:
+        raise ValueError("Hyper-connections require hidden_size")
+    if options.kind == "gr":
+        from .residual.gr import GatedResidual
+
+        return GatedResidual(
+            hidden_size, options.num_streams, options.gate_rank, norm_eps
+        )
+    from .residual.mhc import ManifoldHyperConnection
+
+    return ManifoldHyperConnection(
+        hidden_size,
+        options.num_streams,
+        norm_eps,
+        options.sinkhorn_iters,
+        options.sinkhorn_eps,
+    )

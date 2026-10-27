@@ -1,20 +1,21 @@
-"""Compose attention and FFN as a pre-norm residual decoder layer."""
+"""Compose attention and FFN with independently injected residual sublayers."""
 
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
-import torch
 from torch import nn
 from transformers.modeling_layers import GradientCheckpointingLayer
 
 from .attention.base import Attention, AttentionContext, AttentionOutput
+from .factory import build_residual
+from .residual.base import Residual, ResidualStream
 
 State = TypeVar("State")
 
 
 @dataclass(frozen=True)
 class DecoderOutput(Generic[State]):
-    hidden_states: torch.Tensor
+    hidden_states: ResidualStream
     attention: AttentionOutput[State]
 
 
@@ -31,25 +32,36 @@ class DecoderLayer(GradientCheckpointingLayer, Generic[State]):
         ffn: nn.Module,
         input_layernorm: nn.Module,
         post_attention_layernorm: nn.Module,
+        *,
+        attention_residual: Residual | None = None,
+        ffn_residual: Residual | None = None,
     ) -> None:
         super().__init__()
         self.self_attn = attention
         self.mlp = ffn
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
+        self.attention_residual = (
+            attention_residual if attention_residual is not None else build_residual()
+        )
+        self.ffn_residual = (
+            ffn_residual if ffn_residual is not None else build_residual()
+        )
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: ResidualStream,
         context: AttentionContext,
         state: State | None = None,
         **backend_kwargs,
     ) -> DecoderOutput[State]:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, residual = self.attention_residual.read(
+            hidden_states, self.input_layernorm
+        )
         output = self.self_attn(hidden_states, context, state, **backend_kwargs)
-        hidden_states = residual + output.hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
+        hidden_states = self.attention_residual.write(output.hidden_states, residual)
+        hidden_states, residual = self.ffn_residual.read(
+            hidden_states, self.post_attention_layernorm
+        )
+        hidden_states = self.ffn_residual.write(self.mlp(hidden_states), residual)
         return DecoderOutput(hidden_states, output)

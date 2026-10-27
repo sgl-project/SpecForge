@@ -26,10 +26,12 @@ from .layers.attention.base import AttentionContext
 from .layers.attention.gqa import GQAAttention
 from .layers.attention.mla import MLAAttention
 from .layers.attention.mla import validate_mla_config as validate_dflash_mla_config
-from .layers.config import AttentionConfig
+from .layers.config import AttentionConfig, ResidualConfig
 from .layers.decoder import DecoderLayer
-from .layers.factory import build_attention, build_ffn
+from .layers.factory import build_attention, build_ffn, build_residual
 from .layers.ffn.moe import MoELayer
+from .layers.residual.base import ResidualStream, collapse_streams, expand_streams
+from .layers.residual.gr import GatedResidual
 from .registry import register_draft
 
 FULL_ATTENTION = "full_attention"
@@ -75,6 +77,19 @@ def dflash_attention_resume_contract(draft_model) -> dict:
             is_causal,
         )
     }
+
+
+def dflash_residual_resume_contract(draft_model) -> dict:
+    """Protect non-parameter residual semantics when resuming training."""
+    options = getattr(draft_model, "residual_options", ResidualConfig())
+    if options.kind == "standard":
+        return {}
+    settings = (options.kind, options.num_streams, draft_model.config.rms_norm_eps)
+    if options.kind == "gr":
+        settings += (options.gate_rank,)
+    else:
+        settings += (options.sinkhorn_iters, options.sinkhorn_eps)
+    return {"draft_residual_semantics": (1, *settings)}
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -203,16 +218,34 @@ class Qwen3DFlashDecoderLayer(DecoderLayer):
         layer_idx: int,
         kernels: DFlashKernels,
     ):
+        residual_options = ResidualConfig(
+            **(getattr(config, "draft_residual", None) or {})
+        )
+
+        def make_norm() -> nn.Module:
+            # GR normalizes each stream before its gated read.
+            return (
+                nn.Identity()
+                if residual_options.kind == "gr"
+                else kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
+            )
+
         super().__init__(
             attention=build_attention(
                 config, layer_idx, kernels, _attention_options(config, layer_idx)
             ),
             ffn=build_ffn(config, kernels),
-            input_layernorm=kernels.make_rms_norm(
-                config.hidden_size, config.rms_norm_eps
+            input_layernorm=make_norm(),
+            post_attention_layernorm=make_norm(),
+            attention_residual=build_residual(
+                residual_options,
+                hidden_size=config.hidden_size,
+                norm_eps=config.rms_norm_eps,
             ),
-            post_attention_layernorm=kernels.make_rms_norm(
-                config.hidden_size, config.rms_norm_eps
+            ffn_residual=build_residual(
+                residual_options,
+                hidden_size=config.hidden_size,
+                norm_eps=config.rms_norm_eps,
             ),
         )
         self.hidden_size = config.hidden_size
@@ -220,7 +253,7 @@ class Qwen3DFlashDecoderLayer(DecoderLayer):
     def forward(
         self,
         target_hidden: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: Optional[ResidualStream] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -232,7 +265,7 @@ class Qwen3DFlashDecoderLayer(DecoderLayer):
         ] = None,  # necessary, but kept here for BC
         moe_token_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> torch.Tensor:
+    ) -> ResidualStream:
         context = self._attention_context(
             hidden_states,
             target_hidden,
@@ -258,7 +291,7 @@ class Qwen3DFlashDecoderLayer(DecoderLayer):
 
     def _attention_context(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: ResidualStream,
         target_hidden: torch.Tensor | None,
         attention_mask: torch.Tensor | BlockMask | None,
         position_ids: torch.Tensor | None,
@@ -355,6 +388,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         resolve_dflash_causal_block(config)
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
         self.attention_mode = validate_dflash_attention_config(config)
+        self.residual_options = ResidualConfig(
+            **(getattr(config, "draft_residual", None) or {})
+        )
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         dflash_config = getattr(config, "dflash_config", {}) or {}
         block_size = getattr(config, "block_size", None)
@@ -376,7 +412,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "target_layer_ids",
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
-        self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
+        self.norm = (
+            nn.Identity()
+            if self.residual_options.kind == "gr"
+            else kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
+        )
         self.rotary_emb = Qwen3RotaryEmbedding(
             _rope_config(config, self.attention_mode)
         )
@@ -392,6 +432,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
+        self.residual_readout = (
+            GatedResidual(
+                config.hidden_size,
+                self.residual_options.num_streams,
+                self.residual_options.gate_rank,
+                config.rms_norm_eps,
+                readout=True,
+            )
+            if self.residual_options.kind == "gr"
+            else nn.Identity()
+        )
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
@@ -402,11 +453,19 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             # HF's init skips the MoE layer's bare Parameters.
             module.reset_parameters(self.config.initializer_range)
 
-    def gradient_checkpointing_enable(self, *args, **kwargs) -> None:
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         if any(isinstance(module, MoELayer) for module in self.modules()):
             # MoE layers count tokens in forward; a recompute would count them twice.
             raise ValueError("MoE drafts do not support activation checkpointing")
-        super().gradient_checkpointing_enable(*args, **kwargs)
+        if self.residual_options.kind != "standard":
+            options = dict(gradient_checkpointing_kwargs or {})
+            if options.get("use_reentrant", False):
+                raise ValueError(
+                    "Hyper-connection states require use_reentrant=False for gradient checkpointing"
+                )
+            options["use_reentrant"] = False
+            gradient_checkpointing_kwargs = options
+        return super().gradient_checkpointing_enable(gradient_checkpointing_kwargs)
 
     def _build_decoder_layer(
         self,
@@ -556,6 +615,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             past_key_values,
             is_causal=kwargs.get("is_causal"),
         )
+        if self.residual_options.kind != "standard":
+            hidden_states = expand_streams(
+                hidden_states,
+                self.residual_options.num_streams,
+                single_pass=self.residual_options.kind == "mhc",
+            )
         for layer_type, layer in zip(self.layer_types, self.layers):
             layer_attention_mask = (
                 attention_mask[layer_type]
@@ -573,6 +638,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 moe_token_mask=moe_token_mask,
                 **kwargs,
             )
+        if self.residual_options.kind == "mhc":
+            hidden_states = collapse_streams(hidden_states)
+        elif self.residual_options.kind == "gr":
+            hidden_states = self.residual_readout(hidden_states)
         return self.norm(hidden_states)
 
     @torch.inference_mode()

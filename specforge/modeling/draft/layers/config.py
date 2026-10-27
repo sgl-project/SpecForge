@@ -38,3 +38,24 @@ class AttentionConfig:
             or self.sliding_window <= 0
         ):
             raise ValueError("sliding_window must be a positive integer or None")
+
+
+@dataclass(frozen=True)
+class ResidualConfig:
+    """Opt-in residual architecture; GR matches Qwen's per-branch normalization."""
+
+    kind: Literal["standard", "gr", "mhc"] = "standard"
+    num_streams: int = 4
+    gate_rank: int = 16
+    sinkhorn_iters: int = 20
+    sinkhorn_eps: float = 1e-6
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("standard", "gr", "mhc"):
+            raise ValueError(f"Unsupported residual kind: {self.kind!r}")
+        for name in ("num_streams", "gate_rank", "sinkhorn_iters"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if not 0 < self.sinkhorn_eps < 1:
+            raise ValueError("sinkhorn_eps must be between 0 and 1")

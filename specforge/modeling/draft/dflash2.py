@@ -25,6 +25,7 @@ from typing_extensions import Tuple, Unpack
 
 from .dflash import DFlashDraftModel, Qwen3DFlashDecoderLayer
 from .dflash_kernels import DFlashKernels
+from .layers.residual.base import ResidualStream
 from .registry import register_draft
 
 # Set to "0" to force the eager convolution on CUDA as well.
@@ -220,7 +221,7 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
     def forward(
         self,
         target_hidden: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: Optional[ResidualStream] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -230,9 +231,10 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         moe_token_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> ResidualStream:
+        hidden_states, residual = self.attention_residual.read(
+            hidden_states, self.input_layernorm
+        )
         hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -255,14 +257,15 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
             hidden_states,
             attention_kernel,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = self.attention_residual.write(hidden_states, residual)
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.ffn_residual.read(
+            hidden_states, self.post_attention_layernorm
+        )
         hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self._ffn(hidden_states, moe_token_mask)
         hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
-        return residual + hidden_states
+        return self.ffn_residual.write(hidden_states, residual)
 
 
 class CandidateSelector(nn.Module):

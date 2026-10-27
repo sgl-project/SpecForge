@@ -20,7 +20,11 @@ from specforge.modeling.draft.layers.attention.gqa import GQAAttention
 from specforge.modeling.draft.layers.attention.mla import MLAAttention
 from specforge.modeling.draft.layers.config import AttentionConfig
 from specforge.modeling.draft.layers.decoder import DecoderLayer
-from specforge.modeling.draft.layers.factory import build_attention, build_ffn
+from specforge.modeling.draft.layers.factory import (
+    build_attention,
+    build_ffn,
+    build_residual,
+)
 from specforge.modeling.draft.layers.ffn.dense import GatedMLP
 
 
@@ -192,6 +196,7 @@ class DecoderCompositionTest(unittest.TestCase):
             layer.named_parameters(), reference.named_parameters()
         ):
             assert_close(p.grad, q.grad, atol=0, rtol=0, msg=name)
+        self.assertIsNot(layer.attention_residual, layer.ffn_residual)
 
     def test_checkpointing_preserves_model_gradients(self):
         for kind in ("gqa", "mla"):
@@ -218,6 +223,15 @@ class DecoderCompositionTest(unittest.TestCase):
                     original.named_parameters(), checkpointed.named_parameters()
                 ):
                     assert_close(p.grad, q.grad, atol=0, rtol=0, msg=name)
+
+    def test_standard_residual_keeps_original_state_for_write(self):
+        residual = build_residual()
+        hidden = torch.randn(2, 3, 8, requires_grad=True)
+        normalized, state = residual.read(hidden, nn.LayerNorm(8))
+        self.assertIs(state, hidden)
+        assert_close(
+            residual.write(normalized, state), hidden + normalized, atol=0, rtol=0
+        )
 
 
 class DenseFFNTest(unittest.TestCase):
