@@ -1,5 +1,7 @@
 import logging
 import math
+import statistics
+from collections import deque
 
 import torch
 import torch.distributed as dist
@@ -49,11 +51,21 @@ class BF16Optimizer:
         warmup_ratio=0.015,
         lr_scheduler="cosine",
         offload_master=False,
+        spike_guard_ratio=0.0,
+        spike_guard_window=500,
+        spike_guard_min_history=100,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
+        # Spike guard: pre-clip global norms of the updates taken so far; a step
+        # whose norm is far above their median is skipped (see ``step``).
+        self.spike_guard_ratio = float(spike_guard_ratio)
+        self.spike_guard_min_history = int(spike_guard_min_history)
+        self._grad_norm_history = deque(maxlen=int(spike_guard_window))
+        self.skipped_steps = 0
+        self.last_step_skipped = False
         self.offload_master = bool(offload_master)
         self.fp32_params = [
             (
@@ -178,6 +190,16 @@ class BF16Optimizer:
             for mp in self.fp32_params:
                 mp.grad = None
 
+    def _is_spike(self, grad_norm: float) -> bool:
+        """Whether ``grad_norm`` is an outlier against the recent updates' norms."""
+        if not self.spike_guard_ratio:
+            return False
+        if len(self._grad_norm_history) < self.spike_guard_min_history:
+            return False
+        return grad_norm > self.spike_guard_ratio * statistics.median(
+            self._grad_norm_history
+        )
+
     def step(self, *, loss_denominator=None):
         """Clip, update, and return the pre-clip global grad norm.
 
@@ -218,6 +240,21 @@ class BF16Optimizer:
                 "refusing optimizer step with non-finite global grad norm "
                 f"(max_grad_norm={self.max_grad_norm})"
             )
+        self.last_step_skipped = False
+        if self._is_spike(host_values[0]):
+            # An outlier batch: clipping bounds the gradient, but Adam would
+            # still move every parameter by ~lr in its direction. Drop this
+            # update on purpose; the norm is global, so every rank skips
+            # together. Unlike the non-finite case above, the step keeps its
+            # place: the scheduler, global step and durable ack advance as for
+            # an update, so the data window is consumed, not replayed.
+            self._clear_grads()
+            self.last_grad_norm = grad_norm.detach()
+            self.scheduler.step()
+            self.skipped_steps += 1
+            self.last_step_skipped = True
+            return self.last_grad_norm
+        self._grad_norm_history.append(host_values[0])
         with torch.no_grad():
             model_grads, master_grads = [], []
             for p, mp in zip(self.model_params, self.fp32_params):
@@ -296,6 +333,13 @@ class BF16Optimizer:
                 f"{saved_max_grad_norm} but this run has "
                 f"max_grad_norm={self.max_grad_norm}"
             )
+        spike_guard = state_dict.get("spike_guard")
+        if spike_guard:
+            self._grad_norm_history.clear()
+            self._grad_norm_history.extend(
+                float(norm) for norm in spike_guard.get("grad_norm_history", [])
+            )
+            self.skipped_steps = int(spike_guard.get("skipped_steps", 0))
         # offload_master is a pure device-placement choice: restored fp32
         # masters and Adam moments are relocated to the current master device,
         # so toggling it on resume is safe and intentionally not gated here.
@@ -334,6 +378,10 @@ class BF16Optimizer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "lr_scheduler_type": self.lr_scheduler_type,
             "max_grad_norm": self.max_grad_norm,
+            "spike_guard": {
+                "grad_norm_history": list(self._grad_norm_history),
+                "skipped_steps": self.skipped_steps,
+            },
             # rank-local fp32 masters; without them a resume re-quantizes from bf16
             "fp32_params": [t.detach().cpu() for t in self.fp32_params],
         }

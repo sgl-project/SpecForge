@@ -625,6 +625,10 @@ class TrainerCore:
             else:
                 grad_norm_metric = float(grad_norm)
             metrics["grad_norm"] = grad_norm_metric
+            optimizer = getattr(self.backend, "optimizer", None)
+            if getattr(optimizer, "spike_guard_ratio", 0.0):
+                metrics["spike_guard/skipped"] = float(optimizer.last_step_skipped)
+                metrics["spike_guard/skipped_total"] = float(optimizer.skipped_steps)
         if step_metrics:
             # Per-step hook metrics, logged as reported: the hook pools them itself.
             metrics.update(step_metrics)

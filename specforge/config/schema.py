@@ -989,6 +989,15 @@ class TrainingConfig(StrictConfigModel):
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
+    #: Skip the optimizer update when the pre-clip global grad norm exceeds
+    #: ``spike_guard_ratio`` x the median norm of the last ``spike_guard_window``
+    #: updates (0 = off; nothing is judged before ``spike_guard_min_history``
+    #: updates). Clipping bounds the gradient, not Adam's step: one outlier
+    #: batch still moves every parameter by ~lr in its direction. The skipped
+    #: step keeps its place in the schedule and the data ledger.
+    spike_guard_ratio: float = Field(default=0.0, ge=0.0)
+    spike_guard_window: int = Field(default=500, gt=0)
+    spike_guard_min_history: int = Field(default=100, gt=0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.
     optimizer_cpu_offload: bool = False

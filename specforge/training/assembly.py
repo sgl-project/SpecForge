@@ -270,6 +270,9 @@ class _ConfiguredOptimizerFactory:
             lr_scheduler=t.lr_scheduler,
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
+            spike_guard_ratio=t.spike_guard_ratio,
+            spike_guard_window=t.spike_guard_window,
+            spike_guard_min_history=t.spike_guard_min_history,
         )
 
 
