@@ -8,6 +8,10 @@ and prediction heads. This package owns reusable layer computations.
   explicit Q/K/V and Hugging Face caches.
 - `attention/gqa.py`, `attention/mla.py`: projections and dense attention
   implementations. Projection mixins contain no backend dispatch.
+- `attention/selection.py`: token/block selections and local SWA branches,
+  with explicit KV source names and logical index coordinates.
+- `attention/backends/sparse.py`: typed execution protocol for future sparse
+  adapters, with implementation-specific inputs and per-head output validity.
 - `attention/backends/`: eager, SDPA, FlashAttention and FlexAttention execution;
   the existing FlexAttention compilation/backend adapters live here.
 - `attention/rotary.py`: full and partial rotary position encoding.
@@ -126,11 +130,47 @@ that understands their config and parameter layout.
 
 ## Extension boundary
 
-MoE, QSA and DSA are not implemented or selectable yet. Unsupported attention
-kinds fail at construction. No empty implementations or fallbacks represent them.
+QSA/DSA names are reserved in `AttentionConfig`, but `build_attention` raises
+`NotImplementedError` for them. Algorithm configs still accept only executable
+structures. No QSA/DSA indexer, kernel or MoE implementation is provided yet.
+
+SWA is independent of the projection structure: current GQA/expanded MLA use
+`AttentionConfig(sliding_window=N, is_causal=True)` for a causal window of N
+logical positions including the query itself. Without causality the condition
+is `abs(query_position - key_position) < N`. This is a visibility restriction,
+not a promise of bounded cache storage or sparse-kernel performance.
+
+Future sparse adapters consume `SparseSelection` without constructing a dense
+mask. `IndexedSelection` uses `[B, Hs, Q, K]` source-local token/block indices
+and `[B, Hs, Q]` valid lengths; `SlidingWindowSelection` describes a local
+branch without enumerating its keys. For example:
+
+```python
+selection = SparseSelection(
+    indexed=(IndexedSelection(indices, lengths, source="main", block_size=8),),
+    windows=(SlidingWindowSelection(size=128, source="main"),),
+)
+```
+
+This describes selected blocks **union** local keys, intersected with global
+causality, algorithm masks and any global window. Leave the global
+`AttentionConfig.sliding_window` unset to retain distant selected blocks.
+Overlaps within a source count once; different named sources (e.g. raw local
+KV and compressed KV) remain distinct entries in one attention normalization.
+Each adapter defines its typed input payload, source mappings and supported
+combinations. QSA retrieval blocks must first map to attention KV; compressed
+indexer keys are not implicitly attention values. These are interface contracts,
+not currently executable hybrid attention paths.
 
 A sparse implementation should implement `Attention` and reuse projections as
 appropriate; it must not inherit `DenseAttention.forward`. Its state can differ
-from the dense cache. Indexer objectives and router auxiliary outputs must be
-connected to training when those components are added. Ring execution is kept
+from the dense cache. `AttentionOutput.auxiliary_losses` carries named,
+unweighted scalar tensors without detaching them. `DecoderOutput.attention`
+retains them. Existing algorithm forwards return tensors and do not consume
+these objectives yet; enabling a trainable indexer requires explicitly wiring
+this output through the algorithm and choosing loss weights/reduction there.
+The attention/decoder never performs backward or optimizer stepping. Specialized
+outputs can subclass `AttentionOutput` to expose additional typed indexer data
+when needed. Router objectives likewise need training integration with MoE.
+Ring execution is kept
 in the existing EAGLE path; no new Ring/MLA combination is claimed.

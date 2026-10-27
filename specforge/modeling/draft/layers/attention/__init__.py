@@ -1,3 +1,12 @@
-from .base import Attention, AttentionContext, AttentionOutput
+from .base import Attention, AttentionAuxiliaryLoss, AttentionContext, AttentionOutput
+from .selection import IndexedSelection, SlidingWindowSelection, SparseSelection
 
-__all__ = ["Attention", "AttentionContext", "AttentionOutput"]
+__all__ = [
+    "Attention",
+    "AttentionAuxiliaryLoss",
+    "AttentionContext",
+    "AttentionOutput",
+    "IndexedSelection",
+    "SlidingWindowSelection",
+    "SparseSelection",
+]
