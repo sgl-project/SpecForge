@@ -19,8 +19,8 @@ class LayerKernels:
 class AttentionConfig:
     """Resolved structure and visibility defaults for one attention layer.
 
-    Backends receive these as ``module.is_causal`` and ``module.sliding_window``
-    exactly as before; an explicit mask from the algorithm is used as supplied.
+    Causality and the window intersect with the explicit allow-mask. Algorithms
+    supply token positions when sequence storage differs from logical order.
     """
 
     kind: Literal["gqa", "mha", "mla"] = "gqa"

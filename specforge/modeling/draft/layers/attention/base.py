@@ -1,4 +1,8 @@
-"""Attention contract and the explicit-KV dense implementation scaffold."""
+"""Attention contract and the explicit-KV dense implementation scaffold.
+
+Only DenseAttention owns projections/cache dispatch. Sparse implementations can
+implement Attention directly without inheriting the dense execution path.
+"""
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -29,6 +33,14 @@ class AttentionContext:
     attention_mask: torch.Tensor | BlockMask | None = None
     key_value_prefix: torch.Tensor | None = None
     cache_position: torch.Tensor | None = None
+    # Visibility coordinates for all keys (including cached keys) and queries.
+    # Defaults align queries to the trailing key positions, not SDPA's top-left.
+    query_positions: torch.Tensor | None = None
+    key_positions: torch.Tensor | None = None
+    # The algorithm built attention_mask from this layer's causal and window
+    # rules already (DFlash's per-layer-type masks). Dense backends then use the
+    # mask as is instead of rebuilding an identical one in every layer.
+    mask_encodes_visibility: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,14 +63,7 @@ class Attention(nn.Module, ABC, Generic[State]):
 
 
 class DenseAttention(Attention[Cache]):
-    """Shared execution for GQA and expanded MLA.
-
-    Subclasses own only the projection parameterization: ``_init_projections``
-    builds the weights and must define ``scaling``, ``num_key_value_groups``
-    and ``o_proj``; ``_compute_qkv`` returns rotated ``(q, k, v)`` with keys
-    ordered prefix-then-self. KV-cache updates, backend dispatch, fully masked
-    query zeroing and the output projection live here.
-    """
+    """Shared execution for GQA and expanded MLA, not a sparse attention base."""
 
     def __init__(
         self,
@@ -75,7 +80,6 @@ class DenseAttention(Attention[Cache]):
             if self.attention_dropout != 0.0:
                 raise ValueError("FlexAttention requires attention_dropout=0.0")
         self.sliding_window = options.sliding_window
-        # Read by mask-free backends (flash_attention_2) and SDPA without a mask.
         self.is_causal = options.is_causal
         self._init_projections(config, kernels)
 
@@ -103,6 +107,7 @@ class DenseAttention(Attention[Cache]):
         state: Cache | None = None,
         *,
         output_attentions: bool = False,
+        is_causal: bool | None = None,
         **backend_kwargs,
     ) -> AttentionOutput[Cache]:
         from .backends.dense import dense_attention
@@ -120,9 +125,19 @@ class DenseAttention(Attention[Cache]):
                 {"sin": sin, "cos": cos, "cache_position": context.cache_position},
             )
         output, weights, valid_queries = dense_attention(
-            self, q, k, v, context.attention_mask, **backend_kwargs
+            self,
+            q,
+            k,
+            v,
+            context.attention_mask,
+            query_positions=context.query_positions,
+            key_positions=context.key_positions,
+            mask_encodes_visibility=context.mask_encodes_visibility,
+            is_causal=self.is_causal if is_causal is None else is_causal,
+            **backend_kwargs,
         )
         output = self.o_proj(output.reshape(*hidden_states.shape[:2], -1))
+        # Zero after o_proj as well, so its bias cannot revive a masked query.
         if valid_queries is not None:
             output = output.masked_fill(~valid_queries.any(dim=1), 0)
         return AttentionOutput(output, state, weights if output_attentions else None)
