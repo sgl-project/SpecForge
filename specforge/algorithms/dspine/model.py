@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.core.chunking import checkpointed_chunk_reduce
+from specforge.core.fused_loss import ce_l1_loss
 
 
 class OnlineDSpineModel(OnlineDFlashModel):
@@ -60,18 +61,21 @@ class OnlineDSpineModel(OnlineDFlashModel):
         scores = torch.einsum(
             "bmh,bmkh->bmk", refined, F.embedding(candidates, self.lm_head.weight)
         ).float()
-        refined_log_probabilities = scores.log_softmax(dim=-1)
         target_candidates = teacher_logits.softmax(dim=-1, dtype=torch.float32).gather(
             -1, candidates
         )
+        # The gate uses full-vocabulary mass, before candidate normalization.
         mass = target_candidates.sum(dim=-1)
-        target_candidates = target_candidates / mass.unsqueeze(-1).clamp_min(1e-30)
         covered = candidates == labels.unsqueeze(-1)
-        refined_ce = -(refined_log_probabilities * covered).sum(dim=-1)
-        refined_l1 = (
-            (refined_log_probabilities.exp() - target_candidates).abs().sum(dim=-1)
+        # Normalize both candidate distributions through the same softmax path.
+        refinement = ce_l1_loss(
+            scores,
+            covered.long().argmax(dim=-1),
+            teacher_logits=teacher_logits.gather(-1, candidates),
         )
-        refined_l1 = refined_l1 * (mass > config.candidate_mass_threshold)
+        # Missing labels use index zero above only as a placeholder for CE.
+        refined_ce = refinement.cross_entropy * covered.any(dim=-1)
+        refined_l1 = refinement.teacher_l1 * (mass > config.candidate_mass_threshold)
         reference_codes = F.embedding(labels, self.draft_model.transfer_codes).float()
         alignment = 1 - F.cosine_similarity(
             layer_features.float(), reference_codes.unsqueeze(1), dim=-1
