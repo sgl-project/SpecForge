@@ -32,7 +32,9 @@ from specforge.modeling.draft.dflash2 import (
     DFlash2DraftModel,
     DFlashGroupedConv,
 )
-from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+from specforge.modeling.draft.layers.attention.backends.flex_attention_backend import (
+    flex_attention_backend,
+)
 
 
 @contextlib.contextmanager
