@@ -1,0 +1,72 @@
+# Qwen3-4B EAGLE-4 dense stage-1, online, same node.
+#
+# SpecForge has no online colocated topology. This managed-local recipe is the
+# same-node path: one `specforge train` owns Mooncake, the SGLang capture
+# server (GPU 0), and the trainer (GPU 1). Capture method is eagle3 (EAGLE-4
+# reuses that aux layout). Requires the v0.5.18 spec-capture patch, not a
+# Muse Spark image.
+#
+#   specforge train --config examples/configs/online/disaggregated/managed-local/qwen3-4b-eagle4-amd.yaml
+#
+# Stage 1 trains a full-vocab dense lm_head. Do not pass vocab_mapping_path.
+model:
+  target_model_path: "Qwen/Qwen3-4B"
+  draft_model_config: "configs/qwen3-4b-eagle4.json"
+  target_backend: "sglang"
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  use_liger_kernel: false
+  sglang_attention_backend: "aiter"
+  sglang_mem_fraction_static: 0.5
+  sglang_context_length: 4096
+  sglang_disable_radix_cache: true
+data:
+  train_data_path: "./cache/dataset/sharegpt_train.jsonl"
+  max_length: 2048
+  chat_template: "qwen"
+  build_dataset_num_proc: 32
+  cache_dir: "./cache"
+training:
+  strategy: "eagle4"
+  num_epochs: 1
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  save_interval: 200
+  log_interval: 10
+  dist_timeout: 30
+  seed: 0
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3-4b-eagle4-online"
+output_dir: "./outputs/qwen3-4b-eagle4-online"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+  disaggregated:
+    control_dir: outputs/qwen3-4b-eagle4-online/control
+    consumer_state_dir: outputs/qwen3-4b-eagle4-online/consumer-state
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices:
+        - "1"
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 1073741824
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          mem_fraction_static: 0.5
+          attention_backend: aiter
+          env:
+            SGLANG_USE_AITER: "1"
+            SGLANG_USE_AITER_UNIFIED_ATTN: "1"
+            AITER_FLYDSL_FORCE: "1"
