@@ -4,6 +4,12 @@ The ``LEGACY`` section is copied verbatim from specforge/modeling/draft/dflash.p
 and dflash2.py at e3ab28d6, before attention moved to
 ``specforge.modeling.draft.layers``. Do not edit it to make a test pass; a
 difference means the refactor changed numerics.
+
+One intended difference exists since visibility was unified across backends:
+SDPA now zeroes queries with no visible key after ``o_proj`` (as eager always
+did), so a dropped draft block no longer emits the projection bias. Training
+excludes those rows from the loss, and so do these checks; everything else
+stays bit-exact.
 """
 
 import copy
@@ -636,12 +642,13 @@ def _training_inputs(model):
             ),
             is_causal=getattr(model.config, "is_causal", None),
         )
-    return dict(
+    inputs = dict(
         position_ids=positions,
         attention_mask=masks,
         noise_embedding=torch.randn(2, anchors.shape[1] * block_size, 16),
         target_hidden=torch.randn(2, seq_len, model.fc.in_features),
     )
+    return inputs, keep.repeat_interleave(block_size, dim=1)
 
 
 class PreRefactorParityTest(unittest.TestCase):
@@ -676,15 +683,15 @@ class PreRefactorParityTest(unittest.TestCase):
                     torch.optim.AdamW(m.parameters(), lr=1e-2, weight_decay=0.1)
                     for m in (model, legacy)
                 ]
-                inputs = _training_inputs(model)
+                inputs, valid_rows = _training_inputs(model)
                 for _ in range(2):
                     outputs = []
                     for m, optimizer in zip((model, legacy), optimizers):
                         optimizer.zero_grad()
                         output = m(**inputs)
-                        output.square().mean().backward()
+                        output.square().mean(-1)[valid_rows].mean().backward()
                         optimizer.step()
-                        outputs.append(output)
+                        outputs.append(output[valid_rows])
                     assert_close(*outputs, atol=0, rtol=0)
                     for (name, p), (_, q) in zip(
                         model.named_parameters(), legacy.named_parameters()

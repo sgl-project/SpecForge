@@ -1,9 +1,13 @@
-"""Execution adapters for explicit Q/K/V. No projection weights."""
+"""Execution adapters for explicit Q/K/V. No projection or indexer weights."""
 
 from typing import TYPE_CHECKING, Callable, Optional
 
-import torch
 from torch.nn.attention.flex_attention import BlockMask
+
+if TYPE_CHECKING:
+    from ..base import DenseAttention
+
+import torch
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     eager_attention_forward,
@@ -11,26 +15,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from .flex_attention import compile_friendly_flex_attention
 from .flex_attention_backend import flex_attention_backend
-
-if TYPE_CHECKING:
-    from ..base import DenseAttention
-
-
-def prepare_eager_mask(
-    attention_mask: Optional[torch.Tensor],
-    dtype: torch.dtype,
-) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Convert a boolean allow-mask to eager's additive representation."""
-
-    if attention_mask is None or attention_mask.dtype != torch.bool:
-        return attention_mask, None
-
-    valid_queries = attention_mask.any(dim=-1, keepdim=True)
-    # A finite minimum keeps eager softmax stable. Fully masked query rows are
-    # explicitly zeroed after attention so they cannot average forbidden values.
-    additive_mask = torch.zeros_like(attention_mask, dtype=dtype)
-    additive_mask.masked_fill_(~attention_mask, torch.finfo(dtype).min)
-    return additive_mask, valid_queries
+from .visibility import prepare_tensor_mask, resolve_visibility
 
 
 def dense_attention(
@@ -39,19 +24,67 @@ def dense_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     attention_mask: torch.Tensor | BlockMask | None,
+    *,
+    query_positions: torch.Tensor | None = None,
+    key_positions: torch.Tensor | None = None,
+    mask_encodes_visibility: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Run the configured backend and report eager's fully masked queries."""
-
     implementation = module.config._attn_implementation
+    causal = kwargs.pop("is_causal", module.is_causal)
+    if not isinstance(causal, bool):
+        raise ValueError("is_causal must be a boolean")
     valid_queries = None
+    native_sdpa_causal = (
+        implementation == "sdpa"
+        and causal
+        and module.sliding_window is None
+        and attention_mask is None
+        and query_positions is None
+        and key_positions is None
+        and (q.shape[-2] == k.shape[-2] or q.shape[-2] == 1)
+    )
+    resolved_by_algorithm = mask_encodes_visibility and attention_mask is not None
+    if implementation in ("eager", "sdpa", "flex_attention"):
+        if not native_sdpa_causal and not resolved_by_algorithm:
+            attention_mask = resolve_visibility(
+                attention_mask,
+                q,
+                k,
+                causal=causal,
+                window=module.sliding_window,
+                query_positions=query_positions,
+                key_positions=key_positions,
+                flex=implementation == "flex_attention",
+            )
+    elif implementation.startswith("flash_attention"):
+        # Flash's native right-aligned causal/window support is suitable for
+        # contiguous sequences. Arbitrary logical layouts need Eager/SDPA/Flex.
+        if query_positions is not None or key_positions is not None:
+            raise ValueError(
+                "Explicit visibility positions require Eager, SDPA or FlexAttention"
+            )
+        if attention_mask is not None:
+            if attention_mask.ndim != 2:
+                raise ValueError("FlashAttention only supports a 2D padding mask")
+            valid_queries = attention_mask[:, None, -q.shape[-2] :, None].bool()
+            valid_queries = valid_queries & attention_mask.any(-1)[:, None, None, None]
+    else:
+        raise ValueError(f"Unsupported dense attention backend: {implementation}")
     if implementation == "flex_attention":
         kernel_options = dict(kwargs.pop("kernel_options", None) or {})
         backend = flex_attention_backend()
         if backend is not None:
             kernel_options["BACKEND"] = backend
 
-        attn_output = compile_friendly_flex_attention(
+        # Flex already returns zeros for queries (and heads) without visible
+        # keys; validity is only needed to keep an o_proj bias from reviving
+        # them, so the default bias-free path skips the extra LSE output.
+        need_validity = (
+            attention_mask is not None
+            and getattr(module.o_proj, "bias", None) is not None
+        )
+        result = compile_friendly_flex_attention(
             q,
             k,
             v,
@@ -59,13 +92,22 @@ def dense_attention(
             enable_gqa=True,
             scale=module.scaling,
             kernel_options=kernel_options or None,
-        ).transpose(1, 2)
+            return_lse=need_validity,
+        )
+        if need_validity:
+            attn_output, lse = result
+            valid_queries = (~torch.isneginf(lse)).unsqueeze(-1)
+        else:
+            attn_output = result
+        attn_output = attn_output.transpose(1, 2)
         attn_weights = None
     else:
         attn_fn: Callable = eager_attention_forward
-        if implementation == "eager":
-            attention_mask, valid_queries = prepare_eager_mask(attention_mask, q.dtype)
-        else:
+        if implementation in ("eager", "sdpa"):
+            attention_mask, valid_queries = prepare_tensor_mask(
+                attention_mask, q.dtype, eager=implementation == "eager"
+            )
+        if implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[implementation]
         attn_output, attn_weights = attn_fn(
             module,
@@ -76,8 +118,13 @@ def dense_attention(
             dropout=0.0 if not module.training else module.attention_dropout,
             scaling=module.scaling,
             sliding_window=module.sliding_window,
+            is_causal=causal,
             **kwargs,
         )
         if valid_queries is not None and attn_weights is not None:
             attn_weights = attn_weights.masked_fill(~valid_queries, 0)
+    if valid_queries is not None:
+        # Zero each head before o_proj; otherwise an empty head leaks forbidden
+        # values even when another head has visible keys for the same query.
+        attn_output = attn_output.masked_fill(~valid_queries.transpose(1, 2), 0)
     return attn_output, attn_weights, valid_queries
