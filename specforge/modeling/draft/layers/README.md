@@ -45,25 +45,43 @@ result = attention(
 
 For the current GQA/MLA implementations, new keys are ordered as prefix followed
 by `hidden_states`. RoPE describes these new keys; queries take the trailing
-positions. Omit the prefix for ordinary self attention. Cache state contains
-already rotated keys.
+positions. Omit the prefix for ordinary self attention. Use an explicit mask
+for algorithm-specific visibility. `is_causal=True` intersects that mask with
+causal visibility; `is_causal=False` disables only the causal restriction. A
+configured sliding window intersects both. Without explicit positions, queries
+align to the **trailing** key positions, including prefix and cached keys.
+For packed/non-contiguous layouts, supply `[batch, sequence]` `query_positions`
+and `key_positions`; key positions must cover the entire cache as well.
+DFlash supplies the actual anchor-based positions for packed training blocks.
+Cache state contains already rotated keys.
 
-Masks and causality reach the backends exactly as before this package existed:
-an explicit mask from the algorithm is used as supplied, and
-`AttentionConfig.is_causal` / `sliding_window` are exposed as
-`module.is_causal` / `module.sliding_window` for mask-free backends
-(FlashAttention, and SDPA without a mask). Eager converts boolean allow-masks to
-additive masks and zeroes queries with no visible keys, including after the
-output-projection bias. `output_attentions=True` requests weights from backends
-that provide them; the default does not retain an attention matrix in the
-output. MLA currently expands K/V; it is not a latent-cache inference
-implementation.
+When an algorithm's mask already applies the layer's causal and window rules
+(DFlash builds one mask per layer type that way), it sets
+`mask_encodes_visibility=True` and dense backends use the mask as is, instead of
+rebuilding an identical mask (a Flex `create_block_mask`, or a dense
+`[batch, 1, query, key]` tensor) in every sliding or causal layer.
+
+Eager/SDPA accept four-dimensional boolean allow-masks or additive masks
+(`-inf`/`finfo.min` excludes a key). Flex accepts `BlockMask` and composes mask
+functions without constructing a dense attention matrix. FlashAttention uses
+native right-aligned causality/windows and optional two-dimensional padding
+masks; explicit visibility coordinates or arbitrary masks require another
+backend. A query with no visible keys contributes zero attention output,
+including after output-projection bias. Individual empty heads are zeroed
+before projection, while the residual stream remains intact. Flex already
+returns zeros for empty rows, so it requests the log-sum-exp needed to detect
+them only when `o_proj` has a bias.
+`output_attentions=True` requests weights from backends that provide them; the
+default does not retain an attention matrix in the output.
+MLA currently expands K/V; it is not a latent-cache inference implementation.
 
 The internal DFlash attention classes retain their construction names, but now
 use this context/result interface. Default algorithm model forwards, checkpoint
 parameter names and parameter ordering are preserved;
 `tests/test_modeling/test_layers/test_refactor_parity.py` checks this bit for bit
-against the pre-refactor implementation. Production DFlash-family layers use
+against the pre-refactor implementation, with one intended difference: SDPA
+now zeroes queries with no visible key after `o_proj`, as eager always did.
+Production DFlash-family layers use
 `build_attention`; compatibility attention constructors are not a second
 production dispatch table.
 

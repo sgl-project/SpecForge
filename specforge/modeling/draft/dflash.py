@@ -297,12 +297,33 @@ class Qwen3DFlashDecoderLayer(DecoderLayer):
         cache_position: torch.Tensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> AttentionContext:
-        del hidden_states, position_ids, past_key_value
+        query_positions = key_positions = None
+        # Packed training blocks use logical positions rather than the order of
+        # [target context, draft blocks]. Cached decoding is contiguous and uses
+        # the attention backend's default right alignment.
+        if (
+            past_key_value is None
+            and self.self_attn.config._attn_implementation
+            in ("eager", "sdpa", "flex_attention")
+            and position_ids is not None
+        ):
+            streams = (
+                hidden_states
+                if isinstance(hidden_states, torch.Tensor)
+                else hidden_states.streams
+            )
+            query_positions = position_ids[:, -streams.shape[1] :]
+            key_positions = position_ids
         return AttentionContext(
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             key_value_prefix=target_hidden,
             cache_position=cache_position,
+            query_positions=query_positions,
+            key_positions=key_positions,
+            # DFlash-family masks are built per layer type with the same
+            # causal/window rules as this layer's AttentionConfig.
+            mask_encodes_visibility=attention_mask is not None,
         )
 
 
