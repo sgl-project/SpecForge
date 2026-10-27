@@ -9,6 +9,7 @@ from transformers import Qwen3Config
 from specforge.modeling.draft.dflash import Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DFlashKernels
 from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
+from specforge.modeling.draft.layers.attention.base import AttentionContext
 
 
 def _make_attention(layer_type, implementation, sliding_window, is_causal=None):
@@ -43,13 +44,18 @@ def _forward(attention, hidden_states, target_hidden, attention_mask, **kwargs):
         hidden_states.new_ones(1, total_length, attention.head_dim),
         hidden_states.new_zeros(1, total_length, attention.head_dim),
     )
-    return attention(
+    result = attention(
+        output_attentions=True,
         hidden_states=hidden_states,
-        target_hidden=target_hidden,
-        position_embeddings=position_embeddings,
-        attention_mask=attention_mask,
+        context=AttentionContext(
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            key_value_prefix=target_hidden,
+        ),
         **kwargs,
     )
+
+    return result.hidden_states, result.attention_weights
 
 
 class TestDFlashEagerAttentionMasking(unittest.TestCase):
@@ -74,7 +80,7 @@ class TestDFlashEagerAttentionMasking(unittest.TestCase):
                 hidden, context = torch.randn(1, 3, 8), torch.randn(1, 2, 8)
                 backend = mock.Mock(return_value=(torch.zeros(1, 3, 2, 4), None))
                 with mock.patch(
-                    "specforge.modeling.draft.dflash.ALL_ATTENTION_FUNCTIONS",
+                    "specforge.modeling.draft.layers.attention.backends.dense.ALL_ATTENTION_FUNCTIONS",
                     {"flash_attention_2": backend},
                 ):
                     _forward(attention, hidden, context, None)
@@ -86,7 +92,7 @@ class TestDFlashEagerAttentionMasking(unittest.TestCase):
                 self.assertEqual(backend.call_args.kwargs["sliding_window"], window)
                 self.assertNotIn("is_causal", backend.call_args.kwargs)
                 with mock.patch(
-                    "specforge.modeling.draft.dflash.ALL_ATTENTION_FUNCTIONS",
+                    "specforge.modeling.draft.layers.attention.backends.dense.ALL_ATTENTION_FUNCTIONS",
                     {"flash_attention_2": backend},
                 ):
                     _forward(attention, hidden, context, None, is_causal=True)

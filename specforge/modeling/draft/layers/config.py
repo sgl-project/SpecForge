@@ -1,0 +1,40 @@
+"""Construction options shared by draft components, independent of algorithms."""
+
+from dataclasses import dataclass
+from typing import Callable, Literal
+
+from torch import nn
+from transformers import PretrainedConfig
+
+
+@dataclass(frozen=True)
+class LayerKernels:
+    """Inject norm and FFN implementations without changing parameter paths."""
+
+    make_rms_norm: Callable[[int, float], nn.Module]
+    make_mlp: Callable[[PretrainedConfig], nn.Module]
+
+
+@dataclass(frozen=True)
+class AttentionConfig:
+    """Resolved structure and visibility defaults for one attention layer.
+
+    Backends receive these as ``module.is_causal`` and ``module.sliding_window``
+    exactly as before; an explicit mask from the algorithm is used as supplied.
+    """
+
+    kind: Literal["gqa", "mha", "mla"] = "gqa"
+    is_causal: bool = False
+    sliding_window: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("gqa", "mha", "mla"):
+            raise ValueError(f"Unsupported attention kind: {self.kind!r}")
+        if not isinstance(self.is_causal, bool):
+            raise ValueError("is_causal must be a boolean")
+        if self.sliding_window is not None and (
+            isinstance(self.sliding_window, bool)
+            or not isinstance(self.sliding_window, int)
+            or self.sliding_window <= 0
+        ):
+            raise ValueError("sliding_window must be a positive integer or None")

@@ -236,16 +236,21 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            target_hidden=target_hidden,
-            attention_mask=attention_mask,
+            context=self._attention_context(
+                hidden_states,
+                target_hidden,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                cache_position,
+                position_embeddings,
+            ),
             position_ids=position_ids,
-            past_key_values=past_key_value,
+            state=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
             **kwargs,
-        )[0]
+        ).hidden_states
         hidden_states = self.attention_conv.finish(
             hidden_states,
             attention_kernel,

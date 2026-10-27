@@ -11,15 +11,14 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
-from specforge.modeling.draft.dflash import (
-    DFlashDraftModel,
-    Qwen3DFlashAttention,
-    Qwen3DFlashMLAAttention,
-    apply_mla_rope,
-)
+from specforge.modeling.draft.dflash import DFlashDraftModel, Qwen3DFlashMLAAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.dflash_mask import create_dflash_block_mask
 from specforge.modeling.draft.dspark import DSparkDraftModel
+from specforge.modeling.draft.layers.attention.base import AttentionContext
+from specforge.modeling.draft.layers.attention.gqa import GQAAttention
+from specforge.modeling.draft.layers.attention.mla import MLAAttention
+from specforge.modeling.draft.layers.attention.rotary import apply_mla_rope
 
 
 def _mla_config(
@@ -105,13 +104,18 @@ def _attention_forward(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    return attention(
+    result = attention(
+        output_attentions=True,
         hidden_states=hidden_states,
-        target_hidden=target_hidden,
-        position_embeddings=position_embeddings,
-        attention_mask=attention_mask,
-        past_key_values=past_key_values,
+        context=AttentionContext(
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            key_value_prefix=target_hidden,
+        ),
+        state=past_key_values,
     )
+
+    return result.hidden_states, result.attention_weights
 
 
 class TestDFlashMLASelection(unittest.TestCase):
@@ -119,7 +123,7 @@ class TestDFlashMLASelection(unittest.TestCase):
         model = DFlashDraftModel(_mla_config())
 
         self.assertEqual(model.attention_mode, "mla")
-        self.assertIsInstance(model.layers[0].self_attn, Qwen3DFlashMLAAttention)
+        self.assertIsInstance(model.layers[0].self_attn, MLAAttention)
         # Omitted rope_interleave defaults to the DeepSeek interleaved layout.
         self.assertTrue(model.layers[0].self_attn.rope_interleaved)
         # The model-level rotary rotates only the partial-RoPE slice.
@@ -132,7 +136,7 @@ class TestDFlashMLASelection(unittest.TestCase):
         model = DFlashDraftModel(config)
 
         self.assertEqual(model.attention_mode, "gqa")
-        self.assertIsInstance(model.layers[0].self_attn, Qwen3DFlashAttention)
+        self.assertIsInstance(model.layers[0].self_attn, GQAAttention)
         cos, _ = model.rotary_emb(torch.zeros(1, 2, 1), torch.arange(2).unsqueeze(0))
         self.assertEqual(cos.shape[-1], config.head_dim)
 
@@ -143,7 +147,7 @@ class TestDFlashMLASelection(unittest.TestCase):
         config.num_key_value_heads = 3
         model = DSparkDraftModel(config)
 
-        self.assertIsInstance(model.layers[0].self_attn, Qwen3DFlashMLAAttention)
+        self.assertIsInstance(model.layers[0].self_attn, MLAAttention)
         self.assertEqual(model.config.dflash_config["attention_mode"], "mla")
         self.assertIsNotNone(model.markov_head)
         self.assertIsNotNone(model.confidence_head)
@@ -572,7 +576,7 @@ class TestDFlashMLAConfigValidation(unittest.TestCase):
 
         config.num_key_value_heads = config.num_attention_heads
         model = DFlashDraftModel(config)
-        self.assertIsInstance(model.layers[0].self_attn, Qwen3DFlashAttention)
+        self.assertIsInstance(model.layers[0].self_attn, GQAAttention)
         self.assertEqual(model.layers[0].self_attn.num_key_value_groups, 1)
 
 

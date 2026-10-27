@@ -15,6 +15,10 @@ from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers.attention.backends.flex_attention_backend import (
     flex_attention_backend,
 )
+from specforge.modeling.draft.layers.attention.base import (
+    AttentionContext,
+    AttentionOutput,
+)
 
 
 class FlexAttentionBackendTest(unittest.TestCase):
@@ -95,7 +99,9 @@ class FlexAttentionBackendTest(unittest.TestCase):
 
         for layer in model.layers:
             layer.self_attn.forward = mock.Mock(
-                side_effect=lambda hidden_states, **kwargs: (hidden_states, None)
+                side_effect=lambda hidden_states, context, state, **kwargs: AttentionOutput(
+                    hidden_states
+                )
             )
 
         model(
@@ -109,11 +115,11 @@ class FlexAttentionBackendTest(unittest.TestCase):
         )
 
         self.assertIs(
-            model.layers[0].self_attn.forward.call_args.kwargs["attention_mask"],
+            model.layers[0].self_attn.forward.call_args.args[1].attention_mask,
             sliding_mask,
         )
         self.assertIs(
-            model.layers[1].self_attn.forward.call_args.kwargs["attention_mask"],
+            model.layers[1].self_attn.forward.call_args.args[1].attention_mask,
             full_mask,
         )
 
@@ -140,14 +146,16 @@ class FlexAttentionBackendTest(unittest.TestCase):
         sin = torch.zeros_like(cos)
 
         with mock.patch(
-            "specforge.modeling.draft.dflash.eager_attention_forward",
+            "specforge.modeling.draft.layers.attention.backends.dense.eager_attention_forward",
             return_value=(torch.zeros(1, 1, 1, config.head_dim), None),
         ) as eager:
             attention(
                 hidden_states=torch.randn(1, 1, config.hidden_size),
-                target_hidden=torch.randn(1, 1, config.hidden_size),
-                position_embeddings=(cos, sin),
-                attention_mask=boolean_mask,
+                context=AttentionContext(
+                    position_embeddings=(cos, sin),
+                    attention_mask=boolean_mask,
+                    key_value_prefix=torch.randn(1, 1, config.hidden_size),
+                ),
             )
 
         additive_mask = eager.call_args.args[4]
@@ -298,12 +306,15 @@ class FlexAttentionBackendTest(unittest.TestCase):
         sin = torch.zeros_like(cos)
 
         with mock.patch.dict(os.environ, {"SPECFORGE_FLEX_ATTENTION_BACKEND": "FLASH"}):
-            output, weights = attention(
+            result = attention(
                 hidden_states=hidden_states,
-                target_hidden=target_hidden,
-                position_embeddings=(cos, sin),
-                attention_mask=block_mask,
+                context=AttentionContext(
+                    position_embeddings=(cos, sin),
+                    attention_mask=block_mask,
+                    key_value_prefix=target_hidden,
+                ),
             )
+            output, weights = result.hidden_states, result.attention_weights
             output.float().square().mean().backward()
             torch.cuda.synchronize()
 
