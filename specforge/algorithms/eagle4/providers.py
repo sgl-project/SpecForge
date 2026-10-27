@@ -30,7 +30,7 @@ from specforge.algorithms.eagle3.data import (
     NORMALIZER_ID,
     build_offline_collator,
     build_offline_normalizer,
-    build_offline_reader,
+    build_offline_reader as build_eagle3_offline_reader,
     build_server_collator,
 )
 from specforge.algorithms.eagle3.providers import (
@@ -50,6 +50,14 @@ def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_eagle4_draft
 
     return build_eagle4_draft(config, draft_config)
+
+
+def build_offline_reader(*args, **kwargs):
+    """Reuse EAGLE3's file layout, tagged for an eagle4 training run."""
+
+    reader = build_eagle3_offline_reader(*args, **kwargs)
+    reader.strategy = ALGORITHM_NAME
+    return reader
 
 
 def resume_contract(config, draft_model, training_model):
