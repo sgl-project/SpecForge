@@ -50,7 +50,11 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
-    from specforge.modeling.draft.dflash import dflash_attention_resume_contract
+    from specforge.modeling.draft.dflash import (
+        dflash_attention_resume_contract,
+        dflash_residual_resume_contract,
+        dflash_sparse_resume_contract,
+    )
 
     contract = {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
@@ -69,6 +73,8 @@ def resume_contract(_config, draft_model, training_model):
         ),
     }
     contract.update(dflash_attention_resume_contract(draft_model))
+    contract.update(dflash_residual_resume_contract(draft_model))
+    contract.update(dflash_sparse_resume_contract(draft_model))
     if getattr(draft_model.config, "is_causal", None) is True:
         contract["dspark_causal_block"] = True
     return contract

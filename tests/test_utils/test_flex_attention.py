@@ -6,12 +6,12 @@ from transformers import LlamaConfig
 from transformers.cache_utils import DynamicCache
 
 from specforge.modeling._mask_utils import prepare_decoder_attention_mask
-from specforge.modeling.draft.flex_attention import (
+from specforge.modeling.draft.eagle3 import LlamaAttention, LlamaFlexAttention
+from specforge.modeling.draft.eagle3_mask import generate_eagle3_mask
+from specforge.modeling.draft.layers.attention.backends.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
-    generate_eagle3_mask,
 )
-from specforge.modeling.draft.llama3_eagle import LlamaAttention, LlamaFlexAttention
 from specforge.utils import padding
 from tests.test_utils.utils import norm_tensor
 

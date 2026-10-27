@@ -25,6 +25,7 @@ from typing_extensions import Tuple, Unpack
 
 from .dflash import DFlashDraftModel, Qwen3DFlashDecoderLayer
 from .dflash_kernels import DFlashKernels
+from .layers.residual.base import ResidualStream
 from .registry import register_draft
 
 # Set to "0" to force the eager convolution on CUDA as well.
@@ -220,7 +221,7 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
     def forward(
         self,
         target_hidden: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: Optional[ResidualStream] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -229,34 +230,51 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> ResidualStream | tuple[ResidualStream, torch.Tensor]:
+        return_auxiliary = kwargs.pop("return_auxiliary_losses", False)
+        hidden_states, residual = self.attention_residual.read(
+            hidden_states, self.input_layernorm
+        )
         hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
-        hidden_states = self.self_attn(
+        attention_output = self.self_attn(
             hidden_states=hidden_states,
-            target_hidden=target_hidden,
-            attention_mask=attention_mask,
+            context=self._attention_context(
+                hidden_states,
+                target_hidden,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                cache_position,
+                position_embeddings,
+            ),
             position_ids=position_ids,
-            past_key_values=past_key_value,
+            state=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
+            **({"output_auxiliary_losses": True} if return_auxiliary else {}),
             **kwargs,
-        )[0]
+        )
+        hidden_states = attention_output.hidden_states
         hidden_states = self.attention_conv.finish(
             hidden_states,
             attention_kernel,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = self.attention_residual.write(hidden_states, residual)
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.ffn_residual.read(
+            hidden_states, self.post_attention_layernorm
+        )
         hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
-        return residual + hidden_states
+        hidden_states = self.ffn_residual.write(hidden_states, residual)
+        if return_auxiliary:
+            loss = sum(
+                (term.value for term in attention_output.auxiliary_losses),
+                attention_output.hidden_states.new_zeros((), dtype=torch.float32),
+            )
+            return hidden_states, loss
+        return hidden_states
 
 
 class CandidateSelector(nn.Module):

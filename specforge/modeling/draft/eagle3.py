@@ -5,21 +5,21 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from specforge.modeling.draft.flex_attention import (
+from specforge.modeling.draft.eagle3_mask import generate_eagle3_mask
+from specforge.modeling.draft.layers.attention.backends.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
-    generate_eagle3_mask,
 )
 from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
+from .layers.factory import build_residual
+from .layers.ffn.dense import GatedMLP as LlamaMLP
 from .registry import register_draft
 
 try:
@@ -1097,7 +1097,9 @@ class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
     def forward(
         ctx, q, cache_k, cache_v, ring_group: dist.ProcessGroup, softmax_scale: float
     ):
-        from specforge.layers.ring.ring_flash_attn import ring_flash_attn_forward
+        from specforge.modeling.draft.layers.ring.ring_flash_attn import (
+            ring_flash_attn_forward,
+        )
 
         bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
             _cached_merge_dims(q, cache_k)
@@ -1135,7 +1137,9 @@ class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        from specforge.layers.ring.ring_flash_attn import ring_flash_attn_backward
+        from specforge.modeling.draft.layers.ring.ring_flash_attn import (
+            ring_flash_attn_backward,
+        )
 
         q, cache_k, cache_v, out, merged_lse = ctx.saved_tensors
         bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
@@ -1427,51 +1431,6 @@ class LlamaUSPFlashAttention(LlamaAttention):
         return attn_output
 
 
-class LlamaMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
-
-            gate_proj = torch.cat(
-                [
-                    F.linear(x, gate_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-            up_proj = torch.cat(
-                [
-                    F.linear(x, up_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-        return down_proj
-
-
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -1512,11 +1471,13 @@ class LlamaDecoderLayer(nn.Module):
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # if self.index!=0:
 
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+        self.attention_residual = build_residual()
+        self.ffn_residual = build_residual()
 
     def forward(
         self,
@@ -1545,9 +1506,9 @@ class LlamaDecoderLayer(nn.Module):
             past_key_values (`Cache`, *optional*): cached past key and value projection states
         """
 
-        residual = hidden_states
-
-        hidden_states = self.hidden_norm(hidden_states)
+        hidden_states, residual = self.attention_residual.read(
+            hidden_states, self.hidden_norm
+        )
         input_emb = self.input_layernorm(input_emb)
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
@@ -1561,13 +1522,14 @@ class LlamaDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = self.attention_residual.write(hidden_states, residual)
 
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.ffn_residual.read(
+            hidden_states, self.post_attention_layernorm
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = self.ffn_residual.write(hidden_states, residual)
 
         # outputs = (hidden_states, return_hidden)
         return hidden_states

@@ -18,6 +18,7 @@ from specforge.modeling.draft.dflash2 import (
     DFlashGroupedConv,
     Qwen3DFlash2DecoderLayer,
 )
+from specforge.modeling.draft.layers.attention.base import AttentionOutput
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import DFlashTrainStrategy, StepContext
 
@@ -74,13 +75,14 @@ class DFlash2ArchitectureTest(unittest.TestCase):
             parameter_contract(Qwen3DFlash2DecoderLayer.forward),
             parameter_contract(Qwen3DFlashDecoderLayer.forward),
         )
-        self.assertIs(
-            get_type_hints(Qwen3DFlash2DecoderLayer.forward)["return"],
-            torch.Tensor,
+        from specforge.modeling.draft.layers.residual.base import ResidualStream
+
+        expected = ResidualStream | tuple[ResidualStream, torch.Tensor]
+        self.assertEqual(
+            get_type_hints(Qwen3DFlash2DecoderLayer.forward)["return"], expected
         )
-        self.assertIs(
-            get_type_hints(Qwen3DFlashDecoderLayer.forward)["return"],
-            torch.Tensor,
+        self.assertEqual(
+            get_type_hints(Qwen3DFlashDecoderLayer.forward)["return"], expected
         )
 
     def test_decoder_forward_accepts_positionals_and_maps_cache_name(self):
@@ -98,7 +100,7 @@ class DFlash2ArchitectureTest(unittest.TestCase):
 
             def forward(self, **kwargs):
                 self.received = kwargs
-                return kwargs["hidden_states"], None
+                return AttentionOutput(kwargs["hidden_states"])
 
         layer = DFlash2DraftModel(_tiny_config()).layers[0]
         attention = CaptureAttention()
@@ -134,14 +136,16 @@ class DFlash2ArchitectureTest(unittest.TestCase):
         )
 
         self.assertEqual(output.shape, hidden_states.shape)
-        self.assertIs(attention.received["target_hidden"], target_hidden)
-        self.assertIs(attention.received["attention_mask"], attention_mask)
+        self.assertIs(attention.received["context"].key_value_prefix, target_hidden)
+        self.assertIs(attention.received["context"].attention_mask, attention_mask)
         self.assertIs(attention.received["position_ids"], position_ids)
-        self.assertIs(attention.received["past_key_values"], cache)
+        self.assertIs(attention.received["state"], cache)
         self.assertTrue(attention.received["output_attentions"])
         self.assertTrue(attention.received["use_cache"])
-        self.assertIs(attention.received["cache_position"], cache_position)
-        self.assertIs(attention.received["position_embeddings"], position_embeddings)
+        self.assertIs(attention.received["context"].cache_position, cache_position)
+        self.assertIs(
+            attention.received["context"].position_embeddings, position_embeddings
+        )
         self.assertFalse(attention.received["is_causal"])
 
     def test_rejects_incomplete_checkpoint_switches(self):
