@@ -148,6 +148,7 @@ assert not torch.cuda.is_initialized()
     def test_target_derived_defaults_match_legacy_trainers(self):
         cases = (
             ("eagle3", "LlamaForCausalLMEagle3", 1, None),
+            ("eagle4", "LlamaForCausalLMEagle4", 1, None),
             ("peagle", "PEagleDraftModel", 4, None),
             ("dflash", "DFlashDraftModel", 1, 16),
         )

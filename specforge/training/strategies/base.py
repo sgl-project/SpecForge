@@ -229,25 +229,46 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
                 getattr(getattr(self.target_head, "config", None), "vocab_size", 0)
             )
         )
+        t2d = getattr(draft_model, "t2d", None)
+        d2t = getattr(draft_model, "d2t", None)
+        if t2d is None or d2t is None:
+            vocab = int(draft_model.vocab_size)
+            t2d = torch.ones(vocab, dtype=torch.bool)
+            d2t = torch.zeros(vocab, dtype=torch.int64)
         draft_vocab_size = int(
             getattr(
                 getattr(draft_model, "config", None),
                 "draft_vocab_size",
-                int(draft_model.t2d.sum().item()),
+                int(t2d.sum().item()),
             )
         )
         validate_compact_teacher_enabled(
             is_online=False,
             draft_vocab_size=draft_vocab_size,
             vocab_size=vocab_size,
-            t2d=draft_model.t2d,
+            t2d=t2d,
             target_head_weight=target_head_weight,
             chunk_size=self.compact_teacher_chunk_size,
         )
-        validate_vocab_mapping_consistency(draft_model.t2d, draft_model.d2t)
+        validate_vocab_mapping_consistency(t2d, d2t)
 
     def trainable_module(self) -> nn.Module:
         return self.eagle3_model
+
+    def _live_eagle3_model(self) -> nn.Module:
+        model = self.eagle3_model
+        if not hasattr(model, "draft_model") and hasattr(model, "module"):
+            model = model.module
+        return model
+
+    def after_optimizer_step(self) -> None:
+        draft = getattr(self._live_eagle3_model(), "draft_model", None)
+        updater = getattr(draft, "update_moe_router_bias", None)
+        if updater is None:
+            return
+        imbalance = updater()
+        if imbalance is not None:
+            self._moe_load_imbalance = imbalance
 
     def _device(self) -> torch.device:
         return next(self.eagle3_model.parameters()).device
@@ -330,17 +351,27 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         )
         weights = [self.ploss_decay**i for i in range(len(plosses))]
         loss = sum(weights[i] * plosses[i] for i in range(len(plosses)))
+        metrics = {
+            "plosses": [p.detach() for p in plosses],
+            "acces": [a.detach() for a in acces],
+            "acceptance_rates": [a.detach() for a in acceptance_rates],
+            "acc_corrects": [c.detach() for c in acc_corrects],
+            "acc_denoms": [d.detach() for d in acc_denoms],
+            "metric_losses": [m.detach() for m in metric_losses],
+            "metric_loss_denoms": [d.detach() for d in metric_loss_denoms],
+        }
+        live = self._live_eagle3_model()
+        recall = getattr(live, "last_candidate_recall", None)
+        if recall is not None:
+            metrics["candidate_recall"] = (
+                recall.detach() if isinstance(recall, torch.Tensor) else recall
+            )
+        imbalance = getattr(self, "_moe_load_imbalance", None)
+        if imbalance is not None:
+            metrics["moe_load_imbalance"] = imbalance
         return StepOutput(
             loss=loss,
-            metrics={
-                "plosses": [p.detach() for p in plosses],
-                "acces": [a.detach() for a in acces],
-                "acceptance_rates": [a.detach() for a in acceptance_rates],
-                "acc_corrects": [c.detach() for c in acc_corrects],
-                "acc_denoms": [d.detach() for d in acc_denoms],
-                "metric_losses": [m.detach() for m in metric_losses],
-                "metric_loss_denoms": [d.detach() for d in metric_loss_denoms],
-            },
+            metrics=metrics,
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

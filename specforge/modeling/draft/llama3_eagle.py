@@ -11,6 +11,11 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from specforge.modeling.draft.eagle4_moe import Eagle4MoE
+from specforge.modeling.draft.eagle4_structure import (
+    draft_sliding_window,
+    draft_uses_rope,
+)
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
@@ -234,6 +239,15 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
+
+
+class NoRotaryEmbedding(LlamaRotaryEmbedding):
+    """NoPE as an identity rotation (cos=1, sin=0)."""
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        super()._set_cos_sin_cache(seq_len, device, dtype)
+        self.cos_cached.fill_(1)
+        self.sin_cached.zero_()
 
 
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
@@ -476,14 +490,21 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
+        in_size = self.hidden_size * (1 if getattr(config, "attn_norm", False) else 2)
         self.q_proj = nn.Linear(
-            self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
+            in_size,
+            self.num_heads * self.head_dim,
+            bias=False,
         )
         self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            in_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
         )
         self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            in_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
         )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
@@ -493,6 +514,13 @@ class LlamaAttention(nn.Module):
     def _init_rope(self):
         rope_theta, rope_scaling = get_rope_config(self.config)
         self.rope_scaling = rope_scaling
+        if not draft_uses_rope(self.config):
+            self.rotary_emb = NoRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=rope_theta,
+            )
+            return
 
         if rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
@@ -799,6 +827,7 @@ class LlamaFlexAttention(LlamaAttention):
                 Q_LEN=q_len,
                 KV_LEN=key_cache.shape[-2],
                 lck=lck,
+                sliding_window=draft_sliding_window(self.config),
             ),
             B=bsz,
             H=1,  # Rely on broadcast
@@ -1494,6 +1523,12 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config, attention_backend: str = "sdpa"):
         super().__init__()
         self.hidden_size = config.hidden_size
+        window = draft_sliding_window(config)
+        if window is not None and attention_backend in ("fa", "usp"):
+            raise ValueError(
+                "sliding_window attention is implemented for sdpa and "
+                f"flex_attention; got attention_backend={attention_backend!r}"
+            )
 
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
@@ -1508,15 +1543,44 @@ class LlamaDecoderLayer(nn.Module):
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
         self.attention_backend = attention_backend
-        self.mlp = LlamaMLP(config)
-        # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
+        self.attn_norm = bool(getattr(config, "attn_norm", False))
+        if self.attn_norm:
+            self.eh_proj = nn.Linear(
+                config.hidden_size * 2, config.hidden_size, bias=False
+            )
+            self.pre_attention_layernorm = LlamaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+        else:
+            self.eh_proj = None
+            self.pre_attention_layernorm = None
+        if getattr(config, "enable_moe", False):
+            if not getattr(config, "n_routed_experts", None):
+                raise ValueError("enable_moe requires n_routed_experts")
+            self.mlp = Eagle4MoE(config)
+        else:
+            self.mlp = LlamaMLP(config)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # if self.index!=0:
-
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        if getattr(config, "enable_post_mlp_norm", False):
+            self.post_mlp_layernorm = LlamaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+        else:
+            self.post_mlp_layernorm = None
+
+    def fuse_layer_input(
+        self, input_emb: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        hidden_states = self.hidden_norm(hidden_states)
+        input_emb = self.input_layernorm(input_emb)
+        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+        if self.attn_norm:
+            hidden_states = self.pre_attention_layernorm(self.eh_proj(hidden_states))
+        return hidden_states
 
     def forward(
         self,
@@ -1546,12 +1610,9 @@ class LlamaDecoderLayer(nn.Module):
         """
 
         residual = hidden_states
-
-        hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
-
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
-        # Self Attention
+        hidden_states = self.fuse_layer_input(input_emb, hidden_states)
+        if self.attn_norm:
+            residual = hidden_states
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
             hidden_states=hidden_states,
@@ -1563,13 +1624,10 @@ class LlamaDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
-        # outputs = (hidden_states, return_hidden)
         return hidden_states
 
 

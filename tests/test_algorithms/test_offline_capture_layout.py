@@ -23,6 +23,12 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                 "aux_hidden_state": "aux_hidden_states",
                 "hidden_state": "last_hidden_states",
             },
+            "eagle4": {
+                "input_ids": "input_ids",
+                "loss_mask": "loss_mask",
+                "aux_hidden_state": "aux_hidden_states",
+                "hidden_state": "last_hidden_states",
+            },
             "dflash": {
                 "input_ids": "input_ids",
                 "loss_mask": "loss_mask",
@@ -42,6 +48,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
         }
         expected_capture_methods = {
             "eagle3": "eagle3",
+            "eagle4": "eagle3",
             "dflash": "dflash",
             "domino": "dflash",
             "dspark": "dspark",
