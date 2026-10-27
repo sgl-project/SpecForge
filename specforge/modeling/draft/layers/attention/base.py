@@ -23,10 +23,14 @@ State = TypeVar("State")
 class AttentionContext:
     """Inputs and visibility supplied by the algorithm.
 
-    New keys are ordered [key_value_prefix, hidden_states]. RoPE embeddings
+    For dense attention, new keys are ordered [key_value_prefix, hidden_states]. RoPE embeddings
     describe those new keys; queries use the trailing hidden_states positions.
     Omitting the prefix gives ordinary self attention. Cached positions are
     already rotated and are not included in position_embeddings.
+
+    Sparse implementations own their KV representation and map these logical
+    input positions/masks to each source. This context does not require a dense
+    KV cache, nor does it describe physical slots or compressed indexer keys.
     """
 
     position_embeddings: tuple[torch.Tensor, torch.Tensor]
@@ -44,10 +48,27 @@ class AttentionContext:
 
 
 @dataclass(frozen=True)
+class AttentionAuxiliaryLoss:
+    """An unweighted scalar objective, with its autograd graph retained.
+
+    The algorithm owns weighting/aggregation; the controller owns backward.
+    Return these only when requested by the algorithm's training integration.
+    """
+
+    name: str
+    value: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if not self.name or self.value.ndim != 0:
+            raise ValueError("An auxiliary loss needs a name and a scalar tensor")
+
+
+@dataclass(frozen=True)
 class AttentionOutput(Generic[State]):
     hidden_states: torch.Tensor
     state: State | None = None
     attention_weights: torch.Tensor | None = None
+    auxiliary_losses: tuple[AttentionAuxiliaryLoss, ...] = ()
 
 
 class Attention(nn.Module, ABC, Generic[State]):
