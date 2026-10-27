@@ -23,7 +23,6 @@ class AttentionConfig:
     supply token positions when sequence storage differs from logical order.
     """
 
-    # QSA/DSA reserve structure names; their execution is not implemented yet.
     # SWA is a visibility rule, orthogonal to the projection/selection structure.
     kind: Literal["gqa", "mha", "mla", "qsa", "dsa"] = "gqa"
     is_causal: bool = False

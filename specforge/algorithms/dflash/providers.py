@@ -68,11 +68,13 @@ def resume_contract(_config, draft_model, training_model):
     from specforge.modeling.draft.dflash import (
         dflash_attention_resume_contract,
         dflash_residual_resume_contract,
+        dflash_sparse_resume_contract,
     )
 
     contract = {
         **dflash_attention_resume_contract(draft_model),
         **dflash_residual_resume_contract(draft_model),
+        **dflash_sparse_resume_contract(draft_model),
         "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dflash_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids

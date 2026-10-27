@@ -6,7 +6,6 @@ from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3.modeling_qwen3 import (
     FlashAttentionKwargs,
     Qwen3Config,
@@ -91,6 +90,35 @@ def dflash_residual_resume_contract(draft_model) -> dict:
     return {"draft_residual_semantics": (1, *settings)}
 
 
+def dflash_sparse_resume_contract(draft_model) -> dict:
+    mode = getattr(draft_model, "attention_mode", None)
+    if mode not in ("dsa", "qsa"):
+        return {}
+    from .layers.attention.indexed import SparseTrainingConfig
+
+    options = SparseTrainingConfig.from_model_config(draft_model.config)
+    names = (
+        ("index_n_heads", "index_head_dim", "index_topk")
+        if mode == "dsa"
+        else (
+            "indexer_n_heads",
+            "indexer_kv_heads",
+            "indexer_head_dim",
+            "indexer_budget",
+            "indexer_compress_ratio",
+        )
+    )
+    return {
+        "draft_sparse_attention_semantics": (
+            1,
+            mode,
+            options.indexer_mode,
+            options.loss_weight,
+            *(getattr(draft_model.config, name) for name in names),
+        )
+    }
+
+
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)
@@ -144,10 +172,10 @@ def resolve_dflash_attention_mode(config: Qwen3Config) -> str:
 
     dflash_config = getattr(config, "dflash_config", None) or {}
     attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
-    if attention_mode not in ("gqa", "mha", "mla"):
+    if attention_mode not in ("gqa", "mha", "mla", "dsa", "qsa"):
         raise ValueError(
             "DFlash dflash_config.attention_mode must be one of "
-            f"gqa, mha, mla, got {attention_mode!r}"
+            f"gqa, mha, mla, dsa, qsa, got {attention_mode!r}"
         )
     return attention_mode
 
@@ -164,7 +192,7 @@ def validate_dflash_attention_config(config: Qwen3Config) -> str:
             f"num_attention_heads, got {config.num_key_value_heads} and "
             f"{config.num_attention_heads}"
         )
-    if attention_mode == "mla":
+    if attention_mode in ("mla", "dsa"):
         validate_dflash_mla_config(config)
     return attention_mode
 
@@ -172,7 +200,7 @@ def validate_dflash_attention_config(config: Qwen3Config) -> str:
 def _rope_config(config: Qwen3Config, attention_mode: str) -> Qwen3Config:
     """Rotary config for the mode: MLA rotates only the partial-RoPE slice."""
 
-    if attention_mode != "mla":
+    if attention_mode not in ("mla", "dsa"):
         return config
     rope_config = copy.deepcopy(config)
     rope_config.head_dim = config.qk_rope_head_dim
@@ -263,7 +291,7 @@ class Qwen3DFlashDecoderLayer(DecoderLayer):
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> ResidualStream:
+    ) -> ResidualStream | tuple[ResidualStream, torch.Tensor]:
         context = self._attention_context(
             hidden_states,
             target_hidden,
@@ -273,19 +301,24 @@ class Qwen3DFlashDecoderLayer(DecoderLayer):
             cache_position,
             position_embeddings,
         )
-        return (
-            super()
-            .forward(
-                hidden_states,
-                context,
-                past_key_value,
-                position_ids=position_ids,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                **kwargs,
-            )
-            .hidden_states
+        return_auxiliary = kwargs.pop("return_auxiliary_losses", False)
+        output = super().forward(
+            hidden_states,
+            context,
+            past_key_value,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            **({"output_auxiliary_losses": True} if return_auxiliary else {}),
+            **kwargs,
         )
+        if return_auxiliary:
+            loss = sum(
+                (term.value for term in output.attention.auxiliary_losses),
+                output.attention.hidden_states.new_zeros((), dtype=torch.float32),
+            )
+            return output.hidden_states, loss
+        return output.hidden_states
 
     def _attention_context(
         self,
@@ -465,13 +498,39 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+        self._configure_sparse_training()
+
+    def _configure_sparse_training(self):
+        if self.attention_mode in ("dsa", "qsa"):
+            from .layers.attention.indexed import SparseTrainingConfig
+
+            sparse_options = SparseTrainingConfig.from_model_config(self.config)
+            if sparse_options.indexer_mode == "warmup":
+                self.requires_grad_(False)
+                for layer in self.layers:
+                    layer.self_attn.indexer.requires_grad_(True)
+            elif sparse_options.indexer_mode == "frozen":
+                for layer in self.layers:
+                    layer.self_attn.indexer.requires_grad_(False)
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        # HF may replace Parameter objects while loading, so reapply the
+        # explicit training mode after all weights have been materialized.
+        model = super().from_pretrained(*args, **kwargs)
+        loaded = model[0] if isinstance(model, tuple) else model
+        loaded._configure_sparse_training()
+        return model
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        if self.residual_options.kind != "standard":
+        if self.residual_options.kind != "standard" or self.attention_mode in (
+            "dsa",
+            "qsa",
+        ):
             options = dict(gradient_checkpointing_kwargs or {})
             if options.get("use_reentrant", False):
                 raise ValueError(
-                    "Hyper-connection states require use_reentrant=False for gradient checkpointing"
+                    "Hyper-connection states and sparse auxiliary losses require use_reentrant=False for gradient checkpointing"
                 )
             options["use_reentrant"] = False
             gradient_checkpointing_kwargs = options
@@ -612,8 +671,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        return_auxiliary_losses: bool = False,
         **kwargs,
-    ) -> CausalLMOutputWithPast:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -630,6 +690,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 self.residual_options.num_streams,
                 single_pass=self.residual_options.kind == "mhc",
             )
+        auxiliary_loss = noise_embedding.new_zeros((), dtype=torch.float32)
         for layer_type, layer in zip(self.layer_types, self.layers):
             layer_attention_mask = (
                 attention_mask[layer_type]
@@ -644,13 +705,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                **(
+                    {"return_auxiliary_losses": True} if return_auxiliary_losses else {}
+                ),
                 **kwargs,
             )
+            if return_auxiliary_losses:
+                hidden_states, layer_loss = hidden_states
+                auxiliary_loss = auxiliary_loss + layer_loss
         if self.residual_options.kind == "mhc":
             hidden_states = collapse_streams(hidden_states)
         elif self.residual_options.kind == "gr":
             hidden_states = self.residual_readout(hidden_states)
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if return_auxiliary_losses:
+            return hidden_states, auxiliary_loss / len(self.layers)
+        return hidden_states
 
     @torch.inference_mode()
     def spec_generate(
