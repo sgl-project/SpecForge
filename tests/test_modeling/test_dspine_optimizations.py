@@ -215,6 +215,12 @@ class DSpineOptimizationsTest(unittest.TestCase):
                         **inputs, global_step=step, total_steps=600, ce_only=True
                     )
                 torch.testing.assert_close(actual_accuracy, accuracy)
+                torch.testing.assert_close(
+                    actual["ratio_metrics"]["acc"], metrics["ratio_metrics"]["acc"]
+                )
+                correct, count = actual["ratio_metrics"]["acc"]
+                torch.testing.assert_close(count, actual["accuracy_denom"])
+                torch.testing.assert_close(correct / count.clamp_min(1), accuracy)
                 for got, want in zip(
                     actual["ratio_metrics"]["dspine/backbone_ce"],
                     metrics["ratio_metrics"]["dspine/backbone_ce"],

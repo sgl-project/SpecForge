@@ -180,7 +180,10 @@ class OnlineDSpineModel(OnlineDFlashModel):
                 ce / denominator.clamp_min(1),
                 correct / count.clamp_min(1),
                 dict(
-                    ratio_metrics={"dspine/backbone_ce": (ce, denominator)},
+                    ratio_metrics={
+                        "acc": (correct, count),
+                        "dspine/backbone_ce": (ce, denominator),
+                    },
                     accuracy_denom=count,
                     loss_terms=(ce, denominator),
                 ),
@@ -229,6 +232,7 @@ class OnlineDSpineModel(OnlineDFlashModel):
         )
         count = supervised.sum().float()
         ratios = {
+            "acc": (correct, count),
             "dspine/backbone_ce": (ce.detach(), denominator),
             "dspine/backbone_l1": (l1.detach(), denominator),
             "dspine/refinement_loss": (refinement.detach(), denominator),

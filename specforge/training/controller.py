@@ -22,6 +22,7 @@ import os
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -429,15 +430,27 @@ class TrainerCore:
     ) -> StepResult:
         ctx = replace(ctx or StepContext(), accumulation_steps=self.accumulation_steps)
         is_boundary = (self._micro + 1) % self.accumulation_steps == 0
-        with self.backend.accumulation_context(is_boundary=is_boundary):
+        with ExitStack() as accumulation:
+            accumulation.enter_context(
+                self.backend.accumulation_context(is_boundary=is_boundary)
+            )
             out: StepOutput = self.strategy.forward_loss(batch, ctx)
-            if out.replay_loss is None:
-                if self._prepared_steps:
-                    raise ValueError(
-                        "Cannot mix immediate and replayed losses in one window"
-                    )
-                return self._backward_step(out)
+            self._validate_window_mode(out)
+            if out.replay_loss is not None:
+                # Replay owns fresh accumulation contexts for its backward passes.
+                accumulation.close()
+                return self._prepare_and_replay(out)
+            return self._backward_step(out)
 
+    def _validate_window_mode(self, out: StepOutput) -> None:
+        wants_replay = out.replay_loss is not None
+        if (self._prepared_steps and not wants_replay) or (
+            self._micro % self.accumulation_steps and wants_replay
+        ):
+            raise ValueError("Cannot mix immediate and replayed losses in one window")
+
+    def _prepare_and_replay(self, out: StepOutput) -> StepResult:
+        """Collect a complete prepass window, then replay through controller backward."""
         self._prepared_steps.append(out)
         self._accumulate_ratio_metrics(out.ratio_metrics)
         if len(self._prepared_steps) < self.accumulation_steps:
