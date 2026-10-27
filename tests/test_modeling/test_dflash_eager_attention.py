@@ -9,6 +9,7 @@ from transformers import Qwen3Config
 from specforge.modeling.draft.dflash import Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DFlashKernels
 from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
+from specforge.modeling.draft.layers.attention.base import AttentionContext
 
 
 def _make_attention(layer_type, implementation, sliding_window, is_causal=None):
@@ -43,23 +44,28 @@ def _forward(attention, hidden_states, target_hidden, attention_mask, **kwargs):
         hidden_states.new_ones(1, total_length, attention.head_dim),
         hidden_states.new_zeros(1, total_length, attention.head_dim),
     )
-    return attention(
+    result = attention(
+        output_attentions=True,
         hidden_states=hidden_states,
-        target_hidden=target_hidden,
-        position_embeddings=position_embeddings,
-        attention_mask=attention_mask,
+        context=AttentionContext(
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            key_value_prefix=target_hidden,
+        ),
         **kwargs,
     )
 
+    return result.hidden_states, result.attention_weights
+
 
 class TestDFlashEagerAttentionMasking(unittest.TestCase):
-    def test_supplied_mask_overrides_configured_causality(self):
+    def test_supplied_mask_intersects_configured_causality(self):
         for implementation in ("eager", "sdpa"):
             attention = _make_attention("full_attention", implementation, None, True)
             hidden, context = torch.randn(1, 3, 8), torch.randn(1, 2, 8)
             mask = torch.ones(1, 1, 3, 5, dtype=torch.bool)
             actual, _ = _forward(attention, hidden, context, mask)
-            expected, _ = _forward(attention, hidden, context, None, is_causal=False)
+            expected, _ = _forward(attention, hidden, context, None)
             assert_close(actual, expected)
 
     def test_flash_attention_receives_native_causality_and_window(self):
@@ -74,7 +80,7 @@ class TestDFlashEagerAttentionMasking(unittest.TestCase):
                 hidden, context = torch.randn(1, 3, 8), torch.randn(1, 2, 8)
                 backend = mock.Mock(return_value=(torch.zeros(1, 3, 2, 4), None))
                 with mock.patch(
-                    "specforge.modeling.draft.dflash.ALL_ATTENTION_FUNCTIONS",
+                    "specforge.modeling.draft.layers.attention.backends.dense.ALL_ATTENTION_FUNCTIONS",
                     {"flash_attention_2": backend},
                 ):
                     _forward(attention, hidden, context, None)
@@ -84,9 +90,11 @@ class TestDFlashEagerAttentionMasking(unittest.TestCase):
                     window is not None if causal is None else causal,
                 )
                 self.assertEqual(backend.call_args.kwargs["sliding_window"], window)
-                self.assertNotIn("is_causal", backend.call_args.kwargs)
+                self.assertEqual(
+                    backend.call_args.kwargs["is_causal"], attention.is_causal
+                )
                 with mock.patch(
-                    "specforge.modeling.draft.dflash.ALL_ATTENTION_FUNCTIONS",
+                    "specforge.modeling.draft.layers.attention.backends.dense.ALL_ATTENTION_FUNCTIONS",
                     {"flash_attention_2": backend},
                 ):
                     _forward(attention, hidden, context, None, is_causal=True)
