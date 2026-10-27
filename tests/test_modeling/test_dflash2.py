@@ -77,13 +77,12 @@ class DFlash2ArchitectureTest(unittest.TestCase):
         )
         from specforge.modeling.draft.layers.residual.base import ResidualStream
 
+        expected = ResidualStream | tuple[ResidualStream, torch.Tensor]
         self.assertEqual(
-            get_type_hints(Qwen3DFlash2DecoderLayer.forward)["return"],
-            ResidualStream,
+            get_type_hints(Qwen3DFlash2DecoderLayer.forward)["return"], expected
         )
         self.assertEqual(
-            get_type_hints(Qwen3DFlashDecoderLayer.forward)["return"],
-            ResidualStream,
+            get_type_hints(Qwen3DFlashDecoderLayer.forward)["return"], expected
         )
 
     def test_decoder_forward_accepts_positionals_and_maps_cache_name(self):

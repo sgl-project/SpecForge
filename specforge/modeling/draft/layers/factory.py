@@ -15,10 +15,14 @@ def build_attention(
     kernels: LayerKernels,
     options: AttentionConfig,
 ) -> Attention:
-    if options.kind in ("qsa", "dsa"):
-        raise NotImplementedError(
-            f"{options.kind.upper()} has sparse interfaces but no implementation yet"
-        )
+    if options.kind == "qsa":
+        from .attention.qsa import QSAAttention
+
+        return QSAAttention(config, layer_idx, kernels, options)
+    if options.kind == "dsa":
+        from .attention.dsa import DSAAttention
+
+        return DSAAttention(config, layer_idx, kernels, options)
     if options.kind == "mla":
         from .attention.mla import MLAAttention
 

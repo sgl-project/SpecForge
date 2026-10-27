@@ -95,7 +95,7 @@ class ComponentFactoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported attention kind"):
             AttentionConfig("unknown")
         for kind in ("qsa", "dsa"):
-            with self.assertRaisesRegex(NotImplementedError, "no implementation yet"):
+            with self.assertRaisesRegex(ValueError, "sparse_attention.backend"):
                 build_attention(
                     config(), 0, DEFAULT_DFLASH_KERNELS, AttentionConfig(kind)
                 )

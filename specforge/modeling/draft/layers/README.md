@@ -140,9 +140,12 @@ that understands their config and parameter layout.
 
 ## Extension boundary
 
-QSA/DSA names are reserved in `AttentionConfig`, but `build_attention` raises
-`NotImplementedError` for them. Algorithm configs still accept only executable
-structures. No QSA/DSA indexer, kernel or MoE implementation is provided yet.
+`qsa.py` and `dsa.py` implement opt-in stateless training attention. DSA follows
+the DeepSeek-V3.2 lightning indexer over expanded MLA. QSA follows Qwen's
+compressed indexer over GQA. Both use floating point scoring, without inference
+FP8/FP4 quantization. They do not implement DeepSeek-V4.1 compressed latent
+attention, cross-layer IndexShare, paged caches or official checkpoint conversion.
+MoE is still outside this change.
 
 SWA is independent of the projection structure: current GQA/expanded MLA use
 `AttentionConfig(sliding_window=N, is_causal=True)` for a causal window of N
@@ -170,17 +173,108 @@ KV and compressed KV) remain distinct entries in one attention normalization.
 Each adapter defines its typed input payload, source mappings and supported
 combinations. QSA retrieval blocks must first map to attention KV; compressed
 indexer keys are not implicitly attention values. These are interface contracts,
-not currently executable hybrid attention paths.
+executable in the explicit reference backend. The gathered backend currently
+accepts one source and indexed token/block selections; global SWA restrictions
+are applied before selection. It rejects unsupported multi-source/window-branch
+plans rather than silently executing reference attention.
 
 A sparse implementation should implement `Attention` and reuse projections as
 appropriate; it must not inherit `DenseAttention.forward`. Its state can differ
 from the dense cache. `AttentionOutput.auxiliary_losses` carries named,
 unweighted scalar tensors without detaching them. `DecoderOutput.attention`
-retains them. Existing algorithm forwards return tensors and do not consume
-these objectives yet; enabling a trainable indexer requires explicitly wiring
-this output through the algorithm and choosing loss weights/reduction there.
+retains them. DFlash-family models expose `(hidden_states, auxiliary_loss)` when called with
+`return_auxiliary_losses=True`. Their online training wrappers consume this loss;
+ordinary dense model forwards keep returning tensors. A trainable indexer rejects
+calls that would silently discard its auxiliary loss.
 The attention/decoder never performs backward or optimizer stepping. Specialized
 outputs can subclass `AttentionOutput` to expose additional typed indexer data
 when needed. Router objectives likewise need training integration with MoE.
 Ring execution is kept
 in the existing EAGLE path; no new Ring/MLA combination is claimed.
+
+
+## Training QSA and DSA
+
+Set `dflash_config.attention_mode` to `dsa` or `qsa`. These structures work with
+DFlash, DFlash2, Domino and DSpark, including their target-context prefix and
+algorithm masks. EAGLE3's specialized input path has not been adapted.
+
+Choose the backend explicitly in the draft Hugging Face config:
+
+```json
+"sparse_attention": {
+  "backend": "gathered",
+  "indexer_mode": "joint",
+  "loss_weight": 1.0,
+  "query_chunk_size": 32
+}
+```
+
+DSA additionally needs the existing MLA dimensions and positive `q_lora_rank`,
+plus `index_n_heads`, `index_head_dim` (at least `qk_rope_head_dim`) and
+`index_topk`. The indexer uses LayerNorm on keys, weighted ReLU scores and
+non-interleaved indexer RoPE independently of the MLA RoPE convention.
+
+QSA needs `indexer_n_heads`, `indexer_kv_heads=1`, `indexer_head_dim` (covering
+RoPE), `indexer_compress_ratio>=2` and `indexer_budget` divisible by that ratio.
+The budget counts tokens; the indexer chooses budget/ratio complete blocks.
+Raw index keys are mean-pooled in FP32, Gemma-normalized, and rotated at the
+first position of each block. Attention still reads original GQA K/V.
+For contiguous causal inputs, visible unfinished-block tokens are included
+outside the budget. With packed/non-contiguous masks, visible fragments that
+cannot be safely pooled are included directly, so the actual token count can
+exceed budget + ratio - 1. This prevents retrieval from exposing masked content.
+
+Indexer modes:
+
+- `frozen`: do not train the indexer; use a previously trained indexer checkpoint.
+- `warmup`: dense attention while training only the indexer. Model construction
+  freezes the rest of the draft, and loading reapplies that policy. The online
+  objective uses only weighted indexer KL. Switch to joint training by constructing
+  a new model with the new config and loading weights, rather than mutating mode
+  on a live optimizer. Resume contracts reject accidental mode changes.
+- `joint`: train the main model using its existing objective and the indexer
+  using KL. Indexer inputs and teacher distributions are detached. DSA uses the
+  selected support in joint mode and all visible keys during warmup, following
+  [the V3.2 report, section 2.1](https://arxiv.org/html/2512.02556v1).
+  QSA uses teacher attention mass aggregated per complete visible block; this is
+  a SpecForge distillation objective, not a published Qwen training recipe.
+
+Auxiliary KL averages valid queries per layer and then layers. Padded proposal
+blocks are excluded. `loss_weight` is applied by the online algorithm wrapper.
+DFlash/Domino incorporate it into their existing numerator/denominator contract;
+DSpark adds it to its existing directly normalized loss. Backward, accumulation
+and optimizer stepping remain owned by the controller. Gradient checkpointing
+uses the non-reentrant path and preserves auxiliary gradients.
+
+`reference` explicitly materializes dense scores and is for small numerical
+checks. `gathered` reads selected KV in query chunks with PyTorch autograd. It
+avoids a full attention score matrix in the value computation, but is not a
+fused sparse kernel: indexer scores/visibility still grow with sequence length,
+and teacher distributions are computed in chunks. Shape validation, selection
+compaction and dynamic tail sizes can synchronize the device. Neither backend
+is advertised as production long-context performance or CUDA-graph compatible.
+Dropout, per-head visibility differences and cache mutation are rejected.
+
+QSA score/compression references: [SGLang explanation](https://www.lmsys.org/blog/2026-08-26-qwen-flash-next/)
+and the previously pinned SGLang revision
+`635430d07378e2b12381353781a23b0704969909`. The existing GQA projection/normalization
+is reused; this is not a full Qwen model or output-gating conversion.
+
+
+### Validation snapshot
+
+On NVIDIA H20 / PyTorch 2.13.0+cu130, a small BF16 component probe included
+projection, indexing, KL and backward (B=1, Q=128, S=1024, hidden=128, budget=32).
+Five measured iterations after three warm-ups gave:
+
+| Structure | Backend | Forward + backward | Extra peak allocation |
+| --- | --- | --- | --- |
+| DSA | reference | 7.68 ms | 20.24 MiB |
+| DSA | gathered | 10.90 ms | 15.29 MiB |
+| QSA | reference | 7.82 ms | 16.94 MiB |
+| QSA | gathered | 11.72 ms | 12.51 MiB |
+
+This is a component smoke benchmark, not model throughput or long-context
+scaling evidence. Gathered execution saved memory in this case but was slower;
+fused kernel work and representative workload measurements are still needed.
