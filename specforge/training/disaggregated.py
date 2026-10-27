@@ -24,6 +24,8 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.config.schema import resolve_ref_watermarks
+from specforge.runtime.contracts import consumer_dispatch_quantum
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
 _ONLINE_SCHEDULE_SUFFIX = ".schedule.json"
@@ -256,23 +258,14 @@ def _online_prompt_seed(cfg: Config) -> int:
 def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
     """Resolve and validate producer ref watermarks before prompt preparation.
 
-    The consumer dispatches one complete global optimizer window at a time.
+    The consumer needs one or two complete optimizer windows before dispatch.
     Validating this contract only after tokenizing/materializing prompts can
     waste tens of minutes and many GiB for a large online dataset.
     """
     from specforge.runtime.control_plane.flow_control import FlowControlLimits
 
-    high_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
-    high = int(high_override or cfg.runtime.in_flight_high_watermark)
-    low_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
-    # Preserve the legacy one-watermark environment override: when only the
-    # old high value is supplied, resume at that same threshold.
-    low = (
-        int(low_override)
-        if low_override is not None
-        else (
-            None if high_override is not None else cfg.runtime.in_flight_low_watermark
-        )
+    high, low = resolve_ref_watermarks(
+        cfg.runtime.in_flight_high_watermark, cfg.runtime.in_flight_low_watermark
     )
     limits = FlowControlLimits(
         high_watermark_refs=high,
@@ -280,16 +273,17 @@ def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
         max_prompt_lease_per_worker=cfg.runtime.producer_lease,
     )
     trainer = cfg.deployment.trainer
-    consumer_quantum = (
+    consumer_quantum = consumer_dispatch_quantum(
+        cfg.runtime.consumer_dispatch,
         trainer.nnodes
         * trainer.nproc_per_node
         * cfg.training.batch_size
-        * cfg.training.accumulation_steps
+        * cfg.training.accumulation_steps,
     )
     if high < consumer_quantum:
         raise ValueError(
             "producer in-flight high watermark "
-            f"{high} is smaller than the consumer's global optimizer-step "
+            f"{high} is smaller than the consumer's dispatch "
             f"quantum {consumer_quantum}; set "
             "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
         )
@@ -297,7 +291,7 @@ def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
         raise ValueError(
             "producer in-flight low watermark "
             f"{limits.resolved_low_watermark_refs} is smaller than the "
-            f"consumer's global optimizer-step quantum {consumer_quantum}; "
+            f"consumer's dispatch quantum {consumer_quantum}; "
             "set DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
         )
     return high, low
@@ -862,6 +856,8 @@ def _build_online(
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
         async_ack=_consumer_async_ack(cfg),
+        consumer_dispatch=cfg.runtime.consumer_dispatch,
+        dispatch_num_anchors=cfg.training.num_anchors,
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

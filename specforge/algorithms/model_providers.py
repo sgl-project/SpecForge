@@ -467,7 +467,9 @@ def build_dspine_model(
         draft_model,
         tokenizer,
         lambda common: OnlineDSpineModel(
-            **common, fused_logits_loss=cfg.training.fused_logits_loss
+            **common,
+            fused_logits_loss=cfg.training.fused_logits_loss,
+            warmup_ratio=cfg.training.warmup_ratio,
         ),
     )
 

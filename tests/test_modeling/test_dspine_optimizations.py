@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from itertools import product
 from unittest.mock import patch
 
@@ -10,6 +11,113 @@ from specforge.core import fused_loss
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import StepContext
 from tests.test_modeling.test_dspine import training_inputs, training_model
+
+
+class DSpineRefinementLossTest(unittest.TestCase):
+    def setUp(self):
+        self.model = training_model()
+        # Identity projection makes candidate logits exact in both projection paths.
+        with torch.no_grad():
+            self.model.lm_head.weight.zero_()
+            self.model.lm_head.weight[:16].copy_(torch.eye(16))
+
+    def refinement_loss(self, refined, teacher, labels, weights):
+        hidden = torch.zeros_like(refined)
+        hidden[..., :3] = hidden.new_tensor([3, 2, 1])
+        with patch.object(self.model.draft_model, "refine", return_value=refined):
+            terms = self.model._objective_terms(
+                hidden,
+                refined,
+                refined.new_ones(1, 3, 3, 8),
+                labels,
+                torch.zeros_like(labels),
+                teacher,
+                weights,
+                weights > 0,
+            )
+            alpha = self.model.dspine_config.ce_weight
+            return alpha * terms[2] + (1 - alpha) * terms[4]
+
+    def test_identical_candidate_logits_have_zero_l1_and_gradient(self):
+        devices = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
+        for device, dtype in product(devices, (torch.float32, torch.bfloat16)):
+            with self.subTest(device=device, dtype=dtype):
+                self.model.to(device=device, dtype=dtype)
+                self.model.dspine_config = replace(
+                    self.model.dspine_config, ce_weight=0, candidate_mass_threshold=0
+                )
+                torch.manual_seed(42)
+                teacher = torch.randn(1, 3, 16, device=device, dtype=dtype)
+                teacher.requires_grad_()
+                refined = teacher.detach().clone().requires_grad_()
+                loss = self.refinement_loss(
+                    refined,
+                    teacher,
+                    torch.zeros(1, 3, device=device, dtype=torch.long),
+                    torch.ones(1, 3, device=device),
+                )
+                loss.backward()
+                torch.testing.assert_close(loss, torch.zeros_like(loss), atol=0, rtol=0)
+                torch.testing.assert_close(
+                    refined.grad, torch.zeros_like(refined), atol=0, rtol=0
+                )
+                self.assertIsNone(teacher.grad)
+
+    def test_missing_label_ce_and_masked_positions_have_zero_gradient(self):
+        self.model.dspine_config = replace(
+            self.model.dspine_config, ce_weight=1, candidate_mass_threshold=0.9
+        )
+        refined = torch.zeros(1, 3, 16)
+        refined[..., :3] = torch.tensor([1.5, -0.5, 0.75])
+        refined.requires_grad_()
+        loss = self.refinement_loss(
+            refined,
+            torch.zeros_like(refined),
+            torch.tensor([[2, 31, 1]]),
+            torch.tensor([[0.5, 2, 0]]),
+        )
+        expected = -0.5 * refined[0, 0, :3].log_softmax(-1)[2]
+        torch.testing.assert_close(loss, expected)
+        actual_grad = torch.autograd.grad(loss, refined)[0]
+        torch.testing.assert_close(
+            actual_grad, torch.autograd.grad(expected, refined)[0]
+        )
+        torch.testing.assert_close(
+            actual_grad[:, 1:], torch.zeros_like(actual_grad[:, 1:]), atol=0, rtol=0
+        )
+
+    def test_l1_uses_full_vocab_mass_with_strict_threshold_even_without_label(self):
+        # Uniform teacher assigns exactly 3/32 mass to the three candidates.
+        mass = 3 / 32
+        for threshold in (mass - 0.01, mass, mass + 0.01):
+            with self.subTest(threshold=threshold):
+                self.model.dspine_config = replace(
+                    self.model.dspine_config,
+                    ce_weight=0,
+                    candidate_mass_threshold=threshold,
+                )
+                refined = torch.zeros(1, 3, 16)
+                refined[..., :3] = torch.tensor([1.5, -0.5, 0.75])
+                refined.requires_grad_()
+                weights = torch.tensor([[0.5, 2, 0]])
+                loss = self.refinement_loss(
+                    refined,
+                    torch.zeros_like(refined),
+                    torch.full((1, 3), 31, dtype=torch.long),
+                    weights,
+                )
+                expected = (
+                    (refined[..., :3].softmax(-1) - 1 / 3).abs().sum(-1) * weights
+                ).sum() * (mass > threshold)
+                torch.testing.assert_close(loss, expected)
+                actual_grad = torch.autograd.grad(loss, refined)[0]
+                torch.testing.assert_close(
+                    actual_grad, torch.autograd.grad(expected, refined)[0]
+                )
+                if threshold >= mass:
+                    torch.testing.assert_close(
+                        actual_grad, torch.zeros_like(actual_grad), atol=0, rtol=0
+                    )
 
 
 class DSpineOptimizationsTest(unittest.TestCase):
@@ -109,6 +217,12 @@ class DSpineOptimizationsTest(unittest.TestCase):
                         **inputs, global_step=step, total_steps=600, ce_only=True
                     )
                 torch.testing.assert_close(actual_accuracy, accuracy)
+                torch.testing.assert_close(
+                    actual["ratio_metrics"]["acc"], metrics["ratio_metrics"]["acc"]
+                )
+                correct, count = actual["ratio_metrics"]["acc"]
+                torch.testing.assert_close(count, actual["accuracy_denom"])
+                torch.testing.assert_close(correct / count.clamp_min(1), accuracy)
                 for got, want in zip(
                     actual["ratio_metrics"]["dspine/backbone_ce"],
                     metrics["ratio_metrics"]["dspine/backbone_ce"],

@@ -420,12 +420,17 @@ class TestStreamingRefChannel(unittest.TestCase):
         self.assertEqual(producer.in_flight_remote(), 0)
 
     def test_restart_seeds_consumed_counter_before_new_acks(self):
-        first = StreamingRefChannel(self.path)
-        first.mark_consumed(3)
-        restarted = StreamingRefChannel(self.path)
-        self.assertEqual(restarted.seed_consumed(), 3)
-        restarted.mark_consumed(2)
-        self.assertEqual(first.consumed_remote(), 5)
+        for num_bytes in (None, 30):
+            with self.subTest(num_bytes=num_bytes):
+                first = StreamingRefChannel(self.path)
+                first.mark_consumed(3, num_bytes=num_bytes)
+                restarted = StreamingRefChannel(self.path)
+                self.assertEqual(restarted.seed_consumed(), 3)
+                restarted.mark_consumed(2, num_bytes=None if num_bytes is None else 20)
+                self.assertEqual(
+                    first.consumed_state_remote(),
+                    (5, None if num_bytes is None else 50),
+                )
 
     def test_mark_consumed_is_thread_safe_across_ack_and_fail_paths(self):
         # The trainer thread acks batches while the prefetch worker settles

@@ -21,7 +21,8 @@ that control-plane channel.
   ``poll()`` advances its byte offset only after validating complete records.
   Partial trailing records are reread on the next poll.
 * **Consume-once friendly.** The reader marks how many refs it has consumed
-  (``mark_consumed``) in a sidecar counter the writer reads back, so the producer
+  (``mark_consumed``) in a sidecar counter; source distributors also include the
+  released bytes in that atomic record, so the producer
   can apply backpressure (``in_flight_remote``) without any shared in-process
   state -- the same split-process model as the rest of disaggregation.
 * **Explicit outcome.** ``close()`` drops an EOF sentinel only for a successful
@@ -119,6 +120,7 @@ class StreamingRefChannel:
         # consumer-side
         self._read_offset = 0
         self._consumed = 0
+        self._consumed_bytes: Optional[int] = None
         # ``mark_consumed`` is called from both the trainer thread (batch acks)
         # and the prefetch worker (failure settlement), so the increment and
         # the sidecar publish must be one atomic section.
@@ -231,17 +233,17 @@ class StreamingRefChannel:
 
     def publish_consumer_quantum(
         self,
-        refs_per_optimizer_step: int,
+        refs_per_dispatch: int,
         *,
         allow_existing: bool = False,
     ) -> None:
-        """Claim and publish the consumer's global optimizer-step ref quantum.
+        """Claim and publish the refs required for the consumer's next dispatch.
 
         Rank 0 calls this exactly once for a fresh attempt. The producer waits
         for the value before capture so its in-flight watermark cannot deadlock
-        below the number of refs needed for one lockstep optimizer step.
+        below the dispatch requirement (one or two optimizer windows).
         """
-        quantum = int(refs_per_optimizer_step)
+        quantum = int(refs_per_dispatch)
         if quantum < 1:
             raise ValueError(f"consumer quantum must be >= 1, got {quantum}")
         path = self.path + _CONSUMER_QUANTUM_SUFFIX
@@ -273,7 +275,7 @@ class StreamingRefChannel:
             os.unlink(tmp)
 
     def consumer_quantum(self) -> Optional[int]:
-        """Return the consumer's global optimizer-step ref quantum, if ready."""
+        """Return the consumer's minimum dispatch ref count, if ready."""
         path = self.path + _CONSUMER_QUANTUM_SUFFIX
         try:
             with open(path, encoding="utf-8") as stream:
@@ -305,13 +307,20 @@ class StreamingRefChannel:
     def published(self) -> int:
         return self._published
 
+    def consumed_state_remote(self) -> tuple[int, Optional[int]]:
+        """Read one atomic count/byte snapshot; integer-only inbox counters omit bytes."""
+        try:
+            with open(self.path + _CONSUMED_SUFFIX) as stream:
+                value = json.load(stream)
+        except (FileNotFoundError, ValueError):
+            return 0, None
+        if isinstance(value, int):
+            return value, None
+        return int(value["count"]), int(value["bytes"])
+
     def consumed_remote(self) -> int:
         """How many refs the consumer reports having consumed (cross-process)."""
-        try:
-            with open(self.path + _CONSUMED_SUFFIX) as f:
-                return int(f.read() or "0")
-        except (FileNotFoundError, ValueError):
-            return 0
+        return self.consumed_state_remote()[0]
 
     def in_flight_remote(self) -> int:
         """published - consumed: the producer's backpressure signal."""
@@ -386,24 +395,37 @@ class StreamingRefChannel:
             self._read_offset = next_offset
             return out
 
-    def mark_consumed(self, n: int) -> None:
-        """Record n more consumed refs in the sidecar the producer reads back."""
-        with self._consumed_lock:
-            self._consumed += n
-            # Thread-unique tmp name: a concurrent writer must never observe
-            # (or os.replace away) another writer's half-written counter file.
-            tmp = (
-                f"{self.path}{_CONSUMED_SUFFIX}"
-                f".tmp.{os.getpid()}.{threading.get_ident()}"
+    def _store_consumed(self, count: int, num_bytes: Optional[int]) -> None:
+        # Caller holds _consumed_lock. Publish count and bytes together so a
+        # producer cannot observe half an acknowledgement, including on resume.
+        tmp = f"{self.path}{_CONSUMED_SUFFIX}.tmp.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "w") as stream:
+            json.dump(
+                count if num_bytes is None else {"count": count, "bytes": num_bytes},
+                stream,
             )
-            with open(tmp, "w") as f:
-                f.write(str(self._consumed))
-            os.replace(tmp, self.path + _CONSUMED_SUFFIX)  # atomic counter publish
+        os.replace(tmp, self.path + _CONSUMED_SUFFIX)
+        self._consumed, self._consumed_bytes = count, num_bytes
+
+    def mark_consumed(self, n: int, *, num_bytes: Optional[int] = None) -> None:
+        """Record released refs; source distributors also supply their actual bytes."""
+        with self._consumed_lock:
+            if self._consumed_bytes is not None and num_bytes is None:
+                raise ValueError("byte-aware acknowledgements require num_bytes")
+            total_bytes = (
+                None if num_bytes is None else (self._consumed_bytes or 0) + num_bytes
+            )
+            self._store_consumed(self._consumed + n, total_bytes)
+
+    def restore_consumed(self, count: int, num_bytes: int) -> None:
+        """Restore source accounting from the durable ledger and publication stream."""
+        with self._consumed_lock:
+            self._store_consumed(count, num_bytes)
 
     def seed_consumed(self) -> int:
         """Continue an existing consumed counter after a consumer restart."""
         with self._consumed_lock:
-            self._consumed = self.consumed_remote()
+            self._consumed, self._consumed_bytes = self.consumed_state_remote()
             return self._consumed
 
     def stream(
