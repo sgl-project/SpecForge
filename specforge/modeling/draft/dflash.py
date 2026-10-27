@@ -27,6 +27,7 @@ from .dflash_mask import (
 )
 from .flex_attention import compile_friendly_flex_attention
 from .flex_attention_backend import flex_attention_backend
+from .moe import MoELayer, build_ffn
 from .registry import register_draft
 
 FULL_ATTENTION = "full_attention"
@@ -606,7 +607,8 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             layer_idx=layer_idx,
             kernels=kernels,
         )
-        self.mlp = kernels.make_mlp(config)
+        # Dense MLP, or an MoELayer when the draft JSON names a moe_preset.
+        self.mlp = build_ffn(config, dense=kernels.make_mlp)
         self.input_layernorm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -771,6 +773,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+
+    def _init_weights(self, module: nn.Module) -> None:
+        super()._init_weights(module)
+        if isinstance(module, MoELayer):
+            # HF's init skips the MoE layer's bare Parameters.
+            module.reset_parameters(self.config.initializer_range)
 
     def _build_decoder_layer(
         self,
