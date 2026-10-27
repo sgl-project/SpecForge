@@ -92,9 +92,13 @@ class ComponentFactoryTest(unittest.TestCase):
         assert_close(default.hidden_states, detailed.hidden_states, atol=0, rtol=0)
 
     def test_invalid_combinations_do_not_fall_back(self):
-        for kind in ("qsa", "dsa", "unknown"):
-            with self.assertRaisesRegex(ValueError, "Unsupported attention kind"):
-                AttentionConfig(kind)
+        with self.assertRaisesRegex(ValueError, "Unsupported attention kind"):
+            AttentionConfig("unknown")
+        for kind in ("qsa", "dsa"):
+            with self.assertRaisesRegex(NotImplementedError, "no implementation yet"):
+                build_attention(
+                    config(), 0, DEFAULT_DFLASH_KERNELS, AttentionConfig(kind)
+                )
         for window in (0, -1, True, 1.5):
             with self.assertRaisesRegex(ValueError, "sliding_window"):
                 AttentionConfig(sliding_window=window)
