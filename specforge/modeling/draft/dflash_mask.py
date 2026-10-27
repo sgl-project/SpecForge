@@ -133,7 +133,9 @@ def create_dflash_block_mask(
 
     # Imported lazily: the compiled wrapper pulls in torch._dynamo, which the
     # dense-mask-only callers (and their sys.modules-patching tests) never need.
-    from .flex_attention import compile_friendly_create_block_mask
+    from .layers.attention.backends.flex_attention import (
+        compile_friendly_create_block_mask,
+    )
 
     return compile_friendly_create_block_mask(
         dflash_mask_mod,

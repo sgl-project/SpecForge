@@ -17,7 +17,9 @@ from specforge.modeling.draft.dflash_mask import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
-from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+from specforge.modeling.draft.layers.attention.backends.flex_attention_backend import (
+    flex_attention_backend,
+)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask

@@ -5,21 +5,20 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from specforge.modeling.draft.flex_attention import (
+from specforge.modeling.draft.eagle3_mask import generate_eagle3_mask
+from specforge.modeling.draft.layers.attention.backends.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
-    generate_eagle3_mask,
 )
 from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
+from .layers.ffn.dense import GatedMLP as LlamaMLP
 from .registry import register_draft
 
 try:
@@ -1097,7 +1096,9 @@ class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
     def forward(
         ctx, q, cache_k, cache_v, ring_group: dist.ProcessGroup, softmax_scale: float
     ):
-        from specforge.layers.ring.ring_flash_attn import ring_flash_attn_forward
+        from specforge.modeling.draft.layers.ring.ring_flash_attn import (
+            ring_flash_attn_forward,
+        )
 
         bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
             _cached_merge_dims(q, cache_k)
@@ -1135,7 +1136,9 @@ class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        from specforge.layers.ring.ring_flash_attn import ring_flash_attn_backward
+        from specforge.modeling.draft.layers.ring.ring_flash_attn import (
+            ring_flash_attn_backward,
+        )
 
         q, cache_k, cache_v, out, merged_lse = ctx.saved_tensors
         bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
@@ -1425,51 +1428,6 @@ class LlamaUSPFlashAttention(LlamaAttention):
         attn_output = self.o_proj(attn_output)
 
         return attn_output
-
-
-class LlamaMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
-
-            gate_proj = torch.cat(
-                [
-                    F.linear(x, gate_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-            up_proj = torch.cat(
-                [
-                    F.linear(x, up_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
-                dim=-1,
-            )
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-        return down_proj
 
 
 class LlamaRMSNorm(nn.Module):
