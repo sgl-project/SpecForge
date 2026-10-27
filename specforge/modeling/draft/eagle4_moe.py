@@ -21,6 +21,23 @@ from transformers.activations import ACT2FN
 LATENT_MOE = "nemotron_latent_relu2"
 
 
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    """Squared ReLU; older transformers builds omit this from ``ACT2FN``."""
+
+    return F.relu(x).square()
+
+
+def resolve_act_fn(name: str):
+    """Look up ``hidden_act``, with a ``relu2`` fallback for transformers 4.x."""
+
+    try:
+        return ACT2FN[name]
+    except KeyError:
+        if name == "relu2":
+            return relu2
+        raise
+
+
 class Eagle4Router(nn.Module):
     """Sigmoid router whose expert-selection bias balances load without a loss."""
 
@@ -89,7 +106,7 @@ class Eagle4MoE(nn.Module):
         self.topk_group = getattr(config, "topk_group", None) or self.n_group
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.act_fn = resolve_act_fn(config.hidden_act)
         n = config.n_routed_experts
         hidden = config.hidden_size
         inter = config.moe_intermediate_size
@@ -150,6 +167,19 @@ class Eagle4MoE(nn.Module):
         return out.view_as(hidden_states)
 
 
+def _grouped_mm_fn(h: torch.Tensor):
+    """``F.grouped_mm`` when it is a real CUDA kernel; HIP reports ``is_cuda``."""
+
+    grouped_mm = getattr(F, "grouped_mm", None)
+    if grouped_mm is None:
+        return None
+    if getattr(torch.version, "hip", None):
+        return None
+    if not (h.is_cuda and h.device.type == "cuda"):
+        return None
+    return grouped_mm
+
+
 def _expert_mlp(
     h: torch.Tensor,
     idx: torch.Tensor,
@@ -159,10 +189,13 @@ def _expert_mlp(
     latent: bool,
     act_fn,
 ) -> torch.Tensor:
-    grouped_mm = getattr(F, "grouped_mm", None)
-    if grouped_mm is not None and h.is_cuda and h.device.type == "cuda":
+    grouped_mm = _grouped_mm_fn(h)
+    if grouped_mm is None:
+        return _expert_mlp_loop(h, idx, weights, up, down, latent, act_fn)
+    try:
         return _expert_mlp_grouped(h, idx, weights, up, down, latent, act_fn, grouped_mm)
-    return _expert_mlp_loop(h, idx, weights, up, down, latent, act_fn)
+    except RuntimeError:
+        return _expert_mlp_loop(h, idx, weights, up, down, latent, act_fn)
 
 
 def _expert_mlp_grouped(
@@ -219,5 +252,7 @@ __all__ = [
     "Eagle4MoE",
     "Eagle4Router",
     "LATENT_MOE",
+    "relu2",
+    "resolve_act_fn",
     "update_eagle4_router_bias",
 ]

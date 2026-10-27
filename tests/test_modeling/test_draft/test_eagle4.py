@@ -20,7 +20,13 @@ except ImportError:
 from specforge.modeling._mask_utils import _make_causal_mask
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.eagle4 import LlamaForCausalLMEagle4, candidate_logits
-from specforge.modeling.draft.eagle4_moe import Eagle4MoE
+from specforge.modeling.draft.eagle4_moe import (
+    Eagle4MoE,
+    _expert_mlp,
+    _grouped_mm_fn,
+    relu2,
+    resolve_act_fn,
+)
 from specforge.modeling.draft.eagle4_structure import (
     EAGLE4_ARCH,
     draft_sliding_window,
@@ -242,6 +248,62 @@ class Eagle4MoETest(unittest.TestCase):
     def test_enable_moe_requires_experts(self):
         with self.assertRaisesRegex(ValueError, "n_routed_experts"):
             LlamaForCausalLMEagle4(_config(enable_moe=True), attention_backend="sdpa")
+
+    def test_relu2_resolves_when_act2fn_omits_it(self):
+        missing = mock.MagicMock()
+        missing.__getitem__.side_effect = KeyError("relu2")
+        with mock.patch("specforge.modeling.draft.eagle4_moe.ACT2FN", missing):
+            self.assertIs(resolve_act_fn("relu2"), relu2)
+        x = torch.tensor([-1.0, 2.0])
+        torch.testing.assert_close(relu2(x), torch.tensor([0.0, 4.0]))
+
+    def test_latent_relu2_moe_constructs_and_runs(self):
+        model = LlamaForCausalLMEagle4(
+            self._moe_config(
+                moe_architecture="nemotron_latent_relu2",
+                hidden_act="relu2",
+                moe_latent_size=4,
+                moe_shared_expert_intermediate_size=8,
+                n_shared_experts=1,
+            ),
+            attention_backend="sdpa",
+        )
+        mlp = model.midlayer.mlp
+        self.assertTrue(mlp.latent)
+        self.assertIsNotNone(mlp.shared_experts)
+        hidden, embeds = _inputs()
+        out = model(hidden_states=hidden, inputs_embeds=embeds)
+        self.assertEqual((2, 4, 8), tuple(out.shape))
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_grouped_mm_is_skipped_on_hip(self):
+        h = mock.Mock()
+        h.is_cuda = True
+        h.device.type = "cuda"
+        with mock.patch(
+            "specforge.modeling.draft.eagle4_moe.F.grouped_mm",
+            mock.Mock(),
+        ), mock.patch(
+            "specforge.modeling.draft.eagle4_moe.torch.version.hip",
+            "6.4",
+        ):
+            self.assertIsNone(_grouped_mm_fn(h))
+
+    def test_expert_mlp_falls_back_when_grouped_mm_raises(self):
+        h = torch.randn(4, 4)
+        idx = torch.tensor([[0], [1], [0], [1]])
+        weights = torch.ones(4, 1)
+        up = torch.randn(2, 8, 4)
+        down = torch.randn(2, 4, 8)
+        expected = _expert_mlp(h, idx, weights, up, down, True, relu2)
+        grouped = mock.Mock(side_effect=RuntimeError("no grouped_mm"))
+        with mock.patch(
+            "specforge.modeling.draft.eagle4_moe._grouped_mm_fn",
+            return_value=grouped,
+        ):
+            out = _expert_mlp(h, idx, weights, up, down, True, relu2)
+        torch.testing.assert_close(out, expected)
+        grouped.assert_called()
 
 
 class Eagle4CandidateHeadTest(unittest.TestCase):
