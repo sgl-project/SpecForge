@@ -230,12 +230,13 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> ResidualStream:
+    ) -> ResidualStream | tuple[ResidualStream, torch.Tensor]:
+        return_auxiliary = kwargs.pop("return_auxiliary_losses", False)
         hidden_states, residual = self.attention_residual.read(
             hidden_states, self.input_layernorm
         )
         hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
-        hidden_states = self.self_attn(
+        attention_output = self.self_attn(
             hidden_states=hidden_states,
             context=self._attention_context(
                 hidden_states,
@@ -250,8 +251,10 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
             state=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            **({"output_auxiliary_losses": True} if return_auxiliary else {}),
             **kwargs,
-        ).hidden_states
+        )
+        hidden_states = attention_output.hidden_states
         hidden_states = self.attention_conv.finish(
             hidden_states,
             attention_kernel,
@@ -264,7 +267,14 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
-        return self.ffn_residual.write(hidden_states, residual)
+        hidden_states = self.ffn_residual.write(hidden_states, residual)
+        if return_auxiliary:
+            loss = sum(
+                (term.value for term in attention_output.auxiliary_losses),
+                attention_output.hidden_states.new_zeros((), dtype=torch.float32),
+            )
+            return hidden_states, loss
+        return hidden_states
 
 
 class CandidateSelector(nn.Module):

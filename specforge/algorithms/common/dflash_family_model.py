@@ -560,7 +560,11 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_auxiliary_loss: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
+    ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -637,6 +641,12 @@ class OnlineDFlashModel(nn.Module):
                 draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
             else:
                 draft_kwargs["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}
+        sparse = getattr(self.draft_model, "attention_mode", None) in ("dsa", "qsa")
+        if sparse and return_auxiliary_loss:
+            draft_kwargs["return_auxiliary_losses"] = True
+            draft_kwargs["auxiliary_query_mask"] = block_keep_mask.repeat_interleave(
+                self.block_size, dim=1
+            )
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
@@ -644,7 +654,45 @@ class OnlineDFlashModel(nn.Module):
             attention_mask=dflash_attn_mask,
             **draft_kwargs,
         )
+        if return_auxiliary_loss:
+            auxiliary = None
+            if sparse:
+                output_hidden, auxiliary = output_hidden
+            return anchor_positions, block_keep_mask, output_hidden, auxiliary
         return anchor_positions, block_keep_mask, output_hidden
+
+    def _forward_training_blocks(self, **kwargs):
+        if getattr(self.draft_model, "attention_mode", None) in ("dsa", "qsa"):
+            return self._forward_draft_blocks(return_auxiliary_loss=True, **kwargs)
+        return (*self._forward_draft_blocks(**kwargs), None)
+
+    def _combine_attention_loss(self, loss, accuracy, metrics, attention_loss):
+        if attention_loss is None:
+            return loss, accuracy, metrics
+        from specforge.modeling.draft.layers.attention.indexed import (
+            SparseTrainingConfig,
+        )
+
+        options = SparseTrainingConfig.from_model_config(self.draft_model.config)
+        auxiliary = options.loss_weight * attention_loss
+        # Use the same numerator/denominator contract as the main objective,
+        # so the controller cannot drop auxiliary gradients during accumulation.
+        if "loss_terms" not in metrics:
+            # DSpark supplies an already normalized loss and the controller
+            # backprops it directly; preserve that existing execution path.
+            loss = auxiliary if options.indexer_mode == "warmup" else loss + auxiliary
+            metrics["attention/indexer_kl"] = attention_loss.detach()
+            return loss, accuracy, metrics
+        numerator, denominator = metrics["loss_terms"]
+        if options.indexer_mode == "warmup":
+            loss = auxiliary
+            numerator = auxiliary * denominator
+        else:
+            loss = loss + auxiliary
+            numerator = numerator + auxiliary * denominator
+        metrics["loss_terms"] = (numerator, denominator)
+        metrics["attention/indexer_kl"] = attention_loss.detach()
+        return loss, accuracy, metrics
 
     @staticmethod
     def _selector_token_terms(
@@ -1292,11 +1340,13 @@ class OnlineDFlashModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            loss_mask=loss_mask,
-            max_valid_anchors=max_valid_anchors,
+        anchor_positions, block_keep_mask, output_hidden, attention_loss = (
+            self._forward_training_blocks(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                loss_mask=loss_mask,
+                max_valid_anchors=max_valid_anchors,
+            )
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
@@ -1599,7 +1649,7 @@ class OnlineDFlashModel(nn.Module):
         loss = loss_num / loss_denominator.clamp_min(denominator_floor)
         metrics["loss_terms"] = (loss_num, loss_denominator.detach())
         accuracy = correct_num / accuracy_denom
-        return loss, accuracy, metrics
+        return self._combine_attention_loss(loss, accuracy, metrics, attention_loss)
 
 
 class OnlineDominoModel(OnlineDFlashModel):
@@ -1766,11 +1816,13 @@ class OnlineDominoModel(OnlineDFlashModel):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            loss_mask=loss_mask,
-            max_valid_anchors=max_valid_anchors,
+        anchor_positions, block_keep_mask, output_hidden, attention_loss = (
+            self._forward_training_blocks(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                loss_mask=loss_mask,
+                max_valid_anchors=max_valid_anchors,
+            )
         )
 
         label_start = 1 if self.shift_label else 0
@@ -1886,7 +1938,7 @@ class OnlineDominoModel(OnlineDFlashModel):
                 )
             }
 
-        return loss, accuracy, metrics
+        return self._combine_attention_loss(loss, accuracy, metrics, attention_loss)
 
 
 class OnlineDSparkModel(OnlineDFlashModel):
@@ -2239,11 +2291,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
             )
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            loss_mask=loss_mask,
-            max_valid_anchors=max_valid_anchors,
+        anchor_positions, block_keep_mask, output_hidden, attention_loss = (
+            self._forward_training_blocks(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                loss_mask=loss_mask,
+                max_valid_anchors=max_valid_anchors,
+            )
         )
 
         (
@@ -2272,4 +2326,4 @@ class OnlineDSparkModel(OnlineDFlashModel):
             collect_detailed_metrics=collect_detailed_metrics,
         )
         accuracy = metrics.pop("accuracy")
-        return loss, accuracy, metrics
+        return self._combine_attention_loss(loss, accuracy, metrics, attention_loss)
