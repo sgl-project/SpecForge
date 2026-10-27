@@ -12,7 +12,9 @@ from specforge.algorithms.common.dflash_family_model import (
 )
 from specforge.modeling.draft.dflash import DFlashDraftModel, Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
-from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+from specforge.modeling.draft.layers.attention.backends.flex_attention_backend import (
+    flex_attention_backend,
+)
 
 
 class FlexAttentionBackendTest(unittest.TestCase):
