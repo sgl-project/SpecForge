@@ -24,7 +24,7 @@ from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "eagle3", "eagle4", "mtp", "peagle")
 
 
 def _teacher_metrics_config(enabled: bool):
@@ -142,6 +142,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
     def test_target_derived_defaults_and_overrides_are_provider_owned(self):
         expected = {
             "eagle3": ("llama", 1, 32000, False),
+            "eagle4": ("llama", 1, 32000, False),
             "peagle": ("llama", 4, 32000, False),
             "dflash": ("qwen3", 1, None, True),
         }
@@ -209,6 +210,13 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 kl_scale=0.9,
                 kl_decay=0.8,
             ),
+            "eagle4": SimpleNamespace(
+                length=7,
+                attention_backend="flex_attention",
+                lk_loss_type="lambda",
+                kl_scale=0.9,
+                kl_decay=0.8,
+            ),
             "peagle": SimpleNamespace(
                 num_depths=5,
                 down_sample_ratio=0.7,
@@ -228,6 +236,14 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "eagle3_kl_decay",
                 "eagle3_trim_loss_positions",
                 "eagle3_compact_teacher",
+            },
+            "eagle4": {
+                "eagle4_ttt_length",
+                "eagle4_lk_loss_type",
+                "eagle4_kl_scale",
+                "eagle4_kl_decay",
+                "eagle4_trim_loss_positions",
+                "eagle4_compact_teacher",
             },
             "peagle": {
                 "peagle_num_draft_layers",
@@ -474,7 +490,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
     def test_other_builtins_always_request_their_registered_layout(self):
         # Planning rejects the opt-out for these algorithms; resolution keeps
         # their registered layouts regardless (DSpark trains on last_hidden).
-        for name in ("domino", "dspark", "eagle3", "mtp", "peagle"):
+        for name in ("domino", "dspark", "eagle3", "eagle4", "mtp", "peagle"):
             registration = self.registry.resolve(name)
             provider = registration.providers.server_streaming_for("text")
             with self.subTest(algorithm=name):
@@ -573,7 +589,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==6; "
+            "r=builtin_algorithm_registry(); assert len(r)==7; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

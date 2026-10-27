@@ -52,6 +52,18 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 {"sdpa", "flex_attention", "fa", "usp"},
                 None,
             ),
+            "eagle4": (
+                "LlamaForCausalLMEagle4",
+                {
+                    "input_ids",
+                    "attention_mask",
+                    "loss_mask",
+                    "hidden_state",
+                    "target",
+                },
+                {"sdpa", "flex_attention", "fa", "usp"},
+                None,
+            ),
             "peagle": (
                 "PEagleDraftModel",
                 {
@@ -109,6 +121,12 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
                 "attention_mask",
             ),
+            "eagle4": (
+                "hidden_state",
+                "target",
+                (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
+                "attention_mask",
+            ),
             "peagle": (
                 "hidden_state",
                 "target",
@@ -152,6 +170,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
     def test_step_factories_preserve_concrete_strategy_types(self):
         expected = {
             "eagle3": "Eagle3TrainStrategy",
+            "eagle4": "Eagle3TrainStrategy",
             "peagle": "PEagleTrainStrategy",
             "dflash": "DFlashTrainStrategy",
             "domino": "DominoTrainStrategy",

@@ -470,6 +470,9 @@ class TrainerCore:
                 grad_norm = self.backend.step()
             else:
                 grad_norm = self.backend.step(loss_denominator=loss_denominator)
+            after_step = getattr(self.strategy, "after_optimizer_step", None)
+            if callable(after_step):
+                after_step()
         result_ratio_metrics = self._ratio_totals if stepped else ratio_metrics
         result = self._result(
             out,

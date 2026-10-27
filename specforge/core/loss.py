@@ -23,13 +23,11 @@ def _compute_loss(logits, target_p, position_mask):
 
 def _calculate_settings(n):
     # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
+    # The kernels already walk the vocab in BLOCK_SIZE chunks, so cap rather
+    # than raise when V exceeds the fused limit (Qwen3-4B is 151936).
 
     MAX_FUSED_SIZE = 131072
-    BLOCK_SIZE = triton.next_power_of_2(n)
-    if BLOCK_SIZE > MAX_FUSED_SIZE:
-        raise RuntimeError(
-            f"Cannot launch Triton kernel since n = {n} exceeds the recommended Triton blocksize = {MAX_FUSED_SIZE}."
-        )
+    BLOCK_SIZE = min(triton.next_power_of_2(n), MAX_FUSED_SIZE)
 
     num_warps = 4
     if BLOCK_SIZE >= 32768:

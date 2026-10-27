@@ -1,0 +1,64 @@
+# Qwen3-4B EAGLE-4 dense stage-1 draft, offline (features captured to disk) — AMD ROCm.
+#
+# Stage 1 trains a full-vocab dense lm_head (no efficient_lm_head_config).
+# The low-rank candidate head is a follow-up stage after this dense checkpoint.
+#
+# Qwen3-4B is a dense target. Capture uses the stock SGLang eagle3 layer hook
+# (no --sglang-disable-radix-cache).
+#
+#   SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1 \
+#   torchrun --standalone --nproc_per_node 1 \
+#     scripts/prepare_hidden_states.py \
+#     --target-model-path Qwen/Qwen3-4B \
+#     --strategy eagle4 \
+#     --draft-model-config configs/qwen3-4b-eagle4.json \
+#     --data-path ./cache/dataset/sharegpt_train.jsonl \
+#     --output-path ./cache/hidden_states/qwen3-4b-eagle4-sharegpt \
+#     --chat-template qwen \
+#     --max-length 2048 \
+#     --num-samples 256 \
+#     --tp-size 1 \
+#     --batch-size 8 \
+#     --sglang-attention-backend aiter \
+#     --sglang-mem-fraction-static 0.8 \
+#     --sglang-context-length 4096
+#
+#   specforge train --config examples/configs/offline/colocated/qwen3-4b-eagle4-amd.yaml
+#
+# Do not pass model.vocab_mapping_path: stage 1 trains the dense head at full
+# vocab (draft_vocab_size == vocab_size).
+model:
+  target_model_path: "Qwen/Qwen3-4B"
+  draft_model_config: "configs/qwen3-4b-eagle4.json"
+  target_backend: "sglang"
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  use_liger_kernel: false
+data:
+  hidden_states_path: "./cache/hidden_states/qwen3-4b-eagle4-sharegpt"
+  max_length: 2048
+  chat_template: "qwen"
+  cache_dir: "./cache"
+training:
+  strategy: "eagle4"
+  num_epochs: 1
+  max_steps: 20
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  save_interval: 20
+  log_interval: 1
+  dist_timeout: 20
+  seed: 0
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3-4b-eagle4-offline"
+output_dir: "./outputs/qwen3-4b-eagle4-offline"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

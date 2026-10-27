@@ -67,17 +67,21 @@ def _warm_start(
     draft_config: Any,
     *,
     allow_missing_embedding: bool = False,
-) -> None:
+    allowed_missing_keys: Optional[Any] = None,
+    allowed_unexpected_keys: Optional[Any] = None,
+) -> Optional[Any]:
     if not cfg.model.draft_checkpoint_path:
-        return
+        return None
     from specforge.training.model_loading import warm_start_draft_model
 
-    warm_start_draft_model(
+    return warm_start_draft_model(
         draft_model,
         cfg.model.draft_checkpoint_path,
         draft_config=draft_config,
         strategy=cfg.training.strategy,
         allow_missing_embedding=allow_missing_embedding,
+        allowed_missing_keys=allowed_missing_keys,
+        allowed_unexpected_keys=allowed_unexpected_keys,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
@@ -86,6 +90,63 @@ def _warm_start(
 def _load_vocab_mapping(cfg: Config, draft_model: Any) -> None:
     if cfg.model.vocab_mapping_path:
         draft_model.load_vocab_mapping(cfg.model.vocab_mapping_path)
+
+
+def build_eagle4_draft(cfg: Config, draft_config: PretrainedConfig):
+    from specforge.modeling.auto import AutoDraftModel
+    from specforge.modeling.draft.eagle4_structure import parse_efficient_lm_head_config
+
+    if parse_efficient_lm_head_config(draft_config) is not None:
+        if cfg.model.vocab_mapping_path:
+            raise ValueError(
+                "efficient_lm_head_config trains a full-vocab candidate head; "
+                "do not pass model.vocab_mapping_path"
+            )
+        draft_vocab = getattr(draft_config, "draft_vocab_size", None)
+        if draft_vocab is not None and int(draft_vocab) != int(draft_config.vocab_size):
+            raise ValueError(
+                "efficient_lm_head_config rescores candidates with the "
+                "full-vocab lm_head; set draft_vocab_size equal to vocab_size"
+            )
+
+    draft_model = AutoDraftModel.from_config(
+        draft_config,
+        attention_backend=cfg.training.attention_backend,
+        torch_dtype=_torch_dtype(cfg),
+    )
+    extra_missing = None
+    extra_unexpected = None
+    if getattr(draft_model, "efficient_lm_head", None) is not None:
+        extra_missing = {
+            name
+            for name in draft_model.state_dict()
+            if name.startswith("efficient_lm_head")
+        }
+        extra_unexpected = {"t2d", "d2t"}
+    report = _warm_start(
+        cfg,
+        draft_model,
+        draft_config,
+        allow_missing_embedding=True,
+        allowed_missing_keys=extra_missing,
+        allowed_unexpected_keys=extra_unexpected,
+    )
+    if (
+        extra_missing
+        and report is not None
+        and extra_missing.intersection(report.missing_keys)
+    ):
+        draft_model.init_efficient_head_from_dense()
+    if extra_missing is None:
+        _load_vocab_mapping(cfg, draft_model)
+    if cfg.model.load_target_embedding:
+        draft_model.load_embedding(
+            cfg.model.target_model_path,
+            embedding_key=cfg.model.embedding_key,
+            cache_dir=cfg.model.cache_dir,
+        )
+    draft_model.freeze_embedding()
+    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
 
 
 def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
@@ -538,6 +599,7 @@ __all__ = [
     "build_dspark_model",
     "build_eagle3_draft",
     "build_eagle3_model",
+    "build_eagle4_draft",
     "build_peagle_draft",
     "peagle_resume_contract",
     "build_peagle_model",

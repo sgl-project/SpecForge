@@ -27,7 +27,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -438,6 +438,8 @@ def warm_start_draft_model(
     draft_config: "PretrainedConfig",
     strategy: str,
     allow_missing_embedding: bool = False,
+    allowed_missing_keys: Optional[Iterable[str]] = None,
+    allowed_unexpected_keys: Optional[Iterable[str]] = None,
     cache_dir: Optional[str] = None,
     trust_remote_code: bool = False,
 ) -> WarmStartReport:
@@ -465,16 +467,22 @@ def warm_start_draft_model(
             f"warm-start checkpoint {source!r} has incompatible draft tensor "
             f"shapes: {exc}"
         ) from exc
+    ignored_unexpected = set(allowed_unexpected_keys or ())
+    unexpected_keys = [
+        key for key in result.unexpected_keys if key not in ignored_unexpected
+    ]
     loaded_keys = len(state) - len(result.unexpected_keys)
-    if result.unexpected_keys or loaded_keys == 0:
+    if unexpected_keys or loaded_keys == 0:
         raise ValueError(
             f"warm-start checkpoint {source!r} does not match this draft model: "
             f"loaded={loaded_keys}/{len(state)}, "
-            f"unexpected={sorted(result.unexpected_keys)}"
+            f"unexpected={sorted(unexpected_keys)}"
         )
-    allowed_missing = set()
+    allowed_missing = set(allowed_missing_keys or ())
     if allow_missing_embedding:
-        allowed_missing = {key for key in result.missing_keys if "embed" in key.lower()}
+        allowed_missing.update(
+            key for key in result.missing_keys if "embed" in key.lower()
+        )
     required_missing = sorted(set(result.missing_keys) - allowed_missing)
     if required_missing:
         raise ValueError(
