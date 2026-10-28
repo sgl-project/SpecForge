@@ -156,11 +156,13 @@ class BuildFfnTest(unittest.TestCase):
             build_ffn(
                 Qwen3Config(**TINY_DFLASH, moe_preset="qwen3_moe"), 0, dense=Qwen3MLP
             )
-        # DFlash layers build their MLP through it.
+        # DFlash layers build their MLP through it; MoE drafts refuse checkpointing.
         dense_draft = DFlashDraftModel(config)
         self.assertTrue(all(isinstance(l.mlp, Qwen3MLP) for l in dense_draft.layers))
         moe_draft = DFlashDraftModel(moe_config)
         self.assertTrue(all(isinstance(l.mlp, MoELayer) for l in moe_draft.layers))
+        with self.assertRaisesRegex(ValueError, "activation checkpointing"):
+            moe_draft.gradient_checkpointing_enable()
         # ffn_layer_types picks per layer.
         hybrid = Qwen3Config(
             **TINY_DFLASH, **TINY_MOE, ffn_layer_types=["dense", "moe"]
@@ -170,28 +172,43 @@ class BuildFfnTest(unittest.TestCase):
         self.assertIsInstance(layers[1].mlp, MoELayer)
 
     def test_from_pretrained_inits_missing_moe_weights_and_keeps_loaded_ones(self):
-        model = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE))
+        knobs = {"dflash_config": {"moe_router_enable_expert_bias": True}}
+        model = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE, **knobs))
+        for layer in model.layers:  # a trained bias, and counts mid-step
+            layer.mlp.gate.expert_bias.copy_(torch.linspace(-0.3, 0.3, E))
+            layer.mlp.tokens_per_expert.fill_(7)
         state = model.state_dict()
         missing = {"layers.0.mlp.experts.gate_up_proj", "layers.1.mlp.gate.weight"}
-        kept = "layers.0.mlp.experts.down_proj"
+        kept = ("layers.0.mlp.experts.down_proj", "layers.1.mlp.gate.expert_bias")
         with tempfile.TemporaryDirectory() as tmp:
             model.save_pretrained(
                 tmp, state_dict={k: v for k, v in state.items() if k not in missing}
             )
-            loaded = DFlashDraftModel.from_pretrained(tmp).state_dict()
+            reloaded = DFlashDraftModel.from_pretrained(tmp)
+        loaded = reloaded.state_dict()
         for key in missing:
             self.assertTrue(torch.isfinite(loaded[key]).all(), key)
             self.assertTrue(0 < loaded[key].std() < 0.1, key)
-        torch.testing.assert_close(loaded[kept], state[kept])
+        for key in kept:
+            torch.testing.assert_close(loaded[key], state[key])
+        # The step's counts are not saved; a loaded draft starts a fresh window.
+        for layer in reloaded.layers:
+            self.assertTrue(torch.all(layer.mlp.tokens_per_expert == 0))
 
 
 class FamilyConfigTest(unittest.TestCase):
     def test_family_reads_the_config_and_rejects_bad_values(self):
-        gate = build_moe(_config()).gate
+        knobs = {
+            "moe_router_enable_expert_bias": True,
+            "moe_router_bias_update_rate": 0.01,
+        }
+        gate = build_moe(_config(dflash_config=knobs)).gate
         self.assertIsInstance(gate, Router)  # the contract families implement
         self.assertEqual(
             (gate.num_experts, gate.top_k, gate.norm_topk_prob), (E, K, True)
         )
+        self.assertIsNotNone(gate.expert_bias)
+        self.assertEqual(gate.bias_update_rate, 0.01)
 
         # A family only supplies score(); select and routing_weights come from Router.
         class Uniform(Router):
@@ -206,10 +223,12 @@ class FamilyConfigTest(unittest.TestCase):
             ((3, E), (3, K), (3, K)),
         )
         self.assertTrue(torch.all(weights == 2.0 / E))
-        # Qwen3.8's config omits norm_topk_prob; transformers renormalizes, so do we.
+        # Defaults: no bias, renormalized top-k; Qwen3.8's config omits norm_topk_prob.
         config = _config()
         del config.norm_topk_prob
-        self.assertTrue(build_moe(config).gate.norm_topk_prob)
+        plain = build_moe(config).gate
+        self.assertIsNone(plain.expert_bias)
+        self.assertTrue(plain.norm_topk_prob)
         # Width 0 drops the shared expert: the block is the routed experts alone.
         routed_only = build_moe(_config(shared_expert_intermediate_size=0))
         self.assertIsNone(routed_only.shared_expert)
