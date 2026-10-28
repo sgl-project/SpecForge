@@ -789,6 +789,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             # HF's init skips the MoE layer's bare Parameters.
             module.reset_parameters(self.config.initializer_range)
 
+    def gradient_checkpointing_enable(self, *args, **kwargs) -> None:
+        if any(isinstance(module, MoELayer) for module in self.modules()):
+            # MoE layers count tokens in forward; a recompute would count them twice.
+            raise ValueError("MoE drafts do not support activation checkpointing")
+        super().gradient_checkpointing_enable(*args, **kwargs)
+
     def _build_decoder_layer(
         self,
         config: Qwen3Config,
