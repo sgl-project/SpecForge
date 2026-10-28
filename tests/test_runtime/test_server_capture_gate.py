@@ -34,6 +34,7 @@ installed one is used. Opt in locally with ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=
 that directory; an existing ``target`` subdirectory is rejected. Set
 ``SPECFORGE_CAPTURE_GATE_SERVER_PYTHON`` to launch the server from a separate
 SGLang environment; the tests themselves run in the SpecForge environment.
+This requires an explicit ``SPECFORGE_SERVER_CAPTURE=patch|plugin``.
 """
 
 import importlib.util
@@ -94,6 +95,11 @@ def _server_capture_backend():
     requested = os.environ.get("SPECFORGE_SERVER_CAPTURE")
     if requested:
         return requested
+    if os.environ.get("SPECFORGE_CAPTURE_GATE_SERVER_PYTHON"):
+        raise ValueError(
+            "Set SPECFORGE_SERVER_CAPTURE=patch|plugin when using "
+            "SPECFORGE_CAPTURE_GATE_SERVER_PYTHON"
+        )
     if _patched_sglang():
         return "patch"
     if _capture_plugin():
