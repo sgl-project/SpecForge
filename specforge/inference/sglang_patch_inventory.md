@@ -111,8 +111,9 @@ a plugin instead of a source patch:
 
 The plugin is
 [`plugins/sglang-spec-capture`](../../plugins/sglang-spec-capture). Install it
-into the server's environment with `pip install --no-deps`, then select it
-with `deployment.disaggregated.server_capture: plugin`.
+into the server's environment with `pip install --no-deps`. The default
+`deployment.disaggregated.server_capture: auto` selects it when it is
+installed; `server_capture: plugin` selects it explicitly.
 
 Managed-local capture servers are then launched with `SPECFORGE_SPEC_CAPTURE=1`
 and the flags `--speculative-algorithm <METHOD> --enable-return-aux-hidden-states`,

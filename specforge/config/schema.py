@@ -821,7 +821,10 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: versioned source patch under ``patches/sglang``; ``plugin`` is the
     #: ``specforge-sglang-capture`` plugin on an SGLang build with forward
     #: observers, deferred outputs and ``--enable-return-aux-hidden-states``.
-    server_capture: Literal["patch", "plugin"] = "patch"
+    #: ``auto`` takes ``DISAGG_SERVER_CAPTURE`` when set, else detects the
+    #: backend: managed_local probes each capture server's interpreter while
+    #: planning; the producer reads an external server's ``/server_info``.
+    server_capture: Literal["auto", "patch", "plugin"] = "auto"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None
