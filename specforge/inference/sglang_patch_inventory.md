@@ -79,8 +79,8 @@ when radix cache support is present. Managed-local launch preserves the
 historical disabled-cache default; hybrid targets that require the unified radix
 tree set `model.sglang_disable_radix_cache: false`.
 
-For targets that declare `logits_mup_width_multiplier`, the SGLang model passes
-an LM-head-scaled hidden state into the logits processor. The capture patch
+On v0.5.18, targets that declare `logits_mup_width_multiplier` pass an
+LM-head-scaled hidden state into the logits processor. The capture patch
 restores the pre-head-scale post-norm representation because SpecForge folds
 the same multiplier into the frozen target head used during training.
 
@@ -132,7 +132,12 @@ The plugin keeps the patch's contract:
   writer GPU, sized by `SGLANG_SPEC_CAPTURE_ARENA_BYTES` and checked at
   startup; results use the same `arena` locator as the patch, and the writer
   advertises `spec_capture_control` through `/server_info` before any capture;
-- the `logits_mup_width_multiplier` restoration.
+- unscaled post-norm final hidden states.
+
+SGLang's aux-capture API already returns final hidden states before LM-head
+scaling, including for muP targets. The plugin forwards them unchanged;
+only the versioned capture patch restores scaled states. SpecForge applies
+`logits_mup_width_multiplier` once through its frozen target head.
 
 Its scheduler refuses to start without the required flags. The capture server
 does not need a patched SGLang.

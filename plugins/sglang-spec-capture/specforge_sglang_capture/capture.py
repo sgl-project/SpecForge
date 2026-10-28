@@ -19,7 +19,8 @@ Per scheduler process, on the attention-TP writer rank:
 
 1. ``CaptureObserver`` (an SGLang ``ForwardObserver``) picks the prefill rows of
    capture requests out of the forward's hidden states: the aux-layer
-   concatenation in ``hidden_states`` and the post-norm ``last_hidden_states``.
+   concatenation in ``hidden_states`` and the unscaled post-norm
+   ``last_hidden_states``.
 2. ``CaptureDeviceOutput.copy_to_host`` copies them to pinned host memory with
    the generation result, or keeps device tensors for device publication (RDMA,
    or the NVLink arena under ``MOONCAKE_PROTOCOL=nvlink``).
@@ -238,11 +239,6 @@ class CaptureDeviceOutput:
     @classmethod
     def from_rows(cls, runtime, items, aux, last_hidden, *, copy):
         items, (aux, last_hidden) = _select_rows(items, (aux, last_hidden), copy=copy)
-        if last_hidden is not None and runtime.last_hidden_scale:
-            # muP targets feed the logits processor LM-head-scaled states;
-            # SpecForge folds that multiplier into its frozen target head, so
-            # restore the pre-head-scale representation the trainer expects.
-            last_hidden = last_hidden * runtime.last_hidden_scale
         return cls(runtime, items, aux, last_hidden)
 
     def copy_to_host(self, copy_tensor):
@@ -416,29 +412,15 @@ class CaptureRuntime:
         gpu_put: bool,
         max_pending_batches: int,
         defer_response: Callable[[Any, CaptureCompletion], None],
-        last_hidden_scale: Optional[float] = None,
     ) -> None:
         self.sink = sink
         self.is_writer = is_writer
         self.gpu_put = gpu_put
         self.defer_response = defer_response
-        # The target's logits_mup_width_multiplier, if it declares one.
-        self.last_hidden_scale = last_hidden_scale
         # rid -> result dict, read by the streamer when the request streams.
         self.results: Dict[str, Dict[str, Any]] = {}
         self.pending = PendingCaptures(self, max_pending_batches)
         self.observer = CaptureObserver(self)
-
-
-def logits_mup_width_multiplier(model_runner) -> Optional[float]:
-    """The target's ``logits_mup_width_multiplier``, or ``None``."""
-    model_config = getattr(model_runner, "model_config", None)
-    for name in ("hf_text_config", "hf_config"):
-        config = getattr(model_config, name, None)
-        value = getattr(config, "logits_mup_width_multiplier", None)
-        if value:
-            return float(value)
-    return None
 
 
 def install(scheduler) -> CaptureRuntime:
@@ -488,7 +470,6 @@ def install(scheduler) -> CaptureRuntime:
         gpu_put=gpu_put_enabled(),
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
         defer_response=scheduler.defer_response,
-        last_hidden_scale=logits_mup_width_multiplier(model_runner),
     )
     model_runner.forward_observer = runtime.observer
     scheduler.output_streamer.spec_capture_results = runtime.results

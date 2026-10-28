@@ -231,19 +231,6 @@ class TestObserver(unittest.TestCase):
         self.assertIn("last_hidden", both.error)
         self.assertIsNone(aux_only.error)
 
-    def test_mup_targets_restore_the_pre_head_scale_last_hidden(self):
-        runtime = _runtime()
-        runtime.last_hidden_scale = 24.0
-        out = _logits_output(2)
-        device = runtime.observer.after_forward(
-            SimpleNamespace(reqs=[_req("a", 2, _spec("a"))]),
-            _forward_batch([2]),
-            out,
-            can_run_graph=False,
-        )
-        torch.testing.assert_close(device.last_hidden, out.last_hidden_states * 24.0)
-        self.assertIs(device.aux, out.hidden_states)
-
     def test_partial_row_outputs_fail_every_capture_request(self):
         device = _runtime().observer.after_forward(
             SimpleNamespace(reqs=[_req("a", 2, _spec("a"))]),
@@ -465,16 +452,37 @@ class TestInstall(unittest.TestCase):
         self.assertTrue(runtime.is_writer)
         self.assertFalse(runtime.gpu_put)
 
-    def test_reads_the_mup_multiplier_from_the_target_config(self):
-        scheduler = _scheduler()
-        scheduler.tp_worker.model_runner.model_config = SimpleNamespace(
-            hf_text_config=SimpleNamespace(logits_mup_width_multiplier=24),
-            hf_config=SimpleNamespace(),
-        )
-        _, runtime = self._install(scheduler)
-        self.assertEqual(runtime.last_hidden_scale, 24.0)
-        _, runtime = self._install()
-        self.assertIsNone(runtime.last_hidden_scale)
+    def test_captured_post_norm_hidden_reconstructs_target_logits(self):
+        hidden = torch.tensor([[1.0, 2.0], [-3.0, 4.0]])
+        head_weight = torch.tensor([[1.0, -2.0], [3.0, 0.5], [-1.0, 4.0]])
+        for multiplier in (None, 1.0, 24.0):
+            for can_run_graph in (False, True):
+                with self.subTest(multiplier=multiplier, can_run_graph=can_run_graph):
+                    scheduler = _scheduler()
+                    scheduler.tp_worker.model_runner.model_config = SimpleNamespace(
+                        hf_text_config=SimpleNamespace(
+                            logits_mup_width_multiplier=multiplier
+                        ),
+                        hf_config=SimpleNamespace(),
+                    )
+                    _, runtime = self._install(scheduler)
+                    out = _logits_output(2)
+                    out.last_hidden_states = hidden.clone()
+                    device = runtime.observer.after_forward(
+                        SimpleNamespace(reqs=[_req("a", 2, _spec("a"))]),
+                        _forward_batch([2]),
+                        out,
+                        can_run_graph=can_run_graph,
+                    )
+                    # SGLang returns unscaled post-norm states; SpecForge folds
+                    # the target's logits scaling into the frozen head weights.
+                    scale = multiplier or 1.0
+                    target_logits = (hidden / scale) @ head_weight.T
+                    folded_head_weight = head_weight / scale
+                    reconstructed_logits = device.last_hidden @ folded_head_weight.T
+                    torch.testing.assert_close(reconstructed_logits, target_logits)
+                    torch.testing.assert_close(device.last_hidden, hidden)
+                    torch.testing.assert_close(device.aux, out.hidden_states)
 
     def test_rejects_servers_missing_required_flags(self):
         for overrides, match in (

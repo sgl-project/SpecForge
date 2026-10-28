@@ -24,6 +24,12 @@ and the completion-based `defer_response` revision of
 [PR #43450](https://github.com/sgl-project/sglang/pull/43450), or a branch containing
 both. These extension points are not available in stock SGLang 0.5.18.
 
+The aux-capture API returns `last_hidden_states` after the final norm and
+before LM-head-only scaling, including Inkling's muP division. The plugin
+preserves those values; SpecForge folds `logits_mup_width_multiplier` into
+its frozen target head. Older builds that return scaled states require the
+version-specific capture patch instead.
+
 Use separate environments for the SGLang server and SpecForge training.
 SpecForge currently pins SGLang 0.5.18 and different Torch/Transformers versions;
 installing the main SpecForge package into the server environment would replace
