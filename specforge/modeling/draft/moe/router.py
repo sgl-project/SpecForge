@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Top-k routers for draft MoE layers."""
+"""The router contract and the top-k router for draft MoE layers."""
 
 from typing import Callable
 
@@ -15,7 +15,21 @@ def softmax_scores(logits: torch.Tensor) -> torch.Tensor:
     return logits.softmax(dim=-1)
 
 
-class TopKRouter(nn.Module):
+class Router(nn.Module):
+    """The routing contract every MoE family implements; balancing builds on it."""
+
+    def __init__(self, num_experts: int) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``x`` [T, H] -> scores [T, E], indices [T, K], weights [T, K]."""
+        raise NotImplementedError
+
+
+class TopKRouter(Router):
     """Top-k router; ``weight`` [E, H] matches Qwen3.5-MoE's ``gate``."""
 
     def __init__(
@@ -28,12 +42,11 @@ class TopKRouter(nn.Module):
         score_fn: ScoreFn = softmax_scores,
         route_scale: float = 1.0,
     ) -> None:
-        super().__init__()
+        super().__init__(num_experts)
         if not 1 <= top_k <= num_experts:
             raise ValueError(
                 f"top_k={top_k} must be between 1 and num_experts={num_experts}"
             )
-        self.num_experts = num_experts
         self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
         self.top_k = top_k
         self.norm_topk_prob = norm_topk_prob

@@ -19,7 +19,7 @@ from specforge.modeling.draft import DFlashDraftModel
 from specforge.modeling.draft.moe import MoELayer, build_ffn
 from specforge.modeling.draft.moe import experts as experts_module
 from specforge.modeling.draft.moe.families.qwen3_5_moe import build_moe
-from specforge.modeling.draft.moe.router import TopKRouter
+from specforge.modeling.draft.moe.router import Router, TopKRouter
 
 E, H, I, S, K = 4, 64, 32, 48, 2
 TINY_DFLASH = {
@@ -181,9 +181,12 @@ class BuildFfnTest(unittest.TestCase):
 class FamilyConfigTest(unittest.TestCase):
     def test_family_reads_the_config_and_rejects_bad_values(self):
         gate = build_moe(_config()).gate
+        self.assertIsInstance(gate, Router)  # the contract families implement
         self.assertEqual(
             (gate.num_experts, gate.top_k, gate.norm_topk_prob), (E, K, True)
         )
+        with self.assertRaises(NotImplementedError):
+            Router(E)(torch.zeros(1, H))
         # Qwen3.8's config omits norm_topk_prob; transformers renormalizes, so do we.
         config = _config()
         del config.norm_topk_prob
