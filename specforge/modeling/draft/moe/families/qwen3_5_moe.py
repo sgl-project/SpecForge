@@ -40,4 +40,8 @@ def build_moe(config: PretrainedConfig) -> MoELayer:
         shared_expert_gate=(
             nn.Linear(hidden_size, 1, bias=False) if shared_size else None
         ),
+        # The load-balance loss: 1 when balanced, one coefficient per layer; 0 skips it.
+        aux_loss_coef=dflash_config.get("moe_router_aux_loss_coef", 0.0),
+        # batch_wise (the default) balances the step's pooled load, microbatch_wise this batch's.
+        aux_loss_type=dflash_config.get("moe_router_aux_loss_type", "batch_wise"),
     )

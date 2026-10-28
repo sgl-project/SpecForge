@@ -22,6 +22,8 @@ MOE_DRAFT = {
     "shared_expert_intermediate_size": 0,
     "norm_topk_prob": False,
     "dflash_config": {
+        "moe_router_aux_loss_coef": 0.01,
+        "moe_router_aux_loss_type": "batch_wise",
         "moe_router_enable_expert_bias": True,
         "moe_router_bias_update_rate": 0.001,
     },
@@ -92,9 +94,10 @@ def _worker(rank, world_size, sharding):
         assert module.sharding_strategy is ShardingStrategy.SHARD_GRAD_OP
     assert trainer.fit() == 2
     assert all(torch.isfinite(p).all() for p in module.parameters())
-    # The registered step hook ran: its metric reached the log, the counts were reset.
+    # The registered hook ran: both metrics reached the log, the counts were reset.
     assert len(logged) == 2
-    assert math.isfinite(logged[-1]["moe/step_balance"])
+    for name in ("moe/aux_loss", "moe/step_balance"):
+        assert math.isfinite(logged[-1][name]), name
     assert torch.all(layers[0].tokens_per_expert == 0)
     # Every rank applied the same pooled bias update, under DDP without buffer sync.
     gate = layers[0].gate
