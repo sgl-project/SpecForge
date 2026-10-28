@@ -1,15 +1,16 @@
 # coding=utf-8
-"""The balancing contract: the router's expert bias, the layer's kept-slot counts."""
+"""The balancing contract: the router's expert bias, the layer's counts, the step hook."""
 
 import unittest
+from unittest import mock
 
 import torch
-from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
-    Qwen3_5MoeTextConfig,
-)
+import torch.distributed as dist
+from torch import nn
 
-from specforge.modeling.draft.moe.families.qwen3_5_moe import build_moe
-from specforge.modeling.draft.moe.layer import count_tokens_per_expert
+from specforge.modeling.draft.moe.balance import MoEBalancing, dispatch_balance
+from specforge.modeling.draft.moe.experts import RoutedExperts
+from specforge.modeling.draft.moe.layer import MoELayer, count_tokens_per_expert
 from specforge.modeling.draft.moe.router import Router, TopKRouter
 
 E, K, T, H = 8, 2, 12, 16
@@ -70,15 +71,22 @@ class RouterContractTest(unittest.TestCase):
         self.assertIn("expert_bias", router.state_dict())
 
 
-def _layer():
-    config = Qwen3_5MoeTextConfig(
-        num_experts=E,
-        num_experts_per_tok=K,
-        hidden_size=H,
-        moe_intermediate_size=8,
-        shared_expert_intermediate_size=8,
+def _layer(expert_bias=False, bias_update_rate=0.001):
+    gate = TopKRouter(
+        E,
+        H,
+        K,
+        norm_topk_prob=True,
+        initializer_range=0.5,
+        expert_bias=expert_bias,
+        bias_update_rate=bias_update_rate,
     )
-    return build_moe(config)
+    return MoELayer(gate=gate, experts=RoutedExperts(E, H, 8, initializer_range=0.5))
+
+
+def _zero_mean_sign_step(counts, rate=0.001):
+    delta = rate * torch.sign(counts.mean() - counts)
+    return delta - delta.mean()
 
 
 class LayerCountsTest(unittest.TestCase):
@@ -107,6 +115,48 @@ class LayerCountsTest(unittest.TestCase):
             cast = layer.bfloat16()
             self.assertEqual(cast.tokens_per_expert.dtype, torch.int64)
             self.assertTrue(torch.equal(cast.tokens_per_expert, want))
+
+
+class StepHookTest(unittest.TestCase):
+    """Two micro-batches and one optimizer step boundary through MoEBalancing."""
+
+    def test_the_step_pools_the_counts_and_moves_the_biases(self):
+        torch.manual_seed(0)
+        model = nn.ModuleList(
+            [
+                _layer(expert_bias=True),
+                _layer(expert_bias=True, bias_update_rate=0.0),  # frozen
+                _layer(expert_bias=False),
+            ]
+        )
+        hook = MoEBalancing(model)
+        self.assertEqual(hook.layers, list(model))
+        x = torch.randn(B, S, H)
+        for layer in model:
+            layer(x)
+            layer(x)  # the same routing again: counts double
+        totals = [layer.tokens_per_expert.clone() for layer in model]
+        other = torch.tensor([9, 0, 0, 0, 0, 0, 0, 3])  # another rank's counts
+        with mock.patch.object(dist, "is_initialized", return_value=True):
+            with mock.patch.object(dist, "all_reduce", lambda t: t.add_(other)):
+                metrics = hook.on_step()
+        with self.subTest(phase="the bias moves from the pooled counts"):
+            want = _zero_mean_sign_step((totals[0] + other).float())
+            torch.testing.assert_close(model[0].gate.expert_bias, want)
+            self.assertTrue(torch.all(model[1].gate.expert_bias == 0))  # rate 0
+            self.assertIsNone(model[2].gate.expert_bias)
+            for layer in model:
+                self.assertTrue(torch.all(layer.tokens_per_expert == 0))
+        with self.subTest(phase="the step balance scores the pooled load"):
+            want = torch.stack([dispatch_balance(t + other) for t in totals]).mean()
+            torch.testing.assert_close(metrics["moe/step_balance"], want)
+            uniform, collapsed = torch.full((E,), 3), torch.tensor([24] + [0] * 7)
+            torch.testing.assert_close(dispatch_balance(uniform), torch.tensor(1.0))
+            torch.testing.assert_close(dispatch_balance(collapsed), torch.tensor(8.0))
+        with self.subTest(phase="dense models have no layers"):
+            dense = MoEBalancing(nn.Linear(2, 2))
+            self.assertEqual(dense.layers, [])
+            self.assertEqual(dense.on_step(), {})
 
 
 if __name__ == "__main__":
