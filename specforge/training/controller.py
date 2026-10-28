@@ -403,7 +403,9 @@ def _reduce_eagle3_metrics(
 
 
 class StepHook(Protocol):
-    """Work the trainer runs at every optimizer step boundary; registered once."""
+    """Work the trainer runs around each step; registered once."""
+
+    def before_backward(self, out: StepOutput) -> StepOutput: ...
 
     def on_step(self) -> Dict[str, Any]: ...
 
@@ -427,7 +429,7 @@ class TrainerCore:
         self._step_hooks: List[StepHook] = []
 
     def register_step_hook(self, hook: StepHook) -> None:
-        """Run ``hook.on_step()`` after each optimizer step; its metrics join that step's."""
+        """Hooks adjust each micro-batch's output before backward and run after each step."""
         self._step_hooks.append(hook)
 
     @property
@@ -444,6 +446,8 @@ class TrainerCore:
             return self._backward_step(out)
 
     def _backward_step(self, out: StepOutput) -> StepResult:
+        for hook in self._step_hooks:
+            out = hook.before_backward(out)
         loss = out.loss
         ratio_metrics = dict(out.ratio_metrics)
         if out.loss_terms is not None:

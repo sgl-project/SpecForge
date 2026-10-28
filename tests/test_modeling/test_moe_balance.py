@@ -356,11 +356,19 @@ class MaskPlumbingTest(unittest.TestCase):
 class _Backend(TrainingBackend):
     name = "test"
 
+    def __init__(self, module=None):
+        self.module = module
+
     def prepare_model(self, model):
         return model
 
     def backward(self, loss, *, is_boundary=True):
         loss.backward()
+
+    def scale_gradients(self, factor):
+        for parameter in self.module.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(factor)
 
     def step(self):
         return torch.tensor(1.0)
@@ -392,7 +400,80 @@ def _batch(x):
     return TrainBatch(sample_ids=["s0"], strategy="moe-test", tensors=tensors)
 
 
+class _TermsStrategy(_MoEStrategy):
+    """A strategy with loss_terms: a token-sum numerator over a token-count denominator."""
+
+    def forward_loss(self, batch, ctx=None):
+        out = self.model(batch.tensors["hidden_states"])
+        numerator, denominator = out.square().sum(), torch.tensor(float(out.numel()))
+        loss = numerator / denominator
+        return StepOutput(loss=loss, metrics={}, loss_terms=(numerator, denominator))
+
+
+class FoldTest(unittest.TestCase):
+    """before_backward adds coef x loss per layer to the objective and logs the raw mean."""
+
+    def test_the_hook_folds_the_layers_losses_once(self):
+        torch.manual_seed(0)
+        model = nn.ModuleList(
+            [
+                _layer(aux_loss_coef=0.5, aux_loss_type="microbatch_wise"),
+                _layer(aux_loss_coef=0.25),
+                _layer(aux_loss_coef=0.0),  # no loss, no term
+            ]
+        )
+        hook, x, mask = MoEBalancing(model), torch.randn(B, S, H), _real_token_mask()
+        for layer in model:
+            layer(x, mask)
+        losses = [model[0].aux_loss, model[1].aux_loss]
+        weighted, raw = 0.5 * losses[0] + 0.25 * losses[1], (losses[0] + losses[1]) / 2
+        out = StepOutput(
+            loss=torch.tensor(2.0),
+            metrics={},
+            loss_terms=(torch.tensor(6.0), torch.tensor(3.0)),
+        )
+        with self.subTest(phase="with loss_terms: the numerator carries the fold"):
+            folded = hook.before_backward(out)
+            torch.testing.assert_close(folded.loss, 2.0 + weighted)
+            numerator, denominator = folded.loss_terms
+            torch.testing.assert_close(numerator, 6.0 + weighted * 3.0)
+            self.assertEqual(denominator.item(), 3.0)
+            metric, weight = folded.ratio_metrics["moe/aux_loss"]
+            torch.testing.assert_close(metric, raw.detach())
+            self.assertEqual(weight.item(), 1.0)
+            self.assertFalse(metric.requires_grad)
+            self.assertTrue(all(layer.aux_loss is None for layer in model))
+        with self.subTest(phase="consumed: a second call changes nothing"):
+            self.assertIs(hook.before_backward(out), out)
+        with self.subTest(phase="without loss_terms: the loss carries the fold"):
+            for layer in model:
+                layer(x, mask)
+            plain = StepOutput(loss=torch.tensor(2.0), metrics={})
+            folded = hook.before_backward(plain)
+            torch.testing.assert_close(folded.loss, 2.0 + weighted)
+            self.assertIsNone(folded.loss_terms)
+
+
 class TrainerStepHookTest(unittest.TestCase):
+    def test_the_fold_reaches_the_gradient_like_an_objective_fold(self):
+        """Through TrainerCore, the hook's fold equals folding inside the objective."""
+        torch.manual_seed(0)
+        layer, x = _layer(aux_loss_coef=0.5, aux_loss_type="microbatch_wise"), None
+        x = torch.randn(B, S, H)
+        core = TrainerCore(_TermsStrategy(layer), _Backend(layer), accumulation_steps=1)
+        core.register_step_hook(MoEBalancing(layer))
+        result = core.train_step(_batch(x))
+        got = layer.gate.weight.grad.clone()
+        # The reference: #1003's objective-side fold, numerator += coef * aux * denominator.
+        layer.zero_grad()
+        out = layer(x)
+        numerator, denominator = out.square().sum(), float(out.numel())
+        ((numerator + 0.5 * layer.aux_loss * denominator) / denominator).backward()
+        torch.testing.assert_close(got, layer.gate.weight.grad)
+        self.assertAlmostEqual(
+            float(result.metrics["moe/aux_loss"]), layer.aux_loss.item(), places=5
+        )
+
     def test_the_trainer_runs_the_registered_hook_at_the_step_boundary(self):
         torch.manual_seed(0)
         layer, x = _layer(expert_bias=True), torch.randn(B, S, H)
@@ -402,6 +483,7 @@ class TrainerStepHookTest(unittest.TestCase):
         counts = layer.tokens_per_expert.clone()
         self.assertTrue(torch.all(layer.gate.expert_bias == 0))
         self.assertNotIn("moe/step_balance", first.metrics)
+        self.assertNotIn("moe/aux_loss", first.metrics)  # coefficient 0: no loss at all
         second = core.train_step(_batch(x))  # the same routing again: counts double
         torch.testing.assert_close(
             layer.gate.expert_bias, _zero_mean_sign_step((2 * counts).float())

@@ -1,7 +1,8 @@
 # coding=utf-8
-"""MoE load balancing at the optimizer step: pooled counts, the bias update, the metric."""
+"""MoE load balancing around the step: the aux-loss fold, pooled counts, the bias update."""
 
-from typing import Dict, List
+import dataclasses
+from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
@@ -22,10 +23,40 @@ def moe_layers(model: nn.Module) -> List[MoELayer]:
 
 
 class MoEBalancing:
-    """The trainer's per-step hook over a model's MoE layers; registered once."""
+    """The trainer's hook over a model's MoE layers; registered once."""
 
     def __init__(self, model: nn.Module) -> None:
         self.layers = moe_layers(model)
+
+    def before_backward(self, out: Any) -> Any:
+        """Fold this micro-batch's load-balance losses into the objective; log their mean."""
+        terms = [
+            (layer.aux_loss_coef, layer.aux_loss)
+            for layer in self.layers
+            if layer.aux_loss is not None
+        ]
+        for layer in self.layers:
+            layer.aux_loss = None  # consumed: never folded twice
+        if not terms:
+            return out
+        # One coefficient per layer, as in torchtitan and Megatron; the metric stays a mean.
+        weighted = torch.stack([coef * loss for coef, loss in terms]).sum()
+        raw = torch.stack([loss for _, loss in terms]).mean().detach()
+        ratio_metrics = {
+            **out.ratio_metrics,
+            "moe/aux_loss": (raw, torch.ones_like(raw)),
+        }
+        loss_terms = out.loss_terms
+        if loss_terms is not None:
+            # Into the numerator the trainer backpropagates and normalizes globally.
+            numerator, denominator = loss_terms
+            loss_terms = (numerator + weighted * denominator, denominator)
+        return dataclasses.replace(
+            out,
+            loss=out.loss + weighted,
+            loss_terms=loss_terms,
+            ratio_metrics=ratio_metrics,
+        )
 
     def on_step(self) -> Dict[str, torch.Tensor]:
         """Optimizer step boundary: pool the counts once, move the biases, score the step."""
