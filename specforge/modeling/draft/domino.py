@@ -12,7 +12,7 @@ from torch.func import functional_call
 from specforge.utils import get_device_type
 
 from .dflash import DFlashDraftModel, sample
-from .dflash_kernels import DFlashKernels
+from .dflash_config import DominoConfig
 from .registry import register_draft
 
 
@@ -22,23 +22,12 @@ class DominoDraftModel(DFlashDraftModel):
 
     expected_projector_type = "domino"
 
-    def __init__(self, config, dflash_kernels: Optional[DFlashKernels] = None) -> None:
-        dflash_config = getattr(config, "dflash_config", None) or {}
-        projector_type = dflash_config.get("projector_type")
-        if projector_type is None:
-            dflash_config["projector_type"] = self.expected_projector_type
-            config.dflash_config = dflash_config
-        elif projector_type != self.expected_projector_type:
-            raise ValueError(
-                "DominoDraftModel requires " "dflash_config.projector_type='domino'."
-            )
-        super().__init__(config, dflash_kernels=dflash_kernels)
+    draft_options: DominoConfig
+    draft_options_class = DominoConfig
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
-        self.emb_dim = int(dflash_config["emb_dim"])
-        self.gru_hidden_dim = int(dflash_config["gru_hidden_dim"])
-        self.pure_draft_prefix_len = int(dflash_config.get("pure_draft_prefix_len", 0))
-        self.shift_label = bool(dflash_config.get("shift_label", False))
+        self.emb_dim = self.draft_options.emb_dim
+        self.gru_hidden_dim = self.draft_options.gru_hidden_dim
 
         self.prefix_gru = nn.GRU(
             input_size=config.hidden_size,

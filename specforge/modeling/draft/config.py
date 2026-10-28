@@ -61,6 +61,22 @@ class AutoDraftConfig:
         return config
 
     @classmethod
+    def finalize(cls, config: PretrainedConfig) -> PretrainedConfig:
+        """Validate model-specific settings after run overrides have been applied.
+
+        Models may provide a pure prepare_config hook. Parsing remains separate
+        so callers can override checkpoint settings before final validation.
+        """
+        architectures = getattr(config, "architectures", None) or []
+        if len(architectures) != 1 or architectures[0] not in DRAFT_REGISTRY:
+            raise ValueError(
+                "draft config must name exactly one registered architecture"
+            )
+        model_cls = DRAFT_REGISTRY[architectures[0]]
+        prepare = getattr(model_cls, "prepare_config", None)
+        return prepare(config) if prepare is not None else copy.deepcopy(config)
+
+    @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> PretrainedConfig:
         try:
             with open(path, encoding="utf-8") as stream:
@@ -119,4 +135,6 @@ class AutoDraftConfig:
             force_download=force_download,
             subfolder=subfolder,
         )
-        return cls.from_dict(payload)
+        config = cls.from_dict(payload)
+        config._name_or_path = raw_source
+        return config

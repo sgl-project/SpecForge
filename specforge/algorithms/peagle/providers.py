@@ -45,6 +45,14 @@ def resume_contract(config, draft_model, training_model):
     return contract
 
 
+def apply_overrides(config, draft_config):
+    from specforge.algorithms.model_providers import apply_eagle_overrides
+
+    apply_eagle_overrides(config, draft_config)
+    if config.training.norm_before_residual is not None:
+        draft_config.norm_before_residual = config.training.norm_before_residual
+
+
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_peagle_draft
 
@@ -117,6 +125,7 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
+                apply_overrides=apply_overrides,
                 target_defaults=TargetDerivedDraftDefaults(
                     model_type="llama",
                     num_hidden_layers=4,

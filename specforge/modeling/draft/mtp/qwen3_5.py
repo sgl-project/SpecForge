@@ -37,6 +37,7 @@ from typing_extensions import Unpack
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
 from specforge.modeling.draft.mtp.base import MTPDraftModel
+from specforge.modeling.draft.mtp.config import Qwen3_5MTPConfig
 from specforge.modeling.draft.registry import register_draft
 
 
@@ -396,10 +397,18 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
     """
 
     config_class = Qwen3Config
+    draft_options_class = Qwen3_5MTPConfig
     _no_split_modules = ["Qwen3MTPDecoderLayer"]
 
+    @classmethod
+    def prepare_config(cls, config: Qwen3Config) -> Qwen3Config:
+        return cls.draft_options_class.from_model_config(config).to_model_config(config)
+
     def __init__(self, config: Qwen3Config) -> None:
+        options = self.draft_options_class.from_model_config(config)
+        config = options.to_model_config(config)
         super().__init__(config)
+        self.draft_options = options
         self.config = config
 
         # Shared embedding with the target model (loaded externally, frozen)
@@ -414,6 +423,10 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
 
     def get_input_embeddings(self):
         return self.embed_tokens
+
+    @property
+    def share_lm_head(self) -> bool:
+        return self.draft_options.share_lm_head
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value

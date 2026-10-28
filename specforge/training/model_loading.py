@@ -249,7 +249,9 @@ def resolve_draft_config(
             f"architecture in {sorted(compatible)!r}, got {architectures!r}"
         )
     _apply_draft_overrides(cfg, draft_config, provider)
-    return draft_config
+    from specforge.modeling.draft.config import AutoDraftConfig
+
+    return AutoDraftConfig.finalize(draft_config)
 
 
 def preflight_draft_kernels(

@@ -168,6 +168,12 @@ def algorithm_spec() -> AlgorithmSpec:
     )
 
 
+def apply_overrides(config, draft_config):
+    from specforge.algorithms.model_providers import apply_eagle_overrides
+
+    apply_eagle_overrides(config, draft_config)
+
+
 def algorithm_providers() -> AlgorithmProviders:
     return AlgorithmProviders(
         algorithm_name=ALGORITHM_NAME,
@@ -181,6 +187,7 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
+                apply_overrides=apply_overrides,
                 target_defaults=TargetDerivedDraftDefaults(
                     model_type="llama",
                     num_hidden_layers=1,

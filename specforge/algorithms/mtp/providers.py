@@ -67,13 +67,12 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved MTP model and objective semantics."""
 
-    mtp_config = getattr(draft_model.config, "mtp_config", None) or {}
     return {
         "mtp_draft_num_hidden_layers": int(
             getattr(draft_model.config, "num_hidden_layers", 1)
         ),
         "mtp_draft_vocab_size": int(getattr(draft_model.config, "vocab_size", 0)),
-        "mtp_share_lm_head": bool(mtp_config.get("share_lm_head", True)),
+        "mtp_share_lm_head": draft_model.share_lm_head,
         "mtp_attention_backend": str(
             getattr(draft_model.config, "_attn_implementation", "")
         ),

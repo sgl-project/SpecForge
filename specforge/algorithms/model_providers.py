@@ -116,10 +116,7 @@ def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
 def build_peagle_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.draft.peagle import PEagleDraftModel
 
-    draft_model = PEagleDraftModel(
-        draft_config,
-        norm_before_residual=cfg.training.norm_before_residual,
-    )
+    draft_model = PEagleDraftModel(draft_config)
     if cfg.model.load_target_embedding:
         draft_model.load_embedding(
             cfg.model.target_model_path,
@@ -494,12 +491,20 @@ def populate_dflash_generated_config(
     }
 
 
+def apply_eagle_overrides(cfg: Config, draft_config: Any) -> None:
+    from specforge.modeling.draft.config_base import method_config
+
+    if cfg.model.aux_hidden_state_layer_ids is not None:
+        draft_config.eagle_config = {
+            **method_config(draft_config, "eagle_config"),
+            "eagle_aux_hidden_state_layer_ids": list(
+                cfg.model.aux_hidden_state_layer_ids
+            ),
+        }
+
+
 def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
-    from specforge.modeling.draft.dflash import (
-        build_target_layer_ids,
-        resolve_dflash_attention_layout,
-        validate_dflash_attention_config,
-    )
+    from specforge.modeling.draft.dflash_config import build_target_layer_ids
 
     method_config = dict(getattr(draft_config, "dflash_config", None) or {})
     if cfg.model.draft_block_size is not None:
@@ -509,25 +514,40 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
     requested_layers = cfg.model.draft_num_hidden_layers
     if requested_layers is not None:
         layer_types = draft_config.layer_types
-        if len(layer_types) != requested_layers:
-            if len(set(layer_types)) > 1:
-                raise ValueError(
-                    "model.draft_num_hidden_layers cannot resize a mixed "
-                    "DFlash layer_types layout; provide a draft config with "
-                    "exactly the requested per-layer layout"
-                )
-            draft_config.layer_types = [layer_types[0]] * requested_layers
+        if (
+            not isinstance(layer_types, (list, tuple))
+            or not layer_types
+            or any(not isinstance(layer, str) for layer in layer_types)
+        ):
+            raise ValueError(
+                "DFlash layer_types must be a non-empty list of attention types"
+            )
+        # Setting the existing depth must not change explicitly chosen capture
+        # layers (which need not have the same count as the draft layers).
+        if len(layer_types) == requested_layers:
+            return
+        if len(set(layer_types)) > 1:
+            raise ValueError(
+                "model.draft_num_hidden_layers cannot resize a mixed "
+                "DFlash layer_types layout; provide a draft config with "
+                "exactly the requested per-layer layout"
+            )
+        target_layers = getattr(draft_config, "num_target_layers", None)
+        if type(target_layers) is not int or target_layers <= 0:
+            raise ValueError(
+                "Resizing DFlash requires a positive integer num_target_layers "
+                "to rebuild capture layers; otherwise provide a draft config "
+                "with the requested depth and explicit target_layer_ids"
+            )
+        draft_config.layer_types = [layer_types[0]] * requested_layers
 
         draft_config.dflash_config = {
             **method_config,
             "target_layer_ids": build_target_layer_ids(
-                int(draft_config.num_target_layers),
+                target_layers,
                 requested_layers,
             ),
         }
-
-    resolve_dflash_attention_layout(draft_config)
-    validate_dflash_attention_config(draft_config)
 
 
 __all__ = [

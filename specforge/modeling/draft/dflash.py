@@ -19,6 +19,13 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
+from . import dflash_config as _draft_config
+from .dflash_config import (
+    DFlashConfig,
+    _resolve_mla_rope_interleaved,
+    resolve_dflash_attention_mode,
+    resolve_dflash_causal_block,
+)
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .dflash_mask import (
     create_dflash_block_mask,
@@ -29,20 +36,16 @@ from .flex_attention import compile_friendly_flex_attention
 from .flex_attention_backend import flex_attention_backend
 from .registry import register_draft
 
+# Preserve the existing helper import paths while configuration owns the rules.
+build_target_layer_ids = _draft_config.build_target_layer_ids
+resolve_dflash_attention_layout = _draft_config.resolve_dflash_attention_layout
+validate_dflash_attention_config = _draft_config.validate_dflash_attention_config
+validate_dflash_mla_config = _draft_config.validate_dflash_mla_config
+
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
-_VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
 _ATTENTION_MASK_SEMANTICS_VERSION = 2
 _LEGACY_CAUSAL_ARCHITECTURES = {"DSparkDraftModel", "DSpineDraftModel"}
-
-
-def resolve_dflash_causal_block(config) -> Optional[bool]:
-    """Read the direction override; None preserves the legacy per-layout defaults."""
-
-    value = getattr(config, "is_causal", None)
-    if value is not None and not isinstance(value, bool):
-        raise ValueError("DFlash config.is_causal must be a boolean or null")
-    return value
 
 
 def dflash_attention_resume_contract(draft_model) -> dict:
@@ -82,122 +85,6 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
-
-
-def resolve_dflash_attention_layout(
-    config: Qwen3Config,
-) -> tuple[tuple[str, ...], Optional[int]]:
-    """Validate and return the configured per-layer DFlash attention layout."""
-
-    num_hidden_layers = config.num_hidden_layers
-    layer_types = tuple(config.layer_types)
-
-    if len(layer_types) != num_hidden_layers:
-        raise ValueError(
-            "DFlash config.layer_types must contain exactly "
-            f"num_hidden_layers={num_hidden_layers} entries, got "
-            f"{len(layer_types)}"
-        )
-    invalid = set(layer_types) - _VALID_DFLASH_LAYER_TYPES
-    if invalid:
-        raise ValueError(
-            "DFlash config.layer_types supports only full_attention and "
-            f"sliding_attention, got {sorted(invalid)}"
-        )
-
-    if SLIDING_ATTENTION not in layer_types:
-        return layer_types, None
-
-    sliding_window = config.sliding_window
-    if sliding_window is None or sliding_window <= 0:
-        raise ValueError(
-            "DFlash sliding_attention layers require use_sliding_window=true "
-            "and a positive config.sliding_window"
-        )
-    return layer_types, sliding_window
-
-
-def resolve_dflash_attention_mode(config: Qwen3Config) -> str:
-    """Validate and return the configured draft attention mode.
-
-    ``gqa`` and ``mha`` share :class:`Qwen3DFlashAttention`; ``mla`` swaps in
-    the latent parameterization while retaining the family decoder,
-    target-context injection, masks, and objectives.
-    """
-
-    dflash_config = getattr(config, "dflash_config", None) or {}
-    attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
-    if attention_mode not in _DFLASH_ATTENTION_CLASSES:
-        raise ValueError(
-            "DFlash dflash_config.attention_mode must be one of "
-            f"{sorted(_DFLASH_ATTENTION_CLASSES)}, got {attention_mode!r}"
-        )
-    return attention_mode
-
-
-def _require_bool_config(value: object, field: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"DFlash {field} must be a boolean, got {value!r}")
-    return value
-
-
-def _resolve_mla_rope_interleaved(config: Qwen3Config) -> bool:
-    """Rotation convention from the standard MLA ``rope_interleave`` field."""
-
-    return _require_bool_config(
-        getattr(config, "rope_interleave", True),
-        "config.rope_interleave",
-    )
-
-
-def validate_dflash_mla_config(config: Qwen3Config) -> None:
-    """Validate the standard MLA dimension fields carried by a draft config."""
-
-    required = (
-        "kv_lora_rank",
-        "qk_nope_head_dim",
-        "qk_rope_head_dim",
-        "v_head_dim",
-    )
-    missing = [name for name in required if getattr(config, name, None) is None]
-    if missing:
-        raise ValueError(f"MLA draft config is missing required fields: {missing}")
-
-    q_lora_rank = getattr(config, "q_lora_rank", None)
-    if q_lora_rank is not None and int(q_lora_rank) <= 0:
-        raise ValueError(f"q_lora_rank must be positive or null, got {q_lora_rank}")
-
-    for name in ("kv_lora_rank", "qk_rope_head_dim", "v_head_dim"):
-        value = int(getattr(config, name))
-        if value <= 0:
-            raise ValueError(f"{name} must be positive, got {value}")
-
-    qk_nope_head_dim = int(config.qk_nope_head_dim)
-    if qk_nope_head_dim < 0:
-        raise ValueError(
-            f"qk_nope_head_dim must be non-negative, got {qk_nope_head_dim}"
-        )
-    qk_rope_head_dim = int(config.qk_rope_head_dim)
-    if qk_rope_head_dim % 2:
-        raise ValueError(f"qk_rope_head_dim must be even, got {qk_rope_head_dim}")
-    _resolve_mla_rope_interleaved(config)
-
-
-def validate_dflash_attention_config(config: Qwen3Config) -> str:
-    """Validate the selected attention parameterization and return its mode."""
-
-    attention_mode = resolve_dflash_attention_mode(config)
-    if attention_mode == "mha" and int(config.num_key_value_heads) != int(
-        config.num_attention_heads
-    ):
-        raise ValueError(
-            "attention_mode 'mha' requires num_key_value_heads == "
-            f"num_attention_heads, got {config.num_key_value_heads} and "
-            f"{config.num_attention_heads}"
-        )
-    if attention_mode == "mla":
-        validate_dflash_mla_config(config)
-    return attention_mode
 
 
 def _rope_config(config: Qwen3Config, attention_mode: str) -> Qwen3Config:
@@ -651,19 +538,6 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
-    if num_draft_layers == 1:
-        return [num_target_layers // 2]
-    start = 1
-    end = num_target_layers - 3
-    span = end - start
-    target_layer_ids = [
-        int(round(start + (i * span) / (num_draft_layers - 1)))
-        for i in range(num_draft_layers)
-    ]
-    return target_layer_ids
-
-
 def extract_context_feature(
     hidden_states: list[torch.Tensor],
     layer_ids: Optional[list[int]],
@@ -718,6 +592,7 @@ def normalize_draft_head_checkpoint_keys(
 @register_draft
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
+    draft_options_class = DFlashConfig
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
     decoder_layer_class = Qwen3DFlashDecoderLayer
 
@@ -726,32 +601,23 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         config,
         dflash_kernels: Optional[DFlashKernels] = None,
     ) -> None:
+        options = self.draft_options_class.from_model_config(config)
+        config = options.to_model_config(config)
         super().__init__(config)
-        self.config = config
-        resolve_dflash_causal_block(config)
-        self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
-        self.attention_mode = validate_dflash_attention_config(config)
+        self.draft_options = options
+        self.layer_types = options.layer_types
+        self.sliding_window = options.sliding_window
+        self.attention_mode = options.attention_mode
+        self.block_size = options.block_size
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
-        dflash_config = getattr(config, "dflash_config", {}) or {}
-        block_size = getattr(config, "block_size", None)
-        if block_size is None:
-            block_size = dflash_config.get("block_size")
-        if not isinstance(block_size, int) or isinstance(block_size, bool):
-            raise ValueError(
-                "DFlash config must define an integer block_size either at "
-                "config.block_size or config.dflash_config.block_size"
-            )
-        self.block_size = block_size
+        dflash_config = config.dflash_config
         self.layers = nn.ModuleList(
             [
                 self._build_decoder_layer(config, layer_idx, kernels)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.target_layer_ids = dflash_config.get(
-            "target_layer_ids",
-            build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
-        )
+        self.target_layer_ids = list(options.target_layer_ids)
         self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(
             _rope_config(config, self.attention_mode)
@@ -764,13 +630,18 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
-        self.mask_token_id = dflash_config.get("mask_token_id", None)
-        self.projector_type = dflash_config.get("projector_type", None)
-        self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
-        self.shift_label = dflash_config.get("shift_label", False)
+        self.mask_token_id = options.mask_token_id
+        self.projector_type = options.projector_type
+        self.pure_draft_prefix_len = options.pure_draft_prefix_len
+        self.shift_label = options.shift_label
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+
+    @classmethod
+    def prepare_config(cls, config: Qwen3Config) -> Qwen3Config:
+        """Validate the final architecture without allocating model parameters."""
+        return cls.draft_options_class.from_model_config(config).to_model_config(config)
 
     def _build_decoder_layer(
         self,

@@ -239,14 +239,14 @@ class DFlashAttentionDirectionTest(unittest.TestCase):
         model = DFlashDraftModel(config)
         self.assertEqual(dflash_attention_resume_contract(model), {})
         config.is_causal = True
-        causal = dflash_attention_resume_contract(model)
+        causal = dflash_attention_resume_contract(DFlashDraftModel(config))
         config.is_causal = False
-        bidirectional = dflash_attention_resume_contract(model)
+        bidirectional = dflash_attention_resume_contract(DFlashDraftModel(config))
         self.assertTrue(causal and bidirectional and (causal != bidirectional))
         config.is_causal = True
         config.architectures = ["DSparkDraftModel"]
-        model.sliding_window = None
-        self.assertEqual(dflash_attention_resume_contract(model), {})
+        config.layer_types = ["full_attention"]
+        self.assertEqual(dflash_attention_resume_contract(DFlashDraftModel(config)), {})
 
     def test_checkpoint_versioning_preserves_legacy_cases(self):
         for window, causal, architecture in product(

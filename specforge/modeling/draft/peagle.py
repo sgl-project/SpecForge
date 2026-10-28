@@ -1,5 +1,6 @@
 """P-EAGLE (Parallel EAGLE) draft model with multi-layer architecture."""
 
+import copy
 from typing import List, Optional, Tuple
 
 import torch
@@ -8,6 +9,7 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.modeling.draft.base import Eagle3DraftModel
+from specforge.modeling.draft.eagle_config import EaglePretrainedConfig, PEagleConfig
 from specforge.modeling.draft.flex_attention import compile_friendly_flex_attention
 from specforge.modeling.draft.llama3_eagle import (
     LlamaMLP,
@@ -182,19 +184,27 @@ class PEagleDraftModel(Eagle3DraftModel):
     - External rotary embeddings shared across all layers
     """
 
-    config_class = LlamaConfig
+    config_class = EaglePretrainedConfig
+    draft_options_class = PEagleConfig
+
+    @classmethod
+    def prepare_config(cls, config: LlamaConfig) -> LlamaConfig:
+        return cls.draft_options_class.from_model_config(config).to_model_config(config)
 
     def __init__(
         self,
         config: LlamaConfig,
         norm_before_residual: Optional[bool] = None,
     ) -> None:
-        super().__init__(config)
-        if norm_before_residual is None:
-            norm_before_residual = getattr(config, "norm_before_residual", False)
-        norm_before_residual = bool(norm_before_residual)
+        if norm_before_residual is not None:
+            config = copy.deepcopy(config)
+            config.norm_before_residual = norm_before_residual
+        options = self.draft_options_class.from_model_config(config)
+        config = options.to_model_config(config)
+        norm_before_residual = options.norm_before_residual
         config.architectures = [type(self).__name__]
-        config.norm_before_residual = norm_before_residual
+        super().__init__(config)
+        self.draft_options = options
         self.config = config
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
@@ -205,10 +215,7 @@ class PEagleDraftModel(Eagle3DraftModel):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
 
-        if hasattr(config, "target_hidden_size"):
-            fc_input_size = config.target_hidden_size * 3
-        else:
-            fc_input_size = config.hidden_size * 3
+        fc_input_size = options.target_hidden_size * 3
         self.fc = nn.Linear(fc_input_size, config.hidden_size, bias=False)
         self.mask_hidden = nn.Parameter(torch.randn(1, 1, fc_input_size))
 

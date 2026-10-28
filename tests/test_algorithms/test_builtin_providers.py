@@ -141,8 +141,8 @@ class BuiltinProviderContractTest(unittest.TestCase):
 
     def test_target_derived_defaults_and_overrides_are_provider_owned(self):
         expected = {
-            "eagle3": ("llama", 1, 32000, False),
-            "peagle": ("llama", 4, 32000, False),
+            "eagle3": ("llama", 1, 32000, True),
+            "peagle": ("llama", 4, 32000, True),
             "dflash": ("qwen3", 1, None, True),
         }
         for name, (model_type, layers, vocab_size, has_override) in expected.items():
@@ -184,6 +184,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             norm_before_residual=True,
             target_layer_ids=[3, 7],
             pure_draft_prefix_len=2,
+            share_lm_head=True,
         )
         dflash_family = SimpleNamespace(
             block_size=16,
