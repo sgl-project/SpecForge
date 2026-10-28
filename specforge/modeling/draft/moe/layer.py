@@ -11,6 +11,18 @@ from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert
 from specforge.modeling.draft.moe.router import TopKRouter
 
 
+def count_tokens_per_expert(
+    indices: torch.Tensor, mask: Optional[torch.Tensor], num_experts: int
+) -> torch.Tensor:
+    """Kept slots per expert, int64 [E]; ``mask`` [T] marks the kept tokens."""
+    slots = indices.reshape(-1)
+    kept = torch.ones_like(slots)
+    if mask is not None:
+        kept = mask.to(slots.dtype).repeat_interleave(indices.shape[-1])
+    # scatter_add_, not bincount: bincount reads the indices' range on the host.
+    return slots.new_zeros(num_experts).scatter_add_(0, slots, kept)
+
+
 class MoELayer(nn.Module):
     """Routed experts plus an optional shared expert with an optional sigmoid gate."""
 
@@ -26,15 +38,29 @@ class MoELayer(nn.Module):
         self.experts = experts
         self.shared_expert = shared_expert
         self.shared_expert_gate = shared_expert_gate
+        # The step's kept-slot counts per expert; the balancing hook pools and resets them.
+        self.register_buffer(
+            "tokens_per_expert",
+            torch.zeros(gate.num_experts, dtype=torch.int64),
+            persistent=False,
+        )
 
     def reset_parameters(self, std: float) -> None:
         # Only the router and experts hold bare Parameters that HF's init skips.
         self.gate.reset_parameters(std)
         self.experts.reset_parameters(std)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, token_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """``token_mask`` [B, S] marks the tokens the balancing counts; None counts all."""
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         _, indices, weights = self.gate(x)
+        if self.training:
+            mask = None if token_mask is None else token_mask.reshape(-1)
+            self.tokens_per_expert += count_tokens_per_expert(
+                indices, mask, self.gate.num_experts
+            )
         out = self.experts(x, indices, weights)
         if self.shared_expert is not None:
             shared = self.shared_expert(x)
