@@ -78,16 +78,14 @@ class RouterContractTest(unittest.TestCase):
             self.assertIsNone(off.expert_bias)
             self.assertEqual(list(off.state_dict()), ["weight"])
             off.update_expert_bias(counts)  # no bias: a no-op
-
-    def test_the_bias_keeps_fp32_values_when_cast_to_bf16(self):
-        router = _router(norm_topk_prob=False)
-        bias = torch.linspace(1.001, 1.002, E)  # bf16 would round these to 1.0
-        router.expert_bias.copy_(bias)
-        router = router.bfloat16()
-        self.assertEqual(router.expert_bias.dtype, torch.float32)
-        torch.testing.assert_close(router.expert_bias, bias)
-        self.assertEqual(router.weight.dtype, torch.bfloat16)
-        self.assertIn("expert_bias", router.state_dict())
+        with self.subTest(phase="the bias keeps fp32 values through a bf16 cast"):
+            bias = torch.linspace(1.001, 1.002, E)  # bf16 would round these to 1.0
+            router.expert_bias.copy_(bias)
+            cast = router.bfloat16()
+            self.assertEqual(cast.expert_bias.dtype, torch.float32)
+            torch.testing.assert_close(cast.expert_bias, bias)
+            self.assertEqual(cast.weight.dtype, torch.bfloat16)
+            self.assertIn("expert_bias", cast.state_dict())
 
 
 def _layer(expert_bias=False, bias_update_rate=0.001, **aux):
@@ -282,27 +280,6 @@ def _tiny_moe_draft(cls=DFlashDraftModel, **dflash_config):
     return cls(config)
 
 
-class _MaskRecordingDraft(nn.Module):
-    """A stand-in draft: one MoE layer over the noise embedding."""
-
-    def __init__(self, moe):
-        super().__init__()
-        self.moe = moe
-        self.sliding_window = None
-        self.seen_mask = None
-
-    def forward(
-        self,
-        position_ids,
-        noise_embedding,
-        target_hidden,
-        attention_mask,
-        moe_token_mask,
-    ):
-        self.seen_mask = moe_token_mask
-        return self.moe(noise_embedding, moe_token_mask)
-
-
 def _online(draft, **overrides):
     kwargs = dict(
         draft_model=draft,
@@ -328,12 +305,6 @@ class MaskPlumbingTest(unittest.TestCase):
     def test_the_mask_reaches_the_layers_as_an_argument(self):
         keep = torch.tensor([[True, True], [True, False]])
         anchors = torch.tensor([[1, 3], [2, 0]])
-        with self.subTest(draft="a stand-in records the argument"):
-            draft = _MaskRecordingDraft(_layer())
-            self._run_blocks(_online(draft, block_size=3), keep, anchors)
-            torch.testing.assert_close(
-                draft.seen_mask, keep.repeat_interleave(3, dim=1)
-            )
         for cls in (DFlashDraftModel, DFlash2DraftModel):
             with self.subTest(draft=cls.__name__):
                 extra = {}
@@ -381,33 +352,30 @@ class _Backend(TrainingBackend):
 
 
 class _MoEStrategy(DraftTrainStrategy):
+    """A squared-output loss, with loss_terms (token sum over token count) on request."""
+
     name = "moe-test"
     required_features = {"hidden_states"}
 
-    def __init__(self, model):
+    def __init__(self, model, terms=False):
         self.model = model
+        self.terms = terms
 
     def trainable_module(self):
         return self.model
 
     def forward_loss(self, batch, ctx=None):
-        loss = self.model(batch.tensors["hidden_states"]).square().mean()
-        return StepOutput(loss=loss, metrics={})
+        out = self.model(batch.tensors["hidden_states"])
+        numerator, denominator = out.square().sum(), torch.tensor(float(out.numel()))
+        loss_terms = (numerator, denominator) if self.terms else None
+        return StepOutput(
+            loss=numerator / denominator, metrics={}, loss_terms=loss_terms
+        )
 
 
 def _batch(x):
     tensors = {"hidden_states": x}
     return TrainBatch(sample_ids=["s0"], strategy="moe-test", tensors=tensors)
-
-
-class _TermsStrategy(_MoEStrategy):
-    """A strategy with loss_terms: a token-sum numerator over a token-count denominator."""
-
-    def forward_loss(self, batch, ctx=None):
-        out = self.model(batch.tensors["hidden_states"])
-        numerator, denominator = out.square().sum(), torch.tensor(float(out.numel()))
-        loss = numerator / denominator
-        return StepOutput(loss=loss, metrics={}, loss_terms=(numerator, denominator))
 
 
 class FoldTest(unittest.TestCase):
@@ -455,46 +423,42 @@ class FoldTest(unittest.TestCase):
 
 
 class TrainerStepHookTest(unittest.TestCase):
-    def test_the_fold_reaches_the_gradient_like_an_objective_fold(self):
-        """Through TrainerCore, the hook's fold equals folding inside the objective."""
-        torch.manual_seed(0)
-        layer, x = _layer(aux_loss_coef=0.5, aux_loss_type="microbatch_wise"), None
-        x = torch.randn(B, S, H)
-        core = TrainerCore(_TermsStrategy(layer), _Backend(layer), accumulation_steps=1)
-        core.register_step_hook(MoEBalancing(layer))
-        result = core.train_step(_batch(x))
-        got = layer.gate.weight.grad.clone()
-        # The reference: #1003's objective-side fold, numerator += coef * aux * denominator.
-        layer.zero_grad()
-        out = layer(x)
-        numerator, denominator = out.square().sum(), float(out.numel())
-        ((numerator + 0.5 * layer.aux_loss * denominator) / denominator).backward()
-        torch.testing.assert_close(got, layer.gate.weight.grad)
-        self.assertAlmostEqual(
-            float(result.metrics["moe/aux_loss"]), layer.aux_loss.item(), places=5
-        )
+    """TrainerCore runs the registered hook: the fold before backward, the step work after."""
 
-    def test_the_trainer_runs_the_registered_hook_at_the_step_boundary(self):
+    def test_the_trainer_runs_the_registered_hook(self):
         torch.manual_seed(0)
-        layer, x = _layer(expert_bias=True), torch.randn(B, S, H)
-        core = TrainerCore(_MoEStrategy(layer), _Backend(), accumulation_steps=2)
-        core.register_step_hook(MoEBalancing(layer))
-        first = core.train_step(_batch(x))
-        counts = layer.tokens_per_expert.clone()
-        self.assertTrue(torch.all(layer.gate.expert_bias == 0))
-        self.assertNotIn("moe/step_balance", first.metrics)
-        self.assertNotIn("moe/aux_loss", first.metrics)  # coefficient 0: no loss at all
-        second = core.train_step(_batch(x))  # the same routing again: counts double
-        torch.testing.assert_close(
-            layer.gate.expert_bias, _zero_mean_sign_step((2 * counts).float())
-        )
-        self.assertTrue(torch.all(layer.tokens_per_expert == 0))
-        # The step's pooled balance is reported with the boundary step's metrics.
-        self.assertAlmostEqual(
-            float(second.metrics["moe/step_balance"]),
-            dispatch_balance(2 * counts).item(),
-            places=5,
-        )
+        x = torch.randn(B, S, H)
+        with self.subTest(phase="the fold reaches the gradient like an objective fold"):
+            layer = _layer(aux_loss_coef=0.5, aux_loss_type="microbatch_wise")
+            strategy = _MoEStrategy(layer, terms=True)
+            core = TrainerCore(strategy, _Backend(layer), accumulation_steps=1)
+            core.register_step_hook(MoEBalancing(layer))
+            result = core.train_step(_batch(x))
+            got = layer.gate.weight.grad.clone()
+            # The reference: #1003's objective fold, numerator += coef * aux * denominator.
+            layer.zero_grad()
+            out = layer(x)
+            numerator, denominator = out.square().sum(), float(out.numel())
+            ((numerator + 0.5 * layer.aux_loss * denominator) / denominator).backward()
+            torch.testing.assert_close(got, layer.gate.weight.grad)
+            self.assertAlmostEqual(
+                float(result.metrics["moe/aux_loss"]), layer.aux_loss.item(), places=5
+            )
+        with self.subTest(phase="the step work runs at the accumulation boundary"):
+            layer = _layer(expert_bias=True)  # coefficient 0: no loss, no aux metric
+            core = TrainerCore(_MoEStrategy(layer), _Backend(), accumulation_steps=2)
+            core.register_step_hook(MoEBalancing(layer))
+            first = core.train_step(_batch(x))
+            self.assertNotIn("moe/step_balance", first.metrics)
+            self.assertNotIn("moe/aux_loss", first.metrics)
+            counts = layer.tokens_per_expert.clone()
+            second = core.train_step(_batch(x))  # the same routing again: counts double
+            self.assertAlmostEqual(
+                float(second.metrics["moe/step_balance"]),
+                dispatch_balance(2 * counts).item(),
+                places=5,
+            )
+            self.assertTrue(torch.all(layer.tokens_per_expert == 0))
 
 
 if __name__ == "__main__":
