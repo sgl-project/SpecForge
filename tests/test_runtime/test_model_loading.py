@@ -262,7 +262,8 @@ assert not torch.cuda.is_initialized()
         remote.architectures = ["LlamaForCausalLMEagle3"]
         remote.draft_vocab_size = 32
         with mock.patch(
-            "transformers.AutoConfig.from_pretrained", return_value=remote
+            "transformers.PretrainedConfig.get_config_dict",
+            return_value=(remote.to_dict(), {}),
         ) as load:
             resolved = load_draft_config_source(
                 "org/draft-model",
@@ -271,7 +272,13 @@ assert not torch.cuda.is_initialized()
             )
         self.assertEqual(resolved.architectures, ["LlamaForCausalLMEagle3"])
         load.assert_called_once_with(
-            "org/draft-model", cache_dir="/cache", trust_remote_code=True
+            "org/draft-model",
+            cache_dir="/cache",
+            revision=None,
+            token=None,
+            local_files_only=False,
+            force_download=False,
+            subfolder="",
         )
 
     def test_hf_warm_checkpoint_supplies_config_when_not_explicit(self):
@@ -280,7 +287,8 @@ assert not torch.cuda.is_initialized()
         remote.draft_vocab_size = 32
         cfg = _run_config("eagle3", draft_checkpoint_path="org/base-draft")
         with mock.patch(
-            "transformers.AutoConfig.from_pretrained", return_value=remote
+            "transformers.PretrainedConfig.get_config_dict",
+            return_value=(remote.to_dict(), {}),
         ) as load:
             resolved = resolve_draft_config(
                 cfg,
