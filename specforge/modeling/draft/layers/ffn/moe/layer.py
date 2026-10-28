@@ -36,7 +36,10 @@ class MoELayer(nn.Module):
         if self.shared_expert_gate is not None:
             nn.init.normal_(self.shared_expert_gate.weight, std=std)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, moe_token_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """``moe_token_mask`` [B, S] marks the real tokens, for the load balancing to come."""
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         _, indices, weights = self.gate(x)
         out = self.experts(x, indices, weights)
