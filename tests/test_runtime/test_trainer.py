@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -83,6 +84,25 @@ class WeightedStrategy(FakeStrategy):
         )
 
 
+class ReplayStrategy(WeightedStrategy):
+    def __init__(self):
+        super().__init__()
+        self.replay_enabled = True
+        self.replayed_ratios = []
+
+    def forward_loss(self, batch, ctx=None):
+        if not self.replay_enabled:
+            return super().forward_loss(batch, ctx)
+        with torch.no_grad():
+            prepared = super().forward_loss(batch, ctx)
+
+        def replay_loss(window_ratios):
+            self.replayed_ratios.append(window_ratios)
+            return super(ReplayStrategy, self).forward_loss(batch, ctx)
+
+        return replace(prepared, replay_loss=replay_loss)
+
+
 class FakeBackend(TrainingBackend):
     name = "fake"
 
@@ -144,6 +164,78 @@ def _weighted_batch(coefficient, denominator, correct):
 
 
 class TestTrainerCore(unittest.TestCase):
+    def test_rejects_mode_changes_within_accumulation_window_in_both_directions(self):
+        for replay_first in (False, True):
+            for pending in (1, 3):
+                with self.subTest(replay_first=replay_first, pending=pending):
+                    strategy = ReplayStrategy()
+                    strategy.replay_enabled = replay_first
+                    backend = FakeBackend(strategy.model)
+                    core = TrainerCore(strategy, backend, accumulation_steps=4)
+                    for _ in range(pending):
+                        core.train_step(_weighted_batch(2, 1, 1))
+                    backwards = backend.backwards
+                    gradient = strategy.model.w.grad
+                    if gradient is not None:
+                        gradient = gradient.clone()
+
+                    strategy.replay_enabled = not replay_first
+                    with self.assertRaisesRegex(
+                        ValueError, "Cannot mix immediate and replayed losses"
+                    ):
+                        core.train_step(_weighted_batch(100, 10, 0))
+                    self.assertEqual(core.accumulation_remainder, pending)
+                    self.assertEqual(backend.backwards, backwards)
+                    self.assertEqual(backend.steps, 0)
+                    self.assertFalse(strategy.replayed_ratios)
+                    torch.testing.assert_close(strategy.model.w.grad, gradient)
+
+                    # Rejection must not contaminate the existing window.
+                    strategy.replay_enabled = replay_first
+                    for _ in range(4 - pending):
+                        result = core.train_step(_weighted_batch(2, 1, 1))
+                    self.assertTrue(result.optimizer_stepped)
+                    self.assertEqual(core.accumulation_remainder, 0)
+                    self.assertEqual(backend.backwards, 4)
+                    self.assertEqual(backend.boundaries, [False, False, False, True])
+                    self.assertEqual(backend.steps, 1)
+                    self.assertEqual(result.metrics["acc"], 1.0)
+                    self.assertEqual(result.metrics["sample_count"], 4.0)
+                    torch.testing.assert_close(
+                        strategy.model.w.grad, torch.tensor([2.0])
+                    )
+
+    def test_modes_can_change_between_complete_accumulation_windows(self):
+        for first_mode in (False, True):
+            with self.subTest(first_mode=first_mode):
+                strategy = ReplayStrategy()
+                backend = FakeBackend(strategy.model)
+                core = TrainerCore(strategy, backend, accumulation_steps=2)
+                for window, mode in enumerate((first_mode, not first_mode, first_mode)):
+                    strategy.replay_enabled = mode
+                    strategy.model.zero_grad(set_to_none=True)
+                    first = core.train_step(_weighted_batch(2, 1, 1))
+                    self.assertFalse(first.optimizer_stepped)
+                    self.assertEqual(core.accumulation_remainder, 1)
+                    self.assertEqual(backend.backwards, 2 * window + int(not mode))
+                    self.assertEqual(backend.steps, window)
+                    result = core.train_step(_weighted_batch(30, 3, 1))
+                    self.assertTrue(result.optimizer_stepped)
+                    self.assertEqual(core.accumulation_remainder, 0)
+                    self.assertEqual(backend.backwards, 2 * (window + 1))
+                    self.assertEqual(backend.steps, window + 1)
+                    self.assertEqual(result.loss, 8.0)
+                    self.assertEqual(result.metrics["acc"], 0.5)
+                    self.assertEqual(result.metrics["sample_count"], 4.0)
+                    torch.testing.assert_close(
+                        strategy.model.w.grad, torch.tensor([8.0])
+                    )
+                self.assertEqual(backend.boundaries, [False, True] * 3)
+                for ratios in strategy.replayed_ratios:
+                    torch.testing.assert_close(
+                        ratios["acc"], (torch.tensor(2.0), torch.tensor(4.0))
+                    )
+
     def test_accumulation_boundary(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
