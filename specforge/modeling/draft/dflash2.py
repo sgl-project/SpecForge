@@ -228,7 +228,7 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        token_mask: Optional[torch.Tensor] = None,
+        moe_token_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -255,7 +255,7 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
-        hidden_states = self._ffn(hidden_states, token_mask)
+        hidden_states = self._ffn(hidden_states, moe_token_mask)
         hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return residual + hidden_states
 

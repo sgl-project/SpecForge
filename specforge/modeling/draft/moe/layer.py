@@ -90,14 +90,14 @@ class MoELayer(nn.Module):
         self.experts.reset_parameters(std)
 
     def forward(
-        self, hidden_states: torch.Tensor, token_mask: Optional[torch.Tensor] = None
+        self, hidden_states: torch.Tensor, moe_token_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """``token_mask`` [B, S] marks the tokens the balancing counts; None counts all."""
+        """``moe_token_mask`` [B, S] marks the tokens the balancing counts; None counts all."""
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         scores, indices, weights = self.gate(x)
         self.aux_loss = None
         if self.training:
-            mask = None if token_mask is None else token_mask.reshape(-1)
+            mask = None if moe_token_mask is None else moe_token_mask.reshape(-1)
             counts = count_tokens_per_expert(indices, mask, self.gate.num_experts)
             self.tokens_per_expert += counts
             if self.aux_loss_coef != 0:

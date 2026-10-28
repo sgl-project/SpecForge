@@ -102,7 +102,7 @@ def _layer(expert_bias=False, bias_update_rate=0.001, **aux):
     return MoELayer(gate=gate, experts=experts, **aux)
 
 
-def _real_token_mask():
+def _real_moe_token_mask():
     mask = torch.ones(B, S, dtype=torch.bool)
     mask[1, 4:] = False  # the second sample ends in padding
     return mask
@@ -147,7 +147,7 @@ class LoadBalanceLossTest(unittest.TestCase):
         logits = torch.randn(B * S, E, requires_grad=True)
         scores = logits.softmax(dim=-1)
         indices = scores.topk(K, dim=-1).indices
-        for mask in (None, _real_token_mask()):
+        for mask in (None, _real_moe_token_mask()):
             with self.subTest(masked=mask is not None):
                 # transformers sums the K slots per token: K times our per-token form.
                 want = load_balancing_loss_func((logits,), E, K, mask)
@@ -171,7 +171,7 @@ class LayerAuxLossTest(unittest.TestCase):
 
     def test_the_loss_follows_the_coefficient_and_the_load_type(self):
         torch.manual_seed(0)
-        x, x2, mask = torch.randn(B, S, H), torch.randn(B, S, H), _real_token_mask()
+        x, x2, mask = torch.randn(B, S, H), torch.randn(B, S, H), _real_moe_token_mask()
         flat = mask.reshape(-1)
         with self.subTest(phase="coefficient 0 skips the loss and its collectives"):
             layer = _layer(aux_loss_coef=0.0)
@@ -390,7 +390,11 @@ class FoldTest(unittest.TestCase):
                 _layer(aux_loss_coef=0.0),  # no loss, no term
             ]
         )
-        hook, x, mask = MoEBalancing(model), torch.randn(B, S, H), _real_token_mask()
+        hook, x, mask = (
+            MoEBalancing(model),
+            torch.randn(B, S, H),
+            _real_moe_token_mask(),
+        )
         for layer in model:
             layer(x, mask)
         losses = [model[0].aux_loss, model[1].aux_loss]

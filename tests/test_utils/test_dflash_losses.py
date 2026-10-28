@@ -80,7 +80,7 @@ class _FixedDraft(nn.Module):
         noise_embedding,
         target_hidden,
         attention_mask,
-        block_keep_mask=None,
+        moe_token_mask=None,
     ):
         bsz, draft_len = noise_embedding.shape[:2]
         return torch.zeros(
@@ -131,9 +131,9 @@ class _LearnableDSparkDraft(_FixedDraft):
         noise_embedding,
         target_hidden,
         attention_mask,
-        block_keep_mask=None,
+        moe_token_mask=None,
     ):
-        del position_ids, target_hidden, attention_mask, block_keep_mask
+        del position_ids, target_hidden, attention_mask, moe_token_mask
         bsz, draft_len = noise_embedding.shape[:2]
         return self.signal.view(1, 1, -1).expand(bsz, draft_len, -1)
 
