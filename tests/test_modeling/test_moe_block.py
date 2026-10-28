@@ -182,14 +182,22 @@ class BuildFfnTest(unittest.TestCase):
 
 class FamilyConfigTest(unittest.TestCase):
     def test_family_reads_the_config_and_rejects_bad_values(self):
-        gate = build_moe(_config()).gate
+        knobs = {
+            "moe_router_enable_expert_bias": True,
+            "moe_router_bias_update_rate": 0.01,
+        }
+        gate = build_moe(_config(dflash_config=knobs)).gate
         self.assertEqual(
             (gate.num_experts, gate.top_k, gate.norm_topk_prob), (E, K, True)
         )
-        # Qwen3.8's config omits norm_topk_prob; transformers renormalizes, so do we.
+        self.assertIsNotNone(gate.expert_bias)
+        self.assertEqual(gate.bias_update_rate, 0.01)
+        # Defaults: no bias, renormalized top-k; Qwen3.8's config omits norm_topk_prob.
         config = _config()
         del config.norm_topk_prob
-        self.assertTrue(build_moe(config).gate.norm_topk_prob)
+        plain = build_moe(config).gate
+        self.assertIsNone(plain.expert_bias)
+        self.assertTrue(plain.norm_topk_prob)
         # Width 0 drops the shared expert: the block is the routed experts alone.
         routed_only = build_moe(_config(shared_expert_intermediate_size=0))
         self.assertIsNone(routed_only.shared_expert)

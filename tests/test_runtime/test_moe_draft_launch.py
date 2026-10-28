@@ -21,6 +21,10 @@ MOE_DRAFT = {
     "moe_intermediate_size": 32,
     "shared_expert_intermediate_size": 0,
     "norm_topk_prob": False,
+    "dflash_config": {
+        "moe_router_enable_expert_bias": True,
+        "moe_router_bias_update_rate": 0.001,
+    },
 }
 
 
@@ -92,13 +96,19 @@ def _worker(rank, world_size, sharding):
     assert len(logged) == 2
     assert math.isfinite(logged[-1]["moe/step_balance"])
     assert torch.all(layers[0].tokens_per_expert == 0)
+    # Every rank applied the same pooled bias update, under DDP without buffer sync.
+    gate = layers[0].gate
+    assert torch.isfinite(gate.expert_bias).all()
+    gathered = [torch.empty_like(gate.expert_bias) for _ in range(world_size)]
+    dist.all_gather(gathered, gate.expert_bias)
+    assert all(torch.equal(other, gate.expert_bias) for other in gathered)
     dist.barrier()
     dist.destroy_process_group()
 
 
 @unittest.skipUnless(CUDA and NGPU >= WORLD, f"requires >={WORLD} GPUs")
 class TestMoEDraftLaunch(unittest.TestCase):
-    def test_moe_dspark_trains_from_precomputed_features(self):
+    def test_moe_dspark_trains_and_balances_from_precomputed_features(self):
         import torch.multiprocessing as mp
 
         for sharding in ("SHARD_GRAD_OP", "NO_SHARD"):  # FSDP, then DDP
