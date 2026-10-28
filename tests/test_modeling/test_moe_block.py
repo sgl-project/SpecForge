@@ -201,14 +201,20 @@ class FamilyConfigTest(unittest.TestCase):
         knobs = {
             "moe_router_enable_expert_bias": True,
             "moe_router_bias_update_rate": 0.01,
+            "moe_router_aux_loss_coef": 0.25,
+            "moe_router_aux_loss_type": "microbatch_wise",
         }
-        gate = build_moe(_config(dflash_config=knobs)).gate
+        layer = build_moe(_config(dflash_config=knobs))
+        gate = layer.gate
         self.assertIsInstance(gate, Router)  # the contract families implement
         self.assertEqual(
             (gate.num_experts, gate.top_k, gate.norm_topk_prob), (E, K, True)
         )
         self.assertIsNotNone(gate.expert_bias)
         self.assertEqual(gate.bias_update_rate, 0.01)
+        self.assertEqual(
+            (layer.aux_loss_coef, layer.aux_loss_type), (0.25, "microbatch_wise")
+        )
 
         # A family only supplies score(); select and routing_weights come from Router.
         class Uniform(Router):
@@ -223,12 +229,15 @@ class FamilyConfigTest(unittest.TestCase):
             ((3, E), (3, K), (3, K)),
         )
         self.assertTrue(torch.all(weights == 2.0 / E))
-        # Defaults: no bias, renormalized top-k; Qwen3.8's config omits norm_topk_prob.
+        # Defaults: no bias, no loss, batch-wise load, renormalized top-k (Qwen3.8 omits it).
         config = _config()
         del config.norm_topk_prob
-        plain = build_moe(config).gate
-        self.assertIsNone(plain.expert_bias)
-        self.assertTrue(plain.norm_topk_prob)
+        plain = build_moe(config)
+        self.assertIsNone(plain.gate.expert_bias)
+        self.assertEqual(
+            (plain.aux_loss_coef, plain.aux_loss_type), (0.0, "batch_wise")
+        )
+        self.assertTrue(plain.gate.norm_topk_prob)
         # Width 0 drops the shared expert: the block is the routed experts alone.
         routed_only = build_moe(_config(shared_expert_intermediate_size=0))
         self.assertIsNone(routed_only.shared_expert)
@@ -239,6 +248,8 @@ class FamilyConfigTest(unittest.TestCase):
         for top_k in (0, E + 1):
             with self.assertRaises(ValueError):
                 TopKRouter(E, H, top_k, norm_topk_prob=True, initializer_range=0.02)
+        with self.assertRaisesRegex(ValueError, "aux_loss_type"):
+            build_moe(_config(dflash_config={"moe_router_aux_loss_type": "x"}))
 
 
 if __name__ == "__main__":

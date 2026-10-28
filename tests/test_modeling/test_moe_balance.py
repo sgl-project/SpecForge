@@ -1,5 +1,5 @@
 # coding=utf-8
-"""The balancing: the router's expert bias, the layer's counts, the step hook."""
+"""The balancing: the router's expert bias, the layer's counts and loss, the step hook."""
 
 import unittest
 from unittest import mock
@@ -8,6 +8,9 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from transformers import Qwen3Config
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    load_balancing_loss_func,
+)
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.modeling.draft.dflash import DFlashDraftModel
@@ -21,6 +24,7 @@ from specforge.modeling.draft.layers.ffn.moe.experts import RoutedExperts
 from specforge.modeling.draft.layers.ffn.moe.layer import (
     MoELayer,
     count_tokens_per_expert,
+    load_balance_loss,
 )
 from specforge.modeling.draft.layers.ffn.moe.router import Router, TopKRouter
 from specforge.runtime.contracts import TrainBatch
@@ -84,7 +88,7 @@ class RouterContractTest(unittest.TestCase):
             self.assertIn("expert_bias", cast.state_dict())
 
 
-def _layer(expert_bias=False, bias_update_rate=0.001):
+def _layer(expert_bias=False, bias_update_rate=0.001, **aux):
     gate = TopKRouter(
         E,
         H,
@@ -95,7 +99,7 @@ def _layer(expert_bias=False, bias_update_rate=0.001):
         bias_update_rate=bias_update_rate,
     )
     experts = RoutedExperts(E, H, 8, initializer_range=0.5)
-    return MoELayer(gate=gate, experts=experts)
+    return MoELayer(gate=gate, experts=experts, **aux)
 
 
 def _real_moe_token_mask():
@@ -135,6 +139,76 @@ class LayerCountsTest(unittest.TestCase):
             cast = layer.bfloat16()
             self.assertEqual(cast.tokens_per_expert.dtype, torch.int64)
             self.assertTrue(torch.equal(cast.tokens_per_expert, want))
+
+
+class LoadBalanceLossTest(unittest.TestCase):
+    def test_matches_transformers_load_balancing_loss(self):
+        torch.manual_seed(0)
+        logits = torch.randn(B * S, E, requires_grad=True)
+        scores = logits.softmax(dim=-1)
+        indices = scores.topk(K, dim=-1).indices
+        for mask in (None, _real_moe_token_mask()):
+            with self.subTest(masked=mask is not None):
+                # transformers sums the K slots per token: K times our per-token form.
+                want = load_balancing_loss_func((logits,), E, K, mask)
+                flat = None if mask is None else mask.reshape(-1)
+                counts = count_tokens_per_expert(indices, flat, E)
+                torch.testing.assert_close(
+                    K * load_balance_loss(scores, counts, flat), want
+                )
+        with self.subTest(masked="every token"):
+            none = torch.zeros(B * S, dtype=torch.bool)
+            loss = load_balance_loss(
+                scores, count_tokens_per_expert(indices, none, E), none
+            )
+            self.assertEqual(loss.item(), 0.0)
+            loss.backward()
+            self.assertTrue(torch.all(logits.grad == 0))
+
+
+class LayerAuxLossTest(unittest.TestCase):
+    """The layer's per-forward loss: its load, its gradient, and when it is skipped."""
+
+    def test_the_loss_follows_the_coefficient_and_the_load_type(self):
+        torch.manual_seed(0)
+        x, x2, mask = torch.randn(B, S, H), torch.randn(B, S, H), _real_moe_token_mask()
+        flat = mask.reshape(-1)
+        with self.subTest(phase="coefficient 0 skips the loss and its collectives"):
+            layer = _layer(aux_loss_coef=0.0)
+            with mock.patch.object(dist, "is_initialized", return_value=True):
+                with mock.patch.object(dist, "all_reduce") as all_reduce:
+                    layer(x, mask)
+            self.assertIsNone(layer.aux_loss)
+            all_reduce.assert_not_called()
+        with self.subTest(phase="micro-batch-wise: this micro-batch's counts"):
+            layer = _layer(aux_loss_coef=0.5, aux_loss_type="microbatch_wise")
+            layer(x, mask)
+            scores, indices, _ = layer.gate(x.reshape(-1, H))
+            want = load_balance_loss(
+                scores, count_tokens_per_expert(indices, flat, E), flat
+            )
+            torch.testing.assert_close(layer.aux_loss, want)
+            (grad,) = torch.autograd.grad(layer.aux_loss, layer.gate.weight)
+            self.assertTrue(torch.any(grad != 0))
+        with self.subTest(phase="batch-wise: the step's counts so far, pooled"):
+            layer = _layer(aux_loss_coef=0.5)  # the default type
+            layer(x, mask)
+            first = layer.tokens_per_expert.clone()
+            other = torch.tensor([9, 0, 0, 0, 0, 0, 0, 3])  # another rank's counts
+            with mock.patch.object(dist, "is_initialized", return_value=True):
+                with mock.patch.object(dist, "all_reduce", lambda t: t.add_(other)):
+                    layer(x2)
+            scores, indices, _ = layer.gate(x2.reshape(-1, H))
+            pooled = first + count_tokens_per_expert(indices, None, E) + other
+            torch.testing.assert_close(
+                layer.aux_loss, load_balance_loss(scores, pooled)
+            )
+            self.assertTrue(torch.all(layer.tokens_per_expert == pooled - other))
+        with self.subTest(phase="eval and bad types"):
+            layer.eval()(x, mask)
+            self.assertIsNone(layer.aux_loss)
+            with self.assertRaises(ValueError):
+                _layer(aux_loss_type="x")
 
 
 class StepHookTest(unittest.TestCase):
@@ -308,25 +382,91 @@ def _batch(x):
     return TrainBatch(sample_ids=["s0"], strategy="moe-test", tensors=tensors)
 
 
-class TrainerStepHookTest(unittest.TestCase):
-    def test_the_trainer_runs_the_registered_hook_at_the_step_boundary(self):
+class FoldTest(unittest.TestCase):
+    """before_backward adds coef x loss per layer to the objective and logs the raw mean."""
+
+    def test_the_hook_folds_the_layers_losses_once(self):
         torch.manual_seed(0)
-        layer, x = _layer(expert_bias=True), torch.randn(B, S, H)
-        core = TrainerCore(_MoEStrategy(layer), _Backend(), accumulation_steps=2)
-        core.register_step_hook(MoEBalancing(layer))
-        first = core.train_step(_batch(x))
-        self.assertNotIn("moe/step_balance", first.metrics)
-        counts = layer.tokens_per_expert.clone()
-        second = core.train_step(_batch(x))  # the same routing again: counts double
-        torch.testing.assert_close(
-            layer.gate.expert_bias, _zero_mean_sign_step((2 * counts).float())
+        model = nn.ModuleList(
+            [
+                _layer(aux_loss_coef=0.5, aux_loss_type="microbatch_wise"),
+                _layer(aux_loss_coef=0.25),
+                _layer(aux_loss_coef=0.0),  # no loss, no term
+            ]
         )
-        self.assertAlmostEqual(
-            float(second.metrics["moe/step_balance"]),
-            dispatch_balance(2 * counts).item(),
-            places=5,
+        hook, x, mask = (
+            MoEBalancing(model),
+            torch.randn(B, S, H),
+            _real_moe_token_mask(),
         )
-        self.assertTrue(torch.all(layer.tokens_per_expert == 0))
+        for layer in model:
+            layer(x, mask)
+        losses = [model[0].aux_loss, model[1].aux_loss]
+        weighted, raw = 0.5 * losses[0] + 0.25 * losses[1], (losses[0] + losses[1]) / 2
+        out = StepOutput(
+            loss=torch.tensor(2.0),
+            metrics={},
+            loss_terms=(torch.tensor(6.0), torch.tensor(3.0)),
+        )
+        with self.subTest(phase="with loss_terms: the numerator carries the fold"):
+            folded = hook.before_backward(out)
+            torch.testing.assert_close(folded.loss, 2.0 + weighted)
+            numerator, denominator = folded.loss_terms
+            torch.testing.assert_close(numerator, 6.0 + weighted * 3.0)
+            self.assertEqual(denominator.item(), 3.0)
+            metric, weight = folded.ratio_metrics["moe/aux_loss"]
+            torch.testing.assert_close(metric, raw.detach())
+            self.assertEqual(weight.item(), 1.0)
+            self.assertFalse(metric.requires_grad)
+            self.assertTrue(all(layer.aux_loss is None for layer in model))
+        with self.subTest(phase="consumed: a second call changes nothing"):
+            self.assertIs(hook.before_backward(out), out)
+        with self.subTest(phase="without loss_terms: the loss carries the fold"):
+            for layer in model:
+                layer(x, mask)
+            plain = StepOutput(loss=torch.tensor(2.0), metrics={})
+            folded = hook.before_backward(plain)
+            torch.testing.assert_close(folded.loss, 2.0 + weighted)
+            self.assertIsNone(folded.loss_terms)
+
+
+class TrainerStepHookTest(unittest.TestCase):
+    """TrainerCore runs the registered hook: the fold before backward, the step work after."""
+
+    def test_the_trainer_runs_the_registered_hook(self):
+        torch.manual_seed(0)
+        x = torch.randn(B, S, H)
+        with self.subTest(phase="the fold reaches the gradient like an objective fold"):
+            layer = _layer(aux_loss_coef=0.5, aux_loss_type="microbatch_wise")
+            strategy = _MoEStrategy(layer, terms=True)
+            core = TrainerCore(strategy, _Backend(layer), accumulation_steps=1)
+            core.register_step_hook(MoEBalancing(layer))
+            result = core.train_step(_batch(x))
+            got = layer.gate.weight.grad.clone()
+            # The reference: #1003's objective fold, numerator += coef * aux * denominator.
+            layer.zero_grad()
+            out = layer(x)
+            numerator, denominator = out.square().sum(), float(out.numel())
+            ((numerator + 0.5 * layer.aux_loss * denominator) / denominator).backward()
+            torch.testing.assert_close(got, layer.gate.weight.grad)
+            self.assertAlmostEqual(
+                float(result.metrics["moe/aux_loss"]), layer.aux_loss.item(), places=5
+            )
+        with self.subTest(phase="the step work runs at the accumulation boundary"):
+            layer = _layer(expert_bias=True)  # coefficient 0: no loss, no aux metric
+            core = TrainerCore(_MoEStrategy(layer), _Backend(), accumulation_steps=2)
+            core.register_step_hook(MoEBalancing(layer))
+            first = core.train_step(_batch(x))
+            self.assertNotIn("moe/step_balance", first.metrics)
+            self.assertNotIn("moe/aux_loss", first.metrics)
+            counts = layer.tokens_per_expert.clone()
+            second = core.train_step(_batch(x))  # the same routing again: counts double
+            self.assertAlmostEqual(
+                float(second.metrics["moe/step_balance"]),
+                dispatch_balance(2 * counts).item(),
+                places=5,
+            )
+            self.assertTrue(torch.all(layer.tokens_per_expert == 0))
 
 
 if __name__ == "__main__":

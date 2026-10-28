@@ -69,9 +69,10 @@ def _tiny_dflash2(attention_backend, *, sliding, moe=False):
         },
     )
     config._attn_implementation = attention_backend
-    if moe:  # the MoE FFN of the DSpark MoE recipe, with its expert bias
+    if moe:  # the MoE FFN of the DSpark MoE recipe, with its bias and batch-wise loss
         config.update(_TINY_MOE)
         config.dflash_config["moe_router_enable_expert_bias"] = True
+        config.dflash_config["moe_router_aux_loss_coef"] = 0.01
     device = torch.device("cuda")
     draft = DFlash2DraftModel(config).to(device, torch.bfloat16)
     return OnlineDFlashModel(
@@ -191,7 +192,7 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
         for backend, sliding, moe in (
             ("sdpa", False, False),
             ("flex_attention", True, False),
-            ("sdpa", False, True),  # the MoE layer's counts must stay on device
+            ("sdpa", False, True),  # the MoE layer's counts and loss stay on device
         ):
             with self.subTest(backend=backend, sliding=sliding, moe=moe):
                 strategy = DFlashTrainStrategy(

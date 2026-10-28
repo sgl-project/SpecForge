@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Two ranks pool their counts: the bias update and the step metric agree."""
+"""Two ranks pool their counts: the batch-wise load, the bias update and the metric agree."""
 
 import unittest
 
@@ -23,7 +23,10 @@ def _worker(rank, world_size):
         dispatch_balance,
     )
     from specforge.modeling.draft.layers.ffn.moe.experts import RoutedExperts
-    from specforge.modeling.draft.layers.ffn.moe.layer import MoELayer
+    from specforge.modeling.draft.layers.ffn.moe.layer import (
+        MoELayer,
+        load_balance_loss,
+    )
     from specforge.modeling.draft.layers.ffn.moe.router import TopKRouter
 
     torch.manual_seed(0)  # the same weights on every rank
@@ -31,12 +34,16 @@ def _worker(rank, world_size):
         E, H, 1, norm_topk_prob=False, initializer_range=0.5, expert_bias=True
     )
     experts = RoutedExperts(E, H, 8, initializer_range=0.5)
-    layer = MoELayer(gate, experts).cuda()
+    layer = MoELayer(gate, experts, aux_loss_coef=0.01).cuda()  # batch-wise load
     torch.manual_seed(100 + rank)  # different tokens on each rank
-    layer(torch.randn(T, H, device="cuda"))
+    x = torch.randn(T, H, device="cuda")
+    layer(x)  # the batch-wise loss pools both ranks' counts inside the forward
+    got = layer.aux_loss
     pooled = layer.tokens_per_expert.clone()
     dist.all_reduce(pooled)
     pooled = pooled.float()
+    scores, _, _ = gate(x)
+    torch.testing.assert_close(got, load_balance_loss(scores, pooled))
 
     metrics = MoEBalancing(layer).on_step()  # one real all-reduce, then the bias moves
     delta = 0.001 * torch.sign(pooled.mean() - pooled)
@@ -53,7 +60,7 @@ def _worker(rank, world_size):
 
 @unittest.skipUnless(CUDA and NGPU >= WORLD, f"requires >={WORLD} GPUs")
 class TestMoEBalanceTwoRanks(unittest.TestCase):
-    def test_pooled_counts_drive_the_bias_and_the_step_metric(self):
+    def test_pooled_counts_drive_the_load_the_bias_and_the_step_metric(self):
         import torch.multiprocessing as mp
 
         mp.spawn(_worker, args=(WORLD,), nprocs=WORLD, join=True)
