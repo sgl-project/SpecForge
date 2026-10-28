@@ -1,6 +1,7 @@
 # coding=utf-8
 """An MoE DSpark draft through the canonical offline trainer runtime on two GPUs, FSDP and DDP."""
 
+import math
 import os
 import tempfile
 import unittest
@@ -87,7 +88,10 @@ def _worker(rank, world_size, sharding):
         assert module.sharding_strategy is ShardingStrategy.SHARD_GRAD_OP
     assert trainer.fit() == 2
     assert all(torch.isfinite(p).all() for p in module.parameters())
-    assert len(logged) == 2  # one log per optimizer step
+    # The registered step hook ran: its metric reached the log, the counts were reset.
+    assert len(logged) == 2
+    assert math.isfinite(logged[-1]["moe/step_balance"])
+    assert torch.all(layers[0].tokens_per_expert == 0)
     dist.barrier()
     dist.destroy_process_group()
 

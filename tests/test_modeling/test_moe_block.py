@@ -156,11 +156,13 @@ class BuildFfnTest(unittest.TestCase):
             build_ffn(
                 Qwen3Config(**TINY_DFLASH, moe_preset="qwen3_moe"), dense=Qwen3MLP
             )
-        # DFlash layers build their MLP through it.
+        # DFlash layers build their MLP through it; MoE drafts refuse checkpointing.
         dense_draft = DFlashDraftModel(config)
         self.assertTrue(all(isinstance(l.mlp, Qwen3MLP) for l in dense_draft.layers))
         moe_draft = DFlashDraftModel(moe_config)
         self.assertTrue(all(isinstance(l.mlp, MoELayer) for l in moe_draft.layers))
+        with self.assertRaisesRegex(ValueError, "activation checkpointing"):
+            moe_draft.gradient_checkpointing_enable()
 
     def test_from_pretrained_inits_missing_moe_weights_and_keeps_loaded_ones(self):
         model = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE))

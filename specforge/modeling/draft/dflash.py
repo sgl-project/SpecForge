@@ -629,6 +629,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        moe_token_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -648,9 +649,17 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self._ffn(hidden_states, moe_token_mask)
         hidden_states = residual + hidden_states
         return hidden_states
+
+    def _ffn(
+        self, hidden_states: torch.Tensor, moe_token_mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        # Only an MoELayer takes the mask; the dense MLP keeps its one-argument call.
+        if moe_token_mask is None or not isinstance(self.mlp, MoELayer):
+            return self.mlp(hidden_states)
+        return self.mlp(hidden_states, moe_token_mask)
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
@@ -779,6 +788,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if isinstance(module, MoELayer):
             # HF's init skips the MoE layer's bare Parameters.
             module.reset_parameters(self.config.initializer_range)
+
+    def gradient_checkpointing_enable(self, *args, **kwargs) -> None:
+        if any(isinstance(module, MoELayer) for module in self.modules()):
+            # MoE layers count tokens in forward; a recompute would count them twice.
+            raise ValueError("MoE drafts do not support activation checkpointing")
+        super().gradient_checkpointing_enable(*args, **kwargs)
 
     def _build_decoder_layer(
         self,
@@ -915,6 +930,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        moe_token_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
@@ -941,6 +957,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                moe_token_mask=moe_token_mask,
                 **kwargs,
             )
         return self.norm(hidden_states)

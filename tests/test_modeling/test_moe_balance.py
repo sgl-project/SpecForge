@@ -7,14 +7,26 @@ from unittest import mock
 import torch
 import torch.distributed as dist
 from torch import nn
+from transformers import Qwen3Config
 
-from specforge.modeling.draft.moe.balance import MoEBalancing, dispatch_balance
+from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.dflash2 import DFlash2DraftModel
+from specforge.modeling.draft.moe.balance import (
+    MoEBalancing,
+    dispatch_balance,
+    moe_layers,
+)
 from specforge.modeling.draft.moe.experts import RoutedExperts
 from specforge.modeling.draft.moe.layer import MoELayer, count_tokens_per_expert
 from specforge.modeling.draft.moe.router import Router, TopKRouter
+from specforge.runtime.contracts import TrainBatch
+from specforge.training.backend import TrainingBackend
+from specforge.training.controller import TrainerCore
+from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 
 E, K, T, H = 8, 2, 12, 16
-B, S = 2, 6
+B, S, V = 2, 6, 32
 
 
 def _router(expert_bias=True, norm_topk_prob=True):
@@ -157,6 +169,166 @@ class StepHookTest(unittest.TestCase):
             dense = MoEBalancing(nn.Linear(2, 2))
             self.assertEqual(dense.layers, [])
             self.assertEqual(dense.on_step(), {})
+
+
+def _tiny_moe_draft(cls=DFlashDraftModel, **dflash_config):
+    """A one-layer DFlash-family draft whose FFN is a 4-expert top-2 MoE, on CPU."""
+    config = Qwen3Config(
+        architectures=[cls.__name__],
+        hidden_size=H,
+        intermediate_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=1,
+        num_target_layers=4,
+        head_dim=4,
+        max_position_embeddings=64,
+        vocab_size=V,
+        layer_types=["full_attention"],
+        block_size=2,
+        dflash_config={"target_layer_ids": [1], **dflash_config},
+        moe_preset="qwen3_5_moe",
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=0,
+        norm_topk_prob=False,
+    )
+    config._attn_implementation = "eager"
+    return cls(config)
+
+
+class _MaskRecordingDraft(nn.Module):
+    """A stand-in draft: one MoE layer over the noise embedding."""
+
+    def __init__(self, moe):
+        super().__init__()
+        self.moe = moe
+        self.sliding_window = None
+        self.seen_mask = None
+
+    def forward(
+        self,
+        position_ids,
+        noise_embedding,
+        target_hidden,
+        attention_mask,
+        moe_token_mask,
+    ):
+        self.seen_mask = moe_token_mask
+        return self.moe(noise_embedding, moe_token_mask)
+
+
+def _online(draft, **overrides):
+    kwargs = dict(
+        draft_model=draft,
+        target_lm_head=nn.Linear(H, V, bias=False),
+        target_embed_tokens=nn.Embedding(V, H),
+        mask_token_id=V - 1,
+        block_size=2,
+        attention_backend="eager",
+        num_anchors=2,
+    )
+    return OnlineDFlashModel(**{**kwargs, **overrides})
+
+
+class MaskPlumbingTest(unittest.TestCase):
+    """The draft blocks hand the kept-block mask down to every MoE layer."""
+
+    def _run_blocks(self, model, keep, anchors):
+        model._sample_anchor_positions = lambda *args, **kwargs: (anchors, keep)
+        torch.manual_seed(0)
+        input_ids = torch.randint(1, V, (2, 6))
+        model._forward_draft_blocks(input_ids, torch.randn(2, 6, H), torch.ones(2, 6))
+
+    def test_the_mask_reaches_the_layers_as_an_argument(self):
+        keep = torch.tensor([[True, True], [True, False]])
+        anchors = torch.tensor([[1, 3], [2, 0]])
+        with self.subTest(draft="a stand-in records the argument"):
+            draft = _MaskRecordingDraft(_layer())
+            self._run_blocks(_online(draft, block_size=3), keep, anchors)
+            torch.testing.assert_close(
+                draft.seen_mask, keep.repeat_interleave(3, dim=1)
+            )
+        for cls in (DFlashDraftModel, DFlash2DraftModel):
+            with self.subTest(draft=cls.__name__):
+                extra = {}
+                if cls is DFlash2DraftModel:
+                    extra = dict(
+                        conv_group_size=4,
+                        conv_kernel_size=2,
+                        selector_rank=4,
+                        selector_top_k=3,
+                    )
+                draft = _tiny_moe_draft(cls, **extra)
+                self._run_blocks(_online(draft), keep, anchors)
+                (layer,) = moe_layers(draft)
+                # Only the kept blocks' tokens were counted: block_size 2, top-2.
+                self.assertEqual(
+                    layer.tokens_per_expert.sum().item(), keep.sum().item() * 2 * 2
+                )
+
+
+class _Backend(TrainingBackend):
+    name = "test"
+
+    def prepare_model(self, model):
+        return model
+
+    def backward(self, loss, *, is_boundary=True):
+        loss.backward()
+
+    def step(self):
+        return torch.tensor(1.0)
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state):
+        pass
+
+
+class _MoEStrategy(DraftTrainStrategy):
+    name = "moe-test"
+    required_features = {"hidden_states"}
+
+    def __init__(self, model):
+        self.model = model
+
+    def trainable_module(self):
+        return self.model
+
+    def forward_loss(self, batch, ctx=None):
+        loss = self.model(batch.tensors["hidden_states"]).square().mean()
+        return StepOutput(loss=loss, metrics={})
+
+
+def _batch(x):
+    tensors = {"hidden_states": x}
+    return TrainBatch(sample_ids=["s0"], strategy="moe-test", tensors=tensors)
+
+
+class TrainerStepHookTest(unittest.TestCase):
+    def test_the_trainer_runs_the_registered_hook_at_the_step_boundary(self):
+        torch.manual_seed(0)
+        layer, x = _layer(expert_bias=True), torch.randn(B, S, H)
+        core = TrainerCore(_MoEStrategy(layer), _Backend(), accumulation_steps=2)
+        core.register_step_hook(MoEBalancing(layer))
+        first = core.train_step(_batch(x))
+        counts = layer.tokens_per_expert.clone()
+        self.assertTrue(torch.all(layer.gate.expert_bias == 0))
+        self.assertNotIn("moe/step_balance", first.metrics)
+        second = core.train_step(_batch(x))  # the same routing again: counts double
+        torch.testing.assert_close(
+            layer.gate.expert_bias, _zero_mean_sign_step((2 * counts).float())
+        )
+        self.assertTrue(torch.all(layer.tokens_per_expert == 0))
+        # The step's pooled balance is reported with the boundary step's metrics.
+        self.assertAlmostEqual(
+            float(second.metrics["moe/step_balance"]),
+            dispatch_balance(2 * counts).item(),
+            places=5,
+        )
 
 
 if __name__ == "__main__":

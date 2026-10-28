@@ -640,6 +640,8 @@ class OnlineDFlashModel(nn.Module):
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            # MoE layers count only the kept blocks' tokens for their balancing.
+            moe_token_mask=block_keep_mask.repeat_interleave(self.block_size, dim=1),
             **draft_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
