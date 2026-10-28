@@ -445,9 +445,10 @@ class Trainer:
         )
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
         # MoE drafts: the pooled counts and bias updates, once per optimizer step.
-        balancing = MoEBalancing(model)
-        if balancing.layers:
-            core.register_step_hook(balancing)
+        if isinstance(model, torch.nn.Module):
+            balancing = MoEBalancing(model)
+            if balancing.layers:
+                core.register_step_hook(balancing)
         ack_fn = None
         if durable_ack:
 
