@@ -165,19 +165,28 @@ class BuildFfnTest(unittest.TestCase):
             moe_draft.gradient_checkpointing_enable()
 
     def test_from_pretrained_inits_missing_moe_weights_and_keeps_loaded_ones(self):
-        model = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE))
+        knobs = {"dflash_config": {"moe_router_enable_expert_bias": True}}
+        model = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE, **knobs))
+        for layer in model.layers:  # a trained bias, and counts mid-step
+            layer.mlp.gate.expert_bias.copy_(torch.linspace(-0.3, 0.3, E))
+            layer.mlp.tokens_per_expert.fill_(7)
         state = model.state_dict()
         missing = {"layers.0.mlp.experts.gate_up_proj", "layers.1.mlp.gate.weight"}
-        kept = "layers.0.mlp.experts.down_proj"
+        kept = ("layers.0.mlp.experts.down_proj", "layers.1.mlp.gate.expert_bias")
         with tempfile.TemporaryDirectory() as tmp:
             model.save_pretrained(
                 tmp, state_dict={k: v for k, v in state.items() if k not in missing}
             )
-            loaded = DFlashDraftModel.from_pretrained(tmp).state_dict()
+            reloaded = DFlashDraftModel.from_pretrained(tmp)
+        loaded = reloaded.state_dict()
         for key in missing:
             self.assertTrue(torch.isfinite(loaded[key]).all(), key)
             self.assertTrue(0 < loaded[key].std() < 0.1, key)
-        torch.testing.assert_close(loaded[kept], state[kept])
+        for key in kept:
+            torch.testing.assert_close(loaded[key], state[key])
+        # The step's counts are not saved; a loaded draft starts a fresh window.
+        for layer in reloaded.layers:
+            self.assertTrue(torch.all(layer.mlp.tokens_per_expert == 0))
 
 
 class FamilyConfigTest(unittest.TestCase):

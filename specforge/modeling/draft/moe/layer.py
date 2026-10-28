@@ -88,6 +88,8 @@ class MoELayer(nn.Module):
         # Only the router and experts hold bare Parameters that HF's init skips.
         self.gate.reset_parameters(std)
         self.experts.reset_parameters(std)
+        # Not in checkpoints: from_pretrained's meta-device build leaves it unset.
+        self.tokens_per_expert.zero_()
 
     def forward(
         self, hidden_states: torch.Tensor, moe_token_mask: Optional[torch.Tensor] = None
