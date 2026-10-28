@@ -223,6 +223,9 @@ The SGLang normalization gate rejects bidirectional sliding-window exports
 until that external serving path is validated; it does not silently fall back
 to a causal mask. These settings do not change CE/L1 losses or kernel optimizations.
 
+DSpine requires causal attention for both full and sliding layers and rejects
+`is_causal: false`. It uses the shared DFlash attention masks.
+
 ### DFlash2
 
 DFlash2 is a draft-architecture variant of DFlash, not a separate capture

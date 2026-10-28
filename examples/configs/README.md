@@ -212,7 +212,7 @@ should make their training strategy and topology explicit.
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
-| `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. |
+| `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
@@ -289,6 +289,8 @@ Common fields:
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.ddp_bucket_cap_mb` | unset | Optional DDP bucket target in MiB for `NO_SHARD`; unset keeps PyTorch's default. Benchmark changes because larger buckets trade launch overhead for later overlap. |
+| `training.fused_logits_loss` | `true` | Optimized FP32 logits loss, including Domino's specialized CE. Enabled by default for all supported models. `false` uses eager losses. Independent of projection and checkpointing. |
+| `training.objective_checkpointing` | `true` | Recompute DFlash-family objective chunks during backward, including projection. With `objective_chunk_blocks=0`, checkpoints the whole objective. Without it, saved logits accumulate across chunks. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |

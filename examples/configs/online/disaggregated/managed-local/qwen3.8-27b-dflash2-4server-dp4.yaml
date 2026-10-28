@@ -56,6 +56,9 @@ training:
   num_anchors: 512
   loss_decay_gamma: 7.0
   objective_chunk_blocks: 128
+  # Measured without objective checkpointing: keep each chunk's logits for
+  # backward instead of recomputing the 248k-vocabulary projection.
+  objective_checkpointing: false
   loss_type: dflash
   dflash2_selector_loss_alpha: 1.0
   dflash2_selector_stop_gradient: false
