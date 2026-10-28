@@ -629,7 +629,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
-        moe_token_mask: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -649,17 +649,17 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self._ffn(hidden_states, moe_token_mask)
+        hidden_states = self._ffn(hidden_states, token_mask)
         hidden_states = residual + hidden_states
         return hidden_states
 
     def _ffn(
-        self, hidden_states: torch.Tensor, moe_token_mask: Optional[torch.Tensor]
+        self, hidden_states: torch.Tensor, token_mask: Optional[torch.Tensor]
     ) -> torch.Tensor:
         # Only an MoELayer takes the mask; the dense MLP keeps its one-argument call.
-        if moe_token_mask is None or not isinstance(self.mlp, MoELayer):
+        if token_mask is None or not isinstance(self.mlp, MoELayer):
             return self.mlp(hidden_states)
-        return self.mlp(hidden_states, moe_token_mask)
+        return self.mlp(hidden_states, token_mask)
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
@@ -930,10 +930,16 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
-        moe_token_mask: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
+        # Which draft tokens are real: padding blocks stay out of the MoE balancing counts.
+        token_mask = (
+            None
+            if block_keep_mask is None
+            else block_keep_mask.repeat_interleave(self.block_size, dim=1)
+        )
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         attention_mask = self._prepare_attention_mask(
@@ -957,7 +963,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
-                moe_token_mask=moe_token_mask,
+                token_mask=token_mask,
                 **kwargs,
             )
         return self.norm(hidden_states)

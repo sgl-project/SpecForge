@@ -18,7 +18,6 @@ from specforge.modeling.draft.dflash_mask import (
     create_dflash_sdpa_mask,
 )
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
-from specforge.modeling.draft.moe import MoELayer
 
 try:
     from torch.nn.attention.flex_attention import BlockMask
@@ -292,10 +291,6 @@ class OnlineDFlashModel(nn.Module):
             )
 
         self.draft_model = draft_model
-        # Only drafts with MoE layers take the kept-block mask; others keep their signature.
-        self._moe_token_mask = any(
-            isinstance(m, MoELayer) for m in draft_model.modules()
-        )
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
         self.block_size = block_size
@@ -652,16 +647,12 @@ class OnlineDFlashModel(nn.Module):
                 draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
             else:
                 draft_kwargs["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}
-        if self._moe_token_mask:
-            # MoE layers count only the kept blocks' tokens for their balancing.
-            draft_kwargs["moe_token_mask"] = block_keep_mask.repeat_interleave(
-                self.block_size, dim=1
-            )
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            block_keep_mask=block_keep_mask,  # padding blocks stay out of MoE balancing
             **draft_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden

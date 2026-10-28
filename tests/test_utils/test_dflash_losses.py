@@ -74,7 +74,14 @@ class _FixedDraft(nn.Module):
         self.hidden_size = hidden_size
         self.sliding_window = None
 
-    def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
+    def forward(
+        self,
+        position_ids,
+        noise_embedding,
+        target_hidden,
+        attention_mask,
+        block_keep_mask=None,
+    ):
         bsz, draft_len = noise_embedding.shape[:2]
         return torch.zeros(
             bsz,
@@ -118,8 +125,15 @@ class _LearnableDSparkDraft(_FixedDraft):
         self.signal = nn.Parameter(torch.linspace(-0.2, 0.2, hidden_size))
         self.confidence_head = nn.Identity()
 
-    def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
-        del position_ids, target_hidden, attention_mask
+    def forward(
+        self,
+        position_ids,
+        noise_embedding,
+        target_hidden,
+        attention_mask,
+        block_keep_mask=None,
+    ):
+        del position_ids, target_hidden, attention_mask, block_keep_mask
         bsz, draft_len = noise_embedding.shape[:2]
         return self.signal.view(1, 1, -1).expand(bsz, draft_len, -1)
 
