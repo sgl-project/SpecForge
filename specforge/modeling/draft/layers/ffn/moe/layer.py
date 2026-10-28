@@ -11,6 +11,18 @@ from specforge.modeling.draft.layers.ffn.moe.experts import RoutedExperts, Share
 from specforge.modeling.draft.layers.ffn.moe.router import Router
 
 
+def count_tokens_per_expert(
+    indices: torch.Tensor, mask: Optional[torch.Tensor], num_experts: int
+) -> torch.Tensor:
+    """Kept slots per expert, int64 [E]; ``mask`` [T] marks the kept tokens."""
+    slots = indices.reshape(-1)
+    kept = torch.ones_like(slots)
+    if mask is not None:
+        kept = mask.to(slots.dtype).repeat_interleave(indices.shape[-1])
+    # scatter_add_, not bincount: bincount reads the indices' range on the host.
+    return slots.new_zeros(num_experts).scatter_add_(0, slots, kept)
+
+
 class MoELayer(nn.Module):
     """Routed experts plus an optional shared expert with an optional sigmoid gate."""
 
@@ -26,6 +38,12 @@ class MoELayer(nn.Module):
         self.experts = experts
         self.shared_expert = shared_expert
         self.shared_expert_gate = shared_expert_gate
+        # The step's kept-slot counts per expert; the balancing hook pools and resets them.
+        self.register_buffer(
+            "tokens_per_expert",
+            torch.zeros(gate.num_experts, dtype=torch.int64),
+            persistent=False,
+        )
 
     def reset_parameters(self, std: float) -> None:
         """Every part of the layer, bare Parameters and Linears alike."""
@@ -35,13 +53,20 @@ class MoELayer(nn.Module):
             self.shared_expert.reset_parameters(std)
         if self.shared_expert_gate is not None:
             nn.init.normal_(self.shared_expert_gate.weight, std=std)
+        # Not in checkpoints: from_pretrained's meta-device build leaves it unset.
+        self.tokens_per_expert.zero_()
 
     def forward(
         self, hidden_states: torch.Tensor, moe_token_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """``moe_token_mask`` [B, S] marks the real tokens, for the load balancing to come."""
+        """``moe_token_mask`` [B, S] marks the tokens the balancing counts; None counts all."""
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         _, indices, weights = self.gate(x)
+        if self.training:
+            mask = None if moe_token_mask is None else moe_token_mask.reshape(-1)
+            self.tokens_per_expert += count_tokens_per_expert(
+                indices, mask, self.gate.num_experts
+            )
         out = self.experts(x, indices, weights)
         if self.shared_expert is not None:
             shared = self.shared_expert(x)
