@@ -283,7 +283,7 @@ class TargetEmbeddingsAndHeadLoadingTest(unittest.TestCase):
                     module.lm_head.weight, torch.full((6, 3), 2.0)
                 )
                 self.assertIsNot(module.lm_head.weight, module.embed_tokens.weight)
-                self.assertEqual(module.lm_head_mup_folded, 4.0)
+                self.assertEqual(module.logit_transform.head_divisor, 4.0)
                 self.assertFalse(module.lm_head.weight.requires_grad)
                 self.assertFalse(module.embed_tokens.weight.requires_grad)
                 self.assertFalse(module.training)
