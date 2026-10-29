@@ -182,40 +182,21 @@ def _copy_shared_embeddings(
 
 
 def _patch_text_config(base_config: dict, draft_config: dict) -> dict:
-    """Ensure base text_config contains MTP-critical dims from the draft config.
+    """Delegate native config adaptation to the registered draft architecture.
 
-    Some Qwen3.5 base checkpoints omit ``head_dim`` in ``text_config``; vLLM's
-    ``Qwen3_5TextConfig`` then falls back to its default (``head_dim=256``),
-    which mismatches the trained MTP weights (e.g. q_norm/k_norm shape 128).
-    Only the structural dims that must agree between base and draft are synced.
+    Old standalone MTP exports without architectures describe Qwen3.5, the
+    only family supported by that legacy format.
     """
+    from specforge.modeling.draft.registry import DRAFT_REGISTRY
 
-    keys_to_sync = [
-        "head_dim",
-        "hidden_size",
-        "intermediate_size",
-        "num_attention_heads",
-        "num_key_value_heads",
-    ]
-
-    target = base_config
-    if "text_config" in base_config:
-        target = base_config["text_config"]
-
-    source = draft_config
-    if "text_config" in draft_config:
-        source = draft_config["text_config"]
-
-    for key in keys_to_sync:
-        if key not in source:
-            continue
-        old = target.get(key)
-        new = source[key]
-        if old != new:
-            target[key] = new
-            print(f"  overriding text_config.{key}: {old} -> {new}")
-
-    return base_config
+    architectures = draft_config.get("architectures") or ["Qwen3_5MTPDraftModel"]
+    if len(architectures) != 1:
+        raise ValueError("Native MTP export requires exactly one draft architecture")
+    model = DRAFT_REGISTRY.get(architectures[0])
+    adapter = getattr(model, "checkpoint_adapter", None)
+    if adapter is None:
+        raise ValueError(f"No native checkpoint adapter for {architectures[0]!r}")
+    return adapter.patch_target_config(base_config, draft_config)
 
 
 def _has_model_weights(path: str) -> bool:
