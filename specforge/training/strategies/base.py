@@ -181,9 +181,11 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         trim_loss_positions: bool = False,
         compact_teacher: bool = False,
         compact_teacher_chunk_size: Optional[int] = None,
+        name: str = "eagle3",
     ) -> None:
         self.eagle3_model = eagle3_model
         self.target_head = target_head
+        self.name = name
         self.ploss_decay = ploss_decay
         self.trim_loss_positions = trim_loss_positions
         self.compact_teacher = compact_teacher

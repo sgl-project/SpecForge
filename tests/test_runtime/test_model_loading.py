@@ -14,6 +14,7 @@ import torch
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.training.model_loading import (
+    checkpoint_strategy_matches,
     load_draft_config_source,
     resolve_draft_config,
     warm_start_draft_model,
@@ -395,6 +396,31 @@ class WarmStartTest(unittest.TestCase):
                     draft_config=object(),
                     strategy="eagle3",
                 )
+
+    def test_eagle4_warm_start_accepts_eagle3_tagged_ttt_checkpoints(self):
+        self.assertTrue(checkpoint_strategy_matches("eagle3", "eagle4"))
+        self.assertTrue(checkpoint_strategy_matches("eagle4", "eagle4"))
+        self.assertFalse(checkpoint_strategy_matches("peagle", "eagle4"))
+        self.assertFalse(checkpoint_strategy_matches(None, "eagle4"))
+        self.assertTrue(
+            checkpoint_strategy_matches(None, "eagle4", allow_missing=True)
+        )
+        source = _TinyDraft()
+        destination = _TinyDraft()
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_runtime_state(
+                directory, source.state_dict(), strategy="eagle3"
+            )
+            report = warm_start_draft_model(
+                destination,
+                path,
+                draft_config=object(),
+                strategy="eagle4",
+            )
+        self.assertEqual(report.checkpoint_format, "specforge")
+        self.assertTrue(
+            torch.equal(destination.proj.weight, source.proj.weight)
+        )
 
     def test_pretrained_repo_uses_registered_hf_loader(self):
         source = _TinyDraft()

@@ -35,7 +35,6 @@ from specforge.algorithms.eagle3.data import (
 )
 from specforge.algorithms.eagle3.providers import (
     allowed_missing_checkpoint_keys,
-    build_step,
     build_training_model,
     resolve_capture_layers,
     resume_contract as eagle3_resume_contract,
@@ -44,6 +43,17 @@ from specforge.algorithms.eagle3.providers import (
 
 ALGORITHM_NAME = "eagle4"
 DRAFT_ARCHITECTURE = "LlamaForCausalLMEagle4"
+
+
+def build_step(wrapped_model, *, target_head=None, **options):
+    from specforge.training.strategies.base import Eagle3TrainStrategy
+
+    return Eagle3TrainStrategy(
+        wrapped_model,
+        target_head=target_head,
+        name=ALGORITHM_NAME,
+        **options,
+    )
 
 
 def build_draft(config, draft_config):

@@ -41,6 +41,25 @@ logger = logging.getLogger(__name__)
 _CONFIG_FILE = "config.json"
 _STATE_FILE = "training_state.pt"
 
+
+def checkpoint_strategy_matches(
+    saved_strategy: Optional[str],
+    expected_strategy: str,
+    *,
+    allow_missing: bool = False,
+) -> bool:
+    """Return whether a persisted strategy tag may initialize this run.
+
+    EAGLE-4 reuses EAGLE-3 TTT. Checkpoints from those runs were tagged
+    ``eagle3`` because the shared step class hard-coded that name.
+    """
+
+    if saved_strategy is None:
+        return allow_missing
+    if saved_strategy == expected_strategy:
+        return True
+    return expected_strategy == "eagle4" and saved_strategy == "eagle3"
+
 # These are the architecture fields the legacy EAGLE generator copied from the
 # target, plus RoPE/attention fields needed by newer Qwen-family targets.  A
 # whitelist avoids feeding a target-specific nested config into the registered
@@ -397,7 +416,9 @@ def _load_specforge_draft_state(
             f"SpecForge warm-start checkpoint has no draft_state_dict: {state_path}"
         )
     saved_strategy = state.get("strategy")
-    if saved_strategy is not None and saved_strategy != expected_strategy:
+    if not checkpoint_strategy_matches(
+        saved_strategy, expected_strategy, allow_missing=True
+    ):
         raise ValueError(
             f"warm-start checkpoint {state_path} was written by strategy "
             f"{saved_strategy!r}; this run trains {expected_strategy!r}"
@@ -509,6 +530,7 @@ def warm_start_draft_model(
 
 __all__ = [
     "WarmStartReport",
+    "checkpoint_strategy_matches",
     "draft_config_dict",
     "load_draft_config_source",
     "preflight_draft_kernels",

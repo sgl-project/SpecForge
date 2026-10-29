@@ -297,7 +297,9 @@ class Trainer:
                 else CheckpointManager.read_resume_state(resume_from)
             )
             saved_strategy = state.get("strategy")
-            if saved_strategy != algorithm_name:
+            from specforge.training.model_loading import checkpoint_strategy_matches
+
+            if not checkpoint_strategy_matches(saved_strategy, algorithm_name):
                 raise ValueError(
                     f"checkpoint {resume_from} was written by strategy "
                     f"{saved_strategy!r}; this run trains {algorithm_name!r}"

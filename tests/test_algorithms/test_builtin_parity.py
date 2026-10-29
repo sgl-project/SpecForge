@@ -182,6 +182,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 provider = self.registry.resolve(name).providers.step
                 instance = provider.build(model, target_head=None)
                 self.assertEqual(class_name, type(instance).__name__)
+                self.assertEqual(name, instance.name)
 
     def test_dflash_family_collator_matches_existing_padding_contract(self):
         short = {
