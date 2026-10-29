@@ -20,7 +20,7 @@ from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
-from .eagle_config import Eagle3Config, EaglePretrainedConfig
+from .config.eagle3 import Eagle3Config, EaglePretrainedConfig
 from .registry import register_draft
 
 try:

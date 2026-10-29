@@ -511,7 +511,7 @@ def populate_dflash_generated_config(
 
 
 def apply_eagle_overrides(cfg: Config, draft_config: Any) -> None:
-    from specforge.modeling.draft.config_base import method_config
+    from specforge.modeling.draft.config.base import method_config
 
     if cfg.model.aux_hidden_state_layer_ids is not None:
         draft_config.eagle_config = {

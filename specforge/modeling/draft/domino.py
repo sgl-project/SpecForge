@@ -12,7 +12,7 @@ from torch.func import functional_call
 from specforge.utils import get_device_type
 
 from .dflash import DFlashDraftModel, sample
-from .dflash_config import DominoConfig
+from .config.domino import DominoConfig
 from .registry import register_draft
 
 

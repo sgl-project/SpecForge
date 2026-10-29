@@ -24,7 +24,7 @@ from transformers.models.qwen3.modeling_qwen3 import FlashAttentionKwargs, Qwen3
 from typing_extensions import Tuple, Unpack
 
 from .dflash import DFlashDraftModel, Qwen3DFlashDecoderLayer
-from .dflash_config import DFlash2Config
+from .config.dflash2 import DFlash2Config
 from .dflash_kernels import DFlashKernels
 from .registry import register_draft
 

@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from .dflash import DFlashDraftModel
-from .dflash_config import DSparkConfig
+from .config.dspark import DSparkConfig
 from .registry import register_draft
 
 

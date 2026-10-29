@@ -9,7 +9,7 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.modeling.draft.base import Eagle3DraftModel
-from specforge.modeling.draft.eagle_config import EaglePretrainedConfig, PEagleConfig
+from specforge.modeling.draft.config import EaglePretrainedConfig, PEagleConfig
 from specforge.modeling.draft.flex_attention import compile_friendly_flex_attention
 from specforge.modeling.draft.llama3_eagle import (
     LlamaMLP,

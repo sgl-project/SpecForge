@@ -19,8 +19,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
-from . import dflash_config as _draft_config
-from .dflash_config import (
+from .config import dflash as _draft_config
+from .config.dflash import (
     DFlashConfig,
     _resolve_mla_rope_interleaved,
     resolve_dflash_attention_mode,
