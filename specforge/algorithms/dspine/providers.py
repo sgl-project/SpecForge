@@ -70,7 +70,7 @@ def build_training_model(config, draft_model, draft_config, target_config, token
 
 def populate_target_defaults(payload, target_config, config):
     from specforge.algorithms.model_providers import populate_dflash_generated_config
-    from specforge.modeling.draft.models.dflash import build_target_layer_ids
+    from specforge.modeling.draft.config.dflash import build_target_layer_ids
 
     populate_dflash_generated_config(payload, target_config, config)
     payload["dflash_config"]["target_layer_ids"] = build_target_layer_ids(

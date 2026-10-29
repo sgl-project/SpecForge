@@ -18,9 +18,12 @@ from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.dspine.model import OnlineDSpineModel
 from specforge.config import Config
 from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
-from specforge.modeling.draft.dspine import DSpineConfig, DSpineDraftModel
+from specforge.modeling.draft.config.dspine import DSpineConfig
+from specforge.modeling.draft.models.dflash import DFlashDraftModel
+from specforge.modeling.draft.models.dspine import DSpineDraftModel
+from specforge.modeling.draft.models.layers.attention.masks import (
+    create_dflash_sdpa_mask,
+)
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import StepContext
 
@@ -254,7 +257,7 @@ class DSpineTest(unittest.TestCase):
                     self.subTest(window=window, backend=backend),
                     # CUDA tests cover compiled execution; this checks visibility.
                     mock.patch(
-                        "specforge.modeling.draft.flex_attention.compile_friendly_create_block_mask",
+                        "specforge.modeling.draft.models.layers.attention.backends.flex.compile_friendly_create_block_mask",
                         create_block_mask,
                     ),
                 ):

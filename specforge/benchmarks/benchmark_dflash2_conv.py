@@ -27,13 +27,13 @@ from specforge.algorithms.common.dflash_family_model import (
     create_dflash_block_mask,
 )
 from specforge.modeling.auto import AutoDraftModelConfig
-from specforge.modeling.draft.models.dflash2 import (
-    FUSED_CONV_ENV,
-    DFlash2DraftModel,
-    DFlashGroupedConv,
-)
+from specforge.modeling.draft.models.dflash2 import DFlash2DraftModel
 from specforge.modeling.draft.models.layers.attention.backends.flex_options import (
     flex_attention_backend,
+)
+from specforge.modeling.draft.models.layers.convolution.dflash2 import (
+    FUSED_CONV_ENV,
+    DFlashGroupedConv,
 )
 
 

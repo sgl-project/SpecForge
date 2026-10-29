@@ -21,11 +21,11 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm
 from specforge.algorithms.dflash import providers
 from specforge.algorithms.domino import providers as domino_providers
 from specforge.algorithms.dspark import providers as dspark_providers
-from specforge.modeling.draft import dflash_kernels
 from specforge.modeling.draft.models.dflash import DFlashDraftModel
 from specforge.modeling.draft.models.dflash2 import DFlash2DraftModel
 from specforge.modeling.draft.models.domino import DominoDraftModel
 from specforge.modeling.draft.models.dspark import DSparkDraftModel
+from specforge.modeling.draft.models.layers import kernels as dflash_kernels
 from specforge.modeling.draft.models.layers.kernels import (
     DEFAULT_DFLASH_KERNELS,
     LIGER_REQUIREMENT,

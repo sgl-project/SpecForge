@@ -9,7 +9,7 @@ import torch
 from specforge.algorithms.dspine import providers
 from specforge.application import resolve_run
 from specforge.config import Config
-from specforge.modeling.draft import dflash_kernels
+from specforge.modeling.draft.models.layers import kernels as dflash_kernels
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.model_loading import preflight_draft_kernels
 from specforge.training.strategies.base import StepContext

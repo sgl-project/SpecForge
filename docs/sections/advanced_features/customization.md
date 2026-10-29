@@ -137,7 +137,7 @@ class name and must match the single entry in the draft JSON's
 ```python
 from transformers import PretrainedConfig
 
-from specforge.modeling.draft.base import Eagle3DraftModel
+from specforge.modeling.draft.models.base import Eagle3DraftModel
 from specforge.modeling.draft.registry import register_draft
 
 
@@ -216,7 +216,7 @@ layout. Architecture-specific implementations are:
 | DFlash2 | `DFlash2Config` | `draft/dflash_config.py` |
 | Domino | `DominoConfig` | `draft/dflash_config.py` |
 | DSpark | `DSparkConfig` | `draft/dflash_config.py` |
-| Qwen3.5 MTP | `Qwen3_5MTPConfig` | `draft/mtp/config.py` |
+| Qwen3.5 MTP | `Qwen3_5MTPConfig` | `draft/config/mtp.py` |
 
 Each built-in model exposes `draft_options_class`, a `prepare_config` hook, and
 the resolved `model.draft_options` snapshot. Model constructors enforce the same

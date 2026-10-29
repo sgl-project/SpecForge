@@ -10,13 +10,11 @@ from specforge.algorithms.common.dflash_family_model import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
-from specforge.modeling.draft.models.dflash import (
-    DFlashDraftModel,
-    Qwen3DFlashAttention,
-)
+from specforge.modeling.draft.models.dflash import DFlashDraftModel
 from specforge.modeling.draft.models.layers.attention.backends.flex_options import (
     flex_attention_backend,
 )
+from specforge.modeling.draft.models.layers.attention.gqa import Qwen3DFlashAttention
 from specforge.modeling.draft.models.layers.kernels import DEFAULT_DFLASH_KERNELS
 
 

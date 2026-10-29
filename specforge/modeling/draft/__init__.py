@@ -1,7 +1,7 @@
+from specforge.modeling.draft.config.dflash import build_target_layer_ids
 from specforge.modeling.draft.models.base import Eagle3DraftModel
 from specforge.modeling.draft.models.dflash import (
     DFlashDraftModel,
-    build_target_layer_ids,
     extract_context_feature,
     sample,
 )
@@ -20,6 +20,7 @@ from specforge.modeling.draft.registry import (
     resolve_draft,
 )
 
+from .config.dflash import build_target_layer_ids
 from .models.dspine import DSpineDraftModel
 
 __all__ = [
