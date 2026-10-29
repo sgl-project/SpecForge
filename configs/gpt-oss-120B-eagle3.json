@@ -2,13 +2,6 @@
   "architectures": [
     "LlamaForCausalLMEagle3"
   ],
-  "eagle_config": {
-    "eagle_aux_hidden_state_layer_ids": [
-      1,
-      17,
-      33
-    ]
-  },
   "head_dim": 64,
   "hidden_act": "silu",
   "hidden_size": 2880,
@@ -26,5 +19,27 @@
   "transformers_version": "4.52.3",
   "use_cache": true,
   "vocab_size": 201088,
-  "draft_vocab_size": 32000
+  "draft_vocab_size": 32000,
+  "attention_config": {
+    "type": "gqa",
+    "is_causal": true
+  },
+  "residual_config": {
+    "type": "standard"
+  },
+  "ffn_config": {
+    "type": "dense"
+  },
+  "spec_config": {
+    "schema_version": 1,
+    "algorithm": "eagle3",
+    "target_hidden_size": 2880,
+    "fc_norm": false,
+    "norm_output": false,
+    "target_layer_ids": [
+      1,
+      17,
+      33
+    ]
+  }
 }

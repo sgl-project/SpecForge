@@ -1,21 +1,13 @@
 {
-  "architectures": ["DSparkDraftModel"],
+  "architectures": [
+    "DSparkDraftModel"
+  ],
   "attention_bias": false,
   "attention_dropout": 0.0,
-  "auto_map": {"AutoModel": "dspark.DSparkDraftModel"},
-  "block_size": 7,
-  "bos_token_id": 163584,
-  "dflash_config": {
-    "attention_mode": "gqa",
-    "confidence_head_alpha": 1.0,
-    "confidence_head_with_markov": true,
-    "enable_confidence_head": true,
-    "markov_head_type": "vanilla",
-    "markov_rank": 256,
-    "mask_token_id": 163824,
-    "projector_type": "dspark",
-    "target_layer_ids": [7, 23, 51, 67, 83]
+  "auto_map": {
+    "AutoModel": "dspark.DSparkDraftModel"
   },
+  "bos_token_id": 163584,
   "dtype": "bfloat16",
   "eos_token_id": 163586,
   "head_dim": 64,
@@ -49,5 +41,35 @@
   "tie_word_embeddings": false,
   "use_cache": true,
   "use_sliding_window": false,
-  "vocab_size": 163840
+  "vocab_size": 163840,
+  "attention_config": {
+    "type": "gqa",
+    "is_causal": null
+  },
+  "residual_config": {
+    "type": "standard"
+  },
+  "ffn_config": {
+    "type": "dense"
+  },
+  "spec_config": {
+    "schema_version": 1,
+    "algorithm": "dspark",
+    "block_size": 7,
+    "target_layer_ids": [
+      7,
+      23,
+      51,
+      67,
+      83
+    ],
+    "mask_token_id": 163824,
+    "projector_type": "dspark",
+    "pure_draft_prefix_len": 0,
+    "shift_label": false,
+    "markov_rank": 256,
+    "markov_head_type": "vanilla",
+    "enable_confidence_head": true,
+    "confidence_head_with_markov": true
+  }
 }

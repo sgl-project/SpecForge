@@ -7,18 +7,7 @@
   "auto_map": {
     "AutoModel": "dflash.DFlashDraftModel"
   },
-  "block_size": 16,
   "bos_token_id": null,
-  "dflash_config": {
-    "mask_token_id": 248070,
-    "target_layer_ids": [
-      1,
-      16,
-      31,
-      46,
-      61
-    ]
-  },
   "dtype": "bfloat16",
   "eos_token_id": 248044,
   "head_dim": 128,
@@ -49,5 +38,31 @@
   "use_sliding_window": true,
   "vocab_size": 248320,
   "rope_theta": 10000000,
-  "rope_scaling": null
+  "rope_scaling": null,
+  "attention_config": {
+    "type": "gqa",
+    "is_causal": null
+  },
+  "residual_config": {
+    "type": "standard"
+  },
+  "ffn_config": {
+    "type": "dense"
+  },
+  "spec_config": {
+    "schema_version": 1,
+    "algorithm": "dflash",
+    "block_size": 16,
+    "target_layer_ids": [
+      1,
+      16,
+      31,
+      46,
+      61
+    ],
+    "mask_token_id": 248070,
+    "projector_type": null,
+    "pure_draft_prefix_len": 0,
+    "shift_label": false
+  }
 }

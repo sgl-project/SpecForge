@@ -5,22 +5,6 @@
   "attention_bias": false,
   "attention_dropout": 0.0,
   "bos_token_id": null,
-  "is_causal": false,
-  "dflash_config": {
-    "block_size": 8,
-    "conv_group_size": 16,
-    "conv_kernel_size": 2,
-    "mask_token_id": 248070,
-    "selector_rank": 256,
-    "selector_top_k": 16,
-    "target_layer_ids": [
-      1,
-      16,
-      31,
-      46,
-      61
-    ]
-  },
   "dtype": "bfloat16",
   "eos_token_id": 248044,
   "head_dim": 128,
@@ -53,5 +37,37 @@
   "transformers_version": "5.8.1",
   "use_cache": true,
   "use_sliding_window": true,
-  "vocab_size": 248320
+  "vocab_size": 248320,
+  "attention_config": {
+    "type": "gqa",
+    "is_causal": false
+  },
+  "residual_config": {
+    "type": "standard"
+  },
+  "ffn_config": {
+    "type": "dense"
+  },
+  "spec_config": {
+    "schema_version": 1,
+    "algorithm": "dflash2",
+    "block_size": 8,
+    "target_layer_ids": [
+      1,
+      16,
+      31,
+      46,
+      61
+    ],
+    "mask_token_id": 248070,
+    "projector_type": null,
+    "pure_draft_prefix_len": 0,
+    "shift_label": false,
+    "conv_kernel_size": 2,
+    "conv_group_size": 16,
+    "selector_rank": 256,
+    "selector_top_k": 16,
+    "output_multiplier": 1.0,
+    "final_logit_softcapping": null
+  }
 }

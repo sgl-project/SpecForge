@@ -26,5 +26,22 @@
   "use_cache": true,
   "use_sliding_window": false,
   "vocab_size": 152064,
-  "draft_vocab_size": 16000
+  "draft_vocab_size": 16000,
+  "attention_config": {
+    "type": "gqa",
+    "is_causal": true
+  },
+  "residual_config": {
+    "type": "standard"
+  },
+  "ffn_config": {
+    "type": "dense"
+  },
+  "spec_config": {
+    "schema_version": 1,
+    "algorithm": "eagle3",
+    "target_hidden_size": 3584,
+    "fc_norm": false,
+    "norm_output": false
+  }
 }

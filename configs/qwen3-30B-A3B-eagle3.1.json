@@ -6,7 +6,6 @@
   "attention_dropout": 0.0,
   "bos_token_id": 151643,
   "eos_token_id": 151645,
-  "fc_norm": true,
   "head_dim": 128,
   "hidden_act": "silu",
   "hidden_size": 2048,
@@ -15,7 +14,6 @@
   "max_position_embeddings": 2048,
   "max_window_layers": 48,
   "model_type": "llama",
-  "norm_output": true,
   "num_attention_heads": 32,
   "num_hidden_layers": 1,
   "num_key_value_heads": 4,
@@ -29,5 +27,22 @@
   "use_cache": true,
   "use_sliding_window": false,
   "vocab_size": 151936,
-  "draft_vocab_size": 32000
+  "draft_vocab_size": 32000,
+  "attention_config": {
+    "type": "gqa",
+    "is_causal": true
+  },
+  "residual_config": {
+    "type": "standard"
+  },
+  "ffn_config": {
+    "type": "dense"
+  },
+  "spec_config": {
+    "schema_version": 1,
+    "algorithm": "eagle3",
+    "target_hidden_size": 2048,
+    "fc_norm": true,
+    "norm_output": true
+  }
 }
