@@ -16,7 +16,7 @@ def softmax_scores(logits: torch.Tensor) -> torch.Tensor:
 
 
 class Router(nn.Module):
-    """Routing in three steps, score -> select -> combine; families override the steps."""
+    """Routing as score -> select -> routing_weights; families override the steps."""
 
     def __init__(
         self,
@@ -44,8 +44,10 @@ class Router(nn.Module):
         """``scores`` [T, E] -> the chosen experts [T, K]."""
         return scores.topk(self.top_k, dim=-1).indices
 
-    def combine(self, scores: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """The combine weights [T, K], renormalized and scaled as the family asks."""
+    def routing_weights(
+        self, scores: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        """The weights [T, K] that combine the chosen experts' outputs."""
         weights = scores.gather(-1, indices)
         if self.norm_topk_prob:
             weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -56,7 +58,7 @@ class Router(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         scores = self.score(x)
         indices = self.select(scores)
-        weights = self.combine(scores, indices)
+        weights = self.routing_weights(scores, indices)
         return scores, indices, weights
 
 
