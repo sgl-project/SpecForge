@@ -203,19 +203,19 @@ allocating weights. Standalone callers can use the same method after applying
 their overrides. Parsing alone deliberately accepts incomplete variant settings
 so an override can repair them before finalization.
 
-`draft/config_base.py` defines the immutable `DraftConfig` contract:
+`draft/config/base.py` defines the immutable `DraftConfig` contract:
 `from_model_config` resolves and validates options without allocating parameters;
 `to_model_config` writes them into an independent HF config in the existing JSON
 layout. Architecture-specific implementations are:
 
 | Draft architecture | Resolved options | File |
 | --- | --- | --- |
-| EAGLE3 | `Eagle3Config` | `draft/eagle_config.py` |
-| P-EAGLE | `PEagleConfig` | `draft/eagle_config.py` |
-| DFlash | `DFlashConfig` | `draft/dflash_config.py` |
-| DFlash2 | `DFlash2Config` | `draft/dflash_config.py` |
-| Domino | `DominoConfig` | `draft/dflash_config.py` |
-| DSpark | `DSparkConfig` | `draft/dflash_config.py` |
+| EAGLE3 | `Eagle3Config` | `draft/config/eagle3.py` |
+| P-EAGLE | `PEagleConfig` | `draft/config/peagle.py` |
+| DFlash | `DFlashConfig` | `draft/config/dflash.py` |
+| DFlash2 | `DFlash2Config` | `draft/config/dflash2.py` |
+| Domino | `DominoConfig` | `draft/config/domino.py` |
+| DSpark | `DSparkConfig` | `draft/config/dspark.py` |
 | Qwen3.5 MTP | `Qwen3_5MTPConfig` | `draft/config/mtp.py` |
 
 Each built-in model exposes `draft_options_class`, a `prepare_config` hook, and
