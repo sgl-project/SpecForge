@@ -40,9 +40,7 @@ class Eagle3LossMaskTest(unittest.TestCase):
                 }
                 raw["loss_mask"][max_len - 1] = terminal
                 original = raw["loss_mask"].clone()
-                expected_mask = F.pad(original[1:max_len], (0, 1)).view(
-                    1, max_len, 1
-                )
+                expected_mask = F.pad(original[1:max_len], (0, 1)).view(1, max_len, 1)
 
                 for normalize in (
                     normalize_offline_sample,
@@ -86,9 +84,7 @@ class Eagle3LossMaskTest(unittest.TestCase):
                                 padded = F.pad(
                                     full_mask, (0, 0, 0, chunk * sp_size - max_len)
                                 )
-                                expected = padded[
-                                    :, rank * chunk : (rank + 1) * chunk
-                                ]
+                                expected = padded[:, rank * chunk : (rank + 1) * chunk]
                                 torch.testing.assert_close(
                                     local_mask[:, :chunk], expected
                                 )
