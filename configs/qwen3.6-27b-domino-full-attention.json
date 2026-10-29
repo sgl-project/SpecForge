@@ -7,17 +7,7 @@
   "auto_map": {
     "AutoModel": "domino.DominoDraftModel"
   },
-  "block_size": 16,
   "bos_token_id": null,
-  "dflash_config": {
-    "mask_token_id": 248070,
-    "target_layer_ids": [1, 16, 31, 46, 61],
-    "projector_type": "domino",
-    "pure_draft_prefix_len": 1,
-    "emb_dim": 256,
-    "gru_hidden_dim": 1024,
-    "shift_label": false
-  },
   "dtype": "bfloat16",
   "eos_token_id": 248044,
   "head_dim": 128,
@@ -48,5 +38,33 @@
   "transformers_version": "5.5.3",
   "use_cache": true,
   "use_sliding_window": false,
-  "vocab_size": 248320
+  "vocab_size": 248320,
+  "attention_config": {
+    "type": "gqa",
+    "is_causal": null
+  },
+  "residual_config": {
+    "type": "standard"
+  },
+  "ffn_config": {
+    "type": "dense"
+  },
+  "spec_config": {
+    "schema_version": 1,
+    "algorithm": "domino",
+    "block_size": 16,
+    "target_layer_ids": [
+      1,
+      16,
+      31,
+      46,
+      61
+    ],
+    "mask_token_id": 248070,
+    "projector_type": "domino",
+    "pure_draft_prefix_len": 1,
+    "shift_label": false,
+    "emb_dim": 256,
+    "gru_hidden_dim": 1024
+  }
 }

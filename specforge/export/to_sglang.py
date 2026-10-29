@@ -27,6 +27,7 @@ from specforge.export.checkpoint_io import (
     apply_legacy_rope_scaling,
     materialize_draft,
     resolve_training_state,
+    write_serving_config,
 )
 
 #: per-architecture trainer-key -> serving-key renames ({} = identity).
@@ -93,6 +94,7 @@ def export_to_sglang(
         }
     )
     model.save_pretrained(output_dir, state_dict=_serving_state(full, weight_map))
+    write_serving_config(model, output_dir)
     apply_legacy_rope_scaling(output_dir)
     return output_dir
 

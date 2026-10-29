@@ -273,7 +273,7 @@ def preflight_draft_kernels(
         or not algorithm.spec.capabilities.supports_liger_kernel
     ):
         return
-    from specforge.modeling.draft.dflash_kernels import (
+    from specforge.modeling.draft.models.layers.kernels import (
         load_liger_dflash_kernels,
         resolve_draft_liger_kernel_choice,
     )

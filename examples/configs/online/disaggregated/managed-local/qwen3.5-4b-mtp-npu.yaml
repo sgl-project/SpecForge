@@ -3,7 +3,7 @@
 # ASCEND_RT_VISIBLE_DEVICES.
 model:
   target_model_path: "Qwen/Qwen3.5-4B"
-  draft_model_config: "configs/qwen3.5-4b-mtp.json"
+  draft_model_config: "configs/qwen3.5-4b-mtp-native.json"
   target_backend: sglang
   trust_remote_code: true
   # Qwen3.5-4B nests its text decoder under model.language_model and ties

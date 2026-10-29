@@ -14,6 +14,7 @@ import glob
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
@@ -205,4 +206,25 @@ __all__ = [
     "resolve_training_state",
     "materialize_draft",
     "STATE_FILE",
+    "write_serving_config",
 ]
+
+
+def write_serving_config(model, output_dir: str) -> None:
+    """Render the legacy serving fields and retain the canonical training setting.
+
+    Existing HF/SGLang loaders consume algorithm-specific legacy fields. Keep
+    this conversion at the export boundary; ordinary save_pretrained uses the
+    canonical SpecForge config layout.
+    """
+    from specforge.modeling.draft.config import AutoDraftConfig
+
+    directory = Path(output_dir)
+    source = AutoDraftConfig.to_dict(model.config)
+    (directory / "specforge_config.json").write_text(
+        json.dumps(source, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (directory / "config.json").write_text(
+        json.dumps(model.config.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )

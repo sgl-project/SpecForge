@@ -776,7 +776,7 @@ directory):
 python scripts/merge_mtp_to_base.py \
   --base-model-path Qwen/Qwen3.5-4B \
   --mtp-checkpoint-path ./outputs/qwen3.5-4b-mtp/qwen3.5-4b-mtp-latest \
-  --draft-config configs/qwen3.5-4b-mtp.json \
+  --draft-config configs/qwen3.5-4b-mtp-native.json \
   --output-path ./exports/Qwen3.5-4B-MTP
 ```
 

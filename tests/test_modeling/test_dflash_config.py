@@ -13,8 +13,8 @@ import torch
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.config import AutoDraftConfig
-from specforge.modeling.draft.dflash_config import (
+from specforge.modeling.draft.config import (
+    AutoDraftConfig,
     DFlash2Config,
     DFlashConfig,
     DominoConfig,

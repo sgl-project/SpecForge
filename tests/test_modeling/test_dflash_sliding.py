@@ -9,11 +9,11 @@ from transformers import DynamicCache, Qwen3Config
 from transformers.utils import is_flash_attn_2_available
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
-from specforge.modeling.draft.dflash import (
+from specforge.modeling.draft.models.dflash import (
     DFlashDraftModel,
     resolve_dflash_attention_layout,
 )
-from specforge.modeling.draft.dflash_mask import (
+from specforge.modeling.draft.models.layers.attention.masks import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )

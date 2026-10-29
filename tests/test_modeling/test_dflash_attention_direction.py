@@ -17,7 +17,7 @@ from specforge.algorithms.common.dflash_family_model import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
-from specforge.modeling.draft.dflash import (
+from specforge.modeling.draft.models.dflash import (
     DFlashDraftModel,
     dflash_attention_resume_contract,
     resolve_dflash_causal_block,

@@ -20,5 +20,22 @@
   "transformers_version": "4.28.1",
   "use_cache": true,
   "vocab_size": 128256,
-  "draft_vocab_size": 32000
+  "draft_vocab_size": 32000,
+  "attention_config": {
+    "type": "gqa",
+    "is_causal": true
+  },
+  "residual_config": {
+    "type": "standard"
+  },
+  "ffn_config": {
+    "type": "dense"
+  },
+  "spec_config": {
+    "schema_version": 1,
+    "algorithm": "eagle3",
+    "target_hidden_size": 4096,
+    "fc_norm": false,
+    "norm_output": false
+  }
 }

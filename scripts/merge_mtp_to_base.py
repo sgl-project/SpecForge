@@ -9,7 +9,7 @@ Example:
     python scripts/merge_mtp_to_base.py \
         --base-model-path PATH/TO/Qwen3.5-4B \
         --mtp-checkpoint-path PATH/TO/outputs/qwen3.5-4b-mtp/RUN-latest \
-        --draft-config configs/qwen3.5-4b-mtp.json \
+        --draft-config configs/qwen3.5-4b-mtp-native.json \
         --output-path PATH/TO/Qwen3.5-4B-MTP \
         --key-format sglang
 """

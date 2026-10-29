@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from specforge.config import Config
-    from specforge.modeling.draft.dflash_kernels import DFlashKernels
+    from specforge.modeling.draft.models.layers.kernels import DFlashKernels
 
 
 @dataclass
@@ -114,7 +114,7 @@ def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
 
 
 def build_peagle_draft(cfg: Config, draft_config: PretrainedConfig):
-    from specforge.modeling.draft.peagle import PEagleDraftModel
+    from specforge.modeling.draft.models.peagle import PEagleDraftModel
 
     draft_model = PEagleDraftModel(draft_config)
     if cfg.model.load_target_embedding:
@@ -473,7 +473,7 @@ def dflash_min_loss_tokens(_cfg: Config, draft_config: Any) -> int:
 def populate_dflash_generated_config(
     payload: Dict[str, Any], target_config: Any, _cfg: Config
 ) -> None:
-    from specforge.modeling.draft.dflash import build_target_layer_ids
+    from specforge.modeling.draft.config.dflash import build_target_layer_ids
 
     target_layers = getattr(target_config, "num_hidden_layers", None)
     if not isinstance(target_layers, int) or target_layers < 1:
@@ -492,7 +492,7 @@ def populate_dflash_generated_config(
 
 
 def apply_eagle_overrides(cfg: Config, draft_config: Any) -> None:
-    from specforge.modeling.draft.config_base import method_config
+    from specforge.modeling.draft.config.base import method_config
 
     if cfg.model.aux_hidden_state_layer_ids is not None:
         draft_config.eagle_config = {
@@ -504,7 +504,7 @@ def apply_eagle_overrides(cfg: Config, draft_config: Any) -> None:
 
 
 def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
-    from specforge.modeling.draft.dflash_config import build_target_layer_ids
+    from specforge.modeling.draft.config.dflash import build_target_layer_ids
 
     method_config = dict(getattr(draft_config, "dflash_config", None) or {})
     if cfg.model.draft_block_size is not None:

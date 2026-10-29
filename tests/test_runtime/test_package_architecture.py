@@ -724,7 +724,7 @@ class TestPackageArchitecture(unittest.TestCase):
         for name, payload in dspark_configs.items():
             with self.subTest(config=name):
                 self.assertEqual(payload["model_type"], "qwen3")
-                attention_mode = payload["dflash_config"]["attention_mode"]
+                attention_mode = payload["attention_config"]["type"]
                 # 'mla' carries its own head geometry and is validated by
                 # validate_dflash_mla_config, so a checked-in MLA DSpark config
                 # must extend this guard deliberately rather than slip through.
