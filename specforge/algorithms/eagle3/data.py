@@ -16,8 +16,6 @@ def normalize_offline_sample(raw, max_len: int):
     target = raw["hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
     input_ids = raw["input_ids"][:max_len].unsqueeze(0)
     loss_mask = raw["loss_mask"][:max_len].clone().unsqueeze(0)
-    if loss_mask.numel() > 0:
-        loss_mask[0, -1] = 0
     return {
         "attention_mask": torch.ones_like(loss_mask, dtype=torch.long),
         "loss_mask": loss_mask,
