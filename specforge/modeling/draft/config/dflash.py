@@ -16,6 +16,7 @@ from .base import DraftConfig
 from .base import boolean as _boolean
 from .base import integer as _integer
 from .base import validate_dimensions, validate_gqa
+from .components import validate_components
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
@@ -174,6 +175,7 @@ class DFlashConfig(DraftConfig):
             method = {}
         if not isinstance(method, dict):
             raise ValueError("dflash_config must be an object")
+        validate_components(config, attention_types=("gqa", "mha", "mla"))
         validate_dimensions(config)
         layer_types, window = resolve_dflash_attention_layout(config)
         mode = validate_dflash_attention_config(config)

@@ -16,6 +16,7 @@ from .base import (
     validate_dimensions,
     validate_gqa,
 )
+from .components import validate_components
 
 
 @strict
@@ -37,6 +38,7 @@ class EagleConfig(DraftConfig):
 
     @classmethod
     def _common_fields(cls, config: LlamaConfig) -> dict:
+        validate_components(config, attention_types=("gqa",))
         validate_dimensions(config)
         if validate_gqa(config) % 2:
             raise ValueError("head_dim must be even for EAGLE rotary embeddings")

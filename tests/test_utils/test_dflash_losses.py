@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 REPO = Path(__file__).resolve().parents[2]
 
-_stub_dflash_draft = types.ModuleType("specforge.modeling.draft.dflash")
+_stub_dflash_draft = types.ModuleType("specforge.modeling.draft.models.dflash")
 
 
 class _DFlashDraftStub(nn.Module):
@@ -56,7 +56,7 @@ with patch.dict(
         "specforge.algorithms.common.dflash_family_model": _dflash_module,
         "specforge.modeling": _pkg_modeling,
         "specforge.modeling.draft": _pkg_draft,
-        "specforge.modeling.draft.dflash": _stub_dflash_draft,
+        "specforge.modeling.draft.models.dflash": _stub_dflash_draft,
     },
 ):
     _spec.loader.exec_module(_dflash_module)
@@ -695,7 +695,7 @@ class TestDFlashLosses(unittest.TestCase):
 
     def test_dflash_draft_stub_does_not_leak_to_sys_modules(self):
         self.assertIsNot(
-            sys.modules.get("specforge.modeling.draft.dflash"),
+            sys.modules.get("specforge.modeling.draft.models.dflash"),
             _stub_dflash_draft,
         )
 

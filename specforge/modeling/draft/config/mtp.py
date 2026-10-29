@@ -9,6 +9,7 @@ from typing import Self
 from transformers import Qwen3Config
 
 from .base import DraftConfig, boolean, method_config, validate_dimensions, validate_gqa
+from .components import validate_components
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -20,6 +21,7 @@ class Qwen3_5MTPConfig(DraftConfig):
 
     @classmethod
     def from_model_config(cls, config: Qwen3Config) -> Self:
+        validate_components(config, attention_types=("gqa",))
         validate_dimensions(config)
         head_dim = validate_gqa(config)
         if config.num_hidden_layers != 1:

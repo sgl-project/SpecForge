@@ -10,7 +10,7 @@ from transformers import PretrainedConfig
 from specforge.core.eagle3_adapters import SdpaLikeAdapter, UspAdapter
 from specforge.distributed import destroy_distributed, init_distributed
 from specforge.layers.ring import ring_flash_attn_func
-from specforge.modeling.draft.llama3_eagle import LlamaDecoderLayer
+from specforge.modeling.draft.models.eagle3 import LlamaDecoderLayer
 from specforge.utils import padding
 from tests.utils import get_available_port, is_port_in_use
 

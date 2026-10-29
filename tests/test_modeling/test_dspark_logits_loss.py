@@ -5,7 +5,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
-from specforge.modeling.draft.dspark import DSparkDraftModel
+from specforge.modeling.draft.models.dspark import DSparkDraftModel
 
 
 def build_model(device="cpu"):
@@ -88,7 +88,7 @@ class DSparkLogitsLossTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_fused_logits_preserves_markov_and_confidence_gradients(self):
-        from specforge.modeling.draft.dspark import AcceptRatePredictor
+        from specforge.modeling.draft.models.dspark import AcceptRatePredictor
 
         torch.manual_seed(42)
         model = build_model(device="cuda").bfloat16()

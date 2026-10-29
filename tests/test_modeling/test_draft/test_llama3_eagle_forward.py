@@ -6,7 +6,7 @@ from unittest import mock
 import torch
 from transformers import LlamaConfig
 
-from specforge.modeling.draft.llama3_eagle import LlamaForCausalLMEagle3
+from specforge.modeling.draft.models.eagle3 import LlamaForCausalLMEagle3
 
 
 class LlamaEagle3ForwardTest(unittest.TestCase):

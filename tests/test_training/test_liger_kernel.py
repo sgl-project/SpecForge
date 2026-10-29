@@ -22,16 +22,16 @@ from specforge.algorithms.dflash import providers
 from specforge.algorithms.domino import providers as domino_providers
 from specforge.algorithms.dspark import providers as dspark_providers
 from specforge.modeling.draft import dflash_kernels
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.draft.dflash2 import DFlash2DraftModel
-from specforge.modeling.draft.dflash_kernels import (
+from specforge.modeling.draft.models.dflash import DFlashDraftModel
+from specforge.modeling.draft.models.dflash2 import DFlash2DraftModel
+from specforge.modeling.draft.models.domino import DominoDraftModel
+from specforge.modeling.draft.models.dspark import DSparkDraftModel
+from specforge.modeling.draft.models.layers.kernels import (
     DEFAULT_DFLASH_KERNELS,
     LIGER_REQUIREMENT,
     DFlashKernels,
     resolve_liger_kernel_choice,
 )
-from specforge.modeling.draft.domino import DominoDraftModel
-from specforge.modeling.draft.dspark import DSparkDraftModel
 from specforge.training.checkpoint import CheckpointManager
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

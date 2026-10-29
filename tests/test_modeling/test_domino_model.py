@@ -9,7 +9,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from specforge.modeling.draft.domino import DominoDraftModel
+from specforge.modeling.draft.models.domino import DominoDraftModel
 
 
 def _bare_domino(

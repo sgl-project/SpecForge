@@ -1,18 +1,26 @@
-from .base import Eagle3DraftModel
-from .dflash import (
+from specforge.modeling.draft.models.base import Eagle3DraftModel
+from specforge.modeling.draft.models.dflash import (
     DFlashDraftModel,
     build_target_layer_ids,
     extract_context_feature,
     sample,
 )
-from .dflash2 import DFlash2DraftModel
-from .domino import DominoDraftModel
-from .dspark import DSparkDraftModel
-from .dspine import DSpineDraftModel
-from .llama3_eagle import LlamaForCausalLMEagle3
-from .mtp import Qwen3_5MTPDraftModel
-from .peagle import PEagleDraftModel
-from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
+from specforge.modeling.draft.models.dflash2 import DFlash2DraftModel
+from specforge.modeling.draft.models.domino import DominoDraftModel
+from specforge.modeling.draft.models.dspark import DSparkDraftModel
+from specforge.modeling.draft.models.eagle3 import LlamaForCausalLMEagle3
+from specforge.modeling.draft.models.peagle import PEagleDraftModel
+from specforge.modeling.draft.models.specialized.qwen3_5_mtp.model import (
+    Qwen3_5MTPDraftModel,
+)
+from specforge.modeling.draft.registry import (
+    DRAFT_REGISTRY,
+    available_drafts,
+    register_draft,
+    resolve_draft,
+)
+
+from .models.dspine import DSpineDraftModel
 
 __all__ = [
     "Eagle3DraftModel",

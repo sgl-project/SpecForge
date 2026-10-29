@@ -13,7 +13,7 @@ from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.config import AutoDraftConfig
-from specforge.modeling.draft.config_base import DraftConfig
+from specforge.modeling.draft.config.base import DraftConfig
 from specforge.modeling.draft.registry import DRAFT_REGISTRY
 from specforge.training.model_loading import resolve_draft_config
 from tests.test_modeling.test_dflash_config import VARIANTS, payload
