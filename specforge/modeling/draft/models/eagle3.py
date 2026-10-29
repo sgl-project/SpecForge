@@ -13,32 +13,9 @@ from specforge.utils import print_with_rank
 
 from .layers.attention.eagle import (
     LlamaAttention,
-    LlamaDynamicNTKScalingRotaryEmbedding,
     LlamaFlashAttention,
     LlamaFlexAttention,
-    LlamaLinearScalingRotaryEmbedding,
-    LlamaMutiRotaryEmbedding,
-    LlamaRotaryEmbedding,
     LlamaUSPFlashAttention,
-    LlamaYarnRotaryEmbedding,
-    _cached_merge_dims,
-    _current_valid_lengths,
-    _FlashCachedMergeFunc,
-    _kernel_lse,
-    _raise_standard_flash_attn_unavailable,
-    _standard_flash_attn_varlen_backward_call,
-    _standard_flash_attn_varlen_forward,
-    _update_ring_out_and_lse,
-    _USPRingFlashCachedMergeFunc,
-    apply_multimodal_rotary_pos_emb,
-    apply_rotary_pos_emb,
-    get_rope_config,
-    repeat_kv,
-    rotate_half,
-    yarn_find_correction_dim,
-    yarn_find_correction_range,
-    yarn_get_mscale,
-    yarn_linear_ramp_mask,
 )
 from .layers.ffn import build_ffn
 from .layers.ffn.dense import LlamaMLP
@@ -284,39 +261,3 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             use_cache=False,
         )
         return self.norm(hidden_states) if self.norm_output else hidden_states
-
-
-# Compatibility exports for callers of the former llama3_eagle module.
-__all__ = [
-    "repeat_kv",
-    "get_rope_config",
-    "rotate_half",
-    "apply_rotary_pos_emb",
-    "apply_multimodal_rotary_pos_emb",
-    "LlamaRotaryEmbedding",
-    "LlamaLinearScalingRotaryEmbedding",
-    "LlamaDynamicNTKScalingRotaryEmbedding",
-    "LlamaMutiRotaryEmbedding",
-    "yarn_find_correction_dim",
-    "yarn_find_correction_range",
-    "yarn_get_mscale",
-    "yarn_linear_ramp_mask",
-    "LlamaYarnRotaryEmbedding",
-    "LlamaAttention",
-    "LlamaFlexAttention",
-    "_raise_standard_flash_attn_unavailable",
-    "_standard_flash_attn_varlen_forward",
-    "_standard_flash_attn_varlen_backward_call",
-    "_cached_merge_dims",
-    "_kernel_lse",
-    "_current_valid_lengths",
-    "_FlashCachedMergeFunc",
-    "_update_ring_out_and_lse",
-    "_USPRingFlashCachedMergeFunc",
-    "LlamaFlashAttention",
-    "LlamaUSPFlashAttention",
-    "LlamaMLP",
-    "LlamaRMSNorm",
-    "LlamaForCausalLMEagle3",
-    "LlamaDecoderLayer",
-]

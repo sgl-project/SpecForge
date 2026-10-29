@@ -142,7 +142,7 @@ class name and must match the single entry in the draft JSON's
 ```python
 from transformers import PretrainedConfig
 
-from specforge.modeling.draft.base import Eagle3DraftModel
+from specforge.modeling.draft.models.base import Eagle3DraftModel
 from specforge.modeling.draft.registry import register_draft
 
 

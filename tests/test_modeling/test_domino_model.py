@@ -398,7 +398,7 @@ class TestDominoDraftModel(unittest.TestCase):
         inputs = torch.randn(2, 5, 4, dtype=torch.bfloat16)
 
         with patch(
-            "specforge.modeling.draft.domino.get_device_type", return_value="npu"
+            "specforge.modeling.draft.models.domino.get_device_type", return_value="npu"
         ):
             output = model._run_gru(inputs)
             output.float().square().mean().backward()

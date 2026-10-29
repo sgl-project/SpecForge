@@ -169,7 +169,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             self.assertEqual({"text"}, modalities, registration.name)
 
     def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
-        from specforge.modeling.draft.dspine import DSpineConfig
+        from specforge.modeling.draft.config.dspine import DSpineConfig
 
         training = SimpleNamespace(
             attention_backend="flex_attention",

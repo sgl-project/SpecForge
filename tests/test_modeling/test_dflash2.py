@@ -15,9 +15,9 @@ from specforge.modeling.draft.models.dflash import Qwen3DFlashDecoderLayer
 from specforge.modeling.draft.models.dflash2 import (
     CandidateSelector,
     DFlash2DraftModel,
-    DFlashGroupedConv,
     Qwen3DFlash2DecoderLayer,
 )
+from specforge.modeling.draft.models.layers.convolution.dflash2 import DFlashGroupedConv
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import DFlashTrainStrategy, StepContext
 
