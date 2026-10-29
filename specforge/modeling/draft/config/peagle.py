@@ -1,3 +1,5 @@
+"""P-EAGLE parameters."""
+
 from dataclasses import dataclass
 from typing import Self
 
@@ -9,6 +11,10 @@ from .eagle3 import EagleConfig
 
 @dataclass(frozen=True, kw_only=True)
 class PEagleConfig(EagleConfig):
+    """P-EAGLE feature settings and normalization ordering around the residual."""
+
+    algorithm = "peagle"
+
     norm_before_residual: bool
 
     @classmethod

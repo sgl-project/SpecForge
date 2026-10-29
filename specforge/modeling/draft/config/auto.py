@@ -14,7 +14,9 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
-from ..registry import DRAFT_REGISTRY, available_drafts
+from specforge.modeling.draft.registry import DRAFT_REGISTRY, available_drafts
+
+from .layout import decode_layout, encode_layout
 
 
 class AutoDraftConfig:
@@ -50,6 +52,7 @@ class AutoDraftConfig:
         if "draft_vocab_size" in payload and payload["draft_vocab_size"] is None:
             raise ValueError("draft config draft_vocab_size cannot be null")
 
+        payload = decode_layout(payload)
         payload["architectures"] = [architecture]
         payload["tie_word_embeddings"] = False
         payload.setdefault("use_cache", True)
@@ -75,6 +78,11 @@ class AutoDraftConfig:
         model_cls = DRAFT_REGISTRY[architectures[0]]
         prepare = getattr(model_cls, "prepare_config", None)
         return prepare(config) if prepare is not None else copy.deepcopy(config)
+
+    @classmethod
+    def to_dict(cls, config: PretrainedConfig) -> dict[str, Any]:
+        """Return a validated, portable setting in the public JSON layout."""
+        return encode_layout(cls.finalize(config).to_dict())
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> PretrainedConfig:

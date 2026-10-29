@@ -1,3 +1,5 @@
+"""dspark parameters and algorithm-specific validation."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +14,16 @@ from .dflash import DFlashConfig, _projector
 
 @dataclass(frozen=True, kw_only=True)
 class DSparkConfig(DFlashConfig):
+    """DSpark block_size counts proposed tokens (verification adds the anchor).
+
+    markov_rank: Auxiliary Markov head rank; zero disables the head.
+    markov_head_type: vanilla, gated, or rnn parameterization.
+    enable_confidence_head: Allocate per-position acceptance prediction weights.
+    confidence_head_with_markov: Feed Markov features to the confidence head.
+    """
+
+    algorithm = "dspark"
+
     markov_rank: int
     markov_head_type: str
     enable_confidence_head: bool

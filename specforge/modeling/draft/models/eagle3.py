@@ -6,6 +6,7 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.modeling.draft.config.eagle3 import Eagle3Config, EaglePretrainedConfig
+from specforge.modeling.draft.config.hf import prepare_hf_config
 from specforge.modeling.draft.models.base import Eagle3DraftModel
 from specforge.modeling.draft.registry import register_draft
 from specforge.utils import print_with_rank
@@ -139,9 +140,11 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     @classmethod
     def prepare_config(cls, config: LlamaConfig) -> LlamaConfig:
+        config = prepare_hf_config(config, cls.config_class, cls.__name__)
         return cls.draft_options_class.from_model_config(config).to_model_config(config)
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
+        config = prepare_hf_config(config, self.config_class, type(self).__name__)
         options = self.draft_options_class.from_model_config(config)
         config = options.to_model_config(config)
         super().__init__(config)

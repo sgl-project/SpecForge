@@ -55,9 +55,16 @@ def validate_gqa(config: PretrainedConfig) -> int:
 class DraftConfig(ABC):
     """Immutable model-specific options; HF config remains the checkpoint format.
 
-    Parsing does not allocate tensors or mutate its input. Subclasses own their
-    legacy JSON layout and retain fields they do not interpret.
+    Parsing does not allocate tensors or mutate its input. Subclasses own field semantics and declare legacy field locations;
+    layout.py translates these to the public spec_config at the IO boundary.
     """
+
+    # Serialization policy is inherited, but algorithm semantics belong to the subclass.
+    algorithm: ClassVar[str]
+    legacy_section: ClassVar[str | None] = None
+    top_level_fields: ClassVar[frozenset[str]] = frozenset()
+    non_spec_fields: ClassVar[frozenset[str]] = frozenset()
+    spec_aliases: ClassVar[dict[str, tuple[str | None, str]]] = {}
 
     _nested_fields: ClassVar[frozenset[str]] = frozenset()
 

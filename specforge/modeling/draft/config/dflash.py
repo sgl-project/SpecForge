@@ -12,10 +12,11 @@ from typing import Any, Optional, Self
 
 from transformers import Qwen3Config
 
-from .base import DraftConfig
-from .base import boolean as _boolean
-from .base import integer as _integer
-from .base import validate_dimensions, validate_gqa
+from specforge.modeling.draft.config.base import DraftConfig
+from specforge.modeling.draft.config.base import boolean as _boolean
+from specforge.modeling.draft.config.base import integer as _integer
+from specforge.modeling.draft.config.base import validate_dimensions, validate_gqa
+
 from .components import validate_components
 
 FULL_ATTENTION = "full_attention"
@@ -157,6 +158,23 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
 
 @dataclass(frozen=True, kw_only=True)
 class DFlashConfig(DraftConfig):
+    """Block draft parameters.
+
+    block_size: Total positions per block, including its anchor token.
+    target_layer_ids: Zero-based target layers concatenated as context features.
+    mask_token_id: Token used for unfilled draft positions; resolved by training if null.
+    projector_type: Algorithm-owned auxiliary projection selector.
+    pure_draft_prefix_len: Prefix positions supplied without target context.
+    shift_label: Whether the configured prefix layout shifts supervision labels.
+    """
+
+    algorithm = "dflash"
+    legacy_section = "dflash_config"
+    top_level_fields = frozenset({"block_size"})
+    non_spec_fields = frozenset(
+        {"layer_types", "sliding_window", "is_causal", "attention_mode"}
+    )
+
     block_size: int
     layer_types: tuple[str, ...]
     sliding_window: int | None
@@ -241,6 +259,11 @@ class DFlashConfig(DraftConfig):
         result.use_sliding_window = self.sliding_window is not None
         result.is_causal = self.is_causal
         result.dflash_config = method
+        result.attention_config = {
+            **getattr(result, "attention_config", {}),
+            "type": self.attention_mode,
+            "is_causal": self.is_causal,
+        }
         return result
 
 

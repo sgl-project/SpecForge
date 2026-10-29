@@ -1,3 +1,5 @@
+"""domino parameters and algorithm-specific validation."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +13,14 @@ from .dflash import DFlashConfig, _projector
 
 @dataclass(frozen=True, kw_only=True)
 class DominoConfig(DFlashConfig):
+    """Domino retains DFlash block_size semantics, including the anchor.
+
+    emb_dim: Token embedding projection width for the prefix recurrence.
+    gru_hidden_dim: Prefix GRU state width.
+    """
+
+    algorithm = "domino"
+
     emb_dim: int
     gru_hidden_dim: int
 

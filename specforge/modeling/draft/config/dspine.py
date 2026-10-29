@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 from .base import method_config
 from .dflash import DFlashConfig
@@ -77,6 +77,12 @@ class DSpineConfig:
 
 @dataclass(frozen=True, kw_only=True)
 class DSpineDraftConfig(DFlashConfig):
+    algorithm = "dspine"
+    non_spec_fields = DFlashConfig.non_spec_fields | {"dspine"}
+    spec_aliases = {
+        field.name: ("dspine_config", field.name) for field in fields(DSpineConfig)
+    }
+
     dspine: DSpineConfig
 
     @classmethod

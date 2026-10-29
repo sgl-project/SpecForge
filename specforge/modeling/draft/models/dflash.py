@@ -20,6 +20,7 @@ from specforge.modeling.draft.config.dflash import (
     DFlashConfig,
     resolve_dflash_causal_block,
 )
+from specforge.modeling.draft.config.hf import DraftQwen3Config, prepare_hf_config
 from specforge.modeling.draft.models.layers.attention.backends.flex_options import (
     flex_attention_backend,
 )
@@ -223,7 +224,7 @@ def normalize_draft_head_checkpoint_keys(
 
 @register_draft
 class DFlashDraftModel(Qwen3PreTrainedModel):
-    config_class = Qwen3Config
+    config_class = DraftQwen3Config
     draft_options_class = DFlashConfig
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
     decoder_layer_class = Qwen3DFlashDecoderLayer
@@ -233,6 +234,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         config,
         dflash_kernels: Optional[DFlashKernels] = None,
     ) -> None:
+        config = prepare_hf_config(config, self.config_class, type(self).__name__)
         options = self.draft_options_class.from_model_config(config)
         config = options.to_model_config(config)
         super().__init__(config)
@@ -273,6 +275,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     @classmethod
     def prepare_config(cls, config: Qwen3Config) -> Qwen3Config:
         """Validate the final architecture without allocating model parameters."""
+        config = prepare_hf_config(config, cls.config_class, cls.__name__)
         return cls.draft_options_class.from_model_config(config).to_model_config(config)
 
     def _build_decoder_layer(

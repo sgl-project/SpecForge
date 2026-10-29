@@ -36,6 +36,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from typing_extensions import Unpack
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
+from specforge.modeling.draft.config.hf import DraftQwen3Config, prepare_hf_config
 from specforge.modeling.draft.config.mtp import Qwen3_5MTPConfig
 from specforge.modeling.draft.models.mtp import MTPDraftModel
 from specforge.modeling.draft.registry import register_draft
@@ -402,15 +403,17 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
     directly by SGLang's Qwen3_5ForCausalLMMTP.
     """
 
-    config_class = Qwen3Config
+    config_class = DraftQwen3Config
     draft_options_class = Qwen3_5MTPConfig
     _no_split_modules = ["Qwen3MTPDecoderLayer"]
 
     @classmethod
     def prepare_config(cls, config: Qwen3Config) -> Qwen3Config:
+        config = prepare_hf_config(config, cls.config_class, cls.__name__)
         return cls.draft_options_class.from_model_config(config).to_model_config(config)
 
     def __init__(self, config: Qwen3Config) -> None:
+        config = prepare_hf_config(config, self.config_class, type(self).__name__)
         options = self.draft_options_class.from_model_config(config)
         config = options.to_model_config(config)
         super().__init__(config)

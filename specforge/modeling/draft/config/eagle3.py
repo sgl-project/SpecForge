@@ -8,7 +8,7 @@ from typing import Self
 from huggingface_hub.dataclasses import strict
 from transformers import LlamaConfig
 
-from .base import (
+from specforge.modeling.draft.config.base import (
     DraftConfig,
     boolean,
     integer,
@@ -16,11 +16,13 @@ from .base import (
     validate_dimensions,
     validate_gqa,
 )
+
 from .components import validate_components
+from .hf import DraftSerializationMixin
 
 
 @strict
-class EaglePretrainedConfig(LlamaConfig):
+class EaglePretrainedConfig(DraftSerializationMixin, LlamaConfig):
     """Llama JSON compatibility with EAGLE's independent projection width."""
 
     def validate_architecture(self):
@@ -32,13 +34,22 @@ class EaglePretrainedConfig(LlamaConfig):
 
 @dataclass(frozen=True, kw_only=True)
 class EagleConfig(DraftConfig):
+    legacy_section = "eagle_config"
+    non_spec_fields = frozenset({"aux_hidden_state_layer_ids"})
+    top_level_fields = frozenset(
+        {"target_hidden_size", "fc_norm", "norm_output", "norm_before_residual"}
+    )
+    spec_aliases = {
+        "target_layer_ids": ("eagle_config", "eagle_aux_hidden_state_layer_ids")
+    }
+
     _nested_fields = frozenset({"aux_hidden_state_layer_ids"})
     target_hidden_size: int
     aux_hidden_state_layer_ids: tuple[int, ...] | None
 
     @classmethod
     def _common_fields(cls, config: LlamaConfig) -> dict:
-        validate_components(config, attention_types=("gqa",))
+        validate_components(config, attention_types=("gqa", "mha"), causal_only=True)
         validate_dimensions(config)
         if validate_gqa(config) % 2:
             raise ValueError("head_dim must be even for EAGLE rotary embeddings")
@@ -77,6 +88,10 @@ class EagleConfig(DraftConfig):
 
 @dataclass(frozen=True, kw_only=True)
 class Eagle3Config(EagleConfig):
+    """EAGLE3 feature width/layers and optional fusion/output normalization."""
+
+    algorithm = "eagle3"
+
     fc_norm: bool
     norm_output: bool
 

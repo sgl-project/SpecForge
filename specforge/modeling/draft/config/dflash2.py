@@ -1,3 +1,5 @@
+"""dflash2 parameters and algorithm-specific validation."""
+
 from __future__ import annotations
 
 import math
@@ -12,6 +14,18 @@ from .dflash import DFlashConfig
 
 @dataclass(frozen=True, kw_only=True)
 class DFlash2Config(DFlashConfig):
+    """DFlash2 retains DFlash block_size semantics, including the anchor.
+
+    conv_kernel_size: Width of the within-block causal convolution.
+    conv_group_size: Channels per convolution group; must divide hidden_size.
+    selector_rank: Low-rank candidate selector width.
+    selector_top_k: Number of vocabulary candidates selected per position.
+    output_multiplier: Scale applied to output logits.
+    final_logit_softcapping: Optional positive output logit cap.
+    """
+
+    algorithm = "dflash2"
+
     conv_kernel_size: int
     conv_group_size: int
     selector_rank: int

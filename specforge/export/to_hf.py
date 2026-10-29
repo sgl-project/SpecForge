@@ -23,6 +23,7 @@ from specforge.export.checkpoint_io import (
     apply_legacy_rope_scaling,
     materialize_draft,
     resolve_training_state,
+    write_serving_config,
 )
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
@@ -85,6 +86,7 @@ def export_to_hf(
         }
     )
     model.save_pretrained(output_dir, state_dict=full_state)
+    write_serving_config(model, output_dir)
     apply_legacy_rope_scaling(output_dir)
     return output_dir
 

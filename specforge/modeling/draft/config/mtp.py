@@ -8,12 +8,29 @@ from typing import Self
 
 from transformers import Qwen3Config
 
-from .base import DraftConfig, boolean, method_config, validate_dimensions, validate_gqa
+from specforge.modeling.draft.config.base import (
+    DraftConfig,
+    boolean,
+    method_config,
+    validate_dimensions,
+    validate_gqa,
+)
+
 from .components import validate_components
 
 
 @dataclass(frozen=True, kw_only=True)
 class Qwen3_5MTPConfig(DraftConfig):
+    """Native Qwen3.5 MTP: output gating, rotary fraction, and target head sharing.
+
+    This configuration does not assume EAGLE3's feature concatenation protocol.
+    """
+
+    algorithm = "mtp"
+    legacy_section = "mtp_config"
+    top_level_fields = frozenset({"attn_output_gate"})
+    non_spec_fields = frozenset({"partial_rotary_factor"})
+
     _nested_fields = frozenset({"share_lm_head"})
     attn_output_gate: bool
     partial_rotary_factor: float
@@ -21,7 +38,7 @@ class Qwen3_5MTPConfig(DraftConfig):
 
     @classmethod
     def from_model_config(cls, config: Qwen3Config) -> Self:
-        validate_components(config, attention_types=("gqa",))
+        validate_components(config, attention_types=("gqa", "mha"), causal_only=True)
         validate_dimensions(config)
         head_dim = validate_gqa(config)
         if config.num_hidden_layers != 1:

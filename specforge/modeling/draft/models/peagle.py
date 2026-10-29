@@ -9,6 +9,7 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.modeling.draft.config.eagle3 import EaglePretrainedConfig
+from specforge.modeling.draft.config.hf import prepare_hf_config
 from specforge.modeling.draft.config.peagle import PEagleConfig
 from specforge.modeling.draft.models.base import Eagle3DraftModel
 from specforge.modeling.draft.models.layers.attention.backends.flex import (
@@ -197,6 +198,7 @@ class PEagleDraftModel(Eagle3DraftModel):
 
     @classmethod
     def prepare_config(cls, config: LlamaConfig) -> LlamaConfig:
+        config = prepare_hf_config(config, cls.config_class, cls.__name__)
         return cls.draft_options_class.from_model_config(config).to_model_config(config)
 
     def __init__(
@@ -207,6 +209,7 @@ class PEagleDraftModel(Eagle3DraftModel):
         if norm_before_residual is not None:
             config = copy.deepcopy(config)
             config.norm_before_residual = norm_before_residual
+        config = prepare_hf_config(config, self.config_class, type(self).__name__)
         options = self.draft_options_class.from_model_config(config)
         config = options.to_model_config(config)
         norm_before_residual = options.norm_before_residual

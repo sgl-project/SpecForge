@@ -88,8 +88,9 @@ tracking are also config features rather than custom launchers; see the
 ## DFlash-family attention modes
 
 DFlash-family draft models select their attention parameterization with
-`dflash_config.attention_mode`: `gqa` (the default), `mha`, or `mla`. The mode
-swaps only the attention projections inside the shared decoder layer; the
+`attention_config.type`: `gqa` (the default), `mha`, or `mla`. Legacy
+`dflash_config.attention_mode` remains readable. The implemented modes
+swap only the attention projections inside the shared decoder layer; the
 `DFlashDraftModel`, `DFlash2DraftModel`, `DominoDraftModel`, and
 `DSparkDraftModel` architectures, target-context injection, per-layer
 full/sliding masks, objectives, capture contract, and
@@ -102,24 +103,28 @@ architecture:
   "architectures": ["DSparkDraftModel"],
   "hidden_size": 4096,
   "num_attention_heads": 32,
-  "q_lora_rank": 1536,
-  "kv_lora_rank": 512,
-  "qk_nope_head_dim": 128,
-  "qk_rope_head_dim": 64,
-  "v_head_dim": 128,
-  "dflash_config": {
-    "projector_type": "dspark",
-    "attention_mode": "mla"
+  "attention_config": {
+    "type": "mla",
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128
+  },
+  "spec_config": {
+    "schema_version": 1,
+    "algorithm": "dspark",
+    "projector_type": "dspark"
   }
 }
 ```
 
-MLA dimensions and behavior use the standard top-level Hugging Face fields:
+MLA-specific dimensions and behavior live in `attention_config`:
 `q_lora_rank` (`null` selects a direct query projection), `kv_lora_rank`, the
 head dims (`qk_nope_head_dim` may be zero; `qk_rope_head_dim` must be even),
 and `rope_interleave` for the rotation convention (omitted means interleaved,
 the DeepSeek default; `false` selects NeoX-style half rotation). Omitting
-`attention_mode` preserves the existing GQA path; `"mha"` requires equal
+`attention_config.type` preserves the existing GQA path; `"mha"` requires equal
 query/KV head counts.
 
 MLA is a training-side mode: checkpoints train, evaluate through
@@ -203,20 +208,25 @@ allocating weights. Standalone callers can use the same method after applying
 their overrides. Parsing alone deliberately accepts incomplete variant settings
 so an override can repair them before finalization.
 
-`draft/config_base.py` defines the immutable `DraftConfig` contract:
+`draft/config/base.py` defines the immutable `DraftConfig` contract:
 `from_model_config` resolves and validates options without allocating parameters;
-`to_model_config` writes them into an independent HF config in the existing JSON
-layout. Architecture-specific implementations are:
+`to_model_config` writes them into an independent HF runtime config.
+`AutoDraftConfig.to_dict` emits the public JSON format: HF root fields alongside
+`attention_config`, `residual_config`, `ffn_config`, and `spec_config`.
+`DraftConfigClass` is an alias for this unified loader. Ordinary `save_pretrained`
+writes the public format; the HF/SGLang exporters translate to legacy serving
+fields and retain a canonical `specforge_config.json` alongside them.
+Architecture-specific implementations are:
 
 | Draft architecture | Resolved options | File |
 | --- | --- | --- |
-| EAGLE3 | `Eagle3Config` | `draft/eagle_config.py` |
-| P-EAGLE | `PEagleConfig` | `draft/eagle_config.py` |
-| DFlash | `DFlashConfig` | `draft/dflash_config.py` |
-| DFlash2 | `DFlash2Config` | `draft/dflash_config.py` |
-| Domino | `DominoConfig` | `draft/dflash_config.py` |
-| DSpark | `DSparkConfig` | `draft/dflash_config.py` |
-| Qwen3.5 MTP | `Qwen3_5MTPConfig` | `draft/mtp/config.py` |
+| EAGLE3 | `Eagle3Config` | `draft/config/eagle3.py` |
+| P-EAGLE | `PEagleConfig` | `draft/config/peagle.py` |
+| DFlash | `DFlashConfig` | `draft/config/dflash.py` |
+| DFlash2 | `DFlash2Config` | `draft/config/dflash2.py` |
+| Domino | `DominoConfig` | `draft/config/domino.py` |
+| DSpark | `DSparkConfig` | `draft/config/dspark.py` |
+| Qwen3.5 MTP | `Qwen3_5MTPConfig` | `draft/config/mtp.py` |
 
 Each built-in model exposes `draft_options_class`, a `prepare_config` hook, and
 the resolved `model.draft_options` snapshot. Model constructors enforce the same
@@ -233,9 +243,10 @@ override and EAGLE-family capture-layer overrides are applied before validation
 and preserved in the resolved config. Loss weights and sampling policy remain
 owned by the algorithm/run config.
 
-Finalization returns a copy and preserves unknown JSON fields. Top-level
-`block_size` retains precedence over `dflash_config.block_size`; both are written
-consistently in the resolved copy. Default capture layers and head switches are
+Finalization returns a copy and preserves unknown legacy metadata. New extension
+fields are validated and conflicting new/old aliases are rejected. For legacy
+inputs, top-level `block_size` retains precedence over `dflash_config.block_size`;
+both are written consistently in the resolved copy. Default capture layers and head switches are
 made explicit for serialization. Model construction does not mutate the caller's
 config. Resolved architecture options are snapshots: create a new model to change
 its architecture rather than mutating the original config after construction.
