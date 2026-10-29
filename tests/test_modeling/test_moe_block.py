@@ -192,8 +192,22 @@ class FamilyConfigTest(unittest.TestCase):
         self.assertEqual(
             (gate.num_experts, gate.top_k, gate.norm_topk_prob), (E, K, True)
         )
+        # A family only has to supply score(): select and combine come from Router.
         with self.assertRaises(NotImplementedError):
-            Router(E)(torch.zeros(1, H))
+            Router(E, K)(torch.zeros(1, H))
+
+        class Uniform(Router):
+            def score(self, x):
+                return torch.full(
+                    (x.shape[0], self.num_experts), 1.0 / self.num_experts
+                )
+
+        scores, indices, weights = Uniform(E, K, route_scale=2.0)(torch.zeros(3, H))
+        self.assertEqual(
+            (tuple(scores.shape), tuple(indices.shape), tuple(weights.shape)),
+            ((3, E), (3, K), (3, K)),
+        )
+        self.assertTrue(torch.all(weights == 2.0 / E))
         # Qwen3.8's config omits norm_topk_prob; transformers renormalizes, so do we.
         config = _config()
         del config.norm_topk_prob

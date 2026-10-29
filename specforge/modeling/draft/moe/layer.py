@@ -8,7 +8,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert
-from specforge.modeling.draft.moe.router import TopKRouter
+from specforge.modeling.draft.moe.router import Router
 
 
 class MoELayer(nn.Module):
@@ -16,7 +16,7 @@ class MoELayer(nn.Module):
 
     def __init__(
         self,
-        gate: TopKRouter,
+        gate: Router,
         experts: RoutedExperts,
         shared_expert: Optional[SharedExpert] = None,
         shared_expert_gate: Optional[nn.Linear] = None,
