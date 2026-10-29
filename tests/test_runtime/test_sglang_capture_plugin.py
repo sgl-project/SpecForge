@@ -565,8 +565,17 @@ class TestInstall(unittest.TestCase):
                 result = SimpleNamespace(internal_state={"existing": "value"})
                 with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": protocol}):
                     specforge_sglang_capture._capture_internal_state(result, scheduler)
-                self.assertEqual(result.internal_state, {"existing": "value"})
+                self.assertEqual(
+                    result.internal_state,
+                    {"existing": "value", "spec_capture_backend": "plugin"},
+                )
                 self.assertIsNone(runtime.sink._control_listener)
+
+    def test_internal_state_marks_only_installed_capture(self):
+        # server_capture: auto reads this marker from /server_info.
+        result = SimpleNamespace(internal_state={"existing": "value"})
+        specforge_sglang_capture._capture_internal_state(result, SimpleNamespace())
+        self.assertEqual(result.internal_state, {"existing": "value"})
 
 
 class TestRegister(unittest.TestCase):

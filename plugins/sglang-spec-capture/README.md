@@ -83,10 +83,23 @@ MOONCAKE_METADATA_SERVER=http://127.0.0.1:8080/metadata \
 ```
 
 The scheduler refuses to start if capture is enabled without these flags.
-SpecForge's managed launcher renders them when
-`deployment.disaggregated.server_capture: plugin` is set. For an external
-server, set that config field or `DISAGG_SERVER_CAPTURE=plugin` so the
-producer sends specs the plugin's way.
+
+SpecForge selects the plugin with `deployment.disaggregated.server_capture`.
+The default, `auto`, finds it without configuration:
+
+- Managed-local servers: while planning, SpecForge probes each capture
+  server's Python. It selects the plugin when `specforge_sglang_capture`,
+  `sglang.srt.model_executor.forward_observer` and
+  `sglang.srt.managers.deferred_output` (with `ResponseCompletion`, the
+  `defer_response` completion protocol) import. Otherwise it selects the
+  patch if the patched SGLang imports. It then renders the flags above and
+  `SPECFORGE_SPEC_CAPTURE=1`. `specforge train --plan` shows the result.
+- External servers: before the first request, the producer reads each
+  server's `/server_info`. The enabled plugin adds `spec_capture_backend:
+  plugin` to every scheduler's `internal_states`.
+
+`server_capture: plugin`, or `DISAGG_SERVER_CAPTURE=plugin` when the config
+leaves it at `auto`, skips detection.
 
 For managed servers in a separate environment, set the server's Python
 executable explicitly while launching SpecForge from its training environment:
@@ -94,7 +107,6 @@ executable explicitly while launching SpecForge from its training environment:
 ```yaml
 deployment:
   disaggregated:
-    server_capture: plugin
     managed_local:
       capture_servers:
         - port: 32000
