@@ -197,9 +197,59 @@ fields are preserved and copied so parsing does not modify the caller's input.
 Training policy remains separate: explicit `model.draft_model_config` takes
 precedence over checkpoint configuration, then target-derived defaults are used
 when the algorithm supports them. Run overrides are applied afterward by the
-training resolver. Architecture-specific validation still lives in the existing
-providers and model constructors; loading a config alone does not validate all
-model-specific constraints or allocate model weights.
+training resolver. For all built-in draft models, the resolver then calls
+`AutoDraftConfig.finalize(config)` to validate the final architecture before
+allocating weights. Standalone callers can use the same method after applying
+their overrides. Parsing alone deliberately accepts incomplete variant settings
+so an override can repair them before finalization.
+
+`draft/config_base.py` defines the immutable `DraftConfig` contract:
+`from_model_config` resolves and validates options without allocating parameters;
+`to_model_config` writes them into an independent HF config in the existing JSON
+layout. Architecture-specific implementations are:
+
+| Draft architecture | Resolved options | File |
+| --- | --- | --- |
+| EAGLE3 | `Eagle3Config` | `draft/eagle_config.py` |
+| P-EAGLE | `PEagleConfig` | `draft/eagle_config.py` |
+| DFlash | `DFlashConfig` | `draft/dflash_config.py` |
+| DFlash2 | `DFlash2Config` | `draft/dflash_config.py` |
+| Domino | `DominoConfig` | `draft/dflash_config.py` |
+| DSpark | `DSparkConfig` | `draft/dflash_config.py` |
+| Qwen3.5 MTP | `Qwen3_5MTPConfig` | `draft/mtp/config.py` |
+
+Each built-in model exposes `draft_options_class`, a `prepare_config` hook, and
+the resolved `model.draft_options` snapshot. Model constructors enforce the same
+rules when called directly with a legacy HF config. External registered models
+without a hook retain their previous behavior; new architectures should implement
+the contract and add a case to `test_all_draft_configs.py`.
+
+EAGLE's HF adapter remains a `LlamaConfig` subclass and retains `model_type=llama`.
+It permits the explicit projection width used by EAGLE when hidden size is not
+divisible by query head count. The current EAGLE3 and Qwen3.5 MTP implementations
+require one layer; P-EAGLE supports multiple layers. Boolean architecture switches
+must be JSON booleans, not strings. P-EAGLE's training `norm_before_residual`
+override and EAGLE-family capture-layer overrides are applied before validation
+and preserved in the resolved config. Loss weights and sampling policy remain
+owned by the algorithm/run config.
+
+Finalization returns a copy and preserves unknown JSON fields. Top-level
+`block_size` retains precedence over `dflash_config.block_size`; both are written
+consistently in the resolved copy. Default capture layers and head switches are
+made explicit for serialization. Model construction does not mutate the caller's
+config. Resolved architecture options are snapshots: create a new model to change
+its architecture rather than mutating the original config after construction.
+Converting a resolved view back to HF config writes its attention layout, sliding
+window, and direction along with the method settings. Attention dimensions and
+active sliding windows must be integers; fractional values and booleans are not
+silently converted to dimensions.
+
+Setting `draft_num_hidden_layers` to the existing depth preserves explicit capture
+layers. Changing the depth retains the existing policy of rebuilding capture
+layers from `num_target_layers`; a mixed attention layout must instead be supplied
+explicitly at the requested depth. Configs without `num_target_layers` can still
+specify capture layers directly, but must provide the desired layout and depth
+rather than relying on automatic resizing.
 
 ## Fused token losses
 

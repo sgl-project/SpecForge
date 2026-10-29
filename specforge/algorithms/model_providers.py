@@ -116,10 +116,7 @@ def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
 def build_peagle_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.draft.peagle import PEagleDraftModel
 
-    draft_model = PEagleDraftModel(
-        draft_config,
-        norm_before_residual=cfg.training.norm_before_residual,
-    )
+    draft_model = PEagleDraftModel(draft_config)
     if cfg.model.load_target_embedding:
         draft_model.load_embedding(
             cfg.model.target_model_path,
@@ -513,12 +510,20 @@ def populate_dflash_generated_config(
     }
 
 
+def apply_eagle_overrides(cfg: Config, draft_config: Any) -> None:
+    from specforge.modeling.draft.config_base import method_config
+
+    if cfg.model.aux_hidden_state_layer_ids is not None:
+        draft_config.eagle_config = {
+            **method_config(draft_config, "eagle_config"),
+            "eagle_aux_hidden_state_layer_ids": list(
+                cfg.model.aux_hidden_state_layer_ids
+            ),
+        }
+
+
 def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
-    from specforge.modeling.draft.dflash import (
-        build_target_layer_ids,
-        resolve_dflash_attention_layout,
-        validate_dflash_attention_config,
-    )
+    from specforge.modeling.draft.config.dflash import build_target_layer_ids
 
     method_config = dict(getattr(draft_config, "dflash_config", None) or {})
     if cfg.model.draft_block_size is not None:
@@ -544,9 +549,6 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
                 requested_layers,
             ),
         }
-
-    resolve_dflash_attention_layout(draft_config)
-    validate_dflash_attention_config(draft_config)
 
 
 __all__ = [

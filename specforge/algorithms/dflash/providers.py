@@ -85,13 +85,13 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_kl_decay": float(training_model.kl_decay),
     }
     if getattr(draft_model, "candidate_selector", None) is not None:
-        method_config = dict(getattr(draft_model.config, "dflash_config", None) or {})
+        options = draft_model.draft_options
         contract.update(
             {
-                "dflash2_conv_kernel_size": int(method_config["conv_kernel_size"]),
-                "dflash2_conv_group_size": int(method_config["conv_group_size"]),
-                "dflash2_selector_rank": int(method_config["selector_rank"]),
-                "dflash2_selector_top_k": int(method_config["selector_top_k"]),
+                "dflash2_conv_kernel_size": options.conv_kernel_size,
+                "dflash2_conv_group_size": options.conv_group_size,
+                "dflash2_selector_rank": options.selector_rank,
+                "dflash2_selector_top_k": options.selector_top_k,
                 "dflash2_selector_loss_alpha": float(
                     training_model.selector_loss_alpha
                 ),

@@ -20,6 +20,7 @@ from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
+from .eagle_config import Eagle3Config, EaglePretrainedConfig
 from .registry import register_draft
 
 try:
@@ -1576,10 +1577,18 @@ class LlamaDecoderLayer(nn.Module):
 @register_draft
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
-    config_class = LlamaConfig
+    config_class = EaglePretrainedConfig
+    draft_options_class = Eagle3Config
+
+    @classmethod
+    def prepare_config(cls, config: LlamaConfig) -> LlamaConfig:
+        return cls.draft_options_class.from_model_config(config).to_model_config(config)
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
+        options = self.draft_options_class.from_model_config(config)
+        config = options.to_model_config(config)
         super().__init__(config)
+        self.draft_options = options
         self.config = config
         self.quant_config = quant_config
 
@@ -1590,16 +1599,14 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
-        self.target_hidden_size = getattr(
-            config, "target_hidden_size", config.hidden_size
-        )
+        self.target_hidden_size = options.target_hidden_size
 
         self.fc = torch.nn.Linear(
             self.target_hidden_size * 3,
             config.hidden_size,
             bias=False,
         )
-        if getattr(config, "fc_norm", False):
+        if options.fc_norm:
             self.fc_norm = nn.ModuleList(
                 [
                     LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps)
@@ -1610,7 +1617,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_output = getattr(config, "norm_output", False)
+        self.norm_output = options.norm_output
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
