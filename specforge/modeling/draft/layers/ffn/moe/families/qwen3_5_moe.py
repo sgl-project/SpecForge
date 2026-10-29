@@ -4,9 +4,9 @@
 from torch import nn
 from transformers import PretrainedConfig
 
-from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert
-from specforge.modeling.draft.moe.layer import MoELayer
-from specforge.modeling.draft.moe.router import TopKRouter
+from specforge.modeling.draft.layers.ffn.moe.experts import RoutedExperts, SharedExpert
+from specforge.modeling.draft.layers.ffn.moe.layer import MoELayer
+from specforge.modeling.draft.layers.ffn.moe.router import TopKRouter
 
 
 def build_moe(config: PretrainedConfig) -> MoELayer:

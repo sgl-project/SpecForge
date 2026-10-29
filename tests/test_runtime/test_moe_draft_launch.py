@@ -35,7 +35,7 @@ def _worker(rank, world_size, sharding):
     from torch.nn.parallel import DistributedDataParallel as DDP
 
     from specforge.launch import build_offline_runtime
-    from specforge.modeling.draft.moe import MoELayer
+    from specforge.modeling.draft.layers.ffn.moe import MoELayer
     from specforge.optimizer import BF16Optimizer
 
     hidden, sequence_length = 64, 12

@@ -7,8 +7,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from specforge.modeling.draft.moe.experts import RoutedExperts, SharedExpert
-from specforge.modeling.draft.moe.router import Router
+from specforge.modeling.draft.layers.ffn.moe.experts import RoutedExperts, SharedExpert
+from specforge.modeling.draft.layers.ffn.moe.router import Router
 
 
 class MoELayer(nn.Module):
@@ -66,7 +66,7 @@ def build_ffn(
         return dense(config)
     else:
         # Families import MoELayer from this module, so load them lazily.
-        from specforge.modeling.draft.moe.families import FAMILIES
+        from specforge.modeling.draft.layers.ffn.moe.families import FAMILIES
 
         if moe_preset not in FAMILIES:
             raise ValueError(

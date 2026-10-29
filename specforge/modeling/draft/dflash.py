@@ -27,7 +27,7 @@ from .dflash_mask import (
 )
 from .flex_attention import compile_friendly_flex_attention
 from .flex_attention_backend import flex_attention_backend
-from .moe import MoELayer, build_ffn
+from .layers.ffn.moe import MoELayer, build_ffn
 from .registry import register_draft
 
 FULL_ATTENTION = "full_attention"

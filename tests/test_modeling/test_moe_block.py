@@ -16,10 +16,10 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from specforge.modeling.draft import DFlashDraftModel
-from specforge.modeling.draft.moe import MoELayer, build_ffn
-from specforge.modeling.draft.moe import experts as experts_module
-from specforge.modeling.draft.moe.families.qwen3_5_moe import build_moe
-from specforge.modeling.draft.moe.router import Router, TopKRouter
+from specforge.modeling.draft.layers.ffn.moe import MoELayer, build_ffn
+from specforge.modeling.draft.layers.ffn.moe import experts as experts_module
+from specforge.modeling.draft.layers.ffn.moe.families.qwen3_5_moe import build_moe
+from specforge.modeling.draft.layers.ffn.moe.router import Router, TopKRouter
 
 E, H, I, S, K = 4, 64, 32, 48, 2
 TINY_DFLASH = {
