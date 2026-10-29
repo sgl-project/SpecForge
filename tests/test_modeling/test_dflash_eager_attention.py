@@ -6,7 +6,7 @@ from torch import nn
 from torch.testing import assert_close
 from transformers import Qwen3Config
 
-from specforge.modeling.draft.models.dflash import Qwen3DFlashAttention
+from specforge.modeling.draft.models.layers.attention.gqa import Qwen3DFlashAttention
 from specforge.modeling.draft.models.layers.attention.masks import (
     create_dflash_sdpa_mask,
 )

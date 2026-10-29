@@ -11,16 +11,14 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
-from specforge.modeling.draft.models.dflash import (
-    DFlashDraftModel,
-    Qwen3DFlashAttention,
-    Qwen3DFlashMLAAttention,
-    apply_mla_rope,
-)
+from specforge.modeling.draft.models.dflash import DFlashDraftModel
 from specforge.modeling.draft.models.dspark import DSparkDraftModel
+from specforge.modeling.draft.models.layers.attention.dflash import apply_mla_rope
+from specforge.modeling.draft.models.layers.attention.gqa import Qwen3DFlashAttention
 from specforge.modeling.draft.models.layers.attention.masks import (
     create_dflash_block_mask,
 )
+from specforge.modeling.draft.models.layers.attention.mla import Qwen3DFlashMLAAttention
 from specforge.modeling.draft.models.layers.kernels import DEFAULT_DFLASH_KERNELS
 
 

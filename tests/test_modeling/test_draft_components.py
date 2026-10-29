@@ -1,6 +1,5 @@
-"""Component validation and compatibility paths for draft models."""
+"""Component validation for draft models."""
 
-import importlib
 import unittest
 from unittest.mock import patch
 
@@ -37,16 +36,3 @@ class DraftComponentsTest(unittest.TestCase):
                 config = AutoDraftConfig.from_dict({**payload, field: {"typo": 1}})
                 with self.assertRaisesRegex(ValueError, "Unknown"):
                     AutoDraftConfig.finalize(config)
-
-    def test_legacy_imports_refer_to_the_same_implementations(self):
-        for old, new in [
-            ("dflash", "models.dflash"),
-            ("dspark", "models.dspark"),
-            ("llama3_eagle", "models.eagle3"),
-            ("mtp.qwen3_5", "models.specialized.qwen3_5_mtp.model"),
-        ]:
-            with self.subTest(module=old):
-                self.assertIs(
-                    importlib.import_module(f"specforge.modeling.draft.{old}"),
-                    importlib.import_module(f"specforge.modeling.draft.{new}"),
-                )

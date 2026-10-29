@@ -15,7 +15,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
-from specforge.modeling.draft.config import dflash as _draft_config
 from specforge.modeling.draft.config.dflash import (
     DFlashConfig,
     resolve_dflash_causal_block,
@@ -34,12 +33,6 @@ from specforge.modeling.draft.models.layers.kernels import (
     DFlashKernels,
 )
 from specforge.modeling.draft.registry import register_draft
-
-# Preserve the existing helper import paths while configuration owns the rules.
-build_target_layer_ids = _draft_config.build_target_layer_ids
-resolve_dflash_attention_layout = _draft_config.resolve_dflash_attention_layout
-validate_dflash_attention_config = _draft_config.validate_dflash_attention_config
-validate_dflash_mla_config = _draft_config.validate_dflash_mla_config
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
@@ -97,14 +90,6 @@ def _rope_config(config: Qwen3Config, attention_mode: str) -> Qwen3Config:
 
 
 from .layers.attention import build_dflash_attention
-from .layers.attention.dflash import (
-    Qwen3DFlashAttentionBase,
-    _prepare_dflash_eager_mask,
-    apply_mla_rope,
-    apply_rotary_pos_emb,
-)
-from .layers.attention.gqa import Qwen3DFlashAttention
-from .layers.attention.mla import Qwen3DFlashMLAAttention
 from .layers.ffn import build_ffn
 from .layers.residual import build_residual
 
@@ -556,19 +541,3 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 ]
 
         return output_ids
-
-
-# Preserve the historical helper surface while implementations live in layers.
-__all__ = [
-    "DFlashDraftModel",
-    "Qwen3DFlashDecoderLayer",
-    "Qwen3DFlashAttentionBase",
-    "Qwen3DFlashAttention",
-    "Qwen3DFlashMLAAttention",
-    "apply_rotary_pos_emb",
-    "apply_mla_rope",
-    "_prepare_dflash_eager_mask",
-    "build_target_layer_ids",
-    "extract_context_feature",
-    "sample",
-]
