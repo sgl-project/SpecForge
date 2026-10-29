@@ -49,7 +49,9 @@ class OnlineDSpineModel(OnlineDFlashModel):
     ) -> tuple[torch.Tensor, ...]:
         config = self.dspine_config
         with torch.no_grad():
-            teacher_logits = self.lm_head(teacher_hidden)
+            teacher_logits = self.target_logit_transform.apply_teacher(
+                self.lm_head(teacher_hidden)
+            )
         terms = self._logits_loss_terms(
             self.lm_head(hidden),
             labels,
