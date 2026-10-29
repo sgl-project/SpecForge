@@ -35,7 +35,10 @@ draft/
         masks.py               block visibility, causal and sliding-window masks
         backends/              eager, SDPA, Flash and Flex execution
         parallel/              Ring communication and attention execution
-      ffn/                     FFN factory, dense FFN, DFlash2 convolution kernel
+      ffn/                     FFN factory and dense FFN
+      convolution/
+        dflash2.py             grouped convolution, eager path and backend selection
+        dflash2_triton.py      optional Triton forward/backward kernels
       residual/                residual contract and ordinary additive residual
       normalization.py         shared RMSNorm
       kernels.py               optional optimized kernel factories
@@ -52,11 +55,12 @@ not an instruction to load weights. Only `architectures` selects a model.
 `llama3_eagle.py` is now `models/eagle3.py`; the registered architecture name
 `LlamaForCausalLMEagle3` is retained so existing checkpoints keep loading.
 
-The old Python import paths forward to the new implementations. Internal code
-uses the new paths; compatibility modules must not acquire their own logic.
+Old Python import paths have been removed. Import model classes from
+`models/`, typed options from `config/`, and reusable components from
+`models/layers/`. Update external imports to these canonical paths.
 The general-purpose embedding, linear, and LM-head modules in
 `specforge/layers/` retain their existing location. Ring's implementation lives
-under draft attention, with compatibility imports at its former location.
+at `models/layers/attention/parallel/ring.py`; its old imports have been removed.
 
 ## Public JSON
 
