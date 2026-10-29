@@ -8,8 +8,8 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from .dflash import DFlashDraftModel
 from .config.dspark import DSparkConfig
+from .dflash import DFlashDraftModel
 from .registry import register_draft
 
 

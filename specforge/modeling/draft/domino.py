@@ -11,8 +11,8 @@ from torch.func import functional_call
 
 from specforge.utils import get_device_type
 
-from .dflash import DFlashDraftModel, sample
 from .config.domino import DominoConfig
+from .dflash import DFlashDraftModel, sample
 from .registry import register_draft
 
 
