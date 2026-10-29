@@ -144,23 +144,30 @@ class MoEBlockTest(unittest.TestCase):
 
 
 class BuildFfnTest(unittest.TestCase):
-    def test_build_ffn_switches_on_moe_preset(self):
+    def test_build_ffn_switches_on_moe_preset_and_ffn_layer_types(self):
         config = Qwen3Config(**TINY_DFLASH)
-        self.assertIsInstance(build_ffn(config, dense=Qwen3MLP), Qwen3MLP)
+        self.assertIsInstance(build_ffn(config, 0, dense=Qwen3MLP), Qwen3MLP)
         # MoE fields alone keep the dense MLP: the preset is the switch.
         with_fields = Qwen3Config(**TINY_DFLASH, num_experts=8, num_experts_per_tok=1)
-        self.assertIsInstance(build_ffn(with_fields, dense=Qwen3MLP), Qwen3MLP)
+        self.assertIsInstance(build_ffn(with_fields, 0, dense=Qwen3MLP), Qwen3MLP)
         moe_config = Qwen3Config(**TINY_DFLASH, **TINY_MOE)
-        self.assertIsInstance(build_ffn(moe_config, dense=Qwen3MLP), MoELayer)
+        self.assertIsInstance(build_ffn(moe_config, 0, dense=Qwen3MLP), MoELayer)
         with self.assertRaisesRegex(ValueError, "qwen3_moe"):
             build_ffn(
-                Qwen3Config(**TINY_DFLASH, moe_preset="qwen3_moe"), dense=Qwen3MLP
+                Qwen3Config(**TINY_DFLASH, moe_preset="qwen3_moe"), 0, dense=Qwen3MLP
             )
         # DFlash layers build their MLP through it.
         dense_draft = DFlashDraftModel(config)
         self.assertTrue(all(isinstance(l.mlp, Qwen3MLP) for l in dense_draft.layers))
         moe_draft = DFlashDraftModel(moe_config)
         self.assertTrue(all(isinstance(l.mlp, MoELayer) for l in moe_draft.layers))
+        # ffn_layer_types picks per layer.
+        hybrid = Qwen3Config(
+            **TINY_DFLASH, **TINY_MOE, ffn_layer_types=["dense", "moe"]
+        )
+        layers = DFlashDraftModel(hybrid).layers
+        self.assertIsInstance(layers[0].mlp, Qwen3MLP)
+        self.assertIsInstance(layers[1].mlp, MoELayer)
 
     def test_from_pretrained_inits_missing_moe_weights_and_keeps_loaded_ones(self):
         model = DFlashDraftModel(Qwen3Config(**TINY_DFLASH, **TINY_MOE))

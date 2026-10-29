@@ -51,19 +51,26 @@ class MoELayer(nn.Module):
 
 def build_ffn(
     config: PretrainedConfig,
+    layer_idx: int,
     *,
     dense: Callable[[PretrainedConfig], nn.Module],
 ) -> nn.Module:
-    """``dense(config)``, or the MoE layer of the family the ``moe_preset`` names."""
+    """``dense(config)``, or for an MoE draft (``moe_preset``) the family's MoE layer."""
 
     moe_preset = getattr(config, "moe_preset", None)
     if moe_preset is None:
         return dense(config)
-    # Families import MoELayer from this module, so load them lazily.
-    from specforge.modeling.draft.moe.families import FAMILIES
+    # Within an MoE draft, ffn_layer_types marks the dense layers; no list means all MoE.
+    types = getattr(config, "ffn_layer_types", None)
+    if types is not None and types[layer_idx] == "dense":
+        return dense(config)
+    else:
+        # Families import MoELayer from this module, so load them lazily.
+        from specforge.modeling.draft.moe.families import FAMILIES
 
-    if moe_preset not in FAMILIES:
-        raise ValueError(
-            f"unknown moe_preset={moe_preset!r}; expected one of {sorted(FAMILIES)}"
-        )
-    return FAMILIES[moe_preset](config)
+        if moe_preset not in FAMILIES:
+            raise ValueError(
+                f"unknown moe_preset={moe_preset!r}; "
+                f"expected one of {sorted(FAMILIES)}"
+            )
+        return FAMILIES[moe_preset](config)
