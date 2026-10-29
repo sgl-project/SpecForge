@@ -28,9 +28,13 @@ class MoELayer(nn.Module):
         self.shared_expert_gate = shared_expert_gate
 
     def reset_parameters(self, std: float) -> None:
-        # Only the router and experts hold bare Parameters that HF's init skips.
+        """Every part of the layer, bare Parameters and Linears alike."""
         self.gate.reset_parameters(std)
         self.experts.reset_parameters(std)
+        if self.shared_expert is not None:
+            self.shared_expert.reset_parameters(std)
+        if self.shared_expert_gate is not None:
+            nn.init.normal_(self.shared_expert_gate.weight, std=std)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         x = hidden_states.reshape(-1, hidden_states.shape[-1])

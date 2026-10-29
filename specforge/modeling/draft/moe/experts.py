@@ -116,6 +116,10 @@ class SharedExpert(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.activation = activation
 
+    def reset_parameters(self, std: float) -> None:
+        for proj in (self.gate_proj, self.up_proj, self.down_proj):
+            nn.init.normal_(proj.weight, std=std)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(x)
         return self.down_proj(self.activation(gate, self.up_proj(x)).to(gate.dtype))
