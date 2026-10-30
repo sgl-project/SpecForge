@@ -1,8 +1,9 @@
 # coding=utf-8
-"""Unit tests for the ``specforge-sglang-capture`` SGLang plugin (CPU, fakes).
+"""Unit tests for the ``specforge-sglang-capture`` SGLang plugin.
 
 The plugin's logic is driven with stand-ins for SGLang's batch, forward batch,
 logits output and scheduler, so these run on any installed SGLang version.
+The graph replay regression additionally requires CUDA.
 ``test_sglang_capture_plugin_integration.py`` drives the same plugin through
 SGLang's real result-processing and streaming code when the installed SGLang
 has the forward-observer extension points.
@@ -13,6 +14,7 @@ import os
 import sys
 import types
 import unittest
+import weakref
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest import mock
@@ -52,7 +54,6 @@ def _req(rid, prompt_len, spec=None, *, finished=True):
         rid=rid,
         origin_input_ids=list(range(prompt_len)),
         sampling_params=SimpleNamespace(custom_params=custom_params),
-        defer_output=False,
         finished=lambda: finished,
     )
 
@@ -92,6 +93,7 @@ def _runtime(*, is_writer=True, gpu_put=False, max_pending=2):
         is_writer=is_writer,
         gpu_put=gpu_put,
         max_pending_batches=max_pending,
+        defer_response=mock.Mock(),
     )
 
 
@@ -171,14 +173,36 @@ class TestObserver(unittest.TestCase):
         self.assertIs(device.aux, out.hidden_states)
         self.assertIs(device.last_hidden, out.last_hidden_states)
 
-    def test_graph_outputs_are_copied_out_of_static_buffers(self):
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_graph_outputs_survive_replay_and_host_copy(self):
         batch = SimpleNamespace(reqs=[_req("a", 2, _spec("a"))])
         out = _logits_output(2)
+        out.hidden_states = out.hidden_states.cuda()
+        out.last_hidden_states = out.last_hidden_states.cuda()
+        aux_input = torch.full_like(out.hidden_states, 7)
+        last_input = torch.full_like(out.last_hidden_states, 11)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out.hidden_states.copy_(aux_input)
+            out.last_hidden_states.copy_(last_input)
+        graph.replay()
         device = _runtime().observer.after_forward(
             batch, _forward_batch([2]), out, can_run_graph=True
         )
-        self.assertIsNot(device.aux, out.hidden_states)
-        torch.testing.assert_close(device.aux, out.hidden_states)
+        aux_input.fill_(19)
+        last_input.fill_(23)
+        graph.replay()
+
+        def copy_to_host(tensor):
+            host = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            return host.copy_(tensor, non_blocking=True)
+
+        host = device.copy_to_host(copy_to_host)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.hidden_states, aux_input)
+        torch.testing.assert_close(out.last_hidden_states, last_input)
+        torch.testing.assert_close(host.aux, torch.full((2, 6), 7.0))
+        torch.testing.assert_close(host.last_hidden, torch.full((2, 2), 11.0))
 
     def test_mixed_batch_gathers_capture_rows_and_rebases_items(self):
         reqs = [_req("plain", 2), _req("a", 3, _spec("a")), _req("b", 1, _spec("b"))]
@@ -207,19 +231,6 @@ class TestObserver(unittest.TestCase):
         self.assertIn("last_hidden", both.error)
         self.assertIsNone(aux_only.error)
 
-    def test_mup_targets_restore_the_pre_head_scale_last_hidden(self):
-        runtime = _runtime()
-        runtime.last_hidden_scale = 24.0
-        out = _logits_output(2)
-        device = runtime.observer.after_forward(
-            SimpleNamespace(reqs=[_req("a", 2, _spec("a"))]),
-            _forward_batch([2]),
-            out,
-            can_run_graph=False,
-        )
-        torch.testing.assert_close(device.last_hidden, out.last_hidden_states * 24.0)
-        self.assertIs(device.aux, out.hidden_states)
-
     def test_partial_row_outputs_fail_every_capture_request(self):
         device = _runtime().observer.after_forward(
             SimpleNamespace(reqs=[_req("a", 2, _spec("a"))]),
@@ -246,12 +257,14 @@ class TestConsume(unittest.TestCase):
         out = _logits_output(5)
         self._consume(runtime, reqs, [2, 3], out)
 
-        [(samples, _future)] = runtime.sink.submissions
+        [(samples, future)] = runtime.sink.submissions
         self.assertEqual([spec["sample_id"] for spec, _, _ in samples], ["a", "b"])
         torch.testing.assert_close(samples[1][1], out.hidden_states[2:5])
         torch.testing.assert_close(samples[1][2], out.last_hidden_states[2:5])
-        self.assertTrue(all(req.defer_output for req in reqs))
-        self.assertTrue(runtime.pending.has_pending())
+        calls = runtime.defer_response.call_args_list
+        self.assertEqual([call.args[0] for call in calls], reqs)
+        self.assertTrue(all(call.args[1].future is future for call in calls))
+        self.assertEqual(runtime.results, {})
 
     def test_errors_stream_immediately_with_an_error_result(self):
         runtime = _runtime()
@@ -259,51 +272,81 @@ class TestConsume(unittest.TestCase):
         self._consume(runtime, [req], [2], _logits_output(2))
 
         self.assertEqual(runtime.sink.submissions, [])
-        self.assertFalse(req.defer_output)
+        runtime.defer_response.assert_not_called()
         self.assertIn("max_new_tokens=0", runtime.results["a"]["error"])
         self.assertEqual(runtime.results["a"]["sample_id"], "a")
 
 
-class TestPendingCaptures(unittest.TestCase):
-    def _submit(self, runtime, rid):
-        req = _req(rid, 1, _spec(rid))
-        runtime.pending.submit([req], [(_spec(rid), None, None)])
-        return req, runtime.sink.submissions[-1][1]
+class TestCaptureCompletion(unittest.TestCase):
+    def _batch(self):
+        runtime = _runtime()
+        future = runtime.pending.submit([(_spec(rid), None, None) for rid in "ab"])
+        completions = [
+            capture.CaptureCompletion(future, i, 2, rid, _spec(rid), runtime.results)
+            for i, rid in enumerate("ab")
+        ]
+        return runtime, future, completions
 
-    def test_releases_in_submission_order(self):
-        runtime = _runtime(max_pending=4)
-        first, first_future = self._submit(runtime, "a")
-        second, second_future = self._submit(runtime, "b")
-
-        second_future.set_result([{"sample_id": "b"}])
-        self.assertEqual(runtime.pending.poll(), [])
-
-        first_future.set_result([{"sample_id": "a"}])
-        self.assertEqual(runtime.pending.poll(), [first, second])
+    def test_metadata_is_applied_only_when_the_scheduler_reads_the_result(self):
+        runtime, future, completions = self._batch()
+        self.assertTrue(all(not item.done() for item in completions))
+        future.set_result([{"sample_id": "a"}, {"sample_id": "b"}])
+        self.assertEqual(runtime.results, {})
+        for completion in completions:
+            self.assertTrue(completion.done())
+            self.assertIsNone(completion.result())
         self.assertEqual(
             runtime.results, {"a": {"sample_id": "a"}, "b": {"sample_id": "b"}}
         )
-        self.assertFalse(runtime.pending.has_pending())
+        self.assertFalse(completions[0].cancel())
 
-    def test_a_failed_batch_releases_its_requests_with_error_results(self):
-        runtime = _runtime()
-        req, future = self._submit(runtime, "a")
-        future.set_exception(RuntimeError("put failed"))
+    def test_failed_or_malformed_batches_produce_each_requests_error(self):
+        for failure in (RuntimeError("put failed"), []):
+            with self.subTest(failure=failure):
+                runtime, future, completions = self._batch()
+                if isinstance(failure, Exception):
+                    future.set_exception(failure)
+                else:
+                    future.set_result(failure)
+                for completion in completions:
+                    completion.result()
+                for rid in "ab":
+                    self.assertEqual(runtime.results[rid]["sample_id"], rid)
+                    self.assertIn("error", runtime.results[rid])
 
-        self.assertEqual(runtime.pending.poll(), [req])
-        self.assertEqual(
-            runtime.results["a"], {"sample_id": "a", "error": "put failed"}
-        )
+    def test_cancellation_suppresses_metadata_without_cancelling_siblings(self):
+        runtime, future, (first, second) = self._batch()
+        self.assertTrue(first.cancel())
+        self.assertTrue(first.done())
+        self.assertFalse(future.cancelled())
+        future.set_result([{"sample_id": "a"}, {"sample_id": "b"}])
+        first.result()
+        second.result()
+        self.assertEqual(runtime.results, {"b": {"sample_id": "b"}})
 
+
+class TestPendingCaptures(unittest.TestCase):
     def test_backpressure_waits_for_the_oldest_batch(self):
         runtime = _runtime(max_pending=1)
-        _, first_future = self._submit(runtime, "a")
+        first_future = runtime.pending.submit([(_spec("a"), None, None)])
         waited = []
         with mock.patch.object(
             capture, "wait_futures", side_effect=lambda fs: waited.extend(fs)
         ):
-            self._submit(runtime, "b")
+            runtime.pending.submit([(_spec("b"), None, None)])
         self.assertEqual(waited, [first_future])
+
+    def test_completed_batches_are_released_before_the_next_submission(self):
+        runtime = _runtime(max_pending=1)
+        future = runtime.pending.submit([(_spec("a"), None, None)])
+        future.set_result([{"sample_id": "a"}])
+        previous = weakref.ref(future)
+        runtime.sink.submissions.clear()
+        del future
+        with mock.patch.object(capture, "wait_futures") as wait:
+            runtime.pending.submit([(_spec("b"), None, None)])
+        wait.assert_not_called()
+        self.assertIsNone(previous())
 
 
 class FakeStreamer:
@@ -348,13 +391,18 @@ class TestStreamer(unittest.TestCase):
 
 
 def _fake_sglang_modules(features, *, chunked_prefill_size=-1, attn_tp_rank=0):
+    disaggregation = types.ModuleType("sglang.srt.disaggregation.utils")
+    disaggregation.DisaggregationMode = SimpleNamespace(NULL="null")
     runtime_context = types.ModuleType("sglang.srt.runtime_context")
     runtime_context.get_exec = lambda: SimpleNamespace(features=features)
     runtime_context.get_parallel = lambda: SimpleNamespace(attn_tp_rank=attn_tp_rank)
     runtime_context.get_schedule = lambda: SimpleNamespace(
         chunked_prefill_size=chunked_prefill_size
     )
-    return {"sglang.srt.runtime_context": runtime_context}
+    return {
+        "sglang.srt.disaggregation.utils": disaggregation,
+        "sglang.srt.runtime_context": runtime_context,
+    }
 
 
 class _ModelRunner:
@@ -365,9 +413,9 @@ def _scheduler():
     scheduler = SimpleNamespace(
         tp_worker=SimpleNamespace(model_runner=_ModelRunner()),
         output_streamer=SimpleNamespace(),
-        sources=[],
+        defer_response=mock.Mock(),
+        disaggregation_mode="null",
     )
-    scheduler.register_deferred_output_source = scheduler.sources.append
     return scheduler
 
 
@@ -392,28 +440,49 @@ class TestInstall(unittest.TestCase):
         ):
             return scheduler, capture.install(scheduler)
 
-    def test_wires_observer_source_and_results(self):
+    def test_wires_observer_completions_and_results(self):
         scheduler, runtime = self._install()
         self.assertIs(
             scheduler.tp_worker.model_runner.forward_observer, runtime.observer
         )
-        self.assertEqual(scheduler.sources, [runtime.pending])
+        self.assertIs(runtime.defer_response, scheduler.defer_response)
         self.assertIs(scheduler.output_streamer.spec_capture_results, runtime.results)
         self.assertIs(scheduler._specforge_capture_runtime, runtime)
         self.assertEqual(runtime.sink.aux_layer_ids, [1, 3])
         self.assertTrue(runtime.is_writer)
         self.assertFalse(runtime.gpu_put)
 
-    def test_reads_the_mup_multiplier_from_the_target_config(self):
-        scheduler = _scheduler()
-        scheduler.tp_worker.model_runner.model_config = SimpleNamespace(
-            hf_text_config=SimpleNamespace(logits_mup_width_multiplier=24),
-            hf_config=SimpleNamespace(),
-        )
-        _, runtime = self._install(scheduler)
-        self.assertEqual(runtime.last_hidden_scale, 24.0)
-        _, runtime = self._install()
-        self.assertIsNone(runtime.last_hidden_scale)
+    def test_captured_post_norm_hidden_reconstructs_target_logits(self):
+        hidden = torch.tensor([[1.0, 2.0], [-3.0, 4.0]])
+        head_weight = torch.tensor([[1.0, -2.0], [3.0, 0.5], [-1.0, 4.0]])
+        for multiplier in (None, 1.0, 24.0):
+            for can_run_graph in (False, True):
+                with self.subTest(multiplier=multiplier, can_run_graph=can_run_graph):
+                    scheduler = _scheduler()
+                    scheduler.tp_worker.model_runner.model_config = SimpleNamespace(
+                        hf_text_config=SimpleNamespace(
+                            logits_mup_width_multiplier=multiplier
+                        ),
+                        hf_config=SimpleNamespace(),
+                    )
+                    _, runtime = self._install(scheduler)
+                    out = _logits_output(2)
+                    out.last_hidden_states = hidden.clone()
+                    device = runtime.observer.after_forward(
+                        SimpleNamespace(reqs=[_req("a", 2, _spec("a"))]),
+                        _forward_batch([2]),
+                        out,
+                        can_run_graph=can_run_graph,
+                    )
+                    # SGLang returns unscaled post-norm states; SpecForge folds
+                    # the target's logits scaling into the frozen head weights.
+                    scale = multiplier or 1.0
+                    target_logits = (hidden / scale) @ head_weight.T
+                    folded_head_weight = head_weight / scale
+                    reconstructed_logits = device.last_hidden @ folded_head_weight.T
+                    torch.testing.assert_close(reconstructed_logits, target_logits)
+                    torch.testing.assert_close(device.last_hidden, hidden)
+                    torch.testing.assert_close(device.aux, out.hidden_states)
 
     def test_rejects_servers_missing_required_flags(self):
         for overrides, match in (
@@ -425,11 +494,24 @@ class TestInstall(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, match):
                     self._install(**overrides)
 
+    def test_rejects_pd_disaggregation_at_install(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                scheduler = _scheduler()
+                scheduler.disaggregation_mode = mode
+                with self.assertRaisesRegex(RuntimeError, "PD disaggregation"):
+                    self._install(scheduler)
+
     def test_rejects_sglang_builds_without_the_extension_points(self):
-        scheduler = _scheduler()
-        scheduler.tp_worker.model_runner = SimpleNamespace()
-        with self.assertRaisesRegex(RuntimeError, "forward observers"):
-            self._install(scheduler)
+        for missing in ("forward_observer", "defer_response"):
+            with self.subTest(missing=missing):
+                scheduler = _scheduler()
+                if missing == "forward_observer":
+                    scheduler.tp_worker.model_runner = SimpleNamespace()
+                else:
+                    del scheduler.defer_response
+                with self.assertRaisesRegex(RuntimeError, "forward observers"):
+                    self._install(scheduler)
 
     def test_nvlink_publishes_device_tensors_into_a_lazy_arena(self):
         env = {
@@ -483,8 +565,17 @@ class TestInstall(unittest.TestCase):
                 result = SimpleNamespace(internal_state={"existing": "value"})
                 with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": protocol}):
                     specforge_sglang_capture._capture_internal_state(result, scheduler)
-                self.assertEqual(result.internal_state, {"existing": "value"})
+                self.assertEqual(
+                    result.internal_state,
+                    {"existing": "value", "spec_capture_backend": "plugin"},
+                )
                 self.assertIsNone(runtime.sink._control_listener)
+
+    def test_internal_state_marks_only_installed_capture(self):
+        # server_capture: auto reads this marker from /server_info.
+        result = SimpleNamespace(internal_state={"existing": "value"})
+        specforge_sglang_capture._capture_internal_state(result, SimpleNamespace())
+        self.assertEqual(result.internal_state, {"existing": "value"})
 
 
 class TestRegister(unittest.TestCase):

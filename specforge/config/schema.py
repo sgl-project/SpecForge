@@ -667,6 +667,8 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
 
     port: int = Field(gt=0, le=65535)
     cuda_visible_devices: List[str] = Field(min_length=1)
+    #: Python from a separate SGLang environment; None uses the trainer's Python.
+    python_executable: Optional[str] = Field(default=None, min_length=1)
     tp_size: int = Field(default=1, gt=0)
     #: Optional server-specific override. When omitted, inherit the canonical
     #: model.sglang_mem_fraction_static setting instead of silently shadowing it.
@@ -844,7 +846,10 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: versioned source patch under ``patches/sglang``; ``plugin`` is the
     #: ``specforge-sglang-capture`` plugin on an SGLang build with forward
     #: observers, deferred outputs and ``--enable-return-aux-hidden-states``.
-    server_capture: Literal["patch", "plugin"] = "patch"
+    #: ``auto`` takes ``DISAGG_SERVER_CAPTURE`` when set, else detects the
+    #: backend: managed_local probes each capture server's interpreter while
+    #: planning; the producer reads an external server's ``/server_info``.
+    server_capture: Literal["auto", "patch", "plugin"] = "auto"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None

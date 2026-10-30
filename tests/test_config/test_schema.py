@@ -516,6 +516,19 @@ class ConfigSchemaTest(unittest.TestCase):
             cfg.deployment.disaggregated.managed_local.capture_servers[0].gpu_put
         )
 
+    def test_server_capture_defaults_to_auto_detection(self):
+        payload = _managed_local_payload(ep_size=1)
+        disaggregated = payload["deployment"]["disaggregated"]
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.deployment.disaggregated.server_capture, "auto")
+        for backend in ("auto", "patch", "plugin"):
+            disaggregated["server_capture"] = backend
+            cfg = Config.model_validate(payload)
+            self.assertEqual(cfg.deployment.disaggregated.server_capture, backend)
+        disaggregated["server_capture"] = "sidecar"
+        with self.assertRaisesRegex(ValidationError, "server_capture"):
+            Config.model_validate(payload)
+
     def test_unknown_backend_rejected(self):
         bad = {**MINIMAL, "model": {**MINIMAL["model"], "target_backend": "vllm"}}
         with self.assertRaises(ValidationError):

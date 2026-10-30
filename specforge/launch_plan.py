@@ -195,8 +195,16 @@ class LaunchPlan:
     services: tuple[ServiceSpec, ...] = ()
     managed_root: Optional[str] = None
     managed_ports: tuple[int, ...] = ()
-    #: How managed capture servers implement spec capture (preflight checks it).
-    server_capture: Literal["patch", "plugin"] = "patch"
+    #: How managed capture servers implement spec capture (preflight checks it);
+    #: ``auto`` only while ``server_capture_error`` says why it is unresolved.
+    server_capture: Literal["auto", "patch", "plugin"] = "patch"
+    #: True when ``auto`` was resolved by probing every capture server's
+    #: interpreter, which already covers the preflight's module check.
+    server_capture_detected: bool = False
+    #: Why ``auto`` could not be resolved on this host. Like
+    #: ``managed_rdma_error``, the plan still renders (without capture flags)
+    #: and the managed preflight raises it before anything starts.
+    server_capture_error: Optional[str] = None
     #: Host bytes the largest owned Mooncake client registers over RDMA, which
     #: RLIMIT_MEMLOCK must cover; None when the managed stack uses TCP or its
     #: RDMA devices are unresolved.
@@ -226,6 +234,8 @@ class LaunchPlan:
                     "managed_root": self.managed_root,
                     "managed_ports": list(self.managed_ports),
                     "server_capture": self.server_capture,
+                    "server_capture_detected": self.server_capture_detected,
+                    "server_capture_error": self.server_capture_error,
                     "managed_rdma_memlock_bytes": self.managed_rdma_memlock_bytes,
                     "managed_rdma_error": self.managed_rdma_error,
                     "shutdown_grace_s": self.shutdown_grace_s,
@@ -652,11 +662,15 @@ def _capture_flags(server_capture: str, contract) -> tuple[str, ...]:
 def _managed_local_services(
     cfg: Config,
     *,
-    algorithm: "AlgorithmRegistration",
+    contract,
     shared_env: Mapping[str, str],
+    server_capture: Optional[str],
 ) -> tuple[ServiceSpec, ...]:
-    from specforge.training.capture_contract import resolve_server_capture_contract
+    """The owned Mooncake master and capture servers.
 
+    *server_capture* selects the capture flags; None (``auto`` before or
+    without resolution) renders the servers without them.
+    """
     deployment = cfg.deployment.disaggregated
     assert deployment is not None and deployment.managed_local is not None
     managed = deployment.managed_local
@@ -706,11 +720,10 @@ def _managed_local_services(
         phase=0,
     )
 
-    contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
     capture_services = []
     for index, server in enumerate(managed.capture_servers):
         argv = [
-            sys.executable,
+            server.python_executable or sys.executable,
             "-m",
             "sglang.launch_server",
             "--model-path",
@@ -729,7 +742,11 @@ def _managed_local_services(
                 str(server.tp_size),
                 "--chunked-prefill-size",
                 "-1",
-                *_capture_flags(deployment.server_capture, contract),
+                *(
+                    _capture_flags(server_capture, contract)
+                    if server_capture is not None
+                    else ()
+                ),
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -764,7 +781,13 @@ def _managed_local_services(
         argv.extend(cfg.model.sglang_extra_args)
         argv.extend(server.extra_args)
         gpu_put = server.gpu_put if server.gpu_put is not None else default_gpu_put
+        python_env: dict[str, Optional[str]] = {}
+        if server.python_executable:
+            python_env = {"PYTHONPATH": None, "VIRTUAL_ENV": None}
+            if directory := os.path.dirname(server.python_executable):
+                python_env["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
         service_env = {
+            **python_env,
             # Validated not to overlap the keys below, which win regardless.
             **server.env,
             **shared_env,
@@ -774,8 +797,10 @@ def _managed_local_services(
                 if gpu_put is not None
                 else {}
             ),
-            "SPECFORGE_SPEC_CAPTURE": (
-                "1" if deployment.server_capture == "plugin" else "0"
+            **(
+                {"SPECFORGE_SPEC_CAPTURE": "1" if server_capture == "plugin" else "0"}
+                if server_capture is not None
+                else {}
             ),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
@@ -962,6 +987,9 @@ def build_launch_plan(
     worker_prefix: Optional[Sequence[str]] = None,
     torchrun_prefix: Optional[Sequence[str]] = None,
     rdma_device_resolver: Optional[Callable[..., str]] = None,
+    capture_module_probe: Optional[
+        Callable[[CommandSpec, Sequence[str]], list[str]]
+    ] = None,
 ) -> LaunchPlan:
     """Resolve one validated config into a side-effect-free process plan.
 
@@ -970,6 +998,10 @@ def build_launch_plan(
     env) -> device list``). A probe that fails is recorded as
     ``managed_rdma_error`` instead of raising, so the plan still renders on a
     host without the HCAs, and the managed preflight refuses to launch it.
+    A managed-local stack with ``server_capture`` ``auto`` likewise inspects
+    each capture server's interpreter; *capture_module_probe* replaces that
+    probe (``(command, modules) -> missing modules``) and a failed resolution
+    is recorded as ``server_capture_error``.
     """
     if cfg.mode == "online":
         if cfg.deployment.mode != "disaggregated":
@@ -1127,6 +1159,26 @@ def build_launch_plan(
             )
         return LaunchPlan("command", role, commands=(command,))
 
+    if managed_local is not None:
+        from specforge.training.capture_contract import resolve_server_capture_contract
+
+        contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
+        requested_capture = requested_server_capture(cfg, base_env)
+        server_capture: str = requested_capture
+        server_capture_error: Optional[str] = None
+        if requested_capture == "auto":
+            server_capture, server_capture_error = _detect_server_capture(
+                _managed_local_services(
+                    cfg,
+                    contract=contract,
+                    shared_env=managed_environment,
+                    server_capture=None,
+                ),
+                capture_module_probe or _missing_capture_modules,
+            )
+        if server_capture != "auto":
+            # The managed producer reads the resolution instead of re-probing.
+            producer_env["DISAGG_SERVER_CAPTURE"] = server_capture
     producer = CommandSpec(
         "producer",
         tuple(_worker_argv(worker_prefix, config_path, "producer", overrides)),
@@ -1149,7 +1201,10 @@ def build_launch_plan(
             "both",
             commands=(producer, consumer),
             services=_managed_local_services(
-                cfg, algorithm=algorithm, shared_env=managed_environment
+                cfg,
+                contract=contract,
+                shared_env=managed_environment,
+                server_capture=None if server_capture == "auto" else server_capture,
             ),
             managed_root=deployment.control_dir,
             managed_ports=(
@@ -1158,7 +1213,11 @@ def build_launch_plan(
                 managed_local.mooncake.metrics_port,
                 *[server.port for server in managed_local.capture_servers],
             ),
-            server_capture=deployment.server_capture,
+            server_capture=server_capture,
+            server_capture_detected=(
+                requested_capture == "auto" and server_capture != "auto"
+            ),
+            server_capture_error=server_capture_error,
             managed_rdma_memlock_bytes=_managed_rdma_memlock_bytes(
                 cfg, managed_environment
             ),
@@ -1238,11 +1297,153 @@ def _terminate_processes(
                 pass
 
 
+#: What each capture backend needs in a capture server's interpreter: a module,
+#: or ``module:attribute`` for an attribute the module must define.
+_SERVER_CAPTURE_REQUIREMENTS = {
+    "plugin": (
+        "specforge_sglang_capture",
+        "sglang.srt.model_executor.forward_observer",
+        # Scheduler.defer_response(req, completion) takes this completion
+        # protocol; the earlier deferred-output revision lacks both.
+        "sglang.srt.managers.deferred_output:ResponseCompletion",
+    ),
+    "patch": ("sglang.srt.spec_capture_sink",),
+}
+_SERVER_CAPTURE_INSTALL = {
+    "plugin": (
+        "the specforge-sglang-capture plugin (pip install --no-deps "
+        "plugins/sglang-spec-capture) on an SGLang build with forward "
+        "observers and deferred outputs"
+    ),
+    "patch": (
+        "patched SGLang spec capture; run scripts/apply_sglang_spec_capture_patch.sh"
+    ),
+}
+
+
 def _module_available(name: str) -> bool:
+    module, _, attribute = name.partition(":")
     try:
-        return importlib.util.find_spec(name) is not None
-    except ModuleNotFoundError:
+        if importlib.util.find_spec(module) is None:
+            return False
+        return not attribute or hasattr(importlib.import_module(module), attribute)
+    except Exception:
         return False
+
+
+def _missing_capture_modules(command: CommandSpec, modules: Sequence[str]) -> list[str]:
+    """Entries of *modules* (``module`` or ``module:attribute``) that the
+    capture server's interpreter cannot resolve."""
+    if command.argv[0] == sys.executable and "PYTHONPATH" not in command.env:
+        return [module for module in modules if not _module_available(module)]
+    # Probe the server's environment without enabling its plugin.
+    env = {
+        name: value
+        for name, value in {**os.environ, **command.env}.items()
+        if value is not None
+    }
+    env.update(
+        SPECFORGE_SPEC_CAPTURE="0", CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES=""
+    )
+    env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+    env.pop("ASCEND_VISIBLE_DEVICES", None)
+    probe = """import importlib, importlib.util, json, sys
+missing = []
+for name in sys.argv[1:]:
+    module, _, attribute = name.partition(":")
+    try:
+        found = importlib.util.find_spec(module) is not None and (
+            not attribute or hasattr(importlib.import_module(module), attribute)
+        )
+    except Exception:
+        found = False
+    if not found:
+        missing.append(name)
+print(json.dumps(missing))
+"""
+    try:
+        result = subprocess.run(
+            [command.argv[0], "-c", probe, "mooncake.store", *modules],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        detail = getattr(exc, "stderr", None) or str(exc)
+        raise RuntimeError(
+            f"Cannot inspect {command.label} Python {command.argv[0]!r}: {detail}. "
+            "Check capture_servers[].python_executable and install its capture dependencies."
+        ) from exc
+
+
+def requested_server_capture(cfg: Config, env: Mapping[str, str]) -> str:
+    """The requested capture backend: an explicit ``patch``/``plugin`` in the
+    deployment config, else ``DISAGG_SERVER_CAPTURE``, else ``auto``."""
+    deployment = cfg.deployment.disaggregated
+    configured = deployment.server_capture if deployment is not None else "auto"
+    if configured != "auto":
+        return configured
+    requested = env.get("DISAGG_SERVER_CAPTURE") or "auto"
+    if requested not in ("auto", *_SERVER_CAPTURE_REQUIREMENTS):
+        raise ValueError(
+            "DISAGG_SERVER_CAPTURE must be auto, patch or plugin, " f"got {requested!r}"
+        )
+    return requested
+
+
+def _detect_server_capture(
+    services: Sequence[ServiceSpec],
+    probe: Callable[[CommandSpec, Sequence[str]], list[str]],
+) -> tuple[str, Optional[str]]:
+    """Resolve ``auto`` from what each capture server's interpreter provides.
+
+    Every server resolves to the plugin when its requirements are met, else to
+    the patch. Returns ``(server_capture, None)`` when all servers agree, else
+    ``("auto", error)``.
+    """
+    requirements = [
+        name for needed in _SERVER_CAPTURE_REQUIREMENTS.values() for name in needed
+    ]
+    detected: dict[str, str] = {}
+    for service in services:
+        command = service.command
+        if not command.label.startswith("capture-server-"):
+            continue
+        try:
+            missing = probe(command, requirements)
+        except RuntimeError as exc:
+            return "auto", str(exc)
+        found = [
+            backend
+            for backend, needed in _SERVER_CAPTURE_REQUIREMENTS.items()
+            if not set(needed).intersection(missing)
+        ]
+        if not found:
+            return "auto", (
+                "deployment.disaggregated.server_capture=auto found no capture "
+                f"backend for {command.label} using {command.argv[0]!r} "
+                f"(missing {missing}); install {_SERVER_CAPTURE_INSTALL['plugin']}, "
+                f"or {_SERVER_CAPTURE_INSTALL['patch']}"
+            )
+        # Modules every backend needs (mooncake.store).
+        shared = [name for name in missing if name not in requirements]
+        if shared:
+            return "auto", (
+                f"managed_local requires {_SERVER_CAPTURE_INSTALL[found[0]]} for "
+                f"{command.label} using {command.argv[0]!r}; missing {shared}"
+            )
+        detected[command.label] = found[0]
+    if len(set(detected.values())) != 1:
+        return "auto", (
+            "deployment.disaggregated.server_capture=auto resolved the capture "
+            f"servers to different backends {detected}; one plan needs one "
+            "backend, so install the same one for every capture server or set "
+            "server_capture: patch|plugin"
+        )
+    return next(iter(detected.values())), None
 
 
 def _managed_rdma_preflight(plan: LaunchPlan) -> None:
@@ -1306,28 +1507,22 @@ def _managed_preflight(plan: LaunchPlan) -> None:
         mooncake_available = False
     if not mooncake_available:
         raise RuntimeError("managed_local requires the mooncake Python package")
-    if plan.server_capture == "plugin":
-        missing = [
-            module
-            for module in (
-                "specforge_sglang_capture",
-                "sglang.srt.model_executor.forward_observer",
-                "sglang.srt.managers.deferred_output",
-            )
-            if not _module_available(module)
-        ]
+    if plan.server_capture_error is not None:
+        raise RuntimeError(plan.server_capture_error)
+    # Planning already probed these interpreters when it resolved auto.
+    capture_services = () if plan.server_capture_detected else plan.services
+    for service in capture_services:
+        if not service.command.label.startswith("capture-server-"):
+            continue
+        missing = _missing_capture_modules(
+            service.command, _SERVER_CAPTURE_REQUIREMENTS[plan.server_capture]
+        )
         if missing:
             raise RuntimeError(
-                "managed_local server_capture=plugin requires the "
-                "specforge-sglang-capture plugin (pip install --no-deps "
-                "plugins/sglang-spec-capture) on an SGLang build with forward "
-                f"observers and deferred outputs; missing {missing}"
+                f"managed_local requires {_SERVER_CAPTURE_INSTALL[plan.server_capture]} "
+                f"for {service.command.label} using {service.command.argv[0]!r}; "
+                f"missing {missing}"
             )
-    elif not _module_available("sglang.srt.spec_capture_sink"):
-        raise RuntimeError(
-            "managed_local requires patched SGLang spec capture; run "
-            "scripts/apply_sglang_spec_capture_patch.sh"
-        )
     _managed_rdma_preflight(plan)
 
     for port in plan.managed_ports:
