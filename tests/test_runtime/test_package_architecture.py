@@ -716,6 +716,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "inkling-dspark.json",
                 "kimi-k3-dspark.json",
                 "ling-3.0-tiny-dspark.json",
+                "minimax-m3-dspark.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
                 "qwen3.6-27b-dspark.json",
