@@ -593,7 +593,9 @@ class TestDFlashSlidingConfig(unittest.TestCase):
         config_path = (
             Path(__file__).resolve().parents[2] / "configs" / "qwen3.6-27b-dflash.json"
         )
-        config = Qwen3Config.from_json_file(str(config_path))
+        from specforge.config.draft import AutoDraftConfig
+
+        config = AutoDraftConfig.from_file(config_path)
 
         layer_types, sliding_window = resolve_dflash_attention_layout(config)
 

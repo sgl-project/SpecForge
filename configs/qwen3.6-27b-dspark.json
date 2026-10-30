@@ -1,61 +1,58 @@
 {
-    "architectures": [
-        "DSparkDraftModel"
+  "schema_version": 1,
+  "hidden_size": 5120,
+  "num_hidden_layers": 5,
+  "num_attention_heads": 32,
+  "hidden_act": "silu",
+  "initializer_range": 0.02,
+  "rms_norm_eps": 1e-06,
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "pad_token_id": 248044,
+  "bos_token_id": null,
+  "eos_token_id": 248044,
+  "use_cache": true,
+  "tie_word_embeddings": false,
+  "dtype": "bfloat16",
+  "vocab_size": 248320,
+  "intermediate_size": 17408,
+  "max_position_embeddings": 262144,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "architectures": [
+    "DSparkDraftModel"
+  ],
+  "auto_map": {
+    "AutoModel": "dspark.DSparkDraftModel"
+  },
+  "dflash_config": {
+    "confidence_head_alpha": 1.0,
+    "confidence_head_with_markov": true,
+    "enable_confidence_head": true,
+    "markov_head_type": "vanilla",
+    "markov_rank": 256,
+    "mask_token_id": 248070,
+    "projector_type": "dspark",
+    "target_layer_ids": [
+      2,
+      17,
+      32,
+      47,
+      62
     ],
-    "attention_bias": false,
-    "attention_dropout": 0.0,
-    "auto_map": {
-        "AutoModel": "dspark.DSparkDraftModel"
-    },
-    "dflash_config": {
-        "attention_mode": "gqa",
-        "confidence_head_alpha": 1.0,
-        "confidence_head_with_markov": true,
-        "enable_confidence_head": true,
-        "markov_head_type": "vanilla",
-        "markov_rank": 256,
-        "mask_token_id": 248070,
-        "projector_type": "dspark",
-        "target_layer_ids": [
-            2,
-            17,
-            32,
-            47,
-            62
-        ]
-    },
-
-    "block_size": 16,
-    "dtype": "bfloat16",
-    "target_hidden_size": null,
-    "bos_token_id": null,
-    "eos_token_id": 248044,
-    "head_dim": 128,
-    "hidden_act": "silu",
-    "hidden_size": 5120,
-    "initializer_range": 0.02,
-    "intermediate_size": 17408,
-    "layer_types": [
-        "full_attention",
-        "full_attention",
-        "full_attention",
-        "full_attention",
-        "full_attention"
-    ],
-    "max_position_embeddings": 262144,
-    "max_window_layers": 28,
-    "model_type": "qwen3",
-    "num_attention_heads": 32,
-    "num_hidden_layers": 5,
-    "num_key_value_heads": 8,
-    "pad_token_id": 248044,
-    "rms_norm_eps": 1e-06,
-    "rope_theta": 10000000,
-    "rope_scaling": null,
-    "num_target_layers": 64,
-    "sliding_window": null,
-    "tie_word_embeddings": false,
-    "use_cache": true,
-    "use_sliding_window": false,
-    "vocab_size": 248320
+    "pure_draft_prefix_len": 0,
+    "shift_label": false
+  },
+  "block_size": 16,
+  "target_hidden_size": null,
+  "model_type": "qwen3",
+  "rope_theta": 10000000,
+  "rope_scaling": null,
+  "num_target_layers": 64,
+  "layers": {
+    "attention": {
+      "type": "gqa",
+      "is_causal": false
+    }
+  }
 }

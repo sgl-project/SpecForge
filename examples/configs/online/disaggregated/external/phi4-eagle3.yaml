@@ -1,31 +1,40 @@
 model:
   target_model_path: "microsoft/phi-4"
   draft_model_config:
-    architectures: [LlamaForCausalLMEagle3]
+    schema_version: 1
+    hidden_size: 5120
+    num_hidden_layers: 1
+    num_attention_heads: 40
+    hidden_act: silu
+    initializer_range: 0.02
+    rms_norm_eps: 1.0e-05
     attention_bias: false
     attention_dropout: 0.0
+    pad_token_id: 100257
     bos_token_id: 100257
     eos_token_id: 100257
-    pad_token_id: 100257
-    hidden_act: silu
-    hidden_size: 5120
-    initializer_range: 0.02
+    use_cache: true
+    tie_word_embeddings: false
+    vocab_size: 100352
     intermediate_size: 17920
     max_position_embeddings: 16384
-    model_type: phi3
-    num_attention_heads: 40
-    num_hidden_layers: 1
     num_key_value_heads: 10
-    rms_norm_eps: 1.0e-05
+    architectures:
+    - LlamaForCausalLMEagle3
+    model_type: llama
     rope_theta: 250000.0
-    tie_word_embeddings: false
     torch_dtype: bfloat16
     transformers_version: 4.47.0
-    use_cache: true
-    vocab_size: 100352
     draft_vocab_size: 32000
     eagle_config:
-      eagle_aux_hidden_state_layer_ids: [1, 19, 36]
+      eagle_aux_hidden_state_layer_ids:
+      - 1
+      - 19
+      - 36
+    layers:
+      attention:
+        type: gqa
+        is_causal: true
   vocab_mapping_path: cache/vocab_mapping/phi4-eagle3.pt
   target_backend: "sglang"
   embedding_key: "model.embed_tokens.weight"
