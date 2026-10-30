@@ -1,0 +1,77 @@
+name: Draft configuration tests
+
+on:
+  pull_request:
+    paths:
+      - "specforge/**"
+      - "tests/**"
+      - "configs/**"
+      - "examples/configs/**"
+      - "pyproject.toml"
+      - ".github/workflows/draft-config.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: draft-config-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      OMP_NUM_THREADS: "1"
+      HF_HUB_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install CPU test dependencies
+        shell: bash
+        run: |
+          uv venv
+          source .venv/bin/activate
+          python - <<'PY'
+          import re
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          dependencies = tomllib.loads(Path("pyproject.toml").read_text())["project"]["dependencies"]
+          name = lambda dependency: re.split(r"[<>=!~;\[]", dependency, maxsplit=1)[0].strip()
+          torch_requirement = next(item for item in dependencies if name(item) == "torch")
+          subprocess.run(["uv", "pip", "install", torch_requirement,
+                          "--index-url", "https://download.pytorch.org/whl/cpu"], check=True)
+          cpu_dependencies = [item for item in dependencies
+                              if name(item) not in {"torch", "sglang", "liger-kernel"}]
+          subprocess.run(["uv", "pip", "install", *cpu_dependencies], check=True)
+          subprocess.run(["uv", "pip", "install", "--no-deps", "-e", "."], check=True)
+          PY
+      - name: Validate configuration and draft loading
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          python -m unittest discover -s tests/test_config
+          python -m unittest tests.test_modeling.test_draft.test_llama3
+          python - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          # These suites are introduced by the stacked config PRs. Earlier
+          # bases still run the existing config and EAGLE loading suites above.
+          candidates = (
+              "test_all_draft_configs", "test_immutable_draft_config",
+              "test_draft_components", "test_layer_spec", "test_draft_format",
+              "test_draft_settings",
+          )
+          modules = [f"tests.test_modeling.{name}" for name in candidates
+                     if Path(f"tests/test_modeling/{name}.py").is_file()]
+          if modules:
+              subprocess.run(["python", "-m", "unittest", *modules], check=True)
+          PY
