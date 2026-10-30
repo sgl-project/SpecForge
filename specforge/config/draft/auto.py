@@ -44,6 +44,7 @@ class AutoDraftConfig:
         values = inline_values(payload, model_type=registration.config_class.model_type)
         integer(values.draft_vocab_size, "draft_vocab_size")
         layers = decode_layers(values, registration.options_class)
+        values.layers = layers
         if registration.options_class is not None:
             options = registration.options_class.from_model_config(values)
             values = options.to_model_config(values)

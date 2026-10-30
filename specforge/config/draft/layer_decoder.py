@@ -8,7 +8,7 @@ from dataclasses import asdict, fields
 from .base import integer
 from .component_registry import component_registration, require_contract
 from .layers import LayerSpec
-from .legacy_attention import MLA_FIELDS
+from .legacy_attention import MLA_FIELDS, resolve_dflash_attention_layout
 
 _LAYER_FIELDS = {"attention", "ffn", "residual", "conv"}
 _ATTENTION_FIELDS = (
@@ -59,9 +59,9 @@ def decode_layers(config, options_class):
     requires_causal = options_class.requires_causal if options_class else False
     requires_conv = options_class.requires_conv if options_class else False
     contract = options_class.attention_contract if options_class else "eagle_cache"
-    legacy_types = getattr(config, "layer_types", None) or ["full_attention"] * count
-    if not explicit and len(legacy_types) != count:
-        raise ValueError("layer_types must contain exactly num_hidden_layers entries")
+    legacy_types = ["full_attention"] * count
+    if not explicit and hasattr(config, "layer_types"):
+        legacy_types, _ = resolve_dflash_attention_layout(config)
     if (
         not explicit
         and getattr(config, "architectures", None) == ["DSparkDraftModel"]
@@ -112,6 +112,10 @@ def decode_layers(config, options_class):
             # Legacy null direction means the layout's original default.
             if not explicit and attention_data.get("is_causal", True) is None:
                 attention_data = {**attention_data, "is_causal": causal}
+            if explicit and "is_causal" not in attention_data:
+                attention_defaults["is_causal"] = (
+                    requires_causal or attention_data.get("sliding_window") is not None
+                )
             attention = _component("attention", attention_data, attention_defaults)
             ffn = _component(
                 "ffn",

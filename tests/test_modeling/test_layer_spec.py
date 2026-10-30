@@ -204,3 +204,41 @@ class LayerSpecTest(unittest.TestCase):
         for layer in model.layers:
             self.assertIs(layer.self_attn.config.model, config)
         self.assertEqual(copy.deepcopy(config), config)
+
+    def test_uniform_layers_reuse_rotary_computation(self):
+        model = AutoDraftModel.from_config(
+            AutoDraftConfig.from_inline(
+                self.payload(
+                    num_hidden_layers=2, layers={"attention": {"is_causal": False}}
+                )
+            )
+        )
+        with (
+            patch.object(
+                model.rotary_emb, "forward", wraps=model.rotary_emb.forward
+            ) as first,
+            patch.object(
+                model.extra_rotary_emb[0],
+                "forward",
+                wraps=model.extra_rotary_emb[0].forward,
+            ) as second,
+        ):
+            self.run_model(model)
+        self.assertEqual(first.call_count, 1)
+        self.assertEqual(second.call_count, 0)
+
+    def test_native_mtp_checks_and_uses_effective_layer_dimensions(self):
+        from specforge.config.draft.mtp import Qwen3_5MTPConfig
+
+        payload = self.payload(
+            "Qwen3_5MTPDraftModel", layers={"attention": {"head_dim": 8}}
+        )
+        config = AutoDraftConfig.from_inline(payload)
+        model = AutoDraftModel.from_config(config)
+        self.assertEqual(model.mtp.layers[0].self_attn.head_dim, 8)
+        self.assertEqual(model.mtp.rotary_emb.inv_freq.numel(), 2)
+        native = AutoDraftConfig.from_inline(
+            self.payload("Qwen3_5MTPDraftModel")
+        ).to_hf_config()
+        with self.assertRaisesRegex(ValueError, "head_dim"):
+            Qwen3_5MTPConfig.validate_native_config(config, native)
