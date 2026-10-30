@@ -14,7 +14,6 @@ import torch
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.training.model_loading import (
-    load_draft_config_source,
     resolve_draft_config,
     warm_start_draft_model,
 )
@@ -115,7 +114,10 @@ class DraftConfigResolutionTest(unittest.TestCase):
                 json.dump(payload, stream)
 
             with self.assertRaisesRegex(ValueError, "draft_vocab_size cannot be null"):
-                load_draft_config_source(path)
+                resolve_draft_config(
+                    _run_config("eagle3", draft_model_config=path),
+                    provider=_draft_config_provider("eagle3"),
+                )
 
     def test_config_resolution_does_not_initialize_cuda_model_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -127,9 +129,9 @@ import sys
 import torch
 import specforge.data.preprocessing
 import specforge.modeling.auto
-from specforge.training.model_loading import load_draft_config_source
+from specforge.modeling.draft.config import AutoDraftConfig
 
-config = load_draft_config_source(sys.argv[1])
+config = AutoDraftConfig.from_pretrained(sys.argv[1])
 assert config.architectures == ["DominoDraftModel"]
 assert config.block_size == 16
 assert "yunchang" not in sys.modules
@@ -253,8 +255,13 @@ assert not torch.cuda.is_initialized()
             path = os.path.join(directory, "config.json")
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump(_draft_payload("LlamaForCausalLMEagle3"), stream)
-            from_file = load_draft_config_source(path)
-            from_directory = load_draft_config_source(directory)
+            provider = _draft_config_provider("eagle3")
+            from_file = resolve_draft_config(
+                _run_config("eagle3", draft_model_config=path), provider=provider
+            )
+            from_directory = resolve_draft_config(
+                _run_config("eagle3", draft_model_config=directory), provider=provider
+            )
         self.assertEqual(from_file.to_dict(), from_directory.to_dict())
 
     def test_hf_repository_is_a_supported_config_source(self):
@@ -265,10 +272,14 @@ assert not torch.cuda.is_initialized()
             "transformers.PretrainedConfig.get_config_dict",
             return_value=(remote.to_dict(), {}),
         ) as load:
-            resolved = load_draft_config_source(
-                "org/draft-model",
-                cache_dir="/cache",
-                trust_remote_code=True,
+            resolved = resolve_draft_config(
+                _run_config(
+                    "eagle3",
+                    draft_model_config="org/draft-model",
+                    cache_dir="/cache",
+                    trust_remote_code=True,
+                ),
+                provider=_draft_config_provider("eagle3"),
             )
         self.assertEqual(resolved.architectures, ["LlamaForCausalLMEagle3"])
         load.assert_called_once_with(

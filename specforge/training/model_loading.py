@@ -91,26 +91,6 @@ def _looks_like_local_path(source: str) -> bool:
     )
 
 
-def _draft_config_from_dict(payload: Dict[str, Any]) -> "PretrainedConfig":
-    from specforge.modeling.draft.config import AutoDraftConfig
-
-    return AutoDraftConfig.from_dict(payload)
-
-
-def load_draft_config_source(
-    source: str,
-    *,
-    cache_dir: Optional[str] = None,
-    trust_remote_code: bool = False,
-) -> "PretrainedConfig":
-    """Compatibility entry point for the shared draft configuration loader."""
-    from specforge.modeling.draft.config import AutoDraftConfig
-
-    return AutoDraftConfig.from_pretrained(
-        source, cache_dir=cache_dir, trust_remote_code=trust_remote_code
-    )
-
-
 def _checkpoint_config_source(checkpoint_source: Optional[str]) -> Optional[str]:
     """Return a config-bearing warm-start source, if it can be identified."""
 
@@ -206,7 +186,9 @@ def _generate_draft_config(
         payload["draft_vocab_size"] = defaults.draft_vocab_size
     if defaults.populate is not None:
         defaults.populate(payload, target_config, cfg)
-    return _draft_config_from_dict(payload)
+    from specforge.modeling.draft.config import AutoDraftConfig
+
+    return AutoDraftConfig.from_dict(payload)
 
 
 def _apply_draft_overrides(
@@ -228,11 +210,13 @@ def resolve_draft_config(
 ) -> "PretrainedConfig":
     """Resolve and validate the draft architecture for one typed run config."""
 
+    from specforge.modeling.draft.config import AutoDraftConfig
+
     source = cfg.model.draft_model_config
     if not source:
         source = _checkpoint_config_source(cfg.model.draft_checkpoint_path)
     if source:
-        draft_config = load_draft_config_source(
+        draft_config = AutoDraftConfig.from_pretrained(
             source,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
@@ -452,7 +436,6 @@ def warm_start_draft_model(
 __all__ = [
     "WarmStartReport",
     "draft_config_dict",
-    "load_draft_config_source",
     "preflight_draft_kernels",
     "resolve_draft_config",
     "warm_start_draft_model",

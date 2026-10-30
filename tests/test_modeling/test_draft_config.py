@@ -13,7 +13,6 @@ from transformers import LlamaConfig, PretrainedConfig, Qwen3Config
 from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 from specforge.modeling.draft.config import AutoDraftConfig
 from specforge.modeling.draft.registry import DRAFT_REGISTRY
-from specforge.training.model_loading import load_draft_config_source
 
 
 class DraftConfigTest(unittest.TestCase):
@@ -44,7 +43,6 @@ class DraftConfigTest(unittest.TestCase):
                 self.assertEqual(
                     AutoDraftConfig.from_pretrained(source).to_dict(), expected
                 )
-                self.assertEqual(load_draft_config_source(source).to_dict(), expected)
         self.assertEqual(AutoDraftModelConfig.from_file(self.path).to_dict(), expected)
         self.assertFalse(expected["tie_word_embeddings"])
         self.assertEqual(expected["draft_vocab_size"], 128)
@@ -55,7 +53,7 @@ class DraftConfigTest(unittest.TestCase):
         loaders = (
             lambda: AutoDraftConfig.from_dict(payload),
             lambda: AutoDraftModelConfig.from_file(self.path),
-            lambda: load_draft_config_source(self.path.parent),
+            lambda: AutoDraftConfig.from_pretrained(self.path.parent),
             lambda: AutoDraftModel.from_pretrained(self.path.parent),
         )
         for loader in loaders:
