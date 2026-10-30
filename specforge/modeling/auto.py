@@ -4,7 +4,8 @@ from typing import Union
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import PretrainedConfig, modeling_utils
 
-from .draft.config import AutoDraftConfig
+from specforge.config.draft import AutoDraftConfig
+
 from .draft.registry import DRAFT_REGISTRY, available_drafts
 
 

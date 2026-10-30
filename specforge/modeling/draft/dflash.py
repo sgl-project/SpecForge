@@ -19,13 +19,14 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
-from .config import dflash as _draft_config
-from .config.dflash import (
+from specforge.config.draft import dflash as _draft_config
+from specforge.config.draft.dflash import (
     DFlashConfig,
     _resolve_mla_rope_interleaved,
     resolve_dflash_attention_mode,
     resolve_dflash_causal_block,
 )
+
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .dflash_mask import (
     create_dflash_block_mask,
@@ -637,11 +638,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
-
-    @classmethod
-    def prepare_config(cls, config: Qwen3Config) -> Qwen3Config:
-        """Validate the final architecture without allocating model parameters."""
-        return cls.draft_options_class.from_model_config(config).to_model_config(config)
 
     def _build_decoder_layer(
         self,

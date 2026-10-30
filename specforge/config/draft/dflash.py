@@ -168,6 +168,14 @@ class DFlashConfig(DraftConfig):
     shift_label: bool
 
     @classmethod
+    def validate_training_config(cls, config) -> None:
+        mask = config.dflash_config.get("mask_token_id")
+        if type(mask) is not int or not 0 <= mask < config.vocab_size:
+            raise ValueError(
+                "inline dflash_config.mask_token_id must be within vocab_size"
+            )
+
+    @classmethod
     def from_model_config(cls, config: Qwen3Config) -> Self:
         method = getattr(config, "dflash_config", None)
         if method is None:

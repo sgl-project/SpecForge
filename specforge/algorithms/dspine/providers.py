@@ -22,7 +22,6 @@ from specforge.algorithms.common.providers import (
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepProvider,
-    TargetDerivedDraftDefaults,
     make_registration,
 )
 from specforge.algorithms.contracts import (
@@ -33,7 +32,6 @@ from specforge.algorithms.contracts import (
     FeatureMode,
     OfflineStorageContract,
 )
-from specforge.algorithms.dflash.providers import apply_draft_overrides
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 
@@ -65,16 +63,6 @@ def build_training_model(config, draft_model, draft_config, target_config, token
         draft_config,
         target_config,
         tokenizer,
-    )
-
-
-def populate_target_defaults(payload, target_config, config):
-    from specforge.algorithms.model_providers import populate_dflash_generated_config
-    from specforge.modeling.draft.dflash import build_target_layer_ids
-
-    populate_dflash_generated_config(payload, target_config, config)
-    payload["dflash_config"]["target_layer_ids"] = build_target_layer_ids(
-        payload["num_target_layers"], payload["num_hidden_layers"]
     )
 
 
@@ -126,7 +114,6 @@ def algorithm_spec() -> AlgorithmSpec:
         draft=DraftRequirement(
             compatible_architectures=frozenset({"DSpineDraftModel"}),
             default_architecture="DSpineDraftModel",
-            supported_overrides={"num_hidden_layers", "block_size"},
         ),
         feature_contracts=(
             FeatureContract(
@@ -171,12 +158,6 @@ def algorithm_providers() -> AlgorithmProviders:
                 architecture="DSpineDraftModel",
                 compatible_architectures=frozenset({"DSpineDraftModel"}),
                 expected_auto_map_model="dspine.DSpineDraftModel",
-                target_defaults=TargetDerivedDraftDefaults(
-                    model_type="qwen3",
-                    num_hidden_layers=5,
-                    populate=populate_target_defaults,
-                ),
-                apply_overrides=apply_draft_overrides,
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

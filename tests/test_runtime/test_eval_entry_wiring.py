@@ -12,6 +12,7 @@ from specforge.training.assembly import (
     _prepare_prompts,
     build_training_run,
 )
+from tests.draft_config_utils import draft_settings
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
@@ -22,7 +23,7 @@ class TestEvalAssembly(unittest.TestCase):
             {
                 "model": {
                     "target_model_path": "target",
-                    "draft_model_config": "draft.json",
+                    "draft_model_config": draft_settings("eagle3"),
                 },
                 "data": {
                     "train_data_path": "/train.jsonl",
@@ -67,7 +68,7 @@ class TestEvalAssembly(unittest.TestCase):
             {
                 "model": {
                     "target_model_path": "target",
-                    "draft_model_config": "draft.json",
+                    "draft_model_config": draft_settings("eagle3"),
                     "vocab_mapping_path": "mapping.pt",
                 },
                 "data": {

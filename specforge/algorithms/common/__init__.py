@@ -11,7 +11,6 @@ from specforge.algorithms.common.providers import (
     ServerStreamingProvider,
     StepProvider,
     StepRuntimeConfig,
-    TargetDerivedDraftDefaults,
     make_registration,
 )
 
@@ -26,6 +25,5 @@ __all__ = [
     "ServerStreamingProvider",
     "StepProvider",
     "StepRuntimeConfig",
-    "TargetDerivedDraftDefaults",
     "make_registration",
 ]

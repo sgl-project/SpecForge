@@ -9,8 +9,8 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
-from transformers.models.llama.configuration_llama import LlamaConfig
 
+from specforge.config.draft.eagle3 import Eagle3Config, EaglePretrainedConfig
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
@@ -20,7 +20,6 @@ from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from .base import Eagle3DraftModel
-from .config.eagle3 import Eagle3Config, EaglePretrainedConfig
 from .registry import register_draft
 
 try:
@@ -1579,10 +1578,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = EaglePretrainedConfig
     draft_options_class = Eagle3Config
-
-    @classmethod
-    def prepare_config(cls, config: LlamaConfig) -> LlamaConfig:
-        return cls.draft_options_class.from_model_config(config).to_model_config(config)
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         options = self.draft_options_class.from_model_config(config)

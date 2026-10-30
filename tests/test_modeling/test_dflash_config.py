@@ -12,14 +12,14 @@ import torch
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
-from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.config import (
+from specforge.config.draft import (
     AutoDraftConfig,
     DFlash2Config,
     DFlashConfig,
     DominoConfig,
     DSparkConfig,
 )
+from specforge.modeling.auto import AutoDraftModel
 from specforge.training.model_loading import resolve_draft_config
 
 
@@ -252,17 +252,16 @@ class DFlashConfigTest(unittest.TestCase):
             AutoDraftConfig.finalize(config).dflash_config["attention_mode"], "mha"
         )
 
-    def test_run_overrides_are_applied_before_final_validation(self):
+    def test_inline_settings_validate_before_model_construction(self):
         data = payload("DFlash2DraftModel", **{**VARIANTS[1][2], "conv_kernel_size": 6})
+        data["block_size"] = 8
+        data["dflash_config"]["mask_token_id"] = 3
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.json"
-            path.write_text(json.dumps(data))
             cfg = Config.model_validate(
                 {
                     "model": {
                         "target_model_path": "unused",
-                        "draft_model_config": str(path),
-                        "draft_block_size": 8,
+                        "draft_model_config": data,
                     },
                     "data": {"hidden_states_path": "/unused"},
                     "training": {"strategy": "dflash"},
@@ -277,7 +276,7 @@ class DFlashConfigTest(unittest.TestCase):
             self.assertEqual(resolved.block_size, 8)
             self.assertEqual(resolved.dflash_config["block_size"], 8)
             self.assertEqual(resolved.dflash_config["conv_kernel_size"], 6)
-            cfg.model.draft_block_size = None
+            cfg.model.draft_model_config["block_size"] = 4
             with self.assertRaisesRegex(ValueError, "must not exceed block_size"):
                 resolve_draft_config(cfg, provider=provider)
 

@@ -10,10 +10,9 @@ from unittest import mock
 import torch
 from transformers import LlamaConfig, PretrainedConfig, Qwen3Config
 
+from specforge.config.draft import AutoDraftConfig
 from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
-from specforge.modeling.draft.config import AutoDraftConfig
 from specforge.modeling.draft.registry import DRAFT_REGISTRY
-from specforge.training.model_loading import load_draft_config_source
 
 
 class DraftConfigTest(unittest.TestCase):
@@ -44,26 +43,21 @@ class DraftConfigTest(unittest.TestCase):
                 self.assertEqual(
                     AutoDraftConfig.from_pretrained(source).to_dict(), expected
                 )
-                self.assertEqual(load_draft_config_source(source).to_dict(), expected)
         self.assertEqual(AutoDraftModelConfig.from_file(self.path).to_dict(), expected)
         self.assertFalse(expected["tie_word_embeddings"])
         self.assertEqual(expected["draft_vocab_size"], 128)
 
-    def test_null_vocab_rejected_by_all_entry_points(self):
+    def test_null_vocab_inherits_inline_vocab_for_artifact_readers(self):
         payload = {**self.payload, "draft_vocab_size": None}
         self.write(payload)
         loaders = (
             lambda: AutoDraftConfig.from_dict(payload),
             lambda: AutoDraftModelConfig.from_file(self.path),
-            lambda: load_draft_config_source(self.path.parent),
-            lambda: AutoDraftModel.from_pretrained(self.path.parent),
+            lambda: AutoDraftConfig.from_pretrained(self.path.parent),
         )
         for loader in loaders:
             with self.subTest(loader=loader):
-                with self.assertRaisesRegex(
-                    ValueError, "draft_vocab_size cannot be null"
-                ):
-                    loader()
+                self.assertEqual(loader().draft_vocab_size, self.payload["vocab_size"])
 
     def test_normalization_is_independent_and_preserves_custom_fields(self):
         payload = {**self.payload, "tie_word_embeddings": True, "use_cache": False}

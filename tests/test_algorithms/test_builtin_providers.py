@@ -121,9 +121,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             {
                 "architecture",
                 "compatible_architectures",
-                "target_defaults",
                 "expected_auto_map_model",
-                "apply_overrides",
             },
             provider_fields,
         )
@@ -139,27 +137,11 @@ class BuiltinProviderContractTest(unittest.TestCase):
             with self.subTest(algorithm=registration.name):
                 self.assertFalse(hasattr(registration.spec, "draft_config_resolver"))
 
-    def test_target_derived_defaults_and_overrides_are_provider_owned(self):
-        expected = {
-            "eagle3": ("llama", 1, 32000, True),
-            "peagle": ("llama", 4, 32000, True),
-            "dflash": ("qwen3", 1, None, True),
-        }
-        for name, (model_type, layers, vocab_size, has_override) in expected.items():
-            with self.subTest(algorithm=name):
-                policy = self.registry.resolve(name).providers.model.draft_config
-                defaults = policy.target_defaults
-                self.assertIsNotNone(defaults)
-                self.assertEqual(model_type, defaults.model_type)
-                self.assertEqual(layers, defaults.num_hidden_layers)
-                self.assertEqual(vocab_size, defaults.draft_vocab_size)
-                self.assertEqual(has_override, policy.apply_overrides is not None)
-
-        for name in ("domino", "dspark", "mtp"):
-            with self.subTest(algorithm=name):
-                policy = self.registry.resolve(name).providers.model.draft_config
-                self.assertIsNone(policy.target_defaults)
-                self.assertIsNone(policy.apply_overrides)
+    def test_algorithm_providers_cannot_change_draft_settings(self):
+        for registration in self.registry:
+            policy = registration.providers.model.draft_config
+            self.assertFalse(hasattr(policy, "target_defaults"))
+            self.assertFalse(hasattr(policy, "apply_overrides"))
 
     def test_vlm_is_not_registered_as_a_builtin(self):
         for registration in self.registry:

@@ -10,6 +10,8 @@ from specforge.algorithms.contracts import FeatureMode
 from specforge.application import resolve_run
 from specforge.application.planning import _validate_training_topology
 from specforge.config import Config, TrainingConfig
+from specforge.config.draft import AutoDraftConfig
+from tests.draft_config_utils import draft_settings
 
 
 def _payload(
@@ -20,7 +22,7 @@ def _payload(
 ) -> dict:
     model = {
         "target_model_path": "target",
-        "draft_model_config": "draft.json",
+        "draft_model_config": draft_settings("eagle3"),
         "input_modality": modality,
     }
     if algorithm in {"eagle3", "peagle"} and mode == "online":
@@ -117,16 +119,12 @@ class ApplicationCompositionTest(unittest.TestCase):
         payload = _payload("eagle3")
         payload["model"]["draft_num_hidden_layers"] = 2
 
-        with self.assertRaisesRegex(
-            ValueError, "requires model.draft_num_hidden_layers=1"
-        ):
+        with self.assertRaisesRegex(ValueError, "draft_num_hidden_layers"):
             resolve_run(Config.model_validate(payload))
 
         domino = _payload("domino")
         domino["model"]["draft_block_size"] = 8
-        with self.assertRaisesRegex(
-            ValueError, "does not support model.draft_block_size"
-        ):
+        with self.assertRaisesRegex(ValueError, "draft_block_size"):
             resolve_run(Config.model_validate(domino))
 
     def test_disaggregated_vocab_mapping_is_provider_owned(self):
@@ -167,7 +165,7 @@ class ApplicationCompositionTest(unittest.TestCase):
         config = Config.model_validate(_payload())
         provenance = _model_resume_provenance(
             config,
-            SimpleNamespace(_name_or_path="draft.json", _commit_hash="draft-rev"),
+            AutoDraftConfig.from_dict(draft_settings()),
             SimpleNamespace(_commit_hash="target-rev"),
             capture_layers=[1, 7, 15],
         )

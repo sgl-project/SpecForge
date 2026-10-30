@@ -10,11 +10,13 @@ from .dspine import DSpineDraftConfig
 from .eagle3 import Eagle3Config, EagleConfig, EaglePretrainedConfig
 from .mtp import Qwen3_5MTPConfig
 from .peagle import PEagleConfig
+from .registry import register_draft_config
 
 DraftConfigClass = AutoDraftConfig
 
 __all__ = [
     "AutoDraftConfig",
+    "register_draft_config",
     "DraftConfigClass",
     "DraftConfig",
     "DFlashConfig",

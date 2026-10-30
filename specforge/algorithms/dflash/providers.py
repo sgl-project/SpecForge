@@ -24,7 +24,6 @@ from specforge.algorithms.common.providers import (
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepProvider,
-    TargetDerivedDraftDefaults,
     make_registration,
 )
 from specforge.algorithms.contracts import (
@@ -163,18 +162,6 @@ def resolve_capture_layers(config, draft_config, target_config):
     return resolve_dflash_capture_layers(config, draft_config, target_config)
 
 
-def populate_target_defaults(payload, target_config, config):
-    from specforge.algorithms.model_providers import populate_dflash_generated_config
-
-    return populate_dflash_generated_config(payload, target_config, config)
-
-
-def apply_draft_overrides(config, draft_config):
-    from specforge.algorithms.model_providers import apply_dflash_overrides
-
-    return apply_dflash_overrides(config, draft_config)
-
-
 def minimum_loss_tokens(config, draft_config):
     from specforge.algorithms.model_providers import dflash_min_loss_tokens
 
@@ -202,7 +189,6 @@ def algorithm_spec() -> AlgorithmSpec:
         draft=DraftRequirement(
             compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
             default_architecture=DRAFT_ARCHITECTURE,
-            supported_overrides={"num_hidden_layers", "block_size"},
         ),
         feature_contracts=(
             FeatureContract(
@@ -245,12 +231,6 @@ def algorithm_providers() -> AlgorithmProviders:
                 architecture=DRAFT_ARCHITECTURE,
                 compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
                 expected_auto_map_model="dflash.DFlashDraftModel",
-                target_defaults=TargetDerivedDraftDefaults(
-                    model_type="qwen3",
-                    num_hidden_layers=1,
-                    populate=populate_target_defaults,
-                ),
-                apply_overrides=apply_draft_overrides,
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

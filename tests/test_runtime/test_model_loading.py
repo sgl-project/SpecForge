@@ -3,8 +3,6 @@
 
 import json
 import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -14,7 +12,6 @@ import torch
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.training.model_loading import (
-    load_draft_config_source,
     resolve_draft_config,
     warm_start_draft_model,
 )
@@ -106,197 +103,120 @@ def _draft_payload(architecture: str, *, layers: int = 1, block_size=None):
 
 
 class DraftConfigResolutionTest(unittest.TestCase):
-    def test_explicit_null_draft_vocab_size_does_not_fallback(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "draft.json")
-            payload = _draft_payload("LlamaForCausalLMEagle3")
-            payload["draft_vocab_size"] = None
-            with open(path, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream)
+    def test_inline_settings_are_authoritative_for_every_weight_source(self):
+        import copy
 
-            with self.assertRaisesRegex(ValueError, "draft_vocab_size cannot be null"):
-                load_draft_config_source(path)
+        from tests.draft_config_utils import draft_settings
 
-    def test_config_resolution_does_not_initialize_cuda_model_dependencies(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "draft.json")
-            with open(path, "w", encoding="utf-8") as stream:
-                json.dump(_draft_payload("DominoDraftModel", block_size=16), stream)
-            script = """
-import sys
-import torch
-import specforge.data.preprocessing
-import specforge.modeling.auto
-from specforge.training.model_loading import load_draft_config_source
-
-config = load_draft_config_source(sys.argv[1])
-assert config.architectures == ["DominoDraftModel"]
-assert config.block_size == 16
-assert "yunchang" not in sys.modules
-assert not torch.cuda.is_initialized()
-"""
-            env = dict(os.environ)
-            env["CUDA_VISIBLE_DEVICES"] = ""
-            subprocess.run(
-                [sys.executable, "-c", script, path],
-                check=True,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-
-    def test_target_derived_defaults_match_legacy_trainers(self):
-        cases = (
-            ("eagle3", "LlamaForCausalLMEagle3", 1, None),
-            ("peagle", "PEagleDraftModel", 4, None),
-            ("dflash", "DFlashDraftModel", 1, 16),
-        )
-        for strategy, architecture, layers, block_size in cases:
-            with self.subTest(strategy=strategy):
-                cfg = _run_config(strategy)
-                with mock.patch(
-                    "transformers.AutoConfig.from_pretrained",
-                    return_value=_target_config(),
-                ):
-                    resolved = resolve_draft_config(
-                        cfg,
-                        provider=_draft_config_provider(strategy),
-                    )
-                self.assertEqual(resolved.architectures, [architecture])
-                self.assertEqual(resolved.num_hidden_layers, layers)
-                if block_size is not None:
-                    self.assertEqual(resolved.block_size, block_size)
-                    self.assertEqual(resolved.num_target_layers, 12)
-                    self.assertEqual(len(resolved.dflash_config["target_layer_ids"]), 1)
-                    self.assertEqual(resolved.layer_types, ["full_attention"])
-                    self.assertIsNone(resolved.sliding_window)
-                    self.assertFalse(resolved.use_sliding_window)
-                else:
-                    self.assertEqual(resolved.draft_vocab_size, 32000)
-
-    def test_dflash_typed_overrides_rebuild_capture_layers(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "draft.json")
-            payload = _draft_payload("DFlashDraftModel", layers=5, block_size=16)
-            payload["dflash_config"] = {"target_layer_ids": [1, 3, 5, 7, 9]}
-            with open(path, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream)
+        for checkpoint in (None, "org/draft", "/run/training_state.pt"):
+            payload = draft_settings("dflash")
+            original = copy.deepcopy(payload)
             cfg = _run_config(
-                "dflash",
-                draft_model_config=path,
-                draft_num_hidden_layers=2,
-                draft_block_size=8,
+                "dflash", draft_model_config=payload, draft_checkpoint_path=checkpoint
             )
-            resolved = resolve_draft_config(
-                cfg,
-                provider=_draft_config_provider("dflash"),
-            )
-        self.assertEqual(resolved.num_hidden_layers, 2)
-        self.assertEqual(resolved.block_size, 8)
-        self.assertEqual(len(resolved.dflash_config["target_layer_ids"]), 2)
-        self.assertEqual(
-            resolved.layer_types,
-            ["full_attention", "full_attention"],
-        )
+            with mock.patch(
+                "specforge.config.draft.AutoDraftConfig.from_pretrained"
+            ) as read:
+                resolved = resolve_draft_config(
+                    cfg, provider=_draft_config_provider("dflash")
+                )
+            read.assert_not_called()
+            self.assertEqual(resolved.dflash_config["target_layer_ids"], [6])
+            self.assertEqual(cfg.model.draft_model_config, original)
+            resolved.dflash_config["mask_token_id"] = 9
+            self.assertEqual(cfg.model.draft_model_config, original)
 
-    def test_dflash_layer_override_rejects_ambiguous_hybrid_resize(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "draft.json")
-            payload = _draft_payload("DFlashDraftModel", layers=3, block_size=16)
-            payload.update(
-                layer_types=[
-                    "sliding_attention",
-                    "sliding_attention",
-                    "full_attention",
-                ],
-                sliding_window=128,
-                use_sliding_window=True,
-            )
-            with open(path, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream)
-            cfg = _run_config(
-                "dflash",
-                draft_model_config=path,
-                draft_num_hidden_layers=2,
-            )
-            with self.assertRaisesRegex(ValueError, "mixed DFlash layer_types"):
-                resolve_draft_config(
-                    cfg,
-                    provider=_draft_config_provider("dflash"),
+    def test_null_vocabulary_inherits_inline_vocab(self):
+        from tests.draft_config_utils import draft_settings
+
+        payload = draft_settings("dflash")
+        payload["draft_vocab_size"] = None
+        cfg = _run_config("dflash", draft_model_config=payload)
+        resolved = resolve_draft_config(cfg, provider=_draft_config_provider("dflash"))
+        self.assertEqual(resolved.draft_vocab_size, payload["vocab_size"])
+
+    def test_missing_training_settings_fail_before_allocation(self):
+        from tests.draft_config_utils import draft_settings
+
+        for strategy, field in (
+            ("dflash", "mask_token_id"),
+            ("eagle3", "eagle_aux_hidden_state_layer_ids"),
+        ):
+            payload = draft_settings(strategy)
+            method = "dflash_config" if strategy == "dflash" else "eagle_config"
+            payload[method].pop(field)
+            cfg = _run_config(strategy, draft_model_config=payload)
+            with self.assertRaisesRegex(ValueError, field):
+                resolve_draft_config(cfg, provider=_draft_config_provider(strategy))
+
+    def test_contract_rejects_same_shape_different_semantics(self):
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.config.draft.contract import (
+            draft_config_contract,
+            validate_draft_config_contract,
+        )
+        from tests.draft_config_utils import draft_settings
+
+        payload = draft_settings("dflash")
+        current = AutoDraftConfig.from_dict(payload)
+        for field, value in (("rope_theta", 12345), ("is_causal", False)):
+            saved = AutoDraftConfig.from_dict({**payload, field: value})
+            with self.assertRaisesRegex(ValueError, field):
+                validate_draft_config_contract(
+                    draft_config_contract(current),
+                    draft_config_contract(saved),
+                    source="checkpoint",
                 )
 
-    def test_dflash_resolution_validates_mla_before_model_construction(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "draft.json")
-            payload = _draft_payload("DFlashDraftModel", block_size=16)
-            payload.update(
-                q_lora_rank=16,
-                kv_lora_rank=8,
-                qk_nope_head_dim=4,
-                qk_rope_head_dim=4,
-                v_head_dim=8,
-                rope_interleave="false",
-            )
-            payload["dflash_config"] = {"attention_mode": "mla"}
-            with open(path, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream)
+    def test_contract_ignores_execution_and_serialization_metadata(self):
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.config.draft.contract import draft_config_contract
+        from tests.draft_config_utils import draft_settings
 
-            cfg = _run_config("dflash", draft_model_config=path)
-            with self.assertRaisesRegex(ValueError, "rope_interleave"):
-                resolve_draft_config(
-                    cfg,
-                    provider=_draft_config_provider("dflash"),
-                )
+        current = AutoDraftConfig.from_dict(draft_settings("dflash"))
+        saved = AutoDraftConfig.from_dict(current.to_dict())
+        saved._name_or_path = "/old/path"
+        saved._attn_implementation = "sdpa"
+        saved.dtype = torch.bfloat16
+        self.assertEqual(draft_config_contract(current), draft_config_contract(saved))
 
-    def test_local_json_and_directory_are_equivalent_sources(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "config.json")
-            with open(path, "w", encoding="utf-8") as stream:
-                json.dump(_draft_payload("LlamaForCausalLMEagle3"), stream)
-            from_file = load_draft_config_source(path)
-            from_directory = load_draft_config_source(directory)
-        self.assertEqual(from_file.to_dict(), from_directory.to_dict())
+    def test_native_mtp_normalizes_hf_rope_parameters(self):
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.draft.mtp.qwen3_5 import PartialRotaryEmbedding
+        from tests.draft_config_utils import draft_settings
 
-    def test_hf_repository_is_a_supported_config_source(self):
-        remote = _target_config(layers=1)
-        remote.architectures = ["LlamaForCausalLMEagle3"]
-        remote.draft_vocab_size = 32
-        with mock.patch(
-            "transformers.PretrainedConfig.get_config_dict",
-            return_value=(remote.to_dict(), {}),
-        ) as load:
-            resolved = load_draft_config_source(
-                "org/draft-model",
-                cache_dir="/cache",
-                trust_remote_code=True,
-            )
-        self.assertEqual(resolved.architectures, ["LlamaForCausalLMEagle3"])
-        load.assert_called_once_with(
-            "org/draft-model",
-            cache_dir="/cache",
-            revision=None,
-            token=None,
-            local_files_only=False,
-            force_download=False,
-            subfolder="",
+        payload = draft_settings("mtp")
+        payload["rope_parameters"] = {
+            "rope_type": "default",
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.5,
+        }
+        config = AutoDraftConfig.finalize(AutoDraftConfig.from_dict(payload))
+        self.assertEqual(config.rope_theta, 10000000)
+        self.assertEqual(config.partial_rotary_factor, 0.5)
+        rotary = PartialRotaryEmbedding(config, config.head_dim)
+        expected = 1.0 / (10000000 ** (torch.arange(0, 4, 2).float() / 4))
+        torch.testing.assert_close(rotary.inv_freq, expected)
+
+    def test_native_mtp_semantics_checked_without_mutating_inline_config(self):
+        import copy
+        from types import SimpleNamespace
+
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.config.draft.mtp import Qwen3_5MTPConfig
+        from tests.draft_config_utils import draft_settings
+
+        current = AutoDraftConfig.finalize(
+            AutoDraftConfig.from_dict(draft_settings("mtp"))
         )
-
-    def test_hf_warm_checkpoint_supplies_config_when_not_explicit(self):
-        remote = _target_config(layers=1)
-        remote.architectures = ["LlamaForCausalLMEagle3"]
-        remote.draft_vocab_size = 32
-        cfg = _run_config("eagle3", draft_checkpoint_path="org/base-draft")
-        with mock.patch(
-            "transformers.PretrainedConfig.get_config_dict",
-            return_value=(remote.to_dict(), {}),
-        ) as load:
-            resolved = resolve_draft_config(
-                cfg,
-                provider=_draft_config_provider("eagle3"),
-            )
-        self.assertEqual(resolved.architectures, ["LlamaForCausalLMEagle3"])
-        load.assert_called_once()
-        self.assertEqual(load.call_args.args[0], "org/base-draft")
+        original = copy.deepcopy(current.to_dict())
+        target = SimpleNamespace(**current.to_dict())
+        target.num_hidden_layers = 48
+        Qwen3_5MTPConfig.validate_native_config(current, target)
+        target.partial_rotary_factor = 0.5
+        with self.assertRaisesRegex(ValueError, "partial_rotary_factor"):
+            Qwen3_5MTPConfig.validate_native_config(current, target)
+        self.assertEqual(current.to_dict(), original)
 
 
 class _TinyDraft(torch.nn.Module):
@@ -307,10 +227,21 @@ class _TinyDraft(torch.nn.Module):
 
 
 class WarmStartTest(unittest.TestCase):
+    def setUp(self):
+        from specforge.config.draft import AutoDraftConfig
+        from tests.draft_config_utils import draft_settings
+
+        self.config = AutoDraftConfig.from_dict(draft_settings("dflash"))
+
     def _write_runtime_state(self, directory, state, *, strategy="dflash"):
         path = os.path.join(directory, "training_state.pt")
+        from specforge.config.draft.contract import draft_config_contract
+
         torch.save(
             {
+                "specforge_model_provenance": (
+                    ("draft_settings", draft_config_contract(self.config)),
+                ),
                 "draft_state_dict": state,
                 "strategy": strategy,
                 # Warm start must ignore every field below.
@@ -325,6 +256,29 @@ class WarmStartTest(unittest.TestCase):
         )
         return path
 
+    def test_semantic_mismatch_rejected_before_any_weight_is_loaded(self):
+        source = _TinyDraft()
+        destination = _TinyDraft()
+        original = {k: v.clone() for k, v in destination.state_dict().items()}
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_runtime_state(directory, source.state_dict())
+            self.config.rope_theta = 12345
+            with self.assertRaisesRegex(ValueError, "rope_theta"):
+                warm_start_draft_model(
+                    destination, path, draft_config=self.config, strategy="dflash"
+                )
+        for key, value in destination.state_dict().items():
+            self.assertTrue(torch.equal(value, original[key]))
+
+    def test_missing_saved_settings_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "training_state.pt")
+            torch.save({"draft_state_dict": _TinyDraft().state_dict()}, path)
+            with self.assertRaisesRegex(ValueError, "no saved draft settings"):
+                warm_start_draft_model(
+                    _TinyDraft(), path, draft_config=self.config, strategy="dflash"
+                )
+
     def test_specforge_checkpoint_loads_only_draft_weights(self):
         torch.manual_seed(1)
         source = _TinyDraft()
@@ -335,7 +289,7 @@ class WarmStartTest(unittest.TestCase):
                 report = warm_start_draft_model(
                     destination,
                     path,
-                    draft_config=object(),
+                    draft_config=self.config,
                     strategy="dflash",
                 )
         self.assertEqual(report.checkpoint_format, "specforge")
@@ -363,7 +317,7 @@ class WarmStartTest(unittest.TestCase):
             report = warm_start_draft_model(
                 destination,
                 path,
-                draft_config=object(),
+                draft_config=self.config,
                 strategy="eagle3",
                 allow_missing_embedding=True,
             )
@@ -384,7 +338,7 @@ class WarmStartTest(unittest.TestCase):
                 warm_start_draft_model(
                     destination,
                     path,
-                    draft_config=object(),
+                    draft_config=self.config,
                     strategy="dflash",
                 )
 
@@ -399,21 +353,27 @@ class WarmStartTest(unittest.TestCase):
                 warm_start_draft_model(
                     destination,
                     path,
-                    draft_config=object(),
+                    draft_config=self.config,
                     strategy="eagle3",
                 )
 
     def test_pretrained_repo_uses_registered_hf_loader(self):
         source = _TinyDraft()
         destination = _TinyDraft()
-        with mock.patch(
-            "specforge.modeling.auto.AutoDraftModel.from_pretrained",
-            return_value=(source, {"missing_keys": []}),
-        ) as load:
+        with (
+            mock.patch(
+                "specforge.modeling.auto.AutoDraftModel.from_pretrained",
+                return_value=(source, {"missing_keys": []}),
+            ) as load,
+            mock.patch(
+                "specforge.config.draft.AutoDraftConfig.from_pretrained",
+                return_value=self.config,
+            ),
+        ):
             report = warm_start_draft_model(
                 destination,
                 "org/base-draft",
-                draft_config=object(),
+                draft_config=self.config,
                 strategy="dflash",
                 cache_dir="/cache",
                 trust_remote_code=True,
@@ -485,6 +445,7 @@ class WarmStartTest(unittest.TestCase):
                             break
                     checkpoint_state[checkpoint_key] = value.detach().clone()
                 self.assertTrue(migrated)
+                self.config = config
                 state_path = self._write_runtime_state(
                     directory, checkpoint_state, strategy=strategy
                 )

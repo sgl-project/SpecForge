@@ -11,9 +11,9 @@ import torch
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
+from specforge.config.draft import AutoDraftConfig
+from specforge.config.draft.base import DraftConfig
 from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.config import AutoDraftConfig
-from specforge.modeling.draft.config.base import DraftConfig
 from specforge.modeling.draft.registry import DRAFT_REGISTRY
 from specforge.training.model_loading import resolve_draft_config
 from tests.test_modeling.test_dflash_config import VARIANTS, payload
@@ -69,6 +69,12 @@ class AllDraftConfigsTest(unittest.TestCase):
 
     def test_every_algorithm_resolves_its_compatible_architectures(self):
         cases = architecture_payloads()
+        for name, data in cases.items():
+            if "Eagle" in name:
+                data["eagle_config"] = {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
+                data["mask_token_id"] = 3
+            elif "dflash_config" in data:
+                data["dflash_config"]["mask_token_id"] = 3
         for registration in builtin_algorithm_registry():
             for name in registration.spec.draft.compatible_architectures:
                 with (
@@ -81,7 +87,7 @@ class AllDraftConfigsTest(unittest.TestCase):
                         {
                             "model": {
                                 "target_model_path": "unused",
-                                "draft_model_config": str(path),
+                                "draft_model_config": cases[name],
                             },
                             "data": {"hidden_states_path": "/unused"},
                             "training": {"strategy": registration.name},
@@ -231,49 +237,36 @@ class AllDraftConfigsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "norm_before_residual"):
             AutoDraftModel.from_config(config, norm_before_residual="false")
 
-    def test_run_overrides_precede_eagle_family_validation(self):
-        for strategy, name in (
-            ("eagle3", "LlamaForCausalLMEagle3"),
-            ("peagle", "PEagleDraftModel"),
-        ):
-            with (
-                self.subTest(strategy=strategy),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                data = architecture_payloads()[name]
-                data["eagle_config"] = {"eagle_aux_hidden_state_layer_ids": [1]}
-                if strategy == "peagle":
-                    data["norm_before_residual"] = "invalid"
-                path = Path(directory) / "config.json"
-                path.write_text(json.dumps(data))
-                cfg = Config.model_validate(
-                    {
-                        "model": {
-                            "target_model_path": "unused",
-                            "draft_model_config": str(path),
-                            "aux_hidden_state_layer_ids": [1, 2, 3],
-                        },
-                        "data": {"hidden_states_path": "/unused"},
-                        "training": {
-                            "strategy": strategy,
-                            "norm_before_residual": False,
-                        },
-                    }
-                )
-                provider = (
-                    builtin_algorithm_registry()
-                    .resolve(strategy)
-                    .providers.model.draft_config
-                )
-                resolved = resolve_draft_config(cfg, provider=provider)
-                self.assertEqual(
-                    resolved.eagle_config["eagle_aux_hidden_state_layer_ids"], [1, 2, 3]
-                )
-                if strategy == "peagle":
-                    self.assertFalse(resolved.norm_before_residual)
-                cfg.model.aux_hidden_state_layer_ids = None
-                with self.assertRaisesRegex(ValueError, "layer_ids"):
-                    resolve_draft_config(cfg, provider=provider)
+    def test_inline_eagle_settings_validate_without_task_overrides(self):
+        from tests.draft_config_utils import draft_settings
+
+        for strategy in ("eagle3", "peagle"):
+            data = draft_settings(strategy)
+            data["norm_before_residual"] = False
+            cfg = Config.model_validate(
+                {
+                    "model": {
+                        "target_model_path": "unused",
+                        "draft_model_config": data,
+                    },
+                    "data": {"hidden_states_path": "/unused"},
+                    "training": {"strategy": strategy},
+                }
+            )
+            provider = (
+                builtin_algorithm_registry()
+                .resolve(strategy)
+                .providers.model.draft_config
+            )
+            resolved = resolve_draft_config(cfg, provider=provider)
+            self.assertEqual(
+                resolved.eagle_config["eagle_aux_hidden_state_layer_ids"], [1, 5, 8]
+            )
+            cfg.model.draft_model_config["eagle_config"][
+                "eagle_aux_hidden_state_layer_ids"
+            ] = [1]
+            with self.assertRaisesRegex(ValueError, "layer_ids"):
+                resolve_draft_config(cfg, provider=provider)
 
     def test_all_checked_in_draft_configs_finalize(self):
         directory = Path(__file__).resolve().parents[2] / "configs"

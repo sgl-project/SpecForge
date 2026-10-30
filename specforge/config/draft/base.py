@@ -62,6 +62,14 @@ class DraftConfig(ABC):
     _nested_fields: ClassVar[frozenset[str]] = frozenset()
 
     @classmethod
+    def validate_training_config(cls, config: PretrainedConfig) -> None:
+        """Validate training-only settings before constructing a model.
+
+        Serving may legitimately omit capture/masking metadata. Algorithms that
+        need it during training validate it here, without tokenizer fallback.
+        """
+
+    @classmethod
     @abstractmethod
     def from_model_config(cls, config: PretrainedConfig) -> Self:
         raise NotImplementedError

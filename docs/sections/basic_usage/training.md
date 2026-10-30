@@ -93,7 +93,40 @@ A run config has seven typed sections (`model`, `data`, `training`, `tracking`,
 ```yaml
 model:
   target_model_path: Qwen/Qwen3-8B
-  draft_model_config: configs/qwen3-8b-eagle3.json
+  draft_model_config:
+    architectures:
+    - LlamaForCausalLMEagle3
+    attention_bias: false
+    attention_dropout: 0.0
+    bos_token_id: 151643
+    eos_token_id: 151645
+    head_dim: 128
+    hidden_act: silu
+    hidden_size: 4096
+    initializer_range: 0.02
+    intermediate_size: 12288
+    max_position_embeddings: 40960
+    max_window_layers: 36
+    model_type: llama
+    num_attention_heads: 32
+    num_hidden_layers: 1
+    num_key_value_heads: 8
+    rms_norm_eps: 1.0e-06
+    rope_scaling: null
+    rope_theta: 1000000
+    sliding_window: null
+    tie_word_embeddings: false
+    torch_dtype: bfloat16
+    transformers_version: 4.51.0
+    use_cache: true
+    use_sliding_window: false
+    vocab_size: 151936
+    draft_vocab_size: 32000
+    eagle_config:
+      eagle_aux_hidden_state_layer_ids:
+      - 1
+      - 17
+      - 32
   target_backend: sglang
   vocab_mapping_path: cache/vocab_mapping/qwen3-8b.pt
   torch_dtype: bfloat16
@@ -132,28 +165,24 @@ deployment:
 
 ### Draft configuration and model initialization
 
-`model.draft_model_config` accepts any of these equivalent config sources:
+`model.draft_model_config` is a required inline mapping inside the training
+YAML (or JSON). It is the only source of draft settings, whether training from
+scratch, loading a trained draft checkpoint, or fine-tuning a native MTP head.
+The `architectures` entry selects the registered draft class; ordinary HF fields
+remain alongside algorithm-specific nested settings.
 
-- a local JSON file;
-- a local draft-model directory containing `config.json`;
-- a Hugging Face draft-model repository ID.
+Edit depth, attention layout, block size, capture-layer IDs and mask token in
+this mapping. There are no task-level structural overrides. Dotted CLI overrides
+may edit existing inline fields before parsing, for example
+`model.draft_model_config.block_size=8`.
 
-It may be omitted for EAGLE3, P-EAGLE, and DFlash. In that case SpecForge
-derives a registered draft config from the target config. The defaults preserve
-the former trainers: one EAGLE3 layer, four P-EAGLE layers, and one DFlash layer
-with block size 16. This DFlash default selects `DFlashDraftModel`; DFlash2
-always requires an explicit draft config or pretrained config source. Typed
-overrides are available when creating a different fresh architecture:
-
-```yaml
-model:
-  target_model_path: Qwen/Qwen3-8B
-  draft_num_hidden_layers: 2  # P-EAGLE or DFlash; EAGLE3 remains one layer
-  draft_block_size: 8         # DFlash only
-```
+EAGLE-family training requires explicit `eagle_config.eagle_aux_hidden_state_layer_ids`.
+DFlash-family training requires `dflash_config.mask_token_id`; P-EAGLE uses
+`mask_token_id` in the inline draft mapping. These settings are validated before
+model construction, with no tokenizer fallback or post-construction mutation.
 
 For DFlash-family drafts, including DFlash2, configure the attention layout in
-the referenced draft JSON. Each entry corresponds to one draft layer; sliding
+the inline draft mapping. Each entry corresponds to one draft layer; sliding
 layers share one positive window:
 
 ```json
@@ -173,8 +202,7 @@ layers share one positive window:
 
 Use `"full_attention"` for every entry, `"use_sliding_window": false`, and
 `"sliding_window": null` for a full-only draft. The layout length must equal
-`num_hidden_layers`. A layer-count override may resize a uniform layout, but a
-mixed layout must be edited explicitly in the draft JSON.
+`num_hidden_layers`. Changing depth requires editing the per-layer layout explicitly in the same mapping.
 
 The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
 
@@ -428,9 +456,13 @@ There are two deliberately separate checkpoint operations:
 | Initialize a new run from weights | `model.draft_checkpoint_path` | draft weights only |
 
 A weights-only warm start accepts a Hugging Face model directory/repository or
-a SpecForge checkpoint directory, `training_state.pt`, or run root. If the warm
-source contains `config.json`, it also supplies the draft architecture unless
-`model.draft_model_config` is explicit. Warm start never restores optimizer
+a SpecForge checkpoint directory, `training_state.pt`, or run root. The inline
+settings must match the saved draft settings, including non-shape parameters
+such as RoPE and masking. Incompatible settings fail before weights are applied;
+checkpoint configuration is never merged into the YAML. Older SpecForge checkpoints
+without saved settings require their original `config.json` beside `training_state.pt`
+for validation. Native MTP settings are checked against the target model before
+allocation. Warm start never restores optimizer
 state, counters, data position, or RNG, and it is mutually exclusive with
 `training.resume_from`:
 
@@ -438,6 +470,7 @@ state, counters, data position, or RNG, and it is mutually exclusive with
 model:
   target_model_path: Qwen/Qwen3-8B
   draft_checkpoint_path: ./outputs/base/base-step1000
+  # Retain the complete model.draft_model_config mapping from your recipe.
 ```
 
 For an online disaggregated run, the producer may receive the same field. It

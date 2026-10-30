@@ -15,6 +15,7 @@ from specforge.training.assembly import (
     _logger,
     _profiling_options,
 )
+from tests.draft_config_utils import draft_settings
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG_DIR = REPO_ROOT / "examples" / "configs"
@@ -22,7 +23,7 @@ EXAMPLE_CONFIG_DIR = REPO_ROOT / "examples" / "configs"
 OFFLINE_EAGLE3 = {
     "model": {
         "target_model_path": "target",
-        "draft_model_config": "draft.json",
+        "draft_model_config": draft_settings("eagle3"),
         "vocab_mapping_path": "mapping.pt",
     },
     "data": {"hidden_states_path": "features"},

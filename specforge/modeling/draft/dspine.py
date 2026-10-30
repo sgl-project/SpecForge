@@ -9,7 +9,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .config.dspine import DSpineConfig, DSpineDraftConfig
+from specforge.config.draft.dspine import DSpineConfig, DSpineDraftConfig
+
 from .dflash import DFlashDraftModel
 from .registry import register_draft
 

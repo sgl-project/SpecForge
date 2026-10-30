@@ -11,14 +11,16 @@ from unittest import mock
 
 import torch.distributed as dist
 
+from specforge.config.draft import AutoDraftConfig
 from specforge.training import provenance
+from tests.draft_config_utils import draft_settings
 
 
 def _config(target_model_path: str) -> SimpleNamespace:
     return SimpleNamespace(
         model=SimpleNamespace(
             target_model_path=target_model_path,
-            draft_model_config="remote/draft",
+            draft_model_config=draft_settings(),
             vocab_mapping_path="",
             embedding_key="model.embed_tokens.weight",
             lm_head_key="lm_head.weight",
@@ -206,7 +208,7 @@ class ModelProvenanceTest(unittest.TestCase):
 
             current_mapping = provenance._compute_model_resume_provenance(
                 _config(str(target)),
-                SimpleNamespace(_commit_hash=None),
+                AutoDraftConfig.from_dict(draft_settings()),
                 SimpleNamespace(_commit_hash=None),
                 capture_layers=[1, 3],
             )

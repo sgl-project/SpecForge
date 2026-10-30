@@ -16,6 +16,7 @@ from unittest import mock
 import torch
 from transformers import LlamaConfig, Qwen3Config
 
+from specforge.config.draft.registry import DRAFT_CONFIG_REGISTRY
 from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 from specforge.modeling.draft import (
     DRAFT_REGISTRY,
@@ -146,6 +147,7 @@ class DraftRegistryTest(unittest.TestCase):
             config_class = LlamaConfig
 
         self.addCleanup(DRAFT_REGISTRY.pop, "tiny_fake_draft", None)
+        self.addCleanup(DRAFT_CONFIG_REGISTRY.pop, "tiny_fake_draft", None)
         self.assertIs(resolve_draft("tiny_fake_draft"), FakeDraft)
 
 
