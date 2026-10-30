@@ -21,8 +21,8 @@ class AutoDraftConfig:
     """One parsing contract for training, export, and pretrained loading.
 
     Existing Llama/Qwen config classes and custom fields are preserved. An
-    omitted draft vocabulary inherits the resolved HF vocabulary; explicit
-    null is rejected. Draft embedding and output weights are always untied.
+    omitted or null draft vocabulary inherits the resolved HF vocabulary.
+    Draft embedding and output weights are always untied.
     Algorithm-specific overrides remain owned by DraftConfigProvider.
     """
 
@@ -47,14 +47,11 @@ class AutoDraftConfig:
                 f"draft architecture {architecture!r} is not registered; "
                 f"available: {available_drafts()}"
             )
-        if "draft_vocab_size" in payload and payload["draft_vocab_size"] is None:
-            raise ValueError("draft config draft_vocab_size cannot be null")
-
         payload["architectures"] = [architecture]
         payload["tie_word_embeddings"] = False
         payload.setdefault("use_cache", True)
         config = DRAFT_REGISTRY[architecture].config_class.from_dict(payload)
-        if "draft_vocab_size" not in payload:
+        if payload.get("draft_vocab_size") is None:
             config.draft_vocab_size = config.vocab_size
         if type(config.draft_vocab_size) is not int or config.draft_vocab_size <= 0:
             raise ValueError("draft config draft_vocab_size must be a positive integer")

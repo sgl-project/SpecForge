@@ -189,9 +189,9 @@ loading reads JSON without executing an `auto_map` config implementation.
 Custom draft architectures must be registered locally before loading.
 
 All entry points require exactly one registered `architectures` entry, force
-`tie_word_embeddings=False`, and default an omitted `draft_vocab_size` to the
-resolved `vocab_size`. An explicit null or non-positive/non-integer draft
-vocabulary is rejected, including through the legacy loader. Nested custom
+`tie_word_embeddings=False`, and default an omitted or null `draft_vocab_size`
+to the resolved `vocab_size`, including through the legacy loader. Explicit
+non-positive or non-integer draft vocabulary values are rejected. Nested custom
 fields are preserved and copied so parsing does not modify the caller's input.
 
 Training policy remains separate: explicit `model.draft_model_config` takes

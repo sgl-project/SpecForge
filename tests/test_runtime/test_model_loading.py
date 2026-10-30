@@ -105,7 +105,7 @@ def _draft_payload(architecture: str, *, layers: int = 1, block_size=None):
 
 
 class DraftConfigResolutionTest(unittest.TestCase):
-    def test_explicit_null_draft_vocab_size_does_not_fallback(self):
+    def test_explicit_null_draft_vocab_size_defaults_to_vocab_size(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "draft.json")
             payload = _draft_payload("LlamaForCausalLMEagle3")
@@ -113,11 +113,11 @@ class DraftConfigResolutionTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump(payload, stream)
 
-            with self.assertRaisesRegex(ValueError, "draft_vocab_size cannot be null"):
-                resolve_draft_config(
-                    _run_config("eagle3", draft_model_config=path),
-                    provider=_draft_config_provider("eagle3"),
-                )
+            config = resolve_draft_config(
+                _run_config("eagle3", draft_model_config=path),
+                provider=_draft_config_provider("eagle3"),
+            )
+            self.assertEqual(config.draft_vocab_size, payload["vocab_size"])
 
     def test_config_resolution_does_not_initialize_cuda_model_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:

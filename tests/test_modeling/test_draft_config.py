@@ -47,21 +47,31 @@ class DraftConfigTest(unittest.TestCase):
         self.assertFalse(expected["tie_word_embeddings"])
         self.assertEqual(expected["draft_vocab_size"], 128)
 
-    def test_null_vocab_rejected_by_all_entry_points(self):
+    def test_null_vocab_defaults_to_vocab_size_for_all_entry_points(self):
         payload = {**self.payload, "draft_vocab_size": None}
         self.write(payload)
         loaders = (
             lambda: AutoDraftConfig.from_dict(payload),
             lambda: AutoDraftModelConfig.from_file(self.path),
             lambda: AutoDraftConfig.from_pretrained(self.path.parent),
-            lambda: AutoDraftModel.from_pretrained(self.path.parent),
         )
         for loader in loaders:
             with self.subTest(loader=loader):
-                with self.assertRaisesRegex(
-                    ValueError, "draft_vocab_size cannot be null"
-                ):
-                    loader()
+                config = loader()
+                self.assertEqual(config.draft_vocab_size, payload["vocab_size"])
+        self.assertIsNone(payload["draft_vocab_size"])
+
+        with mock.patch.object(
+            PretrainedConfig, "get_config_dict", return_value=(payload, {})
+        ):
+            config = AutoDraftConfig.from_pretrained("org/draft")
+        self.assertEqual(config.draft_vocab_size, payload["vocab_size"])
+
+        model_cls = DRAFT_REGISTRY[payload["architectures"][0]]
+        with mock.patch.object(model_cls, "from_pretrained") as load:
+            AutoDraftModel.from_pretrained(self.path.parent)
+        config = load.call_args.kwargs["config"]
+        self.assertEqual(config.draft_vocab_size, payload["vocab_size"])
 
     def test_normalization_is_independent_and_preserves_custom_fields(self):
         payload = {**self.payload, "tie_word_embeddings": True, "use_cache": False}
@@ -74,9 +84,11 @@ class DraftConfigTest(unittest.TestCase):
         self.assertEqual(payload, before)
 
     def test_missing_vocab_uses_config_class_default(self):
-        payload = {"architectures": ["LlamaForCausalLMEagle3"]}
-        config = AutoDraftConfig.from_dict(payload)
-        self.assertEqual(config.draft_vocab_size, LlamaConfig().vocab_size)
+        for fields in ({}, {"draft_vocab_size": None}):
+            with self.subTest(fields=fields):
+                payload = {"architectures": ["LlamaForCausalLMEagle3"], **fields}
+                config = AutoDraftConfig.from_dict(payload)
+                self.assertEqual(config.draft_vocab_size, LlamaConfig().vocab_size)
 
     def test_invalid_vocab_and_architectures_fail_before_construction(self):
         for value in (False, 0, -1, 1.5, "128"):
