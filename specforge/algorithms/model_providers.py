@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 if TYPE_CHECKING:
     from specforge.config import Config
     from specforge.config.draft import DraftModelConfig
-    from specforge.modeling.draft.dflash_kernels import DFlashKernels
+    from specforge.modeling.draft.models.layers.kernels import DFlashKernels
 
 
 @dataclass
@@ -108,7 +108,7 @@ def build_eagle3_draft(cfg: Config, draft_config: DraftModelConfig):
 
 
 def build_peagle_draft(cfg: Config, draft_config: DraftModelConfig):
-    from specforge.modeling.draft.peagle import PEagleDraftModel
+    from specforge.modeling.draft.models.peagle import PEagleDraftModel
 
     draft_model = PEagleDraftModel(draft_config)
     if cfg.model.load_target_embedding:

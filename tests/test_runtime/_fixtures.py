@@ -283,7 +283,7 @@ def build_dflash(
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
 
     from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
-    from specforge.modeling.draft.dflash import DFlashDraftModel
+    from specforge.modeling.draft.models.dflash import DFlashDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
     # Tiny Qwen3 target saved to disk; the draft config is derived from it.
@@ -354,7 +354,7 @@ def build_domino(
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
 
     from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
-    from specforge.modeling.draft.domino import DominoDraftModel
+    from specforge.modeling.draft.models.domino import DominoDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
     tcfg = Qwen3Config(
@@ -426,7 +426,7 @@ def build_dspark(
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
 
     from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
-    from specforge.modeling.draft.dspark import DSparkDraftModel
+    from specforge.modeling.draft.models.dspark import DSparkDraftModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
     target_config = Qwen3Config(

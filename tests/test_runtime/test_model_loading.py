@@ -168,7 +168,9 @@ class DraftConfigResolutionTest(unittest.TestCase):
 
     def test_native_mtp_normalizes_hf_rope_parameters(self):
         from specforge.config.draft import AutoDraftConfig
-        from specforge.modeling.draft.mtp.qwen3_5 import PartialRotaryEmbedding
+        from specforge.modeling.draft.models.specialized.qwen3_5_mtp.model import (
+            PartialRotaryEmbedding,
+        )
         from tests.draft_config_utils import draft_settings
 
         payload = draft_settings("mtp")

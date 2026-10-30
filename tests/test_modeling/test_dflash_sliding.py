@@ -9,11 +9,9 @@ from transformers import DynamicCache, Qwen3Config
 from transformers.utils import is_flash_attn_2_available
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
-from specforge.modeling.draft.dflash import (
-    DFlashDraftModel,
-    resolve_dflash_attention_layout,
-)
-from specforge.modeling.draft.dflash_mask import (
+from specforge.config.draft.dflash import resolve_dflash_attention_layout
+from specforge.modeling.draft.models.dflash import DFlashDraftModel
+from specforge.modeling.draft.models.layers.attention.masks import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
@@ -197,7 +195,7 @@ class TestDFlashGenerationMasks(unittest.TestCase):
                         else "create_dflash_sdpa_mask"
                     )
                     with mock.patch(
-                        "specforge.modeling.draft.dflash." + name,
+                        "specforge.modeling.draft.models.dflash." + name,
                         wraps=builder,
                     ) as create_mask:
                         _forward(model, None)
@@ -236,10 +234,10 @@ class TestDFlashGenerationMasks(unittest.TestCase):
                 with self.subTest(backend=implementation, mask_type=type(supplied)):
                     with (
                         mock.patch(
-                            "specforge.modeling.draft.dflash.create_dflash_sdpa_mask"
+                            "specforge.modeling.draft.models.dflash.create_dflash_sdpa_mask"
                         ) as dense,
                         mock.patch(
-                            "specforge.modeling.draft.dflash.create_dflash_block_mask"
+                            "specforge.modeling.draft.models.dflash.create_dflash_block_mask"
                         ) as block,
                     ):
                         _forward(model, supplied)
@@ -261,10 +259,10 @@ class TestDFlashGenerationMasks(unittest.TestCase):
         )
         with (
             mock.patch(
-                "specforge.modeling.draft.dflash.create_dflash_sdpa_mask"
+                "specforge.modeling.draft.models.dflash.create_dflash_sdpa_mask"
             ) as dense,
             mock.patch(
-                "specforge.modeling.draft.dflash.create_dflash_block_mask"
+                "specforge.modeling.draft.models.dflash.create_dflash_block_mask"
             ) as block,
         ):
             _forward(model, None)
@@ -303,11 +301,11 @@ class TestDFlashGenerationMasks(unittest.TestCase):
                 )
                 with (
                     mock.patch(
-                        "specforge.modeling.draft.dflash.flex_attention_backend",
+                        "specforge.modeling.draft.models.dflash.flex_attention_backend",
                         return_value=backend,
                     ),
                     mock.patch(
-                        "specforge.modeling.draft.dflash.create_dflash_block_mask"
+                        "specforge.modeling.draft.models.dflash.create_dflash_block_mask"
                     ) as builder,
                 ):
                     _forward(model, None)
@@ -322,7 +320,7 @@ class TestDFlashGenerationMasks(unittest.TestCase):
         for causal in (None, False):
             model, layers = _capture_model(["full_attention"], is_causal=causal)
             with mock.patch(
-                "specforge.modeling.draft.dflash.create_dflash_sdpa_mask",
+                "specforge.modeling.draft.models.dflash.create_dflash_sdpa_mask",
             ) as create_mask:
                 _forward(model, None)
             create_mask.assert_not_called()

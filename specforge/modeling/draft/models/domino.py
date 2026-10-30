@@ -10,10 +10,10 @@ from torch import nn
 from torch.func import functional_call
 
 from specforge.config.draft.domino import DominoConfig
+from specforge.modeling.draft.registry import register_draft
 from specforge.utils import get_device_type
 
 from .dflash import DFlashDraftModel, sample
-from .registry import register_draft
 
 
 @register_draft

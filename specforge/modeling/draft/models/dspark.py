@@ -9,9 +9,9 @@ import torch
 from torch import nn
 
 from specforge.config.draft.dspark import DSparkConfig
+from specforge.modeling.draft.registry import register_draft
 
 from .dflash import DFlashDraftModel
-from .registry import register_draft
 
 
 def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:

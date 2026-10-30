@@ -37,9 +37,12 @@ from typing_extensions import Unpack
 from specforge.config.draft import AutoDraftConfig
 from specforge.config.draft.mtp import Qwen3_5MTPConfig
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
-from specforge.modeling.draft.mtp.base import MTPDraftModel
+from specforge.modeling.draft.models.mtp import MTPDraftModel
 from specforge.modeling.draft.registry import register_draft
 from specforge.modeling.draft.serialization import DraftSerializationMixin
+
+from ...layers.ffn import build_ffn
+from ...layers.residual import build_residual
 
 
 class Qwen3_5RMSNorm(nn.Module):
@@ -250,7 +253,8 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3MTPAttention(config=config, layer_idx=layer_idx)
-        self.mlp = Qwen3MLP(config)
+        self.mlp = build_ffn(config, dense_factory=Qwen3MLP)
+        self.residual = build_residual(config)
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -273,7 +277,7 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(self.residual.branch_input(hidden_states))
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -282,12 +286,14 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
             cache_position=cache_position,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = self.residual.combine(residual, hidden_states)
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(
+            self.residual.branch_input(hidden_states)
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = self.residual.combine(residual, hidden_states)
 
         outputs = (hidden_states,)
         if output_attentions:

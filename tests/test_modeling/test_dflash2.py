@@ -11,13 +11,13 @@ from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.algorithms.dflash.providers import resume_contract
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.core.position_weights import dpace_weights
-from specforge.modeling.draft.dflash import Qwen3DFlashDecoderLayer
-from specforge.modeling.draft.dflash2 import (
+from specforge.modeling.draft.models.dflash import Qwen3DFlashDecoderLayer
+from specforge.modeling.draft.models.dflash2 import (
     CandidateSelector,
     DFlash2DraftModel,
-    DFlashGroupedConv,
     Qwen3DFlash2DecoderLayer,
 )
+from specforge.modeling.draft.models.layers.convolution.dflash2 import DFlashGroupedConv
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import DFlashTrainStrategy, StepContext
 

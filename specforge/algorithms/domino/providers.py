@@ -62,7 +62,7 @@ def step_options(config):
 def resume_contract(config, draft_model, training_model):
     """Persist resolved Domino model, sampling, and objective semantics."""
 
-    from specforge.modeling.draft.dflash import dflash_attention_resume_contract
+    from specforge.modeling.draft.models.dflash import dflash_attention_resume_contract
 
     return {
         **dflash_attention_resume_contract(draft_model),

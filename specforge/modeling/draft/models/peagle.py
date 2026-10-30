@@ -8,16 +8,17 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.config.draft import AutoDraftConfig, EaglePretrainedConfig, PEagleConfig
-from specforge.modeling.draft.base import Eagle3DraftModel
-from specforge.modeling.draft.flex_attention import compile_friendly_flex_attention
-from specforge.modeling.draft.llama3_eagle import (
-    LlamaMLP,
-    LlamaRMSNorm,
-    LlamaRotaryEmbedding,
-    get_rope_config,
-    rotate_half,
+from specforge.modeling.draft.models.base import Eagle3DraftModel
+from specforge.modeling.draft.models.layers.attention.backends.flex import (
+    compile_friendly_flex_attention,
 )
 from specforge.modeling.draft.registry import register_draft
+
+from .layers.attention.eagle import LlamaRotaryEmbedding, get_rope_config, rotate_half
+from .layers.ffn import build_ffn
+from .layers.ffn.dense import LlamaMLP
+from .layers.normalization import LlamaRMSNorm
+from .layers.residual import build_residual
 
 
 class PEagleAttention(nn.Module):
@@ -110,7 +111,8 @@ class PEagleFirstLayer(nn.Module):
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = LlamaMLP(config)
+        self.mlp = build_ffn(config, dense_factory=LlamaMLP)
+        self.residual = build_residual(config)
 
     def forward(
         self,
@@ -131,12 +133,14 @@ class PEagleFirstLayer(nn.Module):
         hidden_states = self.self_attn(
             hidden_states, attention_mask, position_embeddings
         )
-        hidden_states = residual + hidden_states
+        hidden_states = self.residual.combine(residual, hidden_states)
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(
+            self.residual.branch_input(hidden_states)
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = self.residual.combine(residual, hidden_states)
         return hidden_states
 
 
@@ -151,7 +155,8 @@ class PEagleStandardLayer(nn.Module):
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = LlamaMLP(config)
+        self.mlp = build_ffn(config, dense_factory=LlamaMLP)
+        self.residual = build_residual(config)
 
     def forward(
         self,
@@ -160,16 +165,18 @@ class PEagleStandardLayer(nn.Module):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(self.residual.branch_input(hidden_states))
         hidden_states = self.self_attn(
             hidden_states, attention_mask, position_embeddings
         )
-        hidden_states = residual + hidden_states
+        hidden_states = self.residual.combine(residual, hidden_states)
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(
+            self.residual.branch_input(hidden_states)
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = self.residual.combine(residual, hidden_states)
         return hidden_states
 
 

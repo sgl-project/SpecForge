@@ -2521,7 +2521,7 @@ class LaunchPlanTest(unittest.TestCase):
                     "specforge.training.model_loading.resolve_draft_config"
                 ) as resolve_draft_config,
                 mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
+                    "specforge.modeling.draft.models.layers.kernels.load_liger_dflash_kernels"
                 ) as load_liger,
             ):
                 plan = build_launch_plan(cfg, config_path="run.yaml", env={})
@@ -2544,7 +2544,7 @@ class LaunchPlanTest(unittest.TestCase):
                     return_value=draft_config,
                 ),
                 mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
+                    "specforge.modeling.draft.models.layers.kernels.current_liger_platform",
                     return_value="rocm",
                 ),
                 mock.patch.dict(
@@ -2566,11 +2566,11 @@ class LaunchPlanTest(unittest.TestCase):
                     return_value=draft_config,
                 ),
                 mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
+                    "specforge.modeling.draft.models.layers.kernels.current_liger_platform",
                     return_value="cuda",
                 ),
                 mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
+                    "specforge.modeling.draft.models.layers.kernels.load_liger_dflash_kernels"
                 ) as load_liger,
             ):
                 plan.preflight_checks[0]()
@@ -2619,7 +2619,7 @@ class LaunchPlanTest(unittest.TestCase):
                 return_value=draft_config,
             ),
             mock.patch(
-                "specforge.modeling.draft.dflash_kernels.current_liger_platform",
+                "specforge.modeling.draft.models.layers.kernels.current_liger_platform",
                 return_value="cuda",
             ),
             mock.patch.dict(

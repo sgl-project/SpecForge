@@ -8,15 +8,15 @@ from unittest.mock import patch
 import torch
 from transformers import LlamaConfig
 
-from specforge.modeling.draft.llama3_eagle import (
+from specforge.modeling.draft.models.eagle3 import LlamaForCausalLMEagle3
+from specforge.modeling.draft.models.layers.attention.eagle import (
     LlamaAttention,
-    LlamaForCausalLMEagle3,
-    LlamaMLP,
     LlamaMutiRotaryEmbedding,
-    LlamaRMSNorm,
     LlamaRotaryEmbedding,
     get_rope_config,
 )
+from specforge.modeling.draft.models.layers.ffn.dense import LlamaMLP
+from specforge.modeling.draft.models.layers.normalization import LlamaRMSNorm
 
 # from model_module import LlamaForCausalLMEagle3
 

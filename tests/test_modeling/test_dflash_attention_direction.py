@@ -18,7 +18,7 @@ from specforge.algorithms.common.dflash_family_model import (
     create_dflash_sdpa_mask,
 )
 from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.dflash import (
+from specforge.modeling.draft.models.dflash import (
     DFlashDraftModel,
     dflash_attention_resume_contract,
     resolve_dflash_causal_block,
@@ -29,7 +29,7 @@ from tests.test_modeling.test_dflash_sliding import _draft_config
 class DFlashAttentionDirectionTest(unittest.TestCase):
 
     @patch(
-        "specforge.modeling.draft.flex_attention.compile_friendly_create_block_mask",
+        "specforge.modeling.draft.models.layers.attention.backends.flex.compile_friendly_create_block_mask",
         side_effect=create_block_mask,
     )
     def test_direction_and_range_masks_match_independent_reference(self, _builder):

@@ -21,10 +21,10 @@ from torch import nn
 from transformers import Qwen3Config
 
 from specforge.algorithms.common import dflash_family_model as family
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.draft.dflash2 import DFlash2DraftModel
-from specforge.modeling.draft.domino import DominoDraftModel
-from specforge.modeling.draft.dspark import DSparkDraftModel
+from specforge.modeling.draft.models.dflash import DFlashDraftModel
+from specforge.modeling.draft.models.dflash2 import DFlash2DraftModel
+from specforge.modeling.draft.models.domino import DominoDraftModel
+from specforge.modeling.draft.models.dspark import DSparkDraftModel
 from specforge.optimizer import BF16Optimizer
 
 

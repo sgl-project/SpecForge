@@ -78,7 +78,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
     def test_peagle_assembly_uses_the_validated_mask_token(self):
         from specforge.algorithms.model_providers import build_peagle_model
         from specforge.config.draft import AutoDraftConfig
-        from specforge.modeling.draft.peagle import PEagleDraftModel
+        from specforge.modeling.draft.models.peagle import PEagleDraftModel
         from tests.draft_config_utils import draft_settings
 
         config = AutoDraftConfig.finalize(

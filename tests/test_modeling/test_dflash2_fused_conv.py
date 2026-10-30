@@ -9,10 +9,10 @@ from unittest import mock
 import torch
 from transformers import Qwen3Config
 
-from specforge.modeling.draft import dflash2
-from specforge.modeling.draft.dflash2 import (
+from specforge.modeling.draft.models.dflash2 import DFlash2DraftModel
+from specforge.modeling.draft.models.layers.convolution import dflash2
+from specforge.modeling.draft.models.layers.convolution.dflash2 import (
     FUSED_CONV_ENV,
-    DFlash2DraftModel,
     DFlashGroupedConv,
 )
 
@@ -131,7 +131,10 @@ class DFlash2FusedConvDispatchTest(unittest.TestCase):
                 mock.patch.dict(sys.modules),
                 mock.patch("builtins.__import__", guarded_import),
             ):
-                sys.modules.pop("specforge.modeling.draft.dflash2_conv_triton", None)
+                sys.modules.pop(
+                    "specforge.modeling.draft.models.layers.convolution.dflash2_triton",
+                    None,
+                )
                 self.assertIsNone(dflash2._load_fused_grouped_conv())
         finally:
             dflash2._load_fused_grouped_conv.cache_clear()
@@ -272,7 +275,7 @@ class DFlash2FusedConvParityTest(unittest.TestCase):
             (grad_inputs.sum() + output.sum()).backward()
 
     def test_fused_entry_rejects_mismatched_shapes(self):
-        from specforge.modeling.draft.dflash2_conv_triton import (
+        from specforge.modeling.draft.models.layers.convolution.dflash2_triton import (
             dflash2_grouped_conv_fused,
         )
 
