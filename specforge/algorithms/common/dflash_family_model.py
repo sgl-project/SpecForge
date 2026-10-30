@@ -12,6 +12,12 @@ from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core import fused_loss
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
+from specforge.core.token_objective import (
+    TokenObjectiveConfig,
+    compose_token_objective,
+    lk_kl_weight,
+    token_objective_chunk_terms,
+)
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash_mask import (
     create_dflash_block_mask,
@@ -331,6 +337,20 @@ class OnlineDFlashModel(nn.Module):
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
+
+    @property
+    def token_objective(self) -> TokenObjectiveConfig:
+        """Map resolved model settings to the shared objective composition."""
+        return TokenObjectiveConfig(
+            hard_label_mode=self.lk_loss_type,
+            kl_scale=self.kl_scale,
+            kl_decay=self.kl_decay,
+        )
+
+    @property
+    def requires_teacher_distribution(self) -> bool:
+        """Objective data requirement, separate from confidence and diagnostics."""
+        return self.token_objective.requires_teacher_distribution
 
     def _sample_anchor_positions(
         self,
@@ -822,11 +842,12 @@ class OnlineDFlashModel(nn.Module):
         else:  # defensive: __init__ validates the configured loss type.
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
-        ce_loss_num = (neg_log_q * loss_weights).sum()
-        if self.lk_loss_type in {"lambda", "tv"}:
-            tv_loss_num = ((1.0 - target_probability) * loss_weights).sum()
-        else:
-            tv_loss_num = ce_loss_num.new_zeros(())
+        token = token_objective_chunk_terms(
+            self.token_objective,
+            cross_entropy=neg_log_q,
+            hard_weights=loss_weights,
+        )
+        ce_loss_num, tv_loss_num = token.ce_num, token.hard_tv_num
         target_probability_num = (target_probability.detach() * weight_mask).sum()
 
         selector_terms = SelectorTerms.zeros(ce_loss_num)
@@ -1259,10 +1280,7 @@ class OnlineDFlashModel(nn.Module):
     ) -> Optional[torch.Tensor]:
         """Return the LK-lambda CE weight, or ``None`` for other objectives."""
 
-        if self.lk_loss_type != "lambda":
-            return None
-        acceptance = probability_num / probability_den.clamp_min(1.0)
-        return self.kl_scale * torch.exp(-self.kl_decay * acceptance.detach())
+        return lk_kl_weight(self.token_objective, probability_num, probability_den)
 
     def _compose_token_objective(
         self,
@@ -1273,15 +1291,13 @@ class OnlineDFlashModel(nn.Module):
     ) -> torch.Tensor:
         """Compose a hard-target CE/TV/LK numerator after chunk reduction."""
 
-        if self.lk_loss_type is None or self.lk_loss_type == "alpha":
-            # With a one-hot target distribution, LK-alpha is exactly NLL/CE.
-            return ce_num
-        if self.lk_loss_type == "tv":
-            return tv_num
-        if self.lk_loss_type == "lambda":
-            kl_weight = self._lk_kl_weight(probability_num, probability_den)
-            return kl_weight * ce_num + (1.0 - kl_weight) * tv_num
-        raise ValueError(f"unknown lk_loss_type {self.lk_loss_type!r}")
+        return compose_token_objective(
+            self.token_objective,
+            ce_num=ce_num,
+            hard_tv_num=tv_num,
+            probability_num=probability_num,
+            probability_den=probability_den,
+        )
 
     def forward(
         self,
@@ -1944,6 +1960,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
 
+    @property
+    def token_objective(self) -> TokenObjectiveConfig:
+        """CE and teacher L1 on DSpark's corrected logits."""
+        return TokenObjectiveConfig(
+            hard_ce_weight=self.dspark_ce_loss_alpha,
+            teacher_l1_weight=self.dspark_l1_loss_alpha,
+        )
+
     def _build_dspark_labels_and_mask(
         self,
         input_ids: torch.Tensor,
@@ -2025,16 +2049,21 @@ class OnlineDSparkModel(OnlineDFlashModel):
             terms.teacher_argmax_ids,
             terms.teacher_top1_probability,
         )
-        ce_num = (cross_entropy * loss_weights).sum()
+        token = token_objective_chunk_terms(
+            self.token_objective,
+            cross_entropy=cross_entropy,
+            hard_weights=loss_weights,
+            teacher_l1=l1_per_token,
+            teacher_weights=loss_weights,
+        )
+        ce_num, l1_num = token.ce_num, token.teacher_l1_num
         zero = ce_num.new_zeros(())
-        l1_num = confidence_num = confidence_error_num = zero
+        confidence_num = confidence_error_num = zero
         teacher_agreement_num = teacher_top1_num = draft_top1_num = zero
         tau_num = tau_den = zero
         accept_probability = None
         if l1_per_token is not None:
             accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
-            if self.dspark_l1_loss_alpha > 0:
-                l1_num = (l1_per_token * loss_weights).sum()
 
         confidence_pred = self.draft_model.predict_confidence(
             hidden,
@@ -2120,7 +2149,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         )
         loss_weights = self._dspark_loss_weight_mask(eval_mask)
         local_loss_den = loss_weights.sum()
-        need_target = self.dspark_l1_loss_alpha > 0 or (
+        need_target = self.requires_teacher_distribution or (
             self.dspark_confidence_head_alpha > 0
             and getattr(self.draft_model, "confidence_head", None) is not None
         )
@@ -2185,13 +2214,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
             (global_loss_den > 0).any(),
             "DSpark objective has no supervised target tokens",
         )
+        token_loss_num = compose_token_objective(
+            self.token_objective,
+            ce_num=ce_num,
+            teacher_l1_num=l1_num,
+        )
         loss = (
             world_size
-            * (
-                self.dspark_ce_loss_alpha * ce_num
-                + self.dspark_l1_loss_alpha * l1_num
-                + self.dspark_confidence_head_alpha * confidence_num
-            )
+            * (token_loss_num + self.dspark_confidence_head_alpha * confidence_num)
             / global_loss_den
         )
 
