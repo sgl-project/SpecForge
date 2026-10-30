@@ -52,6 +52,7 @@ There are no method-specific Python training entry points.
 | **[DFlash2](https://inco.ai/blog/dflash2/)** | DFlash with grouped dynamic convolution and top-k path selection | [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml) | [D-PACE](https://arxiv.org/abs/2605.18810)|
 | **[Domino](https://arxiv.org/html/2605.29707v1)** | DFlash with GRU logit correction | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-domino.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-8b-domino.yaml) / [Online managed-local](./examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml) | — |
 | **[DSpark](https://arxiv.org/abs/2607.05147)** | Confidence-Scheduled Semi-Autoregressive Generation | [Online external](./examples/configs/online/disaggregated/external/qwen3-4b-dspark.yaml) / [Offline colocated](./examples/configs/offline/colocated/qwen3-4b-dspark.yaml) | — |
+| **[DSpine](https://arxiv.org/abs/2609.36173)** | Parallel drafting with adjacent causal injection through depth | [Online external](./examples/configs/online/disaggregated/external/qwen3-8b-dspine.yaml) | — |
 
 See the [training guide](./docs/sections/basic_usage/training.md) for the supported
 method/topology matrix and the
@@ -73,6 +74,7 @@ SpecBundle is a collection of production-grade speculative decoding models that 
 
 
 ## 🎉 News
+- [2026-10] 🔥 Added [DSpine](https://arxiv.org/abs/2609.36173) online training with adjacent causal injection through depth.
 - [2026-08] 🔥 Added DFlash2 online training for DFlash draft models.
 - [2026-08] 🎉 Released SpecBundle (phase 2) and SpecForge v0.3.0. Check out our blog at [LMSYS.org](https://www.lmsys.org/blog/2026-08-04-specforge-v0-3)
 - [2026-07] 🚀 Day0 supported two flagship dspark draft model, [Inkling](https://huggingface.co/RadixArk/Inkling-DSpark-Preview) and [Kimi-K3](https://huggingface.co/RadixArk/Kimi-K3-DSpark).

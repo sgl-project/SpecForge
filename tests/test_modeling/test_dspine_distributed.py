@@ -34,6 +34,25 @@ def uneven_batch():
     return inputs
 
 
+def per_microbatch_objective(model, inputs, width, global_step, total_steps):
+    size = inputs["input_ids"].shape[0]
+    parts = [
+        {name: tensor[start : start + width] for name, tensor in inputs.items()}
+        for start in range(0, size, width)
+    ]
+    step = dict(global_step=global_step, total_steps=total_steps)
+    with torch.no_grad():
+        ce_terms = [
+            model(**part, **step, ce_only=True)[2]["loss_terms"] for part in parts
+        ]
+    window_ce = sum(ce for ce, _ in ce_terms) / sum(mass for _, mass in ce_terms)
+    numerator = sum(
+        model(**part, **step, alignment_ce=window_ce)[2]["loss_terms"][0]
+        for part in parts
+    )
+    return numerator / size
+
+
 def combined_batch(accumulation_steps):
     batches = [uneven_batch() for _ in range(accumulation_steps)]
     return {name: torch.cat([batch[name] for batch in batches]) for name in batches[0]}
@@ -158,10 +177,8 @@ class DSpineDistributedTest(unittest.TestCase):
                     tmp_path = Path(directory)
                     model = training_model(chunk_size=1)
                     model._sample_anchor_positions = fixed_anchors
-                    (loss, _, _) = model(
-                        **combined_batch(accumulation_steps),
-                        global_step=300,
-                        total_steps=600,
+                    loss = per_microbatch_objective(
+                        model, combined_batch(accumulation_steps), 1, 300, 600
                     )
                     loss.backward()
                     expected = {
