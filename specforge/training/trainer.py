@@ -30,6 +30,7 @@ from specforge.algorithms.common.providers import (
     StepRuntimeConfig,
     checkpoint_key_fingerprint,
 )
+from specforge.modeling.draft.moe.balance import MoEBalancing
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
@@ -443,6 +444,11 @@ class Trainer:
             **resolved_strategy_kwargs,
         )
         core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
+        # MoE drafts: the pooled counts and bias updates, once per optimizer step.
+        if isinstance(model, torch.nn.Module):
+            balancing = MoEBalancing(model)
+            if balancing.layers:
+                core.register_step_hook(balancing)
         ack_fn = None
         if durable_ack:
 
