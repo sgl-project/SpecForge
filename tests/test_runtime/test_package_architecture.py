@@ -713,6 +713,7 @@ class TestPackageArchitecture(unittest.TestCase):
             {
                 "deepseek-v4-flash-dspark.json",
                 "glm-5.2-dspark.json",
+                "gpt-oss-120B-dspark.json",
                 "inkling-dspark.json",
                 "kimi-k3-dspark.json",
                 "ling-3.0-tiny-dspark.json",
