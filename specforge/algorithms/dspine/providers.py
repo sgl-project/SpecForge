@@ -157,7 +157,6 @@ def algorithm_providers() -> AlgorithmProviders:
             draft_config=DraftConfigProvider(
                 architecture="DSpineDraftModel",
                 compatible_architectures=frozenset({"DSpineDraftModel"}),
-                expected_auto_map_model="dspine.DSpineDraftModel",
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

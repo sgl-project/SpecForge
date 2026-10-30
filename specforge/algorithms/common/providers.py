@@ -130,7 +130,6 @@ class DraftConfigProvider:
     """
 
     architecture: str
-    expected_auto_map_model: str | None = None
     compatible_architectures: FrozenSet[str] | None = None
 
     def __post_init__(self) -> None:
@@ -149,11 +148,6 @@ class DraftConfigProvider:
                     "architecture must be included in compatible_architectures"
                 )
         object.__setattr__(self, "compatible_architectures", compatible)
-        if self.expected_auto_map_model is not None:
-            _non_empty(
-                self.expected_auto_map_model,
-                field_name="expected_auto_map_model",
-            )
 
 
 @dataclass(frozen=True)

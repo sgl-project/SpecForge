@@ -6,6 +6,7 @@ import unittest
 from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.providers import (
@@ -74,6 +75,33 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "block_size >= 2"):
                     minimum_loss_tokens(None, SimpleNamespace(block_size=1))
 
+    def test_peagle_assembly_uses_the_validated_mask_token(self):
+        from specforge.algorithms.model_providers import build_peagle_model
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.draft.peagle import PEagleDraftModel
+        from tests.draft_config_utils import draft_settings
+
+        config = AutoDraftConfig.finalize(
+            AutoDraftConfig.from_dict(draft_settings("peagle"))
+        )
+        AutoDraftConfig.validate_training_config(config)
+        draft = PEagleDraftModel(config)
+        run = SimpleNamespace(
+            mode="offline",
+            model=SimpleNamespace(torch_dtype="float32"),
+            training=SimpleNamespace(
+                num_depths=2, down_sample_ratio=0.8, down_sample_ratio_min=0.2
+            ),
+        )
+        # Supplying a tokenizer must not change the explicitly configured mask.
+        tokenizer = SimpleNamespace(mask_token_id=config.mask_token_id + 1)
+        with mock.patch(
+            "specforge.algorithms.model_providers._device", return_value="cpu"
+        ):
+            parts = build_peagle_model(run, draft, config, None, tokenizer)
+        self.assertEqual(parts.model.mask_token_id, config.mask_token_id)
+        self.assertEqual(draft.config.mask_token_id, config.mask_token_id)
+
     def test_algorithm_metadata_has_no_factories_or_topology_flags(self):
         field_names = {field.name for field in fields(AlgorithmSpec)}
         self.assertEqual(
@@ -121,7 +149,6 @@ class BuiltinProviderContractTest(unittest.TestCase):
             {
                 "architecture",
                 "compatible_architectures",
-                "expected_auto_map_model",
             },
             provider_fields,
         )

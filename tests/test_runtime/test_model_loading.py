@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Draft config sources, target-derived defaults, and weights-only loading."""
+"""Inline draft settings and compatible weights-only checkpoint loading."""
 
 import json
 import os
@@ -57,21 +57,6 @@ def _run_config(strategy: str, **model_overrides) -> Config:
 def _draft_config_provider(strategy: str):
     registration = builtin_algorithm_registry().resolve(strategy)
     return registration.providers.model.draft_config
-
-
-def _target_config(*, layers: int = 12):
-    from transformers import LlamaConfig
-
-    return LlamaConfig(
-        vocab_size=128,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=layers,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=256,
-        pad_token_id=0,
-    )
 
 
 def _draft_payload(architecture: str, *, layers: int = 1, block_size=None):

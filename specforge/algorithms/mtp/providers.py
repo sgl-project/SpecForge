@@ -278,7 +278,6 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
-                expected_auto_map_model="mtp.Qwen3_5MTPDraftModel",
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

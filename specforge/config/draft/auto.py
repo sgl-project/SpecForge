@@ -1,7 +1,8 @@
 """Load and normalize draft configs independently of training-run policy.
 
-The configuration registry owns the HF adapter and typed architecture options. This loader does not infer
-the draft architecture from the target or construct model parameters.
+The configuration registry owns the HF adapter and typed architecture options.
+This loader does not infer the draft architecture from the target or construct
+model parameters.
 """
 
 from __future__ import annotations
@@ -21,7 +22,8 @@ class AutoDraftConfig:
     """One parsing contract for training, export, and pretrained loading.
 
     Existing Llama/Qwen config classes and custom fields are preserved. An
-    omitted or null draft vocabulary inherits the resolved HF vocabulary. Draft embedding and output weights are always untied.
+    omitted or null draft vocabulary inherits the resolved HF vocabulary.
+    Draft embedding and output weights are always untied.
     """
 
     @classmethod

@@ -237,16 +237,6 @@ def resolve_dflash_capture_layers(
     return layers
 
 
-def _resolve_mask_token_id(draft_model: Any) -> int:
-    # A tokenizer must never change architecture settings after construction.
-    config = draft_model.config
-    method = getattr(config, "dflash_config", None) or {}
-    value = method.get("mask_token_id", getattr(config, "mask_token_id", None))
-    if type(value) is not int or not 0 <= value < config.vocab_size:
-        raise ValueError("inline draft mask_token_id must be within vocab_size")
-    return value
-
-
 def build_eagle3_model(
     cfg: Config,
     draft_model: Any,
@@ -293,7 +283,7 @@ def build_peagle_model(
 ) -> AlgorithmModelParts:
     from specforge.algorithms.peagle.model import OnlinePEagleModel
 
-    mask_token_id = _resolve_mask_token_id(draft_model)
+    mask_token_id = draft_model.config.mask_token_id
     model = OnlinePEagleModel(
         draft_model=draft_model,
         mask_token_id=mask_token_id,
@@ -332,7 +322,7 @@ def _build_dflash_family_model(
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
     _validate_dflash_block_size(draft_model)
-    mask_token_id = _resolve_mask_token_id(draft_model)
+    mask_token_id = draft_model.mask_token_id
     target_parts = TargetEmbeddingsAndHead.from_pretrained(
         cfg.model.target_model_path,
         embed_key=cfg.model.embedding_key,

@@ -212,9 +212,9 @@ as `config_class` and `draft_options_class`; model registration verifies that
 they agree. Omit the options class for a custom model that uses only HF fields.
 
 All entry points require exactly one registered `architectures` entry, force
-`tie_word_embeddings=False`, and default an omitted `draft_vocab_size` to the
-resolved `vocab_size`. Explicit null has the same fallback; non-positive or
-non-integer draft vocabulary values are rejected. Nested custom
+`tie_word_embeddings=False`, and default an omitted or null `draft_vocab_size`
+to the resolved `vocab_size`, including through the legacy loader. Explicit
+non-positive or non-integer draft vocabulary values are rejected. Nested custom
 fields are preserved and copied so parsing does not modify the caller's input.
 
 Training reads only the inline `model.draft_model_config` mapping. It calls

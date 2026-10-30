@@ -12,12 +12,9 @@ from .mtp import Qwen3_5MTPConfig
 from .peagle import PEagleConfig
 from .registry import register_draft_config
 
-DraftConfigClass = AutoDraftConfig
-
 __all__ = [
     "AutoDraftConfig",
     "register_draft_config",
-    "DraftConfigClass",
     "DraftConfig",
     "DFlashConfig",
     "DFlash2Config",
