@@ -25,7 +25,7 @@ data:
 
 training:
   strategy: "dspark"
-  num_epochs: 12
+  num_epochs: 6
   total_steps: null
   max_steps: null
   tp_size: 1
