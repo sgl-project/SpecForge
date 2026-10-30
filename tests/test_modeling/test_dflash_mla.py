@@ -118,7 +118,7 @@ class TestDFlashMLASelection(unittest.TestCase):
     def test_dflash_selects_mla_from_config(self):
         model = DFlashDraftModel(_mla_config())
 
-        self.assertEqual(model.attention_mode, "mla")
+        self.assertEqual(model.config.dflash_config["attention_mode"], "mla")
         self.assertIsInstance(model.layers[0].self_attn, Qwen3DFlashMLAAttention)
         # Omitted rope_interleave defaults to the DeepSeek interleaved layout.
         self.assertTrue(model.layers[0].self_attn.rope_interleaved)
@@ -131,7 +131,7 @@ class TestDFlashMLASelection(unittest.TestCase):
         del config.dflash_config["attention_mode"]
         model = DFlashDraftModel(config)
 
-        self.assertEqual(model.attention_mode, "gqa")
+        self.assertEqual(model.config.dflash_config["attention_mode"], "gqa")
         self.assertIsInstance(model.layers[0].self_attn, Qwen3DFlashAttention)
         cos, _ = model.rotary_emb(torch.zeros(1, 2, 1), torch.arange(2).unsqueeze(0))
         self.assertEqual(cos.shape[-1], config.head_dim)

@@ -99,7 +99,9 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "specforge.algorithms.model_providers._device", return_value="cpu"
         ):
             parts = build_peagle_model(run, draft, config, None, tokenizer)
-        self.assertEqual(parts.model.mask_token_id, config.mask_token_id)
+        self.assertEqual(
+            parts.model.draft_model.config.mask_token_id, config.mask_token_id
+        )
         self.assertEqual(draft.config.mask_token_id, config.mask_token_id)
 
     def test_algorithm_metadata_has_no_factories_or_topology_flags(self):
@@ -178,7 +180,9 @@ class BuiltinProviderContractTest(unittest.TestCase):
             self.assertEqual({"text"}, modalities, registration.name)
 
     def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
-        from specforge.modeling.draft.dspine import DSpineConfig
+        from dataclasses import asdict
+
+        from specforge.config.draft.dspine import DSpineConfig
 
         training = SimpleNamespace(
             attention_backend="flex_attention",
@@ -190,15 +194,22 @@ class BuiltinProviderContractTest(unittest.TestCase):
         )
         config = SimpleNamespace(training=training)
         draft = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=2),
+            config=SimpleNamespace(
+                num_hidden_layers=2,
+                norm_before_residual=True,
+                mask_token_id=31,
+                block_size=16,
+                dspine_config=asdict(DSpineConfig()),
+                layer_types=["full_attention"] * 2,
+                sliding_window=None,
+                dflash_config=dict(
+                    target_layer_ids=[3, 7],
+                    pure_draft_prefix_len=2,
+                    mask_token_id=0,
+                    shift_label=True,
+                ),
+            ),
             layers=[object(), object()],
-            norm_before_residual=True,
-            target_layer_ids=[3, 7],
-            pure_draft_prefix_len=2,
-            block_size=16,
-            dspine_config=DSpineConfig(),
-            layer_types=["full_attention"] * 2,
-            sliding_window=None,
             share_lm_head=True,
         )
         dflash_family = SimpleNamespace(

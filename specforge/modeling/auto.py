@@ -4,14 +4,14 @@ from typing import Union
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import PretrainedConfig, modeling_utils
 
-from specforge.config.draft import AutoDraftConfig
+from specforge.config.draft import AutoDraftConfig, DraftModelConfig
 
 from .draft.registry import DRAFT_REGISTRY, available_drafts
 
 
 class AutoDraftModel(AutoModelForCausalLMBase):
     @classmethod
-    def _model_cls_from_config(cls, config: PretrainedConfig):
+    def _model_cls_from_config(cls, config: DraftModelConfig | PretrainedConfig):
         archs = getattr(config, "architectures", None) or []
         if len(archs) != 1 or archs[0] not in DRAFT_REGISTRY:
             raise ValueError(
@@ -21,13 +21,18 @@ class AutoDraftModel(AutoModelForCausalLMBase):
         return DRAFT_REGISTRY[archs[0]]
 
     @classmethod
-    def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
+    def from_config(
+        cls,
+        config: DraftModelConfig | PretrainedConfig,
+        torch_dtype=None,
+        **config_kwargs,
+    ):
         """
         This class method takes a configuration object and creates its model,
         resolving the class from DRAFT_REGISTRY via ``config.architectures``.
 
         Args:
-            config (PretrainedConfig): A configuration object.
+            config: Resolved runtime settings or legacy HF checkpoint metadata.
 
         Returns:
             A model instance.

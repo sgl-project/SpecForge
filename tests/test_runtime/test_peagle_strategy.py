@@ -182,13 +182,12 @@ class TestPEagleStrategy(unittest.TestCase):
         )
         draft_model = SimpleNamespace(
             layers=[object(), object()],
-            norm_before_residual=True,
+            config=SimpleNamespace(norm_before_residual=True, mask_token_id=0),
         )
         model = SimpleNamespace(
             num_depths=5,
             down_sample_ratio=0.7,
             down_sample_ratio_min=0.3,
-            mask_token_id=0,
         )
 
         runtime = PEAGLE.providers.step.bind_runtime(cfg, draft_model, model)

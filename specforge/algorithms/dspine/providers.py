@@ -1,6 +1,5 @@
 """DSpine uses the existing target-feature capture and training lifecycle."""
 
-from dataclasses import asdict
 from functools import partial
 
 from specforge.algorithms.common.defaults import (
@@ -69,16 +68,18 @@ def build_training_model(config, draft_model, draft_config, target_config, token
 def resume_contract(_config, draft_model, training_model):
     return {
         "dspine_attention_layout": (
-            tuple(draft_model.layer_types),
-            draft_model.sliding_window,
+            tuple(draft_model.config.layer_types),
+            draft_model.config.sliding_window,
             True,
         ),
-        "dspine_options": tuple(sorted(asdict(draft_model.dspine_config).items())),
-        "dspine_block_size": draft_model.block_size,
-        "dspine_target_layer_ids": tuple(draft_model.target_layer_ids),
+        "dspine_options": tuple(sorted(draft_model.config.dspine_config.items())),
+        "dspine_block_size": draft_model.config.block_size,
+        "dspine_target_layer_ids": tuple(
+            draft_model.config.dflash_config["target_layer_ids"]
+        ),
         "dspine_num_hidden_layers": len(draft_model.layers),
         "dspine_num_anchors": training_model.num_anchors,
-        "dspine_mask_token_id": training_model.mask_token_id,
+        "dspine_mask_token_id": draft_model.config.dflash_config["mask_token_id"],
         "dspine_attention_backend": training_model.attention_backend,
         "dspine_loss_decay_gamma": training_model.loss_decay_gamma,
     }

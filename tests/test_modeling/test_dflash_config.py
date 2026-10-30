@@ -148,7 +148,10 @@ class DFlashConfigTest(unittest.TestCase):
                     restored = AutoDraftModel.from_pretrained(
                         path, local_files_only=True
                     )
-                    self.assertEqual(restored.draft_options, model.draft_options)
+                    self.assertEqual(
+                        restored.draft_options_class.from_model_config(restored.config),
+                        model.draft_options_class.from_model_config(model.config),
+                    )
                     torch.testing.assert_close(
                         restored.state_dict(), model.state_dict(), rtol=0, atol=0
                     )
@@ -168,8 +171,13 @@ class DFlashConfigTest(unittest.TestCase):
                 self.assertEqual(resolved.dflash_config["target_layer_ids"], [4])
                 self.assertEqual(resolved.dflash_config["future_field"], {"x": [1]})
                 model = AutoDraftModel.from_config(config)
-                self.assertIsInstance(model.draft_options, options_cls)
-                self.assertEqual(model.config.dflash_config, resolved.dflash_config)
+                self.assertIsInstance(
+                    model.draft_options_class.from_model_config(model.config),
+                    options_cls,
+                )
+                self.assertEqual(
+                    model.config.to_dict()["dflash_config"], resolved.dflash_config
+                )
                 self.assertEqual(config.to_dict(), original)
 
     def test_explicit_capture_layers_do_not_require_target_depth(self):
@@ -177,17 +185,17 @@ class DFlashConfigTest(unittest.TestCase):
         del data["num_target_layers"]
         config = AutoDraftConfig.finalize(AutoDraftConfig.from_dict(data))
         model = AutoDraftModel.from_config(config)
-        self.assertEqual(model.target_layer_ids, [1, 3])
+        self.assertEqual(model.config.dflash_config["target_layer_ids"], (1, 3))
 
     def test_block_size_alias_uses_top_level_precedence(self):
         data = payload(block_size=2)
         config = AutoDraftConfig.finalize(AutoDraftConfig.from_dict(data))
         self.assertEqual(config.block_size, 4)
-        self.assertEqual(config.dflash_config["block_size"], 4)
+        self.assertNotIn("block_size", config.dflash_config)
         del data["block_size"]
         config = AutoDraftConfig.finalize(AutoDraftConfig.from_dict(data))
         self.assertEqual(config.block_size, 2)
-        self.assertEqual(config.dflash_config["block_size"], 2)
+        self.assertNotIn("block_size", config.dflash_config)
 
     def test_invalid_variant_settings_fail_without_allocating_parameters(self):
         cases = (
@@ -274,7 +282,7 @@ class DFlashConfigTest(unittest.TestCase):
             )
             resolved = resolve_draft_config(cfg, provider=provider)
             self.assertEqual(resolved.block_size, 8)
-            self.assertEqual(resolved.dflash_config["block_size"], 8)
+            self.assertNotIn("block_size", resolved.dflash_config)
             self.assertEqual(resolved.dflash_config["conv_kernel_size"], 6)
             cfg.model.draft_model_config["block_size"] = 4
             with self.assertRaisesRegex(ValueError, "must not exceed block_size"):

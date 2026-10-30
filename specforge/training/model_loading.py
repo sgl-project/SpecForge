@@ -29,11 +29,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig
-
     from specforge.algorithms.common.providers import DraftConfigProvider
     from specforge.algorithms.registry import AlgorithmRegistration
     from specforge.config import Config
+    from specforge.config.draft import DraftModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +57,7 @@ def _without_file_uri(source: str) -> str:
 
 def resolve_draft_config(
     cfg: "Config", *, provider: "DraftConfigProvider"
-) -> "PretrainedConfig":
+) -> "DraftModelConfig":
     """Resolve and validate the draft architecture for one typed run config."""
 
     from specforge.config.draft import AutoDraftConfig
@@ -69,7 +68,9 @@ def resolve_draft_config(
             "model.draft_model_config must be a non-empty inline mapping; "
             "checkpoint and target configs never supply draft settings"
         )
-    draft_config = AutoDraftConfig.from_dict(payload)
+    draft_config = AutoDraftConfig.from_inline(
+        {**payload, "_attn_implementation": cfg.training.attention_backend}
+    )
 
     expected = provider.architecture
     compatible = provider.compatible_architectures or frozenset({expected})
@@ -79,7 +80,6 @@ def resolve_draft_config(
             f"training.strategy={cfg.training.strategy!r} requires draft "
             f"architecture in {sorted(compatible)!r}, got {architectures!r}"
         )
-    draft_config = AutoDraftConfig.finalize(draft_config)
     AutoDraftConfig.validate_training_config(draft_config)
     return draft_config
 
@@ -160,7 +160,7 @@ def _runtime_state_file(source: str) -> Optional[str]:
 
 
 def _load_specforge_draft_state(
-    state_path: str, *, expected_strategy: str, draft_config: "PretrainedConfig"
+    state_path: str, *, expected_strategy: str, draft_config: "DraftModelConfig"
 ) -> Dict[str, Any]:
     import torch
 
@@ -212,7 +212,7 @@ def _load_specforge_draft_state(
 def _load_pretrained_draft_state(
     source: str,
     *,
-    draft_config: "PretrainedConfig",
+    draft_config: "DraftModelConfig",
     cache_dir: Optional[str],
     trust_remote_code: bool,
 ) -> Dict[str, Any]:
@@ -255,7 +255,7 @@ def warm_start_draft_model(
     model: Any,
     source: str,
     *,
-    draft_config: "PretrainedConfig",
+    draft_config: "DraftModelConfig",
     strategy: str,
     allow_missing_embedding: bool = False,
     cache_dir: Optional[str] = None,

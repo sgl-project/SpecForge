@@ -218,15 +218,15 @@ non-positive or non-integer draft vocabulary values are rejected. Nested custom
 fields are preserved and copied so parsing does not modify the caller's input.
 
 Training reads only the inline `model.draft_model_config` mapping. It calls
-`AutoDraftConfig.finalize` and the registered options class's
+`AutoDraftConfig.from_inline` and the registered options class's
 `validate_training_config` before allocating model parameters. File/repository
 readers remain available for pretrained artifacts and checkpoint compatibility
 checks; they never supply or override training settings.
 
 `config/draft/base.py` defines the immutable `DraftConfig` contract:
 `from_model_config` resolves and validates options without allocating parameters;
-`to_model_config` writes them into an independent HF config in the existing JSON
-layout. Architecture-specific implementations are:
+`to_model_config` writes normalized fields into a temporary parsing object.
+These typed options are discarded after parsing. Architecture-specific implementations are:
 
 | Draft architecture | Resolved options | File |
 | --- | --- | --- |
@@ -239,12 +239,23 @@ layout. Architecture-specific implementations are:
 | DSpine | `DSpineDraftConfig` | `config/draft/dspine.py` |
 | Qwen3.5 MTP | `Qwen3_5MTPConfig` | `config/draft/mtp.py` |
 
-Each built-in model exposes `draft_options_class` and the resolved
-`model.draft_options` snapshot. `AutoDraftConfig.finalize` calls the typed
-configuration contract directly; model-specific parsing hooks are unnecessary.
-Model constructors enforce the same rules when called directly with a legacy HF
-config. New architectures should implement the configuration contract and add a
-case to `test_all_draft_configs.py`.
+Each built-in model exposes `draft_options_class` for parsing and validation.
+The runtime `DraftModelConfig` lives in `config/draft/model.py`. It contains the
+resolved inline values and defaults, with immutable nested mappings and tuples.
+Models, layers, and training wrappers read the same `model.config`; initialization
+does not retain a second spec or copy algorithm settings into model attributes.
+Configuration cannot be changed or replaced after construction.
+
+`model.config.to_hf_config()` creates an independent, mutable HF adapter for
+framework initialization, checkpoint comparison, and serving export.
+`save_pretrained` uses that adapter without changing the live configuration.
+Saving never writes HF serialization metadata back into the live configuration. Legacy checkpoint
+readers remain available; direct model construction resolves their HF configs
+through the same immutable runtime contract.
+
+New architectures should implement the configuration contract and add a case to
+`test_all_draft_configs.py`. Common model-family defaults are explicit in
+`config/draft/model.py`; method-specific defaults stay in their typed parsers.
 
 EAGLE's HF adapter remains a `LlamaConfig` subclass and retains `model_type=llama`.
 It permits the explicit projection width used by EAGLE when hidden size is not
@@ -272,11 +283,14 @@ capture layers live in the inline draft mapping. Loss weights and sampling polic
 owned by the algorithm/run config.
 
 Finalization returns a copy and preserves unknown JSON fields. Top-level
-`block_size` retains precedence over `dflash_config.block_size`; both are written
-consistently in the resolved copy. Default capture layers and head switches are
+`block_size` retains precedence over the legacy `dflash_config.block_size` alias.
+The resolved runtime config keeps only the top-level value; HF serialization adds
+the nested alias to its export copy. Default capture layers and head switches are
 made explicit for serialization. Model construction does not mutate the caller's
-config. Resolved architecture options are snapshots: create a new model to change
-its architecture rather than mutating the original config after construction.
+config. Layers share the resolved config; their weights and derived tensor dimensions
+are constructed from it. Create a new model to change its architecture.
+Saving uses a private config copy, so HF serving metadata never changes the
+live training config, even if serialization fails.
 Converting a resolved view back to HF config writes its attention layout, sliding
 window, and direction along with the method settings. Attention dimensions and
 active sliding windows must be integers; fractional values and booleans are not

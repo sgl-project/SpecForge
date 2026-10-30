@@ -173,7 +173,7 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, DSparkDraftModel)
         self.assertIsInstance(model, DFlashDraftModel)
-        self.assertEqual(model.projector_type, "dspark")
+        self.assertEqual(model.config.dflash_config["projector_type"], "dspark")
         self.assertIsNotNone(model.markov_head)
         self.assertIsNotNone(model.confidence_head)
 
@@ -184,7 +184,7 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, DFlash2DraftModel)
         self.assertIsInstance(model, DFlashDraftModel)
-        self.assertEqual(model.block_size, 4)
+        self.assertEqual(model.config.block_size, 4)
 
     def test_dspark_defaults_to_gqa_and_requires_explicit_mha(self):
         implicit_mha = copy.deepcopy(TINY_DSPARK)
@@ -209,9 +209,11 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         model = AutoDraftModel.from_config(AutoDraftModelConfig.from_file(path))
         expected = torch.tensor([[11, 12, 13]])
         target = SimpleNamespace(
-            lm_head=mock.Mock(return_value=torch.zeros(1, model.block_size - 1, 256))
+            lm_head=mock.Mock(
+                return_value=torch.zeros(1, model.config.block_size - 1, 256)
+            )
         )
-        draft_hidden = torch.zeros(1, model.block_size, model.config.hidden_size)
+        draft_hidden = torch.zeros(1, model.config.block_size, model.config.hidden_size)
         block_ids = torch.tensor([[7, 0, 0, 0]])
         with mock.patch.object(
             model.markov_head,
@@ -224,7 +226,7 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         self.assertEqual(sampler.call_args.kwargs["first_prev_token_ids"].item(), 7)
         self.assertEqual(
             tuple(sampler.call_args.kwargs["hidden_states"].shape),
-            (1, model.block_size - 1, model.config.hidden_size),
+            (1, model.config.block_size - 1, model.config.hidden_size),
         )
 
     def test_from_config_builds_domino_as_explicit_draft(self):
@@ -234,7 +236,7 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, DominoDraftModel)
         self.assertIsInstance(model, DFlashDraftModel)
-        self.assertEqual(model.projector_type, "domino")
+        self.assertEqual(model.config.dflash_config["projector_type"], "domino")
         self.assertIsNotNone(model.prefix_gru)
         self.assertIsNotNone(model.embed_proj)
 

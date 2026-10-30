@@ -7,6 +7,7 @@ normalization and static validation; unknown checkpoint fields are retained.
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from typing import Any, Optional, Self
 
@@ -180,7 +181,7 @@ class DFlashConfig(DraftConfig):
         method = getattr(config, "dflash_config", None)
         if method is None:
             method = {}
-        if not isinstance(method, dict):
+        if not isinstance(method, Mapping):
             raise ValueError("dflash_config must be an object")
         validate_dimensions(config)
         layer_types, window = resolve_dflash_attention_layout(config)
@@ -239,9 +240,9 @@ class DFlashConfig(DraftConfig):
             if field.name not in top_level:
                 value = getattr(self, field.name)
                 method[field.name] = list(value) if isinstance(value, tuple) else value
-        # Top-level block_size retains its historical precedence; canonicalize
-        # the alias as well so downstream readers cannot disagree.
-        result.block_size = method["block_size"] = self.block_size
+        # Accept the legacy alias on input, but keep one runtime value.
+        method.pop("block_size", None)
+        result.block_size = self.block_size
         result.layer_types = list(self.layer_types)
         result.sliding_window = self.sliding_window
         result.use_sliding_window = self.sliding_window is not None

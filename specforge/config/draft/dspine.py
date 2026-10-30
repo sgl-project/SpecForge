@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import copy
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 from .base import method_config
 from .dflash import DFlashConfig
@@ -63,17 +62,6 @@ class DSpineConfig:
         if not 0 <= self.candidate_mass_threshold < 1:
             raise ValueError("DSpine candidate_mass_threshold must be in [0, 1)")
 
-    def schedule(self, step: int, total_steps: int | None) -> tuple[float, float]:
-        warmup = self.alignment_warmup_steps
-        beta = self.alignment_weight * (min(max(step, 0) / warmup, 1) if warmup else 1)
-        if not total_steps or total_steps <= 0:
-            return beta, 0.0
-        progress = max(step, 0) / total_steps
-        fraction = (self.replacement_end_ratio - progress) / (
-            self.replacement_end_ratio - self.replacement_hold_ratio
-        )
-        return beta, self.replacement_probability * min(max(fraction, 0), 1)
-
 
 @dataclass(frozen=True, kw_only=True)
 class DSpineDraftConfig(DFlashConfig):
@@ -81,13 +69,11 @@ class DSpineDraftConfig(DFlashConfig):
 
     @classmethod
     def from_model_config(cls, config):
-        config = copy.deepcopy(config)
         if getattr(config, "is_causal", None) is False:
             raise ValueError(
                 "DSpine requires causal attention; is_causal=false is unsupported"
             )
-        config.is_causal = True
-        return super().from_model_config(config)
+        return replace(super().from_model_config(config), is_causal=True)
 
     @classmethod
     def _variant_fields(cls, config, method, mode, block_size):

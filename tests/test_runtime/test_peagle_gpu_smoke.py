@@ -29,6 +29,7 @@ TINY_PEAGLE_CONFIG = {
     "vocab_size": 32,
     "draft_vocab_size": 32,
     "pad_token_id": PAD_TOKEN_ID,
+    "mask_token_id": MASK_TOKEN_ID,
     "rms_norm_eps": 1e-5,
     "tie_word_embeddings": False,
     "norm_before_residual": True,
@@ -148,14 +149,13 @@ class TestPEagleGpuSmoke(unittest.TestCase):
             ).cuda()
             self.assertIsInstance(draft_model, PEagleDraftModel)
             self.assertIs(resolve_draft("PEagleDraftModel"), PEagleDraftModel)
-            self.assertTrue(draft_model.norm_before_residual)
-            self.assertTrue(draft_model.layers[0].norm_before_residual)
+            self.assertTrue(draft_model.config.norm_before_residual)
+            self.assertTrue(draft_model.layers[0].config.norm_before_residual)
             self.assertTrue(draft_model.embed_tokens.weight.requires_grad)
             self.assertEqual(draft_model.embed_tokens.padding_idx, PAD_TOKEN_ID)
 
             wrapper = OnlinePEagleModel(
                 draft_model=draft_model,
-                mask_token_id=MASK_TOKEN_ID,
                 num_depths=4,
                 down_sample_ratio=1.0,
                 down_sample_ratio_min=1.0,
@@ -271,8 +271,8 @@ class TestPEagleGpuSmoke(unittest.TestCase):
                 dtype=torch.bfloat16,
             ).cuda()
             self.assertIsInstance(reloaded, PEagleDraftModel)
-            self.assertTrue(reloaded.norm_before_residual)
-            self.assertTrue(reloaded.layers[0].norm_before_residual)
+            self.assertTrue(reloaded.config.norm_before_residual)
+            self.assertTrue(reloaded.layers[0].config.norm_before_residual)
 
             actual_state = reloaded.state_dict()
             self.assertEqual(set(expected_state), set(actual_state))
@@ -304,7 +304,6 @@ class TestPEagleGpuSmoke(unittest.TestCase):
 
             reloaded_wrapper = OnlinePEagleModel(
                 draft_model=reloaded,
-                mask_token_id=MASK_TOKEN_ID,
                 num_depths=4,
                 down_sample_ratio=1.0,
                 down_sample_ratio_min=1.0,

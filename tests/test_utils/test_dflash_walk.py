@@ -72,6 +72,7 @@ def _make_case(kind):
         initializer_range=0.02,
     )
     config.dflash_config = dict(
+        mask_token_id=0,
         conv_kernel_size=2,
         conv_group_size=4,
         selector_rank=2,
@@ -85,25 +86,18 @@ def _make_case(kind):
     # Only the backbone output is fixed; all auxiliary heads are production modules.
     draft = draft_class.__new__(draft_class)
     nn.Module.__init__(draft)
-    draft.draft_options = draft_class.draft_options_class.from_model_config(config)
-    draft.config = draft.draft_options.to_model_config(config)
-    draft.block_size = draft.draft_options.block_size
-    draft.shift_label = draft.draft_options.shift_label
-    draft.pure_draft_prefix_len = draft.draft_options.pure_draft_prefix_len
+    options = draft_class.draft_options_class.from_model_config(config)
+    draft.config = options.to_model_config(config)
     draft._init_draft_head(draft.config, draft.config.dflash_config)
     options = (
         dict(dspark_l1_loss_alpha=0, dspark_confidence_head_alpha=0)
         if family == "dspark"
         else {}
     )
-    if family == "domino":
-        options["shift_label"] = shifted
     model = wrapper(
         draft,
         nn.Identity(),
         nn.Embedding(8, 8),
-        0,
-        block_size=4,
         attention_backend="sdpa",
         **options,
     ).double()
@@ -253,7 +247,7 @@ def _check_causal_heads_match_serving_prefixes(case, dtype):
             labels[..., corrupt_at] = (labels[..., corrupt_at] + 1) % 8
         if case.family == "domino":
             clean = torch.cat((anchor_ids.unsqueeze(-1), labels), dim=-1)
-            if model.shift_label:
+            if model.draft_model.config.dflash_config["shift_label"]:
                 targets = torch.cat((labels, torch.zeros_like(labels[..., :1])), dim=-1)
                 prev = clean
             else:

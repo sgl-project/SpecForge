@@ -106,9 +106,10 @@ class DraftConfigResolutionTest(unittest.TestCase):
                     cfg, provider=_draft_config_provider("dflash")
                 )
             read.assert_not_called()
-            self.assertEqual(resolved.dflash_config["target_layer_ids"], [6])
+            self.assertEqual(resolved.dflash_config["target_layer_ids"], (6,))
             self.assertEqual(cfg.model.draft_model_config, original)
-            resolved.dflash_config["mask_token_id"] = 9
+            with self.assertRaises(TypeError):
+                resolved.dflash_config["mask_token_id"] = 9
             self.assertEqual(cfg.model.draft_model_config, original)
 
     def test_null_vocabulary_inherits_inline_vocab(self):

@@ -187,7 +187,6 @@ def build_draft(cfg, draft_config):
         Qwen3_5MTPConfig.validate_native_config(draft_config, native_config)
 
     torch_dtype = getattr(torch, cfg.model.torch_dtype)
-    draft_config._attn_implementation = cfg.training.attention_backend
     draft_model = AutoDraftModel.from_config(draft_config, torch_dtype=torch_dtype)
 
     _init_from_native_mtp(cfg, draft_model)

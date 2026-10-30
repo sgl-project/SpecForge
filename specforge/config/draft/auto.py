@@ -15,19 +15,56 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
+from .base import integer
+from .model import DraftModelConfig, inline_values
 from .registry import DraftConfigRegistration, resolve_draft_config_type
 
 
 class AutoDraftConfig:
-    """One parsing contract for training, export, and pretrained loading.
+    """Resolve inline settings or read HF checkpoint metadata.
 
-    Existing Llama/Qwen config classes and custom fields are preserved. An
-    omitted or null draft vocabulary inherits the resolved HF vocabulary.
-    Draft embedding and output weights are always untied.
+    Training uses from_inline; legacy readers return HF adapters. Models resolve
+    either representation to immutable settings before allocating parameters.
     """
 
     @classmethod
+    def from_inline(cls, payload: Mapping[str, Any]) -> DraftModelConfig:
+        """Resolve the YAML draft section without parsing it through HF."""
+        if not isinstance(payload, Mapping):
+            raise ValueError("draft config must be an object")
+        architectures = payload.get("architectures")
+        if (
+            not isinstance(architectures, (list, tuple))
+            or len(architectures) != 1
+            or not isinstance(architectures[0], str)
+        ):
+            raise ValueError("draft config must name exactly one architecture")
+        registration = resolve_draft_config_type(architectures[0])
+        values = inline_values(payload, model_type=registration.config_class.model_type)
+        integer(values.draft_vocab_size, "draft_vocab_size")
+        if registration.options_class is not None:
+            options = registration.options_class.from_model_config(values)
+            values = options.to_model_config(values)
+        return DraftModelConfig(values.to_dict())
+
+    @classmethod
+    def resolve(cls, config, *, architecture: str | None = None) -> DraftModelConfig:
+        """Accept a resolved config, or adapt an existing HF checkpoint config."""
+        if isinstance(config, DraftModelConfig):
+            return config
+        if isinstance(config, Mapping):
+            return cls.from_inline(config)
+        payload = config.to_dict()
+        # An explicitly selected model class also accepts legacy base-model
+        # metadata (e.g. LlamaForCausalLM). Never rewrite resolved inline settings.
+        if architecture is not None:
+            payload["architectures"] = [architecture]
+        payload["_attn_implementation"] = getattr(config, "_attn_implementation", None)
+        return cls.from_inline(payload)
+
+    @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> PretrainedConfig:
+        """Read legacy HF checkpoint metadata; training uses from_inline."""
         if not isinstance(payload, Mapping):
             raise ValueError("draft config must be a JSON object")
         payload = copy.deepcopy(dict(payload))
@@ -61,6 +98,8 @@ class AutoDraftConfig:
         Typed options own validation and normalization. Resolving configuration
         never imports the model registry or calls model implementation hooks.
         """
+        if isinstance(config, DraftModelConfig):
+            return config
         registration = cls._registration(config)
         if registration.options_class is None:
             return copy.deepcopy(config)

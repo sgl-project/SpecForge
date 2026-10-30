@@ -26,9 +26,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig
-
     from specforge.config import Config
+    from specforge.config.draft import DraftModelConfig
     from specforge.modeling.draft.dflash_kernels import DFlashKernels
 
 
@@ -84,12 +83,11 @@ def _load_vocab_mapping(cfg: Config, draft_model: Any) -> None:
         draft_model.load_vocab_mapping(cfg.model.vocab_mapping_path)
 
 
-def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
+def build_eagle3_draft(cfg: Config, draft_config: DraftModelConfig):
     from specforge.modeling.auto import AutoDraftModel
 
     draft_model = AutoDraftModel.from_config(
         draft_config,
-        attention_backend=cfg.training.attention_backend,
         torch_dtype=_torch_dtype(cfg),
     )
     _warm_start(
@@ -109,7 +107,7 @@ def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
 
 
-def build_peagle_draft(cfg: Config, draft_config: PretrainedConfig):
+def build_peagle_draft(cfg: Config, draft_config: DraftModelConfig):
     from specforge.modeling.draft.peagle import PEagleDraftModel
 
     draft_model = PEagleDraftModel(draft_config)
@@ -136,27 +134,26 @@ def peagle_resume_contract(
 
     return {
         "peagle_num_draft_layers": len(draft_model.layers),
-        "peagle_norm_before_residual": bool(draft_model.norm_before_residual),
+        "peagle_norm_before_residual": bool(draft_model.config.norm_before_residual),
         "peagle_num_depths": int(model.num_depths),
         "peagle_down_sample_ratio": float(model.down_sample_ratio),
         "peagle_down_sample_ratio_min": float(model.down_sample_ratio_min),
-        "peagle_mask_token_id": int(model.mask_token_id),
+        "peagle_mask_token_id": int(draft_model.config.mask_token_id),
     }
 
 
 def _finish_registered_draft(
     cfg: Config,
-    draft_config: PretrainedConfig,
+    draft_config: DraftModelConfig,
     draft_model: Any,
 ):
     _warm_start(cfg, draft_model, draft_config)
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
 
 
-def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
+def build_registered_draft(cfg: Config, draft_config: DraftModelConfig):
     from specforge.modeling.auto import AutoDraftModel
 
-    draft_config._attn_implementation = cfg.training.attention_backend
     draft_model = AutoDraftModel.from_config(
         draft_config,
         torch_dtype=_torch_dtype(cfg),
@@ -166,12 +163,11 @@ def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
 
 def build_dflash_draft(
     cfg: Config,
-    draft_config: PretrainedConfig,
+    draft_config: DraftModelConfig,
     kernels: Optional[DFlashKernels],
 ):
     from specforge.modeling.auto import AutoDraftModel
 
-    draft_config._attn_implementation = cfg.training.attention_backend
     draft_model = AutoDraftModel.from_config(
         draft_config,
         torch_dtype=_torch_dtype(cfg),
@@ -283,10 +279,8 @@ def build_peagle_model(
 ) -> AlgorithmModelParts:
     from specforge.algorithms.peagle.model import OnlinePEagleModel
 
-    mask_token_id = draft_model.config.mask_token_id
     model = OnlinePEagleModel(
         draft_model=draft_model,
-        mask_token_id=mask_token_id,
         num_depths=cfg.training.num_depths,
         down_sample_ratio=cfg.training.down_sample_ratio,
         down_sample_ratio_min=cfg.training.down_sample_ratio_min,
@@ -321,8 +315,6 @@ def _build_dflash_family_model(
 ) -> AlgorithmModelParts:
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
-    _validate_dflash_block_size(draft_model)
-    mask_token_id = draft_model.mask_token_id
     target_parts = TargetEmbeddingsAndHead.from_pretrained(
         cfg.model.target_model_path,
         embed_key=cfg.model.embedding_key,
@@ -336,8 +328,6 @@ def _build_dflash_family_model(
         "draft_model": draft_model,
         "target_lm_head": target_parts.lm_head,
         "target_embed_tokens": target_parts.embed_tokens,
-        "mask_token_id": mask_token_id,
-        "block_size": int(draft_model.block_size),
         "attention_backend": cfg.training.attention_backend,
         "num_anchors": cfg.training.num_anchors,
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
@@ -347,7 +337,7 @@ def _build_dflash_family_model(
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
     return AlgorithmModelParts(
         model=model,
-        capture_layers=list(draft_model.target_layer_ids),
+        capture_layers=list(draft_model.config.dflash_config["target_layer_ids"]),
     )
 
 
@@ -396,7 +386,6 @@ def build_domino_model(
         tokenizer,
         lambda common: OnlineDominoModel(
             **common,
-            shift_label=bool(getattr(draft_model, "shift_label", False)),
             fused_logits_loss=cfg.training.fused_logits_loss,
         ),
     )

@@ -3,7 +3,7 @@
 
 import copy
 import unittest
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -22,9 +22,10 @@ def _bare_domino(
 ) -> DominoDraftModel:
     model = DominoDraftModel.__new__(DominoDraftModel)
     nn.Module.__init__(model)
-    model.block_size = block_size
-    model.shift_label = False
-    model.pure_draft_prefix_len = 0
+    model.config = SimpleNamespace(
+        block_size=block_size,
+        dflash_config=dict(shift_label=False, pure_draft_prefix_len=0, mask_token_id=0),
+    )
     model.prefix_gru = nn.GRU(
         input_size=hidden_size,
         hidden_size=gru_hidden_size,
@@ -70,11 +71,8 @@ class TestDominoDraftModel(unittest.TestCase):
             draft_model=draft,
             target_lm_head=nn.Linear(hidden_size, vocab_size, bias=False),
             target_embed_tokens=nn.Embedding(vocab_size, hidden_size),
-            mask_token_id=0,
-            block_size=block_size,
             attention_backend="sdpa",
             num_anchors=1,
-            shift_label=False,
         )
         fixed_hidden = torch.randn(1, block_size, hidden_size)
 
@@ -126,11 +124,8 @@ class TestDominoDraftModel(unittest.TestCase):
             draft_model=draft,
             target_lm_head=nn.Linear(hidden_size, vocab_size, bias=False),
             target_embed_tokens=nn.Embedding(vocab_size, hidden_size),
-            mask_token_id=0,
-            block_size=block_size,
             attention_backend="sdpa",
             num_anchors=1,
-            shift_label=False,
         )
         fixed_hidden = torch.randn(1, block_size, hidden_size)
 
@@ -185,7 +180,7 @@ class TestDominoDraftModel(unittest.TestCase):
                     vocab_size=vocab_size,
                     block_size=block_size,
                 )
-                draft.shift_label = shift_label
+                draft.config.dflash_config["shift_label"] = shift_label
                 target_head = nn.Linear(hidden_size, vocab_size, bias=False)
                 target_embedding = nn.Embedding(vocab_size, hidden_size)
                 target_head.requires_grad_(False)
@@ -194,12 +189,9 @@ class TestDominoDraftModel(unittest.TestCase):
                     draft_model=draft,
                     target_lm_head=target_head,
                     target_embed_tokens=target_embedding,
-                    mask_token_id=0,
-                    block_size=block_size,
                     attention_backend="sdpa",
                     num_anchors=2,
                     objective_chunk_blocks=0,
-                    shift_label=shift_label,
                 )
                 chunked = copy.deepcopy(full)
                 chunked.objective_chunk_blocks = 1
@@ -318,12 +310,9 @@ class TestDominoDraftModel(unittest.TestCase):
             draft_model=draft,
             target_lm_head=nn.Linear(hidden_size, vocab_size, bias=False),
             target_embed_tokens=nn.Embedding(vocab_size, hidden_size),
-            mask_token_id=0,
-            block_size=block_size,
             attention_backend="sdpa",
             num_anchors=2,
             objective_chunk_blocks=1,
-            shift_label=False,
         ).cuda()
         fixed_hidden = torch.randn(
             1, 2 * block_size, hidden_size, device="cuda", requires_grad=True

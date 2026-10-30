@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -9,6 +11,21 @@ import torch.nn.functional as F
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.core.fused_loss import ce_l1_loss
+
+
+def replacement_schedule(
+    config: Mapping, step: int, total_steps: int | None
+) -> tuple[float, float]:
+    """Return alignment weight and teacher replacement probability for this step."""
+    warmup = config["alignment_warmup_steps"]
+    beta = config["alignment_weight"] * (min(max(step, 0) / warmup, 1) if warmup else 1)
+    if not total_steps or total_steps <= 0:
+        return beta, 0.0
+    progress = max(step, 0) / total_steps
+    fraction = (config["replacement_end_ratio"] - progress) / (
+        config["replacement_end_ratio"] - config["replacement_hold_ratio"]
+    )
+    return beta, config["replacement_probability"] * min(max(fraction, 0), 1)
 
 
 class OnlineDSpineModel(OnlineDFlashModel):
@@ -19,9 +36,6 @@ class OnlineDSpineModel(OnlineDFlashModel):
         self.loss_type = "dspine"
         self.lm_head.requires_grad_(False)
         self.embed_tokens.requires_grad_(False)
-        if self.block_size != self.draft_model.block_size:
-            raise ValueError("DSpine training block_size must match the draft")
-        self.dspine_config = self.draft_model.dspine_config
         if not self.draft_model.transfer_ready.item():
             self.draft_model.initialize_transfer_space(self.lm_head.weight)
 
@@ -47,14 +61,14 @@ class OnlineDSpineModel(OnlineDFlashModel):
         weights: torch.Tensor,
         supervised: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        config = self.dspine_config
+        config = self.draft_model.config.dspine_config
         with torch.no_grad():
             teacher_logits = self.lm_head(teacher_hidden)
         terms = self._logits_loss_terms(
             self.lm_head(hidden),
             labels,
             teacher_logits=teacher_logits,
-            top_k=config.top_k,
+            top_k=config["top_k"],
         )
         candidates = terms.topk_ids
         refined = self.draft_model.refine(pre_injection, predecessors)
@@ -75,7 +89,7 @@ class OnlineDSpineModel(OnlineDFlashModel):
         )
         # Missing labels use index zero above only as a placeholder for CE.
         refined_ce = refinement.cross_entropy * covered.any(dim=-1)
-        refined_l1 = refinement.teacher_l1 * (mass > config.candidate_mass_threshold)
+        refined_l1 = refinement.teacher_l1 * (mass > config["candidate_mass_threshold"])
         reference_codes = F.embedding(labels, self.draft_model.transfer_codes).float()
         alignment = 1 - F.cosine_similarity(
             layer_features.float(), reference_codes.unsqueeze(1), dim=-1
@@ -87,7 +101,10 @@ class OnlineDSpineModel(OnlineDFlashModel):
             (terms.cross_entropy * weights).sum(),
             (terms.teacher_l1 * weights).sum(),
             (
-                (config.ce_weight * refined_ce + (1 - config.ce_weight) * refined_l1)
+                (
+                    config["ce_weight"] * refined_ce
+                    + (1 - config["ce_weight"]) * refined_l1
+                )
                 * weights
             ).sum(),
             (alignment * weights.unsqueeze(1)).sum(),
@@ -115,7 +132,9 @@ class OnlineDSpineModel(OnlineDFlashModel):
         anchors, keep = self._sample_anchor_positions(
             length, loss_mask, input_ids.device, max_valid_anchors
         )
-        offsets = torch.arange(self.block_size, device=input_ids.device)
+        offsets = torch.arange(
+            self.draft_model.config.block_size, device=input_ids.device
+        )
         indices = anchors.unsqueeze(-1) + offsets
         safe_indices = indices.clamp(max=length - 1)
         labels = (
@@ -135,7 +154,9 @@ class OnlineDSpineModel(OnlineDFlashModel):
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             weights = weights * torch.exp(-offsets[:-1].float() / self.loss_decay_gamma)
         denominator = weights.sum()
-        beta, probability = self.dspine_config.schedule(global_step, total_steps)
+        beta, probability = replacement_schedule(
+            self.draft_model.config.dspine_config, global_step, total_steps
+        )
         replace = None
         if self.training and probability > 0:
             replace = (
@@ -162,7 +183,7 @@ class OnlineDSpineModel(OnlineDFlashModel):
             replace_mask=replace,
             **draft_kwargs,
         )
-        tokens = self.block_size - 1
+        tokens = self.draft_model.config.block_size - 1
         if ce_only:
             ce, correct = checkpointed_chunk_reduce(
                 self._ce_terms,
@@ -225,8 +246,8 @@ class OnlineDSpineModel(OnlineDFlashModel):
             alignment_ce = scale_terms[0] / scale_terms[1]
         alignment_scale = beta * alignment_ce.detach()
         numerator = (
-            self.dspine_config.ce_weight * ce
-            + (1 - self.dspine_config.ce_weight) * l1
+            self.draft_model.config.dspine_config["ce_weight"] * ce
+            + (1 - self.draft_model.config.dspine_config["ce_weight"]) * l1
             + refinement
             + alignment_scale * alignment
         )

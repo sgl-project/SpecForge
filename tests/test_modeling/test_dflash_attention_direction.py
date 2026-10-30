@@ -17,6 +17,7 @@ from specforge.algorithms.common.dflash_family_model import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
+from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.dflash import (
     DFlashDraftModel,
     dflash_attention_resume_contract,
@@ -105,8 +106,6 @@ class DFlashAttentionDirectionTest(unittest.TestCase):
                     draft_model=model,
                     target_lm_head=nn.Linear(8, 32),
                     target_embed_tokens=nn.Embedding(32, 8),
-                    mask_token_id=31,
-                    block_size=2,
                     attention_backend="sdpa",
                     num_anchors=1,
                 )
@@ -246,7 +245,9 @@ class DFlashAttentionDirectionTest(unittest.TestCase):
         config.is_causal = True
         config.architectures = ["DSparkDraftModel"]
         config.layer_types = ["full_attention"]
-        self.assertEqual(dflash_attention_resume_contract(DFlashDraftModel(config)), {})
+        self.assertEqual(
+            dflash_attention_resume_contract(AutoDraftModel.from_config(config)), {}
+        )
 
     def test_checkpoint_versioning_preserves_legacy_cases(self):
         for window, causal, architecture in product(
@@ -258,10 +259,11 @@ class DFlashAttentionDirectionTest(unittest.TestCase):
                 layer_type = "sliding_attention" if window else "full_attention"
                 draft = SimpleNamespace(
                     config=SimpleNamespace(
-                        architectures=[architecture], is_causal=causal
+                        architectures=[architecture],
+                        is_causal=causal,
+                        layer_types=(layer_type,),
+                        sliding_window=window,
                     ),
-                    layer_types=(layer_type,),
-                    sliding_window=window,
                 )
                 needs_version = causal is not None and (
                     window is not None

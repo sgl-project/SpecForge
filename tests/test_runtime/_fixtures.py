@@ -311,7 +311,6 @@ def build_dflash(
     draft_config._attn_implementation = attention_backend
 
     draft_model = DFlashDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
-    draft_model.mask_token_id = mask_token_id
 
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
@@ -321,14 +320,17 @@ def build_dflash(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
         target_embed_tokens=target_components.embed_tokens,
-        block_size=draft_model.block_size,
-        mask_token_id=mask_token_id,
         attention_backend=attention_backend,
         num_anchors=num_anchors,
         loss_type="dflash",
     ).cuda()
-    width = len(draft_model.target_layer_ids) * hidden
-    return dflash_model, width, target_dir, list(draft_model.target_layer_ids)
+    width = len(draft_model.config.dflash_config["target_layer_ids"]) * hidden
+    return (
+        dflash_model,
+        width,
+        target_dir,
+        list(draft_model.config.dflash_config["target_layer_ids"]),
+    )
 
 
 def build_domino(
@@ -386,7 +388,6 @@ def build_domino(
     draft_config._attn_implementation = attention_backend
 
     draft_model = DominoDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
-    draft_model.mask_token_id = mask_token_id
 
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
@@ -396,14 +397,16 @@ def build_domino(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
         target_embed_tokens=target_components.embed_tokens,
-        block_size=draft_model.block_size,
-        mask_token_id=mask_token_id,
         attention_backend=attention_backend,
         num_anchors=num_anchors,
-        shift_label=draft_model.shift_label,
     ).cuda()
-    width = len(draft_model.target_layer_ids) * hidden
-    return domino_model, width, target_dir, list(draft_model.target_layer_ids)
+    width = len(draft_model.config.dflash_config["target_layer_ids"]) * hidden
+    return (
+        domino_model,
+        width,
+        target_dir,
+        list(draft_model.config.dflash_config["target_layer_ids"]),
+    )
 
 
 def build_dspark(
@@ -458,7 +461,6 @@ def build_dspark(
     draft_config._attn_implementation = attention_backend
 
     draft_model = DSparkDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
-    draft_model.mask_token_id = mask_token_id
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         target_dir,
         lm_head_key="lm_head.weight",
@@ -469,13 +471,11 @@ def build_dspark(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
         target_embed_tokens=target_components.embed_tokens,
-        block_size=draft_model.block_size,
-        mask_token_id=mask_token_id,
         attention_backend=attention_backend,
         num_anchors=num_anchors,
         dspark_ce_loss_alpha=0.1,
         dspark_l1_loss_alpha=0.9,
         dspark_confidence_head_alpha=1.0,
     ).cuda()
-    width = len(draft_model.target_layer_ids) * hidden
+    width = len(draft_model.config.dflash_config["target_layer_ids"]) * hidden
     return dspark_model, width

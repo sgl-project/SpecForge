@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from typing import ClassVar, Self
 
@@ -22,11 +23,11 @@ def boolean(value: object, name: str) -> bool:
     return value
 
 
-def method_config(config: PretrainedConfig, name: str) -> dict:
+def method_config(config: PretrainedConfig, name: str) -> Mapping:
     value = getattr(config, name, None)
     if value is None:
         return {}
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be an object")
     return value
 

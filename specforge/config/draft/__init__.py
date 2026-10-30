@@ -8,6 +8,7 @@ from .domino import DominoConfig
 from .dspark import DSparkConfig
 from .dspine import DSpineDraftConfig
 from .eagle3 import Eagle3Config, EagleConfig, EaglePretrainedConfig
+from .model import DraftModelConfig
 from .mtp import Qwen3_5MTPConfig
 from .peagle import PEagleConfig
 from .registry import register_draft_config
@@ -16,6 +17,7 @@ __all__ = [
     "AutoDraftConfig",
     "register_draft_config",
     "DraftConfig",
+    "DraftModelConfig",
     "DFlashConfig",
     "DFlash2Config",
     "DominoConfig",
