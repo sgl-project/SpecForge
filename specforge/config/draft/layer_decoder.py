@@ -166,9 +166,10 @@ def decode_layers(config, options_class):
         require_contract("ffn", layer.ffn, "tokenwise")
         require_contract("residual", layer.residual, "single_stream")
         if requires_causal and not layer.attention.is_causal:
-            raise ValueError(
-                f"{options_class.__name__.replace("DraftConfig", "").replace("Config", "")} requires causal attention in every layer"
+            algorithm = options_class.__name__.replace("DraftConfig", "").replace(
+                "Config", ""
             )
+            raise ValueError(f"{algorithm} requires causal attention in every layer")
         if requires_conv != (layer.conv is not None):
             raise ValueError(
                 "this architecture requires conv in every layer"
