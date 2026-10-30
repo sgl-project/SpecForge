@@ -50,7 +50,8 @@ class Router(nn.Module):
         """The weights [T, K] that combine the chosen experts' outputs."""
         weights = scores.gather(-1, indices)
         if self.norm_topk_prob:
-            weights = weights / weights.sum(dim=-1, keepdim=True)
+            # DeepSeek's 1e-20: a sigmoid top-k sum can be 0; a no-op for softmax.
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return weights * self.route_scale
 
     def forward(
