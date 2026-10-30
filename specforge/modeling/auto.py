@@ -1,11 +1,10 @@
-import json
 import os
 from typing import Union
 
-from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import PretrainedConfig, modeling_utils
 
+from .draft.config import AutoDraftConfig
 from .draft.registry import DRAFT_REGISTRY, available_drafts
 
 
@@ -59,7 +58,22 @@ class AutoDraftModel(AutoModelForCausalLMBase):
         try:
             config = kwargs.get("config")
             if config is None:
-                config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+                config = AutoDraftConfig.from_pretrained(
+                    pretrained_model_name_or_path,
+                    **{
+                        key: kwargs[key]
+                        for key in (
+                            "cache_dir",
+                            "trust_remote_code",
+                            "revision",
+                            "token",
+                            "local_files_only",
+                            "force_download",
+                            "subfolder",
+                        )
+                        if key in kwargs
+                    },
+                )
             model_cls = cls._model_cls_from_config(config)
             kwargs = {**kwargs, "config": config}
             model = model_cls.from_pretrained(
@@ -71,46 +85,5 @@ class AutoDraftModel(AutoModelForCausalLMBase):
         return model
 
 
-class AutoDraftModelConfig:
-    @classmethod
-    def from_file(cls, config_path: str):
-        """
-        This class method takes a configuration file path and create its configuration object based on the
-        _config_mapping class variable.
-
-        Args:
-            config_path (str): A path to a configuration file.
-
-        Returns:
-            A configuration object.
-        """
-        with open(config_path, "r") as f:
-            config = json.load(f)
-
-        if "tie_word_embeddings" in config:
-            print("Set draft model tie_word_embeddings to False")
-            config["tie_word_embeddings"] = False
-
-        # check for architectures
-        architectures = config.get("architectures", None)
-
-        if architectures is None:
-            raise ValueError("No architectures found in the config file")
-
-        if len(architectures) != 1:
-            raise ValueError("Only one architecture is supported")
-
-        architecture = architectures[0]
-
-        if architecture not in DRAFT_REGISTRY:
-            raise ValueError(
-                f"Architecture {architecture} not registered; "
-                f"available: {available_drafts()}"
-            )
-        config_cls = DRAFT_REGISTRY[architecture].config_class
-
-        # If draft_vocab_size is not in config or is None, set draft_vocab_size to vocab_size
-        if "draft_vocab_size" not in config or config["draft_vocab_size"] is None:
-            config["draft_vocab_size"] = config.get("vocab_size", None)
-
-        return config_cls.from_dict(config)
+class AutoDraftModelConfig(AutoDraftConfig):
+    """Backward-compatible name for the shared draft config loader."""
