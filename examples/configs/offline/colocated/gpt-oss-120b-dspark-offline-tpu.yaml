@@ -1,0 +1,38 @@
+# gpt-oss-120B DSpark on one TPU v7x-8 host (torch_tpu, 8 ranks).
+model:
+  target_model_path: /models/gpt/gpt-oss-120b
+  draft_model_config: configs/gpt-oss-120B-dspark.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/gpt-oss-120b-dspark
+  max_length: 2048
+  chat_template: gpt-oss
+  cache_dir: ./cache
+
+training:
+  strategy: dspark
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 1
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  fsdp_sharding: NO_SHARD
+  num_anchors: 512
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+run_id: gpt-oss-120b-dspark-offline-tpu
+output_dir: ./outputs/gpt-oss-120b-dspark-offline-tpu
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
