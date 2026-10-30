@@ -84,12 +84,19 @@ class OnlineMTPModel(nn.Module):
         position-wise, so this equals shifting the logits), and each chunk's
         logits are freed (or recomputed under checkpointing) before the next
         chunk runs.
+
+        Only positions with a nonzero loss mask go through lm_head + CE. The
+        others contribute nothing to the loss, accuracy or gradients, and
+        prompts usually leave most positions unsupervised (for example, only
+        the last assistant turn of a Qwen3.5 thinking conversation).
         """
         shift_labels, shift_mask = self._shift_for_next_token(input_ids, loss_mask)
         batch, positions, hidden_size = shift_hidden.shape
+        supervised = shift_mask.reshape(-1).nonzero(as_tuple=True)[0]
         flat_hidden = shift_hidden.reshape(batch * positions, hidden_size)
-        flat_labels = shift_labels.reshape(-1)
-        flat_mask = shift_mask.reshape(-1)
+        flat_hidden = flat_hidden.index_select(0, supervised)
+        flat_labels = shift_labels.reshape(-1).index_select(0, supervised)
+        flat_mask = shift_mask.reshape(-1).index_select(0, supervised)
         rows = flat_hidden.shape[0]
         chunk_size = self.objective_chunk_size if self.objective_chunk_size else rows
         lm_head = self.draft_model.mtp.lm_head
@@ -105,7 +112,9 @@ class OnlineMTPModel(nn.Module):
         loss_num = None
         denom = None
         corrects_chunks = []
-        for start in range(0, rows, chunk_size):
+        # An unsupervised batch still runs one (empty) chunk, so the loss stays
+        # connected to the draft and backward produces zero gradients.
+        for start in range(0, max(rows, 1), max(chunk_size, 1)):
             end = min(start + chunk_size, rows)
             chunk_args = (
                 flat_hidden[start:end],
@@ -128,8 +137,10 @@ class OnlineMTPModel(nn.Module):
             corrects_chunks.append(chunk_corrects)
 
         loss = loss_num / denom.clamp_min(1)
-        corrects = torch.cat(corrects_chunks).view(batch, positions)
-        return loss, corrects, shift_mask.float()
+        supervised_corrects = torch.cat(corrects_chunks)
+        corrects = supervised_corrects.new_zeros(batch * positions)
+        corrects.index_copy_(0, supervised, supervised_corrects)
+        return loss, corrects.view(batch, positions), shift_mask.float()
 
     def forward(
         self,

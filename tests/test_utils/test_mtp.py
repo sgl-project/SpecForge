@@ -107,18 +107,53 @@ class OnlineMTPModelTest(unittest.TestCase):
     def test_chunked_objective_matches_unchunked(self):
         self._assert_objective_parity(torch.device("cpu"), torch.float32)
 
+    def test_sparse_supervision_matches_unchunked(self):
+        self._assert_objective_parity(torch.device("cpu"), torch.float32, sparse=True)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_chunked_objective_cuda_matches_legacy(self):
         for dtype in (torch.float32, torch.bfloat16):
-            with self.subTest(dtype=dtype):
-                self._assert_objective_parity(torch.device("cuda"), dtype)
+            for sparse in (False, True):
+                with self.subTest(dtype=dtype, sparse=sparse):
+                    self._assert_objective_parity(
+                        torch.device("cuda"), dtype, sparse=sparse
+                    )
 
-    def _assert_objective_parity(self, device, dtype):
+    def test_unsupervised_batch_backward_gives_zero_grads(self):
+        config = _tiny_config()
+        draft = Qwen3_5MTPDraftModel(config)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+        for chunk_size in (0, 4):
+            with self.subTest(chunk_size=chunk_size):
+                draft.zero_grad(set_to_none=True)
+                model = OnlineMTPModel(draft, objective_chunk_size=chunk_size)
+                loss, corrects, denoms = model(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    loss_mask=torch.zeros_like(loss_mask),
+                )
+                loss.backward()
+
+                self.assertEqual(0.0, loss.item())
+                self.assertEqual(0.0, corrects[0].sum().item())
+                self.assertEqual(0.0, denoms[0].sum().item())
+                for name, parameter in draft.named_parameters():
+                    if parameter.requires_grad:
+                        with self.subTest(parameter=name):
+                            self.assertIsNotNone(parameter.grad)
+                            self.assertEqual(0.0, parameter.grad.abs().sum().item())
+
+    def _assert_objective_parity(self, device, dtype, sparse=False):
         config = _tiny_config()
         torch.manual_seed(0)
         input_ids, hidden_states, loss_mask = _tiny_batch(config)
         # ragged supervision so chunk boundaries cross masked/unmasked rows
         loss_mask[0, 5:9] = 0.0
+        if sparse:
+            # mostly prompt: a few supervised spans, as in multi-turn data
+            loss_mask.zero_()
+            loss_mask[0, 3:6] = 1.0
+            loss_mask[1, 10:15] = 1.0
         input_ids, loss_mask = input_ids.to(device), loss_mask.to(device)
         hidden_states = hidden_states.to(device=device, dtype=dtype)
         for frozen_head in (False, True):
