@@ -90,6 +90,18 @@ def apply_legacy_rope_scaling(output_dir: str) -> bool:
     return True
 
 
+def save_serving_draft(model, output_dir, *, state_dict):
+    """Validate representability before writing; preserve the canonical config."""
+    adapter = model.config.to_hf_config()
+    adapter.dtype = model.dtype
+    model.save_pretrained(output_dir, state_dict=state_dict)
+    os.replace(
+        os.path.join(output_dir, "config.json"),
+        os.path.join(output_dir, "specforge_config.json"),
+    )
+    adapter.save_pretrained(output_dir)
+
+
 def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
     """Load the runtime training state from any checkpoint-shaped path.
 
@@ -201,6 +213,7 @@ def materialize_draft(
 
 __all__ = [
     "apply_legacy_rope_scaling",
+    "save_serving_draft",
     "checkpoint_dtype",
     "resolve_training_state",
     "materialize_draft",

@@ -103,7 +103,8 @@ class DraftModelConfig:
         payload = self.to_dict()
         from .layer_decoder import legacy_layer_fields
 
-        payload.pop("layers", None)
+        if for_export:
+            payload.pop("layers", None)
         layout, method = legacy_layer_fields(self.layers, check=for_export)
         payload.update(layout)
         if "dflash_config" in payload:
@@ -119,7 +120,9 @@ class DraftModelConfig:
         return config
 
     def save_pretrained(self, *args, **kwargs):
-        return self.to_hf_config().save_pretrained(*args, **kwargs)
+        from .hf import DraftSaveConfig
+
+        return DraftSaveConfig(self).save_pretrained(*args, **kwargs)
 
 
 # Architecture defaults belong to SpecForge; HF adapters do not choose settings
