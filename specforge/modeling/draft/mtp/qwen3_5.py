@@ -36,6 +36,9 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from typing_extensions import Unpack
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
+from specforge.modeling.draft.models.specialized.qwen3_5_mtp.adapter import (
+    Qwen3_5MTPAdapter,
+)
 from specforge.modeling.draft.mtp.base import MTPDraftModel
 from specforge.modeling.draft.registry import register_draft
 
@@ -394,6 +397,11 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
     parameters live under the `mtp.*` prefix so that checkpoints can be loaded
     directly by SGLang's Qwen3_5ForCausalLMMTP.
     """
+
+    checkpoint_adapter = Qwen3_5MTPAdapter
+    NATIVE_KEY_PREFIX = checkpoint_adapter.native_prefix
+    TARGET_EMBED_KEY_CANDIDATES = list(checkpoint_adapter.target_embedding_keys)
+    TARGET_HEAD_KEY_CANDIDATES = list(checkpoint_adapter.target_head_keys)
 
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3MTPDecoderLayer"]
