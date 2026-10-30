@@ -340,12 +340,7 @@ class Qwen3_5MTPModel(nn.Module):
         self.layers = nn.ModuleList([Qwen3MTPDecoderLayer(mtp_config, layer_idx=0)])
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = PartialRotaryEmbedding(
-            mtp_config,
-            getattr(
-                mtp_config,
-                "head_dim",
-                mtp_config.hidden_size // mtp_config.num_attention_heads,
-            ),
+            config, config.layers[0].attention.head_dim
         )
 
         # LM head (shared with target model during training)

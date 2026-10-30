@@ -29,6 +29,10 @@ class Qwen3_5MTPConfig(DraftConfig):
         Target decoder depth/model_type differ from the extracted single-layer
         draft. Only fields used by the native MTP computation are compared.
         """
+        if hasattr(config, "layers"):
+            from .model import LayerConfig
+
+            config = LayerConfig(config, config.layers[0])
         target = getattr(target_config, "text_config", target_config)
         validate_native_rope_type(config, target, supported_types={"default"})
         rope = getattr(target, "rope_parameters", None) or {}
@@ -66,7 +70,11 @@ class Qwen3_5MTPConfig(DraftConfig):
     @classmethod
     def from_model_config(cls, config: Qwen3Config) -> Self:
         validate_dimensions(config)
-        head_dim = validate_gqa(config)
+        head_dim = (
+            config.layers[0].attention.head_dim
+            if hasattr(config, "layers")
+            else validate_gqa(config)
+        )
         if config.num_hidden_layers != 1:
             raise ValueError("Qwen3.5 MTP requires num_hidden_layers=1")
         rope = getattr(config, "rope_parameters", None) or {}
