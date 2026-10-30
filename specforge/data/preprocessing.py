@@ -446,7 +446,6 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
 
         input_ids = data["input_ids"][:max_len][None, :]
         loss_mask = data["loss_mask"][:max_len][None, :]
-        loss_mask[0, -1] = 0
 
         new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
         new_data["loss_mask"] = loss_mask
@@ -511,8 +510,6 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
             full_loss_mask = full_loss_mask.unsqueeze(0)
 
         full_loss_mask = full_loss_mask[:, :global_len].clone()
-        if full_loss_mask.numel() > 0:
-            full_loss_mask[0, -1] = 0
         new_data["loss_mask"], _ = _slice_and_pad(full_loss_mask)
 
         local_len = new_data["input_ids"].shape[1]
@@ -668,8 +665,6 @@ def process_offline_eagle3_sample(
     target = raw["hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
     input_ids = raw["input_ids"][:max_len].unsqueeze(0)
     loss_mask = raw["loss_mask"][:max_len].clone().unsqueeze(0)
-    if loss_mask.numel() > 0:
-        loss_mask[0, -1] = 0
 
     return {
         "attention_mask": torch.ones_like(loss_mask, dtype=torch.long),

@@ -114,12 +114,8 @@ class UspPositionIdsTest(unittest.TestCase):
                             torch.testing.assert_close(
                                 shard["attention_mask"], expected_attention
                             )
-                            expected_loss = expected_attention.clone()
-                            last = global_len - 1 - start
-                            if 0 <= last < valid:
-                                expected_loss[0, last] = 0
                             torch.testing.assert_close(
-                                shard["loss_mask"], expected_loss
+                                shard["loss_mask"], expected_attention
                             )
                             for name, width in (("hidden_state", 6), ("target", 2)):
                                 torch.testing.assert_close(
