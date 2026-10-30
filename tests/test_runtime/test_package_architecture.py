@@ -724,22 +724,11 @@ class TestPackageArchitecture(unittest.TestCase):
         for name, payload in dspark_configs.items():
             with self.subTest(config=name):
                 self.assertEqual(payload["model_type"], "qwen3")
-                attention_mode = payload["dflash_config"]["attention_mode"]
-                # 'mla' carries its own head geometry and is validated by
-                # validate_dflash_mla_config, so a checked-in MLA DSpark config
-                # must extend this guard deliberately rather than slip through.
-                self.assertIn(attention_mode, {"gqa", "mha"})
-                num_heads = payload["num_attention_heads"]
-                num_kv_heads = payload["num_key_value_heads"]
-                self.assertEqual(num_heads % num_kv_heads, 0)
-                if attention_mode == "gqa":
-                    # DSparkDraftModel rejects gqa with num_key_value_heads >=
-                    # num_attention_heads and points at mha instead.
-                    self.assertLess(num_kv_heads, num_heads)
-                else:
-                    # validate_dflash_attention_config requires equal query and
-                    # KV head counts for mha.
-                    self.assertEqual(num_kv_heads, num_heads)
+                from specforge.config.draft import AutoDraftConfig
+
+                config = AutoDraftConfig.from_inline(payload)
+                self.assertEqual(config.model_type, "qwen3")
+                self.assertEqual(len(config.layers), config.num_hidden_layers)
 
     def test_examples_and_scripts_do_not_bypass_the_cli(self):
         direct_imports = []

@@ -85,48 +85,42 @@ EAGLE3 offline sequence parallelism is selected with
 tracking are also config features rather than custom launchers; see the
 [training guide](../basic_usage/training.md) for their validated combinations.
 
-## DFlash-family attention modes
+## DFlash-family attention components
 
-DFlash-family draft models select their attention parameterization with
-`dflash_config.attention_mode`: `gqa` (the default), `mha`, or `mla`. The mode
-swaps only the attention projections inside the shared decoder layer; the
-`DFlashDraftModel`, `DFlash2DraftModel`, `DominoDraftModel`, and
-`DSparkDraftModel` architectures, target-context injection, per-layer
-full/sliding masks, objectives, capture contract, and
-`eager`/`sdpa`/`flex_attention` backend selection are identical across modes.
-Multi-head Latent Attention is therefore a draft JSON change, not a new
-architecture:
+Select each layer's attention with `layers[].attention.type`: `gqa`,
+`mha`, or `mla`. These implement the same context-then-draft contract;
+the algorithm's target-context injection, prediction head and loss stay unchanged.
+Execution backends (eager, SDPA, Flex and Flash) are separate from projection
+structure.
 
-```json
-{
-  "architectures": ["DSparkDraftModel"],
-  "hidden_size": 4096,
-  "num_attention_heads": 32,
-  "q_lora_rank": 1536,
-  "kv_lora_rank": 512,
-  "qk_nope_head_dim": 128,
-  "qk_rope_head_dim": 64,
-  "v_head_dim": 128,
-  "dflash_config": {
-    "projector_type": "dspark",
-    "attention_mode": "mla"
-  }
-}
+For example, use this layer object in a version 1 draft setting for MLA:
+
+```yaml
+layers:
+  attention:
+    type: mla
+    num_attention_heads: 32
+    q_lora_rank: 1536
+    kv_lora_rank: 512
+    qk_nope_head_dim: 128
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    rope_interleave: true
+    is_causal: true
+  ffn:
+    type: dense
+  residual:
+    type: standard
 ```
 
-MLA dimensions and behavior use the standard top-level Hugging Face fields:
-`q_lora_rank` (`null` selects a direct query projection), `kv_lora_rank`, the
-head dims (`qk_nope_head_dim` may be zero; `qk_rope_head_dim` must be even),
-and `rope_interleave` for the rotation convention (omitted means interleaved,
-the DeepSeek default; `false` selects NeoX-style half rotation). Omitting
-`attention_mode` preserves the existing GQA path; `"mha"` requires equal
-query/KV head counts.
+A null `q_lora_rank` selects direct query projection. `qk_nope_head_dim`
+may be zero; `qk_rope_head_dim` must be even. Interleaved RoPE is the MLA
+default; `false` selects NeoX-style half rotation. MHA requires equal query
+and KV head counts. Unknown attention types fail before model allocation.
 
-MLA is a training-side mode: checkpoints train, evaluate through
-`spec_generate`, and export through `--to hf`. SGLang serving of DFlash-family
-drafts currently implements the GQA/MHA layout only, so plan benchmarks
-accordingly. DFlash2 otherwise follows the same mode selection; its convolution
-and selector do not change the attention projection contract.
+MLA can train and run the local draft evaluation path. A config being
+representable in legacy HF fields does not imply that every external serving
+engine implements that architecture; verify the serving backend separately.
 
 ## Draft architectures
 

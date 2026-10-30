@@ -169,7 +169,7 @@ deployment:
 YAML (or JSON). It is the only source of draft settings, whether training from
 scratch, loading a trained draft checkpoint, or fine-tuning a native MTP head.
 The `architectures` entry selects the registered draft class; ordinary HF fields
-remain alongside algorithm-specific nested settings.
+remain alongside algorithm-specific nested settings and the versioned per-layer `layers` section.
 
 Edit depth, attention layout, block size, capture-layer IDs and mask token in
 this mapping. There are no task-level structural overrides. Dotted CLI overrides
@@ -181,78 +181,52 @@ DFlash-family training requires `dflash_config.mask_token_id`; P-EAGLE uses
 `mask_token_id` in the inline draft mapping. These settings are validated before
 model construction, with no tokenizer fallback or post-construction mutation.
 
-For DFlash-family drafts, including DFlash2, configure the attention layout in
-the inline draft mapping. Each entry corresponds to one draft layer; sliding
-layers share one positive window:
+For DFlash-family drafts, describe structure with the versioned `layers`
+section. A list gives each layer its own settings; a single object repeats the
+same settings for `num_hidden_layers` layers. For example, the following
+fragment uses local causal attention followed by full bidirectional attention:
 
-```json
-{
-  "num_hidden_layers": 5,
-  "layer_types": [
-    "sliding_attention",
-    "sliding_attention",
-    "sliding_attention",
-    "sliding_attention",
-    "full_attention"
-  ],
-  "use_sliding_window": true,
-  "sliding_window": 2048
-}
+```yaml
+schema_version: 1
+num_hidden_layers: 2
+layers:
+  - attention:
+      type: gqa
+      sliding_window: 2048
+      is_causal: true
+  - attention:
+      type: gqa
+      is_causal: false
 ```
 
-Use `"full_attention"` for every entry, `"use_sliding_window": false`, and
-`"sliding_window": null` for a full-only draft. The layout length must equal
-`num_hidden_layers`. Changing depth requires editing the per-layer layout explicitly in the same mapping.
+Dimensions default from common HF fields at the draft root. A null/omitted
+`sliding_window` means full attention. For a uniform bidirectional local
+draft, the shorthand is:
 
-The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
-
-Attention range and direction are independent for DFlash, DFlash2, Domino,
-and DSpark. `layer_types` selects global (`full_attention`) or local
-(`sliding_attention`) attention per layer; top-level `is_causal` selects the
-direction uniformly across draft layers:
-
-| Layer type | `is_causal` | Draft-block visibility |
-| --- | --- | --- |
-| `full_attention` | `false` | All positions in the same draft block |
-| `full_attention` | `true` | Current and preceding positions in the same block |
-| `sliding_attention` | `false` | Nearby preceding and following positions in the same block |
-| `sliding_attention` | `true` | Nearby current and preceding positions in the same block |
-
-For example, a bidirectional local draft uses:
-
-```json
-{
-  "layer_types": ["sliding_attention", "sliding_attention"],
-  "num_hidden_layers": 2,
-  "use_sliding_window": true,
-  "sliding_window": 128,
-  "is_causal": false
-}
+```yaml
+schema_version: 1
+num_hidden_layers: 2
+layers:
+  attention:
+    type: gqa
+    sliding_window: 128
+    is_causal: false
 ```
 
-An explicit window `W` requires positional distance `< W`: causal attention
-has at most `W` visible positions, while bidirectional attention has at most
-`2 * W - 1`, including the current position. Context is always restricted to
-target features strictly before the anchor, and different draft blocks remain
-isolated. Bidirectional does not expose future target features or labels.
+Window and direction are independent. Window `W` requires positional
+distance `< W`: causal attention has at most `W` visible positions,
+while bidirectional attention has at most `2 * W - 1`, including the
+current position. Context remains restricted to target features before the
+anchor, and separate draft blocks remain isolated. DSpine requires every layer
+to be causal.
 
-Omitting `is_causal` (or setting it to null) uses the upstream per-layer
-defaults: global layers are bidirectional and sliding layers are causal.
-Sliding windows bound both context and draft attention in every mode.
-Explicit direction overrides add versioned resume metadata for sliding
-layers and globally causal DFlash drafts. Legacy DSpark global-causal
-metadata stays compatible.
-
-Explicit training masks work with eager, SDPA, and Flex Attention. Native
-draft inference without a supplied mask supports these settings through
-eager/SDPA and Flex Attention, including cached decoding. HF exports preserve
-`is_causal`.
-The SGLang normalization gate rejects bidirectional sliding-window exports
-until that external serving path is validated; it does not silently fall back
-to a causal mask. These settings do not change CE/L1 losses or kernel optimizations.
-
-DSpine requires causal attention for both full and sliding layers and rejects
-`is_causal: false`. It uses the shared DFlash attention masks.
+Runtime settings are resolved once and immutable. Training masks use each
+layer's visibility settings and reuse masks for identical layouts. Checkpoint
+saves retain the full per-layer structure. Serving export translates only
+representable layouts to legacy fields, preserving mixed full/SWA with a
+shared window and rejecting incompatible per-layer dimensions or windows.
+Version 1 does not accept the old root `layer_types`/`sliding_window` fields.
+Unversioned legacy artifacts remain readable.
 
 ### DFlash2
 
@@ -812,7 +786,7 @@ directory):
 python scripts/merge_mtp_to_base.py \
   --base-model-path Qwen/Qwen3.5-4B \
   --mtp-checkpoint-path ./outputs/qwen3.5-4b-mtp/qwen3.5-4b-mtp-latest \
-  --draft-config configs/qwen3.5-4b-mtp.json \
+  --draft-config configs/qwen3.5-4b-mtp-native.json \
   --output-path ./exports/Qwen3.5-4B-MTP
 ```
 
