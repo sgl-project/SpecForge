@@ -16,6 +16,7 @@ from typing import Any
 from transformers import PretrainedConfig
 
 from .base import integer
+from .format import decode_format
 from .layer_decoder import decode_layers, strip_legacy_layer_fields
 from .model import DraftModelConfig, inline_values
 from .registry import DraftConfigRegistration, resolve_draft_config_type
@@ -33,6 +34,7 @@ class AutoDraftConfig:
         """Resolve the YAML draft section without parsing it through HF."""
         if not isinstance(payload, Mapping):
             raise ValueError("draft config must be an object")
+        payload = decode_format(payload)
         architectures = payload.get("architectures")
         if (
             not isinstance(architectures, (list, tuple))
@@ -71,6 +73,8 @@ class AutoDraftConfig:
         """Read legacy HF checkpoint metadata; training uses from_inline."""
         if not isinstance(payload, Mapping):
             raise ValueError("draft config must be a JSON object")
+        if "schema_version" in payload:
+            return cls.from_inline(payload)
         payload = copy.deepcopy(dict(payload))
         architectures = payload.get("architectures")
         if (

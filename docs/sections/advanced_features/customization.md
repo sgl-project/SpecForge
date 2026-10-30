@@ -182,126 +182,104 @@ providers own algorithm-specific assembly. Add builtin registrations to the
 explicit catalog used by the application composition root; do not add a
 method-specific launcher or a second mutable registry.
 
-### Draft configuration parsing
+### Draft configuration and layer structure
 
-`specforge.config.draft.AutoDraftConfig` is the shared loader used by
-training, export, and `AutoDraftModel.from_pretrained` when no explicit config
-object is supplied. Use `from_dict`, `from_file`, or `from_pretrained` (a JSON
-file, directory, or Hugging Face repository). The configuration registry declares
-the HF serialization class and the typed options class for each architecture.
-Repository loading reads JSON without executing an `auto_map` config
-implementation. Custom draft architectures must be registered locally before
-loading.
+Training reads only the embedded `model.draft_model_config` mapping. Its values
+and SpecForge defaults are authoritative: checkpoint or native model metadata
+is checked against them, never merged into them. Missing or null
+`draft_vocab_size` defaults to `vocab_size`. Capture-layer IDs are explicit;
+changing draft depth never chooses a subset of those IDs.
 
-`specforge/config/schema.py` defines the training recipe and its inline draft
-mapping. `specforge/config/draft/` owns draft parsing, defaults, architecture
-validation, and checkpoint configuration contracts. It does not import
-`specforge.modeling`; models and export code depend on these configuration types.
+A versioned setting keeps common HF fields at the root, algorithm settings in
+their existing sections, and component structure under `layers`:
 
-To support parsing a custom architecture without importing its model, register
-its configuration in a configuration-only module:
-
-```python
-from specforge.config.draft import register_draft_config
-
-register_draft_config("MyEagle3Draft", MyDraftConfig, MyDraftOptions)
+```yaml
+model:
+  draft_model_config:
+    schema_version: 1
+    architectures: [DFlashDraftModel]
+    hidden_size: 4096
+    intermediate_size: 11008
+    num_hidden_layers: 2
+    num_attention_heads: 32
+    num_key_value_heads: 8
+    head_dim: 128
+    vocab_size: 151936
+    block_size: 8
+    dflash_config:
+      target_layer_ids: [1, 16, 30]
+      mask_token_id: 151669
+    layers:
+      attention:
+        type: gqa
+        is_causal: false
+      ffn:
+        type: dense
+      residual:
+        type: standard
 ```
 
-`MyDraftOptions` implements `DraftConfig`. The model declares the same classes
-as `config_class` and `draft_options_class`; model registration verifies that
-they agree. Omit the options class for a custom model that uses only HF fields.
+A single layer object is shorthand for repeating the same structure. A list
+must have exactly `num_hidden_layers` entries. Internally both forms become
+an immutable tuple of `LayerSpec` objects. Each contains an `AttentionSpec`,
+`FFNSpec`, `ResidualSpec`, and optional `ConvSpec`. Projection dimensions
+and FFN width default from the root HF fields but can be specified per layer.
+DFlash2 requires `conv: {type: grouped, kernel_size: ..., group_size: ...}`
+on every layer.
 
-All entry points require exactly one registered `architectures` entry, force
-`tie_word_embeddings=False`, and default an omitted or null `draft_vocab_size`
-to the resolved `vocab_size`, including through the legacy loader. Explicit
-non-positive or non-integer draft vocabulary values are rejected. Nested custom
-fields are preserved and copied so parsing does not modify the caller's input.
+Version 1 rejects legacy structural fields such as `layer_types`,
+`sliding_window`, `attention_config`, and
+`dflash_config.attention_mode`; those belong in `layers`. Unknown layer
+or component keys and unsupported schema versions fail before allocation.
+Unversioned legacy settings remain accepted by the decoder.
 
-Training reads only the inline `model.draft_model_config` mapping. It calls
-`AutoDraftConfig.from_inline` and the registered options class's
-`validate_training_config` before allocating model parameters. File/repository
-readers remain available for pretrained artifacts and checkpoint compatibility
-checks; they never supply or override training settings.
+`specforge/config/schema.py` owns the training recipe.
+`specforge/config/draft/` owns parsing, defaults, component specs, algorithm
+constraints and checkpoint contracts; it does not import model implementations.
+`AutoDraftConfig.from_inline` parses YAML data directly into the immutable
+runtime `DraftModelConfig`. Typed algorithm options are temporary parsing
+objects, not a second live copy. Models and training wrappers read
+`model.config`; kernel adapters hold references to that same config and a
+single layer. Both the config and its nested settings are fixed after construction.
 
-`config/draft/base.py` defines the immutable `DraftConfig` contract:
-`from_model_config` resolves and validates options without allocating parameters;
-`to_model_config` writes normalized fields into a temporary parsing object.
-These typed options are discarded after parsing. Architecture-specific implementations are:
+| Algorithm settings | Definition |
+| --- | --- |
+| EAGLE3 / P-EAGLE | `config/draft/eagle3.py`, `peagle.py` |
+| DFlash / DFlash2 | `config/draft/dflash.py`, `dflash2.py` |
+| Domino / DSpark / DSpine | `config/draft/domino.py`, `dspark.py`, `dspine.py` |
+| Native Qwen3.5 MTP | `config/draft/mtp.py` |
 
-| Draft architecture | Resolved options | File |
-| --- | --- | --- |
-| EAGLE3 | `Eagle3Config` | `config/draft/eagle3.py` |
-| P-EAGLE | `PEagleConfig` | `config/draft/peagle.py` |
-| DFlash | `DFlashConfig` | `config/draft/dflash.py` |
-| DFlash2 | `DFlash2Config` | `config/draft/dflash2.py` |
-| Domino | `DominoConfig` | `config/draft/domino.py` |
-| DSpark | `DSparkConfig` | `config/draft/dspark.py` |
-| DSpine | `DSpineDraftConfig` | `config/draft/dspine.py` |
-| Qwen3.5 MTP | `Qwen3_5MTPConfig` | `config/draft/mtp.py` |
+Algorithms declare constraints, such as causal layers for DSpine and exactly
+one layer for EAGLE3. They do not select attention types by name. The component
+registry maps a type to a frozen spec class and builders for supported caller
+contracts (`context_then_draft`, `eagle_cache`, `peagle`, or `qwen_mtp`).
+A new component must implement its contract and register its builder.
+Unsupported DSA/QSA/KDA, MoE, GR and mHC choices are rejected; registration
+does not silently substitute a dense implementation. Flex/Flash/SDPA are
+execution backends, while Ring is a parallel execution strategy.
 
-Each built-in model exposes `draft_options_class` for parsing and validation.
-The runtime `DraftModelConfig` lives in `config/draft/model.py`. It contains the
-resolved inline values and defaults, with immutable nested mappings and tuples.
-Models, layers, and training wrappers read the same `model.config`; initialization
-does not retain a second spec or copy algorithm settings into model attributes.
-Configuration cannot be changed or replaced after construction.
+Cross-layer wiring stays in the model assembly: DFlash injects target context,
+DSpine applies injection/refinement, and EAGLE's first layer consumes doubled
+hidden width. Specs contain data, not executable hooks.
 
-`model.config.to_hf_config()` creates an independent, mutable HF adapter for
-framework initialization, checkpoint comparison, and serving export.
-`save_pretrained` uses that adapter without changing the live configuration.
-Saving never writes HF serialization metadata back into the live configuration. Legacy checkpoint
-readers remain available; direct model construction resolves their HF configs
-through the same immutable runtime contract.
+`model.save_pretrained` writes canonical versioned `config.json`.
+`AutoDraftModel.from_pretrained` reloads that layout, including heterogeneous
+layers. Legacy HF checkpoint readers also remain available. For serving,
+the HF/SGLang exporters write legacy fields to `config.json` and retain
+the canonical setting in `specforge_config.json`. Conversion creates a
+temporary HF adapter; it never updates the live model config.
 
-New architectures should implement the configuration contract and add a case to
-`test_all_draft_configs.py`. Common model-family defaults are explicit in
-`config/draft/model.py`; method-specific defaults stay in their typed parsers.
+Serving conversion validates representability before writing weights. Mixed
+full/SWA layers can be exported if their projection structure and shared window
+are representable. Different per-layer projection dimensions, FFN widths,
+convolution settings, or window sizes fail explicitly until the serving parser
+supports them. Being uniform alone does not make an unrecognized component
+exportable.
 
-EAGLE's HF adapter remains a `LlamaConfig` subclass and retains `model_type=llama`.
-It permits the explicit projection width used by EAGLE when hidden size is not
-divisible by query head count. The current EAGLE3 and Qwen3.5 MTP implementations
-require one layer; P-EAGLE supports multiple layers.
-
-Before constructing a draft from native Qwen MTP weights, the adapter checks
-that the inline and native RoPE types match and are supported. Qwen3.5 MTP
-currently supports only default RoPE; its theta and partial rotary factor must
-also match. The shared checks in `config/draft/rope.py` read modern
-`rope_parameters.rope_type` and legacy `rope_scaling.type` declarations without
-modifying either configuration. Conflicting declarations and per-layer layouts
-require an explicit adapter instead of falling back to default RoPE. Future
-native draft adapters must invoke this check with their own supported types
-and validate the numerical parameters used by their implementation.
-
-DSpark currently loads standalone draft checkpoints, not native target draft
-weights. Its checkpoint contract already compares RoPE types and scaling
-parameters against the inline settings. A draft trained from scratch need not
-use the target model's RoPE.
-
-Boolean architecture switches
-must be booleans, not strings. P-EAGLE's `norm_before_residual` and EAGLE-family
-capture layers live in the inline draft mapping. Loss weights and sampling policy remain
-owned by the algorithm/run config.
-
-Finalization returns a copy and preserves unknown JSON fields. Top-level
-`block_size` retains precedence over the legacy `dflash_config.block_size` alias.
-The resolved runtime config keeps only the top-level value; HF serialization adds
-the nested alias to its export copy. Default capture layers and head switches are
-made explicit for serialization. Model construction does not mutate the caller's
-config. Layers share the resolved config; their weights and derived tensor dimensions
-are constructed from it. Create a new model to change its architecture.
-Saving uses a private config copy, so HF serving metadata never changes the
-live training config, even if serialization fails.
-Converting a resolved view back to HF config writes its attention layout, sliding
-window, and direction along with the method settings. Attention dimensions and
-active sliding windows must be integers; fractional values and booleans are not
-silently converted to dimensions.
-
-Changing `num_hidden_layers` requires a matching explicit attention layout.
-Capture layer IDs are retained as configured; changing draft depth never silently
-selects a subset of those IDs. `config/draft/contract.py` records normalized
-settings in training checkpoint provenance. It ignores execution/serialization
-metadata and retains new structural fields by default. Native architectures own
-their source-specific checks (for example `Qwen3_5MTPConfig.validate_native_config`).
+Before loading native Qwen MTP weights, the adapter checks the embedded and
+native RoPE types and numerical parameters. Unsupported native RoPE types
+fail explicitly. Standalone checkpoints use the full normalized configuration
+contract, including all per-layer settings.
 
 ## Fused token losses
 
