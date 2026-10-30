@@ -997,6 +997,21 @@ class TrainingConfig(StrictConfigModel):
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.
     optimizer_cpu_offload: bool = False
+    #: ``adamw`` (default) or ``muon``: Muon on every 2-D nn.Linear weight in
+    #: the draft's decoder layers (``layers.<i>.`` / ``midlayer.``), AdamW at
+    #: ``learning_rate`` on everything else; one global clip and one LR
+    #: schedule multiplier with separate peak rates. See specforge.muon.
+    optimizer: Literal["adamw", "muon"] = "adamw"
+    #: Muon peak LR (required for, and only valid with, ``optimizer: muon``).
+    muon_learning_rate: Optional[float] = Field(default=None, gt=0.0)
+    muon_momentum: float = Field(default=0.95, ge=0.0, lt=1.0)
+    muon_nesterov: bool = True
+    muon_ns_steps: int = Field(default=5, ge=1, le=99)
+    #: Decoupled weight decay of the Muon matrices (lr_t * wd, torch.optim.Muon).
+    muon_weight_decay: float = Field(default=0.0, ge=0.0)
+    #: ``original``: lr * sqrt(max(1, rows / cols)); ``match_rms_adamw``:
+    #: lr * 0.2 * sqrt(max(rows, cols)) (rates on AdamW's scale).
+    muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] = "original"
     ttt_length: int = Field(default=7, gt=0)
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
@@ -1080,6 +1095,33 @@ class TrainingConfig(StrictConfigModel):
     #: Deterministic online prompt ordering. ``None`` preserves the historical
     #: behavior of using the run RNG seed for both model and prompt sampling.
     prompt_seed: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _validate_optimizer(self):
+        # Compared with the defaults (not model_fields_set): dump/re-validate
+        # round trips (overrides, the CLI role split) set every field.
+        muon_keys = sorted(
+            key
+            for key, field in type(self).model_fields.items()
+            if key.startswith("muon_") and getattr(self, key) != field.default
+        )
+        if self.optimizer != "muon":
+            if muon_keys:
+                raise ValueError(
+                    f"training.{', training.'.join(muon_keys)} apply only to "
+                    "training.optimizer=muon"
+                )
+            return self
+        if self.muon_learning_rate is None:
+            raise ValueError(
+                "training.optimizer=muon requires training.muon_learning_rate"
+            )
+        if self.optimizer_cpu_offload:
+            raise ValueError(
+                "training.optimizer=muon does not support "
+                "training.optimizer_cpu_offload"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
