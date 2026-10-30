@@ -491,6 +491,7 @@ class TrainerCore:
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
         grad_norm = None
+        step_metrics = None
         if stepped:
             loss_denominator = None
             if out.loss_terms is not None:
@@ -504,6 +505,8 @@ class TrainerCore:
                 grad_norm = self.backend.step()
             else:
                 grad_norm = self.backend.step(loss_denominator=loss_denominator)
+            # The model's per-step hook; whatever it reports joins this step's metrics.
+            step_metrics = self.strategy.on_optimizer_step()
         result_ratio_metrics = self._ratio_totals if stepped else ratio_metrics
         result = self._result(
             out,
@@ -511,6 +514,7 @@ class TrainerCore:
             stepped,
             ratio_metrics=result_ratio_metrics,
             sum_metrics=self._sum_totals if stepped else out.sum_metrics,
+            step_metrics=step_metrics,
         )
         if stepped:
             self._ratio_totals = {}
@@ -570,6 +574,7 @@ class TrainerCore:
         *,
         ratio_metrics: Optional[Dict[str, Any]] = None,
         sum_metrics: Optional[Dict[str, Any]] = None,
+        step_metrics: Optional[Dict[str, Any]] = None,
     ) -> StepResult:
         # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
         # positions and reduce counts before ratios; scalarizing its lists here
@@ -654,6 +659,13 @@ class TrainerCore:
             else:
                 grad_norm_metric = float(grad_norm)
             metrics["grad_norm"] = grad_norm_metric
+            optimizer = getattr(self.backend, "optimizer", None)
+            if getattr(optimizer, "spike_guard_ratio", 0.0):
+                metrics["spike_guard/skipped"] = float(optimizer.last_step_skipped)
+                metrics["spike_guard/skipped_total"] = float(optimizer.skipped_steps)
+        if step_metrics:
+            # Per-step hook metrics, logged as reported: the hook pools them itself.
+            metrics.update(step_metrics)
         return StepResult(
             optimizer_stepped=stepped,
             metric_values=metrics,

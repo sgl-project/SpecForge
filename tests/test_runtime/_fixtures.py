@@ -418,6 +418,7 @@ def build_dspark(
     markov_rank=8,
     mask_token_id=0,
     attention_backend="sdpa",
+    draft_overrides=None,
 ):
     """Build a tiny OnlineDSparkModel on CUDA without model downloads."""
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
@@ -455,6 +456,12 @@ def build_dspark(
         "enable_confidence_head": True,
         "confidence_head_with_markov": True,
     }
+    # Extra draft fields, an MoE preset for one; dflash_config entries merge in.
+    for key, value in (draft_overrides or {}).items():
+        if key == "dflash_config":
+            draft_config.dflash_config = {**draft_config.dflash_config, **value}
+        else:
+            setattr(draft_config, key, value)
     draft_config._attn_implementation = attention_backend
 
     draft_model = DSparkDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
