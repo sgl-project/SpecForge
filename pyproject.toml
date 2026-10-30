@@ -39,6 +39,9 @@ dependencies = [
 [project.scripts]
 specforge = "specforge.cli:main"
 
+[project.entry-points."specforge.plugins"]
+tpu = "specforge_tpu:register"
+
 [tool.setuptools.packages.find]
 include = ["specforge*"]
 
