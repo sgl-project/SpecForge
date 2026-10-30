@@ -88,7 +88,7 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
-def _rope_config(config: Qwen3Config, attention_mode: str) -> Qwen3Config:
+def _rope_config(config: Qwen3Config) -> Qwen3Config:
     """Rotary config for the mode: MLA rotates only the partial-RoPE slice."""
 
     rope_config = config.model.to_hf_config(for_export=False)
@@ -242,9 +242,7 @@ class DFlashDraftModel(DraftSerializationMixin, Qwen3PreTrainedModel):
         )
         self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
         rotary = [
-            Qwen3RotaryEmbedding(
-                _rope_config(LayerConfig(config, layer), layer.attention.type)
-            )
+            Qwen3RotaryEmbedding(_rope_config(LayerConfig(config, layer)))
             for layer in config.layers
         ]
         self.rotary_emb = rotary[0]
@@ -411,9 +409,13 @@ class DFlashDraftModel(DraftSerializationMixin, Qwen3PreTrainedModel):
             past_key_values,
             is_causal=kwargs.get("is_causal"),
         )
+        rotary_cache = {}
         for index, (spec, layer) in enumerate(zip(self.config.layers, self.layers)):
             rotary = self.rotary_emb if index == 0 else self.extra_rotary_emb[index - 1]
-            position_embeddings = rotary(hidden_states, position_ids)
+            width = spec.attention.rotary_dim
+            if width not in rotary_cache:
+                rotary_cache[width] = rotary(hidden_states, position_ids)
+            position_embeddings = rotary_cache[width]
             layer_type = spec.attention.layer_type
             layer_attention_mask = (
                 (

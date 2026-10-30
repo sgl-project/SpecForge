@@ -182,10 +182,14 @@ class DSpineDraftModel(DFlashDraftModel):
         hidden = noise_embedding
         context = self.hidden_norm(self.fc(target_hidden))
         layer_features = []
+        rotary_cache = {}
         for index, (spec, layer) in enumerate(zip(self.config.layers, self.layers)):
             layer_type = spec.attention.layer_type
             rotary = self.rotary_emb if index == 0 else self.extra_rotary_emb[index - 1]
-            positions = rotary(hidden, position_ids)
+            width = spec.attention.rotary_dim
+            if width not in rotary_cache:
+                rotary_cache[width] = rotary(hidden, position_ids)
+            positions = rotary_cache[width]
             mask = (
                 (
                     attention_mask[index]

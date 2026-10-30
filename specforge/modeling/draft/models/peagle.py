@@ -299,9 +299,13 @@ class PEagleDraftModel(Eagle3DraftModel):
 
         h = layer_input
         seq_len = position_ids.max().item() + 1
+        rotary_cache = {}
         for index, layer in enumerate(self.layers):
             rotary = self.rotary_emb if index == 0 else self.extra_rotary_emb[index - 1]
-            cos, sin = rotary(h, seq_len=seq_len)
+            width = self.config.layers[index].attention.rotary_dim
+            if width not in rotary_cache:
+                rotary_cache[width] = rotary(h, seq_len=seq_len)
+            cos, sin = rotary_cache[width]
             position_embeddings = (
                 cos.squeeze(0).squeeze(0)[position_ids],
                 sin.squeeze(0).squeeze(0)[position_ids],
