@@ -43,97 +43,62 @@ def _payload(strategy: str, **model_overrides):
 
 
 class ModelLoadingSchemaTest(unittest.TestCase):
-    def test_working_legacy_auto_config_strategies_can_omit_source(self):
-        for strategy in ("eagle3", "peagle", "dflash"):
-            with self.subTest(strategy=strategy):
-                cfg = Config.model_validate(_payload(strategy))
-                resolve_run(cfg)
-                self.assertIsNone(cfg.model.draft_model_config)
+    def test_all_algorithms_require_inline_config_even_with_checkpoint(self):
+        for strategy in (
+            "eagle3",
+            "peagle",
+            "dflash",
+            "dspark",
+            "domino",
+            "dspine",
+            "mtp",
+        ):
+            for source in (None, "/draft.json", "org/model", {}):
+                with self.subTest(strategy=strategy, source=source):
+                    payload = _payload(strategy, draft_checkpoint_path="org/draft")
+                    if source is not None:
+                        payload["model"]["draft_model_config"] = source
+                    with self.assertRaisesRegex(ValidationError, "draft_model_config"):
+                        Config.model_validate(payload)
 
-    def test_specialized_dflash_architectures_still_require_a_config(self):
-        with self.assertRaisesRegex(ValueError, "requires model.draft_model_config"):
-            resolve_run(Config.model_validate(_payload("domino")))
-        with self.assertRaisesRegex(ValueError, "requires model.draft_model_config"):
-            resolve_run(
+    def test_task_structural_overrides_are_rejected(self):
+        from tests.draft_config_utils import draft_settings
+
+        for key, value in (
+            ("draft_num_hidden_layers", 2),
+            ("draft_block_size", 8),
+            ("mask_token_id", 3),
+            ("aux_hidden_state_layer_ids", [1, 5, 8]),
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(ValidationError, key):
                 Config.model_validate(
-                    {
-                        **_payload("dflash"),
-                        "model": {
-                            **_payload("dflash")["model"],
-                            "target_backend": "sglang",
-                        },
-                        "training": {
-                            "strategy": "dspark",
-                            "role": "consumer",
-                            "total_steps": 1,
-                        },
-                        "data": {"train_data_path": "/train.jsonl"},
-                        "deployment": ONLINE_DEPLOYMENT,
-                    }
+                    _payload(
+                        "dflash",
+                        draft_model_config=draft_settings("dflash"),
+                        **{key: value},
+                    )
                 )
-            )
 
-        # A warm-start HF repository or local directory can provide config.json.
+    def test_inline_settings_accept_nested_cli_overrides(self):
+        from specforge.config import apply_overrides
+        from tests.draft_config_utils import draft_settings
+
         cfg = Config.model_validate(
-            _payload("domino", draft_checkpoint_path="org/domino-draft")
+            _payload("dflash", draft_model_config=draft_settings("dflash"))
         )
-        resolve_run(cfg)
-        self.assertEqual(cfg.model.draft_checkpoint_path, "org/domino-draft")
-
-    def test_typed_architecture_overrides_are_strategy_scoped(self):
-        dflash = Config.model_validate(
-            _payload(
-                "dflash",
-                draft_num_hidden_layers=3,
-                draft_block_size=8,
-            )
-        )
-        resolve_run(dflash)
-        self.assertEqual(dflash.model.draft_num_hidden_layers, 3)
-        self.assertEqual(dflash.model.draft_block_size, 8)
-
-        with self.assertRaisesRegex(
-            ValueError,
-            "requires model.draft_num_hidden_layers=1",
-        ):
-            resolve_run(
-                Config.model_validate(_payload("eagle3", draft_num_hidden_layers=2))
-            )
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support model.draft_block_size",
-        ):
-            resolve_run(Config.model_validate(_payload("peagle", draft_block_size=8)))
+        updated = apply_overrides(cfg, ["model.draft_model_config.block_size=8"])
+        self.assertEqual(updated.model.draft_model_config["block_size"], 8)
+        self.assertEqual(cfg.model.draft_model_config["block_size"], 4)
+        resolve_run(updated)
 
     def test_warm_start_and_full_resume_are_mutually_exclusive(self):
-        with self.assertRaisesRegex(ValidationError, "mutually exclusive"):
-            Config.model_validate(
-                {
-                    **_payload("eagle3", draft_checkpoint_path="/base/checkpoint"),
-                    "training": {
-                        "strategy": "eagle3",
-                        "resume_from": "/run/checkpoint",
-                    },
-                }
-            )
+        from tests.draft_config_utils import draft_settings
 
-    def test_disaggregated_producer_can_resolve_warm_start_metadata(self):
         payload = _payload(
-            "dflash",
-            draft_checkpoint_path="org/dflash-draft",
+            "eagle3",
+            draft_checkpoint_path="/base/checkpoint",
+            draft_model_config=draft_settings(),
         )
-        payload["model"]["target_backend"] = "sglang"
-        payload["data"] = {"train_data_path": "/train.jsonl"}
-        payload["training"] = {
-            "strategy": "dflash",
-            "role": "producer",
-            "total_steps": 1,
-        }
-        payload["deployment"] = ONLINE_DEPLOYMENT
-        cfg = Config.model_validate(payload)
-        resolve_run(cfg)
-        self.assertEqual(cfg.model.draft_checkpoint_path, "org/dflash-draft")
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+        payload["training"]["resume_from"] = "/run/checkpoint"
+        with self.assertRaisesRegex(ValidationError, "mutually exclusive"):
+            Config.model_validate(payload)

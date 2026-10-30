@@ -53,12 +53,11 @@ Run any recipe through the one public training entry:
 specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml
 ```
 
-`model.draft_model_config` may name a local JSON file, a local model directory,
-or a Hugging Face repository. Fresh EAGLE3, P-EAGLE, and DFlash runs may omit it
-and derive the draft architecture from the target; see the
-[training guide](../../docs/sections/basic_usage/training.md#draft-configuration-and-model-initialization)
-for layer/block overrides and the distinction between weights-only
-`model.draft_checkpoint_path` and full `training.resume_from`.
+`model.draft_model_config` is a required inline mapping. It supplies the draft
+settings for scratch training, checkpoint warm starts, and native draft
+fine-tuning. File paths and target-derived configuration are no longer accepted.
+Checkpoint settings are checked for compatibility and never override the YAML.
+See the [training guide](../../docs/sections/basic_usage/training.md#draft-configuration-and-model-initialization).
 
 Every recipe records its audited process count under `deployment.trainer`.
 Multi-process configs self-launch through torch distributed:
@@ -133,7 +132,40 @@ services looks like:
 ```yaml
 model:
   target_model_path: Qwen/Qwen3-8B
-  draft_model_config: configs/qwen3-8b-eagle3.json
+  draft_model_config:
+    architectures:
+    - LlamaForCausalLMEagle3
+    attention_bias: false
+    attention_dropout: 0.0
+    bos_token_id: 151643
+    eos_token_id: 151645
+    head_dim: 128
+    hidden_act: silu
+    hidden_size: 4096
+    initializer_range: 0.02
+    intermediate_size: 12288
+    max_position_embeddings: 40960
+    max_window_layers: 36
+    model_type: llama
+    num_attention_heads: 32
+    num_hidden_layers: 1
+    num_key_value_heads: 8
+    rms_norm_eps: 1.0e-06
+    rope_scaling: null
+    rope_theta: 1000000
+    sliding_window: null
+    tie_word_embeddings: false
+    torch_dtype: bfloat16
+    transformers_version: 4.51.0
+    use_cache: true
+    use_sliding_window: false
+    vocab_size: 151936
+    draft_vocab_size: 32000
+    eagle_config:
+      eagle_aux_hidden_state_layer_ids:
+      - 1
+      - 17
+      - 32
   target_backend: sglang
   vocab_mapping_path: cache/vocab_mapping/qwen3-8b.pt
 
@@ -204,10 +236,8 @@ should make their training strategy and topology explicit.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `model.target_model_path` | required | Local target directory or Hugging Face repository ID. |
-| `model.draft_model_config` | `null` | Draft JSON, model directory containing `config.json`, or Hugging Face repository. EAGLE3, P-EAGLE, and DFlash may omit it and derive a fresh config; Domino and DSpark require one. |
+| `model.draft_model_config` | required | Inline draft architecture and settings; parsed and validated by the draft configuration registry. |
 | `model.draft_checkpoint_path` | `null` | Weights-only warm start for a new run. Do not combine it with `training.resume_from`. |
-| `model.draft_num_hidden_layers` | `null` | Positive fresh-architecture override where the strategy permits it. EAGLE3 remains one layer; P-EAGLE and DFlash may override their generated defaults. |
-| `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
 | `model.target_backend` | `sglang` | `sglang` is the only accepted value; retired `hf`/`custom` names fail at config load. Offline feature consumers do not instantiate a target inference backend. |
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
@@ -217,10 +247,8 @@ should make their training strategy and topology explicit.
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
 | `model.load_target_embedding` | `true` | Copy the frozen target embedding into a fresh draft when supported. |
-| `model.aux_hidden_state_layer_ids` | `null` | Optional EAGLE3/P-EAGLE capture override containing exactly three non-negative layer IDs. Other strategies derive layers from the draft config. |
 | `model.torch_dtype` | `bfloat16` | `bfloat16`, `float16`, or `float32`. |
 | `model.cache_dir` | `null` | Model/tokenizer download cache. This is distinct from `data.cache_dir`. |
-| `model.mask_token_id` | `null` | DFlash-family/P-EAGLE mask token override. Otherwise it resolves from the draft config and then the tokenizer. |
 | `model.tokenizer_pad_token_id` | `null` | Explicit non-negative tokenizer pad ID. Use it for released tokenizers that omit padding metadata. |
 | `model.sglang_attention_backend` | `flashinfer` | SGLang attention implementation for an in-process or managed capture server. |
 | `model.sglang_mem_fraction_static` | `0.4` | SGLang static-memory fraction in `(0, 1]`; inherited by managed capture servers unless they override it. |
@@ -321,7 +349,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
 | DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
-| P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
+| P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`) |
 | MTP | `training.mtp_objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
 
 New recipes must not write the loader-only migration fields

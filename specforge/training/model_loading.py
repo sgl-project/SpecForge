@@ -29,43 +29,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig
-
     from specforge.algorithms.common.providers import DraftConfigProvider
     from specforge.algorithms.registry import AlgorithmRegistration
     from specforge.config import Config
+    from specforge.config.draft import DraftModelConfig
 
 logger = logging.getLogger(__name__)
 
 _CONFIG_FILE = "config.json"
 _STATE_FILE = "training_state.pt"
-
-# These are the architecture fields the legacy EAGLE generator copied from the
-# target, plus RoPE/attention fields needed by newer Qwen-family targets.  A
-# whitelist avoids feeding a target-specific nested config into the registered
-# Llama/Qwen3 draft classes.
-_TARGET_ARCHITECTURE_FIELDS = (
-    "vocab_size",
-    "hidden_size",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "intermediate_size",
-    "max_position_embeddings",
-    "rms_norm_eps",
-    "hidden_act",
-    "initializer_range",
-    "attention_bias",
-    "attention_dropout",
-    "head_dim",
-    "rope_theta",
-    "rope_scaling",
-    "bos_token_id",
-    "eos_token_id",
-    "pad_token_id",
-    "sliding_window",
-    "use_sliding_window",
-    "max_window_layers",
-)
 
 
 @dataclass(frozen=True)
@@ -83,146 +55,22 @@ def _without_file_uri(source: str) -> str:
     return source[len("file://") :] if source.startswith("file://") else source
 
 
-def _looks_like_local_path(source: str) -> bool:
-    return (
-        source.startswith((".", "/", "~", "file://"))
-        or source.endswith(".json")
-        or os.path.exists(os.path.expanduser(_without_file_uri(source)))
-    )
-
-
-def _checkpoint_config_source(checkpoint_source: Optional[str]) -> Optional[str]:
-    """Return a config-bearing warm-start source, if it can be identified."""
-
-    if not checkpoint_source:
-        return None
-    raw_source = str(checkpoint_source)
-    local_source = os.path.abspath(os.path.expanduser(_without_file_uri(raw_source)))
-    if os.path.isfile(local_source):
-        if os.path.basename(local_source) == _CONFIG_FILE:
-            return local_source
-        sibling = os.path.join(os.path.dirname(local_source), _CONFIG_FILE)
-        return sibling if os.path.isfile(sibling) else None
-    if os.path.isdir(local_source):
-        direct = os.path.join(local_source, _CONFIG_FILE)
-        if os.path.isfile(direct):
-            return direct
-        # A run root may point at a future checkpoint layout that also persists
-        # config.json.  Do not resolve or read training state just to find it.
-        candidates = []
-        for pointer in glob.glob(os.path.join(local_source, "*-latest")):
-            candidate = os.path.join(os.path.realpath(pointer), _CONFIG_FILE)
-            if os.path.isfile(candidate):
-                candidates.append(candidate)
-        if len(set(candidates)) == 1:
-            return candidates[0]
-        return None
-    if _looks_like_local_path(raw_source):
-        return None
-    # A non-local warm-start source is an HF repository. Its config is the best
-    # architecture contract unless the run supplies an explicit config source.
-    return raw_source
-
-
-def _target_text_config(config: "PretrainedConfig") -> "PretrainedConfig":
-    return getattr(config, "text_config", config)
-
-
-def _serializable_config_value(value: Any) -> Any:
-    try:
-        import torch
-
-        if isinstance(value, torch.dtype):
-            return str(value).replace("torch.", "")
-    except ImportError:
-        pass
-    return value
-
-
-def _generate_draft_config(
-    cfg: "Config", provider: "DraftConfigProvider"
-) -> "PretrainedConfig":
-    defaults = provider.target_defaults
-    if defaults is None:
-        raise ValueError(
-            f"training.strategy={cfg.training.strategy!r} requires "
-            "model.draft_model_config "
-            "or a pretrained model.draft_checkpoint_path containing config.json"
-        )
-
-    from specforge.modeling.target.target_utils import (
-        load_target_config,
-        target_text_config,
-        target_vocab_size,
-    )
-
-    target_config = load_target_config(
-        cfg.model.target_model_path,
-        cache_dir=cfg.model.cache_dir,
-        trust_remote_code=cfg.model.trust_remote_code,
-    )
-    target_config = target_text_config(target_config)
-    payload: Dict[str, Any] = {}
-    for field in _TARGET_ARCHITECTURE_FIELDS:
-        value = getattr(target_config, field, None)
-        if value is not None:
-            payload[field] = _serializable_config_value(value)
-    payload["vocab_size"] = target_vocab_size(target_config)
-
-    required = [name for name in ("vocab_size", "hidden_size") if name not in payload]
-    if required:
-        raise ValueError(
-            f"target config {cfg.model.target_model_path!r} cannot generate a "
-            f"draft config; missing {required}"
-        )
-    payload["architectures"] = [provider.architecture]
-    payload["model_type"] = defaults.model_type
-    payload["num_hidden_layers"] = defaults.num_hidden_layers
-    payload["tie_word_embeddings"] = False
-    payload["use_cache"] = True
-    if payload.get("pad_token_id") is None:
-        payload["pad_token_id"] = 0
-    if defaults.draft_vocab_size is not None:
-        payload["draft_vocab_size"] = defaults.draft_vocab_size
-    if defaults.populate is not None:
-        defaults.populate(payload, target_config, cfg)
-    from specforge.modeling.draft.config import AutoDraftConfig
-
-    return AutoDraftConfig.from_dict(payload)
-
-
-def _apply_draft_overrides(
-    cfg: "Config",
-    draft_config: "PretrainedConfig",
-    provider: "DraftConfigProvider",
-) -> None:
-    num_layers = cfg.model.draft_num_hidden_layers
-    if num_layers is not None:
-        draft_config.num_hidden_layers = num_layers
-    if cfg.model.draft_block_size is not None:
-        draft_config.block_size = cfg.model.draft_block_size
-    if provider.apply_overrides is not None:
-        provider.apply_overrides(cfg, draft_config)
-
-
 def resolve_draft_config(
     cfg: "Config", *, provider: "DraftConfigProvider"
-) -> "PretrainedConfig":
+) -> "DraftModelConfig":
     """Resolve and validate the draft architecture for one typed run config."""
 
-    from specforge.modeling.draft.config import AutoDraftConfig
+    from specforge.config.draft import AutoDraftConfig
 
-    source = cfg.model.draft_model_config
-    if not source:
-        source = _checkpoint_config_source(cfg.model.draft_checkpoint_path)
-    if source:
-        draft_config = AutoDraftConfig.from_pretrained(
-            source,
-            cache_dir=cfg.model.cache_dir,
-            trust_remote_code=cfg.model.trust_remote_code,
+    payload = cfg.model.draft_model_config
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(
+            "model.draft_model_config must be a non-empty inline mapping; "
+            "checkpoint and target configs never supply draft settings"
         )
-    else:
-        draft_config = _generate_draft_config(cfg, provider)
+    draft_config = AutoDraftConfig.from_inline(
+        {**payload, "_attn_implementation": cfg.training.attention_backend}
+    )
 
     expected = provider.architecture
     compatible = provider.compatible_architectures or frozenset({expected})
@@ -232,7 +80,7 @@ def resolve_draft_config(
             f"training.strategy={cfg.training.strategy!r} requires draft "
             f"architecture in {sorted(compatible)!r}, got {architectures!r}"
         )
-    _apply_draft_overrides(cfg, draft_config, provider)
+    AutoDraftConfig.validate_training_config(draft_config)
     return draft_config
 
 
@@ -312,7 +160,7 @@ def _runtime_state_file(source: str) -> Optional[str]:
 
 
 def _load_specforge_draft_state(
-    state_path: str, *, expected_strategy: str
+    state_path: str, *, expected_strategy: str, draft_config: "DraftModelConfig"
 ) -> Dict[str, Any]:
     import torch
 
@@ -336,18 +184,51 @@ def _load_specforge_draft_state(
             f"warm-start checkpoint {state_path} was written by strategy "
             f"{saved_strategy!r}; this run trains {expected_strategy!r}"
         )
+    from specforge.algorithms.common.providers import MODEL_PROVENANCE_CONTRACT_KEY
+    from specforge.config.draft import AutoDraftConfig
+    from specforge.config.draft.contract import (
+        draft_config_contract,
+        validate_draft_config_contract,
+    )
+
+    provenance = dict(state.get(MODEL_PROVENANCE_CONTRACT_KEY) or {})
+    saved = provenance.get("draft_settings")
+    if saved is None:
+        # Older checkpoints may keep a sibling config.json. Read it only for
+        # validation, never as an initialization source.
+        source = os.path.join(os.path.dirname(state_path), _CONFIG_FILE)
+        if not os.path.isfile(source):
+            raise ValueError(
+                f"checkpoint {state_path!r} has no saved draft settings; "
+                "provide its original config.json next to training_state.pt"
+            )
+        saved = draft_config_contract(AutoDraftConfig.from_pretrained(source))
+    validate_draft_config_contract(
+        draft_config_contract(draft_config), saved, source=state_path
+    )
     return state["draft_state_dict"]
 
 
 def _load_pretrained_draft_state(
     source: str,
     *,
-    draft_config: "PretrainedConfig",
+    draft_config: "DraftModelConfig",
     cache_dir: Optional[str],
     trust_remote_code: bool,
 ) -> Dict[str, Any]:
+    from specforge.config.draft import AutoDraftConfig
+    from specforge.config.draft.contract import (
+        draft_config_contract,
+        validate_draft_config_contract,
+    )
     from specforge.modeling.auto import AutoDraftModel
 
+    saved = AutoDraftConfig.from_pretrained(
+        source, cache_dir=cache_dir, trust_remote_code=trust_remote_code
+    )
+    validate_draft_config_contract(
+        draft_config_contract(draft_config), draft_config_contract(saved), source=source
+    )
     loaded, loading_info = AutoDraftModel.from_pretrained(
         source,
         config=draft_config,
@@ -355,6 +236,11 @@ def _load_pretrained_draft_state(
         trust_remote_code=trust_remote_code,
         output_loading_info=True,
     )
+    unexpected = loading_info.get("unexpected_keys") or []
+    if unexpected:
+        raise ValueError(
+            f"warm-start checkpoint {source!r} has unexpected draft weights: {unexpected}"
+        )
     missing_from_source = set(loading_info.get("missing_keys") or [])
     state = {
         key: value.detach().cpu()
@@ -369,7 +255,7 @@ def warm_start_draft_model(
     model: Any,
     source: str,
     *,
-    draft_config: "PretrainedConfig",
+    draft_config: "DraftModelConfig",
     strategy: str,
     allow_missing_embedding: bool = False,
     cache_dir: Optional[str] = None,
@@ -380,7 +266,9 @@ def warm_start_draft_model(
     runtime_state = _runtime_state_file(source)
     if runtime_state is not None:
         checkpoint_format: Literal["specforge", "pretrained"] = "specforge"
-        state = _load_specforge_draft_state(runtime_state, expected_strategy=strategy)
+        state = _load_specforge_draft_state(
+            runtime_state, expected_strategy=strategy, draft_config=draft_config
+        )
     else:
         checkpoint_format = "pretrained"
         state = _load_pretrained_draft_state(

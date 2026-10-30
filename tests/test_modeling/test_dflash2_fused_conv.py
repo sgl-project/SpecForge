@@ -424,10 +424,10 @@ class DFlash2FusedConvModelParityTest(unittest.TestCase):
     def _inputs(self, model, batch_size, dtype, *, layer_only):
         config = model.config
         context_length = 13
-        draft_length = 3 * model.block_size
+        draft_length = 3 * model.config.block_size
         # The decoder layer consumes the already projected target context.
         context_width = config.hidden_size * (
-            1 if layer_only else len(model.target_layer_ids)
+            1 if layer_only else len(model.config.dflash_config["target_layer_ids"])
         )
         noise = torch.randn(batch_size, draft_length, config.hidden_size)
         context = torch.randn(batch_size, context_length, context_width)

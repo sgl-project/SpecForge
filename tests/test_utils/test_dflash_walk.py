@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
+from transformers import Qwen3Config
 
 from specforge.algorithms.common import dflash_family_model as family_model
 from specforge.modeling.draft.dflash import DFlashDraftModel
@@ -58,34 +59,45 @@ def _make_case(kind):
         ),
     }[family]
     shifted = kind == "domino_shifted"
-    config = SimpleNamespace(hidden_size=8, vocab_size=8, initializer_range=0.02)
+    config = Qwen3Config(
+        hidden_size=8,
+        intermediate_size=16,
+        vocab_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        num_target_layers=4,
+        block_size=4,
+        initializer_range=0.02,
+    )
     config.dflash_config = dict(
+        mask_token_id=0,
+        conv_kernel_size=2,
+        conv_group_size=4,
         selector_rank=2,
         selector_top_k=2,
         emb_dim=4,
         gru_hidden_dim=4,
         shift_label=shifted,
         markov_rank=4 if "_" in kind else 0,
-        markov_head_type=kind.split("_")[-1],
+        markov_head_type=kind.split("_")[-1] if "_" in kind else "vanilla",
     )
     # Only the backbone output is fixed; all auxiliary heads are production modules.
     draft = draft_class.__new__(draft_class)
     nn.Module.__init__(draft)
-    draft.config, draft.block_size = config, 4
-    draft._init_draft_head(config, config.dflash_config)
+    options = draft_class.draft_options_class.from_model_config(config)
+    draft.config = options.to_model_config(config)
+    draft._init_draft_head(draft.config, draft.config.dflash_config)
     options = (
         dict(dspark_l1_loss_alpha=0, dspark_confidence_head_alpha=0)
         if family == "dspark"
         else {}
     )
-    if family == "domino":
-        options["shift_label"] = shifted
     model = wrapper(
         draft,
         nn.Identity(),
         nn.Embedding(8, 8),
-        0,
-        block_size=4,
         attention_backend="sdpa",
         **options,
     ).double()
@@ -235,7 +247,7 @@ def _check_causal_heads_match_serving_prefixes(case, dtype):
             labels[..., corrupt_at] = (labels[..., corrupt_at] + 1) % 8
         if case.family == "domino":
             clean = torch.cat((anchor_ids.unsqueeze(-1), labels), dim=-1)
-            if model.shift_label:
+            if model.draft_model.config.dflash_config["shift_label"]:
                 targets = torch.cat((labels, torch.zeros_like(labels[..., :1])), dim=-1)
                 prev = clean
             else:

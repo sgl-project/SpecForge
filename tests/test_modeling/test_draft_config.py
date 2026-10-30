@@ -10,8 +10,8 @@ from unittest import mock
 import torch
 from transformers import LlamaConfig, PretrainedConfig, Qwen3Config
 
+from specforge.config.draft import AutoDraftConfig
 from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
-from specforge.modeling.draft.config import AutoDraftConfig
 from specforge.modeling.draft.registry import DRAFT_REGISTRY
 
 
@@ -125,6 +125,7 @@ class DraftConfigTest(unittest.TestCase):
             "architectures": ["DFlashDraftModel"],
             "model_type": "unregistered_remote_model",
             "auto_map": {"AutoConfig": "remote.CustomConfig"},
+            "_commit_hash": "test-commit",
         }
         with mock.patch.object(
             PretrainedConfig, "get_config_dict", return_value=(payload, {})
@@ -138,6 +139,8 @@ class DraftConfigTest(unittest.TestCase):
                 trust_remote_code=True,
             )
         self.assertIsInstance(config, Qwen3Config)
+        self.assertEqual(config._name_or_path, "org/draft")
+        self.assertEqual(config._commit_hash, "test-commit")
         self.assertEqual(hub.call_args.kwargs["revision"], "test-revision")
         self.assertEqual(hub.call_args.kwargs["subfolder"], "draft")
         self.assertTrue(hub.call_args.kwargs["local_files_only"])

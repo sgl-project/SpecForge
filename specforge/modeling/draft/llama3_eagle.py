@@ -1,5 +1,6 @@
 import math
 import warnings
+from collections.abc import Mapping
 from typing import List, Optional, Tuple
 
 import torch
@@ -9,8 +10,9 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
-from transformers.models.llama.configuration_llama import LlamaConfig
 
+from specforge.config.draft import AutoDraftConfig
+from specforge.config.draft.eagle3 import Eagle3Config, EaglePretrainedConfig
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
@@ -503,7 +505,7 @@ class LlamaAttention(nn.Module):
         else:
 
             def rope_get(key, default=None):
-                if isinstance(rope_scaling, dict):
+                if isinstance(rope_scaling, Mapping):
                     return rope_scaling.get(key, default)
                 return getattr(rope_scaling, key, default)
 
@@ -1576,33 +1578,30 @@ class LlamaDecoderLayer(nn.Module):
 @register_draft
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
-    config_class = LlamaConfig
+    config_class = EaglePretrainedConfig
+    draft_options_class = Eagle3Config
 
-    def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
-        super().__init__(config)
-        self.config = config
+    def __init__(self, config, quant_config=None) -> None:
+        config = AutoDraftConfig.resolve(config, architecture=type(self).__name__)
+        super().__init__(config.to_hf_config())
         self.quant_config = quant_config
 
-        self.vocab_size = config.vocab_size
-        self.draft_vocab_size = config.draft_vocab_size
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
-
-        self.target_hidden_size = getattr(
-            config, "target_hidden_size", config.hidden_size
+        self.midlayer = LlamaDecoderLayer(
+            config, attention_backend=config._attn_implementation
         )
 
         self.fc = torch.nn.Linear(
-            self.target_hidden_size * 3,
+            config.target_hidden_size * 3,
             config.hidden_size,
             bias=False,
         )
-        if getattr(config, "fc_norm", False):
+        if config.fc_norm:
             self.fc_norm = nn.ModuleList(
                 [
-                    LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps)
+                    LlamaRMSNorm(config.target_hidden_size, eps=config.rms_norm_eps)
                     for _ in range(3)
                 ]
             )
@@ -1610,18 +1609,18 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_output = getattr(config, "norm_output", False)
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
 
         # create vocab buffers
-        t2d = torch.ones(self.vocab_size, dtype=torch.bool)
-        d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
+        t2d = torch.ones(self.config.vocab_size, dtype=torch.bool)
+        d2t = torch.zeros(self.config.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
         self.post_init()
+        self.config = config
 
     def forward(
         self,
@@ -1682,7 +1681,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.embed_tokens(input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert hidden_states.size(-1) == self.target_hidden_size * 3
+        assert hidden_states.size(-1) == self.config.target_hidden_size * 3
         if self.fc_norm is not None:
             chunks = hidden_states.chunk(3, dim=-1)
             hidden_states = torch.cat(
@@ -1693,7 +1692,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(
-            hidden_states if self.norm_output else self.norm(hidden_states)
+            hidden_states if self.config.norm_output else self.norm(hidden_states)
         )
 
     def backbone(
@@ -1716,4 +1715,4 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             output_attentions=False,
             use_cache=False,
         )
-        return self.norm(hidden_states) if self.norm_output else hidden_states
+        return self.norm(hidden_states) if self.config.norm_output else hidden_states

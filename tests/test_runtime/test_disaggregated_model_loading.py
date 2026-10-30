@@ -12,6 +12,7 @@ from specforge.training.capture_contract import (
     resolve_server_capture_contract,
 )
 from specforge.training.disaggregated import _producer_capture_metadata
+from tests.draft_config_utils import draft_settings
 
 
 def _config(*, strategy="dflash", **model_overrides):
@@ -19,6 +20,7 @@ def _config(*, strategy="dflash", **model_overrides):
         {
             "model": {
                 "target_model_path": "target/model",
+                "draft_model_config": draft_settings(strategy),
                 "target_backend": "sglang",
                 **model_overrides,
             },
@@ -44,7 +46,7 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
     def test_capture_contract_uses_canonical_draft_config_sources(self):
         configs = (
             _config(),
-            _config(draft_model_config="org/dflash-config"),
+            _config(draft_model_config=draft_settings("dflash")),
             _config(draft_checkpoint_path="org/dflash-weights"),
         )
         draft_payload = {
@@ -106,9 +108,7 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
         )
 
     def test_domino_uses_the_dflash_server_capture_method(self):
-        resolved = resolve_run(
-            _config(strategy="domino", draft_model_config="domino-draft")
-        )
+        resolved = resolve_run(_config(strategy="domino"))
         draft_payload = {
             "architectures": ["DominoDraftModel"],
             "vocab_size": 128,
@@ -136,9 +136,7 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
         self.assertEqual(contract.aux_layer_ids, (3, 7))
 
     def test_dspark_uses_its_dedicated_server_capture_method(self):
-        resolved = resolve_run(
-            _config(strategy="dspark", draft_model_config="dspark-draft")
-        )
+        resolved = resolve_run(_config(strategy="dspark"))
         draft_payload = {
             "architectures": ["DSparkDraftModel"],
             "vocab_size": 128,

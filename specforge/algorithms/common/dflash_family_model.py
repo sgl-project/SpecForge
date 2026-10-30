@@ -248,8 +248,6 @@ class OnlineDFlashModel(nn.Module):
         draft_model: DFlashDraftModel,
         target_lm_head: nn.Module,
         target_embed_tokens: nn.Module,
-        mask_token_id: int,
-        block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
@@ -293,8 +291,6 @@ class OnlineDFlashModel(nn.Module):
         self.draft_model = draft_model
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
-        self.block_size = block_size
-        self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
@@ -378,18 +374,24 @@ class OnlineDFlashModel(nn.Module):
         """Create absolute position IDs for parallel draft blocks."""
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        offsets = torch.arange(self.draft_model.config.block_size, device=device).view(
+            1, 1, -1
+        )
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
+        draft_config = self.draft_model.config
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
-        bs = self.block_size
+        bs = draft_config.block_size
         device = input_ids.device
 
         noise_ids = torch.full(
-            (bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device
+            (bsz, n * bs),
+            draft_config.dflash_config["mask_token_id"],
+            dtype=torch.long,
+            device=device,
         )
 
         block_starts = torch.arange(n, device=device) * bs
@@ -401,7 +403,7 @@ class OnlineDFlashModel(nn.Module):
         flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
         # masked_fill with a scalar avoids a pageable H2D copy per microbatch.
         noise_ids[flat_batch_idx, block_starts] = anchor_tokens.masked_fill(
-            ~block_keep_mask, self.mask_token_id
+            ~block_keep_mask, draft_config.dflash_config["mask_token_id"]
         )
 
         return self.embed_tokens(noise_ids)
@@ -559,6 +561,7 @@ class OnlineDFlashModel(nn.Module):
         sequence_length: int,
     ):
         """Build training masks from the draft's layout and causal configuration."""
+        draft_config = self.draft_model.config
         mask_builder = (
             create_dflash_block_mask
             if self.attention_backend == "flex_attention"
@@ -568,7 +571,7 @@ class OnlineDFlashModel(nn.Module):
             "anchor_positions": anchor_positions,
             "block_keep_mask": block_keep_mask,
             "S": sequence_length,
-            "block_size": self.block_size,
+            "block_size": draft_config.block_size,
             "device": anchor_positions.device,
             "is_causal": getattr(
                 getattr(self.draft_model, "config", None), "is_causal", None
@@ -580,14 +583,14 @@ class OnlineDFlashModel(nn.Module):
         ):
             # FLASH requires a minimum of this block size.
             mask_args["BLOCK_SIZE"] = (256, 128)
-        sliding_window = self.draft_model.sliding_window
+        sliding_window = draft_config.sliding_window
         if sliding_window is None:
             dflash_attn_mask = mask_builder(**mask_args)
         else:
             # Build only the masks the draft's layers consume; an all-sliding
             # draft never reads the full mask. Drafts that do not expose their
             # layer layout receive both.
-            layer_types = getattr(self.draft_model, "layer_types", None)
+            layer_types = draft_config.layer_types
             dflash_attn_mask = {}
             if layer_types is None or "full_attention" in layer_types:
                 dflash_attn_mask["full_attention"] = mask_builder(**mask_args)
@@ -800,7 +803,9 @@ class OnlineDFlashModel(nn.Module):
 
         target_probability = torch.exp(-neg_log_q)
         slot_positions = torch.arange(
-            self.block_size - block_size, self.block_size, device=hidden.device
+            self.draft_model.config.block_size - block_size,
+            self.draft_model.config.block_size,
+            device=hidden.device,
         )
         loss_weights = self._dflash_loss_weights(
             target_probability,
@@ -1295,6 +1300,7 @@ class OnlineDFlashModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
+        draft_config = self.draft_model.config
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
@@ -1310,7 +1316,9 @@ class OnlineDFlashModel(nn.Module):
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
-        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
+        label_offsets = torch.arange(0, draft_config.block_size, device=device).view(
+            1, 1, -1
+        )
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
@@ -1327,11 +1335,15 @@ class OnlineDFlashModel(nn.Module):
 
         # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
         weight_mask = (
-            block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
+            block_keep_mask.unsqueeze(-1)
+            .expand(-1, -1, draft_config.block_size)
+            .float()
         )
         weight_mask = weight_mask * valid_label_mask.float()
 
-        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        pos_in_block = torch.arange(draft_config.block_size, device=device).view(
+            1, 1, -1
+        )
         weight_mask = weight_mask * (pos_in_block > 0).float()
 
         original_loss_mask_gathered = torch.gather(
@@ -1344,7 +1356,7 @@ class OnlineDFlashModel(nn.Module):
         hidden_4d = output_hidden.reshape(
             bsz,
             anchor_positions.shape[1],
-            self.block_size,
+            draft_config.block_size,
             -1,
         )
         aligned_target_hidden = (
@@ -1391,7 +1403,7 @@ class OnlineDFlashModel(nn.Module):
             predecessor_ids,
             sequence_anchor_scale,
         )
-        if self.block_size > 1:
+        if draft_config.block_size > 1:
             # Slot 0 is the clean, zero-weight anchor in DFlash objectives.
             # Skip its projection for every backend; diagnostics above retain it.
             # Keep the single-slot case nonempty so a zero loss retains its graph.
@@ -1620,13 +1632,10 @@ class OnlineDominoModel(OnlineDFlashModel):
         draft_model: DFlashDraftModel,
         target_lm_head: nn.Module,
         target_embed_tokens: nn.Module,
-        mask_token_id: int,
-        block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
         objective_chunk_blocks: int = 128,
-        shift_label: bool = False,
         objective_checkpointing: bool = True,
         fused_logits_loss: bool = True,
     ):
@@ -1634,8 +1643,6 @@ class OnlineDominoModel(OnlineDFlashModel):
             draft_model=draft_model,
             target_lm_head=target_lm_head,
             target_embed_tokens=target_embed_tokens,
-            mask_token_id=mask_token_id,
-            block_size=block_size,
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
@@ -1644,7 +1651,6 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_type="dflash",
             fused_logits_loss=fused_logits_loss,
         )
-        self.shift_label = shift_label
 
     def _build_domino_head_inputs(
         self,
@@ -1657,9 +1663,9 @@ class OnlineDominoModel(OnlineDFlashModel):
         hidden4d = output_hidden.reshape(bsz, n, bs, output_hidden.shape[-1])
 
         prev_ids = target_ids
-        if self.shift_label:
+        if self.draft_model.config.dflash_config["shift_label"]:
             prev_offsets = torch.arange(
-                0, self.block_size, device=input_ids.device
+                0, self.draft_model.config.block_size, device=input_ids.device
             ).view(1, 1, -1)
             prev_indices = (anchor_positions.unsqueeze(-1) + prev_offsets).clamp(
                 max=input_ids.size(1) - 1
@@ -1688,7 +1694,11 @@ class OnlineDominoModel(OnlineDFlashModel):
 
         block_size = hidden.shape[2]
         base_logits = self._project_logits(hidden)
-        head_token_ids = prev_ids if self.shift_label else target_ids
+        head_token_ids = (
+            prev_ids
+            if self.draft_model.config.dflash_config["shift_label"]
+            else target_ids
+        )
         head_token_embeddings = self.embed_tokens(head_token_ids)
         correction_logits = self.draft_model.compute_correction_logits(
             hidden_states=hidden,
@@ -1732,7 +1742,11 @@ class OnlineDominoModel(OnlineDFlashModel):
             accept_num = ((accepted + 1.0) * valid_blocks).sum()
             base_accept_num = ((base_accepted + 1.0) * valid_blocks).sum()
             accept_den = valid_blocks.sum()
-            acceptance_slice = slice(None, -1) if self.shift_label else slice(1, None)
+            acceptance_slice = (
+                slice(None, -1)
+                if self.draft_model.config.dflash_config["shift_label"]
+                else slice(1, None)
+            )
             # Before the first rejection, teacher-forced and generated histories agree.
             walk_accepted, base_walk_accepted = (
                 _scatter_accepted_prefix(
@@ -1769,6 +1783,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         collect_detailed_metrics: bool = True,
     ):
         """Parallel Domino training forward pass."""
+        draft_config = self.draft_model.config
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
@@ -1783,9 +1798,9 @@ class OnlineDominoModel(OnlineDFlashModel):
             max_valid_anchors=max_valid_anchors,
         )
 
-        label_start = 1 if self.shift_label else 0
+        label_start = 1 if draft_config.dflash_config["shift_label"] else 0
         label_offsets = torch.arange(
-            label_start, label_start + self.block_size, device=device
+            label_start, label_start + draft_config.block_size, device=device
         ).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
@@ -1805,12 +1820,16 @@ class OnlineDominoModel(OnlineDFlashModel):
             output_hidden=output_hidden,
         )
         weight_mask = (
-            block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
+            block_keep_mask.unsqueeze(-1)
+            .expand(-1, -1, draft_config.block_size)
+            .float()
         )
         weight_mask = weight_mask * valid_label_mask.float()
 
-        if not self.shift_label:
-            pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        if not draft_config.dflash_config["shift_label"]:
+            pos_in_block = torch.arange(draft_config.block_size, device=device).view(
+                1, 1, -1
+            )
             weight_mask = weight_mask * (pos_in_block > 0).float()
 
         original_loss_mask_gathered = torch.gather(
@@ -1823,8 +1842,8 @@ class OnlineDominoModel(OnlineDFlashModel):
         eval_weight_mask = weight_mask.clone()
 
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            offset = 0 if self.shift_label else 1
+            k = torch.arange(draft_config.block_size, device=device).view(1, 1, -1)
+            offset = 0 if draft_config.dflash_config["shift_label"] else 1
             decay_weights = torch.exp(
                 -(k - offset).clamp(min=0).float() / self.loss_decay_gamma
             )
@@ -1884,7 +1903,11 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_den.detach(),
         )
         if collect_detailed_metrics:
-            acceptance_slice = slice(None, -1) if self.shift_label else slice(1, None)
+            acceptance_slice = (
+                slice(None, -1)
+                if draft_config.dflash_config["shift_label"]
+                else slice(1, None)
+            )
             block_valid = (eval_weight_mask[..., acceptance_slice] > 0).any(dim=-1)
             metrics["ratio_metrics"] = {
                 f"domino/{head}/walk_accepted_length": compute_walk_accepted_length_terms(
@@ -1907,8 +1930,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         draft_model: DFlashDraftModel,
         target_lm_head: nn.Module,
         target_embed_tokens: nn.Module,
-        mask_token_id: int,
-        block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
@@ -1923,8 +1944,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_model=draft_model,
             target_lm_head=target_lm_head,
             target_embed_tokens=target_embed_tokens,
-            mask_token_id=mask_token_id,
-            block_size=block_size,
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
@@ -1953,9 +1972,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         seq_len = input_ids.shape[1]
         device = input_ids.device
-        label_offsets = torch.arange(1, self.block_size + 1, device=device).view(
-            1, 1, -1
-        )
+        label_offsets = torch.arange(
+            1, self.draft_model.config.block_size + 1, device=device
+        ).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
         safe_label_indices = torch.where(
@@ -1986,9 +2005,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
     ) -> torch.Tensor:
         loss_weight_mask = eval_mask.to(torch.float32)
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            positions = torch.arange(self.block_size, device=eval_mask.device).view(
-                1, 1, -1
-            )
+            positions = torch.arange(
+                self.draft_model.config.block_size, device=eval_mask.device
+            ).view(1, 1, -1)
             decay_weights = torch.exp(-positions.float() / float(self.loss_decay_gamma))
             loss_weight_mask = loss_weight_mask * decay_weights
         return loss_weight_mask

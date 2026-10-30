@@ -267,17 +267,15 @@ def _compute_model_resume_provenance(
     *,
     capture_layers: Optional[list[int]],
 ) -> dict[str, Any]:
-    draft_source = cfg.model.draft_model_config or getattr(
-        draft_config,
-        "_name_or_path",
-        None,
-    )
+    from specforge.config.draft.contract import draft_config_contract
+
     return {
         MODEL_SOURCE_IDENTITY_FORMAT_FIELD: MODEL_SOURCE_IDENTITY_FORMAT,
         "target_model": model_source_identity(cfg.model.target_model_path),
         "target_revision": getattr(target_config, "_commit_hash", None),
-        "draft_config": model_source_identity(draft_source),
-        "draft_revision": getattr(draft_config, "_commit_hash", None),
+        "draft_config": None,
+        "draft_settings": draft_config_contract(draft_config),
+        "draft_revision": None,
         "vocab_mapping": model_source_identity(cfg.model.vocab_mapping_path or None),
         "embedding_key": cfg.model.embedding_key,
         "lm_head_key": cfg.model.lm_head_key,

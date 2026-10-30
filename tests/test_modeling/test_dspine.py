@@ -3,6 +3,7 @@
 import copy
 import math
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -15,12 +16,13 @@ from torch.nn.attention.flex_attention import create_block_mask
 from transformers import Qwen3Config
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
-from specforge.algorithms.dspine.model import OnlineDSpineModel
+from specforge.algorithms.dspine.model import OnlineDSpineModel, replacement_schedule
 from specforge.config import Config
+from specforge.config.draft.dspine import DSpineConfig
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
-from specforge.modeling.draft.dspine import DSpineConfig, DSpineDraftModel
+from specforge.modeling.draft.dspine import DSpineDraftModel
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import StepContext
 
@@ -45,9 +47,9 @@ def tiny_config(head_dim=4, **options):
     )
 
 
-def initialized_model(**options):
+def initialized_model(config=None, **options):
     torch.manual_seed(17)
-    model = DSpineDraftModel(tiny_config(**options))
+    model = DSpineDraftModel(config if config is not None else tiny_config(**options))
     head = torch.randn(32, 16)
     model.initialize_transfer_space(head, chunk_size=7)
     return model, head
@@ -80,8 +82,8 @@ def forward_inputs(model):
     )
 
 
-def training_model(chunk_size=0, head_dim=4):
-    draft, head_weight = initialized_model(head_dim=head_dim)
+def training_model(chunk_size=0, head_dim=4, **options):
+    draft, head_weight = initialized_model(head_dim=head_dim, **options)
     head = nn.Linear(16, 32, bias=False)
     head.weight.data.copy_(head_weight)
     with torch.no_grad():
@@ -91,8 +93,6 @@ def training_model(chunk_size=0, head_dim=4):
         draft_model=draft,
         target_lm_head=head,
         target_embed_tokens=nn.Embedding(32, 16),
-        mask_token_id=31,
-        block_size=4,
         num_anchors=4,
         attention_backend="sdpa",
         objective_chunk_blocks=chunk_size,
@@ -239,16 +239,17 @@ class DSpineTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(hidden.grad).all())
 
     def test_shared_masks_preserve_causal_visibility(self):
-        model = training_model()
         anchors = torch.tensor([[2, 5], [1, 4]])
         keep = torch.tensor([[True, True], [True, False]])
         for window in (None, 3):
-            model.draft_model.sliding_window = window
-            model.draft_model.layer_types = (
-                ["full_attention", "sliding_attention"]
+            config = tiny_config()
+            config.sliding_window = window
+            config.layer_types = (
+                ["full_attention", "sliding_attention", "full_attention"]
                 if window
-                else ["full_attention"]
+                else ["full_attention"] * 3
             )
+            model = training_model(config=config)
             for backend in ("sdpa", "flex_attention"):
                 with (
                     self.subTest(window=window, backend=backend),
@@ -262,7 +263,9 @@ class DSpineTest(unittest.TestCase):
                     masks = model._attention_mask(anchors, keep, 7)
                     if window is None:
                         masks = {"full_attention": masks}
-                    self.assertEqual(set(masks), set(model.draft_model.layer_types))
+                    self.assertEqual(
+                        set(masks), set(model.draft_model.config.layer_types)
+                    )
                     for layer_type, mask in masks.items():
                         expected = create_dflash_sdpa_mask(
                             anchors,
@@ -338,14 +341,15 @@ class DSpineTest(unittest.TestCase):
 
     def test_schedules_reach_the_paper_endpoints(self):
         options = DSpineConfig()
-        self.assertEqual(options.schedule(0, 600), (0, 0.5))
-        self.assertEqual(options.schedule(100, 600)[1], 0.5)
+        self.assertEqual(replacement_schedule(asdict(options), 0, 600), (0, 0.5))
+        self.assertEqual(replacement_schedule(asdict(options), 100, 600)[1], 0.5)
         self.assertLessEqual(
-            abs(options.schedule(150, 600)[1] - 0.25), max(1e-12, 1e-06 * abs(0.25))
+            abs(replacement_schedule(asdict(options), 150, 600)[1] - 0.25),
+            max(1e-12, 1e-06 * abs(0.25)),
         )
-        self.assertEqual(options.schedule(200, 600)[1], 0)
-        self.assertEqual(options.schedule(146, 600)[0], 0.5)
-        self.assertEqual(options.schedule(0, None)[1], 0)
+        self.assertEqual(replacement_schedule(asdict(options), 200, 600)[1], 0)
+        self.assertEqual(replacement_schedule(asdict(options), 146, 600)[0], 0.5)
+        self.assertEqual(replacement_schedule(asdict(options), 0, None)[1], 0)
 
     def test_chunked_objective_matches_full_loss_and_all_parameter_gradients(self):
         for chunk_size in [1, 3]:
@@ -468,7 +472,7 @@ class DSpineTest(unittest.TestCase):
                     model=dict(
                         target_model_path=str(tmp_path),
                         torch_dtype="float32",
-                        mask_token_id=31,
+                        draft_model_config=tiny_config().to_dict(),
                     ),
                     data=dict(hidden_states_path=str(tmp_path / "features")),
                     training=dict(

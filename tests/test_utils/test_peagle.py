@@ -19,6 +19,7 @@ from specforge.training.model_utils import resolve_mask_token_id
 class TestPEagleTrainingSemantics(unittest.TestCase):
     def _tiny_config(self):
         return LlamaConfig(
+            mask_token_id=0,
             vocab_size=32,
             draft_vocab_size=16,
             hidden_size=16,
@@ -56,7 +57,9 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
     def test_online_wrapper_uses_draft_model_mask_hidden(self):
         config = self._tiny_config()
         draft_model = PEagleDraftModel(config)
-        wrapper = OnlinePEagleModel(draft_model=draft_model, mask_token_id=0)
+        wrapper = OnlinePEagleModel(
+            draft_model=draft_model,
+        )
 
         self.assertIs(wrapper.draft_model.mask_hidden, draft_model.mask_hidden)
         self.assertNotIn("mask_hidden", dict(wrapper.named_parameters(recurse=False)))
@@ -69,7 +72,8 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
 
     def test_norm_before_residual_round_trips_through_config(self):
         config = self._tiny_config()
-        model = PEagleDraftModel(config, norm_before_residual=True)
+        config.norm_before_residual = True
+        model = PEagleDraftModel(config)
 
         self.assertTrue(model.config.norm_before_residual)
         with tempfile.TemporaryDirectory() as output_dir:
@@ -80,8 +84,8 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
         for reloaded in (direct, automatic):
             self.assertIsInstance(reloaded, PEagleDraftModel)
             self.assertTrue(reloaded.config.norm_before_residual)
-            self.assertTrue(reloaded.norm_before_residual)
-            self.assertTrue(reloaded.layers[0].norm_before_residual)
+            self.assertTrue(reloaded.config.norm_before_residual)
+            self.assertTrue(reloaded.layers[0].config.norm_before_residual)
 
     def test_compute_metrics_masks_targets_outside_draft_vocab(self):
         logits = torch.tensor(
@@ -190,7 +194,6 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
         config = self._tiny_config()
         wrapper = OnlinePEagleModel(
             draft_model=PEagleDraftModel(config),
-            mask_token_id=0,
         )
         input_ids = torch.ones(2, 4, dtype=torch.long)
 

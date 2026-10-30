@@ -43,8 +43,6 @@ def build_model(causal=True, backend="sdpa", device="cpu"):
         draft,
         head,
         embedding,
-        mask_token_id=63,
-        block_size=4,
         attention_backend=backend,
         num_anchors=2,
         dspark_confidence_head_alpha=0.0,

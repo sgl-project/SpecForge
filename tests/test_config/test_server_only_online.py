@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from specforge.application import resolve_run
 from specforge.config import Config
+from tests.draft_config_utils import draft_settings
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG_DIR = REPO_ROOT / "examples" / "configs"
@@ -22,7 +23,7 @@ def _online_payload(
     payload = {
         "model": {
             "target_model_path": "target",
-            "draft_model_config": "draft.json",
+            "draft_model_config": draft_settings("eagle3"),
             "vocab_mapping_path": "mapping.pt",
             "target_backend": backend,
             "input_modality": modality,
@@ -74,7 +75,7 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
             return {
                 "model": {
                     "target_model_path": "target",
-                    "draft_model_config": "draft.json",
+                    "draft_model_config": draft_settings("eagle3"),
                     "vocab_mapping_path": "mapping.pt",
                     "target_backend": backend,
                 },

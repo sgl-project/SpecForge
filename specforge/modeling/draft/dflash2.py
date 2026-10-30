@@ -23,6 +23,8 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen3.modeling_qwen3 import FlashAttentionKwargs, Qwen3Config
 from typing_extensions import Tuple, Unpack
 
+from specforge.config.draft.dflash2 import DFlash2Config
+
 from .dflash import DFlashDraftModel, Qwen3DFlashDecoderLayer
 from .dflash_kernels import DFlashKernels
 from .registry import register_draft
@@ -381,8 +383,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             # that pass; checkpoint loading can still overwrite these weights.
             nn.init.zeros_(module.kernel_projection.weight)
 
-    def _dflash2_config(self) -> dict:
-        return dict(getattr(self.config, "dflash_config", None) or {})
+    draft_options_class = DFlash2Config
 
     def _build_decoder_layer(
         self,
@@ -390,20 +391,13 @@ class DFlash2DraftModel(DFlashDraftModel):
         layer_idx: int,
         kernels: DFlashKernels,
     ) -> nn.Module:
-        method_config = dict(getattr(config, "dflash_config", None) or {})
-        taps = method_config.get("conv_kernel_size")
-        group_size = method_config.get("conv_group_size")
-        if not isinstance(taps, int) or isinstance(taps, bool):
-            raise ValueError(
-                "DFlash2DraftModel requires dflash_config.conv_kernel_size"
-            )
-        if not isinstance(group_size, int) or isinstance(group_size, bool):
-            raise ValueError("DFlash2DraftModel requires dflash_config.conv_group_size")
+        taps = config.dflash_config["conv_kernel_size"]
+        group_size = config.dflash_config["conv_group_size"]
 
         def grouped_conv() -> DFlashGroupedConv:
             return DFlashGroupedConv(
                 hidden_size=int(config.hidden_size),
-                block_size=self.block_size,
+                block_size=config.block_size,
                 taps=taps,
                 group_size=group_size,
             )
@@ -417,12 +411,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         )
 
     def _init_draft_head(self, config: Qwen3Config, dflash_config: dict) -> None:
-        selector_rank = dflash_config.get("selector_rank")
-        selector_top_k = dflash_config.get("selector_top_k")
-        if not isinstance(selector_rank, int) or isinstance(selector_rank, bool):
-            raise ValueError("DFlash2DraftModel requires dflash_config.selector_rank")
-        if not isinstance(selector_top_k, int) or isinstance(selector_top_k, bool):
-            raise ValueError("DFlash2DraftModel requires dflash_config.selector_top_k")
+        selector_rank = dflash_config["selector_rank"]
+        selector_top_k = dflash_config["selector_top_k"]
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
@@ -434,10 +424,9 @@ class DFlash2DraftModel(DFlashDraftModel):
     def unary_logits_transform_is_identity(self) -> bool:
         """Whether ``transform_unary_logits`` only upcasts to FP32."""
 
-        method_config = self._dflash2_config()
         return (
-            float(method_config.get("output_multiplier", 1.0)) == 1.0
-            and method_config.get("final_logit_softcapping") is None
+            self.config.dflash_config["output_multiplier"] == 1.0
+            and self.config.dflash_config["final_logit_softcapping"] is None
         )
 
     def transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
@@ -446,15 +435,9 @@ class DFlash2DraftModel(DFlashDraftModel):
         if self.unary_logits_transform_is_identity():
             # ``x * 1.0 == x`` bit for bit; skip the extra FP32 logit tensor.
             return logits.float()
-        method_config = self._dflash2_config()
-        transformed = logits.float() * float(
-            method_config.get("output_multiplier", 1.0)
-        )
-        softcap = method_config.get("final_logit_softcapping")
+        transformed = logits.float() * self.config.dflash_config["output_multiplier"]
+        softcap = self.config.dflash_config["final_logit_softcapping"]
         if softcap is not None:
-            softcap = float(softcap)
-            if softcap <= 0:
-                raise ValueError("DFlash2 final_logit_softcapping must be > 0")
             transformed = torch.tanh(transformed / softcap) * softcap
         return transformed
 
@@ -464,7 +447,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         draft_hidden: torch.Tensor,
         block_output_ids: torch.LongTensor,
     ) -> torch.LongTensor:
-        hidden = draft_hidden[:, -self.block_size + 1 :, :]
+        hidden = draft_hidden[:, -self.config.block_size + 1 :, :]
         unary_logits = self.transform_unary_logits(target.lm_head(hidden))
         unary_topk, candidate_ids = unary_logits.topk(
             self.candidate_selector.top_k,

@@ -7,12 +7,16 @@ must produce the same ``TrainingRun`` the CLI executes, and it must train.
 GPU-only. Run on the H200 box via rcli.
 """
 
+import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
+
+from tests.draft_config_utils import draft_settings
 
 CUDA = torch.cuda.is_available()
 
@@ -40,7 +44,10 @@ class TestCliConfigBuild(unittest.TestCase):
         run_config = {
             "model": {
                 "target_model_path": target_dir,
-                "draft_model_config": cfg_path,
+                "draft_model_config": {
+                    **json.loads(Path(cfg_path).read_text()),
+                    "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]},
+                },
                 "vocab_mapping_path": vocab_path,
                 # fixture target dir holds only the lm_head, not an embedding
                 "load_target_embedding": False,
@@ -91,7 +98,10 @@ class TestCliDispatch(unittest.TestCase):
 
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {
+                    "target_model_path": "t",
+                    "draft_model_config": draft_settings(),
+                },
                 "data": {"hidden_states_path": "/features"},
                 "training": {"strategy": "dflash"},
             }

@@ -74,8 +74,9 @@ class _RecordingDraftModel(nn.Module):
         self.config = SimpleNamespace(
             layer_types=["sliding_attention", "full_attention"],
             sliding_window=8,
+            block_size=4,
+            dflash_config=dict(mask_token_id=31, shift_label=False),
         )
-        self.sliding_window = 8
         self.attention_mask = None
 
     def forward(self, noise_embedding, attention_mask, **kwargs):
@@ -317,8 +318,6 @@ class TestDFlashMask(unittest.TestCase):
                     draft_model=draft_model,
                     target_lm_head=nn.Identity(),
                     target_embed_tokens=nn.Embedding(32, 8).to(self.device),
-                    mask_token_id=31,
-                    block_size=4,
                     attention_backend="sdpa",
                 )
                 with mock.patch.object(
@@ -445,8 +444,6 @@ class TestDFlashMask(unittest.TestCase):
                     draft_model=draft_model,
                     target_lm_head=nn.Identity(),
                     target_embed_tokens=nn.Embedding(32, 8).to(self.device),
-                    mask_token_id=31,
-                    block_size=4,
                     attention_backend="sdpa",
                 )
                 with mock.patch.object(
