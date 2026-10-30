@@ -128,11 +128,16 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
     if not isinstance(attention_mode, str) or attention_mode.lower() not in {
         "gqa",
         "mha",
+        "mla",
     }:
         raise ValueError(
-            "SGLang DFlash-family serving supports only GQA/MHA exports, "
+            "SGLang DFlash-family serving supports only GQA/MHA/MLA exports, "
             f"got dflash_config.attention_mode={attention_mode!r}"
         )
+    # SGLang serves MLA for DFlash/DFlash2 drafts (sgl-project/sglang#44676),
+    # not for DSpark, whose context-KV writers slice a fused qkv_proj.
+    if attention_mode.lower() == "mla" and projector_type == "dspark":
+        raise ValueError("SGLang DSpark serving does not support MLA exports")
 
     if projector_type == "dspark":
         _normalize_dspark(config, method_config)
