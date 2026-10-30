@@ -9,7 +9,7 @@ from transformers import DynamicCache, Qwen3Config
 from transformers.utils import is_flash_attn_2_available
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
-from specforge.config.draft.dflash import resolve_dflash_attention_layout
+from specforge.config.draft.legacy_attention import resolve_dflash_attention_layout
 from specforge.modeling.draft.models.dflash import DFlashDraftModel
 from specforge.modeling.draft.models.layers.attention.masks import (
     create_dflash_block_mask,
@@ -490,7 +490,7 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
             mock.patch(
                 "specforge.algorithms.common.dflash_family_model."
                 "create_dflash_sdpa_mask",
-                side_effect=(full_mask, sliding_mask),
+                side_effect=(sliding_mask, full_mask),
             ) as create_mask,
         ):
             wrapper._forward_draft_blocks(

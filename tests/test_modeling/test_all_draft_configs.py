@@ -339,7 +339,7 @@ class AllDraftConfigsTest(unittest.TestCase):
         original = copy.deepcopy(config.to_dict())
         model = AutoDraftModel.from_config(config)
         self.assertFalse(model.config.norm_before_residual)
-        self.assertIs(model.layers[0].config, model.config)
+        self.assertIs(model.layers[0].config.model, model.config)
         self.assertEqual(config.to_dict(), original)
         with self.assertRaises(TypeError):
             AutoDraftModel.from_config(config, norm_before_residual=True)

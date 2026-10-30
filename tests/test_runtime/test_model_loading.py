@@ -145,7 +145,7 @@ class DraftConfigResolutionTest(unittest.TestCase):
 
         payload = draft_settings("dflash")
         current = AutoDraftConfig.from_dict(payload)
-        for field, value in (("rope_theta", 12345), ("is_causal", False)):
+        for field, value in (("rope_theta", 12345), ("is_causal", True)):
             saved = AutoDraftConfig.from_dict({**payload, field: value})
             with self.assertRaisesRegex(ValueError, field):
                 validate_draft_config_contract(

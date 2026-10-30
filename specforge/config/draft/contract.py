@@ -28,17 +28,17 @@ _METADATA_FIELDS = frozenset(
 def draft_config_contract(config) -> dict[str, Any]:
     """Return normalized, JSON-compatible settings without source provenance."""
     from .auto import AutoDraftConfig
-    from .model import DraftModelConfig
 
-    normalized = AutoDraftConfig.finalize(config)
-    # Compare the same serialized representation for inline and legacy configs.
-    if isinstance(normalized, DraftModelConfig):
-        normalized = AutoDraftConfig.finalize(normalized.to_hf_config())
+    runtime = AutoDraftConfig.resolve(config)
+    normalized = AutoDraftConfig.resolve(
+        runtime.to_hf_config(for_export=False)
+    ).to_hf_config(for_export=False)
     payload = {
         key: value
         for key, value in normalized.to_dict().items()
         if not key.startswith("_") and key not in _METADATA_FIELDS
     }
+    payload["layers"] = runtime.to_dict()["layers"]
     # Tuples in typed options and lists read from JSON must compare identically.
     return json.loads(json.dumps(payload))
 

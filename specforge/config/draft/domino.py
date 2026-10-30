@@ -16,7 +16,7 @@ class DominoConfig(DFlashConfig):
 
     @classmethod
     def _variant_fields(
-        cls, config: Qwen3Config, method: dict[str, Any], mode: str, block_size: int
+        cls, config: Qwen3Config, method: dict[str, Any], block_size: int
     ) -> dict[str, Any]:
         return {
             "projector_type": _projector(method, "domino"),

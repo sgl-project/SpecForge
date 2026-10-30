@@ -35,10 +35,8 @@ def method_config(config: PretrainedConfig, name: str) -> Mapping:
 def validate_dimensions(config: PretrainedConfig) -> None:
     for name in (
         "hidden_size",
-        "intermediate_size",
         "vocab_size",
         "num_hidden_layers",
-        "num_attention_heads",
     ):
         integer(getattr(config, name), name)
     integer(getattr(config, "draft_vocab_size", config.vocab_size), "draft_vocab_size")
@@ -59,6 +57,10 @@ class DraftConfig(ABC):
     Parsing does not allocate tensors or mutate its input. Subclasses own their
     legacy JSON layout and retain fields they do not interpret.
     """
+
+    attention_contract: ClassVar[str] = "eagle_cache"
+    requires_causal: ClassVar[bool] = False
+    requires_conv: ClassVar[bool] = False
 
     _nested_fields: ClassVar[frozenset[str]] = frozenset()
 

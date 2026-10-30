@@ -1,3 +1,6 @@
+from specforge.config.draft.component_registry import build_component
+from specforge.config.draft.model import LayerConfig
+
 # coding=utf-8
 """Multi-Token Prediction (MTP) draft model for Qwen3.5.
 
@@ -251,10 +254,17 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
 
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
+        config = LayerConfig(config, config.layers[layer_idx])
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3MTPAttention(config=config, layer_idx=layer_idx)
-        self.mlp = build_ffn(config, dense_factory=Qwen3MLP)
-        self.residual = build_residual(config)
+        self.self_attn = build_component(
+            "attention",
+            config.layer.attention,
+            "qwen_mtp",
+            config=config,
+            layer_idx=layer_idx,
+        )
+        self.mlp = build_ffn(config.layer.ffn, config=config, dense_factory=Qwen3MLP)
+        self.residual = build_residual(config.layer.residual)
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -410,7 +420,7 @@ class Qwen3_5MTPDraftModel(
 
     def __init__(self, config: Qwen3Config) -> None:
         config = AutoDraftConfig.resolve(config, architecture=type(self).__name__)
-        super().__init__(config.to_hf_config())
+        super().__init__(config.to_hf_config(for_export=False))
 
         # Shared embedding with the target model (loaded externally, frozen)
         self.embed_tokens = nn.Embedding(

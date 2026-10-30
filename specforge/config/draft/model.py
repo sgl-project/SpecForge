@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
@@ -44,6 +44,8 @@ def _freeze(value):
 
 
 def _plain(value):
+    if is_dataclass(value):
+        return _plain(asdict(value))
     if isinstance(value, Mapping):
         return {key: _plain(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -72,6 +74,10 @@ class DraftModelConfig:
         object.__setattr__(self, "_values", _freeze(self._values))
 
     def __getattr__(self, name):
+        if name in ("layer_types", "sliding_window", "is_causal"):
+            from .layer_decoder import legacy_layer_fields
+
+            return _freeze(legacy_layer_fields(self.layers)[0][name])
         try:
             return self._values[name]
         except KeyError:
@@ -81,7 +87,7 @@ class DraftModelConfig:
         return self
 
     def __reduce__(self):
-        return type(self), (self.to_dict(),)
+        return type(self), (dict(self._values),)
 
     def to_dict(self) -> dict[str, Any]:
         return _plain(self._values)
@@ -89,17 +95,27 @@ class DraftModelConfig:
     def get_text_config(self, **kwargs):
         return self
 
-    def to_hf_config(self):
+    def to_hf_config(self, *, for_export=True):
         """Create an HF adapter without changing any runtime settings."""
         from .registry import resolve_draft_config_type
 
         registration = resolve_draft_config_type(self.architectures[0])
         payload = self.to_dict()
+        from .layer_decoder import legacy_layer_fields
+
+        payload.pop("layers", None)
+        layout, method = legacy_layer_fields(self.layers, check=for_export)
+        payload.update(layout)
+        if "dflash_config" in payload:
+            payload["dflash_config"].update(method)
         backend = payload.pop("_attn_implementation", None)
         if "dflash_config" in payload:
             payload["dflash_config"]["block_size"] = self.block_size
         config = registration.config_class.from_dict(payload)
         config._attn_implementation = backend
+        config.rope_theta = payload.get(
+            "rope_theta", payload.get("rope_parameters", {}).get("rope_theta", 10000.0)
+        )
         return config
 
     def save_pretrained(self, *args, **kwargs):
@@ -196,3 +212,29 @@ def inline_values(payload: Mapping, *, model_type: str) -> _ConfigValues:
         rope.setdefault("rope_theta", values.get("rope_theta", 10000.0))
     values["rope_parameters"] = rope
     return _ConfigValues(**values)
+
+
+@dataclass(frozen=True)
+class LayerConfig:
+    """Read-only adapter for kernels that consume HF-shaped attribute names.
+
+    It references the shared model config and one layer; it owns no copied
+    settings. Component code must not use this adapter for serialization.
+    """
+
+    model: DraftModelConfig
+    layer: Any
+
+    def __getattr__(self, name):
+        if name == "layer_types":
+            return (self.layer.attention.layer_type,) * self.model.num_hidden_layers
+        if hasattr(self.layer.attention, name):
+            return getattr(self.layer.attention, name)
+        if name == "intermediate_size":
+            return self.layer.ffn.intermediate_size
+        if name == "dflash_config":
+            return self.model.dflash_config
+        return getattr(self.model, name)
+
+    def get_text_config(self, **kwargs):
+        return self

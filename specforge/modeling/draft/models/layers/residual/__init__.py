@@ -3,9 +3,6 @@
 from abc import ABC, abstractmethod
 
 from torch import Tensor, nn
-from transformers import PretrainedConfig
-
-from specforge.config.draft.components import component_config
 
 
 class ResidualStream(nn.Module, ABC):
@@ -32,8 +29,11 @@ class StandardResidual(ResidualStream):
         return stream + branch_output
 
 
-def build_residual(config: PretrainedConfig) -> ResidualStream:
-    choice = component_config(config, "residual_config", "standard")
-    if choice.type != "standard" or choice.variant is not None:
-        raise ValueError(f"Residual stream {choice!r} is not implemented")
+def build_residual(spec):
+    from specforge.config.draft.component_registry import build_component
+
+    return build_component("residual", spec, "single_stream")
+
+
+def build_standard(*, spec):
     return StandardResidual()

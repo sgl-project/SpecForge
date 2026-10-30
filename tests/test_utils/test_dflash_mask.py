@@ -72,6 +72,14 @@ class _RecordingDraftModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.config = SimpleNamespace(
+            layers=(
+                SimpleNamespace(
+                    attention=SimpleNamespace(sliding_window=8, is_causal=True)
+                ),
+                SimpleNamespace(
+                    attention=SimpleNamespace(sliding_window=None, is_causal=False)
+                ),
+            ),
             layer_types=["sliding_attention", "full_attention"],
             sliding_window=8,
             block_size=4,
@@ -332,9 +340,9 @@ class TestDFlashMask(unittest.TestCase):
                     )
 
                 masks = draft_model.attention_mask
-                self.assertEqual(set(masks), {"full_attention", "sliding_attention"})
-                self.assertTrue(masks["full_attention"][0, 0, 0, 0].item())
-                self.assertFalse(masks["sliding_attention"][0, 0, 0, 0].item())
+                self.assertEqual(set(masks), {0, 1})
+                self.assertTrue(masks[1][0, 0, 0, 0].item())
+                self.assertFalse(masks[0][0, 0, 0, 0].item())
 
     def test_is_causal_follows_sglang_rule(self):
         """Unset/False/True ``is_causal`` match SGLang's per-layer-type rule."""
@@ -439,7 +447,8 @@ class TestDFlashMask(unittest.TestCase):
             with self.subTest(is_causal=is_causal):
                 draft_model = _RecordingDraftModel().to(self.device)
                 if is_causal is not None:
-                    draft_model.config.is_causal = is_causal
+                    for layer in draft_model.config.layers:
+                        layer.attention.is_causal = is_causal
                 model = OnlineDFlashModel(
                     draft_model=draft_model,
                     target_lm_head=nn.Identity(),
@@ -458,8 +467,8 @@ class TestDFlashMask(unittest.TestCase):
                     )
                 masks = draft_model.attention_mask
                 # Query offset 0 of the block vs. key offset 1 (kv index S + 1).
-                full_future = masks["full_attention"][0, 0, 0, 17].item()
-                sliding_future = masks["sliding_attention"][0, 0, 0, 17].item()
+                full_future = masks[1][0, 0, 0, 17].item()
+                sliding_future = masks[0][0, 0, 0, 17].item()
                 self.assertEqual(full_future, not is_causal)
                 self.assertEqual(sliding_future, is_causal is False)
 

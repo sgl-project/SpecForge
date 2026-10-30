@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 
 from .base import method_config
 from .dflash import DFlashConfig
@@ -67,20 +67,14 @@ class DSpineConfig:
 class DSpineDraftConfig(DFlashConfig):
     dspine: DSpineConfig
 
-    @classmethod
-    def from_model_config(cls, config):
-        if getattr(config, "is_causal", None) is False:
-            raise ValueError(
-                "DSpine requires causal attention; is_causal=false is unsupported"
-            )
-        return replace(super().from_model_config(config), is_causal=True)
+    requires_causal = True
 
     @classmethod
-    def _variant_fields(cls, config, method, mode, block_size):
+    def _variant_fields(cls, config, method, block_size):
         settings = DSpineConfig(**method_config(config, "dspine_config"))
         settings.validate(config.hidden_size, config.vocab_size)
         return {
-            **super()._variant_fields(config, method, mode, block_size),
+            **super()._variant_fields(config, method, block_size),
             "dspine": settings,
         }
 

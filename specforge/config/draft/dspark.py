@@ -19,12 +19,8 @@ class DSparkConfig(DFlashConfig):
 
     @classmethod
     def _variant_fields(
-        cls, config: Qwen3Config, method: dict[str, Any], mode: str, block_size: int
+        cls, config: Qwen3Config, method: dict[str, Any], block_size: int
     ) -> dict[str, Any]:
-        if mode == "gqa" and config.num_key_value_heads == config.num_attention_heads:
-            raise ValueError(
-                "DSpark defaults to GQA; set attention_mode='mha' for equal query/KV heads"
-            )
         # Legacy configs used null to disable the optional Markov head.
         rank = method.get("markov_rank")
         rank = _integer(0 if rank is None else rank, "markov_rank", 0)

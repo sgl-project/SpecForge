@@ -16,7 +16,6 @@ from .base import (
     validate_dimensions,
     validate_gqa,
 )
-from .components import validate_components
 
 
 @strict
@@ -32,6 +31,8 @@ class EaglePretrainedConfig(LlamaConfig):
 
 @dataclass(frozen=True, kw_only=True)
 class EagleConfig(DraftConfig):
+    attention_contract = "eagle_cache"
+    requires_causal = True
     _nested_fields = frozenset({"aux_hidden_state_layer_ids"})
     target_hidden_size: int
     aux_hidden_state_layer_ids: tuple[int, ...] | None
@@ -49,10 +50,7 @@ class EagleConfig(DraftConfig):
 
     @classmethod
     def _common_fields(cls, config: LlamaConfig) -> dict:
-        validate_components(config, attention_types=("gqa",))
         validate_dimensions(config)
-        if validate_gqa(config) % 2:
-            raise ValueError("head_dim must be even for EAGLE rotary embeddings")
         layers = method_config(config, "eagle_config").get(
             "eagle_aux_hidden_state_layer_ids"
         )

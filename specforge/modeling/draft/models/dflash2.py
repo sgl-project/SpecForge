@@ -58,7 +58,7 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(self.residual.branch_input(hidden_states))
         hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -76,14 +76,16 @@ class Qwen3DFlash2DecoderLayer(Qwen3DFlashDecoderLayer):
             hidden_states,
             attention_kernel,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = self.residual.combine(residual, hidden_states)
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(
+            self.residual.branch_input(hidden_states)
+        )
         hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
-        return residual + hidden_states
+        return self.residual.combine(residual, hidden_states)
 
 
 class CandidateSelector(nn.Module):
@@ -216,15 +218,11 @@ class DFlash2DraftModel(DFlashDraftModel):
         layer_idx: int,
         kernels: DFlashKernels,
     ) -> nn.Module:
-        taps = config.dflash_config["conv_kernel_size"]
-        group_size = config.dflash_config["conv_group_size"]
+        from specforge.config.draft.component_registry import build_component
 
-        def grouped_conv() -> DFlashGroupedConv:
-            return DFlashGroupedConv(
-                hidden_size=int(config.hidden_size),
-                block_size=config.block_size,
-                taps=taps,
-                group_size=group_size,
+        def grouped_conv():
+            return build_component(
+                "conv", config.layers[layer_idx].conv, "draft_block", config=config
             )
 
         return self.decoder_layer_class(
