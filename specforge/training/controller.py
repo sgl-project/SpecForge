@@ -1266,6 +1266,7 @@ class TrainerController:
             shared,
             step,
             rank_state={
+                "metadata": full.get("metadata"),
                 "optimizer": None if replicated_optimizer else full["optimizer"],
                 "rng": full["rng"],
             },

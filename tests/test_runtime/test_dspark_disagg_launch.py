@@ -24,11 +24,20 @@ ALGORITHM = builtin_algorithm_registry().resolve("dspark")
 @unittest.skipUnless(CUDA, "DSpark disaggregated optimizer gate requires CUDA")
 class TestDSparkDisaggregatedLaunch(unittest.TestCase):
     def test_synthetic_server_features_train_through_canonical_consumer(self):
+        self._check_backend("fsdp")
+
+    def test_fsdp2_trains_through_the_same_launcher(self):
+        self._check_backend("fsdp2")
+
+    def _check_backend(self, training_backend):
         from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port="29579")
 
+        from torch.distributed.fsdp import FSDPModule
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        expected_wrapper = FSDPModule if training_backend == "fsdp2" else FSDP
 
         from specforge.launch import build_disagg_online_consumer
         from specforge.optimizer import BF16Optimizer
@@ -67,6 +76,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
             feature_store=consumer_store,
             channel=channel,
             draft_model=model,
+            training_backend=training_backend,
             optimizer_factory=lambda module: BF16Optimizer(
                 module,
                 lr=1e-3,
@@ -87,7 +97,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
 
         strategy = trainer.core.strategy
         self.assertIsInstance(strategy, DSparkTrainStrategy)
-        self.assertIsInstance(strategy.trainable_module(), FSDP)
+        self.assertIsInstance(strategy.trainable_module(), expected_wrapper)
         self.assertEqual(
             {cls.__name__ for cls in trainer.backend.auto_wrap_block_classes},
             {"Qwen3DFlashDecoderLayer"},
