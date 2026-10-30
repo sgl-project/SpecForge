@@ -192,10 +192,8 @@ class FamilyConfigTest(unittest.TestCase):
         self.assertEqual(
             (gate.num_experts, gate.top_k, gate.norm_topk_prob), (E, K, True)
         )
-        # A family only has to supply score(): select and combine come from Router.
-        with self.assertRaises(NotImplementedError):
-            Router(E, K)(torch.zeros(1, H))
 
+        # A family only supplies score(); select and routing_weights come from Router.
         class Uniform(Router):
             def score(self, x):
                 return torch.full(

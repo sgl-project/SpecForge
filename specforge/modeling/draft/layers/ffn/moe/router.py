@@ -37,8 +37,8 @@ class Router(nn.Module):
         self.route_scale = route_scale
 
     def score(self, x: torch.Tensor) -> torch.Tensor:
-        """``x`` [T, H] -> fp32 affinities [T, E]; load balancing reads these."""
-        raise NotImplementedError
+        """Identity here; families map ``x`` [T, H] to fp32 affinities [T, E]."""
+        return x
 
     def select(self, scores: torch.Tensor) -> torch.Tensor:
         """``scores`` [T, E] -> the chosen experts [T, K]."""
