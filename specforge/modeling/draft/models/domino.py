@@ -9,10 +9,11 @@ import torch
 from torch import nn
 from torch.func import functional_call
 
-from specforge.modeling.draft.config.domino import DominoConfig
-from specforge.modeling.draft.models.dflash import DFlashDraftModel, sample
+from specforge.config.draft.domino import DominoConfig
 from specforge.modeling.draft.registry import register_draft
 from specforge.utils import get_device_type
+
+from .dflash import DFlashDraftModel, sample
 
 
 @register_draft
@@ -21,33 +22,32 @@ class DominoDraftModel(DFlashDraftModel):
 
     expected_projector_type = "domino"
 
-    draft_options: DominoConfig
     draft_options_class = DominoConfig
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
-        self.emb_dim = self.draft_options.emb_dim
-        self.gru_hidden_dim = self.draft_options.gru_hidden_dim
+        emb_dim = dflash_config["emb_dim"]
+        gru_hidden_dim = dflash_config["gru_hidden_dim"]
 
         self.prefix_gru = nn.GRU(
             input_size=config.hidden_size,
-            hidden_size=self.gru_hidden_dim,
+            hidden_size=gru_hidden_dim,
             num_layers=1,
             batch_first=True,
             bias=False,
         )
-        in_dim = config.hidden_size + self.gru_hidden_dim
+        in_dim = config.hidden_size + gru_hidden_dim
         self.embed_proj = nn.Sequential(
-            nn.Linear(in_dim, self.emb_dim, bias=False),
+            nn.Linear(in_dim, emb_dim, bias=False),
             nn.SiLU(),
-            nn.Linear(self.emb_dim, config.vocab_size, bias=False),
+            nn.Linear(emb_dim, config.vocab_size, bias=False),
         )
 
     @property
     def suffix_start(self) -> int:
         return (
-            self.pure_draft_prefix_len
-            if self.shift_label
-            else (1 + self.pure_draft_prefix_len)
+            self.config.dflash_config["pure_draft_prefix_len"]
+            if self.config.dflash_config["shift_label"]
+            else (1 + self.config.dflash_config["pure_draft_prefix_len"])
         )
 
     def _run_gru(self, gru_inputs: torch.Tensor) -> torch.Tensor:
@@ -87,7 +87,11 @@ class DominoDraftModel(DFlashDraftModel):
                 prev_token_embeddings=previous_embeddings,
                 hidden_states=hidden_states4d,
             )
-            head_position = token_position - 1 if self.shift_label else token_position
+            head_position = (
+                token_position - 1
+                if self.config.dflash_config["shift_label"]
+                else token_position
+            )
             next_token_logits = final_logits[:, 0, head_position, :].unsqueeze(1)
             completed_ids[:, token_position] = sample(next_token_logits).squeeze(1)
 
@@ -121,7 +125,7 @@ class DominoDraftModel(DFlashDraftModel):
             raise ValueError("DominoDraftModel requires prev_token_embeddings")
 
         bsz, n_blocks, block_size = hidden_states.shape[:3]
-        if self.shift_label:
+        if self.config.dflash_config["shift_label"]:
             gru_inputs = prev_token_embeddings.reshape(bsz * n_blocks, block_size, -1)
             gru_out = self._run_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n_blocks, block_size, -1)

@@ -16,7 +16,6 @@ Weight key layout matches SGLang's Qwen3_5ForCausalLMMTP:
   mtp.lm_head.weight
 """
 
-import copy
 from typing import Optional, Tuple
 
 import torch
@@ -35,10 +34,12 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Unpack
 
+from specforge.config.draft import AutoDraftConfig
+from specforge.config.draft.mtp import Qwen3_5MTPConfig
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
-from specforge.modeling.draft.config.mtp import Qwen3_5MTPConfig
 from specforge.modeling.draft.models.mtp import MTPDraftModel
 from specforge.modeling.draft.registry import register_draft
+from specforge.modeling.draft.serialization import DraftSerializationMixin
 
 from ...layers.ffn import build_ffn
 from ...layers.residual import build_residual
@@ -325,8 +326,7 @@ class Qwen3_5MTPModel(nn.Module):
 
         # Single-layer Qwen3 transformer, flat under `mtp.layers.*` / `mtp.norm`
         # to match the native Qwen3.5 checkpoint layout consumed by SGLang.
-        mtp_config = copy.deepcopy(config)
-        mtp_config.num_hidden_layers = 1
+        mtp_config = config
         self.layers = nn.ModuleList([Qwen3MTPDecoderLayer(mtp_config, layer_idx=0)])
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = PartialRotaryEmbedding(
@@ -392,7 +392,9 @@ class Qwen3_5MTPModel(nn.Module):
 
 
 @register_draft
-class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
+class Qwen3_5MTPDraftModel(
+    DraftSerializationMixin, MTPDraftModel, Qwen3PreTrainedModel
+):
     """
     Qwen3.5 MTP draft model for SpecForge training.
 
@@ -406,16 +408,9 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
     draft_options_class = Qwen3_5MTPConfig
     _no_split_modules = ["Qwen3MTPDecoderLayer"]
 
-    @classmethod
-    def prepare_config(cls, config: Qwen3Config) -> Qwen3Config:
-        return cls.draft_options_class.from_model_config(config).to_model_config(config)
-
     def __init__(self, config: Qwen3Config) -> None:
-        options = self.draft_options_class.from_model_config(config)
-        config = options.to_model_config(config)
-        super().__init__(config)
-        self.draft_options = options
-        self.config = config
+        config = AutoDraftConfig.resolve(config, architecture=type(self).__name__)
+        super().__init__(config.to_hf_config())
 
         # Shared embedding with the target model (loaded externally, frozen)
         self.embed_tokens = nn.Embedding(
@@ -426,13 +421,14 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
         self.mtp = Qwen3_5MTPModel(config)
 
         self.post_init()
+        self.config = config
 
     def get_input_embeddings(self):
         return self.embed_tokens
 
     @property
     def share_lm_head(self) -> bool:
-        return self.draft_options.share_lm_head
+        return self.config.mtp_config["share_lm_head"]
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value

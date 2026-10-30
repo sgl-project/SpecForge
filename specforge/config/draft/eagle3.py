@@ -37,6 +37,17 @@ class EagleConfig(DraftConfig):
     aux_hidden_state_layer_ids: tuple[int, ...] | None
 
     @classmethod
+    def validate_training_config(cls, config) -> None:
+        layers = method_config(config, "eagle_config").get(
+            "eagle_aux_hidden_state_layer_ids"
+        )
+        if layers is None or len(set(layers)) != 3:
+            raise ValueError(
+                "inline eagle_config.eagle_aux_hidden_state_layer_ids must contain "
+                "three distinct layer indices"
+            )
+
+    @classmethod
     def _common_fields(cls, config: LlamaConfig) -> dict:
         validate_components(config, attention_types=("gqa",))
         validate_dimensions(config)

@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
-from specforge.modeling.draft.config.dflash import _resolve_mla_rope_interleaved
+from specforge.config.draft.dflash import _resolve_mla_rope_interleaved
 
 from ..kernels import DFlashKernels
 

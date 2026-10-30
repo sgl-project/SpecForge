@@ -122,50 +122,14 @@ def checkpoint_key_fingerprint(model: Any, keys: Iterable[str]) -> str:
 
 
 @dataclass(frozen=True)
-class TargetDerivedDraftDefaults:
-    """Defaults used when a target config generates a draft config.
-
-    ``populate`` is the algorithm-owned seam for derived values such as
-    DFlash target-layer IDs.  Reading a config and resolving its model/config
-    class remain responsibilities of ``DraftModelRegistry``.
-    """
-
-    model_type: str
-    num_hidden_layers: int
-    draft_vocab_size: int | None = None
-    populate: Factory | None = None
-
-    def __post_init__(self) -> None:
-        _non_empty(self.model_type, field_name="model_type")
-        if (
-            isinstance(self.num_hidden_layers, bool)
-            or not isinstance(self.num_hidden_layers, int)
-            or self.num_hidden_layers <= 0
-        ):
-            raise ValueError("num_hidden_layers must be a positive integer")
-        if self.draft_vocab_size is not None and (
-            isinstance(self.draft_vocab_size, bool)
-            or not isinstance(self.draft_vocab_size, int)
-            or self.draft_vocab_size <= 0
-        ):
-            raise ValueError("draft_vocab_size must be a positive integer or None")
-        if self.populate is not None and not callable(self.populate):
-            raise TypeError("populate must be callable or None")
-
-
-@dataclass(frozen=True)
 class DraftConfigProvider:
     """Algorithm policy around a registered draft architecture.
 
     This object does not contain a model/config class and does not load a
-    config.  It supplies algorithm-specific generation and override behavior
-    to the composition root after ``DraftModelRegistry`` resolves the class.
+    config. It declares the architectures accepted by the training algorithm.
     """
 
     architecture: str
-    target_defaults: TargetDerivedDraftDefaults | None = None
-    expected_auto_map_model: str | None = None
-    apply_overrides: Factory | None = None
     compatible_architectures: FrozenSet[str] | None = None
 
     def __post_init__(self) -> None:
@@ -184,13 +148,6 @@ class DraftConfigProvider:
                     "architecture must be included in compatible_architectures"
                 )
         object.__setattr__(self, "compatible_architectures", compatible)
-        if self.expected_auto_map_model is not None:
-            _non_empty(
-                self.expected_auto_map_model,
-                field_name="expected_auto_map_model",
-            )
-        if self.apply_overrides is not None and not callable(self.apply_overrides):
-            raise TypeError("apply_overrides must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -857,7 +814,6 @@ __all__ = [
     "ServerStreamingProvider",
     "StepProvider",
     "StepRuntimeConfig",
-    "TargetDerivedDraftDefaults",
     "checkpoint_key_fingerprint",
     "make_registration",
     "resolve_server_capture_layout",

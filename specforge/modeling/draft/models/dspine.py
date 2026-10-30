@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..config.dspine import DSpineConfig, DSpineDraftConfig
-from ..registry import register_draft
+from specforge.config.draft.dspine import DSpineDraftConfig
+from specforge.modeling.draft.registry import register_draft
+
 from .dflash import DFlashDraftModel
 
 
@@ -21,21 +23,21 @@ class DSpineOutput(NamedTuple):
 
 
 class AdjacentInjection(nn.Module):
-    def __init__(self, hidden_size: int, num_layers: int, config: DSpineConfig):
+    def __init__(self, hidden_size: int, num_layers: int, config: Mapping):
         super().__init__()
-        self.rank = config.transfer_rank
-        self.replacement_layers = config.replacement_layers
+        self.rank = config["transfer_rank"]
+        self.config = config
         self.readouts = nn.ModuleList(
             nn.Linear(hidden_size, self.rank, bias=False) for _ in range(num_layers)
         )
         self.writes = nn.ModuleList(
-            nn.Linear(config.message_size, hidden_size, bias=False)
+            nn.Linear(config["message_size"], hidden_size, bias=False)
             for _ in range(num_layers)
         )
-        self.message = nn.Linear(self.rank, config.message_size, bias=False)
-        self.receiver_gate = nn.Linear(self.rank, config.message_size, bias=False)
-        self.predecessor_gate = nn.Linear(self.rank, config.message_size, bias=False)
-        self.bias = nn.Parameter(torch.zeros(config.message_size))
+        self.message = nn.Linear(self.rank, config["message_size"], bias=False)
+        self.receiver_gate = nn.Linear(self.rank, config["message_size"], bias=False)
+        self.predecessor_gate = nn.Linear(self.rank, config["message_size"], bias=False)
+        self.bias = nn.Parameter(torch.zeros(config["message_size"]))
         for write in self.writes:
             nn.init.zeros_(write.weight)
         nn.init.zeros_(self.predecessor_gate.weight)
@@ -78,7 +80,7 @@ class AdjacentInjection(nn.Module):
         features = self.feature(hidden, layer)
         anchor = math.sqrt(self.rank) * F.embedding(token_ids[..., :1], codes)
         predecessors = torch.cat((anchor, features[..., 1:-1, :]), dim=-2)
-        if replace is not None and layer < self.replacement_layers:
+        if replace is not None and layer < self.config["replacement_layers"]:
             correct = math.sqrt(self.rank) * F.embedding(token_ids[..., :-1], codes)
             predecessors = torch.where(replace[..., None, None], correct, predecessors)
         successors = self.write(
@@ -93,13 +95,13 @@ class DSpineDraftModel(DFlashDraftModel):
 
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
-        self.dspine_config = self.draft_options.dspine
+        config = self.config
         self.injection = AdjacentInjection(
-            config.hidden_size, config.num_hidden_layers, self.dspine_config
+            config.hidden_size, config.num_hidden_layers, self.config.dspine_config
         )
         self.register_buffer(
             "transfer_codes",
-            torch.zeros(config.vocab_size, self.dspine_config.transfer_rank),
+            torch.zeros(config.vocab_size, self.config.dspine_config["transfer_rank"]),
         )
         self.register_buffer("transfer_ready", torch.tensor(False))
 
@@ -129,8 +131,8 @@ class DSpineDraftModel(DFlashDraftModel):
         mean = total / head_weight.shape[0]
         covariance.sub_(head_weight.shape[0] * torch.outer(mean, mean))
         values, directions = torch.linalg.eigh(covariance)
-        values = values[-self.dspine_config.transfer_rank :]
-        directions = directions[:, -self.dspine_config.transfer_rank :]
+        values = values[-self.config.dspine_config["transfer_rank"] :]
+        directions = directions[:, -self.config.dspine_config["transfer_rank"] :]
         if not torch.isfinite(values).all() or (values <= 0).any():
             raise ValueError(
                 "Target head has insufficient positive principal directions for transfer_rank"
@@ -170,7 +172,7 @@ class DSpineDraftModel(DFlashDraftModel):
         if attention_mask is None:
             raise ValueError("DSpine requires an explicit causal block attention mask")
         batch, blocks, size = block_token_ids.shape
-        if size != self.block_size or noise_embedding.shape[:2] != (
+        if size != self.config.block_size or noise_embedding.shape[:2] != (
             batch,
             blocks * size,
         ):
@@ -181,7 +183,9 @@ class DSpineDraftModel(DFlashDraftModel):
         context = self.hidden_norm(self.fc(target_hidden))
         positions = self.rotary_emb(hidden, position_ids)
         layer_features = []
-        for index, (layer_type, layer) in enumerate(zip(self.layer_types, self.layers)):
+        for index, (layer_type, layer) in enumerate(
+            zip(self.config.layer_types, self.layers)
+        ):
             mask = (
                 attention_mask[layer_type]
                 if isinstance(attention_mask, dict)

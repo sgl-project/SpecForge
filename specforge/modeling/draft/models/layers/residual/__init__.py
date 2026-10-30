@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from torch import Tensor, nn
 from transformers import PretrainedConfig
 
-from specforge.modeling.draft.config.components import component_config
+from specforge.config.draft.components import component_config
 
 
 class ResidualStream(nn.Module, ABC):

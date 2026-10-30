@@ -15,10 +15,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
-from specforge.modeling.draft.config.dflash import (
-    DFlashConfig,
-    resolve_dflash_causal_block,
-)
+from specforge.config.draft import AutoDraftConfig
+from specforge.config.draft.dflash import DFlashConfig, resolve_dflash_causal_block
 from specforge.modeling.draft.models.layers.attention.backends.flex_options import (
     flex_attention_backend,
 )
@@ -32,6 +30,7 @@ from specforge.modeling.draft.models.layers.kernels import (
     DFlashKernels,
 )
 from specforge.modeling.draft.registry import register_draft
+from specforge.modeling.draft.serialization import DraftSerializationMixin
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
@@ -50,7 +49,7 @@ def dflash_attention_resume_contract(draft_model) -> dict:
     if is_causal is None:
         return {}
 
-    sliding_window = getattr(draft_model, "sliding_window", None)
+    sliding_window = draft_model.config.sliding_window
     if sliding_window is None:
         if not is_causal:
             return {}
@@ -61,7 +60,7 @@ def dflash_attention_resume_contract(draft_model) -> dict:
     return {
         "draft_attention_mask_semantics": (
             _ATTENTION_MASK_SEMANTICS_VERSION,
-            tuple(draft_model.layer_types),
+            tuple(draft_model.config.layer_types),
             sliding_window,
             is_causal,
         )
@@ -83,7 +82,11 @@ def _rope_config(config: Qwen3Config, attention_mode: str) -> Qwen3Config:
 
     if attention_mode != "mla":
         return config
-    rope_config = copy.deepcopy(config)
+    rope_config = (
+        config.to_hf_config()
+        if hasattr(config, "to_hf_config")
+        else copy.deepcopy(config)
+    )
     rope_config.head_dim = config.qk_rope_head_dim
     return rope_config
 
@@ -207,7 +210,7 @@ def normalize_draft_head_checkpoint_keys(
 
 
 @register_draft
-class DFlashDraftModel(Qwen3PreTrainedModel):
+class DFlashDraftModel(DraftSerializationMixin, Qwen3PreTrainedModel):
     config_class = Qwen3Config
     draft_options_class = DFlashConfig
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
@@ -218,14 +221,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         config,
         dflash_kernels: Optional[DFlashKernels] = None,
     ) -> None:
-        options = self.draft_options_class.from_model_config(config)
-        config = options.to_model_config(config)
-        super().__init__(config)
-        self.draft_options = options
-        self.layer_types = options.layer_types
-        self.sliding_window = options.sliding_window
-        self.attention_mode = options.attention_mode
-        self.block_size = options.block_size
+        config = AutoDraftConfig.resolve(config, architecture=type(self).__name__)
+        super().__init__(config.to_hf_config())
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         dflash_config = config.dflash_config
         self.layers = nn.ModuleList(
@@ -234,31 +231,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.target_layer_ids = list(options.target_layer_ids)
         self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(
-            _rope_config(config, self.attention_mode)
+            _rope_config(config, dflash_config["attention_mode"])
         )
         self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.hidden_size,
+            len(dflash_config["target_layer_ids"]) * config.hidden_size,
             config.hidden_size,
             bias=False,
         )
         self.hidden_norm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
-        self.mask_token_id = options.mask_token_id
-        self.projector_type = options.projector_type
-        self.pure_draft_prefix_len = options.pure_draft_prefix_len
-        self.shift_label = options.shift_label
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
-
-    @classmethod
-    def prepare_config(cls, config: Qwen3Config) -> Qwen3Config:
-        """Validate the final architecture without allocating model parameters."""
-        return cls.draft_options_class.from_model_config(config).to_model_config(config)
+        self.config = config
 
     def _build_decoder_layer(
         self,
@@ -319,7 +307,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         duplicating the target-cache and acceptance logic in ``spec_generate``.
         """
         del block_output_ids
-        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
+        draft_logits = target.lm_head(draft_hidden[:, -self.config.block_size + 1 :, :])
         return sample(draft_logits)
 
     def _prepare_attention_mask(
@@ -373,16 +361,16 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             mask_builder = create_dflash_sdpa_mask
 
         masks = {}
-        if FULL_ATTENTION in self.layer_types:
+        if FULL_ATTENTION in self.config.layer_types:
             # A bidirectional full layer sees every key, so it needs no mask.
             full_causal = resolve_dflash_is_causal(is_causal, FULL_ATTENTION)
             masks[FULL_ATTENTION] = (
                 mask_builder(**mask_args, is_causal=True) if full_causal else None
             )
-        if SLIDING_ATTENTION in self.layer_types:
+        if SLIDING_ATTENTION in self.config.layer_types:
             masks[SLIDING_ATTENTION] = mask_builder(
                 **mask_args,
-                sliding_window=self.sliding_window,
+                sliding_window=self.config.sliding_window,
                 is_causal=is_causal,
             )
         return masks
@@ -407,7 +395,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             past_key_values,
             is_causal=kwargs.get("is_causal"),
         )
-        for layer_type, layer in zip(self.layer_types, self.layers):
+        for layer_type, layer in zip(self.config.layer_types, self.layers):
             layer_attention_mask = (
                 attention_mask[layer_type]
                 if isinstance(attention_mask, dict)
@@ -438,10 +426,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
-        block_size = self.block_size
+        block_size = self.config.block_size
         output_ids = torch.full(
             (1, max_length + block_size),
-            self.mask_token_id,
+            self.config.dflash_config["mask_token_id"],
             dtype=torch.long,
             device=target.device,
         )
@@ -467,7 +455,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             output.logits, temperature
         )
         target_hidden = extract_context_feature(
-            output.hidden_states, self.target_layer_ids
+            output.hidden_states, self.config.dflash_config["target_layer_ids"]
         )
 
         # Decode stage
@@ -517,7 +505,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             start += acceptance_length + 1
             past_key_values_target.crop(start)
             target_hidden = extract_context_feature(
-                output.hidden_states, self.target_layer_ids
+                output.hidden_states, self.config.dflash_config["target_layer_ids"]
             )[:, : acceptance_length + 1, :]
             acceptance_lengths.append(acceptance_length + 1)
             if stop_token_ids is not None and any(
@@ -526,7 +514,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             ):
                 break
         output_ids = output_ids[:, :max_length]
-        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
+        output_ids = output_ids[
+            :, output_ids[0] != self.config.dflash_config["mask_token_id"]
+        ]
         if stop_token_ids is not None:
             stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
             stop_token_indices = torch.isin(

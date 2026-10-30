@@ -6,6 +6,7 @@ import unittest
 from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.providers import (
@@ -74,6 +75,35 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "block_size >= 2"):
                     minimum_loss_tokens(None, SimpleNamespace(block_size=1))
 
+    def test_peagle_assembly_uses_the_validated_mask_token(self):
+        from specforge.algorithms.model_providers import build_peagle_model
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.draft.models.peagle import PEagleDraftModel
+        from tests.draft_config_utils import draft_settings
+
+        config = AutoDraftConfig.finalize(
+            AutoDraftConfig.from_dict(draft_settings("peagle"))
+        )
+        AutoDraftConfig.validate_training_config(config)
+        draft = PEagleDraftModel(config)
+        run = SimpleNamespace(
+            mode="offline",
+            model=SimpleNamespace(torch_dtype="float32"),
+            training=SimpleNamespace(
+                num_depths=2, down_sample_ratio=0.8, down_sample_ratio_min=0.2
+            ),
+        )
+        # Supplying a tokenizer must not change the explicitly configured mask.
+        tokenizer = SimpleNamespace(mask_token_id=config.mask_token_id + 1)
+        with mock.patch(
+            "specforge.algorithms.model_providers._device", return_value="cpu"
+        ):
+            parts = build_peagle_model(run, draft, config, None, tokenizer)
+        self.assertEqual(
+            parts.model.draft_model.config.mask_token_id, config.mask_token_id
+        )
+        self.assertEqual(draft.config.mask_token_id, config.mask_token_id)
+
     def test_algorithm_metadata_has_no_factories_or_topology_flags(self):
         field_names = {field.name for field in fields(AlgorithmSpec)}
         self.assertEqual(
@@ -121,9 +151,6 @@ class BuiltinProviderContractTest(unittest.TestCase):
             {
                 "architecture",
                 "compatible_architectures",
-                "target_defaults",
-                "expected_auto_map_model",
-                "apply_overrides",
             },
             provider_fields,
         )
@@ -139,27 +166,11 @@ class BuiltinProviderContractTest(unittest.TestCase):
             with self.subTest(algorithm=registration.name):
                 self.assertFalse(hasattr(registration.spec, "draft_config_resolver"))
 
-    def test_target_derived_defaults_and_overrides_are_provider_owned(self):
-        expected = {
-            "eagle3": ("llama", 1, 32000, True),
-            "peagle": ("llama", 4, 32000, True),
-            "dflash": ("qwen3", 1, None, True),
-        }
-        for name, (model_type, layers, vocab_size, has_override) in expected.items():
-            with self.subTest(algorithm=name):
-                policy = self.registry.resolve(name).providers.model.draft_config
-                defaults = policy.target_defaults
-                self.assertIsNotNone(defaults)
-                self.assertEqual(model_type, defaults.model_type)
-                self.assertEqual(layers, defaults.num_hidden_layers)
-                self.assertEqual(vocab_size, defaults.draft_vocab_size)
-                self.assertEqual(has_override, policy.apply_overrides is not None)
-
-        for name in ("domino", "dspark", "mtp"):
-            with self.subTest(algorithm=name):
-                policy = self.registry.resolve(name).providers.model.draft_config
-                self.assertIsNone(policy.target_defaults)
-                self.assertIsNone(policy.apply_overrides)
+    def test_algorithm_providers_cannot_change_draft_settings(self):
+        for registration in self.registry:
+            policy = registration.providers.model.draft_config
+            self.assertFalse(hasattr(policy, "target_defaults"))
+            self.assertFalse(hasattr(policy, "apply_overrides"))
 
     def test_vlm_is_not_registered_as_a_builtin(self):
         for registration in self.registry:
@@ -169,7 +180,9 @@ class BuiltinProviderContractTest(unittest.TestCase):
             self.assertEqual({"text"}, modalities, registration.name)
 
     def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
-        from specforge.modeling.draft.config.dspine import DSpineConfig
+        from dataclasses import asdict
+
+        from specforge.config.draft.dspine import DSpineConfig
 
         training = SimpleNamespace(
             attention_backend="flex_attention",
@@ -181,15 +194,22 @@ class BuiltinProviderContractTest(unittest.TestCase):
         )
         config = SimpleNamespace(training=training)
         draft = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=2),
+            config=SimpleNamespace(
+                num_hidden_layers=2,
+                norm_before_residual=True,
+                mask_token_id=31,
+                block_size=16,
+                dspine_config=asdict(DSpineConfig()),
+                layer_types=["full_attention"] * 2,
+                sliding_window=None,
+                dflash_config=dict(
+                    target_layer_ids=[3, 7],
+                    pure_draft_prefix_len=2,
+                    mask_token_id=0,
+                    shift_label=True,
+                ),
+            ),
             layers=[object(), object()],
-            norm_before_residual=True,
-            target_layer_ids=[3, 7],
-            pure_draft_prefix_len=2,
-            block_size=16,
-            dspine_config=DSpineConfig(),
-            layer_types=["full_attention"] * 2,
-            sliding_window=None,
             share_lm_head=True,
         )
         dflash_family = SimpleNamespace(

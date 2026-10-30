@@ -8,9 +8,10 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from specforge.modeling.draft.config.dspark import DSparkConfig
-from specforge.modeling.draft.models.dflash import DFlashDraftModel
+from specforge.config.draft.dspark import DSparkConfig
 from specforge.modeling.draft.registry import register_draft
+
+from .dflash import DFlashDraftModel
 
 
 def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -252,12 +253,12 @@ class RNNMarkovHead(VanillaMarkovHead):
         return torch.stack(sampled_tokens, dim=1), torch.cat(corrected_logits, dim=1)
 
 
-def build_markov_head(config, options: DSparkConfig) -> Optional[nn.Module]:
-    markov_rank = options.markov_rank
+def build_markov_head(config) -> Optional[nn.Module]:
+    markov_rank = config.dflash_config["markov_rank"]
     if markov_rank == 0:
         return None
 
-    markov_head_type = options.markov_head_type
+    markov_head_type = config.dflash_config["markov_head_type"]
     if markov_head_type == "vanilla":
         return VanillaMarkovHead(
             vocab_size=config.vocab_size,
@@ -284,7 +285,6 @@ class DSparkDraftModel(DFlashDraftModel):
 
     expected_projector_type = "dspark"
 
-    draft_options: DSparkConfig
     draft_options_class = DSparkConfig
 
     def _sample_draft_tokens(
@@ -295,7 +295,7 @@ class DSparkDraftModel(DFlashDraftModel):
     ) -> torch.LongTensor:
         """Generate a block with the same Markov correction used in training."""
 
-        proposal_hidden = draft_hidden[:, -self.block_size + 1 :, :]
+        proposal_hidden = draft_hidden[:, -self.config.block_size + 1 :, :]
         base_logits = target.lm_head(proposal_hidden)
         if self.markov_head is None:
             return _sample(base_logits)
@@ -307,16 +307,12 @@ class DSparkDraftModel(DFlashDraftModel):
         return sampled_tokens
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
-        self.markov_head = build_markov_head(config, self.draft_options)
-        self.enable_confidence_head = self.draft_options.enable_confidence_head
-        self.confidence_head_with_markov = (
-            self.draft_options.confidence_head_with_markov
-        )
+        self.markov_head = build_markov_head(config)
 
         self.confidence_head = None
-        if self.enable_confidence_head:
+        if dflash_config["enable_confidence_head"]:
             input_dim = config.hidden_size
-            if self.confidence_head_with_markov:
+            if dflash_config["confidence_head_with_markov"]:
                 input_dim += self.markov_head.markov_rank
             self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
 
@@ -347,7 +343,7 @@ class DSparkDraftModel(DFlashDraftModel):
     ) -> Optional[torch.Tensor]:
         if self.confidence_head is None:
             return None
-        if self.confidence_head_with_markov:
+        if self.config.dflash_config["confidence_head_with_markov"]:
             assert self.markov_head is not None
             if prev_token_ids is None:
                 raise ValueError("prev_token_ids is required for Markov confidence")

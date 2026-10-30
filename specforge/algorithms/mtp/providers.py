@@ -175,8 +175,18 @@ def build_draft(cfg, draft_config):
     from specforge.training.model_loading import warm_start_draft_model
     from specforge.utils import get_local_device
 
+    if not cfg.model.draft_checkpoint_path:
+        from specforge.config.draft.mtp import Qwen3_5MTPConfig
+        from specforge.modeling.target.target_utils import load_target_config
+
+        native_config = load_target_config(
+            cfg.model.target_model_path,
+            cache_dir=cfg.model.cache_dir,
+            trust_remote_code=cfg.model.trust_remote_code,
+        )
+        Qwen3_5MTPConfig.validate_native_config(draft_config, native_config)
+
     torch_dtype = getattr(torch, cfg.model.torch_dtype)
-    draft_config._attn_implementation = cfg.training.attention_backend
     draft_model = AutoDraftModel.from_config(draft_config, torch_dtype=torch_dtype)
 
     _init_from_native_mtp(cfg, draft_model)
@@ -267,7 +277,6 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
-                expected_auto_map_model="mtp.Qwen3_5MTPDraftModel",
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

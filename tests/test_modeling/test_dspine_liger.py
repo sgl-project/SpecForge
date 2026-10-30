@@ -13,6 +13,7 @@ from specforge.modeling.draft.models.layers import kernels as dflash_kernels
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.model_loading import preflight_draft_kernels
 from specforge.training.strategies.base import StepContext
+from tests.draft_config_utils import draft_settings
 from tests.test_modeling.test_dspine import tiny_config, training_inputs, training_model
 from tests.test_modeling.test_dspine_accumulation import training_core
 
@@ -23,6 +24,7 @@ def provider_config(enabled, attention_backend="sdpa"):
     return Config.model_validate(
         {
             "model": {
+                "draft_model_config": draft_settings(),
                 "target_model_path": "unused",
                 "use_liger_kernel": enabled,
                 "torch_dtype": "float32",

@@ -1,7 +1,8 @@
 """Load and normalize draft configs independently of training-run policy.
 
-The architecture registry owns the HF config class. This loader does not infer
-the draft architecture from the target or construct model parameters.
+The configuration registry owns the HF adapter and typed architecture options.
+This loader does not infer the draft architecture from the target or construct
+model parameters.
 """
 
 from __future__ import annotations
@@ -14,20 +15,56 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
-from ..registry import DRAFT_REGISTRY, available_drafts
+from .base import integer
+from .model import DraftModelConfig, inline_values
+from .registry import DraftConfigRegistration, resolve_draft_config_type
 
 
 class AutoDraftConfig:
-    """One parsing contract for training, export, and pretrained loading.
+    """Resolve inline settings or read HF checkpoint metadata.
 
-    Existing Llama/Qwen config classes and custom fields are preserved. An
-    omitted draft vocabulary inherits the resolved HF vocabulary; explicit
-    null is rejected. Draft embedding and output weights are always untied.
-    Algorithm-specific overrides remain owned by DraftConfigProvider.
+    Training uses from_inline; legacy readers return HF adapters. Models resolve
+    either representation to immutable settings before allocating parameters.
     """
 
     @classmethod
+    def from_inline(cls, payload: Mapping[str, Any]) -> DraftModelConfig:
+        """Resolve the YAML draft section without parsing it through HF."""
+        if not isinstance(payload, Mapping):
+            raise ValueError("draft config must be an object")
+        architectures = payload.get("architectures")
+        if (
+            not isinstance(architectures, (list, tuple))
+            or len(architectures) != 1
+            or not isinstance(architectures[0], str)
+        ):
+            raise ValueError("draft config must name exactly one architecture")
+        registration = resolve_draft_config_type(architectures[0])
+        values = inline_values(payload, model_type=registration.config_class.model_type)
+        integer(values.draft_vocab_size, "draft_vocab_size")
+        if registration.options_class is not None:
+            options = registration.options_class.from_model_config(values)
+            values = options.to_model_config(values)
+        return DraftModelConfig(values.to_dict())
+
+    @classmethod
+    def resolve(cls, config, *, architecture: str | None = None) -> DraftModelConfig:
+        """Accept a resolved config, or adapt an existing HF checkpoint config."""
+        if isinstance(config, DraftModelConfig):
+            return config
+        if isinstance(config, Mapping):
+            return cls.from_inline(config)
+        payload = config.to_dict()
+        # An explicitly selected model class also accepts legacy base-model
+        # metadata (e.g. LlamaForCausalLM). Never rewrite resolved inline settings.
+        if architecture is not None:
+            payload["architectures"] = [architecture]
+        payload["_attn_implementation"] = getattr(config, "_attn_implementation", None)
+        return cls.from_inline(payload)
+
+    @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> PretrainedConfig:
+        """Read legacy HF checkpoint metadata; training uses from_inline."""
         if not isinstance(payload, Mapping):
             raise ValueError("draft config must be a JSON object")
         payload = copy.deepcopy(dict(payload))
@@ -42,19 +79,13 @@ class AutoDraftConfig:
                 f"got {architectures!r}"
             )
         architecture = architectures[0]
-        if architecture not in DRAFT_REGISTRY:
-            raise ValueError(
-                f"draft architecture {architecture!r} is not registered; "
-                f"available: {available_drafts()}"
-            )
-        if "draft_vocab_size" in payload and payload["draft_vocab_size"] is None:
-            raise ValueError("draft config draft_vocab_size cannot be null")
+        registration = resolve_draft_config_type(architecture)
 
         payload["architectures"] = [architecture]
         payload["tie_word_embeddings"] = False
         payload.setdefault("use_cache", True)
-        config = DRAFT_REGISTRY[architecture].config_class.from_dict(payload)
-        if "draft_vocab_size" not in payload:
+        config = registration.config_class.from_dict(payload)
+        if payload.get("draft_vocab_size") is None:
             config.draft_vocab_size = config.vocab_size
         if type(config.draft_vocab_size) is not int or config.draft_vocab_size <= 0:
             raise ValueError("draft config draft_vocab_size must be a positive integer")
@@ -62,19 +93,38 @@ class AutoDraftConfig:
 
     @classmethod
     def finalize(cls, config: PretrainedConfig) -> PretrainedConfig:
-        """Validate model-specific settings after run overrides have been applied.
+        """Normalize and validate model-specific settings before allocation.
 
-        Models may provide a pure prepare_config hook. Parsing remains separate
-        so callers can override checkpoint settings before final validation.
+        Typed options own validation and normalization. Resolving configuration
+        never imports the model registry or calls model implementation hooks.
         """
+        if isinstance(config, DraftModelConfig):
+            return config
+        registration = cls._registration(config)
+        if registration.options_class is None:
+            return copy.deepcopy(config)
+        options = registration.options_class.from_model_config(config)
+        return options.to_model_config(config)
+
+    @classmethod
+    def validate_training_config(cls, config: PretrainedConfig) -> None:
+        """Check training-only requirements on an already finalized config."""
+        registration = cls._registration(config)
+        if registration.options_class is not None:
+            registration.options_class.validate_training_config(config)
+
+    @staticmethod
+    def _registration(config: PretrainedConfig) -> DraftConfigRegistration:
         architectures = getattr(config, "architectures", None) or []
-        if len(architectures) != 1 or architectures[0] not in DRAFT_REGISTRY:
+        if (
+            not isinstance(architectures, (list, tuple))
+            or len(architectures) != 1
+            or not isinstance(architectures[0], str)
+        ):
             raise ValueError(
                 "draft config must name exactly one registered architecture"
             )
-        model_cls = DRAFT_REGISTRY[architectures[0]]
-        prepare = getattr(model_cls, "prepare_config", None)
-        return prepare(config) if prepare is not None else copy.deepcopy(config)
+        return resolve_draft_config_type(architectures[0])
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> PretrainedConfig:

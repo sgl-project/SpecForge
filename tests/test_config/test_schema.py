@@ -15,11 +15,12 @@ from specforge.algorithms import AlgorithmRegistration, AlgorithmRegistry
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.application import resolve_run
 from specforge.config import Config, apply_overrides, load_config
+from tests.draft_config_utils import draft_settings
 
 MINIMAL = {
     "model": {
         "target_model_path": "some/target",
-        "draft_model_config": "draft.json",
+        "draft_model_config": draft_settings("eagle3"),
         "vocab_mapping_path": "/mapping.pt",
     },
     "data": {"hidden_states_path": "/features"},
@@ -792,7 +793,7 @@ class ConfigSchemaTest(unittest.TestCase):
 
     def test_strategy_specific_capture_and_attention_are_validated(self):
         online = _online_payload()
-        with self.assertRaisesRegex(ValueError, "exactly three"):
+        with self.assertRaisesRegex(ValueError, "aux_hidden_state_layer_ids"):
             resolve_run(
                 Config.model_validate(
                     {
@@ -805,7 +806,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 )
             )
 
-        with self.assertRaisesRegex(ValueError, "would be ignored"):
+        with self.assertRaisesRegex(ValueError, "aux_hidden_state_layer_ids"):
             resolve_run(
                 Config.model_validate(
                     {

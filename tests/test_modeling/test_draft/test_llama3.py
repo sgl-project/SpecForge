@@ -29,16 +29,16 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
 
         config_dict = {
             "architectures": ["LlamaForCausalLM"],
-            "bos_token_id": 128000,
-            "eos_token_id": 128001,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
             "hidden_act": "silu",
-            "hidden_size": 4096,
+            "hidden_size": 32,
             "initializer_range": 0.02,
-            "intermediate_size": 14336,
-            "max_position_embeddings": 2048,
+            "intermediate_size": 64,
+            "max_position_embeddings": 64,
             "model_type": "llama",
-            "num_attention_heads": 32,
-            "num_key_value_heads": 8,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
             "num_hidden_layers": 1,
             "pad_token_id": 0,
             "rms_norm_eps": 1e-05,
@@ -46,8 +46,8 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             "torch_dtype": "float16",
             "transformers_version": "4.28.1",
             "use_cache": True,
-            "vocab_size": 128256,
-            "draft_vocab_size": 32000,
+            "vocab_size": 128,
+            "draft_vocab_size": 64,
         }
 
         self.config = LlamaConfig(**config_dict)
@@ -223,18 +223,16 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             self.assertTrue(torch.equal(val, ref), f"{name} was modified by warm start")
 
     def test_config_validation(self):
-        # A dimensionally-valid config (hidden_size divisible by num_attention_heads
-        # so it passes transformers' strict config validation) that is still missing
-        # the required `draft_vocab_size` attribute. Building the Eagle3 model from it
-        # should raise AttributeError.
+        # EAGLE3 requires exactly one draft layer.
         invalid_config = LlamaConfig(
             vocab_size=1000,
             hidden_size=128,
             num_attention_heads=4,
             num_key_value_heads=2,
+            num_hidden_layers=2,
         )
 
-        with self.assertRaises(AttributeError):
+        with self.assertRaisesRegex(ValueError, "num_hidden_layers"):
             LlamaForCausalLMEagle3(invalid_config)
 
 

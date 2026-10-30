@@ -20,14 +20,11 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen3.modeling_qwen3 import FlashAttentionKwargs, Qwen3Config
 from typing_extensions import Tuple, Unpack
 
-from specforge.modeling.draft.config.dflash2 import DFlash2Config
-from specforge.modeling.draft.models.dflash import (
-    DFlashDraftModel,
-    Qwen3DFlashDecoderLayer,
-)
+from specforge.config.draft.dflash2 import DFlash2Config
 from specforge.modeling.draft.models.layers.kernels import DFlashKernels
 from specforge.modeling.draft.registry import register_draft
 
+from .dflash import DFlashDraftModel, Qwen3DFlashDecoderLayer
 from .layers.convolution.dflash2 import DFlashGroupedConv
 
 
@@ -211,7 +208,6 @@ class DFlash2DraftModel(DFlashDraftModel):
             # that pass; checkpoint loading can still overwrite these weights.
             nn.init.zeros_(module.kernel_projection.weight)
 
-    draft_options: DFlash2Config
     draft_options_class = DFlash2Config
 
     def _build_decoder_layer(
@@ -220,13 +216,13 @@ class DFlash2DraftModel(DFlashDraftModel):
         layer_idx: int,
         kernels: DFlashKernels,
     ) -> nn.Module:
-        taps = self.draft_options.conv_kernel_size
-        group_size = self.draft_options.conv_group_size
+        taps = config.dflash_config["conv_kernel_size"]
+        group_size = config.dflash_config["conv_group_size"]
 
         def grouped_conv() -> DFlashGroupedConv:
             return DFlashGroupedConv(
                 hidden_size=int(config.hidden_size),
-                block_size=self.block_size,
+                block_size=config.block_size,
                 taps=taps,
                 group_size=group_size,
             )
@@ -240,8 +236,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         )
 
     def _init_draft_head(self, config: Qwen3Config, dflash_config: dict) -> None:
-        selector_rank = self.draft_options.selector_rank
-        selector_top_k = self.draft_options.selector_top_k
+        selector_rank = dflash_config["selector_rank"]
+        selector_top_k = dflash_config["selector_top_k"]
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
@@ -254,8 +250,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         """Whether ``transform_unary_logits`` only upcasts to FP32."""
 
         return (
-            self.draft_options.output_multiplier == 1.0
-            and self.draft_options.final_logit_softcapping is None
+            self.config.dflash_config["output_multiplier"] == 1.0
+            and self.config.dflash_config["final_logit_softcapping"] is None
         )
 
     def transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
@@ -264,8 +260,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         if self.unary_logits_transform_is_identity():
             # ``x * 1.0 == x`` bit for bit; skip the extra FP32 logit tensor.
             return logits.float()
-        transformed = logits.float() * self.draft_options.output_multiplier
-        softcap = self.draft_options.final_logit_softcapping
+        transformed = logits.float() * self.config.dflash_config["output_multiplier"]
+        softcap = self.config.dflash_config["final_logit_softcapping"]
         if softcap is not None:
             transformed = torch.tanh(transformed / softcap) * softcap
         return transformed
@@ -276,7 +272,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         draft_hidden: torch.Tensor,
         block_output_ids: torch.LongTensor,
     ) -> torch.LongTensor:
-        hidden = draft_hidden[:, -self.block_size + 1 :, :]
+        hidden = draft_hidden[:, -self.config.block_size + 1 :, :]
         unary_logits = self.transform_unary_logits(target.lm_head(hidden))
         unary_topk, candidate_ids = unary_logits.topk(
             self.candidate_selector.top_k,

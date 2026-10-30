@@ -3,8 +3,8 @@
 import unittest
 from unittest.mock import patch
 
+from specforge.config.draft import AutoDraftConfig
 from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.config import AutoDraftConfig
 from tests.test_modeling.test_all_draft_configs import architecture_payloads
 
 

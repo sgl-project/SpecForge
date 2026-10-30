@@ -5,7 +5,7 @@ from typing import Callable
 from torch import nn
 from transformers import PretrainedConfig
 
-from specforge.modeling.draft.config.components import component_config
+from specforge.config.draft.components import component_config
 
 
 def build_ffn(

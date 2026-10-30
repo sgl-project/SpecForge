@@ -15,7 +15,6 @@ from specforge.algorithms.common.providers import (
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepProvider,
-    TargetDerivedDraftDefaults,
     make_registration,
 )
 from specforge.algorithms.contracts import (
@@ -43,14 +42,6 @@ def resume_contract(config, draft_model, training_model):
     contract = peagle_resume_contract(config, draft_model, training_model)
     contract["peagle_attention_backend"] = config.training.attention_backend
     return contract
-
-
-def apply_overrides(config, draft_config):
-    from specforge.algorithms.model_providers import apply_eagle_overrides
-
-    apply_eagle_overrides(config, draft_config)
-    if config.training.norm_before_residual is not None:
-        draft_config.norm_before_residual = config.training.norm_before_residual
 
 
 def build_draft(config, draft_config):
@@ -83,7 +74,6 @@ def algorithm_spec() -> AlgorithmSpec:
         draft=DraftRequirement(
             compatible_architectures={DRAFT_ARCHITECTURE},
             default_architecture=DRAFT_ARCHITECTURE,
-            supported_overrides={"attention_layout", "num_hidden_layers"},
         ),
         feature_contracts=(
             FeatureContract(
@@ -105,7 +95,6 @@ def algorithm_spec() -> AlgorithmSpec:
             attention_backends={"flex_attention"},
             required_batch_size=1,
             supports_vocab_mapping=True,
-            allows_aux_layer_override=True,
         ),
     )
 
@@ -125,12 +114,6 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
-                apply_overrides=apply_overrides,
-                target_defaults=TargetDerivedDraftDefaults(
-                    model_type="llama",
-                    num_hidden_layers=4,
-                    draft_vocab_size=32000,
-                ),
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

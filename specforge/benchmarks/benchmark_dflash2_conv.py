@@ -232,7 +232,7 @@ def benchmark_draft(model, config, args):
     """Time the full draft forward+backward on DFlash training-shaped inputs."""
     device = torch.device("cuda")
     batch_size, seq_len = args.batch_size, args.context_length
-    block_size = model.block_size
+    block_size = model.config.block_size
     embed = torch.nn.Embedding(config.vocab_size, config.hidden_size).to(
         device=device, dtype=torch.bfloat16
     )
@@ -241,8 +241,6 @@ def benchmark_draft(model, config, args):
         draft_model=model,
         target_lm_head=torch.nn.Identity(),
         target_embed_tokens=embed,
-        mask_token_id=model.mask_token_id,
-        block_size=block_size,
         attention_backend="flex_attention",
         num_anchors=args.num_anchors,
     )
@@ -253,7 +251,7 @@ def benchmark_draft(model, config, args):
     target_hidden = torch.randn(
         batch_size,
         seq_len,
-        len(model.target_layer_ids) * config.hidden_size,
+        len(model.config.dflash_config["target_layer_ids"]) * config.hidden_size,
         device=device,
         dtype=torch.bfloat16,
     )
@@ -278,11 +276,11 @@ def benchmark_draft(model, config, args):
     if flex_attention_backend() == "FLASH":
         mask_args["BLOCK_SIZE"] = (256, 128)
     attention_mask = create_dflash_block_mask(**mask_args)
-    if model.sliding_window is not None:
+    if model.config.sliding_window is not None:
         attention_mask = {
             "full_attention": attention_mask,
             "sliding_attention": create_dflash_block_mask(
-                **mask_args, sliding_window=model.sliding_window
+                **mask_args, sliding_window=model.config.sliding_window
             ),
         }
     kernel_options = (
@@ -337,7 +335,7 @@ def main():
     torch.manual_seed(0)
     model = DFlash2DraftModel(config).to(device="cuda", dtype=torch.bfloat16)
     randomize_convs(model)
-    num_tokens = args.num_anchors * model.block_size
+    num_tokens = args.num_anchors * model.config.block_size
 
     report_numerics(model.layers[0].attention_conv, args.batch_size, num_tokens)
     benchmark_layer_convs(

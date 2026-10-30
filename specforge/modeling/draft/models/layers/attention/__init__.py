@@ -8,7 +8,7 @@ contract they implement instead of being coerced into a dense Q/K/V API.
 from torch import nn
 from transformers import Qwen3Config
 
-from specforge.modeling.draft.config.dflash import resolve_dflash_attention_mode
+from specforge.config.draft.dflash import resolve_dflash_attention_mode
 
 from ..kernels import DFlashKernels
 

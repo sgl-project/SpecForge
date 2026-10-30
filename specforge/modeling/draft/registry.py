@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+from specforge.config.draft import register_draft_config
+
 DRAFT_REGISTRY: Dict[str, type] = {}
 
 
@@ -29,7 +31,9 @@ def register_draft(cls: Optional[type] = None, *, name: Optional[str] = None):
     The key defaults to the class name — exactly what draft-config JSONs carry
     in ``architectures``. The class must declare ``config_class`` (the HF
     ``PretrainedConfig`` subclass it is built from) so the auto loaders can
-    resolve both the model and its config from the one registry entry.
+    verify it against the independent configuration registry. Custom models also
+    register their config here; callers that only parse settings can register
+    it directly with ``register_draft_config`` without importing the model.
     """
 
     def _register(cls: type) -> type:
@@ -44,6 +48,9 @@ def register_draft(cls: Optional[type] = None, *, name: Optional[str] = None):
                 f"draft architecture {key!r} already registered to "
                 f"{existing.__name__}"
             )
+        register_draft_config(
+            key, cls.config_class, getattr(cls, "draft_options_class", None)
+        )
         DRAFT_REGISTRY[key] = cls
         return cls
 

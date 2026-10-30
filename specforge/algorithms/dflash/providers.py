@@ -24,7 +24,6 @@ from specforge.algorithms.common.providers import (
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepProvider,
-    TargetDerivedDraftDefaults,
     make_registration,
 )
 from specforge.algorithms.contracts import (
@@ -71,10 +70,11 @@ def resume_contract(_config, draft_model, training_model):
         **dflash_attention_resume_contract(draft_model),
         "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dflash_target_layer_ids": tuple(
-            int(layer_id) for layer_id in draft_model.target_layer_ids
+            int(layer_id)
+            for layer_id in draft_model.config.dflash_config["target_layer_ids"]
         ),
-        "dflash_block_size": int(training_model.block_size),
-        "dflash_mask_token_id": int(training_model.mask_token_id),
+        "dflash_block_size": int(draft_model.config.block_size),
+        "dflash_mask_token_id": int(draft_model.config.dflash_config["mask_token_id"]),
         "dflash_attention_backend": str(training_model.attention_backend),
         "dflash_num_anchors": int(training_model.num_anchors),
         "dflash_loss_decay_gamma": training_model.loss_decay_gamma,
@@ -85,13 +85,13 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_kl_decay": float(training_model.kl_decay),
     }
     if getattr(draft_model, "candidate_selector", None) is not None:
-        options = draft_model.draft_options
+        options = draft_model.config.dflash_config
         contract.update(
             {
-                "dflash2_conv_kernel_size": options.conv_kernel_size,
-                "dflash2_conv_group_size": options.conv_group_size,
-                "dflash2_selector_rank": options.selector_rank,
-                "dflash2_selector_top_k": options.selector_top_k,
+                "dflash2_conv_kernel_size": options["conv_kernel_size"],
+                "dflash2_conv_group_size": options["conv_group_size"],
+                "dflash2_selector_rank": options["selector_rank"],
+                "dflash2_selector_top_k": options["selector_top_k"],
                 "dflash2_selector_loss_alpha": float(
                     training_model.selector_loss_alpha
                 ),
@@ -163,18 +163,6 @@ def resolve_capture_layers(config, draft_config, target_config):
     return resolve_dflash_capture_layers(config, draft_config, target_config)
 
 
-def populate_target_defaults(payload, target_config, config):
-    from specforge.algorithms.model_providers import populate_dflash_generated_config
-
-    return populate_dflash_generated_config(payload, target_config, config)
-
-
-def apply_draft_overrides(config, draft_config):
-    from specforge.algorithms.model_providers import apply_dflash_overrides
-
-    return apply_dflash_overrides(config, draft_config)
-
-
 def minimum_loss_tokens(config, draft_config):
     from specforge.algorithms.model_providers import dflash_min_loss_tokens
 
@@ -202,7 +190,6 @@ def algorithm_spec() -> AlgorithmSpec:
         draft=DraftRequirement(
             compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
             default_architecture=DRAFT_ARCHITECTURE,
-            supported_overrides={"num_hidden_layers", "block_size"},
         ),
         feature_contracts=(
             FeatureContract(
@@ -244,13 +231,6 @@ def algorithm_providers() -> AlgorithmProviders:
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
                 compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
-                expected_auto_map_model="dflash.DFlashDraftModel",
-                target_defaults=TargetDerivedDraftDefaults(
-                    model_type="qwen3",
-                    num_hidden_layers=1,
-                    populate=populate_target_defaults,
-                ),
-                apply_overrides=apply_draft_overrides,
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

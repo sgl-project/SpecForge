@@ -1,5 +1,6 @@
 import math
 import warnings
+from collections.abc import Mapping
 from typing import List, Optional, Tuple
 
 import torch
@@ -497,7 +498,7 @@ class LlamaAttention(nn.Module):
         else:
 
             def rope_get(key, default=None):
-                if isinstance(rope_scaling, dict):
+                if isinstance(rope_scaling, Mapping):
                     return rope_scaling.get(key, default)
                 return getattr(rope_scaling, key, default)
 

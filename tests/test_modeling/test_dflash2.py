@@ -53,7 +53,7 @@ class DFlash2ArchitectureTest(unittest.TestCase):
     def test_builds_sglang_compatible_modules_and_keys(self):
         model = DFlash2DraftModel(_tiny_config())
 
-        self.assertEqual(model.block_size, 4)
+        self.assertEqual(model.config.block_size, 4)
         self.assertIsInstance(model.layers[0], Qwen3DFlash2DecoderLayer)
         keys = set(model.state_dict())
         self.assertIn("layers.0.attention_conv.base_kernel", keys)
@@ -200,14 +200,16 @@ class DFlash2ArchitectureTest(unittest.TestCase):
         config._attn_implementation = "eager"
         model = DFlash2DraftModel(config)
         context_length = 3
-        noise = torch.randn(1, model.block_size, config.hidden_size)
+        noise = torch.randn(1, model.config.block_size, config.hidden_size)
         target_hidden = torch.randn(1, context_length, config.hidden_size)
-        position_ids = torch.arange(context_length + model.block_size).unsqueeze(0)
+        position_ids = torch.arange(context_length + model.config.block_size).unsqueeze(
+            0
+        )
         attention_mask = torch.ones(
             1,
             1,
-            model.block_size,
-            context_length + model.block_size,
+            model.config.block_size,
+            context_length + model.config.block_size,
             dtype=torch.bool,
         )
 
@@ -309,12 +311,14 @@ class CandidateSelectorTest(unittest.TestCase):
             def transform_unary_logits(logits):
                 return logits.float() * 0.5
 
+        draft = Draft()
+        draft.config = SimpleNamespace(
+            block_size=2, dflash_config=dict(mask_token_id=2)
+        )
         model = OnlineDFlashModel(
-            draft_model=Draft(),
+            draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(3, 3),
-            mask_token_id=2,
-            block_size=2,
             attention_backend="eager",
             selector_loss_alpha=0.0,
         )
@@ -356,12 +360,13 @@ class CandidateSelectorTest(unittest.TestCase):
             draft.candidate_selector.predecessor_codebook.zero_()
             draft.candidate_selector.successor_codebook.zero_()
             draft.candidate_selector.hidden_projection.weight.zero_()
+        draft.config = SimpleNamespace(
+            block_size=3, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
             draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=3,
             attention_backend="eager",
             lk_loss_type="alpha",
         )
@@ -526,12 +531,13 @@ class CandidateSelectorTest(unittest.TestCase):
         )
 
         def run(draft, *, teacher_metrics, feed_teacher=True):
+            draft.config = SimpleNamespace(
+                block_size=3, dflash_config=dict(mask_token_id=3)
+            )
             model = OnlineDFlashModel(
                 draft_model=draft,
                 target_lm_head=nn.Identity(),
                 target_embed_tokens=nn.Embedding(4, 4),
-                mask_token_id=3,
-                block_size=3,
                 attention_backend="eager",
                 metric_top_k=2,
                 teacher_metrics=teacher_metrics,
@@ -591,8 +597,6 @@ class CandidateSelectorTest(unittest.TestCase):
                 draft_model=draft,
                 target_lm_head=nn.Linear(16, 32, bias=False).requires_grad_(False),
                 target_embed_tokens=nn.Embedding(32, 16).requires_grad_(False),
-                mask_token_id=31,
-                block_size=4,
                 attention_backend="sdpa",
                 num_anchors=6,
                 objective_chunk_blocks=2,
@@ -667,12 +671,14 @@ class CandidateSelectorTest(unittest.TestCase):
 
     def test_plain_dflash_draft_reports_family_metrics_without_selector_keys(self):
         # A DFlash draft has neither a candidate selector nor a unary transform.
+        draft = nn.Module()
+        draft.config = SimpleNamespace(
+            block_size=3, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
-            draft_model=nn.Module(),
+            draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=3,
             attention_backend="eager",
             metric_top_k=2,
         )
@@ -748,12 +754,13 @@ class CandidateSelectorTest(unittest.TestCase):
             draft.candidate_selector.predecessor_codebook.zero_()
             draft.candidate_selector.successor_codebook.zero_()
             draft.candidate_selector.hidden_projection.weight.zero_()
+        draft.config = SimpleNamespace(
+            block_size=3, dflash_config=dict(mask_token_id=5)
+        )
         model = OnlineDFlashModel(
             draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(6, 6),
-            mask_token_id=5,
-            block_size=3,
             attention_backend="eager",
             loss_type="dpace",
         )
@@ -888,12 +895,14 @@ class CandidateSelectorTest(unittest.TestCase):
             def transform_unary_logits(logits):
                 return logits.float()
 
+        draft = Draft()
+        draft.config = SimpleNamespace(
+            block_size=2, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
-            draft_model=Draft(),
+            draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=2,
             attention_backend="eager",
             lk_loss_type="lambda",
             kl_scale=1.0,
@@ -936,12 +945,14 @@ class CandidateSelectorTest(unittest.TestCase):
             def transform_unary_logits(logits):
                 return logits.float()
 
+        draft = Draft()
+        draft.config = SimpleNamespace(
+            block_size=2, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
-            draft_model=Draft(),
+            draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=2,
             attention_backend="eager",
         )
         model._forward_draft_blocks = lambda **_kwargs: (
@@ -990,12 +1001,13 @@ class CandidateSelectorTest(unittest.TestCase):
                 return logits.float()
 
         draft = Draft()
+        draft.config = SimpleNamespace(
+            block_size=2, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
             draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=2,
             attention_backend="eager",
             selector_loss_alpha=0.0,
         )
@@ -1103,12 +1115,13 @@ class CandidateSelectorTest(unittest.TestCase):
             draft.candidate_selector.predecessor_codebook.zero_()
             draft.candidate_selector.successor_codebook.zero_()
             draft.candidate_selector.hidden_projection.weight.zero_()
+        draft.config = SimpleNamespace(
+            block_size=2, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
             draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=2,
             attention_backend="eager",
             selector_loss_alpha=1.0,
         )
@@ -1247,12 +1260,13 @@ class CandidateSelectorTest(unittest.TestCase):
             draft.candidate_selector.predecessor_codebook.zero_()
             draft.candidate_selector.successor_codebook.zero_()
             draft.candidate_selector.hidden_projection.weight.zero_()
+        draft.config = SimpleNamespace(
+            block_size=2, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
             draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=2,
             attention_backend="eager",
             selector_loss_alpha=1.0,
             lk_loss_type="tv",
@@ -1298,12 +1312,13 @@ class CandidateSelectorTest(unittest.TestCase):
         draft = Draft()
         with torch.no_grad():
             draft.candidate_selector.successor_codebook.normal_(std=0.2)
+        draft.config = SimpleNamespace(
+            block_size=2, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
             draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=2,
             attention_backend="eager",
         )
         hidden = torch.tensor(
@@ -1346,12 +1361,13 @@ class CandidateSelectorTest(unittest.TestCase):
         draft = Draft()
         with torch.no_grad():
             draft.candidate_selector.successor_codebook.normal_(std=0.2)
+        draft.config = SimpleNamespace(
+            block_size=2, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
             draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=2,
             attention_backend="eager",
             selector_stop_gradient=True,
         )
@@ -1397,12 +1413,13 @@ class CandidateSelectorTest(unittest.TestCase):
         draft = Draft()
         with torch.no_grad():
             draft.candidate_selector.successor_codebook.normal_(std=0.2)
+        draft.config = SimpleNamespace(
+            block_size=2, dflash_config=dict(mask_token_id=3)
+        )
         model = OnlineDFlashModel(
             draft_model=draft,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(4, 4),
-            mask_token_id=3,
-            block_size=2,
             attention_backend="eager",
             selector_loss_alpha=1.0,
         )

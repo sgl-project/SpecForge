@@ -12,6 +12,7 @@ from specforge.config import Config
 from specforge.runtime.data_plane import mooncake_rdma
 from specforge.runtime.data_plane.mooncake_store import _InjectedReplicateConfig
 from specforge.training.disaggregated import _mooncake_store
+from tests.draft_config_utils import draft_settings
 from tests.test_runtime.test_mooncake_rdma import FakeHost
 from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
 
@@ -39,7 +40,10 @@ class DisaggregatedDefaultsTest(unittest.TestCase):
                     deployment["receive_buffers"] = configured
                 cfg = Config.model_validate(
                     {
-                        "model": {"target_model_path": "target"},
+                        "model": {
+                            "draft_model_config": draft_settings(),
+                            "target_model_path": "target",
+                        },
                         "data": {"prompts_path": "prompts.jsonl"},
                         "deployment": {
                             "mode": "disaggregated",
@@ -52,7 +56,10 @@ class DisaggregatedDefaultsTest(unittest.TestCase):
     def test_legacy_environment_worker_uses_pinned_by_default(self):
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "target"},
+                "model": {
+                    "draft_model_config": draft_settings(),
+                    "target_model_path": "target",
+                },
                 "data": {"hidden_states_path": "/features"},
             }
         )
@@ -114,7 +121,10 @@ class MooncakeStoreTransportTest(unittest.TestCase):
         self.host = FakeHost(directory.name)
         self.cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "target"},
+                "model": {
+                    "draft_model_config": draft_settings(),
+                    "target_model_path": "target",
+                },
                 "data": {"hidden_states_path": "/features"},
             }
         )

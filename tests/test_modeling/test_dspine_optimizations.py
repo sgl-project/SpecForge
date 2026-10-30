@@ -1,5 +1,4 @@
 import unittest
-from dataclasses import replace
 from itertools import product
 from unittest.mock import patch
 
@@ -14,8 +13,8 @@ from tests.test_modeling.test_dspine import training_inputs, training_model
 
 
 class DSpineRefinementLossTest(unittest.TestCase):
-    def setUp(self):
-        self.model = training_model()
+    def make_model(self, **options):
+        self.model = training_model(**options)
         # Identity projection makes candidate logits exact in both projection paths.
         with torch.no_grad():
             self.model.lm_head.weight.zero_()
@@ -40,10 +39,8 @@ class DSpineRefinementLossTest(unittest.TestCase):
         devices = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
         for device, dtype in product(devices, (torch.float32, torch.bfloat16)):
             with self.subTest(device=device, dtype=dtype):
+                self.make_model(ce_weight=0, candidate_mass_threshold=0)
                 self.model.to(device=device, dtype=dtype)
-                self.model.dspine_config = replace(
-                    self.model.dspine_config, ce_weight=0, candidate_mass_threshold=0
-                )
                 torch.manual_seed(42)
                 teacher = torch.randn(1, 3, 16, device=device, dtype=dtype)
                 teacher.requires_grad_()
@@ -62,9 +59,7 @@ class DSpineRefinementLossTest(unittest.TestCase):
                 self.assertIsNone(teacher.grad)
 
     def test_missing_label_ce_and_masked_positions_have_zero_gradient(self):
-        self.model.dspine_config = replace(
-            self.model.dspine_config, ce_weight=1, candidate_mass_threshold=0.9
-        )
+        self.make_model(ce_weight=1, candidate_mass_threshold=0.9)
         refined = torch.zeros(1, 3, 16)
         refined[..., :3] = torch.tensor([1.5, -0.5, 0.75])
         refined.requires_grad_()
@@ -89,8 +84,7 @@ class DSpineRefinementLossTest(unittest.TestCase):
         mass = 3 / 32
         for threshold in (mass - 0.01, mass, mass + 0.01):
             with self.subTest(threshold=threshold):
-                self.model.dspine_config = replace(
-                    self.model.dspine_config,
+                self.make_model(
                     ce_weight=0,
                     candidate_mass_threshold=threshold,
                 )

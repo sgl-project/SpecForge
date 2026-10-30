@@ -364,8 +364,6 @@ def _prompt_cache_key(
         "target_model": cfg.model.target_model_path,
         "draft_config": cfg.model.draft_model_config,
         "draft_checkpoint": cfg.model.draft_checkpoint_path,
-        "draft_num_hidden_layers": cfg.model.draft_num_hidden_layers,
-        "draft_block_size": cfg.model.draft_block_size,
         "strategy": cfg.training.strategy,
         "input_modality": cfg.model.input_modality,
     }

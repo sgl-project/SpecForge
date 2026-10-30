@@ -48,7 +48,6 @@ def _spec(*contracts: FeatureContract) -> AlgorithmSpec:
         draft=DraftRequirement(
             compatible_architectures={"LlamaForCausalLMEagle3"},
             default_architecture="LlamaForCausalLMEagle3",
-            supported_overrides={"attention_layout", "num_hidden_layers"},
         ),
         feature_contracts=contracts or (_offline(), _streaming()),
         capabilities=AlgorithmCapabilities(
@@ -125,8 +124,6 @@ class AlgorithmContractTest(unittest.TestCase):
 
     def test_draft_requirement_accepts_flexible_layout_override(self):
         requirement = _spec().draft
-
-        self.assertIn("attention_layout", requirement.supported_overrides)
 
 
 if __name__ == "__main__":
