@@ -16,6 +16,7 @@ from typing import Any
 from transformers import PretrainedConfig
 
 from .base import integer
+from .layer_decoder import decode_layers, strip_legacy_layer_fields
 from .model import DraftModelConfig, inline_values
 from .registry import DraftConfigRegistration, resolve_draft_config_type
 
@@ -42,10 +43,14 @@ class AutoDraftConfig:
         registration = resolve_draft_config_type(architectures[0])
         values = inline_values(payload, model_type=registration.config_class.model_type)
         integer(values.draft_vocab_size, "draft_vocab_size")
+        layers = decode_layers(values, registration.options_class)
+        values.layers = layers
         if registration.options_class is not None:
             options = registration.options_class.from_model_config(values)
             values = options.to_model_config(values)
-        return DraftModelConfig(values.to_dict())
+        data = strip_legacy_layer_fields(values.to_dict())
+        data["layers"] = layers
+        return DraftModelConfig(data)
 
     @classmethod
     def resolve(cls, config, *, architecture: str | None = None) -> DraftModelConfig:
@@ -100,11 +105,10 @@ class AutoDraftConfig:
         """
         if isinstance(config, DraftModelConfig):
             return config
-        registration = cls._registration(config)
-        if registration.options_class is None:
-            return copy.deepcopy(config)
-        options = registration.options_class.from_model_config(config)
-        return options.to_model_config(config)
+        result = cls.resolve(config).to_hf_config()
+        if hasattr(result, "dflash_config"):
+            result.dflash_config.pop("block_size", None)
+        return result
 
     @classmethod
     def validate_training_config(cls, config: PretrainedConfig) -> None:

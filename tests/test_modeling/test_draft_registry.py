@@ -201,7 +201,7 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         config = AutoDraftModelConfig.from_file(path)
         model = AutoDraftModel.from_config(config)
-        self.assertEqual(model.config.dflash_config["attention_mode"], "mha")
+        self.assertEqual(model.config.layers[0].attention.type, "mha")
 
     def test_dspark_generation_uses_the_markov_head(self):
         path = _write(TINY_DSPARK)

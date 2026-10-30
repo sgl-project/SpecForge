@@ -1,3 +1,6 @@
+from specforge.config.draft.component_registry import build_component
+from specforge.config.draft.model import LayerConfig
+
 """P-EAGLE (Parallel EAGLE) draft model with multi-layer architecture."""
 
 from typing import List, Optional, Tuple
@@ -107,12 +110,18 @@ class PEagleFirstLayer(nn.Module):
 
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = PEagleAttention(config, input_size=2 * config.hidden_size)
+        self.self_attn = build_component(
+            "attention",
+            config.layer.attention,
+            "peagle",
+            config=config,
+            input_size=2 * config.hidden_size,
+        )
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = build_ffn(config, dense_factory=LlamaMLP)
-        self.residual = build_residual(config)
+        self.mlp = build_ffn(config.layer.ffn, config=config, dense_factory=LlamaMLP)
+        self.residual = build_residual(config.layer.residual)
 
     def forward(
         self,
@@ -151,12 +160,18 @@ class PEagleStandardLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = PEagleAttention(config, input_size=config.hidden_size)
+        self.self_attn = build_component(
+            "attention",
+            config.layer.attention,
+            "peagle",
+            config=config,
+            input_size=config.hidden_size,
+        )
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = build_ffn(config, dense_factory=LlamaMLP)
-        self.residual = build_residual(config)
+        self.mlp = build_ffn(config.layer.ffn, config=config, dense_factory=LlamaMLP)
+        self.residual = build_residual(config.layer.residual)
 
     def forward(
         self,
@@ -195,7 +210,7 @@ class PEagleDraftModel(Eagle3DraftModel):
 
     def __init__(self, config: LlamaConfig) -> None:
         config = AutoDraftConfig.resolve(config, architecture=type(self).__name__)
-        super().__init__(config.to_hf_config())
+        super().__init__(config.to_hf_config(for_export=False))
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
@@ -206,19 +221,16 @@ class PEagleDraftModel(Eagle3DraftModel):
         self.mask_hidden = nn.Parameter(torch.randn(1, 1, fc_input_size))
 
         num_layers = config.num_hidden_layers
-        layers: List[nn.Module] = [PEagleFirstLayer(config)]
+        layers: List[nn.Module] = [
+            PEagleFirstLayer(LayerConfig(config, config.layers[0]))
+        ]
         for _ in range(1, num_layers):
-            layers.append(PEagleStandardLayer(config))
+            layers.append(
+                PEagleStandardLayer(LayerConfig(config, config.layers[len(layers)]))
+            )
         self.layers = nn.ModuleList(layers)
 
-        rope_theta, _ = get_rope_config(config)
-        self.rotary_emb = LlamaRotaryEmbedding(
-            dim=getattr(
-                config, "head_dim", config.hidden_size // config.num_attention_heads
-            ),
-            max_position_embeddings=config.max_position_embeddings,
-            base=rope_theta,
-        )
+        self._set_rotary_embeddings(config)
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
@@ -231,24 +243,24 @@ class PEagleDraftModel(Eagle3DraftModel):
         self.register_buffer("d2t", d2t)
         self.config = config
 
-    def _rebuild_rotary_embedding(self) -> None:
-        """Recreate non-persistent RoPE buffers after low-memory HF loading."""
+    def _set_rotary_embeddings(self, config):
+        """Each layer owns its rotary width; buffers remain non-persistent."""
         reference = self.fc.weight
-        rope_theta, _ = get_rope_config(self.config)
-        rotary_emb = LlamaRotaryEmbedding(
-            dim=getattr(
-                self.config,
-                "head_dim",
-                self.config.hidden_size // self.config.num_attention_heads,
-            ),
-            max_position_embeddings=self.config.max_position_embeddings,
-            base=rope_theta,
-            device=reference.device,
-        )
-        self.rotary_emb = rotary_emb.to(
-            device=reference.device,
-            dtype=reference.dtype,
-        )
+        rope_theta, _ = get_rope_config(config)
+        modules = [
+            LlamaRotaryEmbedding(
+                dim=layer.attention.rotary_dim,
+                max_position_embeddings=config.max_position_embeddings,
+                base=rope_theta,
+                device=reference.device,
+            ).to(device=reference.device, dtype=reference.dtype)
+            for layer in config.layers
+        ]
+        self.rotary_emb = modules[0]
+        self.extra_rotary_emb = nn.ModuleList(modules[1:])
+
+    def _rebuild_rotary_embedding(self):
+        self._set_rotary_embeddings(self.config)
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
@@ -285,15 +297,19 @@ class PEagleDraftModel(Eagle3DraftModel):
         """
         layer_input = torch.cat([input_embeds, hidden_states], dim=-1)
 
-        cos, sin = self.rotary_emb(layer_input, seq_len=position_ids.max().item() + 1)
-        cos = cos.squeeze(0).squeeze(0)
-        sin = sin.squeeze(0).squeeze(0)
-        cos = cos[position_ids]
-        sin = sin[position_ids]
-        position_embeddings = (cos, sin)
-
         h = layer_input
-        for layer in self.layers:
+        seq_len = position_ids.max().item() + 1
+        rotary_cache = {}
+        for index, layer in enumerate(self.layers):
+            rotary = self.rotary_emb if index == 0 else self.extra_rotary_emb[index - 1]
+            width = self.config.layers[index].attention.rotary_dim
+            if width not in rotary_cache:
+                rotary_cache[width] = rotary(h, seq_len=seq_len)
+            cos, sin = rotary_cache[width]
+            position_embeddings = (
+                cos.squeeze(0).squeeze(0)[position_ids],
+                sin.squeeze(0).squeeze(0)[position_ids],
+            )
             h = layer(h, attention_mask, position_embeddings)
         return h
 

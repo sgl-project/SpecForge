@@ -5,17 +5,13 @@ import torch.nn as nn
 from transformers.cache_utils import Cache
 
 from specforge.config.draft import AutoDraftConfig
+from specforge.config.draft.component_registry import build_component
 from specforge.config.draft.eagle3 import Eagle3Config, EaglePretrainedConfig
+from specforge.config.draft.model import LayerConfig
 from specforge.modeling.draft.models.base import Eagle3DraftModel
 from specforge.modeling.draft.registry import register_draft
 from specforge.utils import print_with_rank
 
-from .layers.attention.eagle import (
-    LlamaAttention,
-    LlamaFlashAttention,
-    LlamaFlexAttention,
-    LlamaUSPFlashAttention,
-)
 from .layers.ffn import build_ffn
 from .layers.ffn.dense import LlamaMLP
 from .layers.normalization import LlamaRMSNorm
@@ -25,23 +21,20 @@ from .layers.residual import build_residual
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config, attention_backend: str = "sdpa"):
         super().__init__()
+        config = LayerConfig(config, config.layers[0])
         self.hidden_size = config.hidden_size
 
-        if attention_backend == "sdpa":
-            self.self_attn = LlamaAttention(config=config)
-        elif attention_backend == "flex_attention":
-            print_with_rank("Using flex attention on draft model training!")
-            self.self_attn = LlamaFlexAttention(config=config)
-        elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config)
-        elif attention_backend == "usp":
-            self.self_attn = LlamaUSPFlashAttention(config=config)
-        else:
-            raise ValueError(f"Unknown attention backend {attention_backend}")
+        self.self_attn = build_component(
+            "attention",
+            config.layer.attention,
+            "eagle_cache",
+            config=config,
+            attention_backend=attention_backend,
+        )
 
         self.attention_backend = attention_backend
-        self.mlp = build_ffn(config, dense_factory=LlamaMLP)
-        self.residual = build_residual(config)
+        self.mlp = build_ffn(config.layer.ffn, config=config, dense_factory=LlamaMLP)
+        self.residual = build_residual(config.layer.residual)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -116,7 +109,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     def __init__(self, config, quant_config=None) -> None:
         config = AutoDraftConfig.resolve(config, architecture=type(self).__name__)
-        super().__init__(config.to_hf_config())
+        super().__init__(config.to_hf_config(for_export=False))
         self.quant_config = quant_config
 
         self.embed_tokens = nn.Embedding(

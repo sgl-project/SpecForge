@@ -9,6 +9,7 @@ from .eagle3 import EagleConfig
 
 @dataclass(frozen=True, kw_only=True)
 class PEagleConfig(EagleConfig):
+    attention_contract = "peagle"
     norm_before_residual: bool
 
     @classmethod

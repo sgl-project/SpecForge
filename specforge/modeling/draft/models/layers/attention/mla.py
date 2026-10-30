@@ -6,8 +6,6 @@ import torch
 from torch import nn
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
-from specforge.config.draft.dflash import _resolve_mla_rope_interleaved
-
 from ..kernels import DFlashKernels
 
 SLIDING_ATTENTION = "sliding_attention"
@@ -53,7 +51,7 @@ class Qwen3DFlashMLAAttention(Qwen3DFlashAttentionBase):
                     else 0.1 * mscale_all_dim * math.log(factor) + 1.0
                 )
                 self.scaling *= mscale * mscale
-        self.rope_interleaved = _resolve_mla_rope_interleaved(config)
+        self.rope_interleaved = getattr(config, "rope_interleave", True)
 
         hidden_size = int(config.hidden_size)
         bias = bool(config.attention_bias)

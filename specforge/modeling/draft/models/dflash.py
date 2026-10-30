@@ -1,4 +1,3 @@
-import copy
 from typing import Optional
 
 import torch
@@ -16,14 +15,15 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from typing_extensions import Tuple, Unpack
 
 from specforge.config.draft import AutoDraftConfig
-from specforge.config.draft.dflash import DFlashConfig, resolve_dflash_causal_block
+from specforge.config.draft.dflash import DFlashConfig
+from specforge.config.draft.legacy_attention import resolve_dflash_causal_block
+from specforge.config.draft.model import LayerConfig
 from specforge.modeling.draft.models.layers.attention.backends.flex_options import (
     flex_attention_backend,
 )
 from specforge.modeling.draft.models.layers.attention.masks import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
-    resolve_dflash_is_causal,
 )
 from specforge.modeling.draft.models.layers.kernels import (
     DEFAULT_DFLASH_KERNELS,
@@ -45,7 +45,18 @@ def dflash_attention_resume_contract(draft_model) -> dict:
     supported global causal attention before independent window directions.
     """
 
-    is_causal = resolve_dflash_causal_block(draft_model.config)
+    try:
+        is_causal = resolve_dflash_causal_block(draft_model.config)
+    except ValueError:
+        return {
+            "draft_attention_mask_semantics": (
+                3,
+                tuple(
+                    (layer.attention.sliding_window, layer.attention.is_causal)
+                    for layer in draft_model.config.layers
+                ),
+            )
+        }
     if is_causal is None:
         return {}
 
@@ -77,17 +88,11 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
-def _rope_config(config: Qwen3Config, attention_mode: str) -> Qwen3Config:
+def _rope_config(config: Qwen3Config) -> Qwen3Config:
     """Rotary config for the mode: MLA rotates only the partial-RoPE slice."""
 
-    if attention_mode != "mla":
-        return config
-    rope_config = (
-        config.to_hf_config()
-        if hasattr(config, "to_hf_config")
-        else copy.deepcopy(config)
-    )
-    rope_config.head_dim = config.qk_rope_head_dim
+    rope_config = config.model.to_hf_config(for_export=False)
+    rope_config.head_dim = config.layer.attention.rotary_dim
     return rope_config
 
 
@@ -104,14 +109,18 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         kernels: DFlashKernels,
     ):
         super().__init__()
+        config = LayerConfig(config, config.layers[layer_idx])
         self.hidden_size = config.hidden_size
         self.self_attn = build_dflash_attention(
+            config.layer.attention,
             config=config,
             layer_idx=layer_idx,
             kernels=kernels,
         )
-        self.mlp = build_ffn(config, dense_factory=kernels.make_mlp)
-        self.residual = build_residual(config)
+        self.mlp = build_ffn(
+            config.layer.ffn, config=config, dense_factory=kernels.make_mlp
+        )
+        self.residual = build_residual(config.layer.residual)
         self.input_layernorm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -222,7 +231,7 @@ class DFlashDraftModel(DraftSerializationMixin, Qwen3PreTrainedModel):
         dflash_kernels: Optional[DFlashKernels] = None,
     ) -> None:
         config = AutoDraftConfig.resolve(config, architecture=type(self).__name__)
-        super().__init__(config.to_hf_config())
+        super().__init__(config.to_hf_config(for_export=False))
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         dflash_config = config.dflash_config
         self.layers = nn.ModuleList(
@@ -232,9 +241,12 @@ class DFlashDraftModel(DraftSerializationMixin, Qwen3PreTrainedModel):
             ]
         )
         self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(
-            _rope_config(config, dflash_config["attention_mode"])
-        )
+        rotary = [
+            Qwen3RotaryEmbedding(_rope_config(LayerConfig(config, layer)))
+            for layer in config.layers
+        ]
+        self.rotary_emb = rotary[0]
+        self.extra_rotary_emb = nn.ModuleList(rotary[1:])
         self.fc = nn.Linear(
             len(dflash_config["target_layer_ids"]) * config.hidden_size,
             config.hidden_size,
@@ -330,8 +342,6 @@ class DFlashDraftModel(DraftSerializationMixin, Qwen3PreTrainedModel):
         implementation = self.config._attn_implementation
         if implementation not in ("eager", "sdpa", "flex_attention"):
             return None
-        if is_causal is None:
-            is_causal = getattr(self.config, "is_causal", None)
 
         # Count cached keys before any layer appends this call's context/draft.
         cached_length = (
@@ -361,18 +371,23 @@ class DFlashDraftModel(DraftSerializationMixin, Qwen3PreTrainedModel):
             mask_builder = create_dflash_sdpa_mask
 
         masks = {}
-        if FULL_ATTENTION in self.config.layer_types:
-            # A bidirectional full layer sees every key, so it needs no mask.
-            full_causal = resolve_dflash_is_causal(is_causal, FULL_ATTENTION)
-            masks[FULL_ATTENTION] = (
-                mask_builder(**mask_args, is_causal=True) if full_causal else None
-            )
-        if SLIDING_ATTENTION in self.config.layer_types:
-            masks[SLIDING_ATTENTION] = mask_builder(
-                **mask_args,
-                sliding_window=self.config.sliding_window,
-                is_causal=is_causal,
-            )
+        shared = {}
+        for index, layer in enumerate(self.config.layers):
+            attention = layer.attention
+            causal = attention.is_causal if is_causal is None else is_causal
+            key = (attention.sliding_window, causal)
+            if key not in shared:
+                shared[key] = (
+                    None
+                    if key == (None, False)
+                    else mask_builder(
+                        **mask_args,
+                        sliding_window=attention.sliding_window,
+                        is_causal=causal,
+                    )
+                )
+            masks[index] = shared[key]
+            masks.setdefault(attention.layer_type, shared[key])
         return masks
 
     def forward(
@@ -387,7 +402,6 @@ class DFlashDraftModel(DraftSerializationMixin, Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         attention_mask = self._prepare_attention_mask(
             attention_mask,
             hidden_states,
@@ -395,9 +409,20 @@ class DFlashDraftModel(DraftSerializationMixin, Qwen3PreTrainedModel):
             past_key_values,
             is_causal=kwargs.get("is_causal"),
         )
-        for layer_type, layer in zip(self.config.layer_types, self.layers):
+        rotary_cache = {}
+        for index, (spec, layer) in enumerate(zip(self.config.layers, self.layers)):
+            rotary = self.rotary_emb if index == 0 else self.extra_rotary_emb[index - 1]
+            width = spec.attention.rotary_dim
+            if width not in rotary_cache:
+                rotary_cache[width] = rotary(hidden_states, position_ids)
+            position_embeddings = rotary_cache[width]
+            layer_type = spec.attention.layer_type
             layer_attention_mask = (
-                attention_mask[layer_type]
+                (
+                    attention_mask[index]
+                    if index in attention_mask
+                    else attention_mask[layer_type]
+                )
                 if isinstance(attention_mask, dict)
                 else attention_mask
             )

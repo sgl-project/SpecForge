@@ -9,12 +9,13 @@ from typing import Self
 from transformers import Qwen3Config
 
 from .base import DraftConfig, boolean, method_config, validate_dimensions, validate_gqa
-from .components import validate_components
 from .rope import resolve_rope_type, validate_native_rope_type
 
 
 @dataclass(frozen=True, kw_only=True)
 class Qwen3_5MTPConfig(DraftConfig):
+    attention_contract = "qwen_mtp"
+    requires_causal = True
     _nested_fields = frozenset({"share_lm_head"})
     attn_output_gate: bool
     partial_rotary_factor: float
@@ -28,6 +29,10 @@ class Qwen3_5MTPConfig(DraftConfig):
         Target decoder depth/model_type differ from the extracted single-layer
         draft. Only fields used by the native MTP computation are compared.
         """
+        if hasattr(config, "layers"):
+            from .model import LayerConfig
+
+            config = LayerConfig(config, config.layers[0])
         target = getattr(target_config, "text_config", target_config)
         validate_native_rope_type(config, target, supported_types={"default"})
         rope = getattr(target, "rope_parameters", None) or {}
@@ -65,8 +70,11 @@ class Qwen3_5MTPConfig(DraftConfig):
     @classmethod
     def from_model_config(cls, config: Qwen3Config) -> Self:
         validate_dimensions(config)
-        validate_components(config, attention_types=("gqa", "mha"), causal_only=True)
-        head_dim = validate_gqa(config)
+        head_dim = (
+            config.layers[0].attention.head_dim
+            if hasattr(config, "layers")
+            else validate_gqa(config)
+        )
         if config.num_hidden_layers != 1:
             raise ValueError("Qwen3.5 MTP requires num_hidden_layers=1")
         rope = getattr(config, "rope_parameters", None) or {}

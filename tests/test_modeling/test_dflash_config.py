@@ -4,7 +4,6 @@ import copy
 import json
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -99,7 +98,7 @@ class DFlashConfigTest(unittest.TestCase):
                         AutoDraftModel.from_config(config)
 
     def test_invalid_layout_and_window_have_config_errors(self):
-        for layout in (None, "full_attention", [None], [[]]):
+        for layout in ("full_attention", [None], [[]]):
             with self.subTest(layout=layout):
                 config = AutoDraftConfig.from_dict(payload())
                 config.__dict__["layer_types"] = layout
@@ -124,18 +123,19 @@ class DFlashConfigTest(unittest.TestCase):
 
     def test_resolved_layout_and_direction_are_written_to_hf_config(self):
         config = AutoDraftConfig.from_dict(payload())
-        options = replace(
-            DFlashConfig.from_model_config(config),
-            layer_types=("sliding_attention",),
-            sliding_window=8,
-            is_causal=True,
+        resolved = AutoDraftConfig.from_inline(
+            {
+                **payload(),
+                "layers": {"attention": {"sliding_window": 8, "is_causal": True}},
+            }
         )
-        resolved = options.to_model_config(config)
-        self.assertEqual(DFlashConfig.from_model_config(resolved), options)
-        restored = AutoDraftConfig.from_dict(resolved.to_dict())
-        self.assertEqual(DFlashConfig.from_model_config(restored), options)
+        exported = resolved.to_hf_config()
+        self.assertEqual(exported.layer_types, ["sliding_attention"])
+        self.assertEqual(exported.sliding_window, 8)
+        self.assertIs(exported.is_causal, True)
+        restored = AutoDraftConfig.resolve(exported)
+        self.assertEqual(restored.layers, resolved.layers)
         self.assertEqual(config.layer_types, ["full_attention"])
-        self.assertIsNone(getattr(config, "is_causal", None))
 
     def test_variant_settings_and_weights_survive_save_reload(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -176,7 +176,8 @@ class DFlashConfigTest(unittest.TestCase):
                     options_cls,
                 )
                 self.assertEqual(
-                    model.config.to_dict()["dflash_config"], resolved.dflash_config
+                    AutoDraftConfig.finalize(model.config.to_hf_config()).dflash_config,
+                    resolved.dflash_config,
                 )
                 self.assertEqual(config.to_dict(), original)
 
@@ -283,7 +284,7 @@ class DFlashConfigTest(unittest.TestCase):
             resolved = resolve_draft_config(cfg, provider=provider)
             self.assertEqual(resolved.block_size, 8)
             self.assertNotIn("block_size", resolved.dflash_config)
-            self.assertEqual(resolved.dflash_config["conv_kernel_size"], 6)
+            self.assertEqual(resolved.layers[0].conv.kernel_size, 6)
             cfg.model.draft_model_config["block_size"] = 4
             with self.assertRaisesRegex(ValueError, "must not exceed block_size"):
                 resolve_draft_config(cfg, provider=provider)
