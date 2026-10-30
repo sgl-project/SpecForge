@@ -22,6 +22,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any, Dict, List
+from unittest import mock
 
 import torch
 
@@ -31,6 +32,7 @@ from specforge.inference.adapters.server_capture import (
     ServerCaptureFailure,
     ServerCaptureSchema,
     SGLangServerCaptureAdapter,
+    detect_server_capture,
 )
 from specforge.inference.capture import (
     CaptureConfig,
@@ -303,6 +305,7 @@ def _mk(
     request_input_adapter=None,
     teacher_metrics=True,
     server_capture="patch",
+    server_info_fn=None,
 ):
     backend = backend or _FakeMooncakeStore()
     if server is None:
@@ -322,6 +325,7 @@ def _mk(
         request_input_adapter=request_input_adapter,
         post_fn=server,
         server_capture=server_capture,
+        server_info_fn=server_info_fn,
     )
     return backend, server, store, adapter
 
@@ -917,6 +921,124 @@ class TestServerCapturePluginTransport(unittest.TestCase):
     def test_unknown_backend_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "server_capture must be one of"):
             _mk(server_capture="sidecar")
+
+
+PLUGIN_SERVER_INFO = {
+    "enable_return_aux_hidden_states": True,
+    "internal_states": [{"spec_capture_backend": "plugin"}],
+}
+PATCH_SERVER_INFO = {"enable_spec_capture": True, "internal_states": [{}]}
+
+
+class TestServerCaptureAutoDetection(unittest.TestCase):
+    """``server_capture="auto"`` reads the backend from ``/server_info``."""
+
+    def _auto(self, *infos, stub=_StubCaptureServer):
+        backend = _FakeMooncakeStore()
+        server = stub(backend)
+        posted, fetched = [], []
+        replies = list(infos)
+
+        def post(url, json_body, timeout):
+            posted.append(json_body)
+            return server(url, json_body, timeout)
+
+        def server_info(url, timeout):
+            fetched.append(url)
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        _, _, store, adapter = _mk(
+            server=post,
+            backend=backend,
+            server_capture="auto",
+            server_info_fn=server_info,
+        )
+        return adapter, store, posted, fetched
+
+    def test_detects_each_backend_once(self):
+        for info, stub, expected in (
+            (PLUGIN_SERVER_INFO, _PluginStubCaptureServer, "plugin"),
+            (PATCH_SERVER_INFO, _StubCaptureServer, "patch"),
+        ):
+            with self.subTest(expected):
+                adapter, _, posted, fetched = self._auto(info, stub=stub)
+                self.assertEqual(adapter.server_capture, "auto")
+                for index in range(2):
+                    (ref,) = adapter.produce_refs(
+                        [_task(index, 4)], capture=_eagle3_contract()
+                    )
+                    self.assertIsInstance(ref, SampleRef)
+                self.assertEqual(adapter.server_capture, expected)
+                self.assertEqual(fetched, ["http://server:30000/server_info"])
+                for body in posted:
+                    if expected == "plugin":
+                        self.assertNotIn("spec_capture", body)
+                        self.assertIn("custom_params", body["sampling_params"][0])
+                    else:
+                        self.assertIn("spec_capture", body)
+
+    def test_server_without_capture_fails_before_any_write(self):
+        for info in (
+            # Stock SGLang, or the plugin installed without SPECFORGE_SPEC_CAPTURE=1.
+            {"enable_return_aux_hidden_states": True, "internal_states": [{}]},
+            {"enable_spec_capture": False},
+        ):
+            with self.subTest(info=info):
+                adapter, store, posted, _ = self._auto(info)
+                with (
+                    mock.patch.object(store, "track_external_attempt") as track,
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "advertises no spec capture.*--enable-spec-capture.*"
+                        "SPECFORGE_SPEC_CAPTURE=1.*DISAGG_SERVER_CAPTURE",
+                    ),
+                ):
+                    adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+                track.assert_not_called()
+                self.assertEqual(posted, [])
+                self.assertEqual(adapter.server_capture, "auto")
+
+    def test_unreadable_server_info_is_detected_again_on_the_next_request(self):
+        adapter, _, posted, fetched = self._auto(
+            ConnectionError("connection refused"), PATCH_SERVER_INFO
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "cannot read http://server:30000/server_info.*refused"
+        ):
+            adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        self.assertEqual(posted, [])
+        (ref,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        self.assertIsInstance(ref, SampleRef)
+        self.assertEqual(adapter.server_capture, "patch")
+        self.assertEqual(len(fetched), 2)
+
+    def test_default_server_info_fetch(self):
+        response = mock.Mock()
+        response.json.return_value = PLUGIN_SERVER_INFO
+        backend = _FakeMooncakeStore()
+        _, _, _, adapter = _mk(
+            server=_PluginStubCaptureServer(backend),
+            backend=backend,
+            server_capture="auto",
+        )
+        with mock.patch("requests.get", return_value=response) as get:
+            (ref,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        self.assertIsInstance(ref, SampleRef)
+        get.assert_called_once_with("http://server:30000/server_info", timeout=30.0)
+        response.raise_for_status.assert_called_once_with()
+
+    def test_detect_server_capture_reads_both_markers(self):
+        self.assertEqual(
+            detect_server_capture(PLUGIN_SERVER_INFO, server_url="u"), "plugin"
+        )
+        self.assertEqual(
+            detect_server_capture(PATCH_SERVER_INFO, server_url="u"), "patch"
+        )
+        with self.assertRaisesRegex(RuntimeError, "^u advertises no spec capture"):
+            detect_server_capture({}, server_url="u")
 
 
 class TestDefaultHttpTransport(unittest.TestCase):
