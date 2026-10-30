@@ -13,7 +13,7 @@ type Source = 'source' | 'pypi'
 const HARDWARE: { key: Hardware; label: string }[] = [
   { key: 'cuda', label: 'NVIDIA CUDA' },
   { key: 'rocm', label: 'AMD ROCm' },
-  { key: 'npu', label: 'Ascend NPU' },
+  { key: 'npu', label: 'Huawei Ascend NPU' },
 ]
 const INSTALLERS: { key: Installer; label: string }[] = [
   { key: 'uv', label: 'uv' },
@@ -101,7 +101,7 @@ const note = computed(() => {
       return {
         text: 'Install the vendor-matched PyTorch, torch_npu and a compatible SGLang/Mooncake service first. The launcher detects the NPU and selects HCCL.',
         link: '/basic_usage/Ascend/ascend_npu',
-        label: 'Ascend NPU tutorial',
+        label: 'Huawei Ascend NPU tutorial',
       }
     default:
       return {

@@ -29,7 +29,7 @@ const features = [
   {
     title: 'Any scale, any accelerator',
     icon: 'M4 4h16v16H4zM9 9h6v6H9zM2 9h2M2 15h2M20 9h2M20 15h2M9 2v2M15 2v2M9 20v2M15 20v2',
-    text: 'Online and offline training, colocated or disaggregated, from a single GPU to multi-server capture on NVIDIA CUDA, AMD ROCm and Ascend NPU.',
+    text: 'Online and offline training, colocated or disaggregated, from a single GPU to multi-server capture on NVIDIA CUDA, AMD ROCm and Huawei Ascend NPU.',
   },
 ]
 
@@ -41,7 +41,7 @@ const steps = [
 ]
 
 const methods = ['EAGLE3', 'P-EAGLE', 'DFlash', 'DFlash2', 'DSpark', 'Domino', 'MTP']
-const hardware = ['NVIDIA GPUs', 'AMD GPUs', 'Ascend NPUs']
+const hardware = ['NVIDIA GPUs', 'AMD GPUs', 'Huawei Ascend NPUs']
 const families = ['Llama', 'Qwen', 'Kimi', 'DeepSeek', 'GLM', 'gpt-oss', 'Step', 'Ling', 'Inkling']
 
 const community = [
