@@ -122,6 +122,58 @@ class CheckpointLoadingTest(unittest.TestCase):
             self.assertEqual({}, load_checkpoint_tensors("unused", keys=[]))
             resolve.assert_not_called()
 
+    def test_weight_map_shard_names_stay_inside_the_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "package"
+            outside = root / "outside"
+            package.mkdir()
+            outside.mkdir()
+            marker = torch.full((2, 2), 7.3125)
+            save_file(
+                {"model.embed_tokens.weight": marker},
+                str(outside / "licensed.safetensors"),
+            )
+            save_file(
+                {"model.embed_tokens.weight": torch.ones(2, 2)},
+                str(package / "model-00001-of-00001.safetensors"),
+            )
+
+            escapes = (
+                "../outside/licensed.safetensors",
+                "nested/../../outside/licensed.safetensors",
+                str(outside / "licensed.safetensors"),
+            )
+            for shard in escapes:
+                with self.subTest(shard=shard):
+                    (package / "model.safetensors.index.json").write_text(
+                        json.dumps({"weight_map": {"model.embed_tokens.weight": shard}})
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "weight_map values must be shard file names"
+                    ):
+                        load_checkpoint_tensors(
+                            str(package), keys=["model.embed_tokens.weight"]
+                        )
+
+            (package / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "model.embed_tokens.weight": (
+                                "model-00001-of-00001.safetensors"
+                            )
+                        }
+                    }
+                )
+            )
+            loaded = load_checkpoint_tensors(
+                str(package), keys=["model.embed_tokens.weight"]
+            )
+            torch.testing.assert_close(
+                loaded["model.embed_tokens.weight"], torch.ones(2, 2)
+            )
+
     def test_invalid_selectors_are_rejected(self):
         with self.assertRaises(ValueError):
             load_checkpoint_tensors(
