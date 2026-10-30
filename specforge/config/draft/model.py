@@ -136,6 +136,7 @@ def inline_values(payload: Mapping, *, model_type: str) -> _ConfigValues:
 
     family_defaults = {
         "llama": {
+            "pretraining_tp": 1,
             "mlp_bias": False,
             "vocab_size": 32000,
             "intermediate_size": 11008,

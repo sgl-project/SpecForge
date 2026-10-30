@@ -60,6 +60,17 @@ class ImmutableDraftConfigTest(unittest.TestCase):
                     draft_config_contract(AutoDraftConfig.from_dict(payload)),
                 )
 
+    def test_inline_eagle_defaults_run_a_forward(self):
+        payload = architecture_payloads()["LlamaForCausalLMEagle3"]
+        model = AutoDraftModel.from_config(AutoDraftConfig.from_inline(payload)).eval()
+        with torch.no_grad():
+            result = model(
+                inputs_embeds=torch.randn(1, 3, model.config.hidden_size),
+                hidden_states=torch.randn(1, 3, model.config.target_hidden_size * 3),
+            )
+        self.assertEqual(result.shape, (1, 3, model.config.hidden_size))
+        self.assertTrue(torch.isfinite(result).all())
+
     def test_nested_settings_are_immutable_and_do_not_alias_input(self):
         payload = architecture_payloads()["DFlashDraftModel"]
         payload["extension"] = {"layers": [{"kind": "gqa"}]}
