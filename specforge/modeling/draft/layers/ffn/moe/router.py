@@ -63,9 +63,8 @@ class Router(nn.Module):
         """Identity here; families map ``x`` [T, H] to fp32 affinities [T, E]."""
         return x
 
-    def select(self, scores: torch.Tensor) -> torch.Tensor:
-        """``scores`` [T, E] -> the chosen experts [T, K]; the bias shifts the picks only."""
-        choice = scores if self.expert_bias is None else scores + self.expert_bias
+    def select(self, choice: torch.Tensor) -> torch.Tensor:
+        """``choice`` [T, E], the scores shifted for picking -> the chosen experts [T, K]."""
         return choice.topk(self.top_k, dim=-1).indices
 
     def routing_weights(
@@ -82,7 +81,9 @@ class Router(nn.Module):
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         scores = self.score(x)
-        indices = self.select(scores)
+        # The bias shifts the picks only; the weights still come from scores.
+        choice = scores if self.expert_bias is None else scores + self.expert_bias
+        indices = self.select(choice)
         weights = self.routing_weights(scores, indices)
         return scores, indices, weights
 
