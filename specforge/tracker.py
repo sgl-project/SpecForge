@@ -3,6 +3,7 @@
 import abc
 import netrc
 import os
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 import torch.distributed as dist
@@ -40,15 +41,35 @@ except ImportError:
 # --- End Lazy Imports ---
 
 
+def _is_secret_field(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in {
+        "key",
+        "token",
+        "password",
+        "secret",
+        "wandb_key",
+        "swanlab_key",
+        "hf_key",
+    } or lowered.endswith(("_api_key", "_auth_token", "_token", "_password", "_secret"))
+
+
+def _redact_config(value: Any, *, field: str | None = None) -> Any:
+    if field is not None and _is_secret_field(field):
+        return None if value is None else "<redacted>"
+    if isinstance(value, Mapping):
+        return {
+            str(name): _redact_config(item, field=str(name))
+            for name, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_config(item) for item in value]
+    return value
+
+
 def _public_config(args) -> Dict[str, Any]:
-    """Return tracker metadata without copying credentials into run logs."""
-    config = dict(vars(args))
-    for name in list(config):
-        lowered = name.lower()
-        if any(secret in lowered for secret in ("key", "token", "password")):
-            if config[name] is not None:
-                config[name] = "<redacted>"
-    return config
+    """Return recursively redacted tracker metadata safe for run logs."""
+    return _redact_config(vars(args))
 
 
 class Tracker(abc.ABC):
@@ -158,6 +179,7 @@ class WandbTracker(Tracker):
 
     def __init__(self, args, output_dir: str):
         super().__init__(args, output_dir)
+        self._run = None
         if wandb is None:
             raise RuntimeError(
                 "To use --report-to wandb, install the W&B client: "
@@ -178,16 +200,25 @@ class WandbTracker(Tracker):
             }
             if args.wandb_offline:
                 init_kwargs["mode"] = "offline"
-            wandb.init(**init_kwargs)
-            self.is_initialized = True
+            # Keep the run handle owned by this tracker.  The module-level
+            # ``wandb.run`` singleton is mutable process-global state; relying
+            # on it after a multiprocessing-heavy setup can silently detach
+            # explicit training history from the initialized run.
+            self._run = wandb.init(**init_kwargs)
+            self.is_initialized = self._run is not None
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
-        if self.rank == 0 and self.is_initialized:
-            wandb.log(log_dict, step=step)
+        if self.rank == 0 and self.is_initialized and self._run is not None:
+            # W&B defaults ``commit`` to False whenever an explicit step is
+            # supplied.  Finalize each trainer record so live runs publish the
+            # point immediately instead of keeping the newest step buffered.
+            self._run.log(log_dict, step=step, commit=True)
 
     def close(self):
-        if self.rank == 0 and self.is_initialized and wandb.run:
-            wandb.finish()
+        if self.rank == 0 and self.is_initialized:
+            if self._run is not None:
+                self._run.finish()
+            self._run = None
             self.is_initialized = False
 
 

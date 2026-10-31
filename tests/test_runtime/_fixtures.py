@@ -111,10 +111,6 @@ def write_target_head_dir(d, hidden=H, vocab=V):
         {"lm_head.weight": torch.randn(vocab, hidden, dtype=torch.float32)},
         os.path.join(d, "model.safetensors"),
     )
-    with open(os.path.join(d, "model.safetensors.index.json"), "w") as f:
-        json.dump(
-            {"metadata": {}, "weight_map": {"lm_head.weight": "model.safetensors"}}, f
-        )
     return d
 
 
@@ -308,6 +304,7 @@ def build_dflash(
 
     draft_config = AutoConfig.from_pretrained(target_dir)
     draft_config.num_hidden_layers = draft_layers
+    draft_config.layer_types = ["full_attention"] * draft_layers
     draft_config.block_size = block_size
     draft_config.num_target_layers = target_layers
     draft_config.dflash_config = {"mask_token_id": mask_token_id}
@@ -375,6 +372,7 @@ def build_domino(
 
     draft_config = AutoConfig.from_pretrained(target_dir)
     draft_config.num_hidden_layers = draft_layers
+    draft_config.layer_types = ["full_attention"] * draft_layers
     draft_config.block_size = block_size
     draft_config.num_target_layers = target_layers
     draft_config.dflash_config = {
@@ -445,6 +443,7 @@ def build_dspark(
 
     draft_config = AutoConfig.from_pretrained(target_dir)
     draft_config.num_hidden_layers = draft_layers
+    draft_config.layer_types = ["full_attention"] * draft_layers
     draft_config.block_size = block_size
     draft_config.num_target_layers = target_layers
     draft_config.dflash_config = {

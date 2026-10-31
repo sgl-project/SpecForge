@@ -21,7 +21,7 @@ CLI; there is no second wrapper-owned training lifecycle.
 
 Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;
-`TrainerCore` owns one branch-free train step and the accumulation boundary;
+`TrainerCore` owns forward/backward scheduling and the accumulation boundary;
 `DraftTrainStrategy` owns model-specific validation, forward/loss, target
 projection, and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
 backward, optimizer steps, distributed gradient norms, and full training state.
@@ -58,6 +58,9 @@ The training plane is the only tensor-carrying side besides the data plane; it
 consumes `TrainBatch.tensors`. `TrainerCore.train_step` divides the loss by
 `accumulation_steps`, uses `no_sync()` only for non-boundary micro-batches, and
 returns `optimizer_stepped` as the single authoritative boundary signal.
+For DDP, the backend accumulation context encloses both forward and backward;
+wrapping backward alone does not disable DDP gradient synchronization. FSDP
+retains its backward-only deferral.
 `TrainerController` increments `global_step` only at that boundary, commits the
 pending sample acknowledgements, emits metrics, and performs configured
 interval saves. The outer `Trainer` owns topology cleanup and the guarded final
@@ -65,11 +68,36 @@ save, so CLI, builders, and Python callers cannot select a second loader-based
 training entry. All saves delegate to `CheckpointManager`; the shared draft
 state is written by rank 0 while every rank writes its own optimizer/RNG state.
 
+DSpine gradient accumulation uses a graph-free CE prepass and
+`StepOutput.replay_loss` to share one detached, globally normalized alignment CE
+across the optimizer window. Replay retains CPU inputs and restores RNG state,
+adding a forward pass without retaining the window's activations. Each replayed
+forward/backward pair uses the backend accumulation context; only the last
+synchronizes DDP gradients. Evaluation and single-micro-batch training skip replay.
+
 Natural end-of-stream is accepted only at an optimizer boundary. If the final
 backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
 gradients or reporting a checkpoint as successful. Queue-mode loaders
 terminally settle and clean a short `drop_last` batch without emitting it;
 fixed offline refs keep normal `drop_last` semantics.
+
+## Consumer dispatch
+
+`runtime.consumer_dispatch` controls sample assignment to consumer ranks:
+
+- `round_robin` (default): assign samples in source order.
+- `cost_balanced`: balance estimated anchor/context costs within each optimizer window.
+- `two_window_bucketed`: sort samples across two windows, then balance each window.
+- `two_window_joint_balanced`: balance two windows jointly, falling back to independent
+  balancing unless the estimated total critical-path cost decreases.
+
+Two-window policies require both high and low ref watermarks to cover two global
+optimizer windows and can change optimizer-step sample membership and the training trajectory.
+Producer byte accounting follows the acknowledged refs, including reordered windows;
+resume rebuilds release totals from the durable ledger and publication stream.
+All policies preserve sample coverage, per-rank accumulation counts, deduplication,
+durable acknowledgements, and incomplete-tail handling. Cost estimates are heuristics,
+not guarantees of throughput improvement.
 
 ## Endpoints
 

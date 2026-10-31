@@ -2,10 +2,11 @@
 """Backend-neutral experiment tracking at the Trainer logger seam."""
 
 import unittest
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
-from specforge.tracker import _public_config
+from specforge.tracker import WandbTracker, _public_config
 from specforge.training.tracking import (
     TrackerLogger,
     create_tracker_logger,
@@ -73,11 +74,31 @@ class TrackingLoggerTest(unittest.TestCase):
                 wandb_key="secret",
                 auth_token="also-secret",
                 wandb_project="specforge",
+                specforge_config={
+                    "tracking": {"wandb_key": "nested-secret"},
+                    "model": {
+                        "embedding_key": "language_model.embed_tokens.weight",
+                        "lm_head_key": "language_model.lm_head.weight",
+                    },
+                    "data": {"cache_key": "reproduction-cache"},
+                },
             )
         )
         self.assertEqual(config["wandb_key"], "<redacted>")
         self.assertEqual(config["auth_token"], "<redacted>")
         self.assertEqual(config["wandb_project"], "specforge")
+        self.assertEqual(
+            config["specforge_config"]["tracking"]["wandb_key"],
+            "<redacted>",
+        )
+        self.assertEqual(
+            config["specforge_config"]["model"]["embedding_key"],
+            "language_model.embed_tokens.weight",
+        )
+        self.assertEqual(
+            config["specforge_config"]["data"]["cache_key"],
+            "reproduction-cache",
+        )
 
     def test_normalizes_scalars_and_expands_vectors(self):
         self.assertEqual(
@@ -104,13 +125,35 @@ class TrackingLoggerTest(unittest.TestCase):
 
         logger({"loss": 1.5}, 7)
 
-        self.assertEqual(tracker.logged, [({"train/loss": 1.5}, 7)])
-        console.assert_called_once_with({"train/loss": 1.5}, 7)
+        expected = {"train/loss": 1.5, "train/optimizer_step": 7.0}
+        self.assertEqual(tracker.logged, [(expected, 7)])
+        console.assert_called_once_with(expected, 7)
 
-    def test_training_namespace_keeps_eval_metrics_unchanged(self):
+    def test_optimizer_step_is_authoritative_for_training_and_eval_rows(self):
+        tracker = _Tracker()
+        logger = TrackerLogger(tracker)
+        logger({"loss": 1, "optimizer_step": 0}, 500)
+        logger({"eval/loss": 2}, 500)
         self.assertEqual(
-            training_metric_names({"loss": 1.0, "eval/loss": 2.0}),
-            {"train/loss": 1.0, "eval/loss": 2.0},
+            [row[0]["train/optimizer_step"] for row in tracker.logged], [500.0, 500.0]
+        )
+
+    def test_training_namespace_keeps_explicit_namespaces_unchanged(self):
+        self.assertEqual(
+            training_metric_names(
+                {
+                    "loss": 1.0,
+                    "eval/loss": 2.0,
+                    "perf/optimizer_step_time_s": 3.0,
+                    "position_1/hard_label/unary_top1_accuracy": 0.5,
+                }
+            ),
+            {
+                "train/loss": 1.0,
+                "eval/loss": 2.0,
+                "perf/optimizer_step_time_s": 3.0,
+                "position_1/hard_label/unary_top1_accuracy": 0.5,
+            },
         )
 
     def test_close_is_idempotent_and_logging_after_close_fails(self):
@@ -134,7 +177,41 @@ class TrackingLoggerTest(unittest.TestCase):
         make.assert_called_once_with("tensorboard")
         tracker_class.validate_args.assert_called_once()
         logger({"loss": 2.0}, 3)
-        self.assertEqual(tracker.logged, [({"train/loss": 2.0}, 3)])
+        self.assertEqual(
+            tracker.logged, [({"train/loss": 2.0, "train/optimizer_step": 3.0}, 3)]
+        )
+
+    def test_wandb_tracker_logs_through_its_owned_run_handle(self):
+        run = mock.Mock()
+        wandb = mock.Mock()
+        wandb.init.return_value = run
+        args = SimpleNamespace(
+            wandb_dir=None,
+            wandb_offline=True,
+            wandb_key=None,
+            wandb_project="specforge",
+            wandb_name="disaggregated-trainer",
+        )
+
+        with (
+            TemporaryDirectory() as output_dir,
+            mock.patch("specforge.tracker.wandb", wandb),
+            mock.patch("specforge.tracker.dist.is_available", return_value=True),
+            mock.patch("specforge.tracker.dist.is_initialized", return_value=True),
+            mock.patch("specforge.tracker.dist.get_rank", return_value=0),
+        ):
+            tracker = WandbTracker(args, output_dir)
+            # A later multiprocessing lifecycle may clear W&B's module-global
+            # current run.  The tracker-owned handle must remain authoritative.
+            wandb.run = None
+            tracker.log({"train/loss": 1.25}, step=10)
+            tracker.close()
+            tracker.close()
+
+        run.log.assert_called_once_with({"train/loss": 1.25}, step=10, commit=True)
+        run.finish.assert_called_once_with()
+        wandb.log.assert_not_called()
+        wandb.finish.assert_not_called()
 
     def test_noop_tracker_does_not_require_initialized_distributed(self):
         logger = create_tracker_logger(SimpleNamespace(report_to="none"), "/tmp/output")

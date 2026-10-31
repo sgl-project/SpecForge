@@ -1,20 +1,71 @@
 # SGLang patch inventory and supported version
 
-SpecForge pins `sglang==0.5.14`. The online patch is also kept compatible with
-SGLang's public `inkling-support` layout. There are two deliberately separate
+SpecForge pins `sglang==0.5.18` by default. A separately versioned patch supports
+the Kimi K3 SGLang fork at the current validated `kimi-k3` branch tip `9acd9cb`
+(and its original `f8493a4` integration point). There are deliberately separate
 SGLang integration surfaces.
 
 ## Online: external spec-capture server
 
-Online training uses
-[`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch).
+Online training uses one of these source-specific patches:
+
+| Target | Patch | Capture methods |
+|---|---|---|
+| SGLang v0.5.18 | [`patches/sglang/v0.5.18/spec-capture.patch`](../../patches/sglang/v0.5.18/spec-capture.patch) | EAGLE3, DFlash, DSpark |
+| Kimi K3 SGLang `9acd9cb` (`f8493a4` compatible) | [`patches/sglang/kimi-k3-f8493a4/spec-capture.patch`](../../patches/sglang/kimi-k3-f8493a4/spec-capture.patch) | EAGLE3, DFlash, DSpark |
+
 The patch adds `--enable-spec-capture` and a server-side sink that:
 
 1. captures requested auxiliary and final hidden states during prefill;
-2. writes tensors directly into Mooncake using
-   `MooncakeFeatureStore`'s key layout; and
+2. writes tensors into Mooncake using `MooncakeFeatureStore`'s key layout
+   from a background writer thread (one `batch_put_from` RPC per scheduler
+   batch), off the scheduler's critical path; and
 3. returns only key, shape, and dtype metadata in
-   `meta_info["spec_capture"]`.
+   `meta_info["spec_capture"]`, and only after every feature object of the
+   request has been durably published — a response therefore guarantees the
+   refs it names are readable.
+
+Under `MOONCAKE_PROTOCOL=rdma` the v0.5.18 sink checks its environment when the
+scheduler starts, before `/health` succeeds: it refuses an empty
+`MOONCAKE_RDMA_DEVICES`, for which Mooncake would auto-discover HCAs and fall
+back to TCP silently, and `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` or
+`MC_USE_TEV1`. The Mooncake connection itself stays lazy. The Kimi K3 patch
+does not check. When a GPU capture buffer fails to register, the error names
+the GPUDirect RDMA requirement and the `SGLANG_SPEC_CAPTURE_GPU_PUT=0` opt-out.
+
+Capture transfers overlap the next target prefill instead of blocking it:
+the aux/last-hidden D2H rides the overlap scheduler's `copy_to_cpu` copy
+stream, per-request tensors stay zero-copy views into the batch-level host
+buffer, and the scheduler retains at most
+`SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES` (default 2) in-flight batches
+before it blocks on the oldest — bounding pinned-host memory while keeping
+backpressure. The idle loop never enters the sleeper while a transfer is
+outstanding, so a lone in-flight response cannot deadlock a waiting
+producer. Set `SGLANG_SPEC_CAPTURE_TIMING=1` to log per-stage
+materialize/register/put timings and queue-to-stream latency.
+
+On multi-node NVLink systems (GB200/GB300 NVL72), `MOONCAKE_PROTOCOL=nvlink`
+moves captures GPU to GPU without the store. Mooncake's NVLink transport only
+exports fabric memory, where the store cannot place objects, so the v0.5.18
+sink copies captures into an arena: one `SGLANG_SPEC_CAPTURE_ARENA_BYTES`-byte
+allocation (`managed_local.mooncake.arena_bytes`) that the TransferEngine makes
+on the writer GPU. Currently only online NVLink capture uses the arena.
+Responses carry each object's device address. Trainers read with
+`transfer_sync_read` into `receive_buffers: cuda` and free objects wherever they
+would remove store objects, by writing the keys to the sink's control
+connection (port `SGLANG_SPEC_CAPTURE_CONTROL_PORT`, ephemeral by default).
+Before the first capture request, the client queries `/server_info` for each
+scheduler's `spec_capture_control` endpoint. This opens only the control socket;
+HBM is still allocated lazily on first capture. Use the current server patch:
+clients refuse capture if these endpoints are not advertised. Every attempted
+endpoint is carried in `SampleRef.metadata["mooncake_arena"]["controls"]`, so a
+lost response followed by a retry on another server does not strand the first
+copy. Failed frees retain their destinations for lifecycle retries.
+Frees are one-way; the writer thread applies them before it allocates, so no
+extra thread competes with the scheduler. Reserve the arena below
+`--mem-fraction-static`; with `nvlink`, `runtime.resident_high_watermark_bytes`
+is required and must fit in the summed arenas. Requires a Mooncake build with
+`USE_MNNVL` (the aarch64 CUDA wheels) and an IMEX channel in every container.
 
 The client boundary is
 [`adapters/server_capture.py`](adapters/server_capture.py). Algorithm-owned
@@ -22,14 +73,75 @@ providers map generic server artifacts (`aux`, `last_hidden`, passthrough
 inputs) to training feature names. No trainer or producer process imports
 SGLang model-runner internals or loads a target model.
 
-The same patch is dry-run validated against the v0.5.14 tag and the public
-`inkling-support` branch. Capture requests carry a unique `extra_key`, so every
-training sample executes a full prefill even when radix cache support is
-present. Capture launch configs therefore leave radix cache enabled, including
-for hybrid targets that require the unified radix tree.
+The default patch is dry-run validated against the v0.5.18 tag. Capture requests
+carry a unique `extra_key`, so every training sample executes a full prefill even
+when radix cache support is present. Managed-local launch preserves the
+historical disabled-cache default; hybrid targets that require the unified radix
+tree set `model.sglang_disable_radix_cache: false`.
 
-Apply the patch with `scripts/apply_sglang_spec_capture_patch.sh`. The
-server-capture unit and GPU gates must pass before updating the SGLang pin.
+On v0.5.18, targets that declare `logits_mup_width_multiplier` pass an
+LM-head-scaled hidden state into the logits processor. The capture patch
+restores the pre-head-scale post-norm representation because SpecForge folds
+the same multiplier into the frozen target head used during training.
+
+Apply the default patch with `scripts/apply_sglang_spec_capture_patch.sh`, or
+the K3 patch with
+`scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb`.
+On the default patch, `--spec-capture-method dspark` rides the DFlash aux
+plumbing (`set_dflash_layers_to_capture`), which stock v0.5.18 models, including
+Inkling, implement; DSpark and DFlash capture the same aux/last-hidden artifacts,
+so managed-local DSpark launches work unchanged. The K3 patch instead routes
+`--spec-capture-method dspark` to the model's dedicated
+`set_dspark_layers_to_capture` hook. It also keeps 64K capture correct by using
+64-bit Triton pointer arithmetic, scale-stable residual scoring, and a generic
+Marlin reduction fallback when the token dimension exceeds CUDA grid.y's
+65,535 limit. The server-capture unit and GPU gates must pass before updating
+either supported source revision.
+
+## Online: spec-capture plugin
+
+SGLang builds that ship three generic extension points run the same capture as
+a plugin instead of a source patch:
+
+- aux hidden-state capture on a target without a draft
+  (`--enable-return-aux-hidden-states` with `--speculative-algorithm` naming
+  the convention, `--return-aux-hidden-state-layer-ids`);
+- `ModelRunner.forward_observer`;
+- `Scheduler.defer_response(req, completion)`.
+
+The plugin is
+[`plugins/sglang-spec-capture`](../../plugins/sglang-spec-capture). Install it
+into the server's environment with `pip install --no-deps`. The default
+`deployment.disaggregated.server_capture: auto` selects it when it is
+installed; `server_capture: plugin` selects it explicitly.
+
+Managed-local capture servers are then launched with `SPECFORGE_SPEC_CAPTURE=1`
+and the flags `--speculative-algorithm <METHOD> --enable-return-aux-hidden-states`,
+`--return-aux-hidden-state-layer-ids ...`, `--return-hidden-states-mode full` and
+`--chunked-prefill-size -1`. The producer sends each spec as a JSON string in
+`sampling_params.custom_params["spec_capture"]` instead of the patch's
+top-level `spec_capture` field.
+
+The plugin keeps the patch's contract:
+
+- the Mooncake key layout;
+- a response only after every object is published;
+- background batch publication bounded by
+  `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`;
+- `SGLANG_SPEC_CAPTURE_GPU_PUT` / `SGLANG_SPEC_CAPTURE_TIMING`;
+- `MOONCAKE_PROTOCOL=nvlink` publication into a fabric-memory arena on the
+  writer GPU, sized by `SGLANG_SPEC_CAPTURE_ARENA_BYTES` and checked at
+  startup; results use the same `arena` locator as the patch, and the writer
+  advertises `spec_capture_control` through `/server_info` before any capture;
+- unscaled post-norm final hidden states.
+
+SGLang's aux-capture API already returns final hidden states before LM-head
+scaling, including for muP targets. The plugin forwards them unchanged;
+only the versioned capture patch restores scaled states. SpecForge applies
+`logits_mup_width_multiplier` once through its frozen target head.
+
+Its scheduler refuses to start without the required flags. The capture server
+does not need a patched SGLang.
 
 ## Offline: dedicated local capture
 
@@ -40,17 +152,17 @@ version-pinned APIs required for offline EAGLE3 preprocessing:
 | Dependency | Upgrade risk |
 |---|---|
 | `CaptureHiddenMode.FULL` and logits-processor replacement | hidden-state output fields or pruning behavior may change |
-| `set_eagle3_layers_to_capture` / `set_dflash_layers_to_capture` | strategy-specific layer-selection APIs may move |
+| `set_eagle3_layers_to_capture` / `set_dflash_layers_to_capture` / `set_dspark_layers_to_capture` | strategy-specific layer-selection APIs may move |
 | `ScheduleBatch`, `ForwardBatch`, and `ModelRunner` construction | constructor and memory-pool setup may change |
 | splitting captured states by request input length | token packing conventions may change |
 | DP-attention/model-parallel initialization patches | distributed group signatures may change |
 
-This package computes no logits and supports text EAGLE3 and DFlash-family
-state capture needed by the preprocessing script. It does not provide
+This package computes no logits and supports text EAGLE3, DFlash, Domino, and
+K3 DSpark state capture needed by the preprocessing script. It does not provide
 HF/custom backends, VLM capture, online rollout, or a general target-engine
 factory.
 
-`tests/test_runtime/test_sglang_0514_compat.py` guards the patched 0.5.14 API
+`tests/test_runtime/test_sglang_0518_compat.py` guards the patched 0.5.18 API
 seams, and
 `tests/test_offline_capture/test_sglang_backend.py`
 provides the GPU smoke coverage for dense and MoE offline capture.

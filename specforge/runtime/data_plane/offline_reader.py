@@ -15,6 +15,19 @@ metadata-only ``SampleRef`` per file, referencing the file in place via a
 through the controller). The strategy registry selects the raw feature keys and
 the FeatureDataLoader applies the strategy's per-sample normalization, keeping
 this reader independent of model code.
+
+Assembly only *lists* filenames; no feature file is opened. Filling
+``SampleRef.feature_specs`` instead costs a full read of every file — tensor
+pages for a ``.ckpt``, and for a ``.ckpt.gz`` a decompression of the whole
+stream, since gzip has no random access and the zip central directory
+``torch.load`` needs sits at the end. That is one serial pass over the dataset,
+in the trainer process, on every rank, before the first step, with no log line
+in between: minutes on a plain dataset and hours on a gzipped one. So the
+tensors are read lazily by the loader's prefetch workers during training,
+overlapped with compute.
+
+Set ``SPECFORGE_VALIDATE_OFFLINE_FEATURES=1`` (or pass ``validate_files=True``)
+to opt back into the eager pass and check a suspect dataset up front.
 """
 
 from __future__ import annotations
@@ -31,6 +44,7 @@ from specforge.runtime.data_plane.feature_store import (
 _FEATURE_SUFFIXES = (".ckpt", ".ckpt.gz")
 # Raw keys present in a SpecForge offline EAGLE3 feature file.
 _OFFLINE_EAGLE3_KEYS = ("input_ids", "loss_mask", "hidden_state", "aux_hidden_state")
+_VALIDATE_ENV = "SPECFORGE_VALIDATE_OFFLINE_FEATURES"
 
 
 def _inspect_feature_file(
@@ -83,7 +97,7 @@ class OfflineManifestReader:
         ttt_length: int = 7,
         max_len: int = 2048,
         target_repr: Optional[str] = "hidden_state",
-        validate_files: bool = True,
+        validate_files: Optional[bool] = None,
     ) -> None:
         self.hidden_states_path = hidden_states_path
         self.run_id = run_id
@@ -94,7 +108,15 @@ class OfflineManifestReader:
         self.ttt_length = ttt_length
         self.max_len = max_len
         self.target_repr = target_repr
-        self.validate_files = validate_files
+        # Spec-less refs stay usable: FeatureDataLoader._validate_refs skips
+        # spec comparison when no ref carries specs, the store resolves tensors
+        # through feature_keys rather than specs, and nothing reads num_tokens
+        # or estimated_bytes off a file:// ref. The cost of skipping the eager
+        # pass is that a missing key or a non-tensor value surfaces on first
+        # access instead of at assembly time.
+        if validate_files is None:
+            validate_files = os.environ.get(_VALIDATE_ENV, "0") == "1"
+        self.validate_files = bool(validate_files)
 
     def _ref_for(self, index: int, path: str) -> SampleRef:
         sample_id = f"{self.run_id}:{index:08d}"

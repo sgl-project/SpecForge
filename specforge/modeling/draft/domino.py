@@ -12,6 +12,7 @@ from torch.func import functional_call
 from specforge.utils import get_device_type
 
 from .dflash import DFlashDraftModel, sample
+from .dflash_kernels import DFlashKernels
 from .registry import register_draft
 
 
@@ -21,7 +22,7 @@ class DominoDraftModel(DFlashDraftModel):
 
     expected_projector_type = "domino"
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, dflash_kernels: Optional[DFlashKernels] = None) -> None:
         dflash_config = getattr(config, "dflash_config", None) or {}
         projector_type = dflash_config.get("projector_type")
         if projector_type is None:
@@ -31,7 +32,7 @@ class DominoDraftModel(DFlashDraftModel):
             raise ValueError(
                 "DominoDraftModel requires " "dflash_config.projector_type='domino'."
             )
-        super().__init__(config)
+        super().__init__(config, dflash_kernels=dflash_kernels)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.emb_dim = int(dflash_config["emb_dim"])
@@ -113,10 +114,25 @@ class DominoDraftModel(DFlashDraftModel):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         del prev_token_ids
+        correction_logits = self.compute_correction_logits(
+            prev_token_embeddings=prev_token_embeddings,
+            hidden_states=hidden_states,
+        )
+        prefix_logits = base_logits[:, :, : self.suffix_start, :]
+        suffix_logits = base_logits[:, :, self.suffix_start :, :] + correction_logits
+        return torch.cat([prefix_logits, suffix_logits], dim=2)
+
+    def compute_correction_logits(
+        self,
+        *,
+        prev_token_embeddings: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return suffix-only Domino logits without materializing final logits."""
         if prev_token_embeddings is None:
             raise ValueError("DominoDraftModel requires prev_token_embeddings")
 
-        bsz, n_blocks, block_size = base_logits.shape[:3]
+        bsz, n_blocks, block_size = hidden_states.shape[:3]
         if self.shift_label:
             gru_inputs = prev_token_embeddings.reshape(bsz * n_blocks, block_size, -1)
             gru_out = self._run_gru(gru_inputs)
@@ -132,11 +148,7 @@ class DominoDraftModel(DFlashDraftModel):
 
         z_n = hidden_states[:, :, self.suffix_start :, :]
         concat_features = torch.cat([z_n, prefix_states], dim=-1)
-        logits_e = self.embed_proj(concat_features)
-
-        prefix_logits = base_logits[:, :, : self.suffix_start, :]
-        suffix_logits = base_logits[:, :, self.suffix_start :, :] + logits_e
-        return torch.cat([prefix_logits, suffix_logits], dim=2)
+        return self.embed_proj(concat_features)
 
 
 __all__ = ["DominoDraftModel"]

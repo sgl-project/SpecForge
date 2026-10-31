@@ -119,4 +119,32 @@ class CosineAnnealingWarmupLR(_WarmupScheduler):
         super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
 
 
-__all__ = ["CosineAnnealingWarmupLR"]
+class _FlatLR(_LRScheduler):
+    """Keep every parameter group at its configured base learning rate."""
+
+    def get_lr(self):
+        return self.base_lrs
+
+
+class ConstantWarmupLR(_WarmupScheduler):
+    """Linear warmup followed by a constant learning rate."""
+
+    def __init__(
+        self,
+        optimizer,
+        total_steps: int,
+        warmup_steps: int = 0,
+        last_epoch: int = -1,
+    ):
+        if total_steps <= 0:
+            raise ValueError(f"total_steps must be positive, got {total_steps}")
+        if not 0 <= warmup_steps < total_steps:
+            raise ValueError(
+                "warmup_steps must be in [0, total_steps), got "
+                f"{warmup_steps} for total_steps={total_steps}"
+            )
+        base_scheduler = _FlatLR(optimizer, last_epoch=last_epoch)
+        super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
+
+
+__all__ = ["ConstantWarmupLR", "CosineAnnealingWarmupLR"]

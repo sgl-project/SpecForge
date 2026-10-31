@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -36,7 +37,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
                     "hidden_states",
                     "target_last_hidden_states",
                 },
-                {"eager", "sdpa", "flex_attention"},
+                {"eager", "sdpa", "flex_attention", "usp"},
                 None,
             ),
             "eagle3": (
@@ -86,7 +87,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
         expected = {
             "dflash": (
                 "hidden_states",
-                None,
+                "target_last_hidden_states",
                 (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
                 None,
             ),
@@ -262,15 +263,18 @@ class BuiltinProviderParityTest(unittest.TestCase):
     def test_dspark_offline_reader_exposes_both_target_feature_sets(self):
         provider = self.registry.resolve("dspark").providers.offline_for("text")
         with tempfile.TemporaryDirectory(prefix="dspark-offline-reader-") as path:
-            torch.save(
-                {
-                    "input_ids": torch.tensor([1, 2, 3]),
-                    "loss_mask": torch.ones(3, dtype=torch.long),
-                    "hidden_states": torch.ones(1, 3, 4),
-                    "target_last_hidden_states": torch.ones(1, 3, 2),
-                },
-                os.path.join(path, "0000.ckpt"),
-            )
+            with mock.patch.dict(
+                os.environ, {"SPECFORGE_VALIDATE_OFFLINE_FEATURES": "1"}
+            ):
+                torch.save(
+                    {
+                        "input_ids": torch.tensor([1, 2, 3]),
+                        "loss_mask": torch.ones(3, dtype=torch.long),
+                        "hidden_states": torch.ones(1, 3, 4),
+                        "target_last_hidden_states": torch.ones(1, 3, 2),
+                    },
+                    os.path.join(path, "0000.ckpt"),
+                )
 
             ref = provider.build_reader(
                 path,
@@ -302,13 +306,16 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 os.path.join(path, "0000.ckpt"),
             )
 
-            with self.assertRaisesRegex(KeyError, "target_last_hidden_states"):
-                provider.build_reader(
-                    path,
-                    run_id="dspark-offline-reader",
-                    ttt_length=4,
-                    max_len=3,
-                ).read()
+            with mock.patch.dict(
+                os.environ, {"SPECFORGE_VALIDATE_OFFLINE_FEATURES": "1"}
+            ):
+                with self.assertRaisesRegex(KeyError, "target_last_hidden_states"):
+                    provider.build_reader(
+                        path,
+                        run_id="dspark-offline-reader",
+                        ttt_length=4,
+                        max_len=3,
+                    ).read()
 
     def test_small_normalizers_match_retained_implementations(self):
         from specforge.data.preprocessing import (

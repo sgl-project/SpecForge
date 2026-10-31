@@ -5,16 +5,13 @@ import torch._dynamo as dynamo
 from transformers import LlamaConfig
 from transformers.cache_utils import DynamicCache
 
+from specforge.modeling._mask_utils import prepare_decoder_attention_mask
 from specforge.modeling.draft.flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from specforge.modeling.draft.llama3_eagle import (
-    LlamaAttention,
-    LlamaFlexAttention,
-    prepare_decoder_attention_mask,
-)
+from specforge.modeling.draft.llama3_eagle import LlamaAttention, LlamaFlexAttention
 from specforge.utils import padding
 from tests.test_utils.utils import norm_tensor
 
@@ -86,8 +83,9 @@ class TestFlexAttention(unittest.TestCase):
         )
         decoder_attention_mask = prepare_decoder_attention_mask(
             attention_mask=attention_mask,
-            input_shape=(batch_size, seq_len),
-            inputs_embeds=input_embeds,
+            hidden_states=input_embeds,
+            batch_size=batch_size,
+            seq_length=seq_len,
             past_key_values_length=0,
         )
         hidden_states_list = []
@@ -175,8 +173,9 @@ class TestFlexAttention(unittest.TestCase):
         )
         decoder_attention_mask = prepare_decoder_attention_mask(
             attention_mask=attention_mask,
-            input_shape=(batch_size, seq_len),
-            inputs_embeds=input_embeds,
+            hidden_states=input_embeds,
+            batch_size=batch_size,
+            seq_length=seq_len,
             past_key_values_length=0,
         )
 

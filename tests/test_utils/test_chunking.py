@@ -52,6 +52,28 @@ class CheckpointedChunkReduceTest(unittest.TestCase):
         self.assertEqual(calls, [(5,)])
         self.assertEqual(total.item(), 10)
 
+    def test_chunking_and_checkpointing_are_independent(self):
+        for chunk_size in (0, 4):
+            for checkpoint in (False, True):
+                with self.subTest(chunk_size=chunk_size, checkpoint=checkpoint):
+                    calls = []
+                    values = torch.arange(6, dtype=torch.double).requires_grad_()
+
+                    def terms(chunk):
+                        calls.append(tuple(chunk.shape))
+                        return (chunk.square().sum(),)
+
+                    (total,) = checkpointed_chunk_reduce(
+                        terms, values, chunk_size=chunk_size, checkpoint=checkpoint
+                    )
+                    forward_shapes = [(6,)] if chunk_size == 0 else [(4,), (2,)]
+                    self.assertEqual(calls, forward_shapes)
+                    torch.testing.assert_close(total, values.detach().square().sum())
+                    total.backward()
+                    expected_calls = len(forward_shapes) * (2 if checkpoint else 1)
+                    self.assertEqual(len(calls), expected_calls)
+                    torch.testing.assert_close(values.grad, 2 * values.detach())
+
     def test_rejects_misaligned_inputs(self):
         with self.assertRaisesRegex(ValueError, "must be aligned"):
             checkpointed_chunk_reduce(

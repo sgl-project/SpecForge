@@ -40,6 +40,12 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                 "target_last_hidden_states": "last_hidden_states",
             },
         }
+        expected_capture_methods = {
+            "eagle3": "eagle3",
+            "dflash": "dflash",
+            "domino": "dflash",
+            "dspark": "dspark",
+        }
         sources = {
             "input_ids": torch.tensor([1, 2, 3]),
             "loss_mask": torch.tensor([1, 1, 0]),
@@ -54,7 +60,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                 record = provider.capture_layout.materialize(sources)
 
                 self.assertEqual(
-                    "eagle3" if strategy == "eagle3" else "dflash",
+                    expected_capture_methods[strategy],
                     provider.capture_layout.capture_method,
                 )
 
@@ -98,6 +104,23 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                         record["hidden_states"].shape[-1],
                     )
 
+    def test_dflash_family_normalizers_require_adjacent_supervision(self):
+        raw = {
+            "input_ids": torch.tensor([1, 2, 3]),
+            "loss_mask": torch.tensor([1, 0, 1]),
+            "hidden_states": torch.randn(1, 3, 8),
+            "target_last_hidden_states": torch.randn(1, 3, 8),
+        }
+        for strategy in ("dflash", "domino", "dspark"):
+            with self.subTest(strategy=strategy):
+                normalizer = (
+                    self.registry.resolve(strategy)
+                    .providers.offline_for("text")
+                    .build_normalizer(3)
+                )
+                with self.assertRaisesRegex(ValueError, "two consecutive"):
+                    normalizer(raw)
+
     def test_duplicate_output_names_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "duplicate.*hidden_states"):
             OfflineCaptureLayout(
@@ -134,16 +157,19 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
         backend = mock.Mock()
         capture = OfflineSGLangCapture(backend)
 
-        capture.set_capture_layers(
-            [1, 9, 17, 25, 33],
-            capture_method="dflash",
-        )
+        for capture_method in ("dflash", "dspark"):
+            with self.subTest(capture_method=capture_method):
+                backend.reset_mock()
+                capture.set_capture_layers(
+                    [1, 9, 17, 25, 33],
+                    capture_method=capture_method,
+                )
 
-        self.assertEqual("dflash", capture.capture_method)
-        backend.set_capture_layers.assert_called_once_with(
-            [1, 9, 17, 25, 33],
-            capture_method="dflash",
-        )
+                self.assertEqual(capture_method, capture.capture_method)
+                backend.set_capture_layers.assert_called_once_with(
+                    [1, 9, 17, 25, 33],
+                    capture_method=capture_method,
+                )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,549 @@
+{
+  "collection": "https://huggingface.co/collections/lmsys/specbundle",
+  "collectionApi": "https://huggingface.co/api/collections/lmsys/specbundle",
+  "title": "SpecBundle",
+  "description": "A collection of production-grade draft models for speculative decoding",
+  "updated": "2026-09-04T06:31:50Z",
+  "models": [
+    {
+      "id": "lmsys/SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
+      "name": "SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "meta-llama/Llama-3.3-70B-Instruct",
+      "dataset": "frankleeeee/PerfectBlend-Regenerated-Llama-3.3-70B-Instruct",
+      "downloads": 160,
+      "likes": 0,
+      "numParameters": 1403187712,
+      "lastModified": "2025-12-28T03:09:23.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/SGLang-EAGLE3-Llama-3.1-8B-Instruct-SpecForge",
+      "name": "SGLang-EAGLE3-Llama-3.1-8B-Instruct-SpecForge",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "meta-llama/Llama-3.1-8B-Instruct",
+      "dataset": "frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct",
+      "downloads": 2242,
+      "likes": 0,
+      "numParameters": 424849920,
+      "lastModified": "2025-12-28T03:09:46.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex",
+      "name": "SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      "dataset": "lukeysong/qwen-30b-regen-blend",
+      "downloads": 7190,
+      "likes": 3,
+      "numParameters": 183168640,
+      "lastModified": "2025-12-28T03:10:02.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/SGLang-EAGLE3-Llama-4-Scout-17B-16E-Instruct-SpecForge",
+      "name": "SGLang-EAGLE3-Llama-4-Scout-17B-16E-Instruct-SpecForge",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+      "dataset": "frankleeeee/PerfectBlend-Regenerated-Llama-4-Scout-17B-16E-Instruct",
+      "downloads": 52,
+      "likes": 0,
+      "numParameters": 845668928,
+      "lastModified": "2025-12-28T03:10:33.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan",
+      "name": "SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+      "dataset": "lukeysong/qwen3-235-regen-perfect_blend",
+      "downloads": 173,
+      "likes": 1,
+      "numParameters": 592645760,
+      "lastModified": "2025-12-28T03:11:42.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI",
+      "name": "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+      "dataset": null,
+      "downloads": 117,
+      "likes": 0,
+      "numParameters": 863710848,
+      "lastModified": "2025-12-28T03:10:50.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/SGLang-EAGLE3-Qwen3-Next-80B-A3B-Instruct-FP8-SpecForge-Meituan",
+      "name": "SGLang-EAGLE3-Qwen3-Next-80B-A3B-Instruct-FP8-SpecForge-Meituan",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+      "dataset": "lukeysong/qwen3-80b-regen-prefectblend",
+      "downloads": 19,
+      "likes": 2,
+      "numParameters": 208334464,
+      "lastModified": "2025-12-22T15:41:21.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/SGLang-EAGLE3-Qwen3-Coder-30B-A3B-Instruct-SpecForge",
+      "name": "SGLang-EAGLE3-Qwen3-Coder-30B-A3B-Instruct-SpecForge",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "dataset": "JinnP/opc_regen_Qwen3-Coder-30B-A3B-Instruct",
+      "downloads": 322,
+      "likes": 5,
+      "numParameters": 183168640,
+      "lastModified": "2025-12-28T03:11:07.000Z",
+      "gated": false
+    },
+    {
+      "id": "nex-agi/SGLANG-EAGLE3-Qwen3-30B-A3B-Nex-N1",
+      "name": "SGLANG-EAGLE3-Qwen3-30B-A3B-Nex-N1",
+      "provider": {
+        "name": "nex-agi",
+        "fullname": "Nex AGI",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/65435cad429b80b14922ab8d/a_O9jT_daz_NXTfxtcw6S.png",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "nex-agi/Qwen3-30B-A3B-Nex-N1",
+      "dataset": null,
+      "downloads": 8,
+      "likes": 4,
+      "numParameters": 183168640,
+      "lastModified": "2025-12-23T14:17:29.000Z",
+      "gated": false
+    },
+    {
+      "id": "nex-agi/SGLANG-EAGLE3-Qwen3-32B-Nex-N1",
+      "name": "SGLANG-EAGLE3-Qwen3-32B-Nex-N1",
+      "provider": {
+        "name": "nex-agi",
+        "fullname": "Nex AGI",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/65435cad429b80b14922ab8d/a_O9jT_daz_NXTfxtcw6S.png",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "nex-agi/Qwen3-32B-Nex-N1",
+      "dataset": null,
+      "downloads": 16,
+      "likes": 7,
+      "numParameters": 782704256,
+      "lastModified": "2025-12-23T14:16:55.000Z",
+      "gated": false
+    },
+    {
+      "id": "AQ-MedAI/Kimi-K2-Instruct-eagle3",
+      "name": "Kimi-K2-Instruct-eagle3",
+      "provider": {
+        "name": "AQ-MedAI",
+        "fullname": "Ant Group (AQ-MedAI)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6826eb9bf609dcc6d6c6df52/mOPPxrtf_etoO1rlLBtnV.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "moonshotai/Kimi-K2-Instruct",
+      "dataset": null,
+      "downloads": 17,
+      "likes": 11,
+      "numParameters": 1191144704,
+      "lastModified": "2025-12-22T12:14:55.000Z",
+      "gated": false
+    },
+    {
+      "id": "AQ-MedAI/Ling-Flash-2.0-eagle3",
+      "name": "Ling-Flash-2.0-eagle3",
+      "provider": {
+        "name": "AQ-MedAI",
+        "fullname": "Ant Group (AQ-MedAI)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6826eb9bf609dcc6d6c6df52/mOPPxrtf_etoO1rlLBtnV.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "inclusionAI/Ling-flash-2.0",
+      "dataset": null,
+      "downloads": 12,
+      "likes": 3,
+      "numParameters": 424878848,
+      "lastModified": "2025-12-24T05:20:40.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/EAGLE3-gpt-oss-120b-bf16",
+      "name": "EAGLE3-gpt-oss-120b-bf16",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "openai/gpt-oss-120b",
+      "dataset": null,
+      "downloads": 7862,
+      "likes": 10,
+      "numParameters": 885164928,
+      "lastModified": "2025-08-21T10:18:15.000Z",
+      "gated": false
+    },
+    {
+      "id": "zhuyksir/EAGLE3-gpt-oss-20b-bf16",
+      "name": "EAGLE3-gpt-oss-20b-bf16",
+      "provider": {
+        "name": "zhuyksir",
+        "fullname": "Yikai Zhu",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6630821b6ee021123fe91604/_4a4W7crTHIYncs04wPmw.jpeg",
+        "type": "user"
+      },
+      "method": "EAGLE3",
+      "target": "openai/gpt-oss-20b",
+      "dataset": "zhuyksir/perfect-blend-gptoss-20B-1M",
+      "downloads": 3605,
+      "likes": 2,
+      "numParameters": 885164928,
+      "lastModified": "2025-08-10T10:01:49.000Z",
+      "gated": false
+    },
+    {
+      "id": "AQ-MedAI/Qwen2.5-VL-72B-Instruct-eagle3",
+      "name": "Qwen2.5-VL-72B-Instruct-eagle3",
+      "provider": {
+        "name": "AQ-MedAI",
+        "fullname": "Ant Group (AQ-MedAI)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6826eb9bf609dcc6d6c6df52/mOPPxrtf_etoO1rlLBtnV.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen2.5-VL-72B-Instruct",
+      "dataset": null,
+      "downloads": 12,
+      "likes": 1,
+      "numParameters": 1034112768,
+      "lastModified": "2026-01-12T12:47:49.000Z",
+      "gated": false
+    },
+    {
+      "id": "huang3eng/SGLang-EAGLE3-Qwen3-Next-80B-A3B-Instruct-SpecForge",
+      "name": "SGLang-EAGLE3-Qwen3-Next-80B-A3B-Instruct-SpecForge",
+      "provider": {
+        "name": "huang3eng",
+        "fullname": "huang3eng",
+        "avatar": "/avatars/e30a5a9563fe8939f44dcacf6456dffe.svg",
+        "type": "user"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen3-Next-80B-A3B-Instruct",
+      "dataset": null,
+      "downloads": 14,
+      "likes": 0,
+      "numParameters": 208334464,
+      "lastModified": "2026-01-13T13:32:59.000Z",
+      "gated": false
+    },
+    {
+      "id": "jiapingW/Qwen3.5-35B-A3B-Eagle3-Specforge",
+      "name": "Qwen3.5-35B-A3B-Eagle3-Specforge",
+      "provider": {
+        "name": "jiapingW",
+        "fullname": "jiapingW",
+        "avatar": "/avatars/757999f7e5707e52942cface1cc20efe.svg",
+        "type": "user"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen3.5-35B-A3B",
+      "dataset": "jiapingW/qwen3.5-35b-a3b-ultrachat-regen",
+      "downloads": 284,
+      "likes": 6,
+      "numParameters": 237790976,
+      "lastModified": "2026-03-14T03:54:20.000Z",
+      "gated": false
+    },
+    {
+      "id": "AQ-MedAI/Kimi-K25-eagle3",
+      "name": "Kimi-K25-eagle3",
+      "provider": {
+        "name": "AQ-MedAI",
+        "fullname": "Ant Group (AQ-MedAI)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6826eb9bf609dcc6d6c6df52/mOPPxrtf_etoO1rlLBtnV.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "moonshotai/Kimi-K2.5",
+      "dataset": null,
+      "downloads": 1571,
+      "likes": 10,
+      "numParameters": 1191144704,
+      "lastModified": "2026-06-25T09:51:51.000Z",
+      "gated": false
+    },
+    {
+      "id": "CMBTech/CMB-Qwen3-32B-Eagle3",
+      "name": "CMB-Qwen3-32B-Eagle3",
+      "provider": {
+        "name": "CMBTech",
+        "fullname": "CMBTech",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/69c4af82c41a2d9d32896387/cWuv-VSG6UZpoIKO8RhB8.png",
+        "type": "user"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen3-32B",
+      "dataset": null,
+      "downloads": 25,
+      "likes": 0,
+      "numParameters": 1591342576,
+      "lastModified": "2026-03-31T11:53:34.000Z",
+      "gated": false
+    },
+    {
+      "id": "AQ-MedAI/Kimi-K26-eagle3",
+      "name": "Kimi-K26-eagle3",
+      "provider": {
+        "name": "AQ-MedAI",
+        "fullname": "Ant Group (AQ-MedAI)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6826eb9bf609dcc6d6c6df52/mOPPxrtf_etoO1rlLBtnV.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "moonshotai/Kimi-K2.6",
+      "dataset": null,
+      "downloads": 8,
+      "likes": 0,
+      "numParameters": 1649960704,
+      "lastModified": "2026-05-17T12:40:32.000Z",
+      "gated": false
+    },
+    {
+      "id": "AQ-MedAI/Kimi-K2.7-Code-eagle3",
+      "name": "Kimi-K2.7-Code-eagle3",
+      "provider": {
+        "name": "AQ-MedAI",
+        "fullname": "Ant Group (AQ-MedAI)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6826eb9bf609dcc6d6c6df52/mOPPxrtf_etoO1rlLBtnV.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "moonshotai/Kimi-K2.7-Code",
+      "dataset": null,
+      "downloads": 13,
+      "likes": 2,
+      "numParameters": 1649960704,
+      "lastModified": "2026-06-22T12:39:21.000Z",
+      "gated": false
+    },
+    {
+      "id": "AQ-MedAI/GLM-5.1-eagle3",
+      "name": "GLM-5.1-eagle3",
+      "provider": {
+        "name": "AQ-MedAI",
+        "fullname": "Ant Group (AQ-MedAI)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6826eb9bf609dcc6d6c6df52/mOPPxrtf_etoO1rlLBtnV.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "zai-org/GLM-5.1",
+      "dataset": null,
+      "downloads": 40,
+      "likes": 1,
+      "numParameters": 1197160960,
+      "lastModified": "2026-05-17T12:40:01.000Z",
+      "gated": false
+    },
+    {
+      "id": "AQ-MedAI/Qwen3.5-397B-A17B-eagle3",
+      "name": "Qwen3.5-397B-A17B-eagle3",
+      "provider": {
+        "name": "AQ-MedAI",
+        "fullname": "Ant Group (AQ-MedAI)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6826eb9bf609dcc6d6c6df52/mOPPxrtf_etoO1rlLBtnV.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "Qwen/Qwen3.5-397B-A17B",
+      "dataset": null,
+      "downloads": 24,
+      "likes": 2,
+      "numParameters": 572851200,
+      "lastModified": "2026-05-15T13:43:32.000Z",
+      "gated": false
+    },
+    {
+      "id": "RadixArk/Kimi-K3-DSpark",
+      "name": "Kimi-K3-DSpark",
+      "provider": {
+        "name": "RadixArk",
+        "fullname": "RadixArk",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/692f6fa22fe03c133986059c/uVcDantaDXJOwc_T93yei.png",
+        "type": "org"
+      },
+      "method": "DSpark",
+      "target": "moonshotai/Kimi-K3",
+      "dataset": null,
+      "downloads": 2933635,
+      "likes": 55,
+      "numParameters": 2249289601,
+      "lastModified": "2026-08-16T16:23:16.000Z",
+      "gated": false
+    },
+    {
+      "id": "RadixArk/Inkling-Small-DSpark-Preview",
+      "name": "Inkling-Small-DSpark-Preview",
+      "provider": {
+        "name": "RadixArk",
+        "fullname": "RadixArk",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/692f6fa22fe03c133986059c/uVcDantaDXJOwc_T93yei.png",
+        "type": "org"
+      },
+      "method": "DSpark",
+      "target": "thinkingmachines/Inkling-Small-NVFP4",
+      "dataset": null,
+      "downloads": 1945,
+      "likes": 2,
+      "numParameters": 1394833153,
+      "lastModified": "2026-07-30T17:52:28.000Z",
+      "gated": false
+    },
+    {
+      "id": "Huang2020/qwen3.6-27B-domino",
+      "name": "qwen3.6-27B-domino",
+      "provider": {
+        "name": "Huang2020",
+        "fullname": "黄佳诺",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/NoJhZHlCdrOQmBoW0xTGY.png",
+        "type": "user"
+      },
+      "method": "Domino",
+      "target": "Qwen/Qwen3.6-27B",
+      "dataset": null,
+      "downloads": 355,
+      "likes": 3,
+      "numParameters": 1814230272,
+      "lastModified": "2026-07-28T07:03:50.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/Qwen3.5-397B-A17B-DFlash",
+      "name": "Qwen3.5-397B-A17B-DFlash",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "DFlash",
+      "target": "Qwen/Qwen3.5-397B-A17B",
+      "dataset": null,
+      "downloads": 93,
+      "likes": 1,
+      "numParameters": 1291904512,
+      "lastModified": "2026-06-15T16:11:04.000Z",
+      "gated": false
+    },
+    {
+      "id": "lmsys/SGLang-EAGLE3-Step-3.5-Flash-SpecForge-RadixArk",
+      "name": "SGLang-EAGLE3-Step-3.5-Flash-SpecForge-RadixArk",
+      "provider": {
+        "name": "lmsys",
+        "fullname": "LMSYS Org (SGLang)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d35f3ceaf3858ce253ab7a/uZ2jFNAjXfdBo6c6Yojmg.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "stepfun-ai/Step-3.5-Flash",
+      "dataset": null,
+      "downloads": 12,
+      "likes": 0,
+      "numParameters": 378713216,
+      "lastModified": "2026-08-01T13:22:02.000Z",
+      "gated": false
+    },
+    {
+      "id": "AQ-MedAI/DeepSeek-V4-Flash-0731-eagle3",
+      "name": "DeepSeek-V4-Flash-0731-eagle3",
+      "provider": {
+        "name": "AQ-MedAI",
+        "fullname": "Ant Group (AQ-MedAI)",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/6826eb9bf609dcc6d6c6df52/mOPPxrtf_etoO1rlLBtnV.jpeg",
+        "type": "org"
+      },
+      "method": "EAGLE3",
+      "target": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "dataset": null,
+      "downloads": 111,
+      "likes": 0,
+      "numParameters": 729001984,
+      "lastModified": "2026-08-03T05:14:21.000Z",
+      "gated": false
+    },
+    {
+      "id": "RadixArk/Inkling-DSpark-Preview",
+      "name": "Inkling-DSpark-Preview",
+      "provider": {
+        "name": "RadixArk",
+        "fullname": "RadixArk",
+        "avatar": "https://cdn-avatars.huggingface.co/v1/production/uploads/692f6fa22fe03c133986059c/uVcDantaDXJOwc_T93yei.png",
+        "type": "org"
+      },
+      "method": "DSpark",
+      "target": "thinkingmachines/Inkling-NVFP4",
+      "dataset": null,
+      "downloads": 530,
+      "likes": 3,
+      "numParameters": 1738783617,
+      "lastModified": "2026-07-22T18:34:46.000Z",
+      "gated": false
+    }
+  ]
+}

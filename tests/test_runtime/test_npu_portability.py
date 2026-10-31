@@ -101,7 +101,7 @@ class NPUDistributedTest(unittest.TestCase):
                 sf_dist,
                 "_load_yunchang_globals",
                 return_value=(process_group, set_seq_parallel_pg),
-            ),
+            ) as load_yunchang,
         ):
             sf_dist.init_distributed(
                 timeout=7, tp_size=2, sp_ulysses_size=1, sp_ring_size=1
@@ -116,7 +116,15 @@ class NPUDistributedTest(unittest.TestCase):
             [call.kwargs["device_type"] for call in from_group.call_args_list],
             ["npu", "npu"],
         )
-        set_seq_parallel_pg.assert_called_once_with(1, 1, 3, 8)
+        # SP sizes of 1 must not touch yunchang: its import probes CUDA and
+        # crashes NPU-only torch builds. The public SP getters must still
+        # return the singleton draft-SP group because PyTorch interprets a
+        # None group as the full WORLD group.
+        load_yunchang.assert_not_called()
+        set_seq_parallel_pg.assert_not_called()
+        self.assertEqual(sf_dist.get_draft_sp_group(), "draft:sp")
+        self.assertEqual(sf_dist.get_sp_ulysses_group(), "draft:sp")
+        self.assertEqual(sf_dist.get_sp_ring_group(), "draft:sp")
 
 
 class DistributedTeardownTest(unittest.TestCase):
@@ -133,6 +141,34 @@ class DistributedTeardownTest(unittest.TestCase):
                 sf_dist.destroy_distributed()
             for name in names:
                 self.assertIsNone(getattr(sf_dist, name), name)
+        finally:
+            for name, value in saved.items():
+                setattr(sf_dist, name, value)
+
+    def test_failure_teardown_aborts_each_distinct_process_group(self):
+        names = NPUDistributedTest._GLOBAL_NAMES
+        saved = {name: getattr(sf_dist, name) for name in names}
+        subgroup = mock.Mock()
+        world = mock.Mock()
+        try:
+            for name in names:
+                setattr(sf_dist, name, None)
+            sf_dist._TP_GROUP = subgroup
+            sf_dist._DP_GROUP = subgroup
+            with (
+                mock.patch.object(sf_dist.dist, "is_initialized", return_value=True),
+                mock.patch.object(
+                    sf_dist.dist,
+                    "group",
+                    SimpleNamespace(WORLD=world),
+                ),
+                mock.patch.object(sf_dist.dist, "destroy_process_group") as destroy,
+            ):
+                sf_dist.destroy_distributed(abort=True)
+
+            subgroup.abort.assert_called_once_with()
+            world.abort.assert_called_once_with()
+            destroy.assert_not_called()
         finally:
             for name, value in saved.items():
                 setattr(sf_dist, name, value)

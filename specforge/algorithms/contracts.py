@@ -238,8 +238,14 @@ class AlgorithmCapabilities:
     attention_backends: FrozenSet[str]
     required_batch_size: int | None = None
     supports_compact_teacher: bool = False
+    supports_trim_loss_positions: bool = False
     supports_vocab_mapping: bool = False
     allows_aux_layer_override: bool = False
+    #: ``training.dflash_teacher_metrics=false`` can drop the teacher-only
+    #: final hidden state from the streaming capture.
+    supports_teacher_metrics_opt_out: bool = False
+    #: The draft builder wires ``model.use_liger_kernel`` into its modules.
+    supports_liger_kernel: bool = False
 
     def __post_init__(self) -> None:
         attention_backends = _normalized_names(
@@ -254,8 +260,11 @@ class AlgorithmCapabilities:
             raise ValueError("required_batch_size must be a positive integer or None")
         for field_name in (
             "supports_compact_teacher",
+            "supports_trim_loss_positions",
             "supports_vocab_mapping",
             "allows_aux_layer_override",
+            "supports_teacher_metrics_opt_out",
+            "supports_liger_kernel",
         ):
             if not isinstance(getattr(self, field_name), bool):
                 raise TypeError(f"{field_name} must be a bool")

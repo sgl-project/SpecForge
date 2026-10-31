@@ -21,6 +21,23 @@ from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .registry import register_draft
 
 
+def resolve_dflash_attention_mode(config) -> str:
+    """Resolve the DSpark/DFlash attention geometry mode from a draft config."""
+    raw = getattr(config, "dflash_config", None) or {}
+    if hasattr(raw, "get"):
+        mode = raw.get("attention_mode")
+    else:
+        mode = getattr(raw, "attention_mode", None)
+    if mode in {"mha", "gqa", "mla"}:
+        return mode
+    model_type = str(getattr(config, "model_type", "")).lower()
+    if "mla" in model_type:
+        return "mla"
+    num_heads = int(getattr(config, "num_attention_heads", 0))
+    num_kv_heads = int(getattr(config, "num_key_value_heads", num_heads))
+    return "mha" if num_heads == num_kv_heads else "gqa"
+
+
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)

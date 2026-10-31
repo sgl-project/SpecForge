@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import partial
 
 from specforge.algorithms.common.defaults import no_missing_checkpoint_keys
-from specforge.algorithms.common.dflash_family_data import (
+from specforge.algorithms.common.hidden_states_data import (
     NORMALIZER_ID,
     build_collator,
     build_offline_normalizer,
@@ -30,6 +30,7 @@ from specforge.algorithms.contracts import (
     FeatureMode,
     OfflineStorageContract,
 )
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "domino"
 DRAFT_ARCHITECTURE = "DominoDraftModel"
@@ -61,7 +62,10 @@ def step_options(config):
 def resume_contract(config, draft_model, training_model):
     """Persist resolved Domino model, sampling, and objective semantics."""
 
+    from specforge.modeling.draft.dflash import dflash_attention_resume_contract
+
     return {
+        **dflash_attention_resume_contract(draft_model),
         "domino_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "domino_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -83,6 +87,13 @@ def resume_contract(config, draft_model, training_model):
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
+    if config.model.use_liger_kernel:
+        from specforge.algorithms.dflash.providers import resolve_dflash_kernels
+        from specforge.algorithms.model_providers import build_dflash_draft
+
+        return build_dflash_draft(
+            config, draft_config, resolve_dflash_kernels(config, draft_config)
+        )
     return build_registered_draft(config, draft_config)
 
 
@@ -143,6 +154,7 @@ def algorithm_spec() -> AlgorithmSpec:
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
+            supports_liger_kernel=True,
         ),
     )
 
@@ -169,6 +181,7 @@ def algorithm_providers() -> AlgorithmProviders:
             minimum_loss_tokens=minimum_loss_tokens,
             needs_input_tools=needs_input_tools,
             default_dataloader_num_workers=8,
+            loss_mask_filter=has_consecutive_supervised_tokens,
         ),
         offline=(
             OfflineDataProvider(

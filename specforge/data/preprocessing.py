@@ -27,7 +27,7 @@ import os
 import re
 import warnings
 from collections import Counter
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -36,7 +36,15 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from ..distributed import get_draft_sp_group, get_sp_ring_group
-from .parse import GeneralParser, GLMParser, HarmonyParser, ThinkingParser
+from .loss_mask import has_consecutive_supervised_tokens
+from .parse import (
+    DeepSeekV4Parser,
+    GeneralParser,
+    GLMParser,
+    HarmonyParser,
+    MuseParser,
+    ThinkingParser,
+)
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -140,10 +148,14 @@ def preprocess_conversations(
         parser = GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
         parser = ThinkingParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "deepseek-v4":
+        parser = DeepSeekV4Parser(tokenizer, chat_template)
     elif chat_template.parser_type == "glm":
         parser = GLMParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "muse":
+        parser = MuseParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
     kwargs_list = [{} for _ in range(len(conversations))]
@@ -154,7 +166,7 @@ def preprocess_conversations(
         if not source:
             # if the source is None, skip it
             continue
-        input_ids, loss_mask = parser.parse(
+        parsed = parser.parse(
             source,
             max_length,
             preformatted=is_preformatted,
@@ -162,6 +174,10 @@ def preprocess_conversations(
             tool=tool,
             **kwargs_item,
         )
+        if parsed is None:
+            # the parser found nothing to render (e.g. no 'user' turn), skip it
+            continue
+        input_ids, loss_mask = parsed
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
@@ -180,6 +196,7 @@ def build_eagle3_dataset(
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
     minimum_valid_tokens: Optional[int] = None,
+    loss_mask_filter: Optional[Callable[[object], bool]] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -206,12 +223,16 @@ def build_eagle3_dataset(
         train_only_last_turn: If True, only the last assistant turn contributes to the loss.
                              Useful for thinking models where history may not contain thoughts.
         minimum_valid_tokens: If set, drops samples with fewer trainable tokens.
+        loss_mask_filter: Optional algorithm-owned predicate applied after
+                          tokenization and truncation.
 
     Returns:
         The processed HF dataset.
     """
     if minimum_valid_tokens is not None and minimum_valid_tokens < 0:
         raise ValueError("minimum_valid_tokens must be >= 0")
+    if loss_mask_filter is not None and not callable(loss_mask_filter):
+        raise TypeError("loss_mask_filter must be callable or None")
 
     # Validate chat_template requirement
     if chat_template is None:
@@ -257,7 +278,7 @@ def build_eagle3_dataset(
                 # Parse tools: handle JSON strings from safe_conversations_generator
                 tools = []
                 for tool_item in tools_raw:
-                    if isinstance(tool_item, (str, list)):
+                    if isinstance(tool_item, str):
                         try:
                             tools.append(json.loads(tool_item))
                         except json.JSONDecodeError:
@@ -342,6 +363,21 @@ def build_eagle3_dataset(
         )
         print(
             f"Filtered dataset by trainable tokens: {before_filter} -> {len(dataset)}"
+        )
+
+    if loss_mask_filter is not None:
+        before_filter = len(dataset)
+
+        def has_eligible_loss_mask(example):
+            return loss_mask_filter(example["loss_mask"])
+
+        dataset = dataset.filter(
+            has_eligible_loss_mask,
+            num_proc=num_proc,
+            desc="Filtering samples by algorithm loss-mask eligibility",
+        )
+        print(
+            f"Filtered dataset by loss-mask eligibility: {before_filter} -> {len(dataset)}"
         )
 
     dataset.set_format(type="torch")
@@ -484,9 +520,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         attention_mask[:, :valid_len] = 1
         new_data["attention_mask"] = attention_mask
 
-        # Position ids should align with Ulysses all2all-expanded sequence length.
-        # Within each ring group there are sp_ulysses_size Ulysses peers; each holds a
-        # distinct usp_chunk_size slice, so position IDs must differ by ulysses_rank offset.
+        # RoPE runs on local Q/K before Ulysses all-to-all. Each rank needs
+        # the global positions of its own chunk, excluding rollout overlap.
+        # Preserve both Ring-block and Ulysses-peer offsets.
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
         usp_chunk_size = max(local_len - ttt_length, 0)
         ring_chunk = usp_chunk_size * sp_ulysses_size
@@ -684,6 +720,10 @@ def process_offline_dflash_sample(
             f"truncation: input_ids={input_ids.shape[1]}, "
             f"loss_mask={loss_mask.shape[1]}, "
             f"hidden_states={hidden_states.shape[1]}"
+        )
+    if not has_consecutive_supervised_tokens(loss_mask[0]):
+        raise ValueError(
+            "offline DFlash samples require two consecutive supervised tokens"
         )
     return {
         "input_ids": input_ids,

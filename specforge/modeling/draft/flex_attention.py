@@ -89,6 +89,7 @@ def compile_friendly_create_block_mask(
     Q_LEN,
     KV_LEN,
     device,
+    **kwargs,
 ):
     create_block_mask_compiled = (
         WrappedCreateBlockMask()()
@@ -102,6 +103,7 @@ def compile_friendly_create_block_mask(
         Q_LEN,
         KV_LEN,
         device,
+        **kwargs,
     )
 
 
