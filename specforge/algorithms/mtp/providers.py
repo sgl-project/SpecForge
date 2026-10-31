@@ -74,6 +74,8 @@ def resume_contract(_config, draft_model, training_model):
         ),
         "mtp_draft_vocab_size": int(getattr(draft_model.config, "vocab_size", 0)),
         "mtp_share_lm_head": bool(mtp_config.get("share_lm_head", True)),
+        "mtp_num_steps": int(training_model.num_steps),
+        "mtp_ploss_decay": float(training_model.ploss_decay),
         "mtp_attention_backend": str(
             getattr(draft_model.config, "_attn_implementation", "")
         ),
@@ -202,7 +204,9 @@ def build_training_model(config, draft_model, draft_config, target_config, token
     return AlgorithmModelParts(
         model=OnlineMTPModel(
             draft_model=draft_model,
+            ploss_decay=config.training.mtp_ploss_decay,
             objective_chunk_size=config.training.mtp_objective_chunk_size,
+            num_steps=config.training.mtp_num_steps,
         ),
         capture_layers=None,
     )

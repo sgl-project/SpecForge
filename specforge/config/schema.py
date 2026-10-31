@@ -1020,6 +1020,13 @@ class TrainingConfig(StrictConfigModel):
     trim_loss_positions: bool = False
     #: MTP token positions per lm_head + CE chunk (0 disables chunking).
     mtp_objective_chunk_size: int = Field(default=4096, ge=0)
+    #: MTP chain length: step j re-feeds the previous draft hidden and shifts
+    #: the teacher-forced input/labels j tokens further (1 = the original
+    #: single-step x_{t+2} objective; 3 mirrors NEXTN's 3-step chain).
+    mtp_num_steps: int = Field(default=1, ge=1)
+    #: Per-step loss decay of the MTP chain: step i is weighted
+    #: ``mtp_ploss_decay ** i`` (same convention as EAGLE3's ``ploss_decay``).
+    mtp_ploss_decay: float = Field(default=0.8, gt=0.0, le=1.0)
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None
