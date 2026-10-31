@@ -5,6 +5,7 @@ from transformers import PretrainedConfig
 
 from .attention.base import Attention
 from .config import AttentionConfig, LayerKernels, ResidualConfig
+from .ffn.moe.layer import build_ffn as build_dense_or_moe_ffn
 from .residual.base import Residual
 from .residual.standard import StandardResidual
 
@@ -29,10 +30,13 @@ def build_attention(
     return GQAAttention(config, layer_idx, kernels, options)
 
 
-def build_ffn(config: PretrainedConfig, kernels: LayerKernels) -> nn.Module:
+def build_ffn(
+    config: PretrainedConfig, layer_idx: int, kernels: LayerKernels
+) -> nn.Module:
+    """``kernels.make_mlp(config)``, or for an MoE draft (``moe_preset``) the family's MoE layer."""
     # Return the provider's module directly: adding a wrapper changes checkpoint
     # paths and can change optimizer parameter ordering.
-    return kernels.make_mlp(config)
+    return build_dense_or_moe_ffn(config, layer_idx, dense=kernels.make_mlp)
 
 
 def build_residual(

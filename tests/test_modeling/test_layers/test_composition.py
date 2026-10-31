@@ -166,7 +166,7 @@ class DecoderCompositionTest(unittest.TestCase):
         kernels = DEFAULT_DFLASH_KERNELS
         layer = DecoderLayer(
             build_attention(cfg, 0, kernels, AttentionConfig()),
-            build_ffn(cfg, kernels),
+            build_ffn(cfg, 0, kernels),
             kernels.make_rms_norm(16, cfg.rms_norm_eps),
             kernels.make_rms_norm(16, cfg.rms_norm_eps),
         )
