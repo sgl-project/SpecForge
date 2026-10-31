@@ -1,5 +1,5 @@
 # coding=utf-8
-"""The MoE block: Qwen3.5-MoE parity, build_ffn and the family's config reading."""
+"""The MoE block: Qwen3.5-MoE and DeepSeek-V4 parity, build_ffn, the families' config reading."""
 
 import tempfile
 import unittest
@@ -7,6 +7,10 @@ from unittest import mock
 
 import torch
 from transformers import Qwen3Config
+from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    DeepseekV4SparseMoeBlock,
+)
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
@@ -18,6 +22,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 from specforge.modeling.draft import DFlashDraftModel
 from specforge.modeling.draft.layers.ffn.moe import MoELayer, build_ffn
 from specforge.modeling.draft.layers.ffn.moe import experts as experts_module
+from specforge.modeling.draft.layers.ffn.moe.families import deepseek_v4
 from specforge.modeling.draft.layers.ffn.moe.families.qwen3_5_moe import build_moe
 from specforge.modeling.draft.layers.ffn.moe.router import Router, TopKRouter
 
@@ -66,6 +71,40 @@ def _pair(**overrides):
     return layer, reference
 
 
+def _v4_config(**overrides):
+    """A tiny DeepSeek-V4 config: one MoE layer, the expert bias on."""
+    values = dict(
+        hidden_size=H,
+        moe_intermediate_size=I,
+        n_routed_experts=E,
+        num_experts_per_tok=K,
+        n_shared_experts=1,
+        routed_scaling_factor=1.5,
+        swiglu_limit=10.0,
+        num_hidden_layers=1,
+        mlp_layer_types=["moe"],
+        dflash_config={"moe_router_enable_expert_bias": True},
+    )
+    return DeepseekV4Config(**{**values, **overrides})
+
+
+def _v4_key(name):
+    """Our state-dict names as transformers' DeepseekV4SparseMoeBlock spells them."""
+    name = name.replace("gate.expert_bias", "gate.e_score_correction_bias")
+    return name.replace("shared_expert.", "shared_experts.")
+
+
+def _v4_pair(**overrides):
+    """Our block and transformers' block, same weights, a non-zero expert bias."""
+    config = _v4_config(**overrides)
+    layer = deepseek_v4.build_moe(config)
+    with torch.no_grad():
+        layer.gate.expert_bias.copy_(torch.linspace(-0.2, 0.2, E))
+    reference = DeepseekV4SparseMoeBlock(config, layer_idx=0)
+    reference.load_state_dict({_v4_key(k): v for k, v in layer.state_dict().items()})
+    return layer, reference
+
+
 def _forward_and_grads(module, x):
     x = x.clone().requires_grad_()
     out = module(x)
@@ -78,14 +117,17 @@ def _tagged(tag):
     return lambda message: f"{tag}: {message}"
 
 
-def _assert_same_forward_and_backward(test, module, reference, x, **tolerance):
+def _assert_same_forward_and_backward(
+    test, module, reference, x, rename=lambda name: name, **tolerance
+):
+    """``rename`` maps our parameter names to the reference's."""
     out, grads = _forward_and_grads(module, x)
     ref_out, ref_grads = _forward_and_grads(reference, x)
     torch.testing.assert_close(out, ref_out, msg=_tagged("output"), **tolerance)
-    test.assertEqual(grads.keys(), ref_grads.keys())
+    test.assertEqual({rename(name) for name in grads}, set(ref_grads))
     for name, grad in grads.items():
         torch.testing.assert_close(
-            grad, ref_grads[name], msg=_tagged(f"grad of {name}"), **tolerance
+            grad, ref_grads[rename(name)], msg=_tagged(f"grad of {name}"), **tolerance
         )
 
 
@@ -122,25 +164,34 @@ class MoEBlockTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_cuda_bf16_matches_cpu_fp32(self):
         # The routed path alone: the shared expert is plain Linear, no kernel to check.
-        layer = build_moe(_config(shared_expert_intermediate_size=0))
-        cuda = build_moe(_config(shared_expert_intermediate_size=0))
-        cuda.load_state_dict(layer.state_dict())
-        cuda = cuda.to(device="cuda", dtype=torch.bfloat16)
-        out, grads = _forward_and_grads(layer, self.x)
-        cuda_out, cuda_grads = _forward_and_grads(
-            cuda, self.x.to("cuda", torch.bfloat16)
-        )
-        tolerance = dict(rtol=2e-2, atol=5e-3)
-        torch.testing.assert_close(
-            cuda_out.float().cpu(), out, msg=_tagged("output"), **tolerance
-        )
-        for name, grad in grads.items():
-            torch.testing.assert_close(
-                cuda_grads[name].float().cpu(),
-                grad,
-                msg=_tagged(f"grad of {name}"),
-                **tolerance,
-            )
+        builders = {
+            "qwen3_5_moe": lambda: build_moe(
+                _config(shared_expert_intermediate_size=0)
+            ),
+            "deepseek_v4": lambda: deepseek_v4.build_moe(
+                _v4_config(n_shared_experts=0)
+            ),
+        }
+        for family, build in builders.items():
+            with self.subTest(family=family):
+                layer, cuda = build(), build()
+                cuda.load_state_dict(layer.state_dict())
+                cuda = cuda.to(device="cuda", dtype=torch.bfloat16)
+                out, grads = _forward_and_grads(layer, self.x)
+                cuda_out, cuda_grads = _forward_and_grads(
+                    cuda, self.x.to("cuda", torch.bfloat16)
+                )
+                tolerance = dict(rtol=2e-2, atol=5e-3)
+                torch.testing.assert_close(
+                    cuda_out.float().cpu(), out, msg=_tagged("output"), **tolerance
+                )
+                for name, grad in grads.items():
+                    torch.testing.assert_close(
+                        cuda_grads[name].float().cpu(),
+                        grad,
+                        msg=_tagged(f"grad of {name}"),
+                        **tolerance,
+                    )
 
 
 class BuildFfnTest(unittest.TestCase):
@@ -250,6 +301,67 @@ class FamilyConfigTest(unittest.TestCase):
                 TopKRouter(E, H, top_k, norm_topk_prob=True, initializer_range=0.02)
         with self.assertRaisesRegex(ValueError, "aux_loss_type"):
             build_moe(_config(dflash_config={"moe_router_aux_loss_type": "x"}))
+
+
+class DeepSeekV4BlockTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        self.x = torch.randn(2, 5, H)
+
+    def test_matches_transformers_deepseek_v4_sparse_block(self):
+        tolerance = dict(rtol=1e-4, atol=1e-6)
+        with self.subTest(path="grouped_mm"):
+            layer, reference = _v4_pair()
+            _assert_same_forward_and_backward(
+                self, layer, reference, self.x, rename=_v4_key, **tolerance
+            )
+        with self.subTest(path="forced fallback loop"):
+            layer, reference = _v4_pair()
+            with mock.patch.object(experts_module, "_GROUPED_MM_DEVICES", ()):
+                _assert_same_forward_and_backward(
+                    self, layer, reference, self.x, rename=_v4_key, **tolerance
+                )
+
+    def test_family_reads_the_config_and_rejects_bad_values(self):
+        layer = deepseek_v4.build_moe(_v4_config())
+        gate = layer.gate
+        self.assertIsInstance(gate, TopKRouter)
+        self.assertEqual((gate.num_experts, gate.top_k, gate.route_scale), (E, K, 1.5))
+        self.assertIs(gate.score_fn, deepseek_v4.sqrtsoftplus_scores)
+        self.assertIsNotNone(gate.expert_bias)  # dflash_config turned it on
+        # One ungated shared expert of moe_intermediate_size; none when n_shared_experts is 0.
+        self.assertEqual(tuple(layer.shared_expert.gate_proj.weight.shape), (I, H))
+        self.assertIsNone(layer.shared_expert_gate)
+        self.assertIsNone(
+            deepseek_v4.build_moe(_v4_config(n_shared_experts=0)).shared_expert
+        )
+        # V4 always renormalizes; the flag is not read, as in transformers.
+        self.assertTrue(
+            deepseek_v4.build_moe(_v4_config(norm_topk_prob=False)).gate.norm_topk_prob
+        )
+        # The clamp: gate capped above, up clamped both ways.
+        activation = deepseek_v4.clamped_swiglu(10.0)
+        big = torch.tensor([20.0, -20.0])
+        torch.testing.assert_close(
+            activation(big, big),
+            torch.nn.functional.silu(torch.tensor([10.0, -20.0]))
+            * torch.tensor([10.0, -10.0]),
+        )
+        # Bad values are refused at construction.
+        with self.assertRaisesRegex(ValueError, "sqrtsoftplus"):
+            deepseek_v4.build_moe(_v4_config(scoring_func="sigmoid"))
+        with self.assertRaisesRegex(ValueError, "silu"):
+            deepseek_v4.build_moe(_v4_config(hidden_act="gelu"))
+        # build_ffn reaches the family through moe_preset.
+        config = Qwen3Config(
+            **TINY_DFLASH,
+            moe_preset="deepseek_v4",
+            n_routed_experts=E,
+            num_experts_per_tok=K,
+            moe_intermediate_size=I,
+            routed_scaling_factor=1.5,
+        )
+        self.assertIsInstance(build_ffn(config, 0, dense=Qwen3MLP), MoELayer)
 
 
 if __name__ == "__main__":
