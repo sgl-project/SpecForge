@@ -3,11 +3,13 @@
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
+import torch
 from torch import nn
 from transformers.modeling_layers import GradientCheckpointingLayer
 
 from .attention.base import Attention, AttentionContext, AttentionOutput
 from .factory import build_residual
+from .ffn.moe.layer import MoELayer
 from .residual.base import Residual, ResidualStream
 
 State = TypeVar("State")
@@ -53,6 +55,7 @@ class DecoderLayer(GradientCheckpointingLayer, Generic[State]):
         hidden_states: ResidualStream,
         context: AttentionContext,
         state: State | None = None,
+        moe_token_mask: torch.Tensor | None = None,
         **backend_kwargs,
     ) -> DecoderOutput[State]:
         hidden_states, residual = self.attention_residual.read(
@@ -63,5 +66,15 @@ class DecoderLayer(GradientCheckpointingLayer, Generic[State]):
         hidden_states, residual = self.ffn_residual.read(
             hidden_states, self.post_attention_layernorm
         )
-        hidden_states = self.ffn_residual.write(self.mlp(hidden_states), residual)
+        hidden_states = self.ffn_residual.write(
+            self._ffn(hidden_states, moe_token_mask), residual
+        )
         return DecoderOutput(hidden_states, output)
+
+    def _ffn(
+        self, hidden_states: torch.Tensor, moe_token_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        # Only an MoELayer takes the mask; the dense MLP keeps its one-argument call.
+        if moe_token_mask is None or not isinstance(self.mlp, MoELayer):
+            return self.mlp(hidden_states)
+        return self.mlp(hidden_states, moe_token_mask)

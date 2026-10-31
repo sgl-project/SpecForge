@@ -234,7 +234,7 @@ class Qwen3DFlashDecoderLayer(DecoderLayer):
             attention=build_attention(
                 config, layer_idx, kernels, _attention_options(config, layer_idx)
             ),
-            ffn=build_ffn(config, kernels),
+            ffn=build_ffn(config, layer_idx, kernels),
             input_layernorm=make_norm(),
             post_attention_layernorm=make_norm(),
             attention_residual=build_residual(
@@ -281,6 +281,7 @@ class Qwen3DFlashDecoderLayer(DecoderLayer):
                 hidden_states,
                 context,
                 past_key_value,
+                moe_token_mask=moe_token_mask,
                 position_ids=position_ids,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
