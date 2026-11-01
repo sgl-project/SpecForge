@@ -42,9 +42,6 @@ SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
     "--skip-tokenizer-init": "the capture launcher",
     "--tp-size": "capture_servers[].tp_size",
     "--chunked-prefill-size": "the capture launcher (complete prefills)",
-    "--enable-spec-capture": "the capture launcher",
-    "--spec-capture-method": "the algorithm's capture contract",
-    "--spec-capture-aux-layer-ids": "the algorithm's capture contract",
     "--speculative-algorithm": "the algorithm's capture contract (plugin backend)",
     "--enable-return-aux-hidden-states": "the algorithm's capture contract",
     "--return-aux-hidden-state-layer-ids": "the algorithm's capture contract",
@@ -659,7 +656,7 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
 
 
 class ManagedLocalCaptureServerConfig(StrictConfigModel):
-    """One patched SGLang capture server owned by the local supervisor.
+    """One SGLang capture server owned by the local supervisor.
 
     ``cuda_visible_devices`` holds plain device ordinals; the launcher maps
     them to the accelerator's visibility env var.
@@ -842,14 +839,13 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     store_root: Optional[str] = None
     store_id: Optional[str] = None
     server_urls: List[str] = Field(default_factory=list)
-    #: How the SGLang capture servers implement spec capture: ``patch`` is the
-    #: versioned source patch under ``patches/sglang``; ``plugin`` is the
+    #: SGLang capture uses the
     #: ``specforge-sglang-capture`` plugin on an SGLang build with forward
     #: observers, deferred outputs and ``--enable-return-aux-hidden-states``.
     #: ``auto`` takes ``DISAGG_SERVER_CAPTURE`` when set, else detects the
     #: backend: managed_local probes each capture server's interpreter while
     #: planning; the producer reads an external server's ``/server_info``.
-    server_capture: Literal["auto", "patch", "plugin"] = "auto"
+    server_capture: Literal["auto", "plugin"] = "auto"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None

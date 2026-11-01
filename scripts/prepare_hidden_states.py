@@ -1,59 +1,34 @@
-"""Generate offline draft-training features with local SGLang capture.
+"""Prepare offline features using a SGLang capture plugin server and Mooncake.
 
-The local target exists only for this preprocessing command. Online training
-consumes features from an external server and never loads a target model in the
-trainer process. Precomputing target features removes the target model's memory
-and latency cost from the later offline training run. ``--strategy`` selects
-the algorithm-owned capture layers and persisted tensor schema.
-The hidden states are saved in ${output_path} and the vocabulary mapping is saved
-in ${output_path}/vocab_mapping/vocab_mapping.pt
-which is used for the offline training.
+Start the capture service separately (see examples/offline/README.md), then:
 
-Usage:
-torchrun --nproc_per_node=2 \
-    scripts/prepare_hidden_states.py \
-    --target-model-path Qwen/Qwen3-8B \
-    --data-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-path ./cache/hidden_states/sharegpt_qwen3-8b \
-    --chat-template qwen \
-    --max-length 4096 \
-    --tp-size 1 \
-    --batch-size 32 \
-    --num-samples 10000 \
-    --strategy dspark \
-    --draft-model-config configs/qwen3-8b-dspark.json
+    python scripts/prepare_hidden_states.py \
+        --server-urls http://127.0.0.1:30000 \
+        --target-model-path Qwen/Qwen3-8B \
+        --data-path ./cache/dataset/sharegpt_train.jsonl \
+        --output-path ./cache/hidden_states/sharegpt_qwen3-8b \
+        --chat-template qwen --strategy eagle3
 
-
-For pre-formatted data (with chat template already applied), add --is-preformatted:
-torchrun --nproc_per_node=2 \
-    scripts/prepare_hidden_states.py \
-    --target-model-path Qwen/Qwen3-8B \
-    --data-path ./cache/dataset/sharegpt_train.jsonl \
-    --output-path ./cache/hidden_states/sharegpt_qwen3-8b \
-    --chat-template qwen \
-    --max-length 4096 \
-    --tp-size 1 \
-    --batch-size 32 \
-    --num-samples 10000 \
-    --strategy dspark \
-    --draft-model-config configs/qwen3-8b-dspark.json \
-    --is-performatted
+Optional torchrun workers shard samples on CPU; model TP belongs to the server.
 """
 
 import argparse
-import gc
 import gzip
 import hashlib
 import os
+import tempfile
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 import torch
 import torch.distributed as dist
 from datasets import Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig
 
@@ -64,22 +39,10 @@ from specforge.data.preprocessing import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
 )
-from specforge.data.utils import prepare_dp_dataloaders
-from specforge.distributed import (
-    destroy_distributed,
-    get_dp_group,
-    get_tp_group,
-    init_distributed,
-    is_tp_rank_0,
-)
-from specforge.offline_capture import OfflineSGLangCapture, load_offline_capture
+from specforge.offline_capture import OfflineCaptureClient
 from specforge.utils import (
-    get_device_type,
-    is_xpu,
     load_tokenizer,
     print_args_with_dots,
-    print_with_rank,
-    rank_0_priority,
     safe_conversations_generator,
 )
 
@@ -135,7 +98,8 @@ def parse_args():
     data_group.add_argument("--build-dataset-num-proc", type=int, default=8)
 
     inference_group = parser.add_argument_group("inference")
-    inference_group.add_argument("--tp-size", type=int, default=1)
+    inference_group.add_argument("--server-urls", nargs="+", required=True)
+    inference_group.add_argument("--capture-timeout", type=float, default=300.0)
     inference_group.add_argument("--batch-size", type=int, default=32)
 
     others_group = parser.add_argument_group("others")
@@ -163,16 +127,6 @@ def parse_args():
         help="Max number of pending I/O futures.",
     )
     others_group.add_argument(
-        "--hidden-state-transfer",
-        choices=("async", "sync"),
-        default="async",
-        help=(
-            "Hidden-state D2H transfer (default: async). Async uses pinned CPU "
-            "buffers and a CUDA copy stream; use sync or reduce --io-queue-size "
-            "if transfer memory is insufficient."
-        ),
-    )
-    others_group.add_argument(
         "--file-group-size",
         type=int,
         default=2000,
@@ -190,31 +144,11 @@ def parse_args():
         help="Gzip compression level (1-9).",
     )
 
-    sglang_group = parser.add_argument_group("sglang")
-    sglang_group.add_argument(
-        "--sglang-attention-backend",
-        default="flashinfer",
-        help="Attention backend used by the offline SGLang capture",
-    )
-    sglang_group.add_argument("--sglang-mem-fraction-static", type=float, default=0.4)
-    sglang_group.add_argument("--sglang-context-length", type=int, default=None)
-    sglang_group.add_argument("--sglang-enable-nccl-nvls", action="store_true")
-    sglang_group.add_argument("--sglang-enable-symm-mem", action="store_true")
-    sglang_group.add_argument("--sglang-enable-torch-compile", action="store_true")
-    sglang_group.add_argument("--sglang-enable-dp-attention", action="store_true")
-    sglang_group.add_argument("--sglang-enable-dp-lm-head", action="store_true")
-    sglang_group.add_argument("--sglang-ep-size", type=int, default=1)
-    sglang_group.add_argument(
-        "--sglang-disable-radix-cache",
-        action="store_true",
-        help=(
-            "Disable the SGLang radix (prefix) cache (default: enabled). "
-            "Required for hybrid linear-attention/Mamba targets on ROCm, whose "
-            "mamba radix-cache extra_buffer strategy asserts CUDA/MUSA/NPU "
-            "(FLA) at server init."
-        ),
-    )
-    return parser.parse_args()
+    args = parser.parse_args()
+    for name in ("batch_size", "io_queue_size", "file_group_size", "capture_timeout"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    return args
 
 
 def _resolve_draft_vocab_size(draft_config: object) -> int:
@@ -245,7 +179,7 @@ def _generate_shared_vocab_mapping(
     mapping_dir = os.path.join(output_path, "vocab_mapping")
     mapping_path = os.path.join(mapping_dir, "vocab_mapping.pt")
     result = [None]
-    if dist.get_rank() == 0:
+    if _rank() == 0:
         temporary_path = None
         try:
             temporary_key = f".vocab_mapping.{uuid.uuid4().hex}"
@@ -291,7 +225,8 @@ def _generate_shared_vocab_mapping(
                 except OSError:
                     pass
 
-    dist.broadcast_object_list(result, src=0)
+    if dist.is_initialized():
+        dist.broadcast_object_list(result, src=0)
     if result[0] is None or "error" in result[0]:
         reason = "rank 0 did not publish a result"
         if result[0] is not None:
@@ -303,23 +238,6 @@ def _generate_shared_vocab_mapping(
             f"{result[0]['path']} != {mapping_path}"
         )
     return mapping_path
-
-
-def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
-    return {
-        "attention_backend": args.sglang_attention_backend,
-        "mem_fraction_static": args.sglang_mem_fraction_static,
-        "context_length": args.sglang_context_length,
-        "enable_nccl_nvls": args.sglang_enable_nccl_nvls,
-        "enable_symm_mem": args.sglang_enable_symm_mem,
-        "enable_torch_compile": args.sglang_enable_torch_compile,
-        "enable_dp_attention": args.sglang_enable_dp_attention,
-        "enable_dp_lm_head": args.sglang_enable_dp_lm_head,
-        "ep_size": args.sglang_ep_size,
-        "disable_radix_cache": getattr(args, "sglang_disable_radix_cache", False),
-        "max_running_requests": args.batch_size,
-        "max_total_tokens": args.batch_size * args.max_length,
-    }
 
 
 def resolve_offline_capture_plan(
@@ -354,506 +272,221 @@ def resolve_offline_capture_plan(
     )
 
 
-def build_target_model(
-    args: argparse.Namespace,
-    model_config: AutoConfig,
-    capture_layers: List[int],
-    capture_method: str = "eagle3",
-) -> OfflineSGLangCapture:
-    """Build the local target used only by this preprocessing command."""
-    target_model = load_offline_capture(
-        args.target_model_path,
-        torch_dtype=(
-            model_config.dtype
-            if hasattr(model_config, "dtype")
-            else model_config.torch_dtype
-        ),
-        trust_remote_code=args.trust_remote_code,
-        **_sglang_kwargs(args),
+def build_capture_client(args, model_config, plan):
+    text_config = getattr(model_config, "text_config", model_config)
+    return OfflineCaptureClient(
+        args.server_urls,
+        target_model_path=args.target_model_path,
+        capture_layers=plan.capture_layers,
+        layout=plan.layout,
+        target_hidden_size=text_config.hidden_size,
+        timeout_s=args.capture_timeout,
     )
-    target_model.set_capture_layers(
-        capture_layers,
-        capture_method=capture_method,
-    )
-    return target_model
+
+
+def _rank():
+    return dist.get_rank() if dist.is_initialized() else 0
+
+
+def _world_size():
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+@contextmanager
+def rank_0_priority():
+    if dist.is_initialized() and _rank() != 0:
+        dist.barrier()
+    try:
+        yield
+    finally:
+        if dist.is_initialized() and _rank() == 0:
+            dist.barrier()
+
+
+def print_with_rank(message):
+    print(f"[capture worker {_rank()}] {message}", flush=True)
+
+
+def sample_range(total, rank, world_size):
+    """Contiguous, non-overlapping ranges, without sampler padding/duplicates."""
+    count, remainder = divmod(total, world_size)
+    start = rank * count + min(rank, remainder)
+    return start, start + count + (rank < remainder)
+
+
+def _collate_rows(rows):
+    # Keep requests unpadded and independent of client batch/worker counts.
+    return rows
+
+
+def _capture_input(row):
+    ids = torch.as_tensor(row["input_ids"]).reshape(-1)
+    mask = torch.as_tensor(row["attention_mask"]).reshape(-1)
+    loss = torch.as_tensor(row["loss_mask"]).reshape(-1)
+    if ids.numel() != mask.numel() or ids.numel() != loss.numel():
+        raise ValueError("input_ids, attention_mask and loss_mask must align")
+    length = int(mask.sum())
+    if (
+        length < 1
+        or not bool((mask[:length] == 1).all())
+        or not bool((mask[length:] == 0).all())
+    ):
+        raise ValueError(
+            "offline capture requires a nonempty prompt with right padding only"
+        )
+    return {"input_ids": ids[:length].clone(), "loss_mask": loss[:length].clone()}
 
 
 class HiddenStatesGenerator:
-    """
-    This is a generator for creating and saving the hidden states based on the target model.
-    It includes the following features:
-        1. Fixes a potential deadlock in TP > 1 scenarios when a batch is skipped.
-        2. Implements a context manager (`with` statement) for robust resource handling.
-        3. Makes internal settings (like queue sizes, group sizes) configurable.
-        4. Centralizes resource cleanup logic.
-    """
+    """Read plugin features on CPU and atomically persist the existing schema."""
 
     def __init__(
         self,
-        target_model,
-        capture_layout: Optional[OfflineCaptureLayout] = None,
-        num_io_threads: int = 4,
-        io_queue_size: int = 50,
-        file_group_size: int = 2000,
-        compress: bool = False,
-        compression_level: int = 6,
-        hidden_state_transfer: str = "async",
+        capture_client,
+        capture_layout=None,
+        *,
+        num_io_threads=None,
+        io_queue_size=50,
+        file_group_size=2000,
+        compress=False,
+        compression_level=6,
     ):
-        """
-        Args:
-            target_model: The model for inference.
-            capture_layout: Algorithm-owned mapping from captured states to files.
-            num_io_threads: Number of threads for async I/O.
-            io_queue_size: Max number of pending I/O futures before cleanup.
-            file_group_size: Number of files per subdirectory.
-            hidden_state_transfer: Async CUDA copies into pinned CPU buffers,
-                or legacy synchronous copies. In-flight records are bounded by
-                io_queue_size; pinned allocator caches may retain freed buffers.
-        """
-        if hidden_state_transfer not in ("async", "sync"):
-            raise ValueError("hidden_state_transfer must be 'async' or 'sync'")
-        if io_queue_size < 1:
-            raise ValueError("io_queue_size must be positive")
-        self.hidden_state_transfer = hidden_state_transfer
-        self._copy_streams = {}
-        self.model = target_model
+        if io_queue_size < 1 or file_group_size < 1:
+            raise ValueError("I/O queue and file group sizes must be positive")
+        self.client = capture_client
         self.capture_layout = capture_layout or OfflineCaptureLayout(
             capture_method="eagle3",
             aux_feature="aux_hidden_state",
             last_hidden_feature="hidden_state",
-            passthrough=(
-                ("input_ids", "input_ids"),
-                ("loss_mask", "loss_mask"),
-            ),
+            passthrough=(("input_ids", "input_ids"), ("loss_mask", "loss_mask")),
         )
-
-        # --- Configurable parameters ---
         self.num_io_threads = num_io_threads
         self.io_queue_size = io_queue_size
         self.file_group_size = file_group_size
         self.compress = compress
         self.compression_level = compression_level
-        self.file_extension = ".ckpt.gz" if self.compress else ".ckpt"
-
-        # progress bar should only shown on TP rank = 0
-        self.show_progress = dist.get_rank(get_tp_group()) == 0
-
-        # --- REFACTOR: Thread pool is now managed by __enter__ and __exit__ ---
+        self.file_extension = ".ckpt.gz" if compress else ".ckpt"
+        self.show_progress = _rank() == 0
         self.io_executor = None
         self.pending_futures = []
 
     def __enter__(self):
-        """Initializes resources when entering a 'with' block."""
-        if is_tp_rank_0():
-            self.io_executor = ThreadPoolExecutor(max_workers=self.num_io_threads)
-        self.pending_futures = []
+        self.io_executor = ThreadPoolExecutor(max_workers=self.num_io_threads)
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Cleans up resources when exiting a 'with' block."""
-        if is_tp_rank_0() and self.io_executor is not None:
-            if self.show_progress:
-                print("\nWaiting for all async I/O operations to complete...")
-            try:
-                self._wait_all_saves()
-            finally:
-                self.io_executor.shutdown(wait=True)
-                self.io_executor = None
-                self.pending_futures.clear()
-                for stream in self._copy_streams.values():
-                    stream.synchronize()
-                self._copy_streams.clear()
-
-        if exc_type is None:
-            dist.barrier()
-
-    @staticmethod
-    def _add_transfer_memory_hint(exc):
-        hint = (
-            "Reduce --io-queue-size or use --hidden-state-transfer sync to "
-            "reduce in-flight transfer memory."
-        )
-        exc.args = (f"{exc}\n{hint}", *exc.args[1:])
-
-    def _stage_hidden_states(self, *tensors):
-        staged = []
-        streams = set()
+    def __exit__(self, exc_type, exc, traceback):
         try:
-            for tensor in tensors:
-                if tensor is None:
-                    staged.append(None)
-                elif (
-                    self.hidden_state_transfer == "sync" or tensor.device.type != "cuda"
-                ):
-                    staged.append(tensor.cpu().clone().unsqueeze(0))
-                else:
-                    device = tensor.device
-                    if device not in self._copy_streams:
-                        self._copy_streams[device] = torch.cuda.Stream(device=device)
-                    stream = self._copy_streams[device]
-                    try:
-                        host = torch.empty(
-                            tensor.shape,
-                            dtype=tensor.dtype,
-                            device="cpu",
-                            pin_memory=True,
-                        )
-                    except (RuntimeError, MemoryError) as exc:
-                        if isinstance(exc, MemoryError) or any(
-                            text in str(exc).lower()
-                            for text in (
-                                "out of memory",
-                                "cannot allocate memory",
-                                "can't allocate memory",
-                                "not enough memory",
-                            )
-                        ):
-                            self._add_transfer_memory_hint(exc)
-                        raise
-                    stream.wait_stream(torch.cuda.current_stream(device))
-                    with torch.cuda.stream(stream):
-                        host.copy_(tensor, non_blocking=True)
-                        # The producer may release its source before D2H finishes.
-                        tensor.record_stream(stream)
-                    streams.add(stream)
-                    staged.append(host.unsqueeze(0))
-        except torch.cuda.OutOfMemoryError as exc:
-            if "--hidden-state-transfer sync" not in str(exc):
-                self._add_transfer_memory_hint(exc)
-            raise
-        events = []
-        for stream in streams:
-            event = torch.cuda.Event()
-            event.record(stream)
-            events.append(event)
-        return staged, events
+            self._wait_all_saves()
+        finally:
+            self.io_executor.shutdown(wait=True)
+            self.io_executor = None
+            self.pending_futures.clear()
 
-    def _save_after_transfer(self, record, output_file, ready_events):
-        for event in ready_events:
-            event.synchronize()
-        self._save_tensor_sync(record, output_file)
+    def _wait_all_saves(self):
+        pending, self.pending_futures = self.pending_futures, []
+        if pending:
+            # All writes must stop before the capture context releases features,
+            # including when an earlier future failed.
+            wait(pending)
+            for future in pending:
+                future.result()
 
     def _wait_for_io_slot(self):
-        pending = []
-        for future in self.pending_futures:
-            if future.done():
-                future.result()  # Do not discard failed writes during cleanup.
-            else:
-                pending.append(future)
-        self.pending_futures = pending
         if len(self.pending_futures) >= self.io_queue_size:
             self.pending_futures.pop(0).result()
 
-    def _save_tensor_sync(
-        self,
-        record: Mapping[str, torch.Tensor],
-        output_file: str,
-    ) -> None:
-        """
-        Save a feature record synchronously, skipping records containing NaNs.
-
-        Args:
-            record: The algorithm-specific feature record to save.
-            output_file (str): The path to the output file.
-        """
+    def _save_tensor_sync(self, record: Mapping[str, torch.Tensor], output_file):
         persisted = dict(record)
-        for feature_name, tensor in persisted.items():
+        for name, tensor in persisted.items():
             if not torch.is_tensor(tensor):
-                raise TypeError(
-                    f"offline feature {feature_name!r} must be a tensor, got "
-                    f"{type(tensor).__name__}"
-                )
+                raise TypeError(f"offline feature {name!r} must be a tensor")
             if (torch.is_floating_point(tensor) or torch.is_complex(tensor)) and bool(
                 torch.isnan(tensor).any()
             ):
-                print(
-                    f"Warning: NaN found in {feature_name} for {output_file}. "
-                    "Skipping save."
-                )
+                print(f"Warning: NaN in {name} for {output_file}; skipping save.")
                 return
+        path = Path(output_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+            ) as output:
+                temporary = output.name
+                if self.compress:
+                    with gzip.GzipFile(
+                        fileobj=output, mode="wb", compresslevel=self.compression_level
+                    ) as zipped:
+                        torch.save(persisted, zipped)
+                else:
+                    torch.save(persisted, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                os.unlink(temporary)
 
-        if self.compress:
-            with gzip.open(
-                output_file, "wb", compresslevel=self.compression_level
-            ) as f:
-                torch.save(persisted, f)
-        else:
-            torch.save(persisted, output_file)
-
-    def _save_tensor_async(
-        self,
-        record: Mapping[str, torch.Tensor],
-        output_file: str,
-        ready_events=(),
-    ) -> None:
-        """
-        Submit a job to the io_executor to save the data point asynchronously.
-
-        Args:
-            record: The algorithm-specific feature record to save.
-            output_file (str): The path to the output file.
-        """
-        assert is_tp_rank_0(), "Only tp_rank=0 should call _save_tensor_async"
+    def _save_tensor_async(self, record, output_file):
         self._wait_for_io_slot()
-        future = self.io_executor.submit(
-            self._save_after_transfer, record, output_file, ready_events
+        self.pending_futures.append(
+            self.io_executor.submit(self._save_tensor_sync, record, output_file)
         )
-        self.pending_futures.append(future)
 
-    def _wait_all_saves(self):
-        """
-        This method is to ensure that all submitted jobs are completed.
-        """
-        if is_tp_rank_0() and self.pending_futures:
-            for future in tqdm(
-                self.pending_futures,
-                desc="Finalizing Writes",
-                disable=not self.show_progress,
-            ):
-                future.result()  # Wait and raise exception if any
-            self.pending_futures.clear()
+    def _get_file_path(self, output_path, idx, extension=None):
+        group = (idx // self.file_group_size) * self.file_group_size
+        return str(
+            Path(output_path)
+            / f"rows_{group}-{group + self.file_group_size}"
+            / f"data_{idx}{extension or self.file_extension}"
+        )
 
-    def _prepare_output_dirs(
-        self, output_path: str, start_idx: int, total_samples: int
-    ) -> None:
-        """
-        The dataset is organized into groups of files, each group has a folder which contains the files for this group. For example, if the
-        file_group_size is 2000, the 0-1999 samples will be saved in the folder "rows_0-2000", the 2000-3999 samples will be saved in the folder "rows_2000-4000", etc.
-
-        Args:
-            output_path (str): The path to the output directory.
-            start_idx (int): The starting index of the samples to save.
-            total_samples (int): The total number of samples to save.
-
-        Returns:
-            None
-        """
-        if not is_tp_rank_0() or total_samples == 0:
-            return
-        start_group = (start_idx // self.file_group_size) * self.file_group_size
-        end_sample_idx = start_idx + total_samples - 1
-        end_group = (end_sample_idx // self.file_group_size) * self.file_group_size
-        for group_start_idx in range(start_group, end_group + 1, self.file_group_size):
-            grouped_subdir = (
-                f"rows_{group_start_idx}-{group_start_idx + self.file_group_size}"
+    def _check_existing_files_batch(self, output_path, indices):
+        return [
+            any(
+                Path(self._get_file_path(output_path, idx, extension=ext)).is_file()
+                for ext in (".ckpt", ".ckpt.gz")
             )
-            output_dir = os.path.join(output_path, grouped_subdir)
-            os.makedirs(output_dir, exist_ok=True)
+            for idx in indices
+        ]
 
-    def _check_existing_files_batch(
-        self, output_path: str, global_indices: List[int]
-    ) -> List[bool]:
-        """
-        A helper function to check if the files for the given global indices exist.
-
-        Args:
-            output_path (str): The path to the output directory.
-            global_indices (List[int]): The global indices of the samples to check.
-
-        Returns:
-            List[bool]: A list of booleans indicating if the files for the given global indices exist.
-        """
-        if not is_tp_rank_0():
-            return [False] * len(global_indices)
-
-        def check_single_file(idx):
-            if os.path.exists(self._get_file_path(output_path, idx)):
-                return True
-            uncompressed_ckpt = self._get_file_path(output_path, idx, extension=".ckpt")
-            compressed_ckpt = self._get_file_path(
-                output_path, idx, extension=".ckpt.gz"
-            )
-            return os.path.exists(uncompressed_ckpt) or os.path.exists(compressed_ckpt)
-
-        # Parallel file existence check
-        with ThreadPoolExecutor(max_workers=self.num_io_threads) as executor:
-            exists = list(executor.map(check_single_file, global_indices))
-        return exists
-
-    def _get_file_path(
-        self, output_path: str, idx: int, extension: Optional[str] = None
-    ) -> str:
-        """
-        A helper function to get the standard file path for the data point with the given index.
-
-        Args:
-            output_path (str): The path to the output directory.
-            idx (int): The global index of the data point.
-
-        Returns:
-            str: The file path for the data point.
-        """
-        ext = self.file_extension if extension is None else extension
-        group_idx = (idx // self.file_group_size) * self.file_group_size
-        grouped_subdir = f"rows_{group_idx}-{group_idx + self.file_group_size}"
-        return os.path.join(output_path, grouped_subdir, f"data_{idx}{ext}")
-
-    @torch.no_grad()
-    def generate(
-        self,
-        data_loader: torch.utils.data.DataLoader,
-        output_path: str,
-        start_idx: int = 0,
-        samples_per_dp: int = 0,
-    ):
-        """
-        CUDA states are copied into pinned CPU buffers on a separate stream by
-        default. Writer threads wait for copy events before checking or saving
-        tensors. The I/O queue applies backpressure before staging another record.
-        Use hidden_state_transfer="sync" for the legacy low-memory transfer path.
-        """
-        self._prepare_output_dirs(output_path, start_idx, samples_per_dp)
-
-        tp_group = get_tp_group()
-        tp_group_ranks = dist.get_process_group_ranks(tp_group)
-        tp_rank_0_global = tp_group_ranks[0]
+    def generate(self, data_loader, output_path, start_idx=0):
         global_idx = start_idx
-
-        progress_bar = tqdm(
+        for batch in tqdm(
             data_loader,
-            disable=(not self.show_progress),
-            desc="Generating Hidden States",
-            position=dist.get_rank(get_dp_group()),
-            leave=True,
-        )
-
-        total_skipped, total_processed = 0, 0
-
-        for batch_idx, batch in enumerate(progress_bar):
-            batch_size = batch["input_ids"].size(0)
-            current_batch_indices = list(range(global_idx, global_idx + batch_size))
-
-            # # Step 1: Synchronize valid indices across TP group
-            # we check which files already exist and sync this info across TP ranks
-            # if exists, we will skip these samples
-            if is_tp_rank_0():
-                exists_list = self._check_existing_files_batch(
-                    output_path, current_batch_indices
-                )
-                exists_tensor = torch.tensor(
-                    exists_list, dtype=torch.bool, device=get_device_type()
-                )
-            else:
-                exists_tensor = torch.tensor(
-                    [False] * batch_size, dtype=torch.bool, device=get_device_type()
-                )
-            dist.broadcast(exists_tensor, src=tp_rank_0_global, group=tp_group)
-
-            # Step 1: TP rank 0 checks which samples need processing
-            valid_indices_in_batch = [
-                i for i, exists in enumerate(exists_tensor) if not exists
+            disable=not self.show_progress,
+            desc="Capturing offline features",
+        ):
+            indices = list(range(global_idx, global_idx + len(batch)))
+            global_idx += len(batch)
+            exists = self._check_existing_files_batch(output_path, indices)
+            selected = [
+                (idx, row) for idx, row, done in zip(indices, batch, exists) if not done
             ]
-            sample_global_indices = [
-                current_batch_indices[i] for i in valid_indices_in_batch
-            ]
-            num_valid = len(valid_indices_in_batch)
-            total_skipped += batch_size - num_valid
-
-            # Step 2: Filter batch before moving to GPU to save memory
-            global_idx += batch_size
-            filtered_batch = {
-                "input_ids": batch["input_ids"][valid_indices_in_batch],
-                "attention_mask": batch["attention_mask"][valid_indices_in_batch],
-                "loss_mask": batch["loss_mask"][valid_indices_in_batch],
-            }
-            del batch
-            if num_valid == 0:
-                # Data has already been generated, no sample processing, update progress bar.
-                if self.show_progress:
-                    progress_bar.set_postfix(
-                        {
-                            "processed": total_processed,
-                            "skipped": total_skipped,
-                            "pending_io": (
-                                len(self.pending_futures) if is_tp_rank_0() else 0
-                            ),
-                        }
-                    )
+            if not selected:
                 continue
-
-            filtered_batch_gpu = {
-                k: v.to(get_device_type(), non_blocking=True)
-                for k, v in filtered_batch.items()
-            }
-            try:
-                captured = self.model.capture(**filtered_batch_gpu)
-            except torch.cuda.OutOfMemoryError as exc:
-                if self.hidden_state_transfer == "async":
-                    self._add_transfer_memory_hint(exc)
-                raise
-            aux_hidden_states_list = captured.hidden_states
-            last_hidden_states_list = captured.last_hidden_states
-            if aux_hidden_states_list is None:
-                aux_hidden_states_list = [None] * num_valid
-            if last_hidden_states_list is None:
-                last_hidden_states_list = [None] * num_valid
-
-            del filtered_batch_gpu
-
-            if is_tp_rank_0():
-                for i, (
-                    current_global_idx,
-                    aux_hidden_states,
-                    last_hidden_states,
-                ) in enumerate(
-                    zip(
-                        sample_global_indices,
-                        aux_hidden_states_list,
-                        last_hidden_states_list,
+            sample_ids = [idx for idx, _ in selected]
+            inputs = [_capture_input(row) for _, row in selected]
+            with self.client.capture_rows(
+                [row["input_ids"].tolist() for row in inputs], sample_ids=sample_ids
+            ) as captured:
+                if len(captured) != len(inputs):
+                    raise RuntimeError(
+                        "capture server returned an unexpected row count"
                     )
-                ):
-
-                    self._wait_for_io_slot()
-                    (aux_hidden_states, last_hidden_states), ready_events = (
-                        self._stage_hidden_states(aux_hidden_states, last_hidden_states)
-                    )
-                    record = self.capture_layout.materialize(
-                        {
-                            "input_ids": filtered_batch["input_ids"][i].clone(),
-                            "loss_mask": filtered_batch["loss_mask"][i].clone(),
-                            "aux_hidden_states": aux_hidden_states,
-                            "last_hidden_states": last_hidden_states,
-                        }
-                    )
-
-                    # 3. Save asynchronously (the backpressure logic is still crucial)
-                    output_file = self._get_file_path(output_path, current_global_idx)
-                    self._save_tensor_async(record, output_file, ready_events)
-
-                    # 4. Immediately clean up the single-sample CPU tensors
-                    del last_hidden_states, aux_hidden_states
-
-                total_processed += len(sample_global_indices)
-
-            # Clean up the large GPU and CPU batch data
-            del aux_hidden_states_list, last_hidden_states_list, filtered_batch
-
-            if self.hidden_state_transfer == "sync" and batch_idx % 5 == 0:
-                torch.cuda.empty_cache()
-                gc.collect()
-
-            if self.show_progress:
-                progress_bar.set_postfix(
-                    {
-                        "processed": total_processed,
-                        "skipped": total_skipped,
-                        "pending_io": (
-                            len(self.pending_futures) if is_tp_rank_0() else 0
-                        ),
-                    }
-                )
-
-        if self.show_progress:
-            print(
-                f"\nGeneration loop finished. Processed: {total_processed}, Skipped: {total_skipped}"
-            )
-        dist.barrier()
+                try:
+                    for idx, source, tensors in zip(sample_ids, inputs, captured):
+                        record = self.capture_layout.materialize({**source, **tensors})
+                        self._save_tensor_async(
+                            record, self._get_file_path(output_path, idx)
+                        )
+                finally:
+                    self._wait_all_saves()
 
 
 def main():
     args = parse_args()
-    if is_xpu():
-        args.sglang_attention_backend = "triton"
     if args.num_io_threads is None:
         cpu_cores = os.cpu_count() or 1
         args.num_io_threads = max(1, cpu_cores)
@@ -870,161 +503,124 @@ def main():
     capture_plan = resolve_offline_capture_plan(args, target_model_config)
     draft_vocab_size = _resolve_draft_vocab_size(capture_plan.draft_config)
 
-    # Initialize distributed environment (TP + DP)
-    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
-    print_args_with_dots(args)
-    if dist.get_rank() == 0:
-        print("Resolved draft model config:")
-        print(capture_plan.draft_config.to_json_string(use_diff=False))
-    print_with_rank(
-        f"Resolved {capture_plan.strategy} offline "
-        f"capture method {capture_plan.capture_method!r}, layers: "
-        f"{list(capture_plan.capture_layers)}"
-    )
-
-    # Build target model (with TP)
-    target_model = build_target_model(
-        args,
-        target_model_config,
-        capture_layers=list(capture_plan.capture_layers),
-        capture_method=capture_plan.capture_method,
-    )
-    target_text_config = getattr(
-        target_model_config, "text_config", target_model_config
-    )
-    target_vocab_size = int(target_text_config.vocab_size)
-    if draft_vocab_size > target_vocab_size:
-        raise ValueError(
-            f"draft_vocab_size={draft_vocab_size} exceeds target "
-            f"vocab_size={target_vocab_size}"
-        )
-
-    print_with_rank(
-        f"DP Rank {dist.get_rank(get_dp_group())}, TP Rank {dist.get_rank(get_tp_group())}, "
-        f"DP Size {dist.get_world_size(get_dp_group())}, TP Size {dist.get_world_size(get_tp_group())}"
-    )
-
-    # Load complete dataset
-    assert os.path.exists(
-        args.data_path
-    ), f"Dataset path {args.data_path} does not exist"
-
-    with rank_0_priority():
-        print_with_rank("Loading/building dataset cache...")
-        dataset = Dataset.from_generator(
-            generator=safe_conversations_generator,
-            gen_kwargs={"file_path": args.data_path},
-            cache_dir=os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "cache",
-                "hf_dataset",
-            ),
-            num_proc=min(args.build_dataset_num_proc, 32),
-        )
-    if args.num_samples is not None and capture_plan.loss_mask_filter is None:
-        dataset = dataset.select(range(args.num_samples))
-    # Tokenizer and cache key
-    tokenizer = load_tokenizer(
-        args.target_model_path, trust_remote_code=args.trust_remote_code
-    )
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-
-    # Preprocess on complete, un-sharded dataset
-    with rank_0_priority():
-        print_with_rank("Main process is building the dataset cache...")
-        eagle3_dataset = build_eagle3_dataset(
-            dataset=dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
-            is_preformatted=args.is_preformatted,
-            num_proc=args.build_dataset_num_proc,
-            loss_mask_filter=capture_plan.loss_mask_filter,
-        )
-    if capture_plan.loss_mask_filter is not None and args.num_samples is not None:
-        eagle3_dataset = eagle3_dataset.select(
-            range(min(args.num_samples, len(eagle3_dataset)))
-        )
-    if not len(eagle3_dataset):
-        raise ValueError(
-            f"no samples satisfy {capture_plan.strategy} training eligibility"
-        )
-    print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
-
-    vocab_mapping_path = _generate_shared_vocab_mapping(
-        eagle3_dataset,
-        output_path=args.output_path,
-        target_vocab_size=target_vocab_size,
-        draft_vocab_size=draft_vocab_size,
-    )
-    if dist.get_rank() == 0:
-        print(f"Vocabulary mapping ready at {vocab_mapping_path}")
-
-    # Create DP-sharded dataloader
-    data_loader = prepare_dp_dataloaders(
-        dataset=eagle3_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=False,
-        process_group=get_dp_group(),
-    )
-
-    print_with_rank(
-        f"DataLoader created for DP Rank {dist.get_rank(get_dp_group())}. "
-        f"Number of batches: {len(data_loader)}"
-    )
-
-    # Calculate starting index and sample count for current DP rank
-    total = len(eagle3_dataset)
-    dp_rank = dist.get_rank(get_dp_group())
-    dp_size = dist.get_world_size(get_dp_group())
-
-    # Calculate samples per DP rank (handle non-divisible case)
-    samples_per_dp = total // dp_size
-    remainder = total % dp_size
-
-    # Earlier ranks handle one extra sample if there's a remainder
-    if dp_rank < remainder:
-        samples_per_dp += 1
-        start_idx = dp_rank * samples_per_dp
-    else:
-        start_idx = dp_rank * samples_per_dp + remainder
-
-    print_with_rank(
-        f"DP Rank {dp_rank} will process {samples_per_dp} samples, "
-        f"starting from index {start_idx}"
-    )
-
-    # Generate hidden states
+    # Client workers use CPU collectives; target TP is owned by SGLang.
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        dist.init_process_group("gloo", timeout=timedelta(minutes=args.dist_timeout))
     try:
-        # Pass configurable arguments from args if needed
-        with HiddenStatesGenerator(
-            target_model,
-            capture_layout=capture_plan.layout,
-            num_io_threads=args.num_io_threads,
-            io_queue_size=args.io_queue_size,
-            file_group_size=args.file_group_size,
-            compress=args.compress,
-            compression_level=args.compression_level,
-            hidden_state_transfer=args.hidden_state_transfer,
-            # Other params like io_queue_size can also be added to argparse
-        ) as hidden_states_generator:
+        print_args_with_dots(args)
+        if _rank() == 0:
+            print("Resolved draft model config:")
+            print(capture_plan.draft_config.to_json_string(use_diff=False))
+        print_with_rank(
+            f"Resolved {capture_plan.strategy} offline "
+            f"capture method {capture_plan.capture_method!r}, layers: "
+            f"{list(capture_plan.capture_layers)}"
+        )
+
+        target_text_config = getattr(
+            target_model_config, "text_config", target_model_config
+        )
+        target_vocab_size = int(target_text_config.vocab_size)
+        if draft_vocab_size > target_vocab_size:
+            raise ValueError(
+                f"draft_vocab_size={draft_vocab_size} exceeds target "
+                f"vocab_size={target_vocab_size}"
+            )
+
+        # Load complete dataset
+        assert os.path.exists(
+            args.data_path
+        ), f"Dataset path {args.data_path} does not exist"
+
+        with rank_0_priority():
+            print_with_rank("Loading/building dataset cache...")
+            dataset = Dataset.from_generator(
+                generator=safe_conversations_generator,
+                gen_kwargs={"file_path": args.data_path},
+                cache_dir=os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "cache",
+                    "hf_dataset",
+                ),
+                num_proc=min(args.build_dataset_num_proc, 32),
+            )
+        if args.num_samples is not None and capture_plan.loss_mask_filter is None:
+            dataset = dataset.select(range(min(args.num_samples, len(dataset))))
+        # Tokenizer and cache key
+        tokenizer = load_tokenizer(
+            args.target_model_path, trust_remote_code=args.trust_remote_code
+        )
+        cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
+        cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+
+        # Preprocess on complete, un-sharded dataset
+        with rank_0_priority():
+            print_with_rank("Main process is building the dataset cache...")
+            eagle3_dataset = build_eagle3_dataset(
+                dataset=dataset,
+                tokenizer=tokenizer,
+                chat_template=args.chat_template,
+                max_length=args.max_length,
+                cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+                cache_key=cache_key,
+                is_preformatted=args.is_preformatted,
+                num_proc=args.build_dataset_num_proc,
+                loss_mask_filter=capture_plan.loss_mask_filter,
+            )
+        if capture_plan.loss_mask_filter is not None and args.num_samples is not None:
+            eagle3_dataset = eagle3_dataset.select(
+                range(min(args.num_samples, len(eagle3_dataset)))
+            )
+        if not len(eagle3_dataset):
+            raise ValueError(
+                f"no samples satisfy {capture_plan.strategy} training eligibility"
+            )
+        print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
+
+        vocab_mapping_path = _generate_shared_vocab_mapping(
+            eagle3_dataset,
+            output_path=args.output_path,
+            target_vocab_size=target_vocab_size,
+            draft_vocab_size=draft_vocab_size,
+        )
+        if _rank() == 0:
+            print(f"Vocabulary mapping ready at {vocab_mapping_path}")
+
+        start_idx, end_idx = sample_range(len(eagle3_dataset), _rank(), _world_size())
+        data_loader = DataLoader(
+            eagle3_dataset.select(range(start_idx, end_idx)),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            shuffle=False,
+            collate_fn=_collate_rows,
+            multiprocessing_context="spawn" if args.num_workers > 0 else None,
+        )
+        print_with_rank(f"Capturing samples [{start_idx}, {end_idx})")
+
+        with (
+            build_capture_client(args, target_model_config, capture_plan) as client,
+            HiddenStatesGenerator(
+                client,
+                capture_layout=capture_plan.layout,
+                num_io_threads=args.num_io_threads,
+                io_queue_size=args.io_queue_size,
+                file_group_size=args.file_group_size,
+                compress=args.compress,
+                compression_level=args.compression_level,
+            ) as hidden_states_generator,
+        ):
 
             # Generate hidden states
             hidden_states_generator.generate(
                 data_loader,
                 output_path=args.output_path,
                 start_idx=start_idx,
-                samples_per_dp=samples_per_dp,
             )
 
     finally:
-        # The finally block ensures destroy_distributed is always called
         print_with_rank("All hidden states generated or job finished.")
-        destroy_distributed()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

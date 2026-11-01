@@ -45,7 +45,7 @@ There is one consumer path for both one-rank and multi-rank runs:
 ```mermaid
 flowchart LR
   subgraph P[producer pool]
-    SG[patched SGLang capture]
+    SG[SGLang with the capture plugin capture]
     MCW[Mooncake tensor writes]
     RW[RolloutWorker]
     CH[StreamingRefChannel]

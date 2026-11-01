@@ -6,7 +6,7 @@
 # Launch this command on both nodes. The cluster launcher supplies
 # RCLI_NODE_RANK, RCLI_NUM_NODES, and RCLI_HEAD_IP; both nodes must share the
 # fresh DISAGG_RUN_ROOT. Install SGLang v0.5.18 in the active environment; the
-# shared launcher applies the checked-in SpecForge capture patch before start.
+# shared launcher requires the SpecForge capture plugin and compatible SGLang APIs.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +25,6 @@ export TRAINER_GPUS="${TRAINER_GPUS:-0,1,2,3}"
 export TRAINER_NPROC="${TRAINER_NPROC:-4}"
 TRAINER_ACCUMULATION_STEPS="${TRAINER_ACCUMULATION_STEPS:-128}"
 
-export APPLY_SGLANG_CAPTURE_PATCH="${APPLY_SGLANG_CAPTURE_PATCH:-1}"
 export SGLANG_ENABLE_UNIFIED_RADIX_TREE="${SGLANG_ENABLE_UNIFIED_RADIX_TREE:-1}"
 export SGLANG_OPT_USE_INKLING_CUSTOM_AR="${SGLANG_OPT_USE_INKLING_CUSTOM_AR:-1}"
 

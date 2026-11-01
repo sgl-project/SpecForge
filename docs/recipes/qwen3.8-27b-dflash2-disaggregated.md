@@ -1,6 +1,6 @@
 ---
 title: Qwen3.8-27B DFlash2 Disaggregated
-description: Train the five-layer GQA DFlash2 draft for Qwen3.8-27B with patched SGLang capture servers and Mooncake, on one 8-GPU node or across two, using the server/trainer split and flow control measured on B300 and H200.
+description: Train the five-layer GQA DFlash2 draft for Qwen3.8-27B with SGLang capture servers and Mooncake, on one 8-GPU node or across two, using the server/trainer split and flow control measured on B300 and H200.
 target: Qwen/Qwen3.8-27B
 method: DFlash2
 topology: Disaggregated
@@ -9,7 +9,7 @@ topology: Disaggregated
 # Qwen3.8-27B DFlash2 disaggregated training
 
 Trains the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
-`Qwen/Qwen3.8-27B` on the disaggregated online data plane: patched SGLang
+`Qwen/Qwen3.8-27B` on the disaggregated online data plane: SGLang with the capture plugin
 capture servers publish the target's hidden states into Mooncake, and
 data-parallel trainer ranks consume them. The first two recipes share every
 model, data and optimizer setting and differ only in topology; the third is the
@@ -36,9 +36,10 @@ payload size and which from the GPU generation.
   prefetches with `data.dataloader_num_workers` concurrent Mooncake reads and
   retries transient read failures. The in-flight watermarks in the recipes are
   sized for that loader.
-- SGLang `v0.5.18` with the checked-in capture patch on every capture host:
-  `scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18`. Capture
-  servers run `--spec-capture-method dflash` with the draft's auxiliary layers
+- A compatible SGLang build with the
+  [capture plugin](../../plugins/sglang-spec-capture/README.md) on every capture
+  host. Servers run `--enable-return-aux-hidden-states --speculative-algorithm DFLASH`
+  with the draft's auxiliary layers
   `5 19 33 47 61`; the DFlash2 selector exists only on the trainer.
 - Mooncake `mooncake-transfer-engine` 0.3.13 with `mooncake_master` on `PATH`.
   Measured stack: PyTorch 2.13.0+cu130, transformers 5.12.1,
@@ -196,7 +197,7 @@ rcli exec --per-node <job> \
   'bash examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh'
 ```
 
-Rank 0 applies the capture patch, starts `mooncake_master` with a 10 s read
+Rank 0 checks the capture plugin, starts `mooncake_master` with a 10 s read
 lease, starts eight TP1 capture servers on GPUs 0-7 (ports 30000-30007) with a
 64 GiB Store segment each, waits for every `/health`, then runs the CPU
 producer. Rank 1 waits for readiness and runs the eight-rank consumer. Both
@@ -232,12 +233,13 @@ for i in 0 1 2 3 4 5 6 7; do
     MOONCAKE_PROTOCOL=tcp \
     MOONCAKE_GLOBAL_SEGMENT_SIZE=68719476736 \
     MOONCAKE_LOCAL_BUFFER_SIZE=4294967296 \
+    SPECFORGE_SPEC_CAPTURE=1 \
     python -m sglang.launch_server \
       --model-path Qwen/Qwen3.8-27B --dtype bfloat16 \
       --trust-remote-code --skip-tokenizer-init \
       --tp-size 1 --host 0.0.0.0 --port $((30000 + i)) \
-      --enable-spec-capture --spec-capture-method dflash \
-      --spec-capture-aux-layer-ids 5 19 33 47 61 \
+      --enable-return-aux-hidden-states --return-hidden-states-mode full --speculative-algorithm DFLASH \
+      --return-aux-hidden-state-layer-ids 5 19 33 47 61 \
       --chunked-prefill-size -1 --disable-radix-cache \
       --context-length 8199 --attention-backend triton \
       --mem-fraction-static 0.85 &
@@ -367,7 +369,7 @@ Recipes and launcher were exercised as follows:
   the same draft and corpus, in which the strict top-k selector gave the best
   serving acceptance length among the objective variants tried.
 
-Bring a new deployment up in this order: config plan, capture patch, server
+Bring a new deployment up in this order: config plan, plugin installation, server
 health, one captured sample's tensor shapes and dtypes, one optimizer step with
 `training.max_steps=1` and `data.max_prompts` at one step quantum, then the
 full run. The low watermark must stay at or above the global optimizer-step

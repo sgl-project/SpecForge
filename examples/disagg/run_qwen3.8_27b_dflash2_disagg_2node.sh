@@ -6,7 +6,7 @@
 # Launch this command on both nodes. The cluster launcher supplies
 # RCLI_NODE_RANK, RCLI_NUM_NODES, and RCLI_HEAD_IP; both nodes must share the
 # fresh DISAGG_RUN_ROOT. Install SGLang v0.5.18 in the active environment; the
-# shared launcher applies the checked-in SpecForge capture patch before start.
+# shared launcher requires the SpecForge capture plugin and compatible SGLang APIs.
 # Throughput, split and flow-control notes:
 # docs/recipes/qwen3.8-27b-dflash2-disaggregated.md
 set -Eeuo pipefail
@@ -36,7 +36,6 @@ export MOONCAKE_DEFAULT_KV_LEASE_TTL="${MOONCAKE_DEFAULT_KV_LEASE_TTL:-10000}"
 export MOONCAKE_GLOBAL_SEGMENT_SIZE="${MOONCAKE_GLOBAL_SEGMENT_SIZE:-$((64 << 30))}"
 export MOONCAKE_LOCAL_BUFFER_SIZE="${MOONCAKE_LOCAL_BUFFER_SIZE:-$((4 << 30))}"
 
-export APPLY_SGLANG_CAPTURE_PATCH="${APPLY_SGLANG_CAPTURE_PATCH:-1}"
 
 # Same server settings as the recipe's model.sglang_* fields. Setting
 # SERVER_EXTRA_ARGS replaces them; SERVER_EXTRA_ARGS_APPEND adds flags after
