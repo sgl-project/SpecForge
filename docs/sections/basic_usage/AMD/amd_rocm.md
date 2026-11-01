@@ -156,8 +156,7 @@ SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1 \
 torchrun --standalone --nproc_per_node 1 \
   scripts/prepare_hidden_states.py \
   --target-model-path Qwen/Qwen3.5-4B \
-  --strategy dflash \
-  --draft-model-config configs/qwen3.5-4b-dflash.json \
+  --config examples/configs/online/disaggregated/external/qwen3.5-4b-dflash.yaml \
   --trust-remote-code \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/qwen3.5-4b-dflash-sharegpt \

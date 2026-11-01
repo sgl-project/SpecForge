@@ -1740,7 +1740,7 @@ def build_disagg_online_consumer(
                 refs_per_rank_batch=batch_size,
                 dispatch_policy=consumer_dispatch,
                 num_anchors=dispatch_num_anchors,
-                block_size=getattr(draft_model, "block_size", 16),
+                block_size=draft_model.config.block_size,
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,

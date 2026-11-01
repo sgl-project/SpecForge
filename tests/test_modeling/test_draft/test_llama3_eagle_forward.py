@@ -23,7 +23,7 @@ class LlamaEagle3ForwardTest(unittest.TestCase):
             pad_token_id=0,
             norm_output=norm_output,
         )
-        return LlamaForCausalLMEagle3(config, attention_backend="sdpa").eval()
+        return LlamaForCausalLMEagle3(config).eval()
 
     @torch.no_grad()
     def test_forward_runs_with_both_normalization_and_cache_modes(self):

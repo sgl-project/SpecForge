@@ -16,7 +16,6 @@ from specforge.algorithms.common.providers import (
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepProvider,
-    TargetDerivedDraftDefaults,
     make_registration,
 )
 from specforge.algorithms.contracts import (
@@ -128,8 +127,6 @@ def algorithm_spec() -> AlgorithmSpec:
         draft=DraftRequirement(
             compatible_architectures={DRAFT_ARCHITECTURE},
             default_architecture=DRAFT_ARCHITECTURE,
-            supported_overrides={"attention_layout", "num_hidden_layers"},
-            fixed_override_values=(("num_hidden_layers", 1),),
         ),
         feature_contracts=(
             FeatureContract(
@@ -163,7 +160,6 @@ def algorithm_spec() -> AlgorithmSpec:
             supports_compact_teacher=True,
             supports_trim_loss_positions=True,
             supports_vocab_mapping=True,
-            allows_aux_layer_override=True,
         ),
     )
 
@@ -181,11 +177,6 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
-                target_defaults=TargetDerivedDraftDefaults(
-                    model_type="llama",
-                    num_hidden_layers=1,
-                    draft_vocab_size=32000,
-                ),
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

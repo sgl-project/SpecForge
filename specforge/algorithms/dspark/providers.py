@@ -55,10 +55,11 @@ def resume_contract(_config, draft_model, training_model):
     contract = {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dspark_target_layer_ids": tuple(
-            int(layer_id) for layer_id in draft_model.target_layer_ids
+            int(layer_id)
+            for layer_id in draft_model.config.dflash_config["target_layer_ids"]
         ),
-        "dspark_block_size": int(training_model.block_size),
-        "dspark_mask_token_id": int(training_model.mask_token_id),
+        "dspark_block_size": int(draft_model.config.block_size),
+        "dspark_mask_token_id": int(draft_model.config.dflash_config["mask_token_id"]),
         "dspark_attention_backend": str(training_model.attention_backend),
         "dspark_num_anchors": int(training_model.num_anchors),
         "dspark_loss_decay_gamma": training_model.loss_decay_gamma,
@@ -172,7 +173,6 @@ def algorithm_providers() -> AlgorithmProviders:
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
                 compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
-                expected_auto_map_model="dspark.DSparkDraftModel",
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

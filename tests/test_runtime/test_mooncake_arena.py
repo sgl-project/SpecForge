@@ -30,6 +30,7 @@ from specforge.runtime.data_plane.mooncake_store import (
     MooncakeFeatureStore,
 )
 from specforge.training.disaggregated import _mooncake_store
+from tests.draft_config_utils import draft_settings
 from tests.test_runtime.test_server_capture import (
     _capture_schema,
     _eagle3_contract,
@@ -307,7 +308,10 @@ class ArenaStoreFactoryTest(unittest.TestCase):
     def _cfg(self, receive_buffers):
         return Config.model_validate(
             {
-                "model": {"target_model_path": "target"},
+                "model": {
+                    "draft_model_config": draft_settings(),
+                    "target_model_path": "target",
+                },
                 "data": {"prompts_path": "prompts.jsonl"},
                 "deployment": {
                     "mode": "disaggregated",

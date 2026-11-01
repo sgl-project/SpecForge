@@ -267,9 +267,8 @@ checked-in Qwen3-8B DFlash recipe with:
 ```bash
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
-    --strategy dflash \
     --target-model-path Qwen/Qwen3-8B \
-    --draft-model-config configs/qwen3-8b-dflash.json \
+    --config examples/configs/online/disaggregated/external/qwen3-8b-dflash.yaml \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
     --output-path ./cache/hidden_states/qwen3-8b-dflash-sharegpt \
     --chat-template qwen \
@@ -280,18 +279,17 @@ torchrun --nproc_per_node=8 \
 
 Use these strategy/model pairs for the checked-in offline colocated recipes:
 
-| Strategy | Target model | Draft config | Output path used by the recipe |
+| Strategy | Target model | Training recipe (`--config`) | Output path used by the recipe |
 | --- | --- | --- | --- |
-| EAGLE3 | `Qwen/Qwen3-8B` | `configs/qwen3-8b-eagle3.json` | `cache/hidden_states/qwen3-8b-sharegpt` |
-| DFlash | `Qwen/Qwen3-8B` | `configs/qwen3-8b-dflash.json` | `cache/hidden_states/qwen3-8b-dflash-sharegpt` |
-| Domino | `Qwen/Qwen3-8B` | `configs/qwen3-8b-domino.json` | `cache/hidden_states/qwen3-8b-domino-sharegpt` |
-| DSpark | `Qwen/Qwen3-4B` | `configs/qwen3-4b-dspark.json` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
+| EAGLE3 | `Qwen/Qwen3-8B` | `examples/configs/offline/colocated/qwen3-8b-eagle3.yaml` | `cache/hidden_states/qwen3-8b-sharegpt` |
+| DFlash | `Qwen/Qwen3-8B` | `examples/configs/offline/colocated/qwen3-8b-dflash.yaml` | `cache/hidden_states/qwen3-8b-dflash-sharegpt` |
+| Domino | `Qwen/Qwen3-8B` | `examples/configs/offline/colocated/qwen3-8b-domino.yaml` | `cache/hidden_states/qwen3-8b-domino-sharegpt` |
+| DSpark | `Qwen/Qwen3-4B` | `examples/configs/offline/colocated/qwen3-4b-dspark.yaml` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
 
-`--strategy` defaults to `eagle3` for compatibility. Pass it explicitly in
-reproducible jobs. `--draft-model-config` is required for Domino and DSpark;
-passing the same explicit config used by training is recommended for every
-strategy. Capture layers come from the resolved draft config. EAGLE3 retains
-target-derived defaults for legacy configs that do not define
+`--config` is required and reads the same training YAML used by the trainer.
+The strategy and draft settings come from that recipe. The explicit
+`--target-model-path` must match its target path. Capture layers come only from
+the inline draft configuration, including EAGLE3's
 `eagle_config.eagle_aux_hidden_state_layer_ids`.
 
 Each output record contains the strategy's exact offline feature contract:
@@ -308,14 +306,14 @@ state for its L1 and confidence objectives. Keep each strategy in a separate
 output directory; the offline reader validates the contract instead of
 silently adapting incompatible features.
 
-DFlash2 feature preparation still uses `--strategy dflash`; pass a
+DFlash2 feature preparation still uses `training.strategy: dflash`; pass a
 `DFlash2DraftModel` config such as `configs/qwen3.6-27b-dflash2.json` so capture
 uses the intended `target_layer_ids`. Its convolution, selector, and selector
 loss schedule are draft/trainer concerns and do not add tensors to the offline
 record.
 
 D-PACE uses `training.strategy: dflash` and the DFlash feature schema. DTA also
-uses `--strategy dflash`, but feature preparation must receive its DTA draft
+uses `training.strategy: dflash`, but feature preparation must receive its DTA draft
 config so the captured layer contract matches the training run.
 
 For preformatted input, add `--is-preformatted` to the same command and keep
@@ -324,9 +322,8 @@ For preformatted input, add `--is-preformatted` to the same command and keep
 ```bash
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
-    --strategy eagle3 \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config configs/llama3-8B-eagle3.json \
+    --config examples/configs/online/disaggregated/external/llama3.1-8b-eagle3.yaml \
     --data-path ./your_preformatted_dataset.jsonl \
     --output-path ./cache/hidden_states/llama3.1-8b-eagle3 \
     --chat-template llama3 \

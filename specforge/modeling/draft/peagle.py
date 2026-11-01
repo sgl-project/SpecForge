@@ -7,6 +7,7 @@ import torch.nn as nn
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from specforge.config.draft import AutoDraftConfig, EaglePretrainedConfig, PEagleConfig
 from specforge.modeling.draft.base import Eagle3DraftModel
 from specforge.modeling.draft.flex_attention import compile_friendly_flex_attention
 from specforge.modeling.draft.llama3_eagle import (
@@ -98,10 +99,10 @@ class PEagleFirstLayer(nn.Module):
     """Eagle3-style first decoder layer: splits 2*hidden_size input into embeds and hidden,
     normalizes separately, then runs attention with 2*hidden_size Q/K/V projections."""
 
-    def __init__(self, config: LlamaConfig, norm_before_residual: bool = False):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
-        self.norm_before_residual = norm_before_residual
 
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -123,7 +124,7 @@ class PEagleFirstLayer(nn.Module):
 
         embeds = self.input_layernorm(embeds)
         hidden = self.hidden_norm(hidden)
-        if self.norm_before_residual:
+        if self.config.norm_before_residual:
             residual = hidden
         hidden_states = torch.cat([embeds, hidden], dim=-1)
 
@@ -182,40 +183,23 @@ class PEagleDraftModel(Eagle3DraftModel):
     - External rotary embeddings shared across all layers
     """
 
-    config_class = LlamaConfig
+    config_class = EaglePretrainedConfig
+    draft_options_class = PEagleConfig
 
-    def __init__(
-        self,
-        config: LlamaConfig,
-        norm_before_residual: Optional[bool] = None,
-    ) -> None:
-        super().__init__(config)
-        if norm_before_residual is None:
-            norm_before_residual = getattr(config, "norm_before_residual", False)
-        norm_before_residual = bool(norm_before_residual)
-        config.architectures = [type(self).__name__]
-        config.norm_before_residual = norm_before_residual
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.vocab_size = config.vocab_size
-        self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
-        self.norm_before_residual = norm_before_residual
+    def __init__(self, config: LlamaConfig) -> None:
+        config = AutoDraftConfig.resolve(config, architecture=type(self).__name__)
+        super().__init__(config.to_hf_config())
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
 
-        if hasattr(config, "target_hidden_size"):
-            fc_input_size = config.target_hidden_size * 3
-        else:
-            fc_input_size = config.hidden_size * 3
+        fc_input_size = config.target_hidden_size * 3
         self.fc = nn.Linear(fc_input_size, config.hidden_size, bias=False)
         self.mask_hidden = nn.Parameter(torch.randn(1, 1, fc_input_size))
 
         num_layers = config.num_hidden_layers
-        layers: List[nn.Module] = [
-            PEagleFirstLayer(config, norm_before_residual=norm_before_residual)
-        ]
+        layers: List[nn.Module] = [PEagleFirstLayer(config)]
         for _ in range(1, num_layers):
             layers.append(PEagleStandardLayer(config))
         self.layers = nn.ModuleList(layers)
@@ -230,12 +214,15 @@ class PEagleDraftModel(Eagle3DraftModel):
         )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
+        self.lm_head = nn.Linear(
+            config.hidden_size, self.config.draft_vocab_size, bias=False
+        )
 
-        t2d = torch.ones(self.vocab_size, dtype=torch.bool)
-        d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
+        t2d = torch.ones(self.config.vocab_size, dtype=torch.bool)
+        d2t = torch.zeros(self.config.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+        self.config = config
 
     def _rebuild_rotary_embedding(self) -> None:
         """Recreate non-persistent RoPE buffers after low-memory HF loading."""

@@ -6,9 +6,6 @@ auto loaders resolve it from that registry.
 """
 
 import copy
-import json
-import os
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -16,7 +13,9 @@ from unittest import mock
 import torch
 from transformers import LlamaConfig, Qwen3Config
 
-from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+from specforge.config.draft import AutoDraftConfig
+from specforge.config.draft.registry import DRAFT_CONFIG_REGISTRY
+from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft import (
     DRAFT_REGISTRY,
     DFlash2DraftModel,
@@ -99,13 +98,6 @@ TINY_DOMINO = {
 }
 
 
-def _write(cfg: dict) -> str:
-    fd, path = tempfile.mkstemp(suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        json.dump(cfg, f)
-    return path
-
-
 class DraftRegistryTest(unittest.TestCase):
     def test_builtin_architectures_registered(self):
         self.assertIn("LlamaForCausalLMEagle3", available_drafts())
@@ -146,70 +138,66 @@ class DraftRegistryTest(unittest.TestCase):
             config_class = LlamaConfig
 
         self.addCleanup(DRAFT_REGISTRY.pop, "tiny_fake_draft", None)
+        self.addCleanup(DRAFT_CONFIG_REGISTRY.pop, "tiny_fake_draft", None)
         self.assertIs(resolve_draft("tiny_fake_draft"), FakeDraft)
 
 
 class AutoLoaderRegistryTest(unittest.TestCase):
-    def test_from_file_resolves_eagle3_via_registry(self):
-        path = _write(TINY_EAGLE3)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+    def test_legacy_mapping_resolves_eagle3_via_registry(self):
+        payload = TINY_EAGLE3
+        config = AutoDraftConfig.from_dict(payload)
         self.assertIsInstance(config, LlamaConfig)
         self.assertEqual(config.draft_vocab_size, 64)
 
-    def test_from_file_resolves_dflash_via_registry(self):
+    def test_legacy_mapping_resolves_dflash_via_registry(self):
         # Not in the legacy _config_mapping: only the registry makes this load.
-        path = _write(TINY_DFLASH)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+        payload = TINY_DFLASH
+        config = AutoDraftConfig.from_dict(payload)
         self.assertIsInstance(config, Qwen3Config)
 
     def test_from_config_builds_dspark_as_explicit_draft(self):
-        path = _write(TINY_DSPARK)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+        payload = TINY_DSPARK
+        config = AutoDraftConfig.from_dict(payload)
         model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, DSparkDraftModel)
         self.assertIsInstance(model, DFlashDraftModel)
-        self.assertEqual(model.projector_type, "dspark")
+        self.assertEqual(model.config.dflash_config["projector_type"], "dspark")
         self.assertIsNotNone(model.markov_head)
         self.assertIsNotNone(model.confidence_head)
 
     def test_from_config_builds_dflash2_as_dflash_variant(self):
-        path = _write(TINY_DFLASH2)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+        payload = TINY_DFLASH2
+        config = AutoDraftConfig.from_dict(payload)
         model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, DFlash2DraftModel)
         self.assertIsInstance(model, DFlashDraftModel)
-        self.assertEqual(model.block_size, 4)
+        self.assertEqual(model.config.block_size, 4)
 
     def test_dspark_defaults_to_gqa_and_requires_explicit_mha(self):
         implicit_mha = copy.deepcopy(TINY_DSPARK)
         implicit_mha["num_key_value_heads"] = implicit_mha["num_attention_heads"]
-        path = _write(implicit_mha)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+        payload = implicit_mha
+        config = AutoDraftConfig.from_dict(payload)
         with self.assertRaisesRegex(ValueError, "defaults to GQA"):
             AutoDraftModel.from_config(config)
 
         explicit_mha = copy.deepcopy(implicit_mha)
         explicit_mha["dflash_config"]["attention_mode"] = "mha"
-        path = _write(explicit_mha)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+        payload = explicit_mha
+        config = AutoDraftConfig.from_dict(payload)
         model = AutoDraftModel.from_config(config)
         self.assertEqual(model.config.dflash_config["attention_mode"], "mha")
 
     def test_dspark_generation_uses_the_markov_head(self):
-        path = _write(TINY_DSPARK)
-        self.addCleanup(os.unlink, path)
-        model = AutoDraftModel.from_config(AutoDraftModelConfig.from_file(path))
+        payload = TINY_DSPARK
+        model = AutoDraftModel.from_config(AutoDraftConfig.from_dict(payload))
         expected = torch.tensor([[11, 12, 13]])
         target = SimpleNamespace(
-            lm_head=mock.Mock(return_value=torch.zeros(1, model.block_size - 1, 256))
+            lm_head=mock.Mock(
+                return_value=torch.zeros(1, model.config.block_size - 1, 256)
+            )
         )
-        draft_hidden = torch.zeros(1, model.block_size, model.config.hidden_size)
+        draft_hidden = torch.zeros(1, model.config.block_size, model.config.hidden_size)
         block_ids = torch.tensor([[7, 0, 0, 0]])
         with mock.patch.object(
             model.markov_head,
@@ -222,24 +210,22 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         self.assertEqual(sampler.call_args.kwargs["first_prev_token_ids"].item(), 7)
         self.assertEqual(
             tuple(sampler.call_args.kwargs["hidden_states"].shape),
-            (1, model.block_size - 1, model.config.hidden_size),
+            (1, model.config.block_size - 1, model.config.hidden_size),
         )
 
     def test_from_config_builds_domino_as_explicit_draft(self):
-        path = _write(TINY_DOMINO)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+        payload = TINY_DOMINO
+        config = AutoDraftConfig.from_dict(payload)
         model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, DominoDraftModel)
         self.assertIsInstance(model, DFlashDraftModel)
-        self.assertEqual(model.projector_type, "domino")
+        self.assertEqual(model.config.dflash_config["projector_type"], "domino")
         self.assertIsNotNone(model.prefix_gru)
         self.assertIsNotNone(model.embed_proj)
 
     def test_domino_uses_direct_state_dict_keys(self):
-        path = _write(TINY_DOMINO)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+        payload = TINY_DOMINO
+        config = AutoDraftConfig.from_dict(payload)
         model = AutoDraftModel.from_config(config)
         keys = set(model.state_dict())
         self.assertTrue(any(key.startswith("prefix_gru.") for key in keys))
@@ -247,26 +233,23 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         self.assertFalse(any(key.startswith("logit_head.") for key in keys))
 
     def test_dspark_uses_direct_state_dict_keys(self):
-        path = _write(TINY_DSPARK)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+        payload = TINY_DSPARK
+        config = AutoDraftConfig.from_dict(payload)
         model = AutoDraftModel.from_config(config)
         keys = set(model.state_dict())
         self.assertTrue(any(key.startswith("markov_head.") for key in keys))
         self.assertTrue(any(key.startswith("confidence_head.") for key in keys))
         self.assertFalse(any(key.startswith("logit_head.") for key in keys))
 
-    def test_from_file_unknown_architecture_raises(self):
-        path = _write({**TINY_EAGLE3, "architectures": ["NoSuchDraft"]})
-        self.addCleanup(os.unlink, path)
+    def test_legacy_mapping_unknown_architecture_raises(self):
+        payload = {**TINY_EAGLE3, "architectures": ["NoSuchDraft"]}
         with self.assertRaises(ValueError) as ctx:
-            AutoDraftModelConfig.from_file(path)
+            AutoDraftConfig.from_dict(payload)
         self.assertIn("available", str(ctx.exception))
 
     def test_from_config_resolves_class_via_architectures(self):
-        path = _write(TINY_EAGLE3)
-        self.addCleanup(os.unlink, path)
-        config = AutoDraftModelConfig.from_file(path)
+        payload = TINY_EAGLE3
+        config = AutoDraftConfig.from_dict(payload)
         model = AutoDraftModel.from_config(config)
         self.assertIsInstance(model, LlamaForCausalLMEagle3)
 

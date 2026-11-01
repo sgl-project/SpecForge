@@ -57,8 +57,15 @@ class _RotaryStub(nn.Module):
         return (torch.empty(0), torch.empty(0))
 
 
-def _capture_model(layer_types, sliding_window=None):
-    model = DFlashDraftModel(_draft_config(layer_types, sliding_window))
+def _capture_model(layer_types, sliding_window=None, backend="sdpa", is_causal=None):
+    config = _draft_config(layer_types, sliding_window)
+    config._attn_implementation = backend
+    config.is_causal = is_causal
+    # These tests replace attention with capture stubs and never call its kernel.
+    with mock.patch.object(
+        DFlashDraftModel, "_check_and_adjust_attn_implementation", return_value=backend
+    ):
+        model = DFlashDraftModel(config)
     capture_layers = [_CaptureLayer() for _ in layer_types]
     model.layers = nn.ModuleList(capture_layers)
     model.fc = nn.Identity()
@@ -181,10 +188,9 @@ class TestDFlashGenerationMasks(unittest.TestCase):
                     model, layers = _capture_model(
                         ["full_attention", "sliding_attention"] * 2,
                         sliding_window=3,
+                        backend=implementation,
+                        is_causal=causal,
                     )
-                    model.config._attn_implementation = implementation
-                    if causal is not None:
-                        model.config.is_causal = causal
                     name = (
                         "create_dflash_block_mask"
                         if implementation == "flex_attention"
@@ -216,13 +222,13 @@ class TestDFlashGenerationMasks(unittest.TestCase):
                             torch.testing.assert_close(layer.attention_mask, expected)
 
     def test_supplied_masks_bypass_default_mask_generation(self):
-        model, layers = _capture_model(
-            ["full_attention", "sliding_attention"],
-            sliding_window=3,
-        )
-        model.config.is_causal = True
         for implementation in ("sdpa", "flex_attention", "flash_attention_2"):
-            model.config._attn_implementation = implementation
+            model, layers = _capture_model(
+                ["full_attention", "sliding_attention"],
+                sliding_window=3,
+                backend=implementation,
+                is_causal=True,
+            )
             for supplied in (
                 torch.ones(1, 1, 2, 6, dtype=torch.bool),
                 {"full_attention": object(), "sliding_attention": object()},
@@ -239,7 +245,7 @@ class TestDFlashGenerationMasks(unittest.TestCase):
                         _forward(model, supplied)
                     dense.assert_not_called()
                     block.assert_not_called()
-                    for layer_type, layer in zip(model.layer_types, layers):
+                    for layer_type, layer in zip(model.config.layer_types, layers):
                         expected = (
                             supplied[layer_type]
                             if isinstance(supplied, dict)
@@ -249,9 +255,10 @@ class TestDFlashGenerationMasks(unittest.TestCase):
 
     def test_flash_attention_uses_native_causality_without_masks(self):
         model, layers = _capture_model(
-            ["full_attention", "sliding_attention"], sliding_window=3
+            ["full_attention", "sliding_attention"],
+            sliding_window=3,
+            backend="flash_attention_2",
         )
-        model.config._attn_implementation = "flash_attention_2"
         with (
             mock.patch(
                 "specforge.modeling.draft.dflash.create_dflash_sdpa_mask"
@@ -277,10 +284,11 @@ class TestDFlashGenerationMasks(unittest.TestCase):
         ):
             with self.subTest(window=window, causal=causal, override=override):
                 model, layers = _capture_model(
-                    ["full_attention", "sliding_attention"], sliding_window=window
+                    ["full_attention", "sliding_attention"],
+                    sliding_window=window,
+                    backend="flash_attention_2",
+                    is_causal=causal,
                 )
-                model.config._attn_implementation = "flash_attention_2"
-                model.config.is_causal = causal
                 _forward(model, None, is_causal=override)
                 self.assertTrue(all(layer.attention_mask is None for layer in layers))
 
@@ -288,10 +296,11 @@ class TestDFlashGenerationMasks(unittest.TestCase):
         for backend in (None, "TRITON", "FLASH"):
             with self.subTest(backend=backend):
                 model, _ = _capture_model(
-                    ["full_attention", "sliding_attention"], sliding_window=3
+                    ["full_attention", "sliding_attention"],
+                    sliding_window=3,
+                    backend="flex_attention",
+                    is_causal=True,
                 )
-                model.config._attn_implementation = "flex_attention"
-                model.config.is_causal = True
                 with (
                     mock.patch(
                         "specforge.modeling.draft.dflash.flex_attention_backend",
@@ -310,9 +319,8 @@ class TestDFlashGenerationMasks(unittest.TestCase):
                         self.assertNotIn("BLOCK_SIZE", call.kwargs)
 
     def test_bidirectional_full_attention_remains_unmasked(self):
-        model, layers = _capture_model(["full_attention"])
         for causal in (None, False):
-            model.config.is_causal = causal
+            model, layers = _capture_model(["full_attention"], is_causal=causal)
             with mock.patch(
                 "specforge.modeling.draft.dflash.create_dflash_sdpa_mask",
             ) as create_mask:
@@ -461,8 +469,6 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
             draft_model=model,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(32, model.config.hidden_size),
-            mask_token_id=31,
-            block_size=2,
             attention_backend="sdpa",
             num_anchors=1,
         )
@@ -509,8 +515,6 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
             draft_model=model,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(32, model.config.hidden_size),
-            mask_token_id=31,
-            block_size=2,
             attention_backend="sdpa",
             num_anchors=1,
         )
@@ -549,8 +553,6 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
             draft_model=model,
             target_lm_head=nn.Identity(),
             target_embed_tokens=nn.Embedding(32, model.config.hidden_size),
-            mask_token_id=31,
-            block_size=2,
             attention_backend="flex_attention",
             num_anchors=1,
         )
@@ -618,10 +620,10 @@ class TestDFlashSlidingConfig(unittest.TestCase):
         )
 
         self.assertEqual(
-            list(model.layer_types),
+            list(model.config.layer_types),
             ["sliding_attention", "full_attention", "sliding_attention"],
         )
-        self.assertEqual(model.sliding_window, 7)
+        self.assertEqual(model.config.sliding_window, 7)
         self.assertEqual(model.layers[0].self_attn.sliding_window, 7)
         self.assertIsNone(model.layers[1].self_attn.sliding_window)
         self.assertEqual(model.layers[2].self_attn.sliding_window, 7)

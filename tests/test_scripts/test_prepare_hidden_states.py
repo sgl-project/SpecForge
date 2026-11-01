@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+import yaml
 
 from scripts.prepare_hidden_states import (
     HiddenStatesGenerator,
@@ -26,14 +27,16 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             "prepare_hidden_states.py",
             "--target-model-path",
             "target",
+            "--config",
+            "train.yaml",
             "--data-path",
             "data.jsonl",
         ]
         with mock.patch("sys.argv", argv):
             args = parse_args()
 
-        self.assertEqual("eagle3", args.strategy)
-        self.assertIsNone(args.draft_model_config)
+        self.assertEqual("train.yaml", args.config)
+        self.assertFalse(hasattr(args, "draft_model_config"))
         self.assertFalse(args.sglang_disable_radix_cache)
         self.assertFalse(hasattr(args, "draft_num_hidden_layers"))
         self.assertFalse(hasattr(args, "draft_block_size"))
@@ -44,6 +47,8 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             "prepare_hidden_states.py",
             "--target-model-path",
             "target",
+            "--config",
+            "train.yaml",
             "--data-path",
             "data.jsonl",
             "--sglang-disable-radix-cache",
@@ -53,33 +58,11 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
 
         self.assertTrue(args.sglang_disable_radix_cache)
 
-    def test_cli_accepts_dflash_family_config(self):
-        argv = [
-            "prepare_hidden_states.py",
-            "--target-model-path",
-            "target",
-            "--data-path",
-            "data.jsonl",
-            "--strategy",
-            "dspark",
-            "--draft-model-config",
-            "configs/qwen3-4b-dspark.json",
-        ]
-        with mock.patch("sys.argv", argv):
-            args = parse_args()
-
-        self.assertEqual("dspark", args.strategy)
-        self.assertEqual(
-            "configs/qwen3-4b-dspark.json",
-            args.draft_model_config,
-        )
-        self.assertFalse(hasattr(args, "capture_layers"))
-
     def test_strategy_capture_plans_use_draft_owned_layers_and_schemas(self):
         expected = {
             "eagle3": (
                 "qwen3-8b-eagle3.json",
-                (1, 19, 36),
+                (1, 17, 32),
                 {
                     "input_ids",
                     "loss_mask",
@@ -114,14 +97,27 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             args = SimpleNamespace(
                 strategy=strategy,
                 target_model_path="target",
-                draft_model_config=str(REPO_ROOT / "configs" / config_name),
+                config="train.yaml",
                 trust_remote_code=False,
                 cache_dir=None,
                 output_path="offline-features",
                 max_length=128,
             )
             with self.subTest(strategy=strategy):
-                plan = resolve_offline_capture_plan(args, target_config)
+                recipe_path = (
+                    REPO_ROOT
+                    / "examples/configs/online/disaggregated/external"
+                    / config_name.replace(".json", ".yaml")
+                )
+                from specforge.config import Config
+
+                recipe = yaml.safe_load(recipe_path.read_text())
+                recipe["model"]["target_model_path"] = "target"
+                with mock.patch(
+                    "scripts.prepare_hidden_states.load_config",
+                    return_value=Config.model_validate(recipe),
+                ):
+                    plan = resolve_offline_capture_plan(args, target_config)
                 self.assertEqual(strategy, plan.strategy)
                 expected_capture_method = {
                     "eagle3": "eagle3",

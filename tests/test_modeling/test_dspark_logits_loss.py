@@ -40,8 +40,6 @@ def build_model(device="cpu"):
         draft,
         head,
         embedding,
-        mask_token_id=63,
-        block_size=4,
         attention_backend="sdpa",
         num_anchors=2,
         dspark_confidence_head_alpha=0.0,
@@ -93,7 +91,7 @@ class DSparkLogitsLossTest(unittest.TestCase):
         torch.manual_seed(42)
         model = build_model(device="cuda").bfloat16()
         model.draft_model.confidence_head = AcceptRatePredictor(128).cuda().bfloat16()
-        model.draft_model.confidence_head_with_markov = False
+        model.draft_model.config.dflash_config["confidence_head_with_markov"] = False
         model.dspark_confidence_head_alpha = 1.0
         model.fused_logits_loss = True
         batch = dict(

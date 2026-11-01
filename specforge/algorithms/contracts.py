@@ -81,52 +81,22 @@ class DraftRequirement:
 
     Draft configuration loading, target-derived generation, validation, and
     model construction belong to the draft-model registry and algorithm-owned
-    providers.  Only stable identifiers and declarative override names belong
-    here.
+    providers. Only stable architecture identifiers belong here.
     """
 
     compatible_architectures: FrozenSet[str]
     default_architecture: str
-    supported_overrides: FrozenSet[str] = frozenset()
-    fixed_override_values: Tuple[Tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         architectures = _normalized_names(
             self.compatible_architectures,
             field_name="compatible_architectures",
         )
-        overrides = _normalized_names(
-            self.supported_overrides,
-            field_name="supported_overrides",
-            allow_empty=True,
-        )
         if self.default_architecture not in architectures:
             raise ValueError(
                 "default_architecture must be present in " "compatible_architectures"
             )
-        fixed_values = tuple(self.fixed_override_values)
-        fixed_names = [name for name, _value in fixed_values]
-        duplicates = sorted(
-            name for name in set(fixed_names) if fixed_names.count(name) > 1
-        )
-        if duplicates:
-            raise ValueError(f"duplicate fixed override values: {duplicates}")
-        unsupported = sorted(set(fixed_names) - overrides)
-        if unsupported:
-            raise ValueError(
-                "fixed_override_values must name supported overrides, got "
-                f"{unsupported}"
-            )
-        if any(
-            not isinstance(name, str)
-            or isinstance(value, bool)
-            or not isinstance(value, int)
-            for name, value in fixed_values
-        ):
-            raise TypeError("fixed_override_values must contain (name, integer) pairs")
         object.__setattr__(self, "compatible_architectures", architectures)
-        object.__setattr__(self, "supported_overrides", overrides)
-        object.__setattr__(self, "fixed_override_values", fixed_values)
 
 
 @dataclass(frozen=True)
@@ -240,7 +210,6 @@ class AlgorithmCapabilities:
     supports_compact_teacher: bool = False
     supports_trim_loss_positions: bool = False
     supports_vocab_mapping: bool = False
-    allows_aux_layer_override: bool = False
     #: ``training.dflash_teacher_metrics=false`` can drop the teacher-only
     #: final hidden state from the streaming capture.
     supports_teacher_metrics_opt_out: bool = False
@@ -262,7 +231,6 @@ class AlgorithmCapabilities:
             "supports_compact_teacher",
             "supports_trim_loss_positions",
             "supports_vocab_mapping",
-            "allows_aux_layer_override",
             "supports_teacher_metrics_opt_out",
             "supports_liger_kernel",
         ):
