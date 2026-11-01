@@ -26,7 +26,9 @@ from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.mtp.providers import _init_from_native_mtp
 from specforge.core.mtp import OnlineMTPModel
 from specforge.modeling.draft import available_drafts, resolve_draft
-from specforge.modeling.draft.mtp import Qwen3_5MTPDraftModel
+from specforge.modeling.draft.models.specialized.qwen3_5_mtp.model import (
+    Qwen3_5MTPDraftModel,
+)
 from specforge.training.strategies.base import MTPTrainStrategy
 
 

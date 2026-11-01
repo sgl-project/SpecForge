@@ -13,16 +13,15 @@ from transformers.cache_utils import Cache
 
 from specforge.config.draft import AutoDraftConfig
 from specforge.config.draft.algorithms.eagle3 import Eagle3Config, EaglePretrainedConfig
-from specforge.modeling.draft.flex_attention import (
+from specforge.distributed import get_sp_ring_group, get_sp_ulysses_group
+from specforge.modeling.draft.models.base import Eagle3DraftModel
+from specforge.modeling.draft.models.layers.attention.backends.flex import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from specforge.modeling.draft.registry import register_draft
 from specforge.utils import print_with_rank
-
-from ...distributed import get_sp_ring_group, get_sp_ulysses_group
-from .base import Eagle3DraftModel
-from .registry import register_draft
 
 try:
     from flash_attn import flash_attn_varlen_func as _std_flash_attn_varlen_func
@@ -1099,7 +1098,9 @@ class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
     def forward(
         ctx, q, cache_k, cache_v, ring_group: dist.ProcessGroup, softmax_scale: float
     ):
-        from specforge.layers.ring.ring_flash_attn import ring_flash_attn_forward
+        from specforge.modeling.draft.models.layers.attention.parallel.ring import (
+            ring_flash_attn_forward,
+        )
 
         bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
             _cached_merge_dims(q, cache_k)
@@ -1137,7 +1138,9 @@ class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        from specforge.layers.ring.ring_flash_attn import ring_flash_attn_backward
+        from specforge.modeling.draft.models.layers.attention.parallel.ring import (
+            ring_flash_attn_backward,
+        )
 
         q, cache_k, cache_v, out, merged_lse = ctx.saved_tensors
         bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (

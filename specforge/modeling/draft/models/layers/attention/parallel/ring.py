@@ -1,7 +1,10 @@
 import torch
 from yunchang.kernels import AttnType, select_flash_attn_impl
 
-from .utils import RingComm, update_out_and_lse
+from specforge.modeling.draft.models.layers.attention.parallel.utils import (
+    RingComm,
+    update_out_and_lse,
+)
 
 
 def ring_flash_attn_forward(

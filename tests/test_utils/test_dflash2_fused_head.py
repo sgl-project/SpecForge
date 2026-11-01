@@ -10,8 +10,8 @@ from torch import nn
 from transformers import Qwen3Config
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.draft.dflash2 import DFlash2DraftModel
+from specforge.modeling.draft.models.dflash import DFlashDraftModel
+from specforge.modeling.draft.models.dflash2 import DFlash2DraftModel
 
 try:
     import triton  # noqa: F401

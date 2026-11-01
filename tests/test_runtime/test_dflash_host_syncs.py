@@ -34,7 +34,7 @@ def _tiny_dflash2(attention_backend, *, sliding):
     from transformers import Qwen3Config
 
     from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
-    from specforge.modeling.draft.dflash2 import DFlash2DraftModel
+    from specforge.modeling.draft.models.dflash2 import DFlash2DraftModel
 
     config = Qwen3Config(
         architectures=["DFlash2DraftModel"],

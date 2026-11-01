@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask
 
 from specforge.core.loss import LogSoftmaxLoss
-from specforge.modeling.draft.peagle import PEagleDraftModel
+from specforge.modeling.draft.models.peagle import PEagleDraftModel
 
 
 def generate_cod_sample_indices(

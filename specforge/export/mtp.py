@@ -29,7 +29,7 @@ from specforge.modeling.target.checkpoint import (
 def _default_key_candidates() -> Tuple[List[str], List[str], str]:
     """Base-class defaults, imported lazily to keep this module import-light."""
 
-    from specforge.modeling.draft.mtp.base import MTPDraftModel
+    from specforge.modeling.draft.models.mtp import MTPDraftModel
 
     return (
         list(MTPDraftModel.TARGET_EMBED_KEY_CANDIDATES),
