@@ -1,10 +1,7 @@
 import torch
 from yunchang.kernels import AttnType, select_flash_attn_impl
 
-from specforge.modeling.draft.models.layers.attention.parallel.utils import (
-    RingComm,
-    update_out_and_lse,
-)
+from .utils import RingComm, update_out_and_lse
 
 
 def ring_flash_attn_forward(
@@ -242,67 +239,6 @@ class RingFlashAttnFunc(torch.autograd.Function):
             None,
             None,
         )
-
-
-def ring_flash_attn_qkvpacked_func(
-    qkv,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    softcap=0.0,
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-    group=None,
-    attn_type: AttnType = AttnType.FA,
-):
-    return RingFlashAttnFunc.apply(
-        qkv[:, :, 0],
-        qkv[:, :, 1],
-        qkv[:, :, 2],
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_attn_probs,
-        group,
-        attn_type,
-    )
-
-
-def ring_flash_attn_kvpacked_func(
-    q,
-    kv,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    softcap=0.0,
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-    group=None,
-    attn_type: AttnType = AttnType.FA,
-):
-    return RingFlashAttnFunc.apply(
-        q,
-        kv[:, :, 0],
-        kv[:, :, 1],
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        softcap,
-        alibi_slopes,
-        deterministic,
-        return_attn_probs,
-        group,
-        attn_type,
-    )
 
 
 def ring_flash_attn_func(

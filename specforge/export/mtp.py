@@ -7,7 +7,7 @@ machinery — copying non-weight files, replacing keys by prefix, shard/index
 writing — lives in ``specforge/modeling/target/checkpoint.py``.
 Architecture-specific knowledge (target-side embed/lm_head key candidates,
 native key prefix) comes from the registered MTP draft class — see
-``specforge/modeling/draft/mtp/``.
+``specforge/modeling/draft/models/specialized/``.
 """
 
 from __future__ import annotations

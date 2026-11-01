@@ -22,10 +22,10 @@ class OnlineMTPModel(nn.Module):
     ``forward_hidden(input_ids, hidden_states, attention_mask, position_ids)``,
     a position-wise ``mtp.lm_head``, and a ``config`` with ``pad_token_id`` can
     be plugged in (see
-    ``specforge/modeling/draft/mtp/``).
+    ``specforge/modeling/draft/models/specialized/``).
 
     Args:
-        draft_model: The MTP draft model (e.g. ``modeling/draft/mtp/qwen3_5.py``).
+        draft_model: The MTP draft model (e.g. ``modeling/draft/models/specialized/qwen3_5_mtp/model.py``).
         ploss_decay: Per-layer loss decay.  For a single MTP layer this is
             unused, but kept for multi-layer extension.
         objective_chunk_size: Token positions per lm_head+CE chunk.  Bounds the
