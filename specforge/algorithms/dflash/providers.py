@@ -86,10 +86,18 @@ def resume_contract(_config, draft_model, training_model):
     }
     if getattr(draft_model, "candidate_selector", None) is not None:
         options = draft_model.config.dflash_config
+        convs = tuple(
+            (layer.conv.kernel_size, layer.conv.group_size)
+            for layer in draft_model.config.layers
+        )
+        if len(set(convs)) > 1:
+            contract["dflash2_layer_convolutions"] = convs
         contract.update(
             {
-                "dflash2_conv_kernel_size": options["conv_kernel_size"],
-                "dflash2_conv_group_size": options["conv_group_size"],
+                "dflash2_conv_kernel_size": draft_model.config.layers[
+                    0
+                ].conv.kernel_size,
+                "dflash2_conv_group_size": draft_model.config.layers[0].conv.group_size,
                 "dflash2_selector_rank": options["selector_rank"],
                 "dflash2_selector_top_k": options["selector_top_k"],
                 "dflash2_selector_loss_alpha": float(

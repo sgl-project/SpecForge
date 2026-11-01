@@ -112,7 +112,7 @@ class DraftConfigTest(unittest.TestCase):
 
     def test_hub_metadata_is_comparison_only_and_never_mutated(self):
         config = AutoDraftConfig.from_yaml(self.path)
-        payload = config.to_hf_config().to_dict()
+        payload = config.to_hf_config(for_export=False).to_dict()
         original = copy.deepcopy(payload)
         model_cls = DRAFT_REGISTRY["LlamaForCausalLMEagle3"]
         with (
@@ -141,7 +141,7 @@ class DraftConfigTest(unittest.TestCase):
 
     def test_checkpoint_mismatch_fails_before_model_or_weights_are_loaded(self):
         config = AutoDraftConfig.from_yaml(self.path)
-        payload = config.to_hf_config().to_dict()
+        payload = config.to_hf_config(for_export=False).to_dict()
         payload["intermediate_size"] += 8
         with (
             mock.patch.object(
@@ -154,7 +154,7 @@ class DraftConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "intermediate_size"):
                 AutoDraftModel.from_pretrained("org/draft", config=config)
         weights.assert_not_called()
-        self.assertEqual(config.intermediate_size, 64)
+        self.assertEqual(config.layers[0].ffn.intermediate_size, 64)
 
     def test_metadata_reader_supports_legacy_local_config_without_constructing_model(
         self,

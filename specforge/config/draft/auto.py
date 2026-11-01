@@ -15,6 +15,7 @@ from typing import Any
 from transformers import PretrainedConfig
 
 from .base import integer
+from .layers.decoder import decode_layers, strip_legacy_layer_fields
 from .model import DraftModelConfig, inline_values
 from .registry import DraftConfigRegistration, resolve_draft_config_type
 
@@ -34,10 +35,14 @@ class AutoDraftConfig:
         registration = cls._registration(payload.get("architectures"))
         values = inline_values(payload, model_type=registration.config_class.model_type)
         integer(values.draft_vocab_size, "draft_vocab_size")
+        layers = decode_layers(values, registration.options_class)
+        values.layers = layers
         if registration.options_class is not None:
             options = registration.options_class.from_model_config(values)
             values = options.to_model_config(values)
-        return DraftModelConfig(values.to_dict())
+        data = strip_legacy_layer_fields(values.to_dict())
+        data["layers"] = layers
+        return DraftModelConfig(data)
 
     @classmethod
     def resolve(cls, config, *, architecture: str | None = None) -> DraftModelConfig:

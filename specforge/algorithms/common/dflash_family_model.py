@@ -575,9 +575,6 @@ class OnlineDFlashModel(nn.Module):
             "S": sequence_length,
             "block_size": draft_config.block_size,
             "device": anchor_positions.device,
-            "is_causal": getattr(
-                getattr(self.draft_model, "config", None), "is_causal", None
-            ),
         }
         if (
             self.attention_backend == "flex_attention"
@@ -585,22 +582,17 @@ class OnlineDFlashModel(nn.Module):
         ):
             # FLASH requires a minimum of this block size.
             mask_args["BLOCK_SIZE"] = (256, 128)
-        sliding_window = draft_config.sliding_window
-        if sliding_window is None:
-            dflash_attn_mask = mask_builder(**mask_args)
-        else:
-            # Build only the masks the draft's layers consume; an all-sliding
-            # draft never reads the full mask. Drafts that do not expose their
-            # layer layout receive both.
-            layer_types = draft_config.layer_types
-            dflash_attn_mask = {}
-            if layer_types is None or "full_attention" in layer_types:
-                dflash_attn_mask["full_attention"] = mask_builder(**mask_args)
-            dflash_attn_mask["sliding_attention"] = mask_builder(
-                **mask_args,
-                sliding_window=sliding_window,
-            )
-        return dflash_attn_mask
+        masks = {}
+        shared = {}
+        for index, layer in enumerate(draft_config.layers):
+            attention = layer.attention
+            key = (attention.sliding_window, attention.is_causal)
+            if key not in shared:
+                shared[key] = mask_builder(
+                    **mask_args, sliding_window=key[0], is_causal=key[1]
+                )
+            masks[index] = shared[key]
+        return masks
 
     def _forward_draft_blocks(
         self,

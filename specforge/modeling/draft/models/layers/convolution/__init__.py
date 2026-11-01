@@ -1,6 +1,6 @@
-from .dflash2 import DFlashGroupedConv
+"""Convolution consumes draft-block boundaries, not an attention backend."""
 
-"""Convolutional components for draft model sublayers."""
+from .dflash2 import DFlashGroupedConv
 
 
 def build_grouped(*, spec, config):

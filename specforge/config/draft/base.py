@@ -35,10 +35,8 @@ def method_config(config: PretrainedConfig, name: str) -> Mapping:
 def validate_dimensions(config: PretrainedConfig) -> None:
     for name in (
         "hidden_size",
-        "intermediate_size",
         "vocab_size",
         "num_hidden_layers",
-        "num_attention_heads",
     ):
         integer(getattr(config, name), name)
     integer(getattr(config, "draft_vocab_size", config.vocab_size), "draft_vocab_size")
