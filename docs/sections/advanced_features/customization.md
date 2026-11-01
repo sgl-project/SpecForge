@@ -166,8 +166,8 @@ runs before config resolution. A minimal draft config then contains:
 }
 ```
 
-Point `model.draft_model_config` at that JSON. `AutoDraftModelConfig` and the
-model assembler resolve both the config and model class from the registry; do
+Point `model.draft_model_config` at that JSON. `AutoDraftConfig` (also available
+under the legacy name `AutoDraftModelConfig`) and the model assembler resolve both the config and model class from the registry; do
 not add a method-specific training launcher.
 
 An architecture alone does not define a new loss. A genuinely new training
@@ -177,6 +177,29 @@ step provider may construct a `DraftTrainStrategy`, while its model and data
 providers own algorithm-specific assembly. Add builtin registrations to the
 explicit catalog used by the application composition root; do not add a
 method-specific launcher or a second mutable registry.
+
+### Draft configuration parsing
+
+`specforge.modeling.draft.config.AutoDraftConfig` is the shared loader used by
+training, export, and `AutoDraftModel.from_pretrained` when no explicit config
+object is supplied. Use `from_dict`, `from_file`, or `from_pretrained` (a JSON
+file, directory, or Hugging Face repository). The registered draft model's
+`config_class` remains the authority for HF configuration fields; repository
+loading reads JSON without executing an `auto_map` config implementation.
+Custom draft architectures must be registered locally before loading.
+
+All entry points require exactly one registered `architectures` entry, force
+`tie_word_embeddings=False`, and default an omitted or null `draft_vocab_size`
+to the resolved `vocab_size`, including through the legacy loader. Explicit
+non-positive or non-integer draft vocabulary values are rejected. Nested custom
+fields are preserved and copied so parsing does not modify the caller's input.
+
+Training policy remains separate: explicit `model.draft_model_config` takes
+precedence over checkpoint configuration, then target-derived defaults are used
+when the algorithm supports them. Run overrides are applied afterward by the
+training resolver. Architecture-specific validation still lives in the existing
+providers and model constructors; loading a config alone does not validate all
+model-specific constraints or allocate model weights.
 
 ## Fused token losses
 
