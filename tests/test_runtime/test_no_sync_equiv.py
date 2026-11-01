@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -27,7 +28,8 @@ def _worker(rank, world_size, workdir, results_dir):
     fx.init_rank_distributed(rank, world_size, port="29581")
 
     from specforge.algorithms.eagle3.model import OnlineEagle3Model
-    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+    from specforge.config.draft import AutoDraftConfig
+    from specforge.modeling.auto import AutoDraftModel
     from specforge.modeling.target.target_head import TargetHead
     from specforge.optimizer import BF16Optimizer
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -38,7 +40,9 @@ def _worker(rank, world_size, workdir, results_dir):
     torch.use_deterministic_algorithms(True, warn_only=True)
 
     TTT, ACC = 3, 2
-    draft_config = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
+    draft_config = AutoDraftConfig.from_dict(
+        json.loads(Path(os.path.join(workdir, "draft.json")).read_text())
+    )
     target_dir = os.path.join(workdir, "target")
     vocab_path = os.path.join(workdir, "vm.pt")
     feat_dir = os.path.join(workdir, "features")

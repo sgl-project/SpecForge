@@ -8,7 +8,6 @@ model parameters.
 from __future__ import annotations
 
 import copy
-import json
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -94,64 +93,16 @@ class AutoDraftConfig:
         return resolve_draft_config_type(architectures[0])
 
     @classmethod
-    def from_file(cls, path: str | os.PathLike[str]) -> PretrainedConfig:
-        try:
-            with open(path, encoding="utf-8") as stream:
-                payload = json.load(stream)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid draft config JSON {path}: {exc}") from exc
-        return cls.from_dict(payload)
+    def from_yaml(cls, path: str | os.PathLike[str]) -> DraftModelConfig:
+        """Read only the user's embedded draft section from a run recipe."""
+        import yaml
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        source: str | os.PathLike[str],
-        *,
-        cache_dir: str | None = None,
-        trust_remote_code: bool = False,
-        revision: str | None = None,
-        token: str | bool | None = None,
-        local_files_only: bool = False,
-        force_download: bool = False,
-        subfolder: str = "",
-    ) -> PretrainedConfig:
-        """Read JSON, a local directory, or an HF repository.
-
-        ``trust_remote_code`` is accepted for caller compatibility. Draft
-        classes are explicitly registered locally; remote Python is not needed
-        to read their configuration, even when config.json contains auto_map.
-        """
-        if not source:
-            raise ValueError("draft config source must be non-empty")
-        raw_source = os.fspath(source)
-        path = os.path.abspath(os.path.expanduser(raw_source.removeprefix("file://")))
-        if os.path.isfile(path):
-            if subfolder:
-                raise ValueError("subfolder cannot be used with a draft config file")
-            return cls.from_file(path)
-        if os.path.isdir(path):
-            config_path = os.path.join(path, subfolder, "config.json")
-            if not os.path.isfile(config_path):
-                raise FileNotFoundError(
-                    f"draft model directory has no config.json: {os.path.dirname(config_path)}"
-                )
-            return cls.from_file(config_path)
-        if raw_source.startswith((".", "/", "~", "file://")) or raw_source.endswith(
-            ".json"
-        ):
-            raise FileNotFoundError(f"draft model config does not exist: {source}")
-
-        # Read the raw payload so model_type does not select a second config
-        # class (or inject its defaults) before the draft registry gets a say.
-        payload, _ = PretrainedConfig.get_config_dict(
-            raw_source,
-            cache_dir=cache_dir,
-            revision=revision,
-            token=token,
-            local_files_only=local_files_only,
-            force_download=force_download,
-            subfolder=subfolder,
+        with open(path, encoding="utf-8") as stream:
+            recipe = yaml.safe_load(stream)
+        model = recipe.get("model") if isinstance(recipe, Mapping) else None
+        payload = (
+            model.get("draft_model_config") if isinstance(model, Mapping) else None
         )
-        config = cls.from_dict(payload)
-        config._name_or_path = raw_source
-        return config
+        if not isinstance(payload, Mapping) or not payload:
+            raise ValueError("YAML must contain model.draft_model_config")
+        return cls.from_inline(payload)

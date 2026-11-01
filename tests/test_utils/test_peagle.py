@@ -78,12 +78,11 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
         self.assertTrue(model.config.norm_before_residual)
         with tempfile.TemporaryDirectory() as output_dir:
             model.save_pretrained(output_dir)
-            direct = PEagleDraftModel.from_pretrained(output_dir)
-            automatic = AutoDraftModel.from_pretrained(output_dir)
+            direct = PEagleDraftModel.from_pretrained(output_dir, config=model.config)
+            automatic = AutoDraftModel.from_pretrained(output_dir, config=model.config)
 
         for reloaded in (direct, automatic):
             self.assertIsInstance(reloaded, PEagleDraftModel)
-            self.assertTrue(reloaded.config.norm_before_residual)
             self.assertTrue(reloaded.config.norm_before_residual)
             self.assertTrue(reloaded.layers[0].config.norm_before_residual)
 

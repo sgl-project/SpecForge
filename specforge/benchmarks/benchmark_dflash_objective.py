@@ -1,7 +1,7 @@
 """Compare current DFlash-family losses with fusion and checkpointing on/off.
 
 Example: python -m specforge.benchmarks.benchmark_dflash_objective \
-    --method dflash --draft-config configs/qwen3-8b-dflash.json
+    --method dflash --config run.yaml
 
 BF16 forward, FP32 losses, synthetic teacher features and frozen projections.
 Times the full draft forward/backward and FP32-master AdamW step (lr=0).
@@ -18,9 +18,9 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from transformers import Qwen3Config
 
 from specforge.algorithms.common import dflash_family_model as family
+from specforge.config.draft import AutoDraftConfig
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash2 import DFlash2DraftModel
 from specforge.modeling.draft.domino import DominoDraftModel
@@ -30,15 +30,17 @@ from specforge.optimizer import BF16Optimizer
 
 def build_model(args):
     torch.manual_seed(17)
-    config = Qwen3Config.from_json_file(args.draft_config)
-    config._attn_implementation = "sdpa"
+    config = AutoDraftConfig.from_yaml(args.config)
     draft_class = {
         "dflash": DFlashDraftModel,
         "dspark": DSparkDraftModel,
         "domino": DominoDraftModel,
         "dflash2": DFlash2DraftModel,
     }[args.method]
-    config.architectures = [draft_class.__name__]
+    if config.architectures != (draft_class.__name__,):
+        raise ValueError(
+            "--method must match the architecture in model.draft_model_config"
+        )
     draft = draft_class(config)
     head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
     embed = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -163,7 +165,11 @@ def main():
     parser.add_argument(
         "--method", choices=["dflash", "dspark", "domino", "dflash2"], required=True
     )
-    parser.add_argument("--draft-config", required=True, help="Draft model JSON config")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="YAML recipe containing model.draft_model_config",
+    )
     parser.add_argument("--sequence", type=int, default=4096)
     parser.add_argument("--anchors", type=int, default=512)
     parser.add_argument("--chunk", type=int, default=128)

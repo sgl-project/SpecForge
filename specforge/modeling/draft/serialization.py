@@ -2,7 +2,8 @@
 
 from copy import copy, deepcopy
 
-from specforge.config.draft.model import DraftModelConfig
+from specforge.config.draft.model import DraftModelConfig, require_inline_config
+from specforge.config.draft.serialization.checkpoint import validate_checkpoint_config
 
 
 class DraftSerializationMixin:
@@ -15,9 +16,27 @@ class DraftSerializationMixin:
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
-        config = kwargs.get("config")
-        if isinstance(config, DraftModelConfig):
-            kwargs["config"] = config.to_hf_config()
+        config = require_inline_config(kwargs.get("config"))
+        source = args[0] if args else kwargs.get("pretrained_model_name_or_path")
+        if source is None:
+            raise ValueError("a checkpoint source is required to load draft weights")
+        validate_checkpoint_config(
+            config,
+            source,
+            **{
+                key: kwargs[key]
+                for key in (
+                    "cache_dir",
+                    "revision",
+                    "token",
+                    "local_files_only",
+                    "force_download",
+                    "subfolder",
+                )
+                if key in kwargs
+            },
+        )
+        kwargs["config"] = config.to_hf_config()
         return super().from_pretrained(*args, **kwargs)
 
     def save_pretrained(self, *args, **kwargs):

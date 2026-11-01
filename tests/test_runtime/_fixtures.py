@@ -9,6 +9,7 @@ the same manifest-reader and feature-loader path used by training.
 
 import json
 import os
+from pathlib import Path
 
 import torch
 
@@ -182,14 +183,15 @@ def build_offline_eagle3_loader(
 def build_eagle3(workdir, ttt=3):
     """Build (eagle3_model, target_head) sharing one set of weights, on cuda."""
     from specforge.algorithms.eagle3.model import OnlineEagle3Model
-    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+    from specforge.config.draft import AutoDraftConfig
+    from specforge.modeling.auto import AutoDraftModel
     from specforge.modeling.target.target_head import TargetHead
 
     cfg = write_draft_config(os.path.join(workdir, "draft.json"))
     target_dir = write_target_head_dir(os.path.join(workdir, "target"))
     vocab_path = write_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
 
-    draft_config = AutoDraftModelConfig.from_file(cfg)
+    draft_config = AutoDraftConfig.from_dict(json.loads(Path(cfg).read_text()))
     draft_model = AutoDraftModel.from_config(
         draft_config, attention_backend="flex_attention", torch_dtype=torch.bfloat16
     ).cuda()
@@ -479,3 +481,15 @@ def build_dspark(
     ).cuda()
     width = len(draft_model.config.dflash_config["target_layer_ids"]) * hidden
     return dspark_model, width
+
+
+def write_draft_recipe(path, **kwargs):
+    """Embed the draft test fixture in the same YAML section users provide."""
+    import yaml
+
+    write_draft_config(path, **kwargs)
+    with open(path, encoding="utf-8") as stream:
+        payload = json.load(stream)
+    with open(path, "w", encoding="utf-8") as stream:
+        yaml.safe_dump({"model": {"draft_model_config": payload}}, stream)
+    return path

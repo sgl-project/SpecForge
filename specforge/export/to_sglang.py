@@ -56,7 +56,7 @@ def _serving_state(state_dict, weight_map: Dict[str, str]):
 
 def export_to_sglang(
     checkpoint_path: str,
-    draft_config_path: str,
+    config_path: str,
     output_dir: str,
     *,
     vocab_mapping_path: Optional[str] = None,
@@ -75,9 +75,7 @@ def export_to_sglang(
             f"checkpoints only, got strategy={state.get('strategy')!r}; use "
             "--to hf for DFlash-family and P-EAGLE draft model directories"
         )
-    model = materialize_draft(
-        state, draft_config_path, vocab_mapping_path=vocab_mapping_path
-    )
+    model = materialize_draft(state, config_path, vocab_mapping_path=vocab_mapping_path)
     if weight_map is None:
         weight_map = WEIGHT_MAPS.get(type(model).__name__, {})
     # Serialize the checkpoint tensors as stored (as the HF exporter does), but
@@ -100,13 +98,17 @@ def export_to_sglang(
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=export_to_sglang.__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--draft-config", required=True)
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="YAML recipe containing model.draft_model_config",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--vocab-mapping", default=None)
     args = parser.parse_args(argv)
     out = export_to_sglang(
         args.checkpoint,
-        args.draft_config,
+        args.config,
         args.output_dir,
         vocab_mapping_path=args.vocab_mapping,
     )

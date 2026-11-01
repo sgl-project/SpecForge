@@ -128,9 +128,17 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         """mock"""
         mock_model = LlamaForCausalLMEagle3(self.config)
         mock_from_pretrained.return_value = mock_model
+        mock_model.config.save_pretrained(self.temp_dir)
 
-        loaded_model = LlamaForCausalLMEagle3.from_pretrained(self.temp_dir)
-        mock_from_pretrained.assert_called_once_with(self.temp_dir)
+        loaded_model = LlamaForCausalLMEagle3.from_pretrained(
+            self.temp_dir, config=mock_model.config
+        )
+        mock_from_pretrained.assert_called_once()
+        self.assertEqual(mock_from_pretrained.call_args.args, (self.temp_dir,))
+        self.assertEqual(
+            mock_from_pretrained.call_args.kwargs["config"].hidden_size,
+            mock_model.config.hidden_size,
+        )
         self.assertIsInstance(loaded_model, LlamaForCausalLMEagle3)
 
     def test_model_forward_pass(self):

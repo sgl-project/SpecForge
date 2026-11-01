@@ -8,8 +8,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Export a DataFlow training checkpoint to an HF-format draft directory.
 
-The output loads back through ``AutoDraftModel.from_pretrained`` (e.g. to
-finetune from it). EAGLE-family embeddings may be absent by design — training
+Loading the output for finetuning requires an explicit config parsed from
+the user's YAML; the saved config is used only for compatibility checks. EAGLE-family embeddings may be absent by design — training
 reloads frozen embeddings from the target — while DFlash-family drafts do not
 own an embedding at all.
 """
@@ -29,7 +29,7 @@ from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
 def export_to_hf(
     checkpoint_path: str,
-    draft_config_path: str,
+    config_path: str,
     output_dir: str,
     *,
     vocab_mapping_path: Optional[str] = None,
@@ -38,17 +38,15 @@ def export_to_hf(
 ) -> str:
     """Write the checkpoint's draft as an HF directory; returns ``output_dir``.
 
-    The exported directory is SELF-CONTAINED (reloads via ``from_pretrained``
-    with no missing keys). Draft checkpoints deliberately exclude the frozen
+    The exported directory contains all serving weights. SpecForge reloads
+    weights with an explicit user config and no missing keys. Draft checkpoints deliberately exclude the frozen
     embedding, so it must come from somewhere real: pass ``embedding_source``
     (the target model path/dir — the embedding is deterministic from it) unless
     the checkpoint itself carries ``embed_tokens.weight``. A randomly
     initialized embedding would silently break serving, so its absence raises.
     """
     state = resolve_training_state(checkpoint_path)
-    model = materialize_draft(
-        state, draft_config_path, vocab_mapping_path=vocab_mapping_path
-    )
+    model = materialize_draft(state, config_path, vocab_mapping_path=vocab_mapping_path)
     full_state = dict(model.state_dict())
     owns_embedding = hasattr(model, "embed_tokens")
     if owns_embedding and "embed_tokens.weight" not in state["draft_state_dict"]:
@@ -92,7 +90,11 @@ def export_to_hf(
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=export_to_hf.__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--draft-config", required=True)
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="YAML recipe containing model.draft_model_config",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--vocab-mapping", default=None)
     parser.add_argument(
@@ -105,7 +107,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     out = export_to_hf(
         args.checkpoint,
-        args.draft_config,
+        args.config,
         args.output_dir,
         vocab_mapping_path=args.vocab_mapping,
         embedding_source=args.embedding_source,

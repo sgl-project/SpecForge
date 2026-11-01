@@ -110,18 +110,19 @@ class TestRoPEConfigCompatibility(unittest.TestCase):
 
 class TestLegacyVocabMappingCompatibility(unittest.TestCase):
     def setUp(self):
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.auto import AutoDraftModel
         from tests.test_runtime import _fixtures as fx
 
         self.tempdir = tempfile.TemporaryDirectory(prefix="legacy_export_")
         self.addCleanup(self.tempdir.cleanup)
-        self.cfg_path = fx.write_draft_config(
+        self.cfg_path = fx.write_draft_recipe(
             os.path.join(self.tempdir.name, "draft.json")
         )
         self.vocab_path = fx.write_vocab_mapping(
             os.path.join(self.tempdir.name, "mapping.pt")
         )
-        config = AutoDraftModelConfig.from_file(self.cfg_path)
+        config = AutoDraftConfig.from_yaml(self.cfg_path)
         model = AutoDraftModel.from_config(config, torch_dtype=torch.bfloat16)
         self.legacy_state = {
             key: value
@@ -169,12 +170,13 @@ class TestHFVocabMappingExport(unittest.TestCase):
     """Exercise serialized and reloaded exports on CPU, without model downloads."""
 
     def setUp(self):
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.auto import AutoDraftModel
         from tests.test_runtime import _fixtures as fx
 
         self.tempdir = tempfile.TemporaryDirectory(prefix="hf_mapping_export_")
         self.addCleanup(self.tempdir.cleanup)
-        self.cfg_path = fx.write_draft_config(
+        self.cfg_path = fx.write_draft_recipe(
             os.path.join(self.tempdir.name, "draft.json")
         )
         old_path = fx.write_vocab_mapping(
@@ -186,7 +188,7 @@ class TestHFVocabMappingExport(unittest.TestCase):
         self.replacement = torch.load(self.mapping_path, weights_only=True)
         with torch.random.fork_rng(devices=[]):
             model = AutoDraftModel.from_config(
-                AutoDraftModelConfig.from_file(self.cfg_path), torch_dtype=torch.float32
+                AutoDraftConfig.from_yaml(self.cfg_path), torch_dtype=torch.float32
             )
         model.load_vocab_mapping(old_path)
         self.weights = model.state_dict()
@@ -202,11 +204,15 @@ class TestHFVocabMappingExport(unittest.TestCase):
     def _assert_export(self, expected_mapping):
         from safetensors.torch import load_file
 
+        from specforge.config.draft import AutoDraftConfig
         from specforge.modeling.auto import AutoDraftModel
 
         saved = load_file(os.path.join(self.output, "model.safetensors"))
         reloaded, info = AutoDraftModel.from_pretrained(
-            self.output, torch_dtype=torch.float32, output_loading_info=True
+            self.output,
+            config=AutoDraftConfig.from_yaml(self.cfg_path),
+            torch_dtype=torch.float32,
+            output_loading_info=True,
         )
         self.assertFalse(info["missing_keys"])
         self.assertFalse(info["unexpected_keys"])
@@ -284,7 +290,7 @@ class TestHFVocabMappingExport(unittest.TestCase):
                 "hf",
                 "--checkpoint",
                 self.checkpoint,
-                "--draft-config",
+                "--config",
                 self.cfg_path,
                 "--output-dir",
                 self.output,
@@ -308,7 +314,7 @@ class TestExportCheckpointPrecision(unittest.TestCase):
 
         self.tempdir = tempfile.TemporaryDirectory(prefix="export_precision_")
         self.addCleanup(self.tempdir.cleanup)
-        self.cfg_path = fx.write_draft_config(
+        self.cfg_path = fx.write_draft_recipe(
             os.path.join(self.tempdir.name, "draft.json")
         )
         self.vocab_path = fx.write_vocab_mapping(
@@ -321,12 +327,13 @@ class TestExportCheckpointPrecision(unittest.TestCase):
         self.output = os.path.join(self.tempdir.name, "export")
 
     def _checkpoint(self, dtype):
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.auto import AutoDraftModel
 
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(0)
             model = AutoDraftModel.from_config(
-                AutoDraftModelConfig.from_file(self.cfg_path), torch_dtype=dtype
+                AutoDraftConfig.from_yaml(self.cfg_path), torch_dtype=dtype
             )
         model.load_vocab_mapping(self.vocab_path)
         weights = model.state_dict()
@@ -385,6 +392,7 @@ class TestExportCheckpointPrecision(unittest.TestCase):
             self.assertTrue(torch.equal(served[key], value), key)
 
     def test_to_hf_reloads_checkpoint_precision_by_default(self):
+        from specforge.config.draft import AutoDraftConfig
         from specforge.export import export_to_hf
         from specforge.modeling.auto import AutoDraftModel
 
@@ -393,8 +401,16 @@ class TestExportCheckpointPrecision(unittest.TestCase):
                 weights = self._checkpoint(dtype)
                 export_to_hf(self.checkpoint, self.cfg_path, self.output)
                 self.assertEqual(self._read_config_dtype(), str(dtype).split(".")[1])
-                # No explicit dtype: Transformers follows the exported config.
-                reloaded = AutoDraftModel.from_pretrained(self.output).state_dict()
+                # The user's config specifies precision; saved config is metadata only.
+                reloaded = AutoDraftModel.from_pretrained(
+                    self.output,
+                    config=AutoDraftConfig.from_inline(
+                        {
+                            **AutoDraftConfig.from_yaml(self.cfg_path).to_dict(),
+                            "dtype": str(dtype).split(".")[1],
+                        }
+                    ),
+                ).state_dict()
                 self.assertEqual(set(reloaded), set(weights))
                 for key, value in weights.items():
                     self.assertEqual(reloaded[key].dtype, value.dtype, key)
@@ -411,7 +427,8 @@ class TestExporters(unittest.TestCase):
         fx.build_single_rank_distributed(port="29591")
 
         from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.auto import AutoDraftModel
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -420,13 +437,13 @@ class TestExporters(unittest.TestCase):
 
         TTT, BS, N = 3, 2, 4
         cls.workdir = tempfile.mkdtemp(prefix="export_gate_")
-        cls.cfg_path = fx.write_draft_config(os.path.join(cls.workdir, "draft.json"))
+        cls.cfg_path = fx.write_draft_recipe(os.path.join(cls.workdir, "draft.json"))
         target_dir = fx.write_target_head_dir(os.path.join(cls.workdir, "target"))
         cls.vocab_path = fx.write_vocab_mapping(os.path.join(cls.workdir, "vm.pt"))
         feat_dir = fx.write_offline_files(os.path.join(cls.workdir, "features"), n=N)
         cls.out_dir = os.path.join(cls.workdir, "out")
 
-        draft_config = AutoDraftModelConfig.from_file(cls.cfg_path)
+        draft_config = AutoDraftConfig.from_yaml(cls.cfg_path)
         dm = AutoDraftModel.from_config(
             draft_config,
             attention_backend="flex_attention",
@@ -474,6 +491,7 @@ class TestExporters(unittest.TestCase):
 
         from safetensors.torch import save_file
 
+        from specforge.config.draft import AutoDraftConfig
         from specforge.export import export_to_hf
         from specforge.modeling.auto import AutoDraftModel
 
@@ -499,7 +517,11 @@ class TestExporters(unittest.TestCase):
             os.path.join(self.workdir, "hf_export"),
             embedding_source=emb_src,
         )
-        reloaded = AutoDraftModel.from_pretrained(out, torch_dtype=torch.bfloat16)
+        reloaded = AutoDraftModel.from_pretrained(
+            out,
+            config=AutoDraftConfig.from_yaml(self.cfg_path),
+            torch_dtype=torch.bfloat16,
+        )
         fresh_sd = reloaded.state_dict()
         # the exported embedding is the source's, not a random re-init
         self.assertTrue(

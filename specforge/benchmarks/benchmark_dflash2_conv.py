@@ -11,7 +11,7 @@ Reports, for eager and fused (``SPECFORGE_DFLASH2_FUSED_CONV=0`` / unset):
 Example::
 
     python -m specforge.benchmarks.benchmark_dflash2_conv \\
-        --config configs/qwen3.8-27b-dflash2.json --batch-size 2 \\
+        --config run.yaml --batch-size 2 \\
         --num-anchors 512 --context-length 4608
 """
 
@@ -26,7 +26,7 @@ from specforge.algorithms.common.dflash_family_model import (
     OnlineDFlashModel,
     create_dflash_block_mask,
 )
-from specforge.modeling.auto import AutoDraftModelConfig
+from specforge.config.draft import AutoDraftConfig
 from specforge.modeling.draft.dflash2 import (
     FUSED_CONV_ENV,
     DFlash2DraftModel,
@@ -318,7 +318,11 @@ def benchmark_draft(model, config, args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/qwen3.8-27b-dflash2.json")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="YAML recipe containing model.draft_model_config",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-anchors", type=int, default=512)
     parser.add_argument("--context-length", type=int, default=4608)
@@ -328,8 +332,9 @@ def main():
     args = parser.parse_args()
 
     print("PyTorch:", torch.__version__, "GPU:", torch.cuda.get_device_name())
-    config = AutoDraftModelConfig.from_file(args.config)
-    config._attn_implementation = "flex_attention"
+    settings = AutoDraftConfig.from_yaml(args.config).to_dict()
+    settings["_attn_implementation"] = "flex_attention"
+    config = AutoDraftConfig.from_inline(settings)
     torch.manual_seed(0)
     model = DFlash2DraftModel(config).to(device="cuda", dtype=torch.bfloat16)
     randomize_convs(model)

@@ -31,6 +31,7 @@ installed one is used. Opt in locally with ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=
 """
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -38,6 +39,7 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -393,7 +395,8 @@ class TestServerCaptureGate(unittest.TestCase):
 
     def _train_step(self, fetched, head):
         from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.auto import AutoDraftModel
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -403,8 +406,12 @@ class TestServerCaptureGate(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29576")
         torch.manual_seed(0)
-        draft_cfg = AutoDraftModelConfig.from_file(
-            fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
+        draft_cfg = AutoDraftConfig.from_dict(
+            json.loads(
+                Path(
+                    fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
+                ).read_text()
+            )
         )
         dm = AutoDraftModel.from_config(
             draft_cfg, attention_backend="sdpa", torch_dtype=torch.bfloat16

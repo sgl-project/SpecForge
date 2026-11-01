@@ -274,7 +274,7 @@ def train(
     help="Export layout.",
 )
 @click.option("--checkpoint", required=True, metavar="PATH")
-@click.option("--draft-config", required=True, metavar="PATH")
+@click.option("--config", "config_path", required=True, metavar="YAML")
 @click.option("--output-dir", required=True, metavar="PATH")
 @click.option("--vocab-mapping", default=None, metavar="PATH")
 @click.option(
@@ -293,7 +293,7 @@ def export(
     ctx: click.Context,
     target: str,
     checkpoint: str,
-    draft_config: str,
+    config_path: str,
     output_dir: str,
     vocab_mapping: Optional[str],
     embedding_source: Optional[str],
@@ -305,7 +305,7 @@ def export(
 
         export_to_hf(
             checkpoint,
-            draft_config,
+            config_path,
             output_dir,
             vocab_mapping_path=vocab_mapping,
             embedding_source=embedding_source,
@@ -318,7 +318,7 @@ def export(
 
     export_to_sglang(
         checkpoint,
-        draft_config,
+        config_path,
         output_dir,
         vocab_mapping_path=vocab_mapping,
     )

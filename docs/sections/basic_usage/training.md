@@ -757,7 +757,7 @@ For EAGLE3 SGLang serving:
 ```bash
 specforge export --to sglang \
   --checkpoint ./outputs/qwen3-8b-eagle3-disaggregated/qwen3-8b-eagle3-disaggregated-latest \
-  --draft-config configs/qwen3-8b-eagle3.json \
+  --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml \
   --output-dir ./exports/qwen3-8b-eagle3-sglang
 ```
 
@@ -782,7 +782,7 @@ serving validation step.
 ```bash
 specforge export --to hf \
   --checkpoint ./outputs/qwen3-8b-eagle3-disaggregated/qwen3-8b-eagle3-disaggregated-latest \
-  --draft-config configs/qwen3-8b-eagle3.json \
+  --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml \
   --embedding-source Qwen/Qwen3-8B \
   --output-dir ./exports/qwen3-8b-eagle3-hf
 ```
@@ -793,9 +793,11 @@ mapping buffers or when you intentionally need to refresh them.
 Both exporters preserve the dtype and values of the draft weights stored in the
 checkpoint. When all floating-point tensors share one dtype (FP32, FP16, or
 BF16), that dtype is written into the exported `config.json`, so
-`AutoDraftModel.from_pretrained` without an explicit dtype restores the saved
-precision and values. SGLang casts the served draft to its own dtype at load
-time.
+serving readers can recover the saved precision. SpecForge weight loading
+requires `config=AutoDraftConfig.from_yaml("run.yaml")`; that user configuration
+(or an explicit load dtype) selects the reload precision. Saved settings are
+checked for compatibility and never applied to the live config. SGLang casts
+the served draft to its own dtype at load time.
 
 For checkpoints with mixed floating-point dtypes, the exported weight tensors
 retain their original dtypes, but the exported config falls back to BF16.
