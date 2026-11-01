@@ -206,3 +206,29 @@ def inline_values(payload: Mapping, *, model_type: str) -> _ConfigValues:
         rope.setdefault("rope_theta", values.get("rope_theta", 10000.0))
     values["rope_parameters"] = rope
     return _ConfigValues(**values)
+
+
+@dataclass(frozen=True)
+class LayerConfig:
+    """Read-only adapter for kernels that consume HF-shaped attribute names.
+
+    It references the shared model config and one layer; it owns no copied
+    settings. Component code must not use this adapter for serialization.
+    """
+
+    model: DraftModelConfig
+    layer: Any
+
+    def __getattr__(self, name):
+        if name == "layer_types":
+            return (self.layer.attention.layer_type,) * self.model.num_hidden_layers
+        if hasattr(self.layer.attention, name):
+            return getattr(self.layer.attention, name)
+        if name == "intermediate_size":
+            return self.layer.ffn.intermediate_size
+        if name == "dflash_config":
+            return self.model.dflash_config
+        return getattr(self.model, name)
+
+    def get_text_config(self, **kwargs):
+        return self

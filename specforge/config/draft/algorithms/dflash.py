@@ -158,6 +158,8 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
 
 @dataclass(frozen=True, kw_only=True)
 class DFlashConfig(DraftConfig):
+    attention_contract = "context_then_draft"
+
     block_size: int
     layer_types: tuple[str, ...]
     sliding_window: int | None

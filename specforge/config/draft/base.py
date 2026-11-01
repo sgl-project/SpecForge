@@ -60,6 +60,10 @@ class DraftConfig(ABC):
     legacy JSON layout and retain fields they do not interpret.
     """
 
+    attention_contract: ClassVar[str] = "eagle_cache"
+    requires_causal: ClassVar[bool] = False
+    requires_conv: ClassVar[bool] = False
+
     _nested_fields: ClassVar[frozenset[str]] = frozenset()
 
     @classmethod

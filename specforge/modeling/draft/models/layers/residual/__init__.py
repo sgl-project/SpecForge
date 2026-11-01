@@ -37,3 +37,7 @@ def build_residual(config: PretrainedConfig) -> ResidualStream:
     if choice.type != "standard" or choice.variant is not None:
         raise ValueError(f"Residual stream {choice!r} is not implemented")
     return StandardResidual()
+
+
+def build_standard(*, spec):
+    return StandardResidual()
