@@ -4,6 +4,7 @@ from copy import copy, deepcopy
 
 from specforge.config.draft.model import DraftModelConfig, require_inline_config
 from specforge.config.draft.serialization.checkpoint import validate_checkpoint_config
+from specforge.config.draft.serialization.hf import DraftSaveConfig
 
 
 class DraftSerializationMixin:
@@ -36,13 +37,13 @@ class DraftSerializationMixin:
                 if key in kwargs
             },
         )
-        kwargs["config"] = config.to_hf_config()
+        kwargs["config"] = config.to_hf_config(for_export=False)
         return super().from_pretrained(*args, **kwargs)
 
     def save_pretrained(self, *args, **kwargs):
         # Share weights; only the HF adapter may receive serialization metadata.
         export_model = copy(self)
-        export_model.__dict__["config"] = self.config.to_hf_config()
+        export_model.__dict__["config"] = DraftSaveConfig(self.config)
         if hasattr(self, "generation_config"):
             export_model.generation_config = deepcopy(self.generation_config)
         return super(DraftSerializationMixin, export_model).save_pretrained(

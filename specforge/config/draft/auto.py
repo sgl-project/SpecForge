@@ -18,6 +18,7 @@ from .base import integer
 from .layers.decoder import decode_layers, strip_legacy_layer_fields
 from .model import DraftModelConfig, inline_values
 from .registry import DraftConfigRegistration, resolve_draft_config_type
+from .serialization.format import decode_format
 
 
 class AutoDraftConfig:
@@ -32,6 +33,7 @@ class AutoDraftConfig:
         """Resolve the YAML draft section without parsing it through HF."""
         if not isinstance(payload, Mapping):
             raise ValueError("draft config must be an object")
+        payload = decode_format(payload)
         registration = cls._registration(payload.get("architectures"))
         values = inline_values(payload, model_type=registration.config_class.model_type)
         integer(values.draft_vocab_size, "draft_vocab_size")
@@ -60,10 +62,14 @@ class AutoDraftConfig:
         return cls.from_inline(payload)
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> PretrainedConfig:
-        """Read legacy HF checkpoint metadata; training uses from_inline."""
+    def from_dict(
+        cls, payload: Mapping[str, Any]
+    ) -> DraftModelConfig | PretrainedConfig:
+        """Read canonical settings or legacy HF metadata; training uses from_inline."""
         if not isinstance(payload, Mapping):
             raise ValueError("draft config must be a JSON object")
+        if "schema_version" in payload:
+            return cls.from_inline(payload)
         payload = copy.deepcopy(dict(payload))
         registration = cls._registration(payload.get("architectures"))
         payload["architectures"] = list(payload["architectures"])
@@ -80,7 +86,7 @@ class AutoDraftConfig:
     def validate_training_config(
         cls, config: DraftModelConfig | PretrainedConfig
     ) -> None:
-        """Check training-only requirements on a resolved config."""
+        """Check training-only requirements on an resolved config."""
         registration = cls._registration(config.architectures)
         if registration.options_class is not None:
             registration.options_class.validate_training_config(config)
