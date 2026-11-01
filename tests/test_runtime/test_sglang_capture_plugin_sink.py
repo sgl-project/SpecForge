@@ -1,7 +1,6 @@
 # coding=utf-8
 """The capture plugin's sink: NVLink publication and the store path it leaves alone.
 
-Mirrors the v0.5.18 patch sink's NVLink tests in ``test_spec_capture_sink.py``.
 The arena's allocator and free protocol run on any host. Publishing into an
 arena needs CUDA and uses a stand-in TransferEngine whose fabric allocation is
 an ordinary device tensor.
@@ -265,7 +264,9 @@ class SpecCaptureSinkTest(unittest.TestCase):
         self._nvlink(backing)
         self.sink.aux_layer_ids = [2, 5, 8]
         scheduler = SimpleNamespace(
-            _specforge_capture_runtime=SimpleNamespace(is_writer=True, sink=self.sink)
+            _specforge_capture_runtime=SimpleNamespace(
+                is_writer=True, sink=self.sink, capture_method="eagle3"
+            )
         )
         client = ArenaObjectClient(local_hostname="127.0.0.1")
 

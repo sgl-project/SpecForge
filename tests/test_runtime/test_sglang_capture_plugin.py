@@ -567,7 +567,12 @@ class TestInstall(unittest.TestCase):
                     specforge_sglang_capture._capture_internal_state(result, scheduler)
                 self.assertEqual(
                     result.internal_state,
-                    {"existing": "value", "spec_capture_backend": "plugin"},
+                    {
+                        "existing": "value",
+                        "spec_capture_backend": "plugin",
+                        "spec_capture_method": "dflash",
+                        "spec_capture_aux_layer_ids": [1, 3],
+                    },
                 )
                 self.assertIsNone(runtime.sink._control_listener)
 

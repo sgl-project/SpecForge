@@ -22,7 +22,8 @@ generic extension points it uses:
 This version requires SGLang's [aux-capture changes in PR #43449](https://github.com/sgl-project/sglang/pull/43449)
 and the completion-based `defer_response` revision of
 [PR #43450](https://github.com/sgl-project/sglang/pull/43450), or a branch containing
-both. These extension points are not available in stock SGLang 0.5.18.
+both. CI uses SGLang commit `c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0` in a separate
+cached `sf-capture` environment. These extension points are not available in stock SGLang 0.5.18.
 
 The aux-capture API returns `last_hidden_states` after the final norm and
 before LM-head-only scaling, including Inkling's muP division. The plugin
@@ -96,7 +97,8 @@ The default, `auto`, finds it without configuration:
   `SPECFORGE_SPEC_CAPTURE=1`. `specforge train --plan` shows the result.
 - External servers: before the first request, the producer reads each
   server's `/server_info`. The enabled plugin adds `spec_capture_backend:
-  plugin` to every scheduler's `internal_states`.
+  plugin` to every scheduler's `internal_states`, together with
+  `spec_capture_method` and the ordered `spec_capture_aux_layer_ids`.
 
 `server_capture: plugin`, or `DISAGG_SERVER_CAPTURE=plugin` when the config
 leaves it at `auto`, skips detection.

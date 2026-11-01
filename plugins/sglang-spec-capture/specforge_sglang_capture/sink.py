@@ -239,8 +239,20 @@ class NvlinkArena:
                 continue
             *lines, self._peers[sock] = (self._peers[sock] + chunk).split(b"\n")
             for line in lines:
-                if line:
-                    freed += self.free(json.loads(line))
+                if not line:
+                    continue
+                try:
+                    keys = json.loads(line)
+                    if not isinstance(keys, list) or not all(
+                        isinstance(key, str) for key in keys
+                    ):
+                        raise ValueError("expected a list of object keys")
+                except (ValueError, UnicodeDecodeError) as exc:
+                    logger.warning(
+                        "Ignoring invalid spec-capture free message: %s", exc
+                    )
+                    continue
+                freed += self.free(keys)
         return freed
 
     def health(self) -> Dict[str, int]:
