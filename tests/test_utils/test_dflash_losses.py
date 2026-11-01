@@ -73,6 +73,13 @@ class _FixedDraft(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.config = types.SimpleNamespace(
+            layers=(
+                types.SimpleNamespace(
+                    attention=types.SimpleNamespace(
+                        sliding_window=None, is_causal=False
+                    )
+                ),
+            ),
             sliding_window=None,
             layer_types=["full_attention"],
             block_size=4,

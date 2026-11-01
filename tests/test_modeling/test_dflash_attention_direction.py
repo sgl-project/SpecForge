@@ -111,7 +111,8 @@ class DFlashAttentionDirectionTest(unittest.TestCase):
                 )
                 self.assertIs(resolve_dflash_causal_block(config), causal)
                 self.assertIs(
-                    getattr(wrapper.draft_model.config, "is_causal", None), causal
+                    wrapper.draft_model.config.layers[0].attention.is_causal,
+                    causal if causal is not None else layer_type == "sliding_attention",
                 )
                 self.assertIs(
                     model.layers[0].self_attn.is_causal,
@@ -236,11 +237,12 @@ class DFlashAttentionDirectionTest(unittest.TestCase):
     def test_new_window_semantics_have_a_distinct_resume_contract(self):
         config = _draft_config(["sliding_attention"], 3)
         model = DFlashDraftModel(config)
-        self.assertEqual(dflash_attention_resume_contract(model), {})
+        default = dflash_attention_resume_contract(model)
         config.is_causal = True
         causal = dflash_attention_resume_contract(DFlashDraftModel(config))
         config.is_causal = False
         bidirectional = dflash_attention_resume_contract(DFlashDraftModel(config))
+        self.assertEqual(default, causal)
         self.assertTrue(causal and bidirectional and (causal != bidirectional))
         config.is_causal = True
         config.architectures = ["DSparkDraftModel"]

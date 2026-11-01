@@ -118,20 +118,22 @@ class TestDFlashMLASelection(unittest.TestCase):
     def test_dflash_selects_mla_from_config(self):
         model = DFlashDraftModel(_mla_config())
 
-        self.assertEqual(model.config.dflash_config["attention_mode"], "mla")
+        self.assertEqual(model.config.layers[0].attention.type, "mla")
         self.assertIsInstance(model.layers[0].self_attn, Qwen3DFlashMLAAttention)
         # Omitted rope_interleave defaults to the DeepSeek interleaved layout.
         self.assertTrue(model.layers[0].self_attn.rope_interleaved)
         # The model-level rotary rotates only the partial-RoPE slice.
         cos, _ = model.rotary_emb(torch.zeros(1, 2, 1), torch.arange(2).unsqueeze(0))
-        self.assertEqual(cos.shape[-1], model.config.qk_rope_head_dim)
+        self.assertEqual(
+            cos.shape[-1], model.config.layers[0].attention.qk_rope_head_dim
+        )
 
     def test_omitting_attention_mode_preserves_gqa(self):
         config = _mla_config()
         del config.dflash_config["attention_mode"]
         model = DFlashDraftModel(config)
 
-        self.assertEqual(model.config.dflash_config["attention_mode"], "gqa")
+        self.assertEqual(model.config.layers[0].attention.type, "gqa")
         self.assertIsInstance(model.layers[0].self_attn, Qwen3DFlashAttention)
         cos, _ = model.rotary_emb(torch.zeros(1, 2, 1), torch.arange(2).unsqueeze(0))
         self.assertEqual(cos.shape[-1], config.head_dim)
@@ -144,7 +146,7 @@ class TestDFlashMLASelection(unittest.TestCase):
         model = DSparkDraftModel(config)
 
         self.assertIsInstance(model.layers[0].self_attn, Qwen3DFlashMLAAttention)
-        self.assertEqual(model.config.dflash_config["attention_mode"], "mla")
+        self.assertEqual(model.config.layers[0].attention.type, "mla")
         self.assertIsNotNone(model.markov_head)
         self.assertIsNotNone(model.confidence_head)
 
@@ -541,7 +543,7 @@ class TestDFlashMLAConfigValidation(unittest.TestCase):
         config = _mla_config()
         config.dflash_config["attention_mode"] = "latent-ish"
 
-        with self.assertRaisesRegex(ValueError, "attention_config.type|attention_mode"):
+        with self.assertRaisesRegex(ValueError, "attention.*type|attention_mode"):
             DFlashDraftModel(config)
 
     def test_rejects_non_boolean_rope_interleave(self):

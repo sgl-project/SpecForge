@@ -1,5 +1,3 @@
-from dataclasses import replace
-
 """DFlash-family configuration resolution precedes model allocation."""
 
 import copy
@@ -120,18 +118,19 @@ class DFlashConfigTest(unittest.TestCase):
 
     def test_resolved_layout_and_direction_are_written_to_hf_config(self):
         config = AutoDraftConfig.from_dict(payload())
-        options = replace(
-            DFlashConfig.from_model_config(config),
-            layer_types=("sliding_attention",),
-            sliding_window=8,
-            is_causal=True,
+        resolved = AutoDraftConfig.from_inline(
+            {
+                **payload(),
+                "layers": {"attention": {"sliding_window": 8, "is_causal": True}},
+            }
         )
-        resolved = options.to_model_config(config)
-        self.assertEqual(DFlashConfig.from_model_config(resolved), options)
-        restored = AutoDraftConfig.from_dict(resolved.to_dict())
-        self.assertEqual(DFlashConfig.from_model_config(restored), options)
+        exported = resolved.to_hf_config()
+        self.assertEqual(exported.layer_types, ["sliding_attention"])
+        self.assertEqual(exported.sliding_window, 8)
+        self.assertIs(exported.is_causal, True)
+        restored = AutoDraftConfig.resolve(exported)
+        self.assertEqual(restored.layers, resolved.layers)
         self.assertEqual(config.layer_types, ["full_attention"])
-        self.assertIsNone(getattr(config, "is_causal", None))
 
     def test_resolution_is_idempotent_and_preserves_unknown_fields(self):
         for architecture, options_cls, method in VARIANTS:
@@ -238,7 +237,7 @@ class DFlashConfigTest(unittest.TestCase):
             AutoDraftConfig.resolve(legacy)
         legacy.dflash_config["attention_mode"] = "mha"
         self.assertEqual(
-            AutoDraftConfig.resolve(legacy).dflash_config["attention_mode"], "mha"
+            AutoDraftConfig.resolve(legacy).layers[0].attention.type, "mha"
         )
 
     def test_inline_settings_validate_before_model_construction(self):
@@ -261,7 +260,7 @@ class DFlashConfigTest(unittest.TestCase):
         resolved = resolve_draft_config(cfg, provider=provider)
         self.assertEqual(resolved.block_size, 8)
         self.assertNotIn("block_size", resolved.dflash_config)
-        self.assertEqual(resolved.dflash_config["conv_kernel_size"], 6)
+        self.assertEqual(resolved.layers[0].conv.kernel_size, 6)
         cfg.model.draft_model_config["block_size"] = 4
         with self.assertRaisesRegex(ValueError, "must not exceed block_size"):
             resolve_draft_config(cfg, provider=provider)

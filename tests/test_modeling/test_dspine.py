@@ -263,12 +263,11 @@ class DSpineTest(unittest.TestCase):
                 ):
                     model.attention_backend = backend
                     masks = model._attention_mask(anchors, keep, 7)
-                    if window is None:
-                        masks = {"full_attention": masks}
-                    self.assertEqual(
-                        set(masks), set(model.draft_model.config.layer_types)
-                    )
-                    for layer_type, mask in masks.items():
+                    self.assertEqual(set(masks), set(range(3)))
+                    for index, mask in masks.items():
+                        layer_type = model.draft_model.config.layers[
+                            index
+                        ].attention.layer_type
                         expected = create_dflash_sdpa_mask(
                             anchors,
                             keep,

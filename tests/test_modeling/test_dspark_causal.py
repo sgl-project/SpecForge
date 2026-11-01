@@ -115,7 +115,7 @@ class DSparkCausalTest(unittest.TestCase):
         )
         contract = resume_contract(None, model.draft_model, model)
         self.assertIs(contract["dspark_causal_block"], True)
-        self.assertIs(model.draft_model.config.to_dict()["is_causal"], True)
+        self.assertIs(model.draft_model.config.layers[0].attention.is_causal, True)
 
 
 if __name__ == "__main__":

@@ -9,11 +9,29 @@ from .algorithms.eagle3 import Eagle3Config, EagleConfig, EaglePretrainedConfig
 from .algorithms.peagle import PEagleConfig
 from .auto import AutoDraftConfig
 from .base import DraftConfig
+from .layers.registry import register_component
+from .layers.specs import (
+    AttentionSpec,
+    ConvSpec,
+    FFNSpec,
+    GQASpec,
+    LayerSpec,
+    MLASpec,
+    ResidualSpec,
+)
 from .model import DraftModelConfig
 from .native.qwen3_5_mtp import Qwen3_5MTPConfig
 from .registry import register_draft_config
 
 __all__ = [
+    "AttentionSpec",
+    "GQASpec",
+    "MLASpec",
+    "FFNSpec",
+    "ResidualSpec",
+    "ConvSpec",
+    "LayerSpec",
+    "register_component",
     "AutoDraftConfig",
     "register_draft_config",
     "DraftConfig",
