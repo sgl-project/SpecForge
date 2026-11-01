@@ -32,6 +32,9 @@ class EaglePretrainedConfig(LlamaConfig):
 
 @dataclass(frozen=True, kw_only=True)
 class EagleConfig(DraftConfig):
+    attention_contract = "eagle_cache"
+    requires_causal = True
+
     _nested_fields = frozenset({"aux_hidden_state_layer_ids"})
     target_hidden_size: int
     aux_hidden_state_layer_ids: tuple[int, ...] | None

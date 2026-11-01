@@ -65,6 +65,8 @@ class DSpineConfig:
 
 @dataclass(frozen=True, kw_only=True)
 class DSpineDraftConfig(DFlashConfig):
+    requires_causal = True
+
     dspine: DSpineConfig
 
     @classmethod

@@ -20,3 +20,7 @@ def build_ffn(
     if choice.type != "dense" or choice.variant is not None:
         raise ValueError(f"FFN {choice!r} is not implemented")
     return dense_factory(config)
+
+
+def build_dense(*, spec, config, dense_factory):
+    return dense_factory(config)

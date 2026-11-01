@@ -12,6 +12,8 @@ from .dflash import DFlashConfig
 
 @dataclass(frozen=True, kw_only=True)
 class DFlash2Config(DFlashConfig):
+    requires_conv = True
+
     conv_kernel_size: int
     conv_group_size: int
     selector_rank: int

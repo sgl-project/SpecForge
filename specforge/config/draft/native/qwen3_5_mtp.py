@@ -21,6 +21,9 @@ from .rope import resolve_rope_type, validate_native_rope_type
 
 @dataclass(frozen=True, kw_only=True)
 class Qwen3_5MTPConfig(DraftConfig):
+    attention_contract = "qwen_mtp"
+    requires_causal = True
+
     _nested_fields = frozenset({"share_lm_head"})
     attn_output_gate: bool
     partial_rotary_factor: float
