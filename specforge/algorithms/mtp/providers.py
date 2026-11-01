@@ -4,7 +4,7 @@ MTP fine-tunes the single-layer draft head shipped natively with Qwen3.5-style
 checkpoints.  The training signal is the target model's *final* (post-norm)
 hidden state — unlike EAGLE3 it needs no aux-layer concat, so the offline
 capture persists only ``input_ids`` / ``loss_mask`` / ``target_last_hidden_states``
-(the streaming layout still carries the aux tensor the server patch always
+(the streaming layout still carries the aux tensor the capture plugin always
 produces; the strategy ignores it).
 
 Draft construction initializes from the *native* ``mtp.*`` weights inside the

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Two-node Qwen3.8-27B DFlash2 recipe:
-#   rank 0: Mooncake + eight SGLang v0.5.18 TP1 capture servers + CPU producer
+#   rank 0: Mooncake + eight SGLang main TP1 capture servers + CPU producer
 #   rank 1: eight-rank FSDP consumer/trainer
 #
 # Launch this command on both nodes. The cluster launcher supplies
 # RCLI_NODE_RANK, RCLI_NUM_NODES, and RCLI_HEAD_IP; both nodes must share the
-# fresh DISAGG_RUN_ROOT. Install SGLang v0.5.18 in the active environment; the
+# fresh DISAGG_RUN_ROOT. Install SGLang main in the active environment; the
 # shared launcher requires the SpecForge capture plugin and compatible SGLang APIs.
 # Throughput, split and flow-control notes:
 # docs/recipes/qwen3.8-27b-dflash2-disaggregated.md

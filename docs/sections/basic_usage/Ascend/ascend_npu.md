@@ -11,7 +11,8 @@ A3 (64GB) host.
 ## 1. Installation
 
 You need an Ascend host with the driver, CANN, and a `torch_npu`-enabled
-PyTorch already installed, plus SGLang `0.5.18` with NPU support. Then install
+PyTorch already installed, plus an NPU-compatible SGLang `main` build with
+the capture extension APIs described below. Then install
 SpecForge without touching that stack:
 
 ```bash
@@ -29,7 +30,7 @@ RMSNorm/SwiGLU (`model.use_liger_kernel` resolves to off). Liger's Ascend
 backend is not validated in SpecForge; an explicit `model.use_liger_kernel:
 true` tries it and logs a warning.
 
-### Install the SGLang capture plugin (online runs only)
+### Install the SGLang capture plugin (online and offline preparation)
 
 Use an Ascend-compatible SGLang build with the generic extension APIs required
 by [the plugin guide](../../../../plugins/sglang-spec-capture/README.md):
@@ -39,8 +40,8 @@ python -m pip install --no-deps plugins/sglang-spec-capture
 export SPECFORGE_SPEC_CAPTURE=1
 ```
 
-The stock 0.5.18 build is insufficient. The plugin handles Ascend's CPU segment
-mount directly; no companion source patch is needed. Offline training from
+Release 0.5.23 lacks the required capture APIs. The plugin handles Ascend's CPU
+segment mount directly. Offline training from
 existing feature files needs no capture service.
 
 ### Device visibility on Ascend

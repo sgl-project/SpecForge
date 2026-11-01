@@ -18,6 +18,7 @@ import ast
 import os
 import subprocess
 import sys
+import textwrap
 import unittest
 
 _CAPTURE_DIR = os.path.normpath(
@@ -58,6 +59,40 @@ class OfflineSglangBoundaryTest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def test_offline_capture_round_trip_without_sglang(self):
+        # Exercise feature capture, file publication and resume with the real
+        # plugin sink and a fake transport. Any SGLang import must fail even
+        # when the test environment happens to have it installed.
+        code = textwrap.dedent(
+            """
+            import importlib.abc
+            import sys
+            import unittest
+
+            class NoSglang(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "sglang" or fullname.startswith("sglang."):
+                        raise ModuleNotFoundError("offline client imported " + fullname)
+
+            sys.meta_path.insert(0, NoSglang())
+            suite = unittest.defaultTestLoader.loadTestsFromName(
+                "tests.test_offline_capture.test_client.OfflineCaptureTest."
+                "test_algorithms_round_trip_and_resume"
+            )
+            result = unittest.TextTestRunner().run(suite)
+            assert result.wasSuccessful()
+            assert not any(n == "sglang" or n.startswith("sglang.") for n in sys.modules)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=os.path.dirname(os.path.dirname(_CAPTURE_DIR)),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_public_wrapper_has_no_toplevel_sglang_import(self):
         path = os.path.join(_CAPTURE_DIR, "client.py")

@@ -88,7 +88,7 @@ and SGLang remain owned by the user, scheduler, or service platform.
 The `kimi-k3-dspark.yaml` recipe is the external
 two-node migration of the 64K Kimi K3 continual run. Its dedicated
 [runbook](../../docs/recipes/kimi-k3-dspark-disaggregated.md) pins the K3
-SGLang revision and patch target, preserves the old effective global batch and
+SGLang capture plugin requirements, preserves the old effective global batch and
 prompt order, and documents the TP8 capture plus four-rank trainer topology.
 
 `deepseek-v4-flash-dspark.yaml` trains a DSpark drafter for
@@ -477,7 +477,7 @@ the strategy's non-blocking copy.
 Select `receive_buffers: pageable` to restore fresh host receives. The 8 GiB receive-pool
 budget is allocated lazily per rank and excludes returned tensors and overflow buffers.
 
-Patched CUDA capture servers use GPU publication automatically when
+CUDA capture servers with the plugin use GPU publication automatically when
 `MOONCAKE_PROTOCOL=rdma` (managed-local: when `mooncake.protocol: rdma` is set
 explicitly); TCP and non-CUDA workers use host publication. External
 servers can set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` to disable it or `1` to explicitly

@@ -19,7 +19,6 @@ from unittest import mock
 from urllib.error import HTTPError
 
 from pydantic import ValidationError
-
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.cli import _config_for_role, main
 from specforge.config import Config, apply_overrides
@@ -1125,9 +1124,7 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(cfg.deployment.disaggregated.server_capture, "auto")
 
     def test_managed_auto_capture_resolves_to_the_installed_backend(self):
-        for installed, expected in (
-            (("plugin",), "plugin"),
-        ):
+        for installed, expected in ((("plugin",), "plugin"),):
             with self.subTest(installed=installed):
                 plan = self._managed_plan_for(
                     capture_module_probe=_installed_capture(*installed)
@@ -1335,9 +1332,7 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "1")
 
     def test_managed_capture_backend_overrides_inherited_plugin_switch(self):
-        for backend, inherited, expected in (
-            ("plugin", "0", "1"),
-        ):
+        for backend, inherited, expected in (("plugin", "0", "1"),):
             with (
                 self.subTest(backend=backend),
                 mock.patch.dict(os.environ, {"SPECFORGE_SPEC_CAPTURE": inherited}),
@@ -1844,11 +1839,10 @@ class LaunchPlanTest(unittest.TestCase):
                             server["extra_args"] = [second]
                         Config.model_validate(raw)
 
-    def test_flag_tables_match_the_pinned_sglang_parser(self):
+    def test_flag_tables_match_the_installed_sglang_parser(self):
         import argparse
 
         from sglang.srt.server_args import ServerArgs
-
         from specforge.config.schema import (
             _SGLANG_EXACT_PREFIX_FLAGS,
             _SGLANG_FLAG_ALIASES,
@@ -2737,9 +2731,7 @@ class LaunchPlanTest(unittest.TestCase):
                 popen.assert_not_called()
 
     @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
-    def test_managed_preflight_rejects_mooncake_tcp_overrides(
-        self, _capture_modules
-    ):
+    def test_managed_preflight_rejects_mooncake_tcp_overrides(self, _capture_modules):
         with (
             tempfile.TemporaryDirectory() as parent,
             mock.patch(

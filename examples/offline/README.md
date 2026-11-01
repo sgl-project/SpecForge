@@ -13,8 +13,9 @@ config/tokenizer and the same draft config used for training.
 
 Use an SGLang environment with the native APIs described in the
 [plugin installation guide](../../plugins/sglang-spec-capture/README.md), and
-install the current plugin there. Stock SGLang 0.5.18 is insufficient. Keep the
-SpecForge client in its own environment with a compatible Mooncake wheel.
+install the current plugin there. SGLang main is required; released 0.5.23
+still lacks the capture APIs. The server and SpecForge client may use the same
+environment with a compatible Mooncake wheel, or separate environments.
 
 For a single-host TCP example, start a Mooncake master in a separate terminal:
 

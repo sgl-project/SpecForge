@@ -21,7 +21,8 @@ build with these generic extension points:
 This version requires SGLang's [aux-capture changes in PR #43449](https://github.com/sgl-project/sglang/pull/43449)
 and the completion-based `defer_response` revision of
 [PR #43450](https://github.com/sgl-project/sglang/pull/43450), or a branch containing
-both. These extension points are not available in stock SGLang 0.5.18.
+both. Use SGLang main: the released 0.5.23 wheel still lacks the forward
+observer, completion and auxiliary-capture APIs required here.
 
 The aux-capture API returns `last_hidden_states` after the final norm and
 before LM-head-only scaling, including Inkling's muP division. The plugin
@@ -29,11 +30,11 @@ preserves those values; SpecForge folds `logits_mup_width_multiplier` into
 its frozen target head. Older builds that return scaled states are unsupported;
 upgrade the capture environment to a build with the required API.
 
-Use separate environments for the SGLang server and SpecForge training.
-SpecForge currently pins SGLang 0.5.18 and different Torch/Transformers versions;
-installing the main SpecForge package into the server environment would replace
-the server's dependencies. The server only needs this plugin, its SGLang build,
-and Mooncake; the plugin does not import the main SpecForge package.
+SpecForge and its capture server now use the same dependency versions: SGLang
+main, Torch 2.14.1 and Transformers 5.19.0. They can run in the same environment;
+the server remains a separate process. Separate environments are also supported
+through `capture_servers[].python_executable`. The plugin itself does not import
+the main SpecForge package.
 
 Install into the SGLang server's environment. The plugin declares no
 dependencies, so the server's pins stay intact:
@@ -51,19 +52,21 @@ Source installation requires the Rust toolchain pinned by SGLang, a C/C++
 compiler, and CUDA development tools. An existing compatible SGLang server
 environment can also be used.
 
-For example, from the SpecForge checkout on a CUDA 13 host, with an SGLang
-checkout containing both changes:
+For example, from the SpecForge checkout on a CUDA 13 host with the Rust,
+C/C++ and CUDA build tools required by SGLang main:
 
 ```bash
-python3.12 -m venv .venv-sglang .venv-training
-.venv-sglang/bin/python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
-.venv-sglang/bin/python -m pip install -e /path/to/sglang/python mooncake-transfer-engine-cuda13
-.venv-sglang/bin/python -m pip install --no-deps plugins/sglang-spec-capture
-.venv-training/bin/python -m pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
-.venv-training/bin/python -m pip install -e . mooncake-transfer-engine-cuda13
-.venv-sglang/bin/python -m pip check
-.venv-training/bin/python -m pip check
+uv venv .venv -p 3.12
+source .venv/bin/activate
+uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+uv pip install wheel setuptools setuptools-rust setuptools-scm
+uv pip install --no-build-isolation --prerelease=allow -e .
+uv pip install --no-deps plugins/sglang-spec-capture
+uv pip install mooncake-transfer-engine-cuda13
 ```
+
+The SGLang requirement follows `main`; no cache refresh is forced. Rebuild
+optional compiled training kernels against the installed Torch when upgrading.
 
 SGLang discovers the plugin through the `sglang.srt.plugins` entry point. If
 `SGLANG_PLUGINS` is set, it must include `specforge_spec_capture`.
@@ -74,7 +77,7 @@ SGLang discovers the plugin through the `sglang.srt.plugins` entry point. If
 SPECFORGE_SPEC_CAPTURE=1 \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:50051 \
 MOONCAKE_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-.venv-sglang/bin/python -m sglang.launch_server --model-path <target> --skip-tokenizer-init \
+python -m sglang.launch_server --model-path <target> --skip-tokenizer-init \
   --chunked-prefill-size -1 \
   --speculative-algorithm DFLASH --enable-return-aux-hidden-states \
   --return-aux-hidden-state-layer-ids 1 16 31 46 61 \

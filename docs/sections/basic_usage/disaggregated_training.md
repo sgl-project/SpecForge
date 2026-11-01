@@ -43,7 +43,7 @@ loader workers) so the strategy sizes DFlash-family anchors without a GPU sync. 
 tensors, prefetched batches, and overflow allocations consume additional memory.
 Set `deployment.disaggregated.receive_buffers: pageable` to use fresh CPU receives.
 
-Patched CUDA capture servers automatically publish device tensors when
+CUDA capture servers with the plugin automatically publish device tensors when
 `MOONCAKE_PROTOCOL=rdma`; managed-local servers do so only when
 `mooncake.protocol: rdma` is set explicitly. TCP and non-CUDA workers keep host
 publication. Set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` on an external server, or
