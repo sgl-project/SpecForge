@@ -9,10 +9,10 @@ from unittest import mock
 import torch
 from transformers import Qwen3Config
 
-from specforge.modeling.draft.models import dflash2
-from specforge.modeling.draft.models.dflash2 import (
+from specforge.modeling.draft.models.dflash2 import DFlash2DraftModel
+from specforge.modeling.draft.models.layers.convolution import dflash2
+from specforge.modeling.draft.models.layers.convolution.dflash2 import (
     FUSED_CONV_ENV,
-    DFlash2DraftModel,
     DFlashGroupedConv,
 )
 

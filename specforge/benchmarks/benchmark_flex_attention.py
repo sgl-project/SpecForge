@@ -9,7 +9,10 @@ from transformers import LlamaConfig
 from transformers.cache_utils import DynamicCache
 
 from specforge.modeling._mask_utils import prepare_decoder_attention_mask
-from specforge.modeling.draft.models.eagle3 import LlamaAttention, LlamaFlexAttention
+from specforge.modeling.draft.models.layers.attention.eagle import (
+    LlamaAttention,
+    LlamaFlexAttention,
+)
 
 dynamo.config.recompile_limit = 64
 

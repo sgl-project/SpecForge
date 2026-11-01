@@ -10,7 +10,7 @@ from transformers import PretrainedConfig
 from specforge.core.eagle3_adapters import SdpaLikeAdapter, UspAdapter
 from specforge.distributed import destroy_distributed, init_distributed
 from specforge.modeling.draft.models.eagle3 import LlamaDecoderLayer
-from specforge.modeling.draft.models.layers.attention.parallel import (
+from specforge.modeling.draft.models.layers.attention.parallel.ring import (
     ring_flash_attn_func,
 )
 from specforge.utils import padding

@@ -11,8 +11,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from specforge.config.draft.algorithms.dspine import DSpineDraftConfig
-from specforge.modeling.draft.models.dflash import DFlashDraftModel
 from specforge.modeling.draft.registry import register_draft
+
+from .dflash import DFlashDraftModel
 
 
 class DSpineOutput(NamedTuple):
