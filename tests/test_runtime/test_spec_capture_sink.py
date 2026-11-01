@@ -21,8 +21,6 @@ sys.path.insert(
 from specforge_sglang_capture import sink
 
 
-
-
 class _BufferStore:
     def __init__(self, *, device=False, register_status=0):
         self.device = device

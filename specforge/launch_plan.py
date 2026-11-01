@@ -788,11 +788,7 @@ def _managed_local_services(
                 if gpu_put is not None
                 else {}
             ),
-            **(
-                {"SPECFORGE_SPEC_CAPTURE": "1"}
-                if server_capture is not None
-                else {}
-            ),
+            **({"SPECFORGE_SPEC_CAPTURE": "1"} if server_capture is not None else {}),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),

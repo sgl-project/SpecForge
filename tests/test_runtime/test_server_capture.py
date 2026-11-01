@@ -186,8 +186,7 @@ class _StubCaptureServer:
 
 def _request_specs(body):
     return [
-        json.loads(p["custom_params"]["spec_capture"])
-        for p in body["sampling_params"]
+        json.loads(p["custom_params"]["spec_capture"]) for p in body["sampling_params"]
     ]
 
 
