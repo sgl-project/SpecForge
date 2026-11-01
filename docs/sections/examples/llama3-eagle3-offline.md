@@ -15,9 +15,13 @@ python ./scripts/prepare_data.py --dataset sharegpt
 Feature preparation is a data-processing step, not a second training entry
 point:
 
+Start the plugin server and Mooncake as described in the
+[offline capture guide](../../../examples/offline/README.md), using the same
+Llama target and EAGLE3 layer IDs. Then run the CPU preparation client:
+
 ```bash
-torchrun --standalone --nproc_per_node 8 \
-  scripts/prepare_hidden_states.py \
+python scripts/prepare_hidden_states.py \
+  --server-urls http://127.0.0.1:30000 \
   --strategy eagle3 \
   --target-model-path meta-llama/Llama-3.1-8B-Instruct \
   --draft-model-config configs/llama3-8B-eagle3.json \
@@ -25,7 +29,6 @@ torchrun --standalone --nproc_per_node 8 \
   --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
   --chat-template llama3 \
   --max-length 4096 \
-  --tp-size 1 \
   --batch-size 32
 ```
 

@@ -359,6 +359,57 @@ class TestServerCaptureGate(unittest.TestCase):
         return aux, logits
 
     # -- tests -------------------------------------------------------------------
+    def test_offline_plugin_to_files_matches_reference_and_resumes(self):
+        from pathlib import Path
+
+        from scripts.prepare_hidden_states import HiddenStatesGenerator
+        from specforge.algorithms.builtin import builtin_algorithm_registry
+        from specforge.offline_capture import OfflineCaptureClient
+
+        layout = (
+            builtin_algorithm_registry()
+            .resolve("eagle3")
+            .providers.offline_for("text")
+            .capture_layout
+        )
+        tokens = [[5, 6, 7, 8, 9, 10], [11, 12, 13]]
+        rows = [
+            {
+                "input_ids": row,
+                "attention_mask": [1] * len(row),
+                "loss_mask": [1] * len(row),
+            }
+            for row in tokens
+        ]
+        with tempfile.TemporaryDirectory(dir=self.workdir) as directory:
+            with (
+                OfflineCaptureClient(
+                    [f"http://localhost:{PORT}"],
+                    target_model_path=self.target_dir,
+                    capture_layers=AUX_LAYER_IDS,
+                    layout=layout,
+                    target_hidden_size=H,
+                ) as client,
+                HiddenStatesGenerator(client, layout) as generator,
+            ):
+                generator.generate([rows], directory)
+                files = sorted(Path(directory).rglob("*.ckpt"))
+                self.assertEqual(len(files), len(rows))
+                mtimes = [path.stat().st_mtime_ns for path in files]
+                generator.generate([rows], directory)
+                self.assertEqual(mtimes, [path.stat().st_mtime_ns for path in files])
+            for row, path in zip(tokens, files):
+                aux, _ = self._hf_reference([row])
+                record = torch.load(path, weights_only=True)
+                self.assertEqual(set(record), set(layout.output_names))
+                self.assertEqual(record["input_ids"].tolist(), row)
+                torch.testing.assert_close(
+                    record["aux_hidden_state"].float(),
+                    aux[0].float(),
+                    rtol=TOL,
+                    atol=TOL,
+                )
+
     def test_eagle3_zero_copy_end_to_end(self):
         from specforge.inference.adapters.server_capture import (
             SGLangServerCaptureAdapter,
