@@ -22,6 +22,8 @@ import sys
 from contextlib import nullcontext
 from typing import Callable, Mapping, Optional
 
+import torch
+
 from specforge.algorithms.common.providers import (
     MODEL_PROVENANCE_CONTRACT_KEY,
     OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
@@ -101,6 +103,7 @@ class Trainer:
         total_steps: Optional[int] = None,
         per_sample_transform=None,
         durable_ack: bool = True,
+        async_ack: bool = False,
         resume_from: Optional[str] = None,
         resume_state: Optional[dict] = None,
         dataset_size: Optional[int] = None,
@@ -142,9 +145,15 @@ class Trainer:
                 "refs_for_epoch must be callable and accompany a refs source"
             )
         trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
+        # Pooled reads finish their device copies before yielding to the trainer.
+        consumer_device = getattr(store, "consumer_device", None)
+        loader_device = consumer_device() if callable(consumer_device) else None
+        if not isinstance(loader_device, torch.device):
+            loader_device = "cpu"
         loader = FeatureDataLoader(
             store,
             **ref_source,
+            device=loader_device,
             batch_size=batch_size,
             collate_fn=collate_fn,
             per_sample_transform=per_sample_transform,
@@ -152,6 +161,9 @@ class Trainer:
             strategy=algorithm_name,
             ack=not defer_queue_ack,
             num_workers=dataloader_num_workers,
+            # Pin in the existing loader workers so Domino's non-blocking H2D
+            # copies do not add pinning work to the training thread.
+            pin_memory=dataloader_num_workers > 0 and torch.cuda.is_available(),
         )
         if refs_for_epoch is not None:
             expected_refs = len(ref_source["refs"])
@@ -469,6 +481,9 @@ class Trainer:
             start_samples=resume["epoch_samples"] if resume else 0,
             data_prepositioned=data_prepositioned,
             profiling_options=profiling_options,
+            # Overlap each optimizer boundary's durable ack with the next step
+            # (TrainerController flushes it before eval/checkpoint/return).
+            async_ack=bool(async_ack and ack_fn is not None),
         )
         if resume is not None:
             # The loaded checkpoint already represents this durable step. If a
@@ -539,7 +554,7 @@ class Trainer:
                 self._on_fit_failure(exc)
             raise
         finally:
-            primary_exception = sys.exception()
+            primary_exception = sys.exc_info()[1]
             cleanup_errors: list[tuple[str, BaseException]] = []
 
             def capture_cleanup(label: str, action) -> None:

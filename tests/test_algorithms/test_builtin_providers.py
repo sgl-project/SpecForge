@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import unittest
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,11 +18,17 @@ from specforge.algorithms.common.providers import (
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepRuntimeConfig,
+    resolve_server_capture_layout,
 )
 from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
+from specforge.algorithms.registry import AlgorithmRegistration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "dspine", "eagle3", "mtp", "peagle")
+
+
+def _teacher_metrics_config(enabled: bool):
+    return SimpleNamespace(training=SimpleNamespace(dflash_teacher_metrics=enabled))
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
@@ -54,6 +60,19 @@ class BuiltinProviderContractTest(unittest.TestCase):
                     ),
                 }
                 self.assertEqual(contract_keys, provider_keys)
+
+    def test_dflash_family_requires_a_trainable_block_size(self):
+        for algorithm in ("dflash", "domino", "dspark"):
+            minimum_loss_tokens = self.registry.resolve(
+                algorithm
+            ).providers.model.minimum_loss_tokens
+            with self.subTest(algorithm=algorithm):
+                self.assertEqual(
+                    minimum_loss_tokens(None, SimpleNamespace(block_size=2)),
+                    2,
+                )
+                with self.assertRaisesRegex(ValueError, "block_size >= 2"):
+                    minimum_loss_tokens(None, SimpleNamespace(block_size=1))
 
     def test_algorithm_metadata_has_no_factories_or_topology_flags(self):
         field_names = {field.name for field in fields(AlgorithmSpec)}
@@ -101,6 +120,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         self.assertEqual(
             {
                 "architecture",
+                "compatible_architectures",
                 "target_defaults",
                 "expected_auto_map_model",
                 "apply_overrides",
@@ -135,7 +155,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertEqual(vocab_size, defaults.draft_vocab_size)
                 self.assertEqual(has_override, policy.apply_overrides is not None)
 
-        for name in ("domino", "dspark"):
+        for name in ("domino", "dspark", "mtp"):
             with self.subTest(algorithm=name):
                 policy = self.registry.resolve(name).providers.model.draft_config
                 self.assertIsNone(policy.target_defaults)
@@ -149,8 +169,11 @@ class BuiltinProviderContractTest(unittest.TestCase):
             self.assertEqual({"text"}, modalities, registration.name)
 
     def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
+        from specforge.modeling.draft.dspine import DSpineConfig
+
         training = SimpleNamespace(
             attention_backend="flex_attention",
+            trim_loss_positions=True,
             compact_teacher=True,
             compact_teacher_chunk_size=1024,
             lambda_base_start=0.75,
@@ -163,6 +186,10 @@ class BuiltinProviderContractTest(unittest.TestCase):
             norm_before_residual=True,
             target_layer_ids=[3, 7],
             pure_draft_prefix_len=2,
+            block_size=16,
+            dspine_config=DSpineConfig(),
+            layer_types=["full_attention"] * 2,
+            sliding_window=None,
         )
         dflash_family = SimpleNamespace(
             block_size=16,
@@ -172,6 +199,9 @@ class BuiltinProviderContractTest(unittest.TestCase):
             loss_decay_gamma=2.0,
             loss_type="dpace",
             dpace_alpha=0.4,
+            lk_loss_type="lambda",
+            kl_scale=0.9,
+            kl_decay=0.8,
             shift_label=True,
             dspark_ce_loss_alpha=0.1,
             dspark_l1_loss_alpha=0.8,
@@ -194,6 +224,8 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "dflash": dflash_family,
             "domino": dflash_family,
             "dspark": dflash_family,
+            "dspine": dflash_family,
+            "mtp": SimpleNamespace(),
         }
         expected_keys = {
             "eagle3": {
@@ -201,6 +233,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "eagle3_lk_loss_type",
                 "eagle3_kl_scale",
                 "eagle3_kl_decay",
+                "eagle3_trim_loss_positions",
                 "eagle3_compact_teacher",
             },
             "peagle": {
@@ -214,6 +247,9 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dflash_num_anchors",
                 "dflash_loss_type",
                 "dflash_dpace_alpha",
+                "dflash_lk_loss_type",
+                "dflash_kl_scale",
+                "dflash_kl_decay",
             },
             "domino": {
                 "domino_block_size",
@@ -227,6 +263,20 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
+            },
+            "dspine": {
+                "dspine_attention_layout",
+                "dspine_options",
+                "dspine_block_size",
+                "dspine_target_layer_ids",
+                "dspine_attention_backend",
+                "dspine_loss_decay_gamma",
+            },
+            "mtp": {
+                "mtp_draft_num_hidden_layers",
+                "mtp_draft_vocab_size",
+                "mtp_share_lm_head",
+                "mtp_attention_backend",
             },
         }
 
@@ -247,6 +297,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         config = SimpleNamespace(
             training=SimpleNamespace(
                 attention_backend="flex_attention",
+                trim_loss_positions=False,
                 compact_teacher=False,
                 compact_teacher_chunk_size=None,
             )
@@ -282,6 +333,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             (
                 ("compact_teacher", False),
                 ("compact_teacher_chunk_size", None),
+                ("trim_loss_positions", False),
             ),
         )
         self.assertEqual(
@@ -408,11 +460,135 @@ class BuiltinProviderContractTest(unittest.TestCase):
             ):
                 provider.create_input_adapter(object())
 
+    def test_dflash_teacher_metrics_selects_the_server_capture_layout(self):
+        registration = self.registry.resolve("dflash")
+        registered = registration.providers.server_streaming_for("text").layout
+        required = registration.spec.feature_contract("streaming", "text")
+
+        enabled = resolve_server_capture_layout(
+            registration, _teacher_metrics_config(True), modality="text"
+        )
+        disabled = resolve_server_capture_layout(
+            registration, _teacher_metrics_config(False), modality="text"
+        )
+
+        self.assertEqual(registered, enabled)
+        self.assertEqual("target_last_hidden_states", enabled.last_hidden_feature)
+        self.assertIsNone(disabled.last_hidden_feature)
+        self.assertEqual(
+            (registered.aux_feature, registered.passthrough),
+            (disabled.aux_feature, disabled.passthrough),
+        )
+        self.assertEqual(
+            {"input_ids", "loss_mask", "hidden_states"},
+            set(disabled.emitted_features),
+        )
+        self.assertLessEqual(required.required_tensors, disabled.emitted_features)
+        self.assertTrue(registration.spec.capabilities.supports_teacher_metrics_opt_out)
+
+    def test_other_builtins_always_request_their_registered_layout(self):
+        # Planning rejects the opt-out for these algorithms; resolution keeps
+        # their registered layouts regardless (DSpark trains on last_hidden).
+        for name in ("domino", "dspark", "eagle3", "mtp", "peagle"):
+            registration = self.registry.resolve(name)
+            provider = registration.providers.server_streaming_for("text")
+            with self.subTest(algorithm=name):
+                self.assertIsNone(provider.select_layout)
+                self.assertFalse(
+                    registration.spec.capabilities.supports_teacher_metrics_opt_out
+                )
+                for enabled in (True, False):
+                    self.assertEqual(
+                        provider.layout,
+                        resolve_server_capture_layout(
+                            registration,
+                            _teacher_metrics_config(enabled),
+                            modality="text",
+                        ),
+                    )
+        dspark = self.registry.resolve("dspark").providers.server_streaming_for("text")
+        self.assertEqual("target_last_hidden_states", dspark.layout.last_hidden_feature)
+
+    def test_layout_selection_may_only_drop_optional_features(self):
+        registration = self.registry.resolve("dflash")
+        provider = registration.providers.server_streaming_for("text")
+
+        def with_selector(select_layout):
+            stream = replace(provider, select_layout=select_layout)
+            return AlgorithmRegistration(
+                spec=registration.spec,
+                providers=replace(registration.providers, server_streaming=(stream,)),
+            )
+
+        added = replace(provider.layout, attention_mask_feature="attention_mask")
+        without_aux = replace(provider.layout, aux_feature=None)
+        cases = (
+            (lambda _config: added, ValueError, "may only drop features"),
+            (lambda _config: without_aux, ValueError, "required tensors"),
+            (
+                lambda _config: replace(
+                    provider.layout,
+                    aux_feature=provider.layout.last_hidden_feature,
+                    last_hidden_feature=provider.layout.aux_feature,
+                ),
+                ValueError,
+                "aux_feature",
+            ),
+            (
+                lambda _config: replace(
+                    provider.layout,
+                    passthrough=(
+                        ("input_ids", "loss_mask", ()),
+                        ("loss_mask", "input_ids", ()),
+                    ),
+                ),
+                ValueError,
+                "passthrough",
+            ),
+            (
+                lambda _config: replace(
+                    provider.layout,
+                    passthrough=(
+                        ("input_ids", "input_ids", (1,)),
+                        provider.layout.passthrough[1],
+                    ),
+                ),
+                ValueError,
+                "passthrough",
+            ),
+            (
+                lambda _config: replace(
+                    provider.layout,
+                    passthrough=(
+                        *provider.layout.passthrough,
+                        provider.layout.passthrough[0],
+                    ),
+                ),
+                ValueError,
+                "passthrough",
+            ),
+            (
+                lambda _config: {"aux": "hidden_states"},
+                TypeError,
+                "ServerCaptureLayout",
+            ),
+        )
+        for select_layout, error, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(error, message):
+                    resolve_server_capture_layout(
+                        with_selector(select_layout),
+                        _teacher_metrics_config(True),
+                        modality="text",
+                    )
+        with self.assertRaisesRegex(TypeError, "select_layout must be callable"):
+            replace(provider, select_layout=object())
+
     def test_building_catalog_does_not_import_training_or_torch(self):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==5; "
+            "r=builtin_algorithm_registry(); assert len(r)==7; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

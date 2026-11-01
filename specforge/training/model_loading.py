@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from specforge.algorithms.common.providers import DraftConfigProvider
+    from specforge.algorithms.registry import AlgorithmRegistration
     from specforge.config import Config
 
 logger = logging.getLogger(__name__)
@@ -114,7 +115,9 @@ def _draft_config_from_dict(payload: Dict[str, Any]) -> "PretrainedConfig":
     payload["architectures"] = [architecture]
     payload["tie_word_embeddings"] = False
     payload.setdefault("use_cache", True)
-    if payload.get("draft_vocab_size") is None:
+    if "draft_vocab_size" in payload and payload["draft_vocab_size"] is None:
+        raise ValueError("draft config draft_vocab_size cannot be null")
+    if "draft_vocab_size" not in payload:
         payload["draft_vocab_size"] = payload.get("vocab_size")
     return DRAFT_REGISTRY[architecture].config_class.from_dict(payload)
 
@@ -288,14 +291,47 @@ def resolve_draft_config(
         draft_config = _generate_draft_config(cfg, provider)
 
     expected = provider.architecture
+    compatible = provider.compatible_architectures or frozenset({expected})
     architectures = list(getattr(draft_config, "architectures", None) or [])
-    if architectures != [expected]:
+    if len(architectures) != 1 or architectures[0] not in compatible:
         raise ValueError(
             f"training.strategy={cfg.training.strategy!r} requires draft "
-            f"architecture {expected}, got {architectures!r}"
+            f"architecture in {sorted(compatible)!r}, got {architectures!r}"
         )
     _apply_draft_overrides(cfg, draft_config, provider)
     return draft_config
+
+
+def preflight_draft_kernels(
+    cfg: "Config", *, algorithm: "AlgorithmRegistration"
+) -> None:
+    """Import the Liger kernels this host's trainer draft build will resolve.
+
+    A supervisor about to start services or workers, and a disaggregated
+    consumer about to wait on its producer, call this so a missing install
+    fails at startup. The trainer's ``build_draft`` still owns the resolution.
+    """
+
+    if (
+        cfg.model.use_liger_kernel is False
+        or (
+            cfg.model.use_liger_kernel is None
+            and cfg.training.strategy in ("domino", "dspark", "dspine")
+        )
+        or not algorithm.spec.capabilities.supports_liger_kernel
+    ):
+        return
+    from specforge.modeling.draft.dflash_kernels import (
+        load_liger_dflash_kernels,
+        resolve_draft_liger_kernel_choice,
+    )
+
+    draft_config = resolve_draft_config(
+        cfg, provider=algorithm.providers.model.draft_config
+    )
+    choice = resolve_draft_liger_kernel_choice(cfg.model.use_liger_kernel, draft_config)
+    if choice.enabled:
+        load_liger_dflash_kernels(choice)
 
 
 def draft_config_dict(
@@ -467,6 +503,7 @@ __all__ = [
     "WarmStartReport",
     "draft_config_dict",
     "load_draft_config_source",
+    "preflight_draft_kernels",
     "resolve_draft_config",
     "warm_start_draft_model",
 ]

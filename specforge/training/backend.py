@@ -20,11 +20,32 @@ import contextlib
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+
+def _foreach_scale_(tensors: List[torch.Tensor], factor: torch.Tensor) -> None:
+    """``tensor.mul_(factor)`` for every tensor, one fused launch per group.
+
+    A same-device CUDA 0-dim factor is cast to each tensor's dtype by the
+    per-tensor ``mul_``; casting it once up front keeps ``_foreach_mul_`` on
+    its fused path (which requires matching dtypes) and bitwise identical.
+    """
+    groups: Dict[Tuple[torch.device, torch.dtype], List[torch.Tensor]] = {}
+    for tensor in tensors:
+        groups.setdefault((tensor.device, tensor.dtype), []).append(tensor)
+    for (device, dtype), group in groups.items():
+        scalar = factor
+        if (
+            isinstance(factor, torch.Tensor)
+            and device.type == "cuda"
+            and factor.device == device
+        ):
+            scalar = factor.to(dtype)
+        torch._foreach_mul_(group, scalar)
 
 
 @dataclass
@@ -125,12 +146,25 @@ class ParallelConfig:
 
 class TrainingBackend(abc.ABC):
     name: str
+    #: Whether ``step(loss_denominator=...)`` validates the global loss
+    #: denominator inside the optimizer's single host read, letting
+    #: ``TrainerCore`` skip its own synchronizing check.
+    checks_loss_denominator: bool = False
+
+    def accumulation_context(self, *, is_boundary: bool = True):
+        return contextlib.nullcontext()
 
     @abc.abstractmethod
     def prepare_model(self, model: nn.Module) -> nn.Module: ...
 
     @abc.abstractmethod
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None: ...
+
+    def scale_gradients(self, factor: torch.Tensor) -> None:
+        """Scale synchronized gradients before clipping and stepping."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement gradient scaling"
+        )
 
     @abc.abstractmethod
     def step(self) -> Optional[torch.Tensor]: ...
@@ -243,6 +277,11 @@ class FSDPTrainingBackend(TrainingBackend):
                     process_group=pc.fsdp_process_group,
                     broadcast_buffers=False,
                     gradient_as_bucket_view=True,
+                    bucket_cap_mb=(
+                        float(os.environ["SPECFORGE_DDP_BUCKET_CAP_MB"])
+                        if "SPECFORGE_DDP_BUCKET_CAP_MB" in os.environ
+                        else None
+                    ),
                 )
                 self._wrapper_kind = "ddp"
             else:
@@ -304,22 +343,48 @@ class FSDPTrainingBackend(TrainingBackend):
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
         """Backward one micro-step with one gradient collective per window.
 
-        Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
-        the boundary backward reduces the accumulated sum once.
+        FSDP defers reduction here; DDP requires ``accumulation_context``
+        around both forward and backward to defer its reducer.
         """
-        if is_boundary or not self._wrapped:
+        if is_boundary or not self._wrapped or self._wrapper_kind == "ddp":
             loss.backward()
         else:
             with self.module.no_sync():
                 loss.backward()
 
-    def step(self) -> Optional[torch.Tensor]:
-        """Run the optimizer step, which clips and returns the global grad norm."""
+    def accumulation_context(self, *, is_boundary: bool = True):
+        if self._wrapper_kind == "ddp" and not is_boundary:
+            return self.module.no_sync()
+        return contextlib.nullcontext()
+
+    def scale_gradients(self, factor: torch.Tensor) -> None:
+        if self.module is None:
+            raise RuntimeError("scale_gradients called before prepare_model")
+        with torch.no_grad():
+            _foreach_scale_(
+                [p.grad for p in self.module.parameters() if p.grad is not None],
+                factor,
+            )
+
+    @property
+    def checks_loss_denominator(self) -> bool:
+        return bool(getattr(self.optimizer, "checks_loss_denominator", False))
+
+    def step(
+        self, *, loss_denominator: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        """Run the optimizer step, which clips and returns the global grad norm.
+
+        ``loss_denominator`` is forwarded only when set; it requires an
+        optimizer that ``checks_loss_denominator``.
+        """
         if self.optimizer is None:
             raise RuntimeError(
                 "FSDPTrainingBackend.step called before optimizer is set"
             )
-        return self.optimizer.step()
+        if loss_denominator is None:
+            return self.optimizer.step()
+        return self.optimizer.step(loss_denominator=loss_denominator)
 
     def state_dict(self) -> dict:
         """Full training state ``{"model", "optimizer", "rng"}`` for resume.

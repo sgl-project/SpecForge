@@ -119,6 +119,7 @@ def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
         draft_model.load_embedding(
             cfg.model.target_model_path,
             embedding_key=cfg.model.embedding_key,
+            cache_dir=cfg.model.cache_dir,
         )
     draft_model.freeze_embedding()
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
@@ -135,6 +136,7 @@ def build_peagle_draft(cfg: Config, draft_config: PretrainedConfig):
         draft_model.load_embedding(
             cfg.model.target_model_path,
             embedding_key=cfg.model.embedding_key,
+            cache_dir=cfg.model.cache_dir,
         )
     _warm_start(
         cfg,
@@ -227,6 +229,25 @@ def resolve_eagle_capture_layers(
     return layers
 
 
+def _validate_dflash_block_size(draft_config: Any) -> None:
+    if isinstance(draft_config, dict):
+        method_config = draft_config.get("dflash_config", {}) or {}
+        block_size = draft_config.get("block_size", method_config.get("block_size"))
+    else:
+        method_config = getattr(draft_config, "dflash_config", {}) or {}
+        block_size = getattr(draft_config, "block_size", None)
+        if block_size is None:
+            block_size = method_config.get("block_size")
+    if (
+        not isinstance(block_size, int)
+        or isinstance(block_size, bool)
+        or block_size < 2
+    ):
+        raise ValueError(
+            "DFlash-family draft config must define an integer block_size >= 2"
+        )
+
+
 def resolve_dflash_capture_layers(
     _cfg: Config, draft_config: Any, _target_config: Any
 ) -> List[int]:
@@ -279,6 +300,7 @@ def build_eagle3_model(
         target_head = TargetHead.from_pretrained(
             cfg.model.target_model_path,
             lm_head_key=cfg.model.lm_head_key,
+            embedding_key=cfg.model.embedding_key,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
         )
@@ -320,6 +342,7 @@ def build_peagle_model(
         target_head = TargetHead.from_pretrained(
             cfg.model.target_model_path,
             lm_head_key=cfg.model.lm_head_key,
+            embedding_key=cfg.model.embedding_key,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
         )
@@ -334,6 +357,7 @@ def _build_dflash_family_model(
 ) -> AlgorithmModelParts:
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
+    _validate_dflash_block_size(draft_model)
     mask_token_id = _resolve_mask_token_id(cfg, draft_model, tokenizer)
     draft_model.mask_token_id = mask_token_id
     method_config = getattr(draft_model.config, "dflash_config", None)
@@ -362,6 +386,7 @@ def _build_dflash_family_model(
         "num_anchors": cfg.training.num_anchors,
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
         "objective_chunk_blocks": cfg.training.objective_chunk_blocks,
+        "objective_checkpointing": cfg.training.objective_checkpointing,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
     return AlgorithmModelParts(
@@ -387,6 +412,15 @@ def build_dflash_model(
             **common,
             loss_type=cfg.training.loss_type,
             dpace_alpha=cfg.training.dpace_alpha,
+            selector_loss_alpha=cfg.training.dflash2_selector_loss_alpha,
+            selector_warmup_ratio=cfg.training.dflash2_selector_warmup_ratio,
+            selector_ramp_ratio=cfg.training.dflash2_selector_ramp_ratio,
+            selector_stop_gradient=cfg.training.dflash2_selector_stop_gradient,
+            lk_loss_type=cfg.training.lk_loss_type,
+            kl_scale=cfg.training.kl_scale,
+            kl_decay=cfg.training.kl_decay,
+            teacher_metrics=cfg.training.dflash_teacher_metrics,
+            fused_logits_loss=cfg.training.fused_logits_loss,
         ),
     )
 
@@ -407,6 +441,7 @@ def build_domino_model(
         lambda common: OnlineDominoModel(
             **common,
             shift_label=bool(getattr(draft_model, "shift_label", False)),
+            fused_logits_loss=cfg.training.fused_logits_loss,
         ),
     )
 
@@ -428,13 +463,34 @@ def build_dspark_model(
             **common,
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
+            fused_logits_loss=cfg.training.fused_logits_loss,
             dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
+        ),
+    )
+
+
+def build_dspine_model(
+    cfg: Config,
+    draft_model: Any,
+    _draft_config: Any,
+    _target_config: Any,
+    tokenizer: Any,
+) -> AlgorithmModelParts:
+    from specforge.algorithms.dspine.model import OnlineDSpineModel
+
+    return _build_dflash_family_model(
+        cfg,
+        draft_model,
+        tokenizer,
+        lambda common: OnlineDSpineModel(
+            **common, fused_logits_loss=cfg.training.fused_logits_loss
         ),
     )
 
 
 def eagle3_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
     return {
+        "trim_loss_positions": cfg.training.trim_loss_positions,
         "compact_teacher": cfg.training.compact_teacher,
         "compact_teacher_chunk_size": cfg.training.compact_teacher_chunk_size,
     }
@@ -448,16 +504,8 @@ def domino_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
 
 
 def dflash_min_loss_tokens(_cfg: Config, draft_config: Any) -> int:
-    block_size = getattr(draft_config, "block_size", None)
-    if (
-        not isinstance(block_size, int)
-        or isinstance(block_size, bool)
-        or block_size < 1
-    ):
-        raise ValueError(
-            "DFlash-family draft config must define a positive integer block_size"
-        )
-    return 2 * block_size
+    _validate_dflash_block_size(draft_config)
+    return 2
 
 
 def populate_dflash_generated_config(
@@ -473,22 +521,48 @@ def populate_dflash_generated_config(
         )
     payload["num_target_layers"] = target_layers
     payload["block_size"] = 16
+    payload["layer_types"] = ["full_attention"] * int(payload["num_hidden_layers"])
+    payload["sliding_window"] = None
+    payload["use_sliding_window"] = False
     payload["dflash_config"] = {
         "target_layer_ids": build_target_layer_ids(target_layers, 1)
     }
 
 
 def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
-    if cfg.model.draft_num_hidden_layers is None:
-        return
-    from specforge.modeling.draft.dflash import build_target_layer_ids
-
-    target_layers = int(draft_config.num_target_layers)
-    method_config = dict(getattr(draft_config, "dflash_config", None) or {})
-    method_config["target_layer_ids"] = build_target_layer_ids(
-        target_layers, cfg.model.draft_num_hidden_layers
+    from specforge.modeling.draft.dflash import (
+        build_target_layer_ids,
+        resolve_dflash_attention_layout,
+        validate_dflash_attention_config,
     )
-    draft_config.dflash_config = method_config
+
+    method_config = dict(getattr(draft_config, "dflash_config", None) or {})
+    if cfg.model.draft_block_size is not None:
+        method_config["block_size"] = cfg.model.draft_block_size
+        draft_config.dflash_config = method_config
+
+    requested_layers = cfg.model.draft_num_hidden_layers
+    if requested_layers is not None:
+        layer_types = draft_config.layer_types
+        if len(layer_types) != requested_layers:
+            if len(set(layer_types)) > 1:
+                raise ValueError(
+                    "model.draft_num_hidden_layers cannot resize a mixed "
+                    "DFlash layer_types layout; provide a draft config with "
+                    "exactly the requested per-layer layout"
+                )
+            draft_config.layer_types = [layer_types[0]] * requested_layers
+
+        draft_config.dflash_config = {
+            **method_config,
+            "target_layer_ids": build_target_layer_ids(
+                int(draft_config.num_target_layers),
+                requested_layers,
+            ),
+        }
+
+    resolve_dflash_attention_layout(draft_config)
+    validate_dflash_attention_config(draft_config)
 
 
 __all__ = [
@@ -497,6 +571,7 @@ __all__ = [
     "build_dflash_model",
     "build_domino_model",
     "build_dspark_model",
+    "build_dspine_model",
     "build_eagle3_draft",
     "build_eagle3_model",
     "build_peagle_draft",

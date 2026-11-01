@@ -8,11 +8,8 @@ import torch._dynamo as dynamo
 from transformers import LlamaConfig
 from transformers.cache_utils import DynamicCache
 
-from specforge.modeling.draft.llama3_eagle import (
-    LlamaAttention,
-    LlamaFlexAttention,
-    prepare_decoder_attention_mask,
-)
+from specforge.modeling._mask_utils import prepare_decoder_attention_mask
+from specforge.modeling.draft.llama3_eagle import LlamaAttention, LlamaFlexAttention
 
 dynamo.config.recompile_limit = 64
 
@@ -60,8 +57,9 @@ def run_attention(
     attention_mask = torch.ones(batch_size, seq_len).to(device)
     decoder_attention_mask = prepare_decoder_attention_mask(
         attention_mask=attention_mask,
-        input_shape=(batch_size, seq_len),
-        inputs_embeds=input_embeds,
+        hidden_states=input_embeds,
+        batch_size=batch_size,
+        seq_length=seq_len,
         past_key_values_length=0,
     )
 

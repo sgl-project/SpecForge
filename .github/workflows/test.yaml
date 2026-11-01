@@ -13,7 +13,24 @@ permissions:
   contents: read
 
 jobs:
+  cleanup-runner:
+    if: (github.repository == 'sgl-project/SpecForge' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: [self-hosted]
+    concurrency:
+      group: specforge-gpu-ci
+      cancel-in-progress: false
+      queue: max
+    timeout-minutes: 5
+    steps:
+      # Job containers need a fresh Docker network before any container step can
+      # run, so stale networks must be pruned in a host-side prerequisite job.
+      - name: Prune stale Docker networks
+        shell: bash
+        run: docker network prune --force --filter "until=1h"
+
   unit-test:
+    needs: cleanup-runner
     if: (github.repository == 'sgl-project/SpecForge' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
     runs-on: [self-hosted]
@@ -22,11 +39,29 @@ jobs:
       cancel-in-progress: false
       queue: max
     container:
-      image: lmsysorg/sglang:v0.5.14-cu130 # we lock to this version to avoid repeated docker pull
+      image: lmsysorg/sglang:v0.5.18-cu130 # we lock to this version to avoid repeated docker pull
       options: --gpus all --shm-size=2g --rm -v /dev/shm --privileged --pid=host
+    # The self-hosted runner exports HTTP(S)_PROXY into the container but no
+    # longer a NO_PROXY, so local requests (sglang's own warmup to 127.0.0.1)
+    # went through the proxy and got 502. Keep loopback off the proxy here
+    # instead of relying on the runner's environment. (Actions env keys are
+    # case-insensitive, so no separate no_proxy; Python reads either case.)
+    env:
+      NO_PROXY: localhost,127.0.0.1,::1
+      # v2 deliberately ignores the legacy venv cache with stale dist-info files.
+      SPECFORGE_CI_CACHE: /github/home/specforge-ci-v2
+      FLASH_ATTN_VERSION: 2.8.3.post2
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # Cancelled or timed-out runs can leave processes behind which keep GPU
+      # memory allocated and make this run OOM. --pid=host above is what makes
+      # those leftovers visible from inside the container.
+      - name: Kill leftover GPU processes
+        timeout-minutes: 5
+        shell: bash
+        run: bash .github/workflows/scripts/kill_gpu_procs.sh
 
       - name: Restore cache
         run: |
@@ -34,8 +69,9 @@ jobs:
             cp -p -r /github/home/cache ./
           fi
 
-          if [ -d /github/home/sf ] && [ ! -z "$(ls -A /github/home/sf/)" ]; then
-            cp -p -r /github/home/sf ./
+          if [ -d "$SPECFORGE_CI_CACHE/sf" ]; then
+            rm -rf sf
+            cp -a "$SPECFORGE_CI_CACHE/sf" sf
           fi
 
       - name: Remove flashinfer # this is needed to avoid flashinfer jit compilation makes the program hang
@@ -51,13 +87,34 @@ jobs:
           fi
           source sf/bin/activate
           uv pip install wheel setuptools psutil packaging ninja
-          uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
-          MAX_JOBS=8  uv pip install -v flash-attn --no-build-isolation
+          uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
           uv pip install -v . --prerelease=allow
+          # SGLang 0.5.18 installs cubin separately and requires it to match
+          # flashinfer-python; replace the 0.6.12 copy in cached venvs.
+          uv pip install flashinfer-cubin==0.6.17 --index-url https://flashinfer.ai/whl
           # The live server-capture gate needs the Mooncake client AND the
           # mooncake_master console script; the isolated venv cannot see the
           # container's site-packages. cu130 image -> the cuda13 wheel.
           uv pip install mooncake-transfer-engine-cuda13
+
+      - name: Ensure FlashAttention ABI
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          source sf/bin/activate
+          bash .github/workflows/scripts/ensure_flash_attention.sh
+
+      - name: Save dependency cache
+        shell: bash
+        run: |
+          # Publish a complete snapshot, never merge into the previous venv.
+          # Save before tests so a test failure does not discard a valid FA build.
+          mkdir -p "$SPECFORGE_CI_CACHE"
+          staging=$(mktemp -d "$SPECFORGE_CI_CACHE/sf.XXXXXX")
+          trap 'rm -rf "$staging"' EXIT
+          cp -a sf "$staging/sf"
+          rm -rf "${SPECFORGE_CI_CACHE:?}/sf"
+          mv "$staging/sf" "$SPECFORGE_CI_CACHE/sf"
 
       - name: Run live server-capture numerics gate
         timeout-minutes: 15
@@ -71,6 +128,15 @@ jobs:
           python -c 'import importlib.util, shutil, torch; assert torch.cuda.is_available(), "live capture gate requires CUDA"; assert importlib.util.find_spec("mooncake.store"), "live capture gate requires mooncake.store"; assert shutil.which("mooncake_master") or __import__("os").environ.get("MOONCAKE_MASTER_SERVER_ADDR"), "live capture gate requires mooncake_master"'
           python -m unittest tests.test_runtime.test_server_capture_gate -v
 
+      - name: Run Liger kernel tests
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          source sf/bin/activate
+          export PYTHONPATH=$PWD
+          # test_training is not a package, so discovery does not collect it.
+          python -m unittest tests.test_training.test_liger_kernel -v
+
       - name: Run test
         timeout-minutes: 45
         shell: bash
@@ -81,5 +147,4 @@ jobs:
 
       - name: Save cache
         run: |
-          cp -p -r sf /github/home/
           cp -p -r cache /github/home/

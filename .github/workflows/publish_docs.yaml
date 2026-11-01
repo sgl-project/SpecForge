@@ -22,49 +22,28 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          fetch-depth: 0 # lastUpdated timestamps come from git history
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
-          cache-dependency-path: docs/spec_bundle/package-lock.json
-
-      - name: Install dependencies
-        run: |
-          pip install -r docs/requirements.txt
-
-      - name: Build spec bundle dashboard
-        run: |
-          # Copy logos to public directory
-          cp assets/logo.png docs/spec_bundle/public/logo.png
-          cp docs/_static/imgs/specbundle-logo.png docs/spec_bundle/public/specbundle-logo.png
-          cd docs/spec_bundle
-          npm ci
-          npm run build
-          # Clean up node_modules to prevent Sphinx from processing them
-          rm -rf node_modules
-          cd ..
+          cache-dependency-path: docs/web/package-lock.json
 
       - name: Build documentation
         run: |
-          cd docs
-          make html
-          # Copy SpecBundle to root of output directory
-          mkdir -p _build/html/SpecBundle
-          cp -r spec_bundle/dist/* _build/html/SpecBundle/
+          cd docs/web
+          npm ci
+          npm run build
 
       - name: Add .nojekyll file
         run: |
-          touch ./docs/_build/html/.nojekyll
+          touch ./docs/web/.vitepress/dist/.nojekyll
 
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs/_build/html
+          publish_dir: ./docs/web/.vitepress/dist

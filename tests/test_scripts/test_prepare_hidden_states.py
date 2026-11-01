@@ -1,5 +1,4 @@
 import gzip
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,9 +34,24 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
 
         self.assertEqual("eagle3", args.strategy)
         self.assertIsNone(args.draft_model_config)
+        self.assertFalse(args.sglang_disable_radix_cache)
         self.assertFalse(hasattr(args, "draft_num_hidden_layers"))
         self.assertFalse(hasattr(args, "draft_block_size"))
         self.assertFalse(hasattr(args, "capture_layers"))
+
+    def test_cli_can_explicitly_disable_radix_cache(self):
+        argv = [
+            "prepare_hidden_states.py",
+            "--target-model-path",
+            "target",
+            "--data-path",
+            "data.jsonl",
+            "--sglang-disable-radix-cache",
+        ]
+        with mock.patch("sys.argv", argv):
+            args = parse_args()
+
+        self.assertTrue(args.sglang_disable_radix_cache)
 
     def test_cli_accepts_dflash_family_config(self):
         argv = [
@@ -109,12 +123,18 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             with self.subTest(strategy=strategy):
                 plan = resolve_offline_capture_plan(args, target_config)
                 self.assertEqual(strategy, plan.strategy)
-                self.assertEqual(
-                    "eagle3" if strategy == "eagle3" else "dflash",
-                    plan.capture_method,
-                )
+                expected_capture_method = {
+                    "eagle3": "eagle3",
+                    "dspark": "dspark",
+                }.get(strategy, "dflash")
+                self.assertEqual(expected_capture_method, plan.capture_method)
                 self.assertEqual(layers, plan.capture_layers)
                 self.assertEqual(feature_names, set(plan.layout.output_names))
+                if strategy == "eagle3":
+                    self.assertIsNone(plan.loss_mask_filter)
+                else:
+                    self.assertTrue(plan.loss_mask_filter([0, 1, 1]))
+                    self.assertFalse(plan.loss_mask_filter([1, 0, 1]))
 
     def test_build_uses_dedicated_offline_loader(self):
         config = SimpleNamespace(num_hidden_layers=32, dtype=None)
@@ -130,6 +150,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             sglang_enable_dp_attention=False,
             sglang_enable_dp_lm_head=False,
             sglang_ep_size=1,
+            sglang_disable_radix_cache=False,
             batch_size=4,
             max_length=128,
         )
@@ -147,6 +168,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
         self.assertEqual(load.call_args.args, ("target",))
         self.assertNotIn("device", load.call_args.kwargs)
         self.assertNotIn("cache_dir", load.call_args.kwargs)
+        self.assertFalse(load.call_args.kwargs["disable_radix_cache"])
         target.set_capture_layers.assert_called_once_with(
             [2, 7, 19],
             capture_method="eagle3",
@@ -166,6 +188,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             sglang_enable_dp_attention=False,
             sglang_enable_dp_lm_head=False,
             sglang_ep_size=1,
+            sglang_disable_radix_cache=True,
             batch_size=4,
             max_length=128,
         )
@@ -174,7 +197,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
         with mock.patch(
             "scripts.prepare_hidden_states.load_offline_capture",
             return_value=target,
-        ):
+        ) as load:
             self.assertIs(
                 build_target_model(
                     args,
@@ -185,6 +208,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 target,
             )
 
+        self.assertTrue(load.call_args.kwargs["disable_radix_cache"])
         target.set_capture_layers.assert_called_once_with(
             capture_layers,
             capture_method="dflash",
@@ -269,29 +293,24 @@ class PrepareHiddenStatesSerializationTest(unittest.TestCase):
 
 
 class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
-    def test_resolves_draft_vocab_size_from_local_json_file(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "config.json"
-            config_path.write_text(
-                json.dumps({"vocab_size": 16, "draft_vocab_size": 8}),
-                encoding="utf-8",
-            )
-
-            self.assertEqual(_resolve_draft_vocab_size(str(config_path)), 8)
-
-    def test_rejects_directory_and_hugging_face_repo_id(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(FileNotFoundError, "local JSON file"):
-                _resolve_draft_vocab_size(directory)
-        with self.assertRaisesRegex(FileNotFoundError, "local JSON file"):
-            _resolve_draft_vocab_size("org/draft-model")
+    def test_prefers_resolved_draft_vocab_size(self):
+        config = SimpleNamespace(vocab_size=16, draft_vocab_size=8)
+        self.assertEqual(_resolve_draft_vocab_size(config), 8)
 
     def test_resolves_vocab_size_fallback(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "draft.json"
-            config_path.write_text(json.dumps({"vocab_size": 16}), encoding="utf-8")
+        self.assertEqual(_resolve_draft_vocab_size(SimpleNamespace(vocab_size=16)), 16)
 
-            self.assertEqual(_resolve_draft_vocab_size(str(config_path)), 16)
+    def test_does_not_fallback_when_draft_vocab_size_is_explicitly_none(self):
+        config = SimpleNamespace(vocab_size=16, draft_vocab_size=None)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            _resolve_draft_vocab_size(config)
+
+    def test_rejects_invalid_resolved_vocab_size(self):
+        for value in (None, True, 0, -1, "16"):
+            with self.subTest(value=value):
+                config = SimpleNamespace(draft_vocab_size=value)
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    _resolve_draft_vocab_size(config)
 
     def test_global_rank_zero_generates_fixed_mapping_path(self):
         with tempfile.TemporaryDirectory() as directory:

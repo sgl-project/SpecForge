@@ -1,0 +1,1703 @@
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+index 1f310d82a5..ff972fdf1a 100644
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -583,6 +583,9 @@ def prewarm_mhc_pre(
+ 
+     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
+     max_num_tokens = get_schedule().chunked_prefill_size
++    if max_num_tokens is None or max_num_tokens <= 0:
++        # Chunked prefill disabled (-1): fall back to the prefill token budget.
++        max_num_tokens = get_schedule().max_prefill_tokens
+     buckets = get_mhc_pre_token_count_representatives(
+         max_num_tokens, hc_mult * hidden_size
+     )
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 2487072b63..1a7d91a329 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -102,6 +102,11 @@ class LogitsProcessorOutput:
+     # Used by speculative decoding (EAGLE)
+     # The last hidden layers
+     hidden_states: Optional[torch.Tensor] = None
++    # Spec-training capture: under FULL+aux, `hidden_states` is the aux
++    # concatenation, so the post-norm last hidden is exposed here separately.
++    last_hidden_states: Optional[torch.Tensor] = None
++    spec_capture_aux_gpu: Optional[torch.Tensor] = None
++    spec_capture_last_hidden_gpu: Optional[torch.Tensor] = None
+ 
+     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
+     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
+@@ -391,6 +396,30 @@ class LogitsProcessor(nn.Module):
+             sample_indices,
+             logits_metadata,
+         )
++        # Spec-training capture: keep the post-norm last hidden (the training
++        # target) alongside the aux concatenation in hidden_states_to_store.
++        last_hidden_states_to_store = (
++            hidden_states
++            if (
++                logits_metadata.capture_hidden_mode.is_full()
++                and aux_hidden_states is not None
++            )
++            else None
++        )
++        # muP targets pass LM-head-scaled hidden states into LogitsProcessor,
++        # while SpecForge folds the same multiplier into its frozen target
++        # head. Restore the pre-head-scale representation before capture so
++        # the multiplier is applied exactly once when training recomputes logits.
++        logits_mup_width_multiplier = getattr(
++            self.config, "logits_mup_width_multiplier", None
++        )
++        if (
++            last_hidden_states_to_store is not None
++            and logits_mup_width_multiplier
++        ):
++            last_hidden_states_to_store = (
++                last_hidden_states_to_store * float(logits_mup_width_multiplier)
++            )
+         del hidden_states
+ 
+         if not logits_metadata.extend_return_logprob:
+@@ -404,6 +433,7 @@ class LogitsProcessor(nn.Module):
+             return LogitsProcessorOutput(
+                 next_token_logits=sampled_logits,
+                 hidden_states=hidden_states_to_store,
++                last_hidden_states=last_hidden_states_to_store,
+                 mm_input_embeds=logits_metadata.mm_input_embeds,
+             )
+ 
+@@ -421,6 +449,7 @@ class LogitsProcessor(nn.Module):
+         logits_output = LogitsProcessorOutput(
+             next_token_logits=sampled_logits,
+             hidden_states=hidden_states_to_store,
++            last_hidden_states=last_hidden_states_to_store,
+             mm_input_embeds=logits_metadata.mm_input_embeds,
+         )
+         logprobs_result.write_input_to(logits_output)
+@@ -608,10 +637,12 @@ class LogitsProcessor(nn.Module):
+         if logits_metadata.capture_hidden_mode.need_capture():
+             if logits_metadata.capture_hidden_mode.is_full():
+                 if aux_hidden_states is not None:
++                    # Explicit aux capture wins over the model-supplied
++                    # pre-norm stream (V4 always passes it).
+                     hidden_states_to_store = pack_aux_hidden_states(aux_hidden_states)
+                 else:
+                     hidden_states_to_store = hidden_states
+-                hidden_states_to_store_before_norm = hidden_states_before_norm
++                    hidden_states_to_store_before_norm = hidden_states_before_norm
+             elif logits_metadata.capture_hidden_mode.is_last():
+                 # Get the last token hidden states. If sample_indices is None,
+                 # pruned states only contain the last tokens already.
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+index f4ec27acca..e09df010a8 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -22,7 +23,13 @@ from sglang.srt.utils import (
+ )
+ from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
+ 
+-_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
++# FLASHINFER_USE_CUDA_QUANT=1 forces the "cuda" mxfp8-quantize backend; the
++# CuTe-DSL kernels miscompile against some nvidia-cutlass-dsl pins.
++_MXFP8_QUANTIZE_BACKEND = (
++    "cuda"
++    if not is_sm100_supported() or os.environ.get("FLASHINFER_USE_CUDA_QUANT") == "1"
++    else "cute-dsl"
++)
+ 
+ if is_flashinfer_available():
+     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index 2a506f88cd..20f87ecb86 100644
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -476,6 +476,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+             output_token_sampling_mask=recv_obj.output_token_sampling_mask,
+             output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
+             output_hidden_states=recv_obj.output_hidden_states,
++            spec_capture=recv_obj.spec_capture,
+             routed_experts=routed_experts,
+             indexer_topk=indexer_topk,
+             customized_info=recv_obj.customized_info,
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 736642c7fe..5b4f46c8f2 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -232,6 +232,9 @@ class GenerateReqInput:
+     return_hidden_states: Union[
+         List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
+     ] = False
++    # Spec-training capture sink instructions (see spec_capture_sink.py).
++    # Batch-level: List[Optional[dict]]; per-request after __getitem__.
++    spec_capture: Optional[Union[List[Optional[Dict]], Dict]] = None
+     # Whether to return captured routed experts
+     return_routed_experts: bool = False
+     # Absolute start position for returned routings; response covers
+@@ -933,6 +936,11 @@ class GenerateReqInput:
+                 if self.multi_item_delimiter_indices is not None
+                 else None
+             ),
++            spec_capture=(
++                self.spec_capture[i]
++                if isinstance(self.spec_capture, list)
++                else self.spec_capture
++            ),
+         )
+         cache[i] = sub
+         return sub
+@@ -1031,6 +1039,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+     # Internal IPC only.
+     encoder_urls: Optional[List[str]] = None
+ 
++    # Spec-training capture sink instructions (see GenerateReqInput.spec_capture)
++    spec_capture: Optional[Dict] = None
++
+     # Pre-computed delimiter indices for multi-item scoring
+     multi_item_delimiter_indices: Optional[List[int]] = None
+ 
+@@ -1462,6 +1473,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
+     # Number of times each request was retracted.
+     retraction_counts: Optional[List[int]] = None
+ 
++    # Spec-training capture: one result dict per request (see spec_capture_sink).
++    spec_capture: Optional[List[Any]] = None
++
+     # The trainer step id. Used to know which step's weights are used for sampling.
+     token_steps: Optional[List[List[int]]] = None
+ 
+@@ -1553,6 +1567,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
+     # Number of times each request was retracted.
+     retraction_counts: Optional[List[int]] = None
+ 
++    # Spec-training capture: one result dict per request (see spec_capture_sink).
++    spec_capture: Optional[List[Any]] = None
++
+     # The trainer step id. Used to know which step's weights are used for sampling.
+     token_steps: Optional[List[List[int]]] = None
+ 
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 3ff2a29f3f..ad8ef20dc9 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -846,6 +846,7 @@ class Req(ReqDllmMixin):
+             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
+         ] = None,
+         return_pooled_hidden_states: bool = False,
++        spec_capture: Optional[Dict[str, Any]] = None,
+         multi_item_delimiter_indices: Optional[List[int]] = None,
+         session_id: Optional[str] = None,
+         cache_salt: Optional[str] = None,
+@@ -914,10 +915,18 @@ class Req(ReqDllmMixin):
+             }
+         self.sampling_params = sampling_params
+         self.custom_logit_processor = custom_logit_processor
++        # Spec-training capture: piggyback the return_hidden_states path (fires
++        # CaptureHiddenMode.FULL); the sink consumes the slices, not the response.
++        self.spec_capture = spec_capture
++        if spec_capture is not None:
++            return_hidden_states = True
+         self.return_hidden_states = return_hidden_states
+         self.return_hidden_states_mode = get_return_hidden_states_mode(
+             return_hidden_states
+         )
++        self.spec_capture_aux: List[torch.Tensor] = []
++        self.spec_capture_last_hidden: List[torch.Tensor] = []
++        self.spec_capture_result = None  # per-request sink result -> output field
+ 
+         # Extra key for caller-defined request classification.
+         if lora_id is not None:
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 7dc5be833f..8212d4efe4 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -655,6 +655,19 @@ class Scheduler(
+ 
+         self.init_batch_result_processor()
+ 
++        if server_args.enable_spec_capture:
++            # Capture needs single-pass prefill; chunking would drop all but the
++            # final chunk's hidden rows.
++            if server_args.chunked_prefill_size != -1:
++                raise ValueError(
++                    "--enable-spec-capture requires --chunked-prefill-size -1 "
++                    "(single-pass prefill) so captured hidden states cover the "
++                    "whole sequence"
++                )
++            from sglang.srt import spec_capture_sink
++
++            spec_capture_sink.maybe_init_sink(server_args)
++
+         self.is_initializing = False
+         self.init_startup_timing_summary()
+ 
+@@ -2432,6 +2445,7 @@ class Scheduler(
+                 dllm_config=self.dllm_config,
+                 time_stats=recv_req.time_stats,
+                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
++                spec_capture=recv_req.spec_capture,
+             )
+             req.tokenizer = self.tokenizer
+ 
+@@ -3578,6 +3592,23 @@ class Scheduler(
+         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
+         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+ 
++    def _should_copy_hidden_states_to_cpu(self, batch: ScheduleBatch) -> bool:
++        from sglang.srt.spec_capture_sink import gpu_put_enabled
++
++        return batch.return_hidden_states and (
++            (self.ps.attn_tp_rank == 0 and not gpu_put_enabled())
++            or any(req.spec_capture is None for req in batch.reqs)
++        )
++
++    def _should_capture_hidden_states_on_device(self, batch: ScheduleBatch) -> bool:
++        from sglang.srt.spec_capture_sink import gpu_put_enabled
++
++        return (
++            self.ps.attn_tp_rank == 0
++            and gpu_put_enabled()
++            and any(req.spec_capture is not None for req in batch.reqs)
++        )
++
+     @contextmanager
+     def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
+         """Make SB transactional across one forward (overlap and non-overlap).
+@@ -3726,7 +3757,16 @@ class Scheduler(
+                                 # overlaps.
+                                 batch_result.copy_to_cpu(
+                                     return_logprob=batch.return_logprob,
+-                                    return_hidden_states=batch.return_hidden_states,
++                                    return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                                        batch
++                                    ),
++                                    capture_stream=(
++                                        self.forward_stream
++                                        if self._should_capture_hidden_states_on_device(
++                                            batch
++                                        )
++                                        else None
++                                    ),
+                                 )
+                             else:
+                                 # Result D2H on copy_stream overlaps the next forward
+@@ -3736,7 +3776,16 @@ class Scheduler(
+                                 with self.copy_stream_ctx:
+                                     batch_result.copy_to_cpu(
+                                         return_logprob=batch.return_logprob,
+-                                        return_hidden_states=batch.return_hidden_states,
++                                        return_hidden_states=self._should_copy_hidden_states_to_cpu(
++                                            batch
++                                        ),
++                                        capture_stream=(
++                                            self.forward_stream
++                                            if self._should_capture_hidden_states_on_device(
++                                                batch
++                                            )
++                                            else None
++                                        ),
+                                     )
+                         else:
+                             batch_result.future_indices = future_indices
+@@ -3775,7 +3824,12 @@ class Scheduler(
+                 batch_result.copy_done = self.device_module.Event()
+                 batch_result.copy_to_cpu(
+                     return_logprob=batch.return_logprob,
+-                    return_hidden_states=batch.return_hidden_states,
++                    return_hidden_states=self._should_copy_hidden_states_to_cpu(batch),
++                    capture_stream=(
++                        self.forward_stream
++                        if self._should_capture_hidden_states_on_device(batch)
++                        else None
++                    ),
+                 )
+             else:
+                 kwargs = (
+@@ -3905,7 +3959,12 @@ class Scheduler(
+         with self.copy_stream_ctx:
+             batch_result.copy_to_cpu(
+                 return_logprob=cur_batch.return_logprob,
+-                return_hidden_states=cur_batch.return_hidden_states,
++                return_hidden_states=self._should_copy_hidden_states_to_cpu(cur_batch),
++                capture_stream=(
++                    self.forward_stream
++                    if self._should_capture_hidden_states_on_device(cur_batch)
++                    else None
++                ),
+             )
+ 
+         # Release the closure and large GPU tensors that are no longer needed.
+@@ -3924,6 +3983,11 @@ class Scheduler(
+         batch: ScheduleBatch,
+         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+     ):
++        # Complete capture transfers on the scheduler thread before processing
++        # any kind of next result (prefill, decode, or idle).  This preserves
++        # the output socket's single-thread ownership under mixed traffic.
++        self.batch_result_processor.drain_spec_captures()
++
+         # Flush async trace ops here: in overlap mode this CPU work runs while
+         # the next batch's GPU forward is in flight, giving free overlap.
+         flush_trace_batch(batch.reqs)
+@@ -4043,6 +4107,15 @@ class Scheduler(
+         # Flush any health-check signal deferred while the engine was busy.
+         self.maybe_send_health_check_signal()
+ 
++        # A capture response is intentionally delayed until its background
++        # sink transfer completes; finish it on this thread so ownership of
++        # the ZeroMQ output socket remains single-threaded.  Do not enter the
++        # idle sleeper while a future is outstanding or the producer waiting
++        # for that response could deadlock.
++        self.batch_result_processor.drain_spec_captures()
++        if self.batch_result_processor.has_pending_spec_captures():
++            time.sleep(0.001)
++            return
+         if not self.is_fully_idle():
+             return
+ 
+@@ -4093,6 +4166,7 @@ class Scheduler(
+             and not self.dllm_manager.any_staging_reqs()
+             and (self.last_batch is None or self.last_batch.is_empty())
+             and (not self.enable_overlap or len(self.result_queue) == 0)
++            and not self.batch_result_processor.has_pending_spec_captures()
+             and self._pp_microbatches_drained()
+         )
+ 
+@@ -4328,6 +4402,13 @@
+         # signal handler); no reader consumes them.
+         ret.pop("model_config", None)
+         ret.pop("custom_sigquit_handler", None)
++
++        if self.server_args.enable_spec_capture:
++            from sglang.srt.spec_capture_sink import get_sink
++
++            sink = get_sink()
++            if sink is not None:
++                ret["spec_capture_control"] = sink.control_endpoint()
+
+         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
+
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 024781c37e..31defd0da1 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
+ import logging
+-from dataclasses import dataclass
++import os
++import time
++from dataclasses import dataclass, field
+ from typing import (
+     TYPE_CHECKING,
+     Callable,
+@@ -93,6 +95,12 @@ class SchedulerBatchResultProcessor:
+     logprob_result_processor: SchedulerLogprobResultProcessor
+     output_streamer: SchedulerOutputStreamer
+     abort_request: Callable
++    _spec_capture_batches: List = field(
++        default_factory=list,
++        init=False,
++        repr=False,
++        compare=False,
++    )
+ 
+     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
+         assert self.disaggregation_mode == DisaggregationMode.DECODE
+@@ -197,6 +205,7 @@ class SchedulerBatchResultProcessor:
+     ):
+         skip_stream_req = None
+         self.token_to_kv_pool_allocator.free_group_begin()
++        pending_spec_captures: List = []
+ 
+         if self.is_generation:
+             if result.copy_done is not None:
+@@ -236,23 +245,28 @@ class SchedulerBatchResultProcessor:
+             logprob_pt = 0
+ 
+             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+-                if (
+-                    batch.return_hidden_states
+-                    and logits_output.hidden_states is not None
+-                ):
++                if batch.return_hidden_states and logits_output.hidden_states is not None:
+                     assert extend_input_len_per_req is not None
+-                    hidden_state_offset = self._append_prefill_hidden_states(
+-                        req=req,
+-                        logits_output=logits_output,
+-                        hidden_state_offset=hidden_state_offset,
+-                        capture_hidden_mode=prefill_hidden_capture_mode,
+-                        extend_input_len=extend_input_len_per_req[i],
+-                        store=(
+-                            not req.finished()
+-                            and not req.is_retracted
+-                            and req.inflight_middle_chunks <= 0
+-                        ),
+-                    )
++                    if req.spec_capture is not None:
++                        hidden_state_offset = self._append_spec_capture_states(
++                            req=req,
++                            logits_output=logits_output,
++                            hidden_state_offset=hidden_state_offset,
++                            extend_input_len=extend_input_len_per_req[i],
++                        )
++                    else:
++                        hidden_state_offset = self._append_prefill_hidden_states(
++                            req=req,
++                            logits_output=logits_output,
++                            hidden_state_offset=hidden_state_offset,
++                            capture_hidden_mode=prefill_hidden_capture_mode,
++                            extend_input_len=extend_input_len_per_req[i],
++                            store=(
++                                not req.finished()
++                                and not req.is_retracted
++                                and req.inflight_middle_chunks <= 0
++                            ),
++                        )
+ 
+                 if (
+                     req.finished() and req.inflight_middle_chunks <= 0
+@@ -294,6 +308,11 @@ class SchedulerBatchResultProcessor:
+                             logprob_pt=logprob_pt,
+                         )
+ 
++                    if req.spec_capture is not None and req.finished():
++                        pending = self._sink_spec_capture(req)
++                        if pending is not None:
++                            pending_spec_captures.append(pending)
++
+                     if req.return_sampling_mask:
+                         self.add_sampling_mask_return_values(i, req, logits_output)
+ 
+@@ -363,9 +382,25 @@ class SchedulerBatchResultProcessor:
+                     req.time_stats.set_last_chunked_prefill_finish_time()
+ 
+         self.token_to_kv_pool_allocator.free_group_end()
+-        self.output_streamer.stream_output(
+-            batch.reqs, batch.return_logprob, skip_stream_req
+-        )
++        if pending_spec_captures:
++            self._queue_spec_captures(
++                pending_spec_captures,
++                return_logprob=batch.return_logprob,
++            )
++            capture_req_ids = {id(item[0]) for item in pending_spec_captures}
++            ready_reqs = [
++                req
++                for req in batch.reqs
++                if id(req) not in capture_req_ids and req is not skip_stream_req
++            ]
++            if ready_reqs:
++                self.output_streamer.stream_output(
++                    ready_reqs, batch.return_logprob
++                )
++        else:
++            self.output_streamer.stream_output(
++                batch.reqs, batch.return_logprob, skip_stream_req
++            )
+ 
+         can_run_cuda_graph = result.can_run_cuda_graph
+         self.metrics_reporter.report_prefill_stats(
+@@ -496,6 +531,192 @@ class SchedulerBatchResultProcessor:
+                     f"Placeholder zeros would be appended to output_ids."
+                 )
+ 
++    def _append_spec_capture_states(
++        self,
++        *,
++        req: Req,
++        logits_output: LogitsProcessorOutput,
++        hidden_state_offset: int,
++        extend_input_len: int,
++    ) -> int:
++        """Retain per-request views of the completed batch capture."""
++        from sglang.srt.spec_capture_sink import gpu_put_enabled
++
++        start = hidden_state_offset
++        end = start + extend_input_len
++        if self.output_streamer.ps.attn_tp_rank != 0:
++            return end
++        gpu_put = gpu_put_enabled()
++        features = dict(req.spec_capture.get("features") or {})
++        for artifact, source_name, gpu_name, cpu_name, chunks in (
++            (
++                "aux",
++                "hidden_states",
++                "spec_capture_aux_gpu",
++                "_spec_capture_aux_cpu",
++                req.spec_capture_aux,
++            ),
++            (
++                "last_hidden",
++                "last_hidden_states",
++                "spec_capture_last_hidden_gpu",
++                "_spec_capture_last_hidden_cpu",
++                req.spec_capture_last_hidden,
++            ),
++        ):
++            if artifact not in features:
++                continue
++            cache_name = gpu_name if gpu_put else cpu_name
++            captured = getattr(logits_output, cache_name, None)
++            if captured is None:
++                source = getattr(logits_output, source_name)
++                if source is None:
++                    continue
++                if gpu_put:
++                    if not source.is_cuda:
++                        raise RuntimeError(
++                            "GPU capture reached the sink after CPU staging"
++                        )
++                    # Non-overlap execution does not create the copy_to_cpu snapshot.
++                    captured = source.detach().clone()
++                else:
++                    captured = source.cpu()
++                setattr(logits_output, cache_name, captured)
++            chunks.append(captured[start:end])
++        return end
++
++    def _sink_spec_capture(self, req: Req):
++        """Stage a finished capture request for the background Mooncake sink.
++
++        Runs on the attention-TP rank that streams output; returns the pending
++        tuple queued by ``_queue_spec_captures`` (or ``None`` off the writer
++        rank).  The per-request result (or an ``{"error": ...}`` marker) is set
++        on ``req.spec_capture_result`` when the batch transfer completes, and
++        returned to the client via the dedicated ``spec_capture`` output field
++        (a per-request channel, unlike per-token ``customized_info``).
++        """
++        from sglang.srt import spec_capture_sink
++
++        sink = spec_capture_sink.get_sink()
++        if sink is None or self.output_streamer.ps.attn_tp_rank != 0:
++            return None
++        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
++        cat_start = time.perf_counter()
++        # With chunked prefill disabled (the recommended capture-server
++        # configuration), each request owns exactly one contiguous view into
++        # the batch-level D2H buffer.  torch.cat([view]) needlessly copied the
++        # whole capture a second time on CPU.  Keep that view zero-copy;
++        # concatenate only the genuinely chunked case.
++        aux = self._coalesce_spec_capture_chunks(req.spec_capture_aux)
++        last_hidden = self._coalesce_spec_capture_chunks(
++            req.spec_capture_last_hidden
++        )
++        cat_ms = (time.perf_counter() - cat_start) * 1000.0
++        req.spec_capture_aux = []
++        req.spec_capture_last_hidden = []
++        return req, req.spec_capture, aux, last_hidden, timing_enabled, cat_ms
++
++    def _queue_spec_captures(self, pending, *, return_logprob: bool) -> None:
++        """Queue one batch transfer while the scheduler runs the next prefill."""
++        if not pending:
++            return
++        from sglang.srt import spec_capture_sink
++
++        sink = spec_capture_sink.get_sink()
++        samples = [
++            (spec, aux, last_hidden)
++            for _, spec, aux, last_hidden, _, _ in pending
++        ]
++        self._spec_capture_batches.append(
++            (
++                pending,
++                sink.submit_samples(samples),
++                return_logprob,
++                time.perf_counter(),
++            )
++        )
++        # Bound retained D2H buffers.  Reaching this point means the target
++        # prefill for batch N+1 already overlapped host transfer N; wait only
++        # if N is still finishing before admitting N+2.
++        max_pending = int(
++            os.environ.get("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", "2")
++        )
++        if max_pending < 1:
++            raise ValueError("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES must be >= 1")
++        if len(self._spec_capture_batches) >= max_pending:
++            self.drain_spec_captures(block=True, max_batches=1)
++
++    def has_pending_spec_captures(self) -> bool:
++        return bool(self._spec_capture_batches)
++
++    def drain_spec_captures(
++        self, *, block: bool = False, max_batches: Optional[int] = None
++    ) -> int:
++        """Finish ready transfers and stream their responses on this thread."""
++        completed = 0
++        while self._spec_capture_batches:
++            if max_batches is not None and completed >= max_batches:
++                break
++            pending, future, return_logprob, queued_at = self._spec_capture_batches[0]
++            if not block and not future.done():
++                break
++            self._spec_capture_batches.pop(0)
++            self._complete_spec_capture_batch(
++                pending,
++                future,
++                return_logprob=return_logprob,
++                queued_at=queued_at,
++            )
++            completed += 1
++        return completed
++
++    def _complete_spec_capture_batch(
++        self, pending, future, *, return_logprob: bool, queued_at: float
++    ) -> None:
++        try:
++            results = future.result()
++            if len(results) != len(pending):
++                raise RuntimeError(
++                    f"spec-capture sink returned {len(results)} results for "
++                    f"{len(pending)} samples"
++                )
++        except Exception as e:
++            logger.error(
++                "spec-capture batch sink failed for %d requests: %s", len(pending), e
++            )
++            for req, spec, _, _, _, _ in pending:
++                req.spec_capture_result = {
++                    "sample_id": spec.get("sample_id"),
++                    "error": str(e),
++                }
++        else:
++            for pending_item, result in zip(pending, results):
++                req, _, _, _, _, _ = pending_item
++                req.spec_capture_result = result
++
++        timing_enabled = any(item[4] for item in pending)
++        if timing_enabled:
++            logger.info(
++                "[spec-capture-timing] async_batch_complete samples=%d "
++                "queue_to_stream_ms=%.3f cat_ms=%.3f",
++                len(pending),
++                (time.perf_counter() - queued_at) * 1000.0,
++                sum(item[5] for item in pending),
++            )
++        self.output_streamer.stream_output(
++            [item[0] for item in pending], return_logprob
++        )
++
++    @staticmethod
++    def _coalesce_spec_capture_chunks(
++        chunks: List[torch.Tensor],
++    ) -> Optional[torch.Tensor]:
++        if not chunks:
++            return None
++        if len(chunks) == 1:
++            return chunks[0]
++        return torch.cat(chunks, dim=0)
++
+     def _append_prefill_hidden_states(
+         self,
+         *,
+diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+index 18a42407af..5c1ce295eb 100644
+--- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
++++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+@@ -162,6 +162,14 @@ class SchedulerOutputStreamer:
+         for req in reqs:
+             if req is skip_req:
+                 continue
++            if self.server_args.enable_spec_capture and req.spec_capture is not None:
++                # Capture requests are not complete until the background sink
++                # has durably published every feature object.  Several
++                # scheduler paths can ask the common streamer to emit a
++                # finished request; centralize the completion barrier here so
++                # none of them can win the race and send a metadata-less 200.
++                if req.finished() and req.spec_capture_result is None:
++                    continue
+             if req.finished() and req.finished_output:
+                 # With the overlap schedule, a request will try to output twice and hit this line twice
+                 # because of the one additional delayed token. This "continue" prevented the dummy output.
+@@ -302,6 +310,7 @@ class _GenerationStreamAccumulator:
+     spec_cap_lens_histogram: list = field(default_factory=list)
+     retraction_counts: list = field(default_factory=list)
+     output_hidden_states: Optional[list] = None
++    spec_capture: list = field(default_factory=list)
+     routed_experts: Optional[list] = None
+     indexer_topk: Optional[list] = None
+     customized_info: dict = field(default_factory=dict)
+@@ -579,6 +588,8 @@ class _GenerationStreamAccumulator:
+                     self.output_hidden_states.append(hs)
+             else:
+                 self.output_hidden_states.append(None)
++        # Per-request spec-capture result (aligned with rids), like the field above.
++        self.spec_capture.append(getattr(req, "spec_capture_result", None))
+         if self.return_routed_experts:
+             self.routed_experts.append(
+                 req.routed_experts if req.return_routed_experts else None
+@@ -671,6 +682,7 @@ class _GenerationStreamAccumulator:
+             output_token_sampling_mask=self.output_token_sampling_mask,
+             output_token_sampling_logprobs=self.output_token_sampling_logprobs,
+             output_hidden_states=self.output_hidden_states,
++            spec_capture=self.spec_capture or None,
+             routed_experts=self.routed_experts,
+             indexer_topk=self.indexer_topk,
+             customized_info=(
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 41c9cd212e..b01fd9e64b 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1450,6 +1450,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                 mm_data_mooncake=obj.mm_data_mooncake,
+                 encoder_urls=obj.encoder_urls,
++                spec_capture=obj.spec_capture,
+             )
+         elif isinstance(obj, EmbeddingReqInput):
+             # Resolve unresolved embed overrides now that input_ids are available
+@@ -2322,6 +2323,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 hidden_states = recv_obj.output_hidden_states[i]
+                 if hidden_states is not None:
+                     meta_info["hidden_states"] = hidden_states
++            if getattr(recv_obj, "spec_capture", None):
++                sc = recv_obj.spec_capture[i]
++                if sc is not None:
++                    meta_info["spec_capture"] = sc
+             if getattr(recv_obj, "routed_experts", None):
+                 val = recv_obj.routed_experts[i]
+                 if val is not None:
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+index 69d00c9af9..3b4f7956f5 100644
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -115,11 +115,35 @@ class GenerationBatchResult:
+         return isinstance(self.next_token_ids, torch.Tensor)
+ 
+     @torch.profiler.record_function("copy_result_to_cpu")
+-    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
++    def copy_to_cpu(
++        self,
++        return_logprob: bool,
++        return_hidden_states: bool = True,
++        capture_stream: Optional[torch.cuda.Stream] = None,
++    ):
+         """Copy tensors to CPU in overlap scheduling.
+         Only the tensors which are needed for processing results are copied,
+         e.g., next_token_ids, logits outputs
+         """
++        if capture_stream is not None:
++            for source_name, snapshot_name in (
++                ("hidden_states", "spec_capture_aux_gpu"),
++                ("last_hidden_states", "spec_capture_last_hidden_gpu"),
++            ):
++                source = getattr(self.logits_output, source_name)
++                if source is not None:
++                    # Snapshot before a later forward can overwrite graph outputs.
++                    setattr(self.logits_output, snapshot_name, source.detach().clone())
++                    source.record_stream(torch.cuda.current_stream(source.device))
++            # A graph replay may overwrite its outputs despite record_stream.
++            capture_stream.wait_stream(torch.cuda.current_stream())
++        if return_hidden_states and self.logits_output.last_hidden_states is not None:
++            # Spec-capture's post-norm last hidden rides the same async D2H
++            # as the aux hidden states (the field exists only when the
++            # spec-capture patch is applied).
++            self.logits_output.last_hidden_states = (
++                self.logits_output.last_hidden_states.to("cpu", non_blocking=True)
++            )
+         if return_logprob:
+             if self.logits_output.next_token_logprobs is not None:
+                 self.logits_output.next_token_logprobs = _async_d2h(
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 017198c76a..32a601fb5d 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -362,6 +362,42 @@ class ModelRunner:
+         # auxiliary hidden capture mode. TODO: expose this to server args?
+         self.init_spec_aux_hidden_state()
+ 
++        if server_args.enable_spec_capture and not self.is_draft_worker:
++            # Aux capture without a draft worker, routed to the strategy's own
++            # capture method (they wire different submodules — e.g. VL models
++            # only populate layers_to_capture via the dflash path).
++            capture_method = getattr(server_args, "spec_capture_method", "eagle3")
++            if capture_method in ("dflash", "dspark"):
++                # Both methods share the dflash-named aux config.  The
++                # capture-only DSpark override in init_attention_backends
++                # below still selects the target's native DSpark hook.
++                self.dflash_use_aux_hidden_state = True
++                self.dflash_target_layer_ids = server_args.spec_capture_aux_layer_ids
++                if hasattr(self, "spec_aux_config"):
++                    self.spec_aux_config.dflash_use_aux_hidden_state = True
++                    self.spec_aux_config.dflash_target_layer_ids = (
++                        server_args.spec_capture_aux_layer_ids
++                    )
++                self.dflash_family_use_aux_hidden_state = True
++                self.dflash_family_target_layer_ids = (
++                    server_args.spec_capture_aux_layer_ids
++                )
++            elif capture_method == "eagle3":
++                self.eagle_use_aux_hidden_state = True
++                self.eagle_aux_hidden_state_layer_ids = (
++                    server_args.spec_capture_aux_layer_ids
++                )
++                if hasattr(self, "spec_aux_config"):
++                    self.spec_aux_config.eagle_use_aux_hidden_state = True
++                    self.spec_aux_config.eagle_aux_hidden_state_layer_ids = (
++                        server_args.spec_capture_aux_layer_ids
++                    )
++            else:
++                raise ValueError(
++                    "--spec-capture-method must be one of: eagle3, dflash, dspark; "
++                    f"got {capture_method!r}"
++                )
++
+         # Apply the rank zero filter to logger
+         if server_args.show_time_cost:
+             enable_show_time_cost()
+@@ -926,7 +962,13 @@ class ModelRunner:
+             eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
+             dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
+             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
+-            is_dspark=self.spec_algorithm.is_dspark(),
++            is_dspark=(
++                self.spec_algorithm.is_dspark()
++                or (
++                    self.server_args.enable_spec_capture
++                    and self.server_args.spec_capture_method == "dspark"
++                )
++            ),
+         )
+         # Resolve before building: backends read the pair off the runner while
+         # they construct (the FlashInfer KV-access check).
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 5c4f3ff44a..c40bcc6c42 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -3511,6 +3511,29 @@ class ServerArgs:
+         ),
+         NS("exec.features"),
+     ] = None
++    enable_spec_capture: A[
++        bool,
++        "Enable server-side speculative-training capture: per-request aux/last "
++        "hidden states are written to a Mooncake store (SpecForge DataFlow "
++        "layout) instead of the response payload. Enables aux-hidden-state "
++        "capture on the target model without a speculative draft worker.",
++        NS("exec.features"),
++    ] = False
++    spec_capture_aux_layer_ids: A[
++        Optional[List[int]],
++        "Target layer ids whose hidden states are captured (concatenated) for "
++        "spec-capture requests. Defaults to the model's EAGLE3 default layers "
++        "(low/mid/high) when unset.",
++        NS("exec.features"),
++    ] = None
++    spec_capture_method: A[
++        str,
++        "Capture method for --enable-spec-capture: 'eagle3', 'dflash', or "
++        "'dspark'. Must match the draft strategy being trained; they wire "
++        "capture onto different submodules (VL targets only populate the "
++        "dflash path; dspark rides the dflash aux plumbing).",
++        NS("exec.features"),
++    ] = "eagle3"
+     enable_return_routed_experts: A[
+         bool,
+         "Enable returning routed experts of each layer with responses.",
+diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
+new file mode 100644
+index 0000000..2deff06ff0
+--- /dev/null
++++ b/python/sglang/srt/spec_capture_sink.py
+@@ -0,0 +1,791 @@
++# Copyright 2024 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++"""Server-side spec-training capture sink (SpecForge DataFlow transport).
++
++Under ``--enable-spec-capture``, a request's ``spec_capture`` dict tells this
++sink to write the prefill's captured tensors straight into a Mooncake store
++(one hard-pinned object per tensor at ``{store_id}/{sample_id}/g{gen}/{name}``,
++raw bytes — shape/dtype travel on the returned spec). Feature tensors never
++touch the response path; ``meta_info["spec_capture"]`` returns only keys +
++shapes/dtypes. Strategy naming is the client's (the ``features`` mapping); the
++server knows only generic artifacts. Self-contained: the scheduler hooks are
++one-liners, every capture decision lives here.
++
++Request schema::
++
++    {"store_id", "sample_id", "gen", "replace", # key namespace / retry policy
++     "features": {"aux": <name>, "last_hidden": <name>},   # artifact -> feature
++     "passthrough": [{"name", "data", "shape", "dtype"}]}  # client tensors verbatim
++
++Response (``meta_info["spec_capture"]``): ``{"sample_id", "store_id", "gen",
++"aux_layer_ids", "features": {name: {"shape", "dtype"}}}``.
++
++Mooncake connection uses the standard ``MOONCAKE_*`` env vars (see
++``MooncakeFeatureStore``). CUDA capture uses device publication on RDMA by
++default. ``SGLANG_SPEC_CAPTURE_GPU_PUT=0`` selects host publication; ``1``
++explicitly enables device publication and requires RDMA. RDMA requires an
++explicit ``MOONCAKE_RDMA_DEVICES`` list: Mooncake auto-discovers HCAs for an
++empty list and silently falls back to TCP when none is usable.
++
++``MOONCAKE_PROTOCOL=nvlink`` (multi-node NVLink) keeps objects in a
++:class:`CaptureArena` on the writer GPU instead of the store. Each result then
++also carries ``"arena": {"session", "control"}`` and every feature its
++``"address"``; the trainer reads objects over MNNVL and frees them by writing
++JSON key lists to the ``control`` TCP endpoint.
++"""
++
++from __future__ import annotations
++
++import bisect
++import json
++import logging
++import os
++import re
++import select
++import socket
++import threading
++import time
++from concurrent.futures import Future, ThreadPoolExecutor
++from typing import Any, Dict, List, Optional, Tuple
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++# torch dtype -> the FeatureSpec dtype string SpecForge's zero-copy get() maps
++# back to a torch dtype. Keep in sync with MooncakeFeatureStore._TORCH_DTYPES.
++_DTYPE_STR = {
++    torch.float32: "float32",
++    torch.float64: "float64",
++    torch.float16: "float16",
++    torch.bfloat16: "bfloat16",
++    torch.int64: "int64",
++    torch.int32: "int32",
++    torch.int16: "int16",
++    torch.int8: "int8",
++    torch.uint8: "uint8",
++    torch.bool: "bool",
++}
++_STR_DTYPE = {v: k for k, v in _DTYPE_STR.items()}
++
++_ARTIFACT_AUX = "aux"
++_ARTIFACT_LAST_HIDDEN = "last_hidden"
++
++
++_NVLINK = "nvlink"
++#: Memory the writer GPU reserves for arena objects (required with the arena).
++_ARENA_BYTES_ENV = "SGLANG_SPEC_CAPTURE_ARENA_BYTES"
++
++
++def arena_enabled() -> bool:
++    # Currently only online NVLink capture uses the arena; TCP and RDMA keep
++    # the Mooncake store.
++    return os.environ.get("MOONCAKE_PROTOCOL", "tcp") == _NVLINK
++
++
++def gpu_put_enabled() -> bool:
++    protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp")
++    configured = os.environ.get("SGLANG_SPEC_CAPTURE_GPU_PUT")
++    if protocol == _NVLINK:
++        # NVLink moves device memory only; captures never stage on the host.
++        if configured == "0":
++            raise ValueError(
++                "SGLANG_SPEC_CAPTURE_GPU_PUT=0 conflicts with MOONCAKE_PROTOCOL=nvlink"
++            )
++        return True
++    if configured is None:
++        return (
++            protocol == "rdma"
++            and torch.version.cuda is not None
++            and torch.cuda.is_available()
++        )
++    enabled = configured == "1"
++    if enabled and protocol != "rdma":
++        raise ValueError(
++            "SGLANG_SPEC_CAPTURE_GPU_PUT=1 requires MOONCAKE_PROTOCOL=rdma"
++        )
++    return enabled
++
++
++# Mooncake switches that replace the RDMA transport or ignore its device list.
++_RDMA_OVERRIDES = (
++    ("MC_FORCE_TCP", "installs the TCP transport"),
++    ("MC_MS_AUTO_DISC", "auto-discovers HCAs and ignores MOONCAKE_RDMA_DEVICES"),
++    ("MC_USE_TENT", "selects the TENT engine, which ignores MOONCAKE_RDMA_DEVICES"),
++    ("MC_USE_TEV1", "selects the TENT engine, which ignores MOONCAKE_RDMA_DEVICES"),
++)
++
++
++def check_rdma_environment() -> None:
++    """Refuse switches that replace RDMA or silently drop listed devices."""
++    if os.environ.get("MOONCAKE_PROTOCOL", "tcp") != "rdma":
++        return
++    if not os.environ.get("MOONCAKE_RDMA_DEVICES", "").strip():
++        raise ValueError(
++            "MOONCAKE_PROTOCOL=rdma requires MOONCAKE_RDMA_DEVICES to list this "
++            "server's HCAs (for example mlx5_0,mlx5_1); with an empty list "
++            "Mooncake falls back to TCP when it finds no usable HCA. Set "
++            "MOONCAKE_PROTOCOL=tcp to use TCP"
++        )
++    conflicts = []
++    for name, effect in _RDMA_OVERRIDES:
++        value = os.environ.get(name)
++        if value is None:
++            continue
++        if name == "MC_MS_AUTO_DISC":
++            # Mooncake parses the value with std::stoi and acts only on 1.
++            number = re.match(r"\s*[+-]?\d+", value)
++            if number is None or int(number.group()) != 1:
++                continue
++        conflicts.append(f"{name}={value!r} ({effect})")
++    whitelist = {
++        name.strip()
++        for name in os.environ.get("MC_TE_FILTERS", "").split(",")
++        if name.strip()
++    }
++    devices = [
++        name.strip()
++        for name in os.environ["MOONCAKE_RDMA_DEVICES"].split(",")
++        if name.strip()
++    ]
++    skipped = [name for name in devices if whitelist and name not in whitelist]
++    if skipped:
++        conflicts.append(
++            f"MC_TE_FILTERS={os.environ['MC_TE_FILTERS']!r} (Mooncake skips "
++            f"{', '.join(skipped)} of MOONCAKE_RDMA_DEVICES without a warning)"
++        )
++    if conflicts:
++        raise ValueError(
++            "MOONCAKE_PROTOCOL=rdma conflicts with "
++            + "; ".join(conflicts)
++            + ". Unset them or set MOONCAKE_PROTOCOL=tcp"
++        )
++
++
++class _CudaBytes:
++    """Exposes a raw device allocation to ``torch.as_tensor`` without copying."""
++
++    def __init__(self, ptr: int, nbytes: int) -> None:
++        self.__cuda_array_interface__ = {
++            "shape": (nbytes,),
++            "typestr": "|u1",
++            "data": (ptr, False),
++            "version": 3,
++        }
++
++
++class CaptureArena:
++    """Capture objects kept in memory the capture server owns, read by address.
++
++    Currently only online NVLink capture uses the arena: Mooncake's NVLink
++    transport can only export memory allocated with a fabric handle, and the
++    Mooncake store cannot place objects there. The arena is one
++    ``SGLANG_SPEC_CAPTURE_ARENA_BYTES``-byte fabric allocation from the
++    TransferEngine on the writer GPU. Objects keep the store's keys and, like
++    hard-pinned store objects, live until a client frees them by writing a JSON
++    list of keys, one per line, to the ``control`` TCP endpoint. Only the
++    writer thread touches the arena and it reads those frees before allocating,
++    so no server thread competes with the scheduler for the GIL.
++    """
++
++    _ALIGNMENT = 512
++    #: How long a full arena waits for frees before failing the batch.
++    _WAIT_S = 30.0
++
++    def __init__(self, device: torch.device, *, listener=None) -> None:
++        capacity = os.environ.get(_ARENA_BYTES_ENV)
++        if not capacity:
++            raise ValueError(
++                f"MOONCAKE_PROTOCOL=nvlink needs {_ARENA_BYTES_ENV}, the HBM the "
++                "writer GPU reserves for capture objects"
++            )
++        from mooncake.engine import TransferEngine
++
++        host = os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost")
++        self.capacity = int(capacity)
++        self._engine = TransferEngine()
++        rc = self._engine.initialize(host, "P2PHANDSHAKE", _NVLINK, "")
++        if int(rc) != 0:
++            raise RuntimeError(f"spec-capture arena transfer engine failed ({rc})")
++        with torch.cuda.device(device):
++            self._base = int(self._engine.allocate_managed_buffer(self.capacity))
++        if not self._base:
++            raise MemoryError(
++                f"spec-capture could not allocate a {self.capacity}-byte "
++                f"arena; leave room for {_ARENA_BYTES_ENV} below "
++                "--mem-fraction-static"
++            )
++        self._bytes = torch.as_tensor(
++            _CudaBytes(self._base, self.capacity), device=device
++        )
++        self._stream = torch.cuda.Stream(device)
++        self._spans = [(0, self.capacity)]  # free (offset, size), sorted, coalesced
++        self._objects: Dict[str, Tuple[int, int]] = {}  # key -> (offset, size)
++        port = int(os.environ.get("SGLANG_SPEC_CAPTURE_CONTROL_PORT", "0"))
++        self._listener = listener or socket.create_server(("", port))
++        self._listener.setblocking(False)
++        self._peers: Dict[socket.socket, bytes] = {}  # connection -> partial line
++        self.session = f"{host}:{self._engine.get_rpc_port()}"
++        self.control = f"{host}:{self._listener.getsockname()[1]}"
++        logger.info(
++            "spec-capture arena: %d bytes, session %s, control %s",
++            self.capacity,
++            self.session,
++            self.control,
++        )
++
++    def publish(
++        self, keys: List[str], tensors: List[torch.Tensor], replace_keys: List[str]
++    ) -> List[int]:
++        """Copy each tensor into its own object; return the device addresses."""
++        deadline = time.monotonic() + self._WAIT_S
++        self.receive_frees()
++        self.free(replace_keys)
++        placed: List[str] = []
++        try:
++            with torch.cuda.stream(self._stream):
++                for key, tensor in zip(keys, tensors):
++                    nbytes = tensor.numel() * tensor.element_size()
++                    offset = self._allocate(key, nbytes, deadline=deadline)
++                    placed.append(key)
++                    self._bytes[offset : offset + nbytes].copy_(
++                        tensor.reshape(-1).view(torch.uint8), non_blocking=True
++                    )
++            self._stream.synchronize()
++        except BaseException:
++            # Never recycle memory that a queued copy may still write.
++            self._stream.synchronize()
++            self.free(placed)
++            raise
++        return [self._base + self._objects[key][0] for key in keys]
++
++    def free(self, keys: List[str]) -> int:
++        freed = 0
++        for key in keys:
++            entry = self._objects.pop(key, None)
++            if entry is not None:
++                self._release(*entry)
++                freed += 1
++        return freed
++
++    def receive_frees(self, timeout: float = 0.0) -> int:
++        """Apply frees clients have sent, waiting up to ``timeout`` for one."""
++        freed = 0
++        readable, _, _ = select.select([self._listener, *self._peers], [], [], timeout)
++        for sock in readable:
++            if sock is self._listener:
++                try:
++                    peer, _ = sock.accept()
++                except BlockingIOError:
++                    continue
++                peer.setblocking(False)
++                self._peers[peer] = b""
++                continue
++            try:
++                chunk = sock.recv(1 << 20)
++            except BlockingIOError:
++                continue
++            except OSError:
++                chunk = b""
++            if not chunk:
++                del self._peers[sock]
++                sock.close()
++                continue
++            *lines, self._peers[sock] = (self._peers[sock] + chunk).split(b"\n")
++            for line in lines:
++                if not line:
++                    continue
++                try:
++                    keys = json.loads(line)
++                except (json.JSONDecodeError, UnicodeDecodeError):
++                    logger.warning("Ignoring malformed arena free message")
++                    continue
++                if not isinstance(keys, list) or any(
++                    not isinstance(key, str) for key in keys
++                ):
++                    logger.warning("Arena free message must be a list of string keys")
++                    continue
++                freed += self.free(keys)
++        return freed
++
++    def health(self) -> Dict[str, int]:
++        return {
++            "objects": len(self._objects),
++            "capacity": self.capacity,
++            "free_bytes": sum(size for _, size in self._spans),
++            "largest_free_bytes": max((size for _, size in self._spans), default=0),
++        }
++
++    def _allocate(self, key: str, nbytes: int, *, deadline: float) -> int:
++        if key in self._objects:
++            raise RuntimeError(f"spec-capture object {key} already exists")
++        size = -(-max(nbytes, 1) // self._ALIGNMENT) * self._ALIGNMENT
++        while True:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise MemoryError(
++                    f"spec-capture arena ({self.capacity} bytes) has no "
++                    f"room for {nbytes} bytes before the batch deadline; raise "
++                    f"{_ARENA_BYTES_ENV} or lower the producer's "
++                    "runtime.resident_high_watermark_bytes"
++                )
++            for index, (offset, span) in enumerate(self._spans):
++                if span >= size:
++                    if span == size:
++                        del self._spans[index]
++                    else:
++                        self._spans[index] = (offset + size, span - size)
++                    self._objects[key] = (offset, size)
++                    return offset
++            self.receive_frees(timeout=remaining)
++
++    def _release(self, offset: int, size: int) -> None:
++        index = bisect.bisect_left(self._spans, (offset, 0))
++        if index < len(self._spans) and self._spans[index][0] == offset + size:
++            size += self._spans.pop(index)[1]
++        if index and self._spans[index - 1][0] + self._spans[index - 1][1] == offset:
++            index -= 1
++            offset, prior = self._spans.pop(index)
++            size += prior
++        self._spans.insert(index, (offset, size))
++
++
++class SpecCaptureSink:
++    """Writes captured per-request tensors into Mooncake in SpecForge layout."""
++
++    def __init__(self, aux_layer_ids: Optional[List[int]] = None) -> None:
++        self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids else None
++        self._store = None
++        self._put_config = None
++        self._capture_arena: Optional[CaptureArena] = None
++        self._control_listener: Optional[socket.socket] = None
++        self._lock = threading.Lock()
++        # One store writer is sufficient: Mooncake already stripes a batched
++        # transfer internally.  The executor decouples that host transfer from
++        # the scheduler so the next target prefill can run concurrently.
++        self._executor = ThreadPoolExecutor(
++            max_workers=1,
++            thread_name_prefix="spec-capture-batch-put",
++        )
++
++    # -- connection ---------------------------------------------------------
++    def _connect(self):
++        if self._store is not None:
++            return self._store
++        with self._lock:
++            if self._store is not None:
++                return self._store
++            from mooncake.store import MooncakeDistributedStore, ReplicateConfig
++
++            store = MooncakeDistributedStore()
++            rc = store.setup(
++                local_hostname=os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
++                metadata_server=os.environ.get(
++                    "MOONCAKE_METADATA_SERVER", "http://localhost:8080/metadata"
++                ),
++                global_segment_size=int(
++                    os.environ.get("MOONCAKE_GLOBAL_SEGMENT_SIZE", 1 << 30)
++                ),
++                local_buffer_size=int(
++                    os.environ.get("MOONCAKE_LOCAL_BUFFER_SIZE", 1 << 30)
++                ),
++                protocol=os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
++                rdma_devices=os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
++                master_server_addr=os.environ.get(
++                    "MOONCAKE_MASTER_SERVER_ADDR", "localhost:50051"
++                ),
++            )
++            if rc is not None and int(rc) != 0:
++                raise RuntimeError(f"spec-capture mooncake setup failed (status {rc})")
++            # Hard-pin every object: SpecForge (not Mooncake's LRU) is the
++            # lifetime authority — a committed feature must never be evicted
++            # before the trainer consumes it.
++            cfg = ReplicateConfig()
++            cfg.replica_num = 1
++            # `with_hard_pin` exists only on newer Mooncake builds; older ROCm
++            # sglang images expose only `with_soft_pin`. Map the hard-pin intent
++            # onto whatever the installed build supports.
++            if hasattr(cfg, "with_hard_pin"):
++                cfg.with_hard_pin = True
++            elif hasattr(cfg, "with_soft_pin"):
++                cfg.with_soft_pin = True
++            self._put_config = cfg
++            self._store = store
++            logger.info("spec-capture mooncake sink connected")
++            return store
++
++    def control_endpoint(self) -> Optional[str]:
++        """Advertise cleanup before the first capture, without allocating HBM."""
++        if not arena_enabled():
++            return None
++        with self._lock:
++            if self._control_listener is None:
++                port = int(os.environ.get("SGLANG_SPEC_CAPTURE_CONTROL_PORT", "0"))
++                self._control_listener = socket.create_server(("", port))
++                self._control_listener.setblocking(False)
++            host = os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost")
++            return f"{host}:{self._control_listener.getsockname()[1]}"
++
++    def _arena(self, device: torch.device) -> CaptureArena:
++        # Lazy like _connect(): only the writer rank allocates, on first capture.
++        self.control_endpoint()
++        with self._lock:
++            if self._capture_arena is None:
++                self._capture_arena = CaptureArena(
++                    device, listener=self._control_listener
++                )
++            return self._capture_arena
++
++    # -- key/put primitives (pinned to MooncakeFeatureStore's layout) --------
++    @staticmethod
++    def _tkey(store_id: str, sample_id: str, gen: int, name: str) -> str:
++        return f"{store_id}/{sample_id}/g{gen}/{name}"
++
++    def _remove_quiet(self, key: str) -> None:
++        try:
++            self._connect().remove(key)
++        except Exception:
++            pass
++
++    def _remove_many_quiet(self, keys: List[str]) -> None:
++        if not keys:
++            return
++        store = self._connect()
++        batch_remove = getattr(store, "batch_remove", None)
++        if batch_remove is not None:
++            try:
++                batch_remove(keys)
++                return
++            except Exception:
++                pass
++        for key in keys:
++            self._remove_quiet(key)
++
++    # -- the batch entry point ------------------------------------------------
++    def submit_samples(
++        self,
++        samples: List[
++            Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]]
++        ],
++    ) -> Future[List[Dict[str, Any]]]:
++        """Queue one scheduler batch without blocking the scheduler thread."""
++        devices = {
++            tensor.device
++            for _, aux, last_hidden in samples
++            for tensor in (aux, last_hidden)
++            if tensor is not None and tensor.is_cuda
++        }
++        ready = []
++        for device in devices:
++            event = torch.cuda.Event()
++            event.record(torch.cuda.current_stream(device))
++            ready.append(event)
++        return self._executor.submit(self._put_ready_samples, samples, ready)
++
++    def _put_ready_samples(self, samples, ready):
++        for event in ready:
++            event.synchronize()
++        return self.put_samples(samples)
++
++    def put_samples(
++        self,
++        samples: List[
++            Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]]
++        ],
++    ) -> List[Dict[str, Any]]:
++        """Publish a scheduler batch with one native Mooncake batch RPC.
++
++        A capture prefill batch normally finishes many samples together.
++        Calling ``put_from`` once per feature object paid dozens of metadata
++        and transport round trips per batch on the writer rank and serialized
++        the response behind them.
++        ``batch_put_from`` preserves the existing per-feature keys and raw
++        tensor layout while amortizing that fixed cost across the whole
++        scheduler batch.  The response is still emitted only after every
++        status succeeds, so refs can never point at incomplete samples.
++        """
++        if not samples:
++            return []
++
++        store = None if arena_enabled() else self._connect()
++        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
++        gpu_put = gpu_put_enabled()
++        started = time.perf_counter()
++        keys: List[str] = []
++        tensors: List[torch.Tensor] = []
++        sizes: List[int] = []
++        replace_keys: List[str] = []
++        results: List[Dict[str, Any]] = []
++        feature_meta: List[Dict[str, Any]] = []  # aligned with keys
++
++        def _stage(
++            result_feats: Dict[str, Dict[str, Any]],
++            *,
++            store_id: str,
++            sample_id: str,
++            gen: int,
++            replace: bool,
++            name: str,
++            tensor: torch.Tensor,
++        ) -> None:
++            if gpu_put and tensor.is_cuda:
++                tensor = tensor.detach().contiguous()
++            else:
++                tensor = tensor.detach().to("cpu").contiguous()
++            key = self._tkey(store_id, sample_id, gen, name)
++            keys.append(key)
++            tensors.append(tensor)
++            sizes.append(tensor.element_size() * tensor.numel())
++            if replace:
++                replace_keys.append(key)
++            result_feats[name] = {
++                "shape": list(tensor.shape),
++                "dtype": _DTYPE_STR.get(
++                    tensor.dtype, str(tensor.dtype).replace("torch.", "")
++                ),
++            }
++            feature_meta.append(result_feats[name])
++
++        for spec, aux, last_hidden in samples:
++            store_id = str(spec["store_id"])
++            sample_id = str(spec["sample_id"])
++            gen = int(spec.get("gen", 1))
++            replace = bool(spec.get("replace", False))
++            features: Dict[str, str] = dict(spec.get("features") or {})
++            result_feats: Dict[str, Dict[str, Any]] = {}
++
++            aux_name = features.get(_ARTIFACT_AUX)
++            if aux_name is not None:
++                if aux is None:
++                    raise RuntimeError(
++                        "spec_capture requested 'aux' but no aux hidden states were "
++                        "captured -- launch the server with --enable-spec-capture "
++                        "(and optionally --spec-capture-aux-layer-ids)"
++                    )
++                _stage(
++                    result_feats,
++                    store_id=store_id,
++                    sample_id=sample_id,
++                    gen=gen,
++                    replace=replace,
++                    name=aux_name,
++                    tensor=aux.unsqueeze(0),
++                )
++            lh_name = features.get(_ARTIFACT_LAST_HIDDEN)
++            if lh_name is not None:
++                if last_hidden is None:
++                    raise RuntimeError(
++                        "spec_capture requested 'last_hidden' but the logits "
++                        "processor did not return it (is aux capture enabled?)"
++                    )
++                _stage(
++                    result_feats,
++                    store_id=store_id,
++                    sample_id=sample_id,
++                    gen=gen,
++                    replace=replace,
++                    name=lh_name,
++                    tensor=last_hidden.unsqueeze(0),
++                )
++            for item in spec.get("passthrough") or []:
++                dtype = _STR_DTYPE.get(str(item.get("dtype", "int64")))
++                if dtype is None:
++                    raise RuntimeError(
++                        f"spec_capture passthrough {item.get('name')!r}: "
++                        f"unsupported dtype {item.get('dtype')!r}"
++                    )
++                tensor = torch.tensor(item["data"], dtype=dtype).reshape(
++                    [int(d) for d in item["shape"]]
++                )
++                _stage(
++                    result_feats,
++                    store_id=store_id,
++                    sample_id=sample_id,
++                    gen=gen,
++                    replace=replace,
++                    name=str(item["name"]),
++                    tensor=tensor,
++                )
++            results.append(
++                {
++                    "sample_id": sample_id,
++                    "store_id": store_id,
++                    "gen": gen,
++                    "aux_layer_ids": self.aux_layer_ids,
++                    "features": result_feats,
++                }
++            )
++
++        for device in {t.device for t in tensors if t.is_cuda}:
++            # Complete any contiguous copies made by this writer thread.
++            torch.cuda.current_stream(device).synchronize()
++        materialize_ms = (time.perf_counter() - started) * 1000.0
++        if store is None:
++            return self._publish_arena(
++                results, keys, tensors, replace_keys, feature_meta, started
++            )
++        self._remove_many_quiet(replace_keys)
++        registered: List[int] = []
++        seen_storage = set()
++        register_started = time.perf_counter()
++        try:
++            for tensor, nbytes in zip(tensors, sizes):
++                storage = tensor.untyped_storage()
++                ptr = storage.data_ptr()
++                if ptr in seen_storage or nbytes == 0:
++                    continue
++                seen_storage.add(ptr)
++                try:
++                    # Per-request slices can share one batch allocation.
++                    rc = store.register_buffer(ptr, storage.nbytes())
++                except Exception:
++                    if tensor.is_cuda:
++                        raise
++                else:
++                    if rc is None or int(rc) == 0:
++                        registered.append(ptr)
++                    elif tensor.is_cuda:
++                        raise RuntimeError(
++                            f"GPU capture buffer registration failed ({rc}); "
++                            "GPU publication needs GPUDirect RDMA (nvidia_peermem "
++                            "loaded or DMA-BUF support) and RDMA-registerable "
++                            "CUDA memory (disable PyTorch expandable_segments for "
++                            "this server). Set SGLANG_SPEC_CAPTURE_GPU_PUT=0 "
++                            "(managed-local gpu_put: false) to publish from host "
++                            "memory instead"
++                        )
++            register_ms = (time.perf_counter() - register_started) * 1000.0
++            put_started = time.perf_counter()
++            batch_put = getattr(store, "batch_put_from", None)
++            if batch_put is None:
++                statuses = [
++                    store.put_from(key, tensor.data_ptr(), nbytes, self._put_config)
++                    for key, tensor, nbytes in zip(keys, tensors, sizes)
++                ]
++            else:
++                statuses = batch_put(
++                    keys,
++                    [tensor.data_ptr() for tensor in tensors],
++                    sizes,
++                    self._put_config,
++                )
++            put_ms = (time.perf_counter() - put_started) * 1000.0
++        except Exception:
++            self._remove_many_quiet(keys)
++            raise
++        finally:
++            for ptr in registered:
++                try:
++                    store.unregister_buffer(ptr)
++                except Exception:
++                    pass
++
++        if statuses is None:
++            statuses = [0] * len(keys)
++        if len(statuses) != len(keys):
++            self._remove_many_quiet(keys)
++            raise RuntimeError(
++                "spec-capture batch_put_from returned "
++                f"{len(statuses)} statuses for {len(keys)} keys"
++            )
++        failed = [
++            (key, status)
++            for key, status in zip(keys, statuses)
++            if status is not None and int(status) < 0
++        ]
++        if failed:
++            self._remove_many_quiet(keys)
++            raise RuntimeError(
++                "spec-capture batch_put_from failed for "
++                f"{len(failed)}/{len(keys)} keys; first={failed[0]}"
++            )
++
++        if timing_enabled:
++            logger.info(
++                "[spec-capture-timing] batch_sink samples=%d objects=%d "
++                "bytes=%d materialize_ms=%.3f register_ms=%.3f put_ms=%.3f "
++                "total_ms=%.3f gpu_payload_bytes=%d host_payload_bytes=%d",
++                len(samples),
++                len(keys),
++                sum(sizes),
++                materialize_ms,
++                register_ms,
++                put_ms,
++                (time.perf_counter() - started) * 1000.0,
++                sum(size for tensor, size in zip(tensors, sizes) if tensor.is_cuda),
++                sum(size for tensor, size in zip(tensors, sizes) if not tensor.is_cuda),
++            )
++        return results
++
++    def _publish_arena(
++        self, results, keys, tensors, replace_keys, feature_meta, started
++    ) -> List[Dict[str, Any]]:
++        # The writer thread's current device is not the scheduler's; use the
++        # capture tensors' device.
++        device = next((t.device for t in tensors if t.is_cuda), None)
++        if device is None:
++            raise RuntimeError("arena publication needs CUDA captures")
++        arena = self._arena(device)
++        addresses = arena.publish(keys, tensors, replace_keys)
++        for meta, address in zip(feature_meta, addresses):
++            meta["address"] = address
++        for result in results:
++            result["arena"] = {"session": arena.session, "control": arena.control}
++        if os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1":
++            logger.info(
++                "[spec-capture-timing] arena_sink samples=%d objects=%d "
++                "bytes=%d total_ms=%.3f",
++                len(results),
++                len(keys),
++                sum(t.element_size() * t.numel() for t in tensors),
++                (time.perf_counter() - started) * 1000.0,
++            )
++        return results
++
++    def put_sample(
++        self,
++        spec: Dict[str, Any],
++        *,
++        aux: Optional[torch.Tensor],
++        last_hidden: Optional[torch.Tensor],
++    ) -> Dict[str, Any]:
++        """Write one sample's artifacts; return the meta_info result dict.
++
++        ``aux``/``last_hidden`` are the per-request (L, W) captured tensors,
++        stored with a leading batch dim of 1. On any failure the keys already
++        written are best-effort removed (no partial sample is consumable).
++        """
++        # Keep the single-sample entry point for compatibility with tests and
++        # callers outside the scheduler; production uses put_samples().
++        return self.put_samples([(spec, aux, last_hidden)])[0]
++
++
++_SINK: Optional[SpecCaptureSink] = None
++
++
++def maybe_init_sink(server_args) -> None:
++    """Called from Scheduler init on the writer rank when spec capture is on.
++
++    Connection to Mooncake is lazy (first put), so a capture-enabled server
++    without a reachable Mooncake master still boots and serves normal traffic.
++    The transport environment is checked here, so an RDMA setup that would
++    fall back to TCP fails server start instead of the first capture.
++    """
++    global _SINK
++    if getattr(server_args, "enable_spec_capture", False) and _SINK is None:
++        check_rdma_environment()
++        logger.info(
++            "Spec capture Mooncake publication uses %s tensors",
++            "device" if gpu_put_enabled() else "host",
++        )
++        _SINK = SpecCaptureSink(
++            aux_layer_ids=getattr(server_args, "spec_capture_aux_layer_ids", None)
++        )
++
++
++def get_sink() -> Optional[SpecCaptureSink]:
++    return _SINK

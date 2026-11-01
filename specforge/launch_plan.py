@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, Optional, Sequence
 from urllib import error as urllib_error
@@ -20,6 +21,17 @@ from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config, ModelConfig
+from specforge.config.schema import (
+    SGLANG_PASSTHROUGH_FIELDS,
+    SGLANG_SECRET_FLAGS,
+    sglang_field_flag,
+    validate_receive_buffers,
+)
+from specforge.runtime.data_plane.mooncake_rdma import (
+    check_rdma_environment,
+    memlock_shortfall,
+    resolve_rdma_devices,
+)
 
 if TYPE_CHECKING:
     from specforge.algorithms.registry import AlgorithmRegistration
@@ -37,6 +49,11 @@ _SECRET_NAMES = (
     "credential",
     "wandb_key",
     "swanlab_key",
+    # Passthrough SGLang flags (``--api-key``) and server env (``HF_TOKEN``).
+    "api_key",
+    "access_key",
+    "hf_token",
+    "hub_token",
 )
 
 
@@ -45,12 +62,21 @@ class _ForwardedSignal(BaseException):
         self.signum = signum
 
 
+def _is_secret_name(name: str) -> bool:
+    normalized = name.lower().replace("-", "_")
+    return any(fragment in normalized for fragment in _SECRET_NAMES) or (
+        name.startswith("--")
+        and len(name) > 2
+        and any(flag.startswith(name) for flag in SGLANG_SECRET_FLAGS)
+    )
+
+
 def _redacted(value: str) -> str:
     name = None
     raw = value
     if "=" in value:
         name, raw = value.split("=", 1)
-        if any(fragment in name.lower() for fragment in _SECRET_NAMES):
+        if _is_secret_name(name):
             return f"{name}=<redacted>"
     try:
         parsed = urlsplit(raw)
@@ -78,12 +104,29 @@ def _redacted(value: str) -> str:
     return f"{name}={raw}" if name is not None else raw
 
 
-def _redacted_env(values: Mapping[str, str]) -> dict[str, str]:
+def _redacted_argv(argv: Sequence[str]) -> list[str]:
+    """Redact ``name=value`` secrets and the value after a ``--secret`` flag."""
+    redacted: list[str] = []
+    for index, value in enumerate(argv):
+        previous = argv[index - 1] if index else ""
+        if (
+            previous.startswith("--")
+            and "=" not in previous
+            and _is_secret_name(previous)
+            and not value.startswith("--")
+        ):
+            redacted.append("<redacted>")
+        else:
+            redacted.append(_redacted(value))
+    return redacted
+
+
+def _redacted_env(values: Mapping[str, Optional[str]]) -> dict[str, Optional[str]]:
     return {
         name: (
             "<redacted>"
-            if any(fragment in name.lower() for fragment in _SECRET_NAMES)
-            else _redacted(value)
+            if _is_secret_name(name)
+            else (_redacted(value) if value is not None else None)
         )
         for name, value in sorted(values.items())
     }
@@ -93,12 +136,14 @@ def _redacted_env(values: Mapping[str, str]) -> dict[str, str]:
 class CommandSpec:
     label: str
     argv: tuple[str, ...]
-    env: Mapping[str, str] = field(default_factory=dict)
+    #: Child environment overrides; a None value unsets the inherited
+    #: variable (Ascend rejects an empty ASCEND_RT_VISIBLE_DEVICES).
+    env: Mapping[str, Optional[str]] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
             "label": self.label,
-            "argv": [_redacted(value) for value in self.argv],
+            "argv": _redacted_argv(self.argv),
             "env": _redacted_env(self.env),
         }
 
@@ -110,12 +155,14 @@ class ReadinessSpec:
     timeout_s: float
     tcp_host: Optional[str] = None
     tcp_port: Optional[int] = None
+    probe_timeout_s: float = 5.0
 
     def as_dict(self) -> dict:
         return {
             "kind": self.kind,
             "url": _redacted(self.url),
             "timeout_s": self.timeout_s,
+            "probe_timeout_s": self.probe_timeout_s,
             "tcp_host": self.tcp_host,
             "tcp_port": self.tcp_port,
         }
@@ -142,10 +189,33 @@ class LaunchPlan:
     kind: PlanKind
     role: Literal["all", "producer", "consumer", "both"]
     commands: tuple[CommandSpec, ...] = ()
-    worker_env: Mapping[str, str] = field(default_factory=dict)
+    #: In-process environment overrides for kind="worker". Shares the
+    #: CommandSpec.env contract: a None value unsets the variable.
+    worker_env: Mapping[str, Optional[str]] = field(default_factory=dict)
     services: tuple[ServiceSpec, ...] = ()
     managed_root: Optional[str] = None
     managed_ports: tuple[int, ...] = ()
+    #: How managed capture servers implement spec capture (preflight checks it);
+    #: ``auto`` only while ``server_capture_error`` says why it is unresolved.
+    server_capture: Literal["auto", "patch", "plugin"] = "patch"
+    #: True when ``auto`` was resolved by probing every capture server's
+    #: interpreter, which already covers the preflight's module check.
+    server_capture_detected: bool = False
+    #: Why ``auto`` could not be resolved on this host. Like
+    #: ``managed_rdma_error``, the plan still renders (without capture flags)
+    #: and the managed preflight raises it before anything starts.
+    server_capture_error: Optional[str] = None
+    #: Host bytes the largest owned Mooncake client registers over RDMA, which
+    #: RLIMIT_MEMLOCK must cover; None when the managed stack uses TCP or its
+    #: RDMA devices are unresolved.
+    managed_rdma_memlock_bytes: Optional[int] = None
+    #: Why the managed stack's RDMA devices could not be resolved on this host.
+    #: The plan still renders (``--plan`` off the training node); the managed
+    #: preflight raises it before anything starts.
+    managed_rdma_error: Optional[str] = None
+    #: Deferred trainer-side dependency checks a supervisor runs before it
+    #: starts any service or worker; planning itself stays side-effect free.
+    preflight_checks: tuple[Callable[[], None], ...] = ()
     # SIGTERM-trapped workers run Mooncake drains, checkpoint flushes, and
     # failure-sentinel publication inside this window before SIGKILL.
     shutdown_grace_s: float = 30.0
@@ -163,6 +233,11 @@ class LaunchPlan:
                     "services": [service.as_dict() for service in self.services],
                     "managed_root": self.managed_root,
                     "managed_ports": list(self.managed_ports),
+                    "server_capture": self.server_capture,
+                    "server_capture_detected": self.server_capture_detected,
+                    "server_capture_error": self.server_capture_error,
+                    "managed_rdma_memlock_bytes": self.managed_rdma_memlock_bytes,
+                    "managed_rdma_error": self.managed_rdma_error,
                     "shutdown_grace_s": self.shutdown_grace_s,
                 }
             )
@@ -203,7 +278,7 @@ def _resolve_role(
         raise ValueError("--role producer/consumer/both requires disaggregated mode")
     if requested == "both" and cfg.training.resume_from:
         raise ValueError(
-            "--role both cannot resume a disaggregated producer; use " "--role consumer"
+            "--role both cannot resume a disaggregated producer; use --role consumer"
         )
     if distributed and requested == "both":
         raise ValueError(
@@ -222,7 +297,7 @@ def _resolved_node_rank(
         node_rank = int(env["NODE_RANK"])
     if node_rank is not None and not 0 <= node_rank < cfg.deployment.trainer.nnodes:
         raise ValueError(
-            f"node_rank={node_rank} must be in [0, " f"{cfg.deployment.trainer.nnodes})"
+            f"node_rank={node_rank} must be in [0, {cfg.deployment.trainer.nnodes})"
         )
     return node_rank
 
@@ -265,6 +340,8 @@ def _disaggregated_env(
         "DISAGG_BACKEND": deployment.backend,
         "DISAGG_STORE_ID": deployment.store_id or cfg.run_id,
     }
+    if deployment.inbox_server_url:
+        values["DISAGG_INBOX_SERVER_URL"] = deployment.inbox_server_url
     if cfg.mode == "online":
         if deployment.backend != "mooncake":
             raise ValueError("online disaggregated training requires Mooncake")
@@ -275,9 +352,9 @@ def _disaggregated_env(
             {
                 "DISAGG_REF_CHANNEL": str(control_dir / "refs.jsonl"),
                 "DISAGG_DB": str(consumer_state_dir / "consumer.sqlite"),
-                # SQLite/WAL stays on rank 0's local filesystem.  Inboxes are
-                # ordinary append-only channels and must remain visible to
-                # ranks on every trainer node.
+                # SQLite/WAL stays on rank 0's local filesystem. Inboxes are
+                # shared normally or served by rank 0 when the HTTP relay is
+                # configured.
                 "DISAGG_INBOX_DIR": str(
                     (
                         control_dir
@@ -285,6 +362,9 @@ def _disaggregated_env(
                         else consumer_state_dir
                     )
                     / "inboxes"
+                ),
+                "DISAGG_ASYNC_ACK": base_env.get(
+                    "DISAGG_ASYNC_ACK", "1" if deployment.async_ack else "0"
                 ),
             }
         )
@@ -308,6 +388,8 @@ def _disaggregated_env(
         values["DISAGG_STORE_ROOT"] = deployment.store_root
     if deployment.backend == "mooncake":
         values["DISAGG_CLIENT_BUFFER_SIZE"] = str(deployment.client_buffer_size)
+        values["DISAGG_RECEIVE_BUFFERS"] = deployment.receive_buffers
+        values["DISAGG_RECEIVE_POOL_BYTES"] = str(deployment.receive_pool_bytes)
 
     optional_values = {
         "MOONCAKE_METADATA_SERVER": deployment.mooncake_metadata_server,
@@ -325,7 +407,22 @@ def _disaggregated_env(
             values[name] = str(value)
 
     if deployment.backend == "mooncake":
-        required = ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
+        protocol = values.get("MOONCAKE_PROTOCOL", "tcp")
+        validate_receive_buffers(deployment.receive_buffers, protocol)
+        if protocol == "nvlink" and cfg.runtime.resident_high_watermark_bytes is None:
+            raise ValueError(
+                "MOONCAKE_PROTOCOL=nvlink keeps objects in capture-server HBM; set "
+                "runtime.resident_high_watermark_bytes at or below the servers' "
+                "summed SGLANG_SPEC_CAPTURE_ARENA_BYTES"
+            )
+        values.update(_mooncake_transport_env(protocol))
+        # Arena objects stay on the capture servers, so there are no store
+        # endpoints; currently only online NVLink capture uses the arena.
+        required = (
+            ()
+            if protocol == "nvlink"
+            else ("MOONCAKE_METADATA_SERVER", "MOONCAKE_MASTER_SERVER_ADDR")
+        )
         missing = [
             name for name in required if not values.get(name) and not base_env.get(name)
         ]
@@ -337,7 +434,88 @@ def _disaggregated_env(
     return values
 
 
-def _managed_local_environment(cfg: Config) -> dict[str, str]:
+def _resolve_managed_rdma_devices(
+    requested: Optional[str], *, defaulted: bool, env: Mapping[str, str]
+) -> str:
+    return resolve_rdma_devices(
+        requested,
+        selected_by=(
+            "managed_local.mooncake.protocol "
+            + ("defaulted to rdma" if defaulted else "is rdma")
+        ),
+        devices_setting="managed_local.mooncake.rdma_devices",
+        opt_out="set managed_local.mooncake.protocol: tcp",
+        env=env,
+    )
+
+
+def _managed_mooncake_transport(
+    cfg: Config,
+    base_env: Mapping[str, str],
+    *,
+    managed_child: bool,
+    rdma_device_resolver: Callable[..., str],
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Resolve the owned stack's Mooncake protocol and RDMA devices once.
+
+    Returns ``(protocol, rdma_devices, error)``; *error* says why the RDMA
+    devices could not be resolved on this host.
+    """
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.managed_local is not None
+    managed = deployment.managed_local
+    mooncake = managed.mooncake
+    if managed_child and base_env.get("MOONCAKE_PROTOCOL"):
+        # The supervisor rendered its resolution into this child's environment.
+        return (
+            base_env["MOONCAKE_PROTOCOL"],
+            base_env.get("MOONCAKE_RDMA_DEVICES"),
+            None,
+        )
+    if mooncake.protocol is not None:
+        protocol = mooncake.protocol
+    elif _device_visibility_env_var() == "ASCEND_RT_VISIBLE_DEVICES":
+        # Ascend stacks keep TCP (the detection behind the NPU attention
+        # backend default).
+        protocol = "tcp"
+    else:
+        protocol = "rdma"
+    if protocol == "nvlink":
+        validate_receive_buffers(deployment.receive_buffers, protocol)
+        return protocol, None, None
+    if protocol == "rdma":
+        try:
+            devices = rdma_device_resolver(
+                mooncake.rdma_devices,
+                defaulted=mooncake.protocol is None,
+                env=base_env,
+            )
+        except RuntimeError as error:
+            # Keep --plan usable off the training node; the configured list, if
+            # any, is rendered and nothing starts (see _managed_rdma_preflight).
+            return protocol, mooncake.rdma_devices, str(error)
+        return protocol, devices, None
+    # The schema rejects these with an explicit tcp; recheck the Ascend default.
+    if any(server.gpu_put for server in managed.capture_servers):
+        raise ValueError(
+            "managed_local capture_servers[].gpu_put needs Mooncake RDMA, but "
+            "managed_local.mooncake.protocol defaulted to tcp on this Ascend host "
+            "and the tcp transport cannot read device memory; set "
+            "managed_local.mooncake.protocol: rdma or remove gpu_put"
+        )
+    if deployment.receive_buffers == "cuda":
+        raise ValueError(
+            "deployment.disaggregated.receive_buffers=cuda needs Mooncake RDMA, "
+            "but managed_local.mooncake.protocol defaulted to tcp on this Ascend "
+            "host and the tcp transport cannot write into device memory; set "
+            "managed_local.mooncake.protocol: rdma or use pinned receive buffers"
+        )
+    return protocol, mooncake.rdma_devices, None
+
+
+def _managed_local_environment(
+    cfg: Config, *, protocol: str, rdma_devices: Optional[str]
+) -> dict[str, str]:
     deployment = cfg.deployment.disaggregated
     assert deployment is not None and deployment.managed_local is not None
     managed = deployment.managed_local
@@ -351,12 +529,79 @@ def _managed_local_environment(cfg: Config) -> dict[str, str]:
         ),
         "MOONCAKE_MASTER_SERVER_ADDR": f"127.0.0.1:{mooncake.rpc_port}",
         "MOONCAKE_LOCAL_HOSTNAME": mooncake.local_hostname,
-        "MOONCAKE_PROTOCOL": mooncake.protocol,
+        "MOONCAKE_PROTOCOL": protocol,
         "DISAGG_SERVER_URLS": ",".join(server_urls),
     }
-    if mooncake.rdma_devices:
-        values["MOONCAKE_RDMA_DEVICES"] = mooncake.rdma_devices
+    # Under rdma the list is always resolved; Mooncake treats an empty one as
+    # auto-discovery with a silent TCP fallback.
+    if rdma_devices:
+        values["MOONCAKE_RDMA_DEVICES"] = rdma_devices
+    values.update(_mooncake_transport_env(protocol))
     return values
+
+
+def _managed_rdma_memlock_bytes(
+    cfg: Config, environment: Mapping[str, str]
+) -> Optional[int]:
+    """Host bytes one owned Mooncake client may register under RDMA.
+
+    Mooncake registers each host buffer with every selected HCA, and the kernel
+    charges each registration to the process's RLIMIT_MEMLOCK, which every
+    child inherits from the supervisor. The largest client is a capture server
+    (global segment plus local buffer) or a trainer rank (client buffer plus a
+    pinned receive pool; cuda pools live in device memory and pageable reads
+    register one transient buffer per fetch).
+    """
+    if environment["MOONCAKE_PROTOCOL"] != "rdma":
+        return None
+    if not environment.get("MOONCAKE_RDMA_DEVICES"):
+        # Unresolved; the preflight refuses the plan before sizing matters.
+        return None
+    deployment = cfg.deployment.disaggregated
+    assert deployment is not None and deployment.managed_local is not None
+    mooncake = deployment.managed_local.mooncake
+    server_bytes = mooncake.global_segment_size_bytes + mooncake.local_buffer_size_bytes
+    trainer_bytes = deployment.client_buffer_size + (
+        deployment.receive_pool_bytes if deployment.receive_buffers == "pinned" else 0
+    )
+    devices = environment["MOONCAKE_RDMA_DEVICES"].split(",")
+    return len(devices) * max(server_bytes, trainer_bytes)
+
+
+def _mooncake_transport_env(protocol: str) -> dict[str, str]:
+    # Mooncake picks NVLink over present RDMA NICs only when this is set.
+    return {"MC_FORCE_MNNVL": "1"} if protocol == "nvlink" else {}
+
+
+def _device_visibility_env_var() -> str:
+    """Visible-devices env var for the active accelerator.
+
+    Kept torch-free for supervisor processes: ``torch_npu`` is detected by
+    module availability, after explicit env markers.
+    """
+    forced = os.environ.get("SPECFORGE_DEVICE")
+    if forced == "npu":
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    if forced == "cuda":
+        return "CUDA_VISIBLE_DEVICES"
+    if os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
+        "ASCEND_VISIBLE_DEVICES"
+    ):
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return "CUDA_VISIBLE_DEVICES"
+    if importlib.util.find_spec("torch_npu") is not None:
+        return "ASCEND_RT_VISIBLE_DEVICES"
+    return "CUDA_VISIBLE_DEVICES"
+
+
+def _hidden_devices_env_value(device_visibility_env: str) -> Optional[str]:
+    """Env value that hides accelerators from a managed child process.
+
+    The Ascend driver rejects an empty ``ASCEND_RT_VISIBLE_DEVICES``, so
+    there the variable must be unset (``None``) instead of emptied.
+    """
+    return "" if device_visibility_env == "CUDA_VISIBLE_DEVICES" else None
 
 
 def _sglang_argv(
@@ -366,18 +611,20 @@ def _sglang_argv(
 ) -> list[str]:
     """Derive SGLang CLI args from all ``sglang_*`` fields on *model*.
 
-    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``.
+    Flag names follow the naming convention ``sglang_foo_bar`` -> ``--foo-bar``
+    unless :func:`sglang_field_flag` records SGLang's own spelling.
     Fields whose values require non-trivial resolution (server-level overrides,
     fallback computations) are passed via *overrides* keyed by the original
     field name; every other ``sglang_*`` field is read directly from *model*.
+    Raw passthrough tokens (``sglang_extra_args``) are appended by the caller.
     """
     resolved = overrides or {}
     argv: list[str] = []
     for name in ModelConfig.model_fields:
-        if not name.startswith("sglang_"):
+        if not name.startswith("sglang_") or name in SGLANG_PASSTHROUGH_FIELDS:
             continue
         value = resolved[name] if name in resolved else getattr(model, name)
-        flag = "--" + name.removeprefix("sglang_").replace("_", "-")
+        flag = sglang_field_flag(name)
         if isinstance(value, bool):
             if value:
                 argv.append(flag)
@@ -386,22 +633,61 @@ def _sglang_argv(
     return argv
 
 
+def _capture_flags(server_capture: str, contract) -> tuple[str, ...]:
+    """SGLang flags enabling spec capture for the selected server backend."""
+    layer_ids = tuple(str(layer) for layer in contract.aux_layer_ids)
+    if server_capture == "plugin":
+        # The plugin (enabled by SPECFORGE_SPEC_CAPTURE) reads the aux and
+        # last hidden states that full hidden-state capture produces. With
+        # --enable-return-aux-hidden-states, --speculative-algorithm only names
+        # the capture convention: SGLang resets it, so no draft runs.
+        return (
+            "--speculative-algorithm",
+            contract.method.upper(),
+            "--enable-return-aux-hidden-states",
+            "--return-aux-hidden-state-layer-ids",
+            *layer_ids,
+            "--return-hidden-states-mode",
+            "full",
+        )
+    return (
+        "--enable-spec-capture",
+        "--spec-capture-method",
+        contract.method,
+        "--spec-capture-aux-layer-ids",
+        *layer_ids,
+    )
+
+
 def _managed_local_services(
     cfg: Config,
     *,
-    algorithm: "AlgorithmRegistration",
+    contract,
+    shared_env: Mapping[str, str],
+    server_capture: Optional[str],
 ) -> tuple[ServiceSpec, ...]:
-    from specforge.training.capture_contract import resolve_server_capture_contract
+    """The owned Mooncake master and capture servers.
 
+    *server_capture* selects the capture flags; None (``auto`` before or
+    without resolution) renders the servers without them.
+    """
     deployment = cfg.deployment.disaggregated
     assert deployment is not None and deployment.managed_local is not None
     managed = deployment.managed_local
     mooncake = managed.mooncake
     control_dir = Path(deployment.control_dir)
     log_dir = control_dir / "logs"
-    shared_env = _managed_local_environment(cfg)
+    device_visibility_env = _device_visibility_env_var()
     capture_context_length = cfg.model.sglang_context_length or (
         cfg.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
+    )
+    # GPU publication also needs GPUDirect RDMA (nvidia_peermem or DMA-BUF),
+    # which the preflight cannot see and the sink meets only at its first
+    # capture, so only an explicit protocol: rdma turns it on automatically.
+    default_gpu_put = (
+        False
+        if mooncake.protocol is None and shared_env["MOONCAKE_PROTOCOL"] == "rdma"
+        else None
     )
 
     mooncake_service = ServiceSpec(
@@ -414,8 +700,13 @@ def _managed_local_services(
                 f"--rpc_port={mooncake.rpc_port}",
                 f"--http_metadata_server_port={mooncake.metadata_port}",
                 f"--metrics_port={mooncake.metrics_port}",
+                *(
+                    (f"--default_kv_lease_ttl={mooncake.default_kv_lease_ttl_ms}",)
+                    if mooncake.default_kv_lease_ttl_ms is not None
+                    else ()
+                ),
             ),
-            {"CUDA_VISIBLE_DEVICES": ""},
+            {device_visibility_env: _hidden_devices_env_value(device_visibility_env)},
         ),
         readiness=ReadinessSpec(
             "mooncake",
@@ -423,16 +714,16 @@ def _managed_local_services(
             mooncake.startup_timeout_s,
             tcp_host="127.0.0.1",
             tcp_port=mooncake.rpc_port,
+            probe_timeout_s=mooncake.probe_timeout_s,
         ),
         log_path=str(log_dir / "mooncake.log"),
         phase=0,
     )
 
-    contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
     capture_services = []
     for index, server in enumerate(managed.capture_servers):
         argv = [
-            sys.executable,
+            server.python_executable or sys.executable,
             "-m",
             "sglang.launch_server",
             "--model-path",
@@ -451,17 +742,27 @@ def _managed_local_services(
                 str(server.tp_size),
                 "--chunked-prefill-size",
                 "-1",
-                "--enable-spec-capture",
-                "--spec-capture-method",
-                contract.method,
-                "--spec-capture-aux-layer-ids",
-                *[str(layer) for layer in contract.aux_layer_ids],
+                *(
+                    _capture_flags(server_capture, contract)
+                    if server_capture is not None
+                    else ()
+                ),
                 "--host",
                 "127.0.0.1",
                 "--port",
                 str(server.port),
             ]
         )
+        attention_backend = (
+            server.attention_backend or cfg.model.sglang_attention_backend
+        )
+        if (
+            server.attention_backend is None
+            and attention_backend == "flashinfer"
+            and device_visibility_env == "ASCEND_RT_VISIBLE_DEVICES"
+        ):
+            # flashinfer does not exist on Ascend; default to the NPU backend.
+            attention_backend = "ascend"
         argv.extend(
             _sglang_argv(
                 cfg.model,
@@ -472,18 +773,43 @@ def _managed_local_services(
                         if server.mem_fraction_static is not None
                         else cfg.model.sglang_mem_fraction_static
                     ),
-                    "sglang_attention_backend": (
-                        server.attention_backend or cfg.model.sglang_attention_backend
-                    ),
+                    "sglang_attention_backend": attention_backend,
                 },
             )
         )
+        # The schema rejects passthrough flags that repeat any flag above.
+        argv.extend(cfg.model.sglang_extra_args)
+        argv.extend(server.extra_args)
+        gpu_put = server.gpu_put if server.gpu_put is not None else default_gpu_put
+        python_env: dict[str, Optional[str]] = {}
+        if server.python_executable:
+            python_env = {"PYTHONPATH": None, "VIRTUAL_ENV": None}
+            if directory := os.path.dirname(server.python_executable):
+                python_env["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
         service_env = {
+            **python_env,
+            # Validated not to overlap the keys below, which win regardless.
+            **server.env,
             **shared_env,
-            "CUDA_VISIBLE_DEVICES": ",".join(server.cuda_visible_devices),
+            device_visibility_env: ",".join(server.cuda_visible_devices),
+            **(
+                {"SGLANG_SPEC_CAPTURE_GPU_PUT": "1" if gpu_put else "0"}
+                if gpu_put is not None
+                else {}
+            ),
+            **(
+                {"SPECFORGE_SPEC_CAPTURE": "1" if server_capture == "plugin" else "0"}
+                if server_capture is not None
+                else {}
+            ),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
+            **(
+                {"SGLANG_SPEC_CAPTURE_ARENA_BYTES": str(mooncake.arena_bytes)}
+                if mooncake.arena_bytes is not None
+                else {}
+            ),
         }
         capture_services.append(
             ServiceSpec(
@@ -494,12 +820,29 @@ def _managed_local_services(
                     "http",
                     f"http://127.0.0.1:{server.port}/health",
                     server.startup_timeout_s,
+                    probe_timeout_s=server.probe_timeout_s,
                 ),
                 log_path=str(log_dir / f"capture-server-{index}.log"),
                 phase=1,
             )
         )
     return (mooncake_service, *capture_services)
+
+
+def _trainer_preflight_checks(
+    cfg: Config,
+    algorithm: Optional["AlgorithmRegistration"],
+) -> tuple[Callable[[], None], ...]:
+    """Trainer-side import checks a supervisor runs before it spawns anything.
+
+    The supervisor runs on the trainer host, so its device matches the
+    trainer's; the trainer rank still owns the authoritative resolution.
+    """
+    if algorithm is None:
+        return ()
+    from specforge.training.model_loading import preflight_draft_kernels
+
+    return (partial(preflight_draft_kernels, cfg, algorithm=algorithm),)
 
 
 def _worker_argv(
@@ -592,8 +935,7 @@ def _validate_consumer_database(
     if cfg.training.resume_from:
         if state_owner and not os.path.exists(database):
             raise ValueError(
-                "consumer resume requires the retained metadata database: "
-                f"{database}"
+                f"consumer resume requires the retained metadata database: {database}"
             )
         return
     stale = [
@@ -644,8 +986,23 @@ def build_launch_plan(
     env: Optional[Mapping[str, str]] = None,
     worker_prefix: Optional[Sequence[str]] = None,
     torchrun_prefix: Optional[Sequence[str]] = None,
+    rdma_device_resolver: Optional[Callable[..., str]] = None,
+    capture_module_probe: Optional[
+        Callable[[CommandSpec, Sequence[str]], list[str]]
+    ] = None,
 ) -> LaunchPlan:
-    """Resolve one validated config into a side-effect-free process plan."""
+    """Resolve one validated config into a side-effect-free process plan.
+
+    A managed-local stack on RDMA reads the host's HCAs from sysfs;
+    *rdma_device_resolver* replaces that probe (``(rdma_devices, *, defaulted,
+    env) -> device list``). A probe that fails is recorded as
+    ``managed_rdma_error`` instead of raising, so the plan still renders on a
+    host without the HCAs, and the managed preflight refuses to launch it.
+    A managed-local stack with ``server_capture`` ``auto`` likewise inspects
+    each capture server's interpreter; *capture_module_probe* replaces that
+    probe (``(command, modules) -> missing modules``) and a failed resolution
+    is recorded as ``server_capture_error``.
+    """
     if cfg.mode == "online":
         if cfg.deployment.mode != "disaggregated":
             raise ValueError(
@@ -708,19 +1065,33 @@ def build_launch_plan(
     if cfg.deployment.mode == "disaggregated":
         role_base_env = base_env
         managed_environment: dict[str, str] = {}
+        managed_rdma_error: Optional[str] = None
         if managed_local is not None:
-            managed_environment = _managed_local_environment(cfg)
+            protocol, rdma_devices, managed_rdma_error = _managed_mooncake_transport(
+                cfg,
+                base_env,
+                managed_child=managed_child,
+                rdma_device_resolver=(
+                    rdma_device_resolver or _resolve_managed_rdma_devices
+                ),
+            )
+            managed_environment = _managed_local_environment(
+                cfg, protocol=protocol, rdma_devices=rdma_devices
+            )
             role_base_env = {**base_env, **managed_environment}
         if role in ("producer", "both"):
             producer_env = _disaggregated_env(cfg, role_base_env, role="producer")
         if role in ("consumer", "both"):
             consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
         if managed_local is not None:
+            device_visibility_env = _device_visibility_env_var()
             producer_env.update(managed_environment)
-            producer_env["CUDA_VISIBLE_DEVICES"] = ""
+            producer_env[device_visibility_env] = _hidden_devices_env_value(
+                device_visibility_env
+            )
             producer_env[_MANAGED_CHILD_ENV] = "1"
             consumer_env.update(managed_environment)
-            consumer_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+            consumer_env[device_visibility_env] = ",".join(
                 managed_local.trainer_cuda_visible_devices
             )
             consumer_env[_MANAGED_CHILD_ENV] = "1"
@@ -788,6 +1159,26 @@ def build_launch_plan(
             )
         return LaunchPlan("command", role, commands=(command,))
 
+    if managed_local is not None:
+        from specforge.training.capture_contract import resolve_server_capture_contract
+
+        contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
+        requested_capture = requested_server_capture(cfg, base_env)
+        server_capture: str = requested_capture
+        server_capture_error: Optional[str] = None
+        if requested_capture == "auto":
+            server_capture, server_capture_error = _detect_server_capture(
+                _managed_local_services(
+                    cfg,
+                    contract=contract,
+                    shared_env=managed_environment,
+                    server_capture=None,
+                ),
+                capture_module_probe or _missing_capture_modules,
+            )
+        if server_capture != "auto":
+            # The managed producer reads the resolution instead of re-probing.
+            producer_env["DISAGG_SERVER_CAPTURE"] = server_capture
     producer = CommandSpec(
         "producer",
         tuple(_worker_argv(worker_prefix, config_path, "producer", overrides)),
@@ -809,7 +1200,12 @@ def build_launch_plan(
             "managed_supervisor",
             "both",
             commands=(producer, consumer),
-            services=_managed_local_services(cfg, algorithm=algorithm),
+            services=_managed_local_services(
+                cfg,
+                contract=contract,
+                shared_env=managed_environment,
+                server_capture=None if server_capture == "auto" else server_capture,
+            ),
             managed_root=deployment.control_dir,
             managed_ports=(
                 managed_local.mooncake.rpc_port,
@@ -817,12 +1213,23 @@ def build_launch_plan(
                 managed_local.mooncake.metrics_port,
                 *[server.port for server in managed_local.capture_servers],
             ),
+            server_capture=server_capture,
+            server_capture_detected=(
+                requested_capture == "auto" and server_capture != "auto"
+            ),
+            server_capture_error=server_capture_error,
+            managed_rdma_memlock_bytes=_managed_rdma_memlock_bytes(
+                cfg, managed_environment
+            ),
+            managed_rdma_error=managed_rdma_error,
+            preflight_checks=_trainer_preflight_checks(cfg, algorithm),
             shutdown_grace_s=managed_local.shutdown_grace_s,
         )
     return LaunchPlan(
         "supervisor",
         "both",
         commands=(producer, consumer),
+        preflight_checks=_trainer_preflight_checks(cfg, algorithm),
         shutdown_grace_s=deployment.shutdown_grace_s,
     )
 
@@ -890,6 +1297,201 @@ def _terminate_processes(
                 pass
 
 
+#: What each capture backend needs in a capture server's interpreter: a module,
+#: or ``module:attribute`` for an attribute the module must define.
+_SERVER_CAPTURE_REQUIREMENTS = {
+    "plugin": (
+        "specforge_sglang_capture",
+        "sglang.srt.model_executor.forward_observer",
+        # Scheduler.defer_response(req, completion) takes this completion
+        # protocol; the earlier deferred-output revision lacks both.
+        "sglang.srt.managers.deferred_output:ResponseCompletion",
+    ),
+    "patch": ("sglang.srt.spec_capture_sink",),
+}
+_SERVER_CAPTURE_INSTALL = {
+    "plugin": (
+        "the specforge-sglang-capture plugin (pip install --no-deps "
+        "plugins/sglang-spec-capture) on an SGLang build with forward "
+        "observers and deferred outputs"
+    ),
+    "patch": (
+        "patched SGLang spec capture; run scripts/apply_sglang_spec_capture_patch.sh"
+    ),
+}
+
+
+def _module_available(name: str) -> bool:
+    module, _, attribute = name.partition(":")
+    try:
+        if importlib.util.find_spec(module) is None:
+            return False
+        return not attribute or hasattr(importlib.import_module(module), attribute)
+    except Exception:
+        return False
+
+
+def _missing_capture_modules(command: CommandSpec, modules: Sequence[str]) -> list[str]:
+    """Entries of *modules* (``module`` or ``module:attribute``) that the
+    capture server's interpreter cannot resolve."""
+    if command.argv[0] == sys.executable and "PYTHONPATH" not in command.env:
+        return [module for module in modules if not _module_available(module)]
+    # Probe the server's environment without enabling its plugin.
+    env = {
+        name: value
+        for name, value in {**os.environ, **command.env}.items()
+        if value is not None
+    }
+    env.update(
+        SPECFORGE_SPEC_CAPTURE="0", CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES=""
+    )
+    env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+    env.pop("ASCEND_VISIBLE_DEVICES", None)
+    probe = """import importlib, importlib.util, json, sys
+missing = []
+for name in sys.argv[1:]:
+    module, _, attribute = name.partition(":")
+    try:
+        found = importlib.util.find_spec(module) is not None and (
+            not attribute or hasattr(importlib.import_module(module), attribute)
+        )
+    except Exception:
+        found = False
+    if not found:
+        missing.append(name)
+print(json.dumps(missing))
+"""
+    try:
+        result = subprocess.run(
+            [command.argv[0], "-c", probe, "mooncake.store", *modules],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        detail = getattr(exc, "stderr", None) or str(exc)
+        raise RuntimeError(
+            f"Cannot inspect {command.label} Python {command.argv[0]!r}: {detail}. "
+            "Check capture_servers[].python_executable and install its capture dependencies."
+        ) from exc
+
+
+def requested_server_capture(cfg: Config, env: Mapping[str, str]) -> str:
+    """The requested capture backend: an explicit ``patch``/``plugin`` in the
+    deployment config, else ``DISAGG_SERVER_CAPTURE``, else ``auto``."""
+    deployment = cfg.deployment.disaggregated
+    configured = deployment.server_capture if deployment is not None else "auto"
+    if configured != "auto":
+        return configured
+    requested = env.get("DISAGG_SERVER_CAPTURE") or "auto"
+    if requested not in ("auto", *_SERVER_CAPTURE_REQUIREMENTS):
+        raise ValueError(
+            "DISAGG_SERVER_CAPTURE must be auto, patch or plugin, " f"got {requested!r}"
+        )
+    return requested
+
+
+def _detect_server_capture(
+    services: Sequence[ServiceSpec],
+    probe: Callable[[CommandSpec, Sequence[str]], list[str]],
+) -> tuple[str, Optional[str]]:
+    """Resolve ``auto`` from what each capture server's interpreter provides.
+
+    Every server resolves to the plugin when its requirements are met, else to
+    the patch. Returns ``(server_capture, None)`` when all servers agree, else
+    ``("auto", error)``.
+    """
+    requirements = [
+        name for needed in _SERVER_CAPTURE_REQUIREMENTS.values() for name in needed
+    ]
+    detected: dict[str, str] = {}
+    for service in services:
+        command = service.command
+        if not command.label.startswith("capture-server-"):
+            continue
+        try:
+            missing = probe(command, requirements)
+        except RuntimeError as exc:
+            return "auto", str(exc)
+        found = [
+            backend
+            for backend, needed in _SERVER_CAPTURE_REQUIREMENTS.items()
+            if not set(needed).intersection(missing)
+        ]
+        if not found:
+            return "auto", (
+                "deployment.disaggregated.server_capture=auto found no capture "
+                f"backend for {command.label} using {command.argv[0]!r} "
+                f"(missing {missing}); install {_SERVER_CAPTURE_INSTALL['plugin']}, "
+                f"or {_SERVER_CAPTURE_INSTALL['patch']}"
+            )
+        # Modules every backend needs (mooncake.store).
+        shared = [name for name in missing if name not in requirements]
+        if shared:
+            return "auto", (
+                f"managed_local requires {_SERVER_CAPTURE_INSTALL[found[0]]} for "
+                f"{command.label} using {command.argv[0]!r}; missing {shared}"
+            )
+        detected[command.label] = found[0]
+    if len(set(detected.values())) != 1:
+        return "auto", (
+            "deployment.disaggregated.server_capture=auto resolved the capture "
+            f"servers to different backends {detected}; one plan needs one "
+            "backend, so install the same one for every capture server or set "
+            "server_capture: patch|plugin"
+        )
+    return next(iter(detected.values())), None
+
+
+def _managed_rdma_preflight(plan: LaunchPlan) -> None:
+    """Refuse an RDMA stack that would fall back to TCP or fail to register."""
+    if plan.managed_rdma_error is not None:
+        raise RuntimeError(plan.managed_rdma_error)
+    opt_out = "set managed_local.mooncake.protocol: tcp"
+    for command in (*(service.command for service in plan.services), *plan.commands):
+        if command.env.get("MOONCAKE_PROTOCOL") != "rdma":
+            continue
+        # Children start from this environment (see _spawn_command).
+        child_env = {
+            name: value
+            for name, value in {**os.environ, **command.env}.items()
+            if value is not None
+        }
+        devices = child_env.get("MOONCAKE_RDMA_DEVICES")
+        check_rdma_environment(
+            child_env,
+            where=f"the {command.label} environment",
+            opt_out=opt_out,
+            devices=devices,
+        )
+        # Per-command port/GID overrides can invalidate the list selected when
+        # building the plan. Recheck that same list in the child's final env.
+        resolve_rdma_devices(
+            devices,
+            selected_by=f"the {command.label} environment selects RDMA",
+            devices_setting=f"{command.label} MOONCAKE_RDMA_DEVICES",
+            opt_out=opt_out,
+            env=child_env,
+        )
+    required = plan.managed_rdma_memlock_bytes
+    if required is None:
+        return
+    limit = memlock_shortfall(required)
+    if limit is not None:
+        raise RuntimeError(
+            f"managed_local Mooncake RDMA registers up to {required} bytes "
+            f"({required / (1 << 30):.1f} GiB) of host memory in one process "
+            "(every host buffer once per selected HCA), but RLIMIT_MEMLOCK is "
+            f"{limit} bytes and this process lacks CAP_IPC_LOCK; owned processes "
+            "inherit both. Raise the limit before launching (ulimit -l unlimited; "
+            "in a container --ulimit memlock=-1 or --cap-add IPC_LOCK), or, to "
+            f"use TCP, {opt_out}."
+        )
+
+
 def _managed_preflight(plan: LaunchPlan) -> None:
     if plan.managed_root is None:
         raise ValueError("managed supervisor plan is missing managed_root")
@@ -905,17 +1507,23 @@ def _managed_preflight(plan: LaunchPlan) -> None:
         mooncake_available = False
     if not mooncake_available:
         raise RuntimeError("managed_local requires the mooncake Python package")
-    try:
-        patched_sglang = (
-            importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
+    if plan.server_capture_error is not None:
+        raise RuntimeError(plan.server_capture_error)
+    # Planning already probed these interpreters when it resolved auto.
+    capture_services = () if plan.server_capture_detected else plan.services
+    for service in capture_services:
+        if not service.command.label.startswith("capture-server-"):
+            continue
+        missing = _missing_capture_modules(
+            service.command, _SERVER_CAPTURE_REQUIREMENTS[plan.server_capture]
         )
-    except ModuleNotFoundError:
-        patched_sglang = False
-    if not patched_sglang:
-        raise RuntimeError(
-            "managed_local requires patched SGLang spec capture; run "
-            "scripts/apply_sglang_spec_capture_patch.sh"
-        )
+        if missing:
+            raise RuntimeError(
+                f"managed_local requires {_SERVER_CAPTURE_INSTALL[plan.server_capture]} "
+                f"for {service.command.label} using {service.command.argv[0]!r}; "
+                f"missing {missing}"
+            )
+    _managed_rdma_preflight(plan)
 
     for port in plan.managed_ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -925,11 +1533,17 @@ def _managed_preflight(plan: LaunchPlan) -> None:
                 raise RuntimeError(
                     f"managed_local port 127.0.0.1:{port} is unavailable: {exc}"
                 ) from exc
+    # Trainer dependencies otherwise fail only after every capture server has
+    # warmed up.
+    for check in plan.preflight_checks:
+        check()
 
 
-def _http_ready(readiness: ReadinessSpec) -> bool:
+def _http_ready(readiness: ReadinessSpec, *, timeout_s: Optional[float] = None) -> bool:
+    if timeout_s is None:
+        timeout_s = readiness.probe_timeout_s
     try:
-        with urllib_request.urlopen(readiness.url, timeout=1.0) as response:
+        with urllib_request.urlopen(readiness.url, timeout=timeout_s) as response:
             status = getattr(response, "status", 200)
             return readiness.kind == "mooncake" or 200 <= status < 300
     except urllib_error.HTTPError as exc:
@@ -940,17 +1554,27 @@ def _http_ready(readiness: ReadinessSpec) -> bool:
         return False
 
 
-def _readiness_satisfied(readiness: ReadinessSpec) -> bool:
-    if not _http_ready(readiness):
+def _readiness_satisfied(
+    readiness: ReadinessSpec, *, deadline: Optional[float] = None
+) -> bool:
+    started = time.monotonic()
+    probe_deadline = started + readiness.probe_timeout_s
+    if deadline is not None:
+        probe_deadline = min(probe_deadline, deadline)
+    timeout_s = probe_deadline - started
+    if timeout_s <= 0 or not _http_ready(readiness, timeout_s=timeout_s):
+        return False
+    remaining = probe_deadline - time.monotonic()
+    if remaining <= 0:
         return False
     if readiness.kind != "mooncake":
         return True
     assert readiness.tcp_host is not None and readiness.tcp_port is not None
     try:
         with socket.create_connection(
-            (readiness.tcp_host, readiness.tcp_port), timeout=1.0
+            (readiness.tcp_host, readiness.tcp_port), timeout=remaining
         ):
-            return True
+            return time.monotonic() < probe_deadline
     except OSError:
         return False
 
@@ -969,9 +1593,12 @@ def _wait_for_service(
                     f"managed service {active_service.command.label!r} exited "
                     f"with status {status}; see {active_service.log_path}"
                 )
-        if _readiness_satisfied(service.readiness):
+        if _readiness_satisfied(service.readiness, deadline=deadline):
             return
-        time.sleep(0.25)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.25, remaining))
     if process.poll() is not None:
         raise RuntimeError(
             f"managed service {service.command.label!r} exited during startup; "
@@ -991,7 +1618,11 @@ def _spawn_command(
     stderr=None,
 ) -> subprocess.Popen:
     child_env = os.environ.copy()
-    child_env.update(command.env)
+    for key, value in command.env.items():
+        if value is None:
+            child_env.pop(key, None)
+        else:
+            child_env[key] = value
     kwargs = {"env": child_env, "start_new_session": True}
     if stdout is not None:
         kwargs["stdout"] = stdout
@@ -1106,6 +1737,11 @@ def run_commands(
                     services.append((service, _spawn_service(service, popen=popen)))
                 for service, process in services[-len(current_phase) :]:
                     readiness_waiter(service, process, tuple(services))
+        elif plan.kind == "supervisor":
+            # Otherwise a trainer dependency fails only in the consumer, after
+            # the producer has started its work.
+            for check in plan.preflight_checks:
+                check()
         for command in plan.commands:
             processes.append(_spawn_command(command, popen=popen))
         remaining = set(range(len(processes)))

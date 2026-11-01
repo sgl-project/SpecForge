@@ -161,7 +161,9 @@ requeues the unacknowledged tail. For an acked remote-rank ref, the fresh
 authority first adopts its durable key metadata before deleting it. A second
 pass over consumed refs remains unsupported. Producer/consumer failures are
 propagated explicitly, and both roles run a bounded pending-remove drain that
-fails loudly instead of hiding a hard-pinned Mooncake leak.
+fails loudly instead of hiding a Mooncake object leak. Hard pinning is used
+when the installed Mooncake client exposes `with_hard_pin`; older clients fall
+back to their default pin behavior and emit a warning.
 
 Offline manifests and feature objects are intentionally stable instead. They
 remain available for repeated epochs and checkpoint resume.

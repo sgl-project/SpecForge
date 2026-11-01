@@ -5,7 +5,11 @@ import tempfile
 import time
 import unittest
 
-from tests.utils import execute_shell_command, terminate_process_trees
+from tests.utils import (
+    execute_shell_command,
+    terminate_process_trees,
+    wait_for_processes_to_stop,
+)
 
 
 @unittest.skipUnless(
@@ -54,15 +58,13 @@ time.sleep(60)
                 process.wait(timeout=5)
                 terminate_process_trees(process, grace_s=1)
 
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    try:
-                        os.killpg(leader_pid, 0)
-                    except ProcessLookupError:
-                        break
-                    time.sleep(0.02)
-                else:
-                    self.fail(f"process group {leader_pid} survived cleanup")
+                survivors = wait_for_processes_to_stop(
+                    (leader_pid, grandchild_pid), timeout_s=5
+                )
+                self.assertFalse(
+                    survivors,
+                    f"processes survived cleanup: {survivors}",
+                )
             finally:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)

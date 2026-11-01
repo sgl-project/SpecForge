@@ -57,13 +57,12 @@ gate_require_command() {
     }
 }
 
-gate_require_tcp_port_free() {
+_gate_tcp_port_is_free() {
     local python=$1
     local host=$2
     local port=$3
-    local label=$4
 
-    if "$python" - "$host" "$port" <<'PY'
+    "$python" - "$host" "$port" <<'PY'
 import socket
 import sys
 
@@ -80,10 +79,45 @@ for family, socktype, proto, _, address in socket.getaddrinfo(
         raise SystemExit(1)
     sock.close()
 PY
-    then
+}
+
+gate_require_tcp_port_free() {
+    local python=$1
+    local host=$2
+    local port=$3
+    local label=$4
+
+    if _gate_tcp_port_is_free "$python" "$host" "$port"; then
         return 0
     fi
     gate_fail "$label is already in use at $host:$port"
+}
+
+gate_report_tcp_ports() {
+    local python=$1
+    local host=$2
+    local label
+    local port
+    local occupied=()
+    shift 2
+
+    while (($# >= 2)); do
+        label=$1
+        port=$2
+        shift 2
+        if ! _gate_tcp_port_is_free "$python" "$host" "$port"; then
+            occupied+=("$label: $host:$port")
+        fi
+    done
+
+    if ((${#occupied[@]} == 0)); then
+        printf 'All requested ports are available.\n'
+        return 0
+    fi
+
+    printf 'Occupied ports:\n'
+    printf '  - %s\n' "${occupied[@]}"
+    return 0
 }
 
 gate_dry_run() {

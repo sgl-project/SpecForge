@@ -44,13 +44,12 @@ import argparse
 import gc
 import gzip
 import hashlib
-import json
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional
+from typing import Callable, Dict, List, Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -75,6 +74,8 @@ from specforge.distributed import (
 )
 from specforge.offline_capture import OfflineSGLangCapture, load_offline_capture
 from specforge.utils import (
+    get_device_type,
+    is_xpu,
     load_tokenizer,
     print_args_with_dots,
     print_with_rank,
@@ -92,6 +93,7 @@ class OfflineCapturePlan:
     capture_method: str
     capture_layers: tuple[int, ...]
     layout: OfflineCaptureLayout
+    loss_mask_filter: Optional[Callable[[object], bool]]
 
 
 def parse_args():
@@ -161,6 +163,16 @@ def parse_args():
         help="Max number of pending I/O futures.",
     )
     others_group.add_argument(
+        "--hidden-state-transfer",
+        choices=("async", "sync"),
+        default="async",
+        help=(
+            "Hidden-state D2H transfer (default: async). Async uses pinned CPU "
+            "buffers and a CUDA copy stream; use sync or reduce --io-queue-size "
+            "if transfer memory is insufficient."
+        ),
+    )
+    others_group.add_argument(
         "--file-group-size",
         type=int,
         default=2000,
@@ -192,34 +204,30 @@ def parse_args():
     sglang_group.add_argument("--sglang-enable-dp-attention", action="store_true")
     sglang_group.add_argument("--sglang-enable-dp-lm-head", action="store_true")
     sglang_group.add_argument("--sglang-ep-size", type=int, default=1)
+    sglang_group.add_argument(
+        "--sglang-disable-radix-cache",
+        action="store_true",
+        help=(
+            "Disable the SGLang radix (prefix) cache (default: enabled). "
+            "Required for hybrid linear-attention/Mamba targets on ROCm, whose "
+            "mamba radix-cache extra_buffer strategy asserts CUDA/MUSA/NPU "
+            "(FLA) at server init."
+        ),
+    )
     return parser.parse_args()
 
 
-def _resolve_draft_vocab_size(source: str) -> int:
-    """Load ``draft_vocab_size`` from one existing local JSON file."""
+def _resolve_draft_vocab_size(draft_config: object) -> int:
+    """Read the vocabulary size from the canonical resolved draft config."""
 
-    expanded = Path(source).expanduser()
-    if not expanded.is_file():
-        raise FileNotFoundError(
-            "--draft-model-config must point to an existing local JSON file: "
-            f"{source}"
-        )
-    if expanded.suffix.lower() != ".json":
-        raise ValueError(
-            f"--draft-model-config must point to a local .json file: {source}"
-        )
-    try:
-        with expanded.open(encoding="utf-8") as stream:
-            payload = json.load(stream)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid draft config JSON {expanded}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"draft config JSON {expanded} must contain an object")
-    value = payload.get("draft_vocab_size", payload.get("vocab_size"))
+    missing = object()
+    value = getattr(draft_config, "draft_vocab_size", missing)
+    if value is missing:
+        value = getattr(draft_config, "vocab_size", None)
 
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(
-            f"draft model config {source!r} must define a positive "
+            "resolved draft model config must define a positive "
             f"draft_vocab_size (or vocab_size fallback), got {value!r}"
         )
     return value
@@ -308,6 +316,7 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
         "enable_dp_attention": args.sglang_enable_dp_attention,
         "enable_dp_lm_head": args.sglang_enable_dp_lm_head,
         "ep_size": args.sglang_ep_size,
+        "disable_radix_cache": getattr(args, "sglang_disable_radix_cache", False),
         "max_running_requests": args.batch_size,
         "max_total_tokens": args.batch_size * args.max_length,
     }
@@ -341,6 +350,7 @@ def resolve_offline_capture_plan(
         capture_method=resolved.capture_method,
         capture_layers=resolved.capture_layers,
         layout=resolved.layout,
+        loss_mask_filter=resolved.loss_mask_filter,
     )
 
 
@@ -387,6 +397,7 @@ class HiddenStatesGenerator:
         file_group_size: int = 2000,
         compress: bool = False,
         compression_level: int = 6,
+        hidden_state_transfer: str = "async",
     ):
         """
         Args:
@@ -395,7 +406,16 @@ class HiddenStatesGenerator:
             num_io_threads: Number of threads for async I/O.
             io_queue_size: Max number of pending I/O futures before cleanup.
             file_group_size: Number of files per subdirectory.
+            hidden_state_transfer: Async CUDA copies into pinned CPU buffers,
+                or legacy synchronous copies. In-flight records are bounded by
+                io_queue_size; pinned allocator caches may retain freed buffers.
         """
+        if hidden_state_transfer not in ("async", "sync"):
+            raise ValueError("hidden_state_transfer must be 'async' or 'sync'")
+        if io_queue_size < 1:
+            raise ValueError("io_queue_size must be positive")
+        self.hidden_state_transfer = hidden_state_transfer
+        self._copy_streams = {}
         self.model = target_model
         self.capture_layout = capture_layout or OfflineCaptureLayout(
             capture_method="eagle3",
@@ -434,12 +454,95 @@ class HiddenStatesGenerator:
         if is_tp_rank_0() and self.io_executor is not None:
             if self.show_progress:
                 print("\nWaiting for all async I/O operations to complete...")
-            self._wait_all_saves()
-            self.io_executor.shutdown(wait=True)
-            self.io_executor = None  # Reset for safety
+            try:
+                self._wait_all_saves()
+            finally:
+                self.io_executor.shutdown(wait=True)
+                self.io_executor = None
+                self.pending_futures.clear()
+                for stream in self._copy_streams.values():
+                    stream.synchronize()
+                self._copy_streams.clear()
 
-        # Final barrier to ensure all processes exit generate() cleanly
-        dist.barrier()
+        if exc_type is None:
+            dist.barrier()
+
+    @staticmethod
+    def _add_transfer_memory_hint(exc):
+        hint = (
+            "Reduce --io-queue-size or use --hidden-state-transfer sync to "
+            "reduce in-flight transfer memory."
+        )
+        exc.args = (f"{exc}\n{hint}", *exc.args[1:])
+
+    def _stage_hidden_states(self, *tensors):
+        staged = []
+        streams = set()
+        try:
+            for tensor in tensors:
+                if tensor is None:
+                    staged.append(None)
+                elif (
+                    self.hidden_state_transfer == "sync" or tensor.device.type != "cuda"
+                ):
+                    staged.append(tensor.cpu().clone().unsqueeze(0))
+                else:
+                    device = tensor.device
+                    if device not in self._copy_streams:
+                        self._copy_streams[device] = torch.cuda.Stream(device=device)
+                    stream = self._copy_streams[device]
+                    try:
+                        host = torch.empty(
+                            tensor.shape,
+                            dtype=tensor.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                    except (RuntimeError, MemoryError) as exc:
+                        if isinstance(exc, MemoryError) or any(
+                            text in str(exc).lower()
+                            for text in (
+                                "out of memory",
+                                "cannot allocate memory",
+                                "can't allocate memory",
+                                "not enough memory",
+                            )
+                        ):
+                            self._add_transfer_memory_hint(exc)
+                        raise
+                    stream.wait_stream(torch.cuda.current_stream(device))
+                    with torch.cuda.stream(stream):
+                        host.copy_(tensor, non_blocking=True)
+                        # The producer may release its source before D2H finishes.
+                        tensor.record_stream(stream)
+                    streams.add(stream)
+                    staged.append(host.unsqueeze(0))
+        except torch.cuda.OutOfMemoryError as exc:
+            if "--hidden-state-transfer sync" not in str(exc):
+                self._add_transfer_memory_hint(exc)
+            raise
+        events = []
+        for stream in streams:
+            event = torch.cuda.Event()
+            event.record(stream)
+            events.append(event)
+        return staged, events
+
+    def _save_after_transfer(self, record, output_file, ready_events):
+        for event in ready_events:
+            event.synchronize()
+        self._save_tensor_sync(record, output_file)
+
+    def _wait_for_io_slot(self):
+        pending = []
+        for future in self.pending_futures:
+            if future.done():
+                future.result()  # Do not discard failed writes during cleanup.
+            else:
+                pending.append(future)
+        self.pending_futures = pending
+        if len(self.pending_futures) >= self.io_queue_size:
+            self.pending_futures.pop(0).result()
 
     def _save_tensor_sync(
         self,
@@ -481,6 +584,7 @@ class HiddenStatesGenerator:
         self,
         record: Mapping[str, torch.Tensor],
         output_file: str,
+        ready_events=(),
     ) -> None:
         """
         Submit a job to the io_executor to save the data point asynchronously.
@@ -490,17 +594,10 @@ class HiddenStatesGenerator:
             output_file (str): The path to the output file.
         """
         assert is_tp_rank_0(), "Only tp_rank=0 should call _save_tensor_async"
-        # If the queue of pending save operations is full, we must wait.
-        if len(self.pending_futures) >= self.io_queue_size:
-            # First, try to clear any futures that have already finished without waiting.
-            self.pending_futures = [f for f in self.pending_futures if not f.done()]
-            # If the queue is *still* full, it means all I/O threads are busy and we have
-            # a backlog. We must now block the main generation loop and wait for the
-            # oldest I/O operation to complete before proceeding.
-            if len(self.pending_futures) >= self.io_queue_size:
-                self.pending_futures.pop(0).result()
-
-        future = self.io_executor.submit(self._save_tensor_sync, record, output_file)
+        self._wait_for_io_slot()
+        future = self.io_executor.submit(
+            self._save_after_transfer, record, output_file, ready_events
+        )
         self.pending_futures.append(future)
 
     def _wait_all_saves(self):
@@ -600,10 +697,10 @@ class HiddenStatesGenerator:
         samples_per_dp: int = 0,
     ):
         """
-        This version prioritizes minimal CPU RAM usage above all else, even at the cost of performance.
-        - It processes samples one-by-one within the tp_rank_0 process.
-        - It avoids batching GPU-to-CPU transfers.
-        - It ensures only one sample's data is in RAM for I/O at any given time.
+        CUDA states are copied into pinned CPU buffers on a separate stream by
+        default. Writer threads wait for copy events before checking or saving
+        tensors. The I/O queue applies backpressure before staging another record.
+        Use hidden_state_transfer="sync" for the legacy low-memory transfer path.
         """
         self._prepare_output_dirs(output_path, start_idx, samples_per_dp)
 
@@ -634,11 +731,11 @@ class HiddenStatesGenerator:
                     output_path, current_batch_indices
                 )
                 exists_tensor = torch.tensor(
-                    exists_list, dtype=torch.bool, device="cuda"
+                    exists_list, dtype=torch.bool, device=get_device_type()
                 )
             else:
                 exists_tensor = torch.tensor(
-                    [False] * batch_size, dtype=torch.bool, device="cuda"
+                    [False] * batch_size, dtype=torch.bool, device=get_device_type()
                 )
             dist.broadcast(exists_tensor, src=tp_rank_0_global, group=tp_group)
 
@@ -675,11 +772,15 @@ class HiddenStatesGenerator:
                 continue
 
             filtered_batch_gpu = {
-                k: v.cuda(non_blocking=True) for k, v in filtered_batch.items()
+                k: v.to(get_device_type(), non_blocking=True)
+                for k, v in filtered_batch.items()
             }
-            captured = self.model.capture(
-                **filtered_batch_gpu,
-            )
+            try:
+                captured = self.model.capture(**filtered_batch_gpu)
+            except torch.cuda.OutOfMemoryError as exc:
+                if self.hidden_state_transfer == "async":
+                    self._add_transfer_memory_hint(exc)
+                raise
             aux_hidden_states_list = captured.hidden_states
             last_hidden_states_list = captured.last_hidden_states
             if aux_hidden_states_list is None:
@@ -702,17 +803,9 @@ class HiddenStatesGenerator:
                     )
                 ):
 
-                    # Process ONE sample at a time to minimize CPU RAM footprint
-                    # 1. Transfer only the required slice for one sample to CPU
-                    aux_hidden_states = (
-                        aux_hidden_states.cpu().clone().unsqueeze(0)
-                        if aux_hidden_states is not None
-                        else None
-                    )
-                    last_hidden_states = (
-                        last_hidden_states.cpu().clone().unsqueeze(0)
-                        if last_hidden_states is not None
-                        else None
+                    self._wait_for_io_slot()
+                    (aux_hidden_states, last_hidden_states), ready_events = (
+                        self._stage_hidden_states(aux_hidden_states, last_hidden_states)
                     )
                     record = self.capture_layout.materialize(
                         {
@@ -725,7 +818,7 @@ class HiddenStatesGenerator:
 
                     # 3. Save asynchronously (the backpressure logic is still crucial)
                     output_file = self._get_file_path(output_path, current_global_idx)
-                    self._save_tensor_async(record, output_file)
+                    self._save_tensor_async(record, output_file, ready_events)
 
                     # 4. Immediately clean up the single-sample CPU tensors
                     del last_hidden_states, aux_hidden_states
@@ -735,7 +828,7 @@ class HiddenStatesGenerator:
             # Clean up the large GPU and CPU batch data
             del aux_hidden_states_list, last_hidden_states_list, filtered_batch
 
-            if batch_idx % 5 == 0:  # Make GC and cache clearing more frequent
+            if self.hidden_state_transfer == "sync" and batch_idx % 5 == 0:
                 torch.cuda.empty_cache()
                 gc.collect()
 
@@ -759,6 +852,8 @@ class HiddenStatesGenerator:
 
 def main():
     args = parse_args()
+    if is_xpu():
+        args.sglang_attention_backend = "triton"
     if args.num_io_threads is None:
         cpu_cores = os.cpu_count() or 1
         args.num_io_threads = max(1, cpu_cores)
@@ -773,7 +868,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
     capture_plan = resolve_offline_capture_plan(args, target_model_config)
-    draft_vocab_size = _resolve_draft_vocab_size(args.draft_model_config)
+    draft_vocab_size = _resolve_draft_vocab_size(capture_plan.draft_config)
 
     # Initialize distributed environment (TP + DP)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -826,7 +921,7 @@ def main():
             ),
             num_proc=min(args.build_dataset_num_proc, 32),
         )
-    if args.num_samples is not None:
+    if args.num_samples is not None and capture_plan.loss_mask_filter is None:
         dataset = dataset.select(range(args.num_samples))
     # Tokenizer and cache key
     tokenizer = load_tokenizer(
@@ -847,6 +942,15 @@ def main():
             cache_key=cache_key,
             is_preformatted=args.is_preformatted,
             num_proc=args.build_dataset_num_proc,
+            loss_mask_filter=capture_plan.loss_mask_filter,
+        )
+    if capture_plan.loss_mask_filter is not None and args.num_samples is not None:
+        eagle3_dataset = eagle3_dataset.select(
+            range(min(args.num_samples, len(eagle3_dataset)))
+        )
+    if not len(eagle3_dataset):
+        raise ValueError(
+            f"no samples satisfy {capture_plan.strategy} training eligibility"
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
 
@@ -905,6 +1009,7 @@ def main():
             file_group_size=args.file_group_size,
             compress=args.compress,
             compression_level=args.compression_level,
+            hidden_state_transfer=args.hidden_state_transfer,
             # Other params like io_queue_size can also be added to argparse
         ) as hidden_states_generator:
 

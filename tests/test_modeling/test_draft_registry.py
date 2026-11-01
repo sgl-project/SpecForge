@@ -19,6 +19,7 @@ from transformers import LlamaConfig, Qwen3Config
 from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 from specforge.modeling.draft import (
     DRAFT_REGISTRY,
+    DFlash2DraftModel,
     DFlashDraftModel,
     DominoDraftModel,
     DSparkDraftModel,
@@ -70,6 +71,20 @@ TINY_DSPARK = {
     },
 }
 
+TINY_DFLASH2 = {
+    **TINY_DFLASH,
+    "architectures": ["DFlash2DraftModel"],
+    "layer_types": ["full_attention"],
+    "dflash_config": {
+        "block_size": 4,
+        "conv_group_size": 16,
+        "conv_kernel_size": 2,
+        "selector_rank": 4,
+        "selector_top_k": 4,
+        "target_layer_ids": [1],
+    },
+}
+
 TINY_DOMINO = {
     **TINY_DFLASH,
     "architectures": ["DominoDraftModel"],
@@ -95,10 +110,12 @@ class DraftRegistryTest(unittest.TestCase):
     def test_builtin_architectures_registered(self):
         self.assertIn("LlamaForCausalLMEagle3", available_drafts())
         self.assertIn("DFlashDraftModel", available_drafts())
+        self.assertIn("DFlash2DraftModel", available_drafts())
         self.assertIn("DominoDraftModel", available_drafts())
         self.assertIn("DSparkDraftModel", available_drafts())
         self.assertIs(resolve_draft("LlamaForCausalLMEagle3"), LlamaForCausalLMEagle3)
         self.assertIs(resolve_draft("DFlashDraftModel"), DFlashDraftModel)
+        self.assertIs(resolve_draft("DFlash2DraftModel"), DFlash2DraftModel)
         self.assertIs(resolve_draft("DominoDraftModel"), DominoDraftModel)
         self.assertIs(resolve_draft("DSparkDraftModel"), DSparkDraftModel)
 
@@ -157,6 +174,15 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         self.assertEqual(model.projector_type, "dspark")
         self.assertIsNotNone(model.markov_head)
         self.assertIsNotNone(model.confidence_head)
+
+    def test_from_config_builds_dflash2_as_dflash_variant(self):
+        path = _write(TINY_DFLASH2)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoDraftModel.from_config(config)
+        self.assertIsInstance(model, DFlash2DraftModel)
+        self.assertIsInstance(model, DFlashDraftModel)
+        self.assertEqual(model.block_size, 4)
 
     def test_dspark_defaults_to_gqa_and_requires_explicit_mha(self):
         implicit_mha = copy.deepcopy(TINY_DSPARK)

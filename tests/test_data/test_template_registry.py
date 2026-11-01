@@ -2,12 +2,35 @@
 
 import unittest
 
+from specforge.data.preprocessing import preprocess_conversations
 from specforge.data.template import TEMPLATE_REGISTRY
 
 
 class TemplateRegistryTest(unittest.TestCase):
+    def test_qwen3_instruct_has_no_default_system_prompt(self):
+        template = TEMPLATE_REGISTRY.get("qwen3-instruct")
+
+        self.assertEqual(template.system_prompt, "")
+        self.assertEqual(template.ignore_token, ["<think>\n\n</think>\n\n"])
+        self.assertEqual(
+            TEMPLATE_REGISTRY.get("qwen").system_prompt,
+            "You are a helpful assistant.",
+        )
+
     def test_qwen2_vl_is_not_a_builtin_template(self):
         self.assertNotIn("qwen2-vl", TEMPLATE_REGISTRY.get_all_template_names())
+
+    def test_every_registered_template_builds_its_parser(self):
+        # The parser is chosen from parser_type and compiles its assistant-span
+        # pattern before any conversation is read, so no tokenizer is needed.
+        for name in TEMPLATE_REGISTRY.get_all_template_names():
+            with self.subTest(template=name):
+                preprocess_conversations(
+                    tokenizer=None,
+                    conversations=[],
+                    chat_template=TEMPLATE_REGISTRY.get(name),
+                    tools=[],
+                )
 
     def test_deepseek_v2_uses_its_plain_text_tokenizer_headers(self):
         template = TEMPLATE_REGISTRY.get("deepseek-v2")
@@ -20,6 +43,21 @@ class TemplateRegistryTest(unittest.TestCase):
             TEMPLATE_REGISTRY.get("deepseek-v3").assistant_header,
             template.assistant_header,
         )
+
+    def test_kimi_k3_template_matches_target_xtml_contract(self):
+        template = TEMPLATE_REGISTRY.get("kimi-k3-thinking")
+        self.assertEqual(
+            template.assistant_header,
+            '<|open|>message role="assistant"<|sep|><|open|>think<|sep|>',
+        )
+        self.assertEqual(
+            template.user_header,
+            '<|open|>message role="user"<|sep|>',
+        )
+        self.assertEqual(template.end_of_turn_token, "<|end_of_msg|>")
+        self.assertEqual(template.parser_type, "thinking")
+        self.assertIsNone(template.enable_thinking)
+        self.assertEqual(template.ignore_token, ["<|end_of_msg|>"])
 
 
 if __name__ == "__main__":

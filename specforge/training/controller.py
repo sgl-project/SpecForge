@@ -8,19 +8,22 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainerCore + TrainerController: the trainer-boundary split.
 
-``TrainerCore`` runs exactly one branch-free step (strategy forward/loss, backend
-backward/step) plus the grad-accumulation boundary. ``TrainerController`` owns
-the lifecycle: fit / evaluate / save_checkpoint. EAGLE3 and DFlash share this
-unchanged — only the strategy differs.
+``TrainerCore`` owns strategy forward/loss, optional window replay, backend
+backward/step, and the accumulation boundary. ``TrainerController`` owns
+the lifecycle: fit / evaluate / save_checkpoint.
 """
 
 from __future__ import annotations
 
 import itertools
 import logging
+import math
 import os
 import sys
-from dataclasses import dataclass, field
+import threading
+import time
+from contextlib import ExitStack
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import torch
@@ -48,28 +51,80 @@ class Checkpoint:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
 class StepResult:
     """Result of one TrainerCore step; ``optimizer_stepped`` is the authoritative
-    grad-accumulation boundary signal."""
+    grad-accumulation boundary signal.
 
-    optimizer_stepped: bool
-    loss: float
-    grad_norm: Optional[float]
-    metrics: Dict[str, Any] = field(default_factory=dict)
+    Metric tensors stay on the training device until a consumer actually asks
+    for host values.  This keeps ``train_step`` asynchronous on non-logging
+    steps while preserving the existing float-valued public properties.
+    """
+
+    def __init__(
+        self,
+        *,
+        optimizer_stepped: bool,
+        metric_values: Dict[str, Any],
+        has_grad_norm: bool,
+    ) -> None:
+        self.optimizer_stepped = optimizer_stepped
+        self._metric_values = metric_values
+        self._has_grad_norm = has_grad_norm
+        self._materialized_metrics: Optional[Dict[str, float]] = None
+
+    def materialize_metrics(self) -> Dict[str, float]:
+        """Copy all device metrics to the host in one synchronization."""
+        if self._materialized_metrics is None:
+            self._materialized_metrics = _materialize_metrics(self._metric_values)
+        return self._materialized_metrics
+
+    @property
+    def metrics(self) -> Dict[str, float]:
+        return self.materialize_metrics()
+
+    @property
+    def loss(self) -> float:
+        return self.materialize_metrics()["loss"]
+
+    @property
+    def grad_norm(self) -> Optional[float]:
+        if not self._has_grad_norm:
+            return None
+        return self.materialize_metrics()["grad_norm"]
 
 
-def _scalar(x: Any) -> float:
-    if isinstance(x, torch.Tensor):
-        return float(x.detach().float().mean().item())
-    if isinstance(x, (list, tuple)) and x:
-        return float(torch.stack([t.detach().float() for t in x]).mean().item())
-    return float(x)
+def _materialize_metrics(values: Dict[str, Any]) -> Dict[str, float]:
+    """Materialize scalar metrics with at most one device-to-host transfer."""
+    host_values: Dict[str, float] = {}
+    tensor_names = []
+    tensors = []
+    for name, value in values.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(
+                    f"metric {name!r} must be scalar before materialization"
+                )
+            tensor_names.append(name)
+            tensors.append(value.detach().float().reshape(()))
+        else:
+            host_values[name] = float(value)
+
+    if tensors:
+        device = tensors[0].device
+        packed = torch.stack([tensor.to(device) for tensor in tensors])
+        materialized = packed.cpu().tolist()
+        host_values.update(
+            {name: float(value) for name, value in zip(tensor_names, materialized)}
+        )
+    return host_values
 
 
 def _dp_mean_scalars(
-    values: Dict[str, torch.Tensor], *, process_group: Any = None
-) -> Dict[str, torch.Tensor]:
+    values: Dict[str, Any],
+    *,
+    device: torch.device,
+    process_group: Any = None,
+) -> Dict[str, Any]:
     """Average scalar metrics across DP ranks with one collective.
 
     Uses the established DFlash metric convention (DP mean):
@@ -82,17 +137,35 @@ def _dp_mean_scalars(
     """
     import torch.distributed as dist
 
-    if not values or not (dist.is_available() and dist.is_initialized()):
-        return values
+    normalized = {
+        name: (
+            value.detach().float().reshape(())
+            if isinstance(value, torch.Tensor)
+            else float(value)
+        )
+        for name, value in values.items()
+    }
+    if not normalized or not (dist.is_available() and dist.is_initialized()):
+        return normalized
     world = (
         dist.get_world_size()
         if process_group is None
         else dist.get_world_size(group=process_group)
     )
     if world <= 1:
-        return values
-    names = list(values)
-    packed = torch.stack([values[name].detach().float().reshape(()) for name in names])
+        return normalized
+    names = list(normalized)
+    # Host scalars become device fills, not synchronizing H2D copies.
+    packed = torch.stack(
+        [
+            (
+                value.to(device)
+                if isinstance(value, torch.Tensor)
+                else torch.full((), value, dtype=torch.float32, device=device)
+            )
+            for value in normalized.values()
+        ]
+    )
     if process_group is None:
         dist.all_reduce(packed)
     else:
@@ -107,11 +180,19 @@ def _reduce_ratio_metrics(
     device: torch.device,
     process_group: Any,
     reduce: bool,
-) -> Dict[str, float]:
-    """Form telemetry ratios only after summing their numerators and counts."""
+    sums: Optional[Dict[str, Any]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Reduce ratios and additive telemetry in one collective.
 
-    if not values:
+    Ratios with no observations retain the existing zero convention; log their
+    counts through ``sums`` when consumers need to distinguish missing data.
+    """
+
+    sums = sums or {}
+    if not values and not sums:
         return {}
+    if values.keys() & sums.keys():
+        raise ValueError("ratio and sum metric names must be distinct")
     normalized = []
     for name in sorted(values):
         pair = values[name]
@@ -128,23 +209,34 @@ def _reduce_ratio_metrics(
             )
         normalized.append((name, numerator, denominator))
 
+    normalized_sums = [
+        (name, torch.as_tensor(sums[name]).detach().float().flatten().to(device))
+        for name in sorted(sums)
+    ]
     packed = torch.cat(
         [
             tensor
             for _, numerator, denominator in normalized
             for tensor in (numerator, denominator)
         ]
+        + [tensor for _, tensor in normalized_sums]
     )
     if reduce:
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
-            if process_group is None:
-                dist.all_reduce(packed)
-            else:
-                dist.all_reduce(packed, group=process_group)
+            world = (
+                dist.get_world_size()
+                if process_group is None
+                else dist.get_world_size(group=process_group)
+            )
+            if world > 1:
+                if process_group is None:
+                    dist.all_reduce(packed)
+                else:
+                    dist.all_reduce(packed, group=process_group)
 
-    output: Dict[str, float] = {}
+    output: Dict[str, torch.Tensor] = {}
     cursor = 0
     for name, numerator, _denominator in normalized:
         width = numerator.numel()
@@ -154,11 +246,17 @@ def _reduce_ratio_metrics(
         cursor += width
         ratios = summed_numerator / summed_denominator.clamp_min(1e-12)
         if width == 1:
-            output[name] = float(ratios.item())
+            output[name] = ratios.reshape(())
         else:
-            output.update(
-                {f"{name}_{index}": float(value) for index, value in enumerate(ratios)}
-            )
+            output.update({f"{name}_{index}": ratios[index] for index in range(width)})
+    for name, tensor in normalized_sums:
+        width = tensor.numel()
+        total = packed[cursor : cursor + width]
+        cursor += width
+        if width == 1:
+            output[name] = total.reshape(())
+        else:
+            output.update({f"{name}_{index}": total[index] for index in range(width)})
     return output
 
 
@@ -196,7 +294,9 @@ def _reduce_eagle3_metrics(
     device: torch.device,
     process_group: Any,
     ploss_decay: float,
-) -> Optional[Dict[str, float]]:
+    reduce: bool,
+    objective_metric_name: Optional[str] = None,
+) -> Optional[Dict[str, torch.Tensor]]:
     """Reduce EAGLE3's per-position training telemetry as numerators/counts.
 
     Accuracy and p-loss are ratios, so averaging rank-local ratios biases the
@@ -268,32 +368,37 @@ def _reduce_eagle3_metrics(
 
     import torch.distributed as dist
 
-    if dist.is_available() and dist.is_initialized():
+    if reduce and dist.is_available() and dist.is_initialized():
         world = dist.get_world_size(process_group)
         if world > 1:
             dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=process_group)
 
     reduced_acc = packed[0] / packed[1].clamp_min(1e-6)
     reduced_ploss = packed[2] / packed[3].clamp_min(1e-6)
-    result: Dict[str, float] = {}
-    for index, value in enumerate(reduced_acc.tolist()):
-        result[f"acc_{index}"] = float(value)
-    for index, value in enumerate(reduced_ploss.tolist()):
-        result[f"ploss_{index}"] = float(value)
+    result: Dict[str, torch.Tensor] = {}
+    for index in range(length):
+        result[f"acc_{index}"] = reduced_acc[index]
+        result[f"ploss_{index}"] = reduced_ploss[index]
+        if objective_metric_name is not None:
+            result[f"{objective_metric_name}_{index}"] = reduced_ploss[index]
 
-    result["acc"] = float(packed[0].sum().div(packed[1].sum().clamp_min(1e-6)).item())
+    result["acc"] = packed[0].sum().div(packed[1].sum().clamp_min(1e-6))
     weights = torch.tensor(
         [ploss_decay**index for index in range(length)],
         dtype=reduced_ploss.dtype,
         device=reduced_ploss.device,
     )
-    result["loss"] = float((reduced_ploss * weights).sum().item())
+    result["loss"] = (reduced_ploss * weights).sum()
+    if objective_metric_name is not None:
+        result[objective_metric_name] = result["loss"]
 
     if acceptance_rates is not None:
         reduced_acceptance = packed[4] / packed[5].clamp_min(1e-6)
-        for index, value in enumerate(reduced_acceptance.tolist()):
-            result[f"acceptance_rate_{index}"] = float(value)
-        result["acceptance_rate"] = float(reduced_acceptance.mean().item())
+        for index in range(length):
+            result[f"acceptance_rate_{index}"] = reduced_acceptance[index]
+            result[f"expected_acceptance_{index}"] = reduced_acceptance[index]
+        result["acceptance_rate"] = reduced_acceptance.mean()
+        result["expected_acceptance"] = result["acceptance_rate"]
     return result
 
 
@@ -311,26 +416,161 @@ class TrainerCore:
         self.backend = backend
         self.accumulation_steps = max(1, accumulation_steps)
         self._micro = 0
+        self._ratio_totals: Dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._sum_totals: Dict[str, torch.Tensor] = {}
+        self._prepared_steps: List[StepOutput] = []
 
     @property
     def accumulation_remainder(self) -> int:
         """Micro-batches whose gradients have not reached an optimizer step."""
-        return self._micro % self.accumulation_steps
+        return (self._micro + len(self._prepared_steps)) % self.accumulation_steps
 
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
-        loss = out.loss / self.accumulation_steps
+        ctx = replace(ctx or StepContext(), accumulation_steps=self.accumulation_steps)
+        is_boundary = (self._micro + 1) % self.accumulation_steps == 0
+        with ExitStack() as accumulation:
+            accumulation.enter_context(
+                self.backend.accumulation_context(is_boundary=is_boundary)
+            )
+            out: StepOutput = self.strategy.forward_loss(batch, ctx)
+            self._validate_window_mode(out)
+            if out.replay_loss is not None:
+                # Replay owns fresh accumulation contexts for its backward passes.
+                accumulation.close()
+                return self._prepare_and_replay(out)
+            return self._backward_step(out)
+
+    def _validate_window_mode(self, out: StepOutput) -> None:
+        wants_replay = out.replay_loss is not None
+        if (self._prepared_steps and not wants_replay) or (
+            self._micro % self.accumulation_steps and wants_replay
+        ):
+            raise ValueError("Cannot mix immediate and replayed losses in one window")
+
+    def _prepare_and_replay(self, out: StepOutput) -> StepResult:
+        """Collect a complete prepass window, then replay through controller backward."""
+        self._prepared_steps.append(out)
+        self._accumulate_ratio_metrics(out.ratio_metrics)
+        if len(self._prepared_steps) < self.accumulation_steps:
+            return self._result(out, None, False)
+
+        window_ratios = self._ratio_totals
+        prepared_steps = self._prepared_steps
+        self._ratio_totals = {}
+        self._prepared_steps = []
+        for prepared in prepared_steps:
+            is_boundary = (self._micro + 1) % self.accumulation_steps == 0
+            with self.backend.accumulation_context(is_boundary=is_boundary):
+                result = self._backward_step(prepared.replay_loss(window_ratios))
+        return result
+
+    def _backward_step(self, out: StepOutput) -> StepResult:
+        loss = out.loss
+        ratio_metrics = dict(out.ratio_metrics)
+        if out.loss_terms is not None:
+            numerator, denominator = out.loss_terms
+            if numerator.numel() != 1 or denominator.numel() != 1:
+                raise ValueError("loss_terms must contain scalar tensors")
+            loss = numerator.reshape(())
+            denominator = denominator.detach().reshape(())
+            ratio_metrics["loss"] = (
+                numerator.detach().reshape(()),
+                denominator,
+            )
+        self._accumulate_ratio_metrics(ratio_metrics)
+        for name, value in out.sum_metrics.items():
+            self._sum_totals[name] = (
+                self._sum_totals.get(name, 0) + torch.as_tensor(value).detach()
+            )
+        loss = loss / self.accumulation_steps
         self._micro += 1
         # The boundary is known before backward so the backend can defer the FSDP
         # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
-        grad_norm = self.backend.step() if stepped else None
-        return self._result(out, grad_norm, stepped)
+        grad_norm = None
+        if stepped:
+            loss_denominator = None
+            if out.loss_terms is not None:
+                # A capable backend validates the global denominator in the
+                # optimizer's single host read instead of syncing here.
+                defer_check = getattr(self.backend, "checks_loss_denominator", False)
+                loss_denominator = self._normalize_gradients(
+                    self._ratio_totals["loss"][1], defer_check=bool(defer_check)
+                )
+            if loss_denominator is None:
+                grad_norm = self.backend.step()
+            else:
+                grad_norm = self.backend.step(loss_denominator=loss_denominator)
+        result_ratio_metrics = self._ratio_totals if stepped else ratio_metrics
+        result = self._result(
+            out,
+            grad_norm,
+            stepped,
+            ratio_metrics=result_ratio_metrics,
+            sum_metrics=self._sum_totals if stepped else out.sum_metrics,
+        )
+        if stepped:
+            self._ratio_totals = {}
+            self._sum_totals = {}
+        return result
 
-    def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
+    def _accumulate_ratio_metrics(self, values: Dict[str, Any]) -> None:
+        for name, (raw_numerator, raw_denominator) in values.items():
+            numerator = torch.as_tensor(raw_numerator).detach()
+            denominator = torch.as_tensor(raw_denominator).detach()
+            previous = self._ratio_totals.get(name)
+            if previous is not None:
+                numerator = previous[0] + numerator
+                denominator = previous[1] + denominator
+            self._ratio_totals[name] = (numerator, denominator)
+
+    def _normalize_gradients(
+        self, local_denominator: torch.Tensor, *, defer_check: bool = False
+    ) -> Optional[torch.Tensor]:
+        """Scale gradients by ``world * accumulation / global denominator``.
+
+        With ``defer_check`` the global denominator stays on the device and is
+        returned for the backend step to validate; otherwise it is checked
+        here with a host synchronization. Either way an invalid denominator
+        raises before the optimizer updates any state.
+        """
+        import torch.distributed as dist
+
+        denominator = local_denominator.clone()
+        parallel_config = getattr(self.backend, "parallel_config", None)
+        process_group = getattr(parallel_config, "fsdp_process_group", None)
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size(group=process_group)
+            if world_size > 1:
+                dist.all_reduce(
+                    denominator,
+                    op=dist.ReduceOp.SUM,
+                    group=process_group,
+                )
+        if not defer_check:
+            denominator_value = denominator.item()
+            if not math.isfinite(denominator_value) or denominator_value <= 0:
+                raise ValueError("global loss denominator must be finite and positive")
+        # new_full fills on the device; new_tensor would be a synchronizing H2D.
+        scale = (
+            denominator.new_full((), world_size * self.accumulation_steps) / denominator
+        )
+        self.backend.scale_gradients(scale)
+        return denominator if defer_check else None
+
+    def _result(
+        self,
+        out: StepOutput,
+        grad_norm,
+        stepped: bool,
+        *,
+        ratio_metrics: Optional[Dict[str, Any]] = None,
+        sum_metrics: Optional[Dict[str, Any]] = None,
+    ) -> StepResult:
         # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
         # positions and reduce counts before ratios; scalarizing its lists here
         # would both collapse the TTT structure and log one rank's local data.
@@ -341,11 +581,22 @@ class TrainerCore:
         )
         parallel_config = getattr(self.backend, "parallel_config", None)
         process_group = getattr(parallel_config, "fsdp_process_group", None)
+        eagle3_model = getattr(self.strategy, "eagle3_model", None)
+        if eagle3_model is not None and not hasattr(eagle3_model, "lk_loss_type"):
+            eagle3_model = getattr(eagle3_model, "module", eagle3_model)
+        objective_metric_name = (
+            "lk_loss"
+            if eagle3_model is not None
+            and getattr(eagle3_model, "lk_loss_type", None) is not None
+            else "kl_loss"
+        )
         structured = _reduce_eagle3_metrics(
             out.metrics,
             device=metric_device,
             process_group=process_group,
             ploss_decay=float(getattr(self.strategy, "ploss_decay", 1.0)),
+            reduce=stepped,
+            objective_metric_name=objective_metric_name,
         )
         # Structured EAGLE3 metrics are already globally reduced.  Remaining
         # scalar diagnostics are DP-averaged in a single collective at optimizer
@@ -353,55 +604,159 @@ class TrainerCore:
         metrics: Dict[str, Any] = dict(structured or {})
         metrics.update(
             _reduce_ratio_metrics(
-                out.ratio_metrics,
+                out.ratio_metrics if ratio_metrics is None else ratio_metrics,
                 device=metric_device,
                 process_group=process_group,
                 reduce=stepped,
+                sums=out.sum_metrics if sum_metrics is None else sum_metrics,
             )
         )
-        scalar_metrics: Dict[str, torch.Tensor] = {}
+        scalar_metrics: Dict[str, Any] = {}
         if "loss" not in metrics:
-            scalar_metrics["loss"] = out.loss
+            scalar_metrics["loss"] = out.loss.detach()
         if "accuracy" in out.metrics and "acc" not in metrics:
             accuracy = out.metrics["accuracy"]
             if isinstance(accuracy, torch.Tensor):
-                scalar_metrics["acc"] = (
-                    accuracy.detach().float().mean().to(out.loss.device)
-                )
+                scalar_metrics["acc"] = accuracy.detach().float().mean()
             elif isinstance(accuracy, (int, float)) and not isinstance(accuracy, bool):
-                scalar_metrics["acc"] = out.loss.detach().new_tensor(float(accuracy))
+                scalar_metrics["acc"] = float(accuracy)
         # Strategies may expose additional scalar diagnostics without teaching
-        # the generic trainer their algorithm-specific names. Move CPU schedule
-        # scalars (for example Domino's lambda_base) onto the loss device before
-        # the DP reduction so NCCL-backed runs do not all-reduce a CPU tensor.
-        reserved_metric_keys = _EAGLE3_STRUCTURED_METRIC_KEYS | {"accuracy", "loss"}
+        # the generic trainer their algorithm-specific names. Keep host schedule
+        # scalars (for example Domino's lambda_base) on the host unless a real
+        # multi-rank DP reduction requires moving them to the loss device.
+        reserved_metric_keys = _EAGLE3_STRUCTURED_METRIC_KEYS | {
+            "accuracy",
+            "accuracy_denom",
+            "loss",
+        }
         for key, value in out.metrics.items():
             if key in reserved_metric_keys:
                 continue
             if isinstance(value, torch.Tensor):
                 if value.numel() != 1:
                     continue
-                scalar = value.detach().reshape(()).to(out.loss.device)
+                scalar = value.detach().reshape(())
             elif isinstance(value, (int, float)) and not isinstance(value, bool):
-                scalar = out.loss.detach().new_tensor(float(value))
+                scalar = float(value)
             else:
                 continue
             scalar_metrics[key] = scalar
         if stepped:
             scalar_metrics = _dp_mean_scalars(
                 scalar_metrics,
+                device=metric_device,
                 process_group=process_group,
             )
-        metrics.update({key: _scalar(value) for key, value in scalar_metrics.items()})
-        gn = _scalar(grad_norm) if grad_norm is not None else None
-        if gn is not None:
-            metrics["grad_norm"] = gn
+        metrics.update(scalar_metrics)
+        if grad_norm is not None:
+            if isinstance(grad_norm, torch.Tensor):
+                grad_norm_metric = grad_norm.detach().float().mean()
+            else:
+                grad_norm_metric = float(grad_norm)
+            metrics["grad_norm"] = grad_norm_metric
         return StepResult(
             optimizer_stepped=stepped,
-            loss=metrics["loss"],
-            grad_norm=gn,
-            metrics=metrics,
+            metric_values=metrics,
+            has_grad_norm=grad_norm is not None,
         )
+
+
+class _AsyncAckRunner:
+    """Run optimizer-boundary durable acks on ONE background thread, in order.
+
+    ``submit`` first waits for the previous ack, so at most one ack is in
+    flight, acks run strictly in optimizer-step order, and every rank issues
+    the ack's collectives in the same sequence (the ack's process group must
+    not be shared with the training thread). The first failure is sticky: it
+    re-raises from every later ``flush``/``submit`` on the training thread, so
+    no checkpoint, eval, or further ack proceeds past a failed durable ack.
+    """
+
+    def __init__(self, ack_fn: Callable[[List[str], int], None]) -> None:
+        self._ack_fn = ack_fn
+        self._cv = threading.Condition()
+        self._job: Optional[tuple] = None
+        self._closed = False
+        self._error: Optional[BaseException] = None
+        self._exec_s = 0.0
+        # CUDA's current device is per thread; pin the ack thread to the
+        # trainer's so nothing it touches lands on device 0 by default.
+        self._device = (
+            torch.cuda.current_device()
+            if torch.cuda.is_available() and torch.cuda.is_initialized()
+            else None
+        )
+        self._thread = threading.Thread(
+            target=self._run, name="specforge-durable-ack", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        if self._device is not None:
+            torch.cuda.set_device(self._device)
+        while True:
+            with self._cv:
+                while self._job is None and not self._closed:
+                    self._cv.wait()
+                if self._job is None:
+                    return
+                sample_ids, step = self._job
+            started = time.perf_counter()
+            error = None
+            try:
+                self._ack_fn(sample_ids, step)
+            except BaseException as exc:
+                exc.add_note(
+                    f"raised by the background durable ack of optimizer step {step}"
+                )
+                error = exc
+            with self._cv:
+                self._exec_s += time.perf_counter() - started
+                if error is not None and self._error is None:
+                    self._error = error
+                self._job = None
+                self._cv.notify_all()
+
+    def wait(self) -> Optional[BaseException]:
+        """Block until no ack is in flight; return the sticky failure, if any."""
+        with self._cv:
+            while self._job is not None:
+                self._cv.wait()
+            return self._error
+
+    def flush(self) -> None:
+        error = self.wait()
+        if error is not None:
+            raise error
+
+    def submit(self, sample_ids: List[str], step: int) -> None:
+        self.flush()
+        job = (list(sample_ids), step)
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("durable ack runner is closed")
+            # Wake the worker BEFORE publishing the job: it re-checks ``_job``
+            # only once this block releases the lock. The reverse order lets a
+            # SIGTERM unwind (raised between the two statements) strand a
+            # published job whose worker never woke, and close() would then
+            # wait on it forever.
+            self._cv.notify_all()
+            self._job = job
+
+    def pop_exec_seconds(self) -> float:
+        """Background ack execution time since the previous call."""
+        with self._cv:
+            elapsed, self._exec_s = self._exec_s, 0.0
+        return elapsed
+
+    def close(self) -> Optional[BaseException]:
+        """Wait for the in-flight ack, stop the thread, return any failure."""
+        error = self.wait()
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+        self._thread.join()
+        return error
 
 
 class TrainerController:
@@ -412,6 +767,15 @@ class TrainerController:
     serving or Hugging Face model format.  Evaluation is configured once at
     construction time, so the public training lifecycle remains one no-argument
     :meth:`Trainer.fit` call.
+
+    ``async_ack=True`` runs ``ack_fn`` for optimizer step N on a background
+    thread while step N+1 computes. The durable marker (and the consumed
+    counter it drives) then lags the trainer by at most one optimizer step:
+    the pending ack is flushed before the next ack starts, before eval, before
+    every checkpoint (a checkpoint is never ahead of its ack), and before
+    ``fit`` returns; an ack failure re-raises on the training thread at that
+    flush. ``ack_fn`` must be safe to call off the training thread and must
+    not share a process group with training collectives.
     """
 
     def __init__(
@@ -439,6 +803,7 @@ class TrainerController:
         checkpoint_manager: Optional[Any] = None,
         checkpoint_extra: Optional[Dict[str, Any]] = None,
         profiling_options=None,
+        async_ack: bool = False,
     ) -> None:
         if (start_batch == 0) != (start_samples == 0):
             raise ValueError(
@@ -468,6 +833,12 @@ class TrainerController:
         # ack_fn(sample_ids, global_step) records the durable ack transaction at
         # the optimizer-step boundary; None = the loader acks (simple runs).
         self.ack_fn = ack_fn
+        self.async_ack = bool(async_ack)
+        # Live only inside fit(); None means acks run inline.
+        self._ack_runner: Optional[_AsyncAckRunner] = None
+        # Training-thread time blocked on ack flushes outside the boundary
+        # submit (eval / checkpoint), folded into perf/durable_ack_time_s.
+        self._ack_flush_wait_s = 0.0
         # global_step counts OPTIMIZER steps (increments only at a grad-accum
         # boundary) so ack/checkpoint/resume semantics are in true optimizer
         # steps; micro_step counts forward/backward micro-batches.
@@ -484,7 +855,8 @@ class TrainerController:
         # with its trained prefix already removed. Suppress the generic iterable
         # seek exactly once; consuming ``start_batch`` again would skip fresh data.
         self._data_prepositioned = bool(data_prepositioned)
-        self.last_metrics: Dict[str, Any] = {}
+        self._last_result: Optional[StepResult] = None
+        self._last_eval_metrics: Dict[str, Any] = {}
         self.last_checkpoint_step: Optional[int] = None
         from specforge.training.profiling import ProfilingOptions, StepProfiler
 
@@ -493,6 +865,16 @@ class TrainerController:
             options,
             output_dir=output_dir,
         )
+
+    @property
+    def last_metrics(self) -> Dict[str, Any]:
+        metrics = (
+            dict(self._last_result.materialize_metrics())
+            if self._last_result is not None
+            else {}
+        )
+        metrics.update(self._last_eval_metrics)
+        return metrics
 
     def _make_progress_bar(self):
         """Build a rank-0 optimizer-step bar for interactive terminals only."""
@@ -518,11 +900,47 @@ class TrainerController:
 
     def fit(self, data: Iterable[TrainBatch]) -> int:
         progress = self._make_progress_bar()
+        if self.async_ack and self.ack_fn is not None:
+            self._ack_runner = _AsyncAckRunner(self.ack_fn)
         try:
-            return self._fit(data, progress)
+            step = self._fit(data, progress)
+            # Every optimizer boundary this call reached is durable on return.
+            self._close_ack_runner(None)
+            return step
+        except BaseException as exc:
+            self._close_ack_runner(exc)
+            raise
         finally:
             if progress is not None:
                 progress.close()
+
+    def _close_ack_runner(self, primary: Optional[BaseException]) -> None:
+        runner, self._ack_runner = self._ack_runner, None
+        if runner is None:
+            return
+        # On failure still wait: the in-flight ack's collectives are already
+        # joined by every peer's ack thread, and lifecycle cleanup (feature
+        # drains, consumer_done) must not race it.
+        error = runner.close()
+        if error is None:
+            return
+        if primary is None:
+            raise error
+        if error is not primary:
+            primary.add_note(
+                "the background durable ack also failed: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    def _flush_durable_ack(self) -> None:
+        """Wait for the in-flight async ack; re-raise its failure here."""
+        if self._ack_runner is None:
+            return
+        started = time.perf_counter()
+        try:
+            self._ack_runner.flush()
+        finally:
+            self._ack_flush_wait_s += time.perf_counter() - started
 
     def _fit(self, data: Iterable[TrainBatch], progress: Optional[Any]) -> int:
         if self.max_steps is not None and self.global_step >= self.max_steps:
@@ -540,6 +958,12 @@ class TrainerController:
             self.eval_interval > 0 and self.eval_data_factory is not None
         )
         pending_ack: List[str] = []
+        perf_window_started = time.perf_counter()
+        perf_window_steps = 0
+        perf_window_samples = 0
+        perf_data_wait_s = 0.0
+        perf_train_compute_s = 0.0
+        perf_durable_ack_s = 0.0
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
@@ -563,40 +987,132 @@ class TrainerController:
                     stream = it
             _it = iter(stream)
             while True:
+                data_wait_started = time.perf_counter()
                 try:
                     batch = next(_it)
                 except StopIteration:
                     break
+                perf_data_wait_s += time.perf_counter() - data_wait_started
+                perf_window_samples += len(batch.sample_ids)
                 self._epoch_batch += 1
                 self._epoch_samples += len(batch.sample_ids)
                 self.micro_step += 1
                 if self.ack_fn is not None:
                     pending_ack.extend(batch.sample_ids)
                 self._step_profiler.before_micro_step(self.global_step)
+                train_compute_started = time.perf_counter()
                 result = self.core.train_step(
                     batch,
                     ctx=StepContext(
-                        global_step=self.global_step, total_steps=self.total_steps
+                        global_step=self.global_step,
+                        total_steps=self.total_steps,
+                        collect_detailed_metrics=(
+                            self.logger is not None
+                            and (self.global_step + 1) % max(1, self.log_interval) == 0
+                        ),
                     ),
                 )
-                self.last_metrics = result.metrics
+                perf_train_compute_s += time.perf_counter() - train_compute_started
                 # grad accumulated but optimizer has not stepped yet; everything
                 # keyed on optimizer steps fires only at the boundary.
                 if not result.optimizer_stepped:
                     continue
                 self.global_step += 1
+                self._last_result = result
+                self._last_eval_metrics = {}
+                perf_window_steps += 1
                 self._step_profiler.after_optimizer_step(self.global_step)
                 if self.ack_fn is not None:
                     # durable ack transaction at the optimizer-step boundary
-                    self.ack_fn(pending_ack, self.global_step)
+                    durable_ack_started = time.perf_counter()
+                    if self._ack_runner is None:
+                        self.ack_fn(pending_ack, self.global_step)
+                    else:
+                        # Waits only for step N-1's ack; step N's overlaps
+                        # the next step's compute.
+                        self._ack_runner.submit(pending_ack, self.global_step)
+                    perf_durable_ack_s += time.perf_counter() - durable_ack_started
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
-                    log_metrics = dict(result.metrics)
+                    log_metrics = dict(result.materialize_metrics())
                     optimizer = getattr(self.core.backend, "optimizer", None)
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
+                    perf_elapsed_s = max(
+                        time.perf_counter() - perf_window_started,
+                        1e-12,
+                    )
+                    parallel = getattr(self.core.backend, "parallel_config", None)
+                    world_size = int(getattr(parallel, "world_size", 1))
+                    tp_size = int(getattr(parallel, "tp_size", 1))
+                    sp_size = int(getattr(parallel, "sp_size", 1))
+                    data_parallel_size = max(1, world_size // (tp_size * sp_size))
+                    # Time the training thread was BLOCKED on durable acks; in
+                    # async mode the ack itself runs behind the next step.
+                    perf_durable_ack_s += self._ack_flush_wait_s
+                    self._ack_flush_wait_s = 0.0
+                    if self._ack_runner is not None:
+                        background_s = self._ack_runner.pop_exec_seconds()
+                        log_metrics["perf/durable_ack_background_time_s"] = (
+                            background_s / max(1, perf_window_steps)
+                        )
+                    log_metrics.update(
+                        {
+                            "perf/optimizer_steps_per_hour": (
+                                perf_window_steps * 3600.0 / perf_elapsed_s
+                            ),
+                            "perf/optimizer_step_time_s": (
+                                perf_elapsed_s / max(1, perf_window_steps)
+                            ),
+                            "perf/data_wait_time_s": (
+                                perf_data_wait_s / max(1, perf_window_steps)
+                            ),
+                            "perf/train_compute_time_s": (
+                                perf_train_compute_s / max(1, perf_window_steps)
+                            ),
+                            "perf/durable_ack_time_s": (
+                                perf_durable_ack_s / max(1, perf_window_steps)
+                            ),
+                            "perf/global_samples_per_second": (
+                                perf_window_samples
+                                * data_parallel_size
+                                / perf_elapsed_s
+                            ),
+                        }
+                    )
+                    # Loader wait attribution: producer bucket = capture or
+                    # dispatch cannot keep up, fetch bucket = transfer is slow.
+                    perf_snapshot = getattr(data, "perf_counters_snapshot", None)
+                    if callable(perf_snapshot):
+                        loader = perf_snapshot(reset=True)
+                        steps = max(1, perf_window_steps)
+                        samples = max(1.0, loader["fetch_samples"])
+                        log_metrics.update(
+                            {
+                                "perf/data_wait_producer_s": (
+                                    loader["wait_producer_s"] / steps
+                                ),
+                                "perf/data_wait_fetch_s": (
+                                    loader["wait_fetch_s"] / steps
+                                ),
+                                "perf/fetch_seconds_per_sample": (
+                                    loader["fetch_s"] / samples
+                                ),
+                                "perf/fetch_delivered_gib_per_s": (
+                                    loader["fetch_bytes"]
+                                    / (1 << 30)
+                                    / max(1e-12, perf_elapsed_s)
+                                ),
+                            }
+                        )
                     self.logger(log_metrics, self.global_step)
+                    perf_window_started = time.perf_counter()
+                    perf_window_steps = 0
+                    perf_window_samples = 0
+                    perf_data_wait_s = 0.0
+                    perf_train_compute_s = 0.0
+                    perf_durable_ack_s = 0.0
                 eval_metrics: Optional[Dict[str, Any]] = None
                 if eval_enabled and self.global_step % self.eval_interval == 0:
                     eval_metrics = self.evaluate_configured()
@@ -604,7 +1120,7 @@ class TrainerController:
                     if eval_metrics:
                         if self.logger:
                             self.logger(eval_metrics, self.global_step)
-                        self.last_metrics = {**self.last_metrics, **eval_metrics}
+                        self._last_eval_metrics = dict(eval_metrics)
                 # ``is_better`` is collective (rank0 verdict broadcast inside
                 # the manager); its guard is rank-identical because eval metrics
                 # are DP-reduced. Empty eval metrics skip best tracking.
@@ -655,6 +1171,7 @@ class TrainerController:
         factories can return an iterable context manager so each interval gets
         a fresh rollout stream without exposing an extra argument on ``fit``.
         """
+        self._flush_durable_ack()
         if self.eval_data_factory is None:
             return self.evaluate(None)
         data = self.eval_data_factory()
@@ -673,6 +1190,7 @@ class TrainerController:
         """
         from specforge.eval import Evaluator
 
+        self._flush_durable_ack()
         module = self.core.strategy.trainable_module()
         was_training = module.training
         module.eval()
@@ -709,6 +1227,9 @@ class TrainerController:
         return self._checkpoint_mgr
 
     def save_checkpoint(self, step: int) -> Checkpoint:
+        # A checkpoint must never be ahead of its durable ack: resume requires
+        # the ledger marker to equal the checkpoint step.
+        self._flush_durable_ack()
         # Every rank participates: FSDP model gathering is collective and every
         # rank persists its RNG. Sharded optimizer state stays rank-local; the
         # identical DDP optimizer is written once in the shared rank0 payload.
