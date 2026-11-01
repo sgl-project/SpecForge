@@ -130,8 +130,7 @@ jobs:
           uv venv sf-capture -p 3.12
           uv pip install --python sf-capture/bin/python torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
           uv pip install --python sf-capture/bin/python wheel setuptools setuptools-rust setuptools-scm
-          # Resolve upstream main on every run, including when uv has a cached checkout.
-          uv pip install --python sf-capture/bin/python --no-build-isolation --refresh-package sglang \
+          uv pip install --python sf-capture/bin/python --no-build-isolation \
             'sglang @ git+https://github.com/sgl-project/sglang.git@main#subdirectory=python' \
             mooncake-transfer-engine-cuda13
           uv pip install --python sf-capture/bin/python --no-deps plugins/sglang-spec-capture
