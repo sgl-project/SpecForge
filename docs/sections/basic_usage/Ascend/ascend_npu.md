@@ -116,7 +116,7 @@ mooncake_master --enable_http_metadata_server=true \
 
 Start the patched capture server on NPU 0. The `--spec-capture-aux-layer-ids`
 must match the draft's `target_layer_ids` — for DFlash these come from
-`configs/qwen3.5-4b-dflash.json`: `1 8 15 22 29`. A mismatch produces zero
+`examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-npu.yaml`: `1 8 15 22 29`. A mismatch produces zero
 features with no error:
 
 ```bash
@@ -165,7 +165,7 @@ Before rerunning, clear stale control state:
 DFlash 2 reuses the DFlash strategy and capture path end to end, so the
 external-server setup above carries over unchanged — including the
 `--spec-capture-aux-layer-ids 1 8 15 22 29` flags, which match
-`configs/qwen3.5-4b-dflash2.json`. Use the checked-in
+`examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-npu.yaml`. Use the checked-in
 [`qwen3.5-4b-dflash2-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-npu.yaml)
 recipe:
 
@@ -280,7 +280,7 @@ the [Disaggregated training](../disaggregated_training.md) guide.
 ## Reference results on 16x A3 (64GB)
 
 End-to-end online run on the managed-local stack, training a **Qwen3.5-4B
-DFlash** draft (`configs/qwen3.5-4b-dflash.json`) with 6 TP=1 capture servers
+DFlash** draft (`examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-npu.yaml`) with 6 TP=1 capture servers
 (devices 0-5) and 10 trainer ranks (devices 6-15): ~9.5k prompts x 10 epochs,
 global batch 80/step, ~1.18k optimizer steps, ~1.5h total.
 

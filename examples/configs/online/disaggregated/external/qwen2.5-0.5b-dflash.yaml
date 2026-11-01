@@ -1,39 +1,49 @@
 model:
   target_model_path: "Qwen/Qwen2.5-0.5B-Instruct"
   draft_model_config:
-    architectures: [DFlashDraftModel]
+    schema_version: 1
+    hidden_size: 896
+    num_hidden_layers: 5
+    num_attention_heads: 14
+    hidden_act: silu
+    initializer_range: 0.02
+    rms_norm_eps: 1.0e-06
     attention_bias: false
     attention_dropout: 0.0
+    bos_token_id: 151643
+    eos_token_id: 151645
+    use_cache: true
+    tie_word_embeddings: false
+    dtype: bfloat16
+    vocab_size: 151936
+    intermediate_size: 4864
+    max_position_embeddings: 32768
+    num_key_value_heads: 2
+    head_dim: 64
+    architectures:
+    - DFlashDraftModel
     auto_map:
       AutoModel: dflash.DFlashDraftModel
     block_size: 16
-    bos_token_id: 151643
     dflash_config:
       mask_token_id: 151669
-      target_layer_ids: [1, 6, 11, 16, 21]
-    dtype: bfloat16
-    eos_token_id: 151645
-    head_dim: 64
-    hidden_act: silu
-    hidden_size: 896
-    initializer_range: 0.02
-    intermediate_size: 4864
-    layer_types: [full_attention, full_attention, full_attention, full_attention, full_attention]
-    max_position_embeddings: 32768
-    max_window_layers: 5
+      target_layer_ids:
+      - 1
+      - 6
+      - 11
+      - 16
+      - 21
+      projector_type: null
+      pure_draft_prefix_len: 0
+      shift_label: false
     model_type: qwen3
-    num_attention_heads: 14
-    num_hidden_layers: 5
-    num_key_value_heads: 2
     num_target_layers: 24
-    rms_norm_eps: 1.0e-06
     rope_scaling: null
     rope_theta: 1000000
-    sliding_window: null
-    tie_word_embeddings: false
-    use_cache: true
-    use_sliding_window: false
-    vocab_size: 151936
+    layers:
+      attention:
+        type: gqa
+        is_causal: false
   target_backend: sglang
   embedding_key: "model.embed_tokens.weight"
   torch_dtype: "bfloat16"

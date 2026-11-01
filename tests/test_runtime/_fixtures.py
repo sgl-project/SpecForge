@@ -191,9 +191,11 @@ def build_eagle3(workdir, ttt=3):
     target_dir = write_target_head_dir(os.path.join(workdir, "target"))
     vocab_path = write_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
 
-    draft_config = AutoDraftConfig.from_dict(json.loads(Path(cfg).read_text()))
+    draft_config = AutoDraftConfig.from_inline(
+        {**json.loads(Path(cfg).read_text()), "_attn_implementation": "flex_attention"}
+    )
     draft_model = AutoDraftModel.from_config(
-        draft_config, attention_backend="flex_attention", torch_dtype=torch.bfloat16
+        draft_config, torch_dtype=torch.bfloat16
     ).cuda()
     draft_model.load_vocab_mapping(vocab_path)
     draft_model.freeze_embedding()

@@ -276,11 +276,14 @@ def _worker(rank, world_size, port, workdir):
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        cfg = AutoDraftConfig.from_dict(
-            json.loads(Path(os.path.join(workdir, "draft.json")).read_text())
+        cfg = AutoDraftConfig.from_inline(
+            {
+                **json.loads(Path(os.path.join(workdir, "draft.json")).read_text()),
+                "_attn_implementation": "usp",
+            }
         )
         dm = AutoDraftModel.from_config(
-            cfg, attention_backend="usp", torch_dtype=torch.bfloat16
+            cfg, torch_dtype=torch.bfloat16
         ).cuda()
         dm.load_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
         dm.freeze_embedding()

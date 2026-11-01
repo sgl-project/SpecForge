@@ -1088,12 +1088,16 @@ class TestCheckpointResume(unittest.TestCase):
         feat_dir = fx.write_offline_files(os.path.join(workdir, "features"), n=N)
         out_dir = os.path.join(workdir, "out")
 
-        draft_config = AutoDraftConfig.from_dict(json.loads(Path(cfg).read_text()))
+        draft_config = AutoDraftConfig.from_inline(
+            {
+                **json.loads(Path(cfg).read_text()),
+                "_attn_implementation": "flex_attention",
+            }
+        )
 
         def build_model():
             dm = AutoDraftModel.from_config(
                 draft_config,
-                attention_backend="flex_attention",
                 torch_dtype=torch.bfloat16,
             ).cuda()
             dm.load_vocab_mapping(vocab_path)

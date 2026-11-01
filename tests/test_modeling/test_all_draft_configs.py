@@ -369,24 +369,6 @@ class AllDraftConfigsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "layer_ids"):
                 resolve_draft_config(cfg, provider=provider)
 
-    def test_all_checked_in_draft_configs_resolve(self):
-        directory = Path(__file__).resolve().parents[2] / "configs"
-        for path in directory.glob("*.json"):
-            data = json.loads(path.read_text())
-            if data.get("architectures", [None])[0] not in DRAFT_REGISTRY:
-                continue
-            with self.subTest(config=path.name):
-                resolved = AutoDraftConfig.resolve(AutoDraftConfig.from_dict(data))
-                self.assertEqual(
-                    AutoDraftConfig.resolve(resolved).to_dict(), resolved.to_dict()
-                )
-                self.assertEqual(
-                    draft_config_contract(AutoDraftConfig.from_inline(data)),
-                    draft_config_contract(resolved),
-                )
-                if hasattr(resolved, "dflash_config"):
-                    self.assertGreaterEqual(resolved.block_size, 2)
-
 
 if __name__ == "__main__":
     unittest.main()

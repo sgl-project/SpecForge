@@ -5,11 +5,10 @@
 Thin CLI wrapper around ``specforge.export.mtp.merge_mtp_into_base``; the merge
 logic and the per-family key mapping live in the package.
 
-Example:
+Example (after exporting with the training YAML):
     python scripts/merge_mtp_to_base.py \
         --base-model-path PATH/TO/Qwen3.5-4B \
-        --mtp-checkpoint-path PATH/TO/outputs/qwen3.5-4b-mtp/RUN-latest \
-        --draft-config configs/qwen3.5-4b-mtp.json \
+        --mtp-checkpoint-path PATH/TO/exports/qwen3.5-4b-mtp \
         --output-path PATH/TO/Qwen3.5-4B-MTP \
         --key-format sglang
 """

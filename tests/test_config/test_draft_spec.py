@@ -1,13 +1,10 @@
 """Draft settings resolve without constructing a model or loading weights."""
 
-import json
 import pickle
 import unittest
 from dataclasses import FrozenInstanceError
-from pathlib import Path
 
 from specforge.config.draft import AutoDraftConfig
-from specforge.config.draft.registry import DRAFT_CONFIG_REGISTRY
 
 
 class DraftSpecTest(unittest.TestCase):
@@ -47,14 +44,3 @@ class DraftSpecTest(unittest.TestCase):
         ):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 AutoDraftConfig.from_inline({**self.data, field: value})
-
-    def test_checked_in_architectures_parse_without_models(self):
-        paths = sorted((Path(__file__).resolve().parents[2] / "configs").glob("*.json"))
-        self.assertTrue(paths)
-        for path in paths:
-            data = json.loads(path.read_text())
-            if data.get("architectures", [None])[0] not in DRAFT_CONFIG_REGISTRY:
-                continue
-            with self.subTest(path=path.name):
-                config = AutoDraftConfig.from_inline(data)
-                self.assertIs(AutoDraftConfig.resolve(config), config)

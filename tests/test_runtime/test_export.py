@@ -444,9 +444,11 @@ class TestExporters(unittest.TestCase):
         cls.out_dir = os.path.join(cls.workdir, "out")
 
         draft_config = AutoDraftConfig.from_yaml(cls.cfg_path)
+        draft_config = AutoDraftConfig.from_inline(
+            {**draft_config.to_dict(), "_attn_implementation": "flex_attention"}
+        )
         dm = AutoDraftModel.from_config(
             draft_config,
-            attention_backend="flex_attention",
             torch_dtype=torch.bfloat16,
         ).cuda()
         dm.load_vocab_mapping(cls.vocab_path)

@@ -64,14 +64,12 @@ python scripts/regenerate_train_data.py \
 export TRAIN_DATA_PATH=./cache/dataset/sharegpt_train_regen_10.jsonl
 export MODEL_NAME=Qwen3.6-27B
 export SPEC_METHOD=Dspark
-export DRAFT_MODEL_CONFIG=configs/qwen3.6-27b-dspark.json
 export MODEL=Qwen/Qwen3.6-27B
 export TRAINING_CONFIG=examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dspark.yaml
 
 specforge train \
   --config ${TRAINING_CONFIG} \
   model.target_model_path=${MODEL} \
-  model.draft_model_config=${DRAFT_MODEL_CONFIG} \
   model.sglang_context_length=4200 \
   data.train_data_path=${TRAIN_DATA_PATH} \
   data.max_length=4096 \
@@ -126,7 +124,7 @@ First export the trained draft:
 specforge export \
   --to hf \
   --checkpoint outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/consumer/${MODEL_NAME}-${SPEC_METHOD}-overfit-latest \
-  --draft-config ${DRAFT_MODEL_CONFIG} \
+  --config ${TRAINING_CONFIG} \
   --output-dir outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/draft_hf \
   --embedding-source ${MODEL} \
   --embedding-key model.language_model.embed_tokens.weight

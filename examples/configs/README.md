@@ -1,7 +1,7 @@
 # Unified training recipe catalog
 
-Every draft model JSON under `configs/` has at least one typed YAML recipe in
-this catalog. Choose a recipe by answering three separate questions:
+Each recipe in this catalog embeds its draft settings under
+`model.draft_model_config`. Choose a recipe by answering three separate questions:
 
 1. **When are target features produced?** `online` captures them during the
    run; `offline` reads feature files prepared earlier.
@@ -102,7 +102,7 @@ its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4.yaml`
 (one node, four capture servers plus a DP4 trainer) and
 `qwen3.8-27b-dflash2-5server-dp3-h200.yaml` (one 8x H200 node,
 five FP8 capture servers with FA3 and FlashInfer GDN, a DP3 trainer, RDMA
-loopback) train the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
+loopback) train the DFlash2 drafter in `examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2.yaml` for
 Qwen3.8-27B. Their
 [runbook](../../docs/recipes/qwen3.8-27b-dflash2-disaggregated.md) records the
 server/trainer splits, Mooncake lease, in-flight watermarks and throughput

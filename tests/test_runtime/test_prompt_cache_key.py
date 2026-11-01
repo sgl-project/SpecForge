@@ -21,7 +21,7 @@ def _cache_config(path: str):
         ),
         model=SimpleNamespace(
             target_model_path="org/target-model",
-            draft_model_config="configs/draft.json",
+            draft_model_config={"architectures": ["LlamaForCausalLMEagle3"]},
             draft_checkpoint_path=None,
             draft_num_hidden_layers=None,
             draft_block_size=None,
