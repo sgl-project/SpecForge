@@ -141,7 +141,7 @@ see the [Data Preparation](../data_preparation.md) guide.
 Offline training reads target features from disk, so the trainer only has to fit
 the draft model. It uses more storage but keeps target inference out of the
 training loop, and needs no capture patch or Mooncake. This section trains a
-**Qwen3.5-4B DFlash** draft (`configs/qwen3.5-4b-dflash.json`).
+**Qwen3.5-4B DFlash** draft (`examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml`).
 
 ### Step 1: Capture hidden states
 
@@ -264,7 +264,7 @@ mooncake_master --enable_http_metadata_server=true \
 
 Start the patched capture server on GPU 0. **The `--spec-capture-aux-layer-ids`
 must match the draft's `target_layer_ids`** — for DFlash these are read straight
-from `configs/qwen3.5-4b-dflash.json`: `1 8 15 22 29` (this is not the EAGLE3
+from `examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml`: `1 8 15 22 29` (this is not the EAGLE3
 `[1, num_layers//2 - 1, num_layers - 4]` formula). A mismatch produces zero
 features with no error. Because Qwen3.5-4B is a hybrid Mamba target, the server
 must run under **AITER** with `--attention-backend aiter` and

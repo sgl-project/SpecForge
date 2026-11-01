@@ -40,17 +40,18 @@ def _worker(rank, world_size, workdir, results_dir):
     torch.use_deterministic_algorithms(True, warn_only=True)
 
     TTT, ACC = 3, 2
-    draft_config = AutoDraftConfig.from_dict(
-        json.loads(Path(os.path.join(workdir, "draft.json")).read_text())
+    draft_config = AutoDraftConfig.from_inline(
+        {
+            **json.loads(Path(os.path.join(workdir, "draft.json")).read_text()),
+            "_attn_implementation": "flex_attention",
+        }
     )
     target_dir = os.path.join(workdir, "target")
     vocab_path = os.path.join(workdir, "vm.pt")
     feat_dir = os.path.join(workdir, "features")
 
     def build_model():
-        dm = AutoDraftModel.from_config(
-            draft_config, attention_backend="flex_attention", torch_dtype=torch.bfloat16
-        ).cuda()
+        dm = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16).cuda()
         dm.load_vocab_mapping(vocab_path)
         dm.freeze_embedding()
         return OnlineEagle3Model(

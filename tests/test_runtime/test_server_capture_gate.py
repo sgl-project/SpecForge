@@ -406,16 +406,17 @@ class TestServerCaptureGate(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29576")
         torch.manual_seed(0)
-        draft_cfg = AutoDraftConfig.from_dict(
-            json.loads(
-                Path(
-                    fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
-                ).read_text()
-            )
+        draft_cfg = AutoDraftConfig.from_inline(
+            {
+                **json.loads(
+                    Path(
+                        fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
+                    ).read_text()
+                ),
+                "_attn_implementation": "sdpa",
+            }
         )
-        dm = AutoDraftModel.from_config(
-            draft_cfg, attention_backend="sdpa", torch_dtype=torch.bfloat16
-        ).cuda()
+        dm = AutoDraftModel.from_config(draft_cfg, torch_dtype=torch.bfloat16).cuda()
         dm.load_vocab_mapping(
             fx.write_vocab_mapping(os.path.join(self.workdir, "vm.pt"))
         )

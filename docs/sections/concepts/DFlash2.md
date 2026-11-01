@@ -31,31 +31,33 @@ proposal position. It then adds a low-rank transition score conditioned on the
 draft hidden state and the predecessor token. The successor codebook is
 zero-initialized, so a new selector initially preserves unary DFlash scores.
 
-A DFlash2 draft config must explicitly select the architecture and provide its
-four additional model fields:
+The embedded DFlash2 draft section selects the architecture and adds convolution
+and selector settings to the common model fields:
 
-```json
-{
-  "architectures": ["DFlash2DraftModel"],
-  "dflash_config": {
-    "block_size": 8,
-    "target_layer_ids": [1, 16, 31, 46, 61],
-    "mask_token_id": 248070,
-    "conv_kernel_size": 2,
-    "conv_group_size": 16,
-    "selector_rank": 256,
-    "selector_top_k": 16
-  }
-}
+```yaml
+model:
+  draft_model_config:
+    schema_version: 1
+    architectures: [DFlash2DraftModel]
+    block_size: 8
+    dflash_config:
+      target_layer_ids: [1, 16, 31, 46, 61]
+      mask_token_id: 248070
+      selector_rank: 256
+      selector_top_k: 16
+    layers:
+      conv:
+        type: grouped
+        kernel_size: 2
+        group_size: 16
 ```
 
-`conv_kernel_size` must be positive and no larger than `block_size`;
-`conv_group_size` must divide `hidden_size`; `selector_rank` must be positive;
-and `selector_top_k` must be between 1 and `vocab_size`. The checked-in complete
-configuration is
-[`configs/qwen3.6-27b-dflash2.json`](https://github.com/sgl-project/SpecForge/blob/main/configs/qwen3.6-27b-dflash2.json).
-Embed these settings under `model.draft_model_config` in the training YAML,
-with `architectures: [DFlash2DraftModel]`. All training methods use inline
+`layers.conv.kernel_size` must be positive and no larger than `block_size`;
+`layers.conv.group_size` must divide `hidden_size`; `selector_rank` must be
+positive; and `selector_top_k` must be between 1 and `vocab_size`. The complete
+model and training settings are in the
+[Qwen3.6-27B DFlash2 recipe](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml).
+All training methods use inline
 settings, including warm starts from a pretrained DFlash2 checkpoint.
 
 ## Selector objective and schedule

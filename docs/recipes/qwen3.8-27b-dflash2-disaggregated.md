@@ -8,7 +8,7 @@ topology: Disaggregated
 
 # Qwen3.8-27B DFlash2 disaggregated training
 
-Trains the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
+Trains the DFlash2 drafter in `examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2.yaml` for
 `Qwen/Qwen3.8-27B` on the disaggregated online data plane: patched SGLang
 capture servers publish the target's hidden states into Mooncake, and
 data-parallel trainer ranks consume them. The first two recipes share every

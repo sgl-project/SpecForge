@@ -1,5 +1,4 @@
 import copy
-import json
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -592,11 +591,12 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
 class TestDFlashSlidingConfig(unittest.TestCase):
     def test_checked_in_qwen36_config_preserves_hybrid_layout(self):
         config_path = (
-            Path(__file__).resolve().parents[2] / "configs" / "qwen3.6-27b-dflash.json"
+            Path(__file__).resolve().parents[2]
+            / "examples/configs/online/disaggregated/external/qwen3.6-27b-dflash.yaml"
         )
         from specforge.config.draft import AutoDraftConfig
 
-        config = AutoDraftConfig.from_dict(json.loads(Path(config_path).read_text()))
+        config = AutoDraftConfig.from_yaml(config_path)
 
         layer_types, sliding_window = resolve_dflash_attention_layout(config)
 

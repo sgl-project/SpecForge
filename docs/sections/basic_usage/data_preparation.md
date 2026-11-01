@@ -307,7 +307,7 @@ output directory; the offline reader validates the contract instead of
 silently adapting incompatible features.
 
 DFlash2 feature preparation still uses `training.strategy: dflash`; pass a
-`DFlash2DraftModel` config such as `configs/qwen3.6-27b-dflash2.json` so capture
+`DFlash2DraftModel` config such as `examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml` so capture
 uses the intended `target_layer_ids`. Its convolution, selector, and selector
 loss schedule are draft/trainer concerns and do not add tensors to the offline
 record.

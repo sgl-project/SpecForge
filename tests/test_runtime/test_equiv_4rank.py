@@ -42,12 +42,14 @@ def _build_model(workdir: str, attention_backend: str):
     from specforge.config.draft import AutoDraftConfig
     from specforge.modeling.auto import AutoDraftModel
 
-    draft_config = AutoDraftConfig.from_dict(
-        json.loads(Path(os.path.join(workdir, "draft.json")).read_text())
+    draft_config = AutoDraftConfig.from_inline(
+        {
+            **json.loads(Path(os.path.join(workdir, "draft.json")).read_text()),
+            "_attn_implementation": attention_backend,
+        }
     )
     draft_model = AutoDraftModel.from_config(
         draft_config,
-        attention_backend=attention_backend,
         torch_dtype=torch.bfloat16,
     ).cuda()
     draft_model.load_vocab_mapping(os.path.join(workdir, "vm.pt"))

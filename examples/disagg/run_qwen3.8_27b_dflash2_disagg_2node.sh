@@ -22,7 +22,7 @@ export SERVER_COUNT="${SERVER_COUNT:-8}"
 export SERVER_GPUS="${SERVER_GPUS:-0,1,2,3,4,5,6,7}"
 export SERVER_TP="${SERVER_TP:-1}"
 export SERVER_MEM_FRACTION="${SERVER_MEM_FRACTION:-0.85}"
-# Auxiliary capture layers of configs/qwen3.8-27b-dflash2.json.
+# Auxiliary capture layers of examples/configs/online/disaggregated/external/qwen3.8-27b-dflash2.yaml.
 export CAPTURE_LAYER_IDS="${CAPTURE_LAYER_IDS:-5 19 33 47 61}"
 
 export TRAINER_GPUS="${TRAINER_GPUS:-0,1,2,3,4,5,6,7}"
