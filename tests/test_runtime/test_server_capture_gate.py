@@ -416,9 +416,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 "_attn_implementation": "sdpa",
             }
         )
-        dm = AutoDraftModel.from_config(
-            draft_cfg, torch_dtype=torch.bfloat16
-        ).cuda()
+        dm = AutoDraftModel.from_config(draft_cfg, torch_dtype=torch.bfloat16).cuda()
         dm.load_vocab_mapping(
             fx.write_vocab_mapping(os.path.join(self.workdir, "vm.pt"))
         )

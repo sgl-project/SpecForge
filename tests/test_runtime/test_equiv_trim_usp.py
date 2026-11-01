@@ -282,9 +282,7 @@ def _worker(rank, world_size, port, workdir):
                 "_attn_implementation": "usp",
             }
         )
-        dm = AutoDraftModel.from_config(
-            cfg, torch_dtype=torch.bfloat16
-        ).cuda()
+        dm = AutoDraftModel.from_config(cfg, torch_dtype=torch.bfloat16).cuda()
         dm.load_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
         dm.freeze_embedding()
         model = OnlineEagle3Model(

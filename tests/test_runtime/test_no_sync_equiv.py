@@ -51,9 +51,7 @@ def _worker(rank, world_size, workdir, results_dir):
     feat_dir = os.path.join(workdir, "features")
 
     def build_model():
-        dm = AutoDraftModel.from_config(
-            draft_config, torch_dtype=torch.bfloat16
-        ).cuda()
+        dm = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16).cuda()
         dm.load_vocab_mapping(vocab_path)
         dm.freeze_embedding()
         return OnlineEagle3Model(
