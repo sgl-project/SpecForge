@@ -37,7 +37,7 @@ from typing_extensions import Unpack
 from specforge.config.draft import AutoDraftConfig
 from specforge.config.draft.native.qwen3_5_mtp import Qwen3_5MTPConfig
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
-from specforge.modeling.draft.mtp.base import MTPDraftModel
+from specforge.modeling.draft.models.mtp import MTPDraftModel
 from specforge.modeling.draft.registry import register_draft
 from specforge.modeling.draft.serialization import DraftSerializationMixin
 

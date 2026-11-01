@@ -64,7 +64,7 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DFlash architecture, sampling, and loss semantics."""
 
-    from specforge.modeling.draft.dflash import dflash_attention_resume_contract
+    from specforge.modeling.draft.models.dflash import dflash_attention_resume_contract
 
     contract = {
         **dflash_attention_resume_contract(draft_model),
@@ -115,7 +115,7 @@ def resolve_dflash_kernels(config, draft_config):
     Planning already rejected an explicit ``true`` for other strategies. Export
     and inference build the draft without kernels, so they stay native.
     """
-    from specforge.modeling.draft.dflash_kernels import (
+    from specforge.modeling.draft.models.layers.kernels import (
         load_liger_dflash_kernels,
         resolve_draft_liger_kernel_choice,
     )

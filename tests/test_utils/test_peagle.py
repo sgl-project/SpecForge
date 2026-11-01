@@ -12,7 +12,7 @@ from specforge.algorithms.peagle.model import (
     generate_cod_sample_indices,
 )
 from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.peagle import PEagleDraftModel
+from specforge.modeling.draft.models.peagle import PEagleDraftModel
 from specforge.training.model_utils import resolve_mask_token_id
 
 

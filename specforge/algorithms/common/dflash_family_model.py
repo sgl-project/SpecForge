@@ -12,12 +12,14 @@ from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core import fused_loss
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.draft.dflash_mask import (
+from specforge.modeling.draft.models.dflash import DFlashDraftModel
+from specforge.modeling.draft.models.layers.attention.backends.flex_options import (
+    flex_attention_backend,
+)
+from specforge.modeling.draft.models.layers.attention.masks import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
-from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 try:
     from torch.nn.attention.flex_attention import BlockMask

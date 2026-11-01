@@ -8,14 +8,16 @@ from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.config.draft import AutoDraftConfig, EaglePretrainedConfig, PEagleConfig
-from specforge.modeling.draft.base import Eagle3DraftModel
-from specforge.modeling.draft.flex_attention import compile_friendly_flex_attention
-from specforge.modeling.draft.llama3_eagle import (
+from specforge.modeling.draft.models.base import Eagle3DraftModel
+from specforge.modeling.draft.models.eagle3 import (
     LlamaMLP,
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
     get_rope_config,
     rotate_half,
+)
+from specforge.modeling.draft.models.layers.attention.backends.flex import (
+    compile_friendly_flex_attention,
 )
 from specforge.modeling.draft.registry import register_draft
 

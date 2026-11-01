@@ -24,10 +24,12 @@ from transformers.models.qwen3.modeling_qwen3 import FlashAttentionKwargs, Qwen3
 from typing_extensions import Tuple, Unpack
 
 from specforge.config.draft.algorithms.dflash2 import DFlash2Config
-
-from .dflash import DFlashDraftModel, Qwen3DFlashDecoderLayer
-from .dflash_kernels import DFlashKernels
-from .registry import register_draft
+from specforge.modeling.draft.models.dflash import (
+    DFlashDraftModel,
+    Qwen3DFlashDecoderLayer,
+)
+from specforge.modeling.draft.models.layers.kernels import DFlashKernels
+from specforge.modeling.draft.registry import register_draft
 
 # Set to "0" to force the eager convolution on CUDA as well.
 FUSED_CONV_ENV = "SPECFORGE_DFLASH2_FUSED_CONV"
@@ -37,7 +39,10 @@ _FUSED_CONV_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 @functools.lru_cache(maxsize=1)
 def _load_fused_grouped_conv() -> Optional[Tuple[Callable, Callable]]:
     try:
-        from .dflash2_conv_triton import dflash2_grouped_conv_fused, supports_group_size
+        from specforge.modeling.draft.models.layers.convolution.dflash2_triton import (
+            dflash2_grouped_conv_fused,
+            supports_group_size,
+        )
     except ModuleNotFoundError as exc:
         name = exc.name or ""
         if name == "triton" or name.startswith("triton."):

@@ -27,17 +27,23 @@ from specforge.config.draft.algorithms.dflash import (
     resolve_dflash_attention_mode,
     resolve_dflash_causal_block,
 )
-from specforge.modeling.draft.serialization import DraftSerializationMixin
-
-from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
-from .dflash_mask import (
+from specforge.modeling.draft.models.layers.attention.backends.flex import (
+    compile_friendly_flex_attention,
+)
+from specforge.modeling.draft.models.layers.attention.backends.flex_options import (
+    flex_attention_backend,
+)
+from specforge.modeling.draft.models.layers.attention.masks import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
     resolve_dflash_is_causal,
 )
-from .flex_attention import compile_friendly_flex_attention
-from .flex_attention_backend import flex_attention_backend
-from .registry import register_draft
+from specforge.modeling.draft.models.layers.kernels import (
+    DEFAULT_DFLASH_KERNELS,
+    DFlashKernels,
+)
+from specforge.modeling.draft.registry import register_draft
+from specforge.modeling.draft.serialization import DraftSerializationMixin
 
 # Preserve the existing helper import paths while configuration owns the rules.
 build_target_layer_ids = _draft_config.build_target_layer_ids

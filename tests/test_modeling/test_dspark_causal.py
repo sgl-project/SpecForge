@@ -8,7 +8,7 @@ from transformers import Qwen3Config
 
 from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 from specforge.algorithms.dspark.providers import resume_contract
-from specforge.modeling.draft.dspark import DSparkDraftModel
+from specforge.modeling.draft.models.dspark import DSparkDraftModel
 
 
 def build_model(causal=True, backend="sdpa", device="cpu"):
