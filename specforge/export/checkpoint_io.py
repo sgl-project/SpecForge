@@ -157,11 +157,11 @@ def checkpoint_dtype(state_dict: Dict[str, Any]) -> Optional[torch.dtype]:
 
 def materialize_draft(
     state: Dict[str, Any],
-    draft_config_path: str,
+    config_path: str,
     *,
     vocab_mapping_path: Optional[str] = None,
 ):
-    """Build the draft model and load the checkpoint's draft weights into it.
+    """Build from the user YAML recipe and load checkpoint draft weights.
 
     The module is materialized in the checkpoint's floating-point dtype, so its
     parameters and the ``dtype`` that ``save_pretrained`` stamps into the
@@ -172,9 +172,10 @@ def materialize_draft(
     them from the target). Legacy ``t2d``/``d2t`` buffers are tolerated only
     when ``vocab_mapping_path`` is supplied to restore them.
     """
-    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+    from specforge.config.draft import AutoDraftConfig
+    from specforge.modeling.auto import AutoDraftModel
 
-    draft_config = AutoDraftModelConfig.from_file(draft_config_path)
+    draft_config = AutoDraftConfig.from_yaml(config_path)
     torch_dtype = checkpoint_dtype(state["draft_state_dict"]) or torch.bfloat16
     model = AutoDraftModel.from_config(draft_config, torch_dtype=torch_dtype)
     missing, unexpected = model.load_state_dict(state["draft_state_dict"], strict=False)

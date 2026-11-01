@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -132,7 +133,8 @@ class TestPEagleGpuSmoke(unittest.TestCase):
         self.addCleanup(torch.cuda.empty_cache)
 
         from specforge.algorithms.peagle.model import OnlinePEagleModel
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.auto import AutoDraftModel
         from specforge.modeling.draft import PEagleDraftModel, resolve_draft
         from specforge.optimizer import BF16Optimizer
 
@@ -142,7 +144,9 @@ class TestPEagleGpuSmoke(unittest.TestCase):
                 json.dump(TINY_PEAGLE_CONFIG, output)
 
             _seed(1234)
-            config = AutoDraftModelConfig.from_file(config_path)
+            config = AutoDraftConfig.from_dict(
+                json.loads(Path(config_path).read_text())
+            )
             draft_model = AutoDraftModel.from_config(
                 config,
                 torch_dtype=torch.bfloat16,
@@ -268,6 +272,7 @@ class TestPEagleGpuSmoke(unittest.TestCase):
             draft_model.save_pretrained(checkpoint_dir)
             reloaded = AutoDraftModel.from_pretrained(
                 checkpoint_dir,
+                config=draft_model.config,
                 dtype=torch.bfloat16,
             ).cuda()
             self.assertIsInstance(reloaded, PEagleDraftModel)

@@ -307,7 +307,7 @@ class DSpineTest(unittest.TestCase):
             expected = model(**inputs).hidden_states
             model.save_pretrained(tmp_path)
             reloaded = DSpineDraftModel.from_pretrained(
-                tmp_path, attn_implementation="sdpa"
+                tmp_path, config=model.config, attn_implementation="sdpa"
             )
             self.assertTrue(reloaded.transfer_ready.item())
             self.assertIs(reloaded.config.is_causal, True)

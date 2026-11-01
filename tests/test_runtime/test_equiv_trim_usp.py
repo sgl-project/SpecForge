@@ -26,6 +26,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -267,14 +268,17 @@ def _worker(rank, world_size, port, workdir):
 
         from specforge.algorithms.builtin import builtin_algorithm_registry
         from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.auto import AutoDraftModel
         from specforge.modeling.target.target_head import TargetHead
         from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
 
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        cfg = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
+        cfg = AutoDraftConfig.from_dict(
+            json.loads(Path(os.path.join(workdir, "draft.json")).read_text())
+        )
         dm = AutoDraftModel.from_config(
             cfg, attention_backend="usp", torch_dtype=torch.bfloat16
         ).cuda()

@@ -8,9 +8,11 @@ continuity after resume (weights/optimizer/scheduler/RNG/data position).
 """
 
 import contextlib
+import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -1070,7 +1072,8 @@ class TestCheckpointResume(unittest.TestCase):
         fx.build_single_rank_distributed(port="29563")
 
         from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.auto import AutoDraftModel
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -1085,7 +1088,7 @@ class TestCheckpointResume(unittest.TestCase):
         feat_dir = fx.write_offline_files(os.path.join(workdir, "features"), n=N)
         out_dir = os.path.join(workdir, "out")
 
-        draft_config = AutoDraftModelConfig.from_file(cfg)
+        draft_config = AutoDraftConfig.from_dict(json.loads(Path(cfg).read_text()))
 
         def build_model():
             dm = AutoDraftModel.from_config(

@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -100,7 +101,7 @@ class DraftConfigResolutionTest(unittest.TestCase):
                 "dflash", draft_model_config=payload, draft_checkpoint_path=checkpoint
             )
             with mock.patch(
-                "specforge.config.draft.AutoDraftConfig.from_pretrained"
+                "specforge.config.draft.serialization.checkpoint.read_checkpoint_contract"
             ) as read:
                 resolved = resolve_draft_config(
                     cfg, provider=_draft_config_provider("dflash")
@@ -351,10 +352,6 @@ class WarmStartTest(unittest.TestCase):
                 "specforge.modeling.auto.AutoDraftModel.from_pretrained",
                 return_value=(source, {"missing_keys": []}),
             ) as load,
-            mock.patch(
-                "specforge.config.draft.AutoDraftConfig.from_pretrained",
-                return_value=self.config,
-            ),
         ):
             report = warm_start_draft_model(
                 destination,
@@ -375,7 +372,8 @@ class WarmStartTest(unittest.TestCase):
         self.assertTrue(torch.equal(destination.proj.weight, source.proj.weight))
 
     def test_nested_draft_head_checkpoint_keys_are_migrated(self):
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+        from specforge.config.draft import AutoDraftConfig
+        from specforge.modeling.auto import AutoDraftModel
 
         cases = (
             (
@@ -417,7 +415,9 @@ class WarmStartTest(unittest.TestCase):
                 config_path = os.path.join(directory, "config.json")
                 with open(config_path, "w", encoding="utf-8") as stream:
                     json.dump(payload, stream)
-                config = AutoDraftModelConfig.from_file(config_path)
+                config = AutoDraftConfig.from_dict(
+                    json.loads(Path(config_path).read_text())
+                )
                 source = AutoDraftModel.from_config(config)
                 destination = AutoDraftModel.from_config(config)
                 checkpoint_state = {}

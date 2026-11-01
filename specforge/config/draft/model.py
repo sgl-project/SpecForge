@@ -106,6 +106,16 @@ class DraftModelConfig:
         return self.to_hf_config().save_pretrained(*args, **kwargs)
 
 
+def require_inline_config(config) -> DraftModelConfig:
+    """Weight loading cannot infer structure from saved configuration."""
+    if not isinstance(config, DraftModelConfig):
+        raise ValueError(
+            "config must be a DraftModelConfig parsed from the user's YAML "
+            "model.draft_model_config; checkpoint settings cannot initialize a draft"
+        )
+    return config
+
+
 # Architecture defaults belong to SpecForge; HF adapters do not choose settings
 # for inline training configs. Method defaults remain in their own parsers.
 _COMMON_DEFAULTS = {

@@ -167,8 +167,7 @@ runs before config resolution. A minimal draft config then contains:
 ```
 
 Embed that mapping under `model.draft_model_config` in the training YAML.
-`AutoDraftConfig` (also available under the legacy name `AutoDraftModelConfig`)
-resolves configuration types through `specforge.config.draft.registry`; the
+`AutoDraftConfig` resolves configuration types through `specforge.config.draft.registry`; the
 model assembler resolves implementations through the model registry. The
 `@register_draft` decorator registers custom configuration types and rejects
 declarations that conflict with an existing configuration registration. Do not

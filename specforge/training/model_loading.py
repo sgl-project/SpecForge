@@ -185,7 +185,7 @@ def _load_specforge_draft_state(
             f"{saved_strategy!r}; this run trains {expected_strategy!r}"
         )
     from specforge.algorithms.common.providers import MODEL_PROVENANCE_CONTRACT_KEY
-    from specforge.config.draft import AutoDraftConfig
+    from specforge.config.draft.serialization.checkpoint import read_checkpoint_contract
     from specforge.config.draft.serialization.contract import (
         draft_config_contract,
         validate_draft_config_contract,
@@ -202,7 +202,7 @@ def _load_specforge_draft_state(
                 f"checkpoint {state_path!r} has no saved draft settings; "
                 "provide its original config.json next to training_state.pt"
             )
-        saved = draft_config_contract(AutoDraftConfig.from_pretrained(source))
+        saved = read_checkpoint_contract(source)
     validate_draft_config_contract(
         draft_config_contract(draft_config), saved, source=state_path
     )
@@ -216,19 +216,10 @@ def _load_pretrained_draft_state(
     cache_dir: Optional[str],
     trust_remote_code: bool,
 ) -> Dict[str, Any]:
-    from specforge.config.draft import AutoDraftConfig
-    from specforge.config.draft.serialization.contract import (
-        draft_config_contract,
-        validate_draft_config_contract,
-    )
     from specforge.modeling.auto import AutoDraftModel
 
-    saved = AutoDraftConfig.from_pretrained(
-        source, cache_dir=cache_dir, trust_remote_code=trust_remote_code
-    )
-    validate_draft_config_contract(
-        draft_config_contract(draft_config), draft_config_contract(saved), source=source
-    )
+    # from_pretrained validates saved metadata against this explicit config
+    # before constructing a model; it never initializes from saved settings.
     loaded, loading_info = AutoDraftModel.from_pretrained(
         source,
         config=draft_config,

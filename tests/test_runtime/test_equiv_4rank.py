@@ -13,6 +13,7 @@ import math
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -38,9 +39,12 @@ def _has_standard_flash_attention() -> bool:
 
 def _build_model(workdir: str, attention_backend: str):
     from specforge.algorithms.eagle3.model import OnlineEagle3Model
-    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+    from specforge.config.draft import AutoDraftConfig
+    from specforge.modeling.auto import AutoDraftModel
 
-    draft_config = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
+    draft_config = AutoDraftConfig.from_dict(
+        json.loads(Path(os.path.join(workdir, "draft.json")).read_text())
+    )
     draft_model = AutoDraftModel.from_config(
         draft_config,
         attention_backend=attention_backend,

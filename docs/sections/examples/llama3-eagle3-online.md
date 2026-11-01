@@ -42,11 +42,12 @@ reference draft checkpoint is available at
 
 The runtime checkpoint contains training state but is not directly loadable by
 the SGLang speculative decoder. Online resume is consumer-only and reuses the
-retained transport state; export the final checkpoint before serving:
+retained transport state; export the final checkpoint before serving using the
+same training recipe (shown as `run.yaml` below):
 
 ```bash
 specforge export --to sglang \
   --checkpoint ./outputs/llama3.1-8b-eagle3-online/llama3.1-8b-eagle3-online-latest \
-  --draft-config configs/llama3-8B-eagle3.json \
+  --config run.yaml \
   --output-dir ./exports/llama3.1-8b-eagle3-sglang
 ```

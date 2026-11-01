@@ -4,7 +4,8 @@ from typing import Union
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import PretrainedConfig, modeling_utils
 
-from specforge.config.draft import AutoDraftConfig, DraftModelConfig
+from specforge.config.draft import DraftModelConfig
+from specforge.config.draft.model import require_inline_config
 
 from .draft.registry import DRAFT_REGISTRY, available_drafts
 
@@ -62,26 +63,8 @@ class AutoDraftModel(AutoModelForCausalLMBase):
         modeling_utils.logger.warning = filtered_warning
 
         try:
-            config = kwargs.get("config")
-            if config is None:
-                config = AutoDraftConfig.from_pretrained(
-                    pretrained_model_name_or_path,
-                    **{
-                        key: kwargs[key]
-                        for key in (
-                            "cache_dir",
-                            "trust_remote_code",
-                            "revision",
-                            "token",
-                            "local_files_only",
-                            "force_download",
-                            "subfolder",
-                        )
-                        if key in kwargs
-                    },
-                )
+            config = require_inline_config(kwargs.get("config"))
             model_cls = cls._model_cls_from_config(config)
-            kwargs = {**kwargs, "config": config}
             model = model_cls.from_pretrained(
                 pretrained_model_name_or_path, *model_args, **kwargs
             )
@@ -89,7 +72,3 @@ class AutoDraftModel(AutoModelForCausalLMBase):
             modeling_utils.logger.warning = original_warn
 
         return model
-
-
-class AutoDraftModelConfig(AutoDraftConfig):
-    """Backward-compatible name for the shared draft config loader."""

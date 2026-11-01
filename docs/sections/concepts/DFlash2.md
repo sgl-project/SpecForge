@@ -133,12 +133,12 @@ training backends and the same full/sliding per-layer layouts.
 
 ## Export and serve
 
-Export the runtime checkpoint as a Hugging Face draft directory:
+Export the runtime checkpoint using the same training recipe (`run.yaml` below):
 
 ```bash
 specforge export --to hf \
   --checkpoint ./outputs/qwen3.6-27b-dflash2-disaggregated-with-selector/qwen3.6-27b-dflash2-disaggregated-with-selector-latest \
-  --draft-config configs/qwen3.6-27b-dflash2.json \
+  --config run.yaml \
   --output-dir ./exports/qwen3.6-27b-dflash2
 ```
 

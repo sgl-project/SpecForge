@@ -626,8 +626,8 @@ class TestCliLifecycle(unittest.TestCase):
                         "hf",
                         "--checkpoint",
                         "checkpoint",
-                        "--draft-config",
-                        "draft.json",
+                        "--config",
+                        "run.yaml",
                         "--output-dir",
                         "exported",
                         "--embedding-source",
@@ -636,7 +636,7 @@ class TestCliLifecycle(unittest.TestCase):
                 ),
                 0,
             )
-        self.assertEqual(calls[0][0], ("checkpoint", "draft.json", "exported"))
+        self.assertEqual(calls[0][0], ("checkpoint", "run.yaml", "exported"))
         self.assertEqual(calls[0][1]["embedding_source"], "target")
 
     def test_sglang_export_rejects_embedding_source_as_usage_error(self):
@@ -654,8 +654,8 @@ class TestCliLifecycle(unittest.TestCase):
                     "sglang",
                     "--checkpoint",
                     "checkpoint",
-                    "--draft-config",
-                    "draft.json",
+                    "--config",
+                    "run.yaml",
                     "--output-dir",
                     "exported",
                     "--embedding-source",
