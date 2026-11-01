@@ -62,7 +62,7 @@ When it is greater than one, the CLI starts torch distributed itself:
 specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.yaml
 ```
 
-Online target inference never runs in the trainer. A patched SGLang server owns
+Online target inference never runs in the trainer. A SGLang server running the capture plugin owns
 target parallelism and publishes captured features through Mooncake; every
 consumer rank is data parallel. Offline runs shard fixed feature references
 across trainer ranks and may additionally use EAGLE3 USP. See
@@ -231,7 +231,7 @@ DSpine requires causal attention for both full and sliding layers and rejects
 DFlash2 is a draft-architecture variant of DFlash, not a separate capture
 strategy. Keep `training.strategy: dflash` and select it with a draft config
 whose architecture is `DFlash2DraftModel`. The target server still captures
-the same selected hidden states with `--spec-capture-method dflash`. Online
+the same selected hidden states with `--speculative-algorithm DFLASH`. Online
 capture also retains the target's final hidden state for teacher-alignment
 telemetry; existing offline DFlash datasets remain compatible and omit only
 the teacher-only metrics. The objective never reads that hidden state. Set
