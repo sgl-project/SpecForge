@@ -121,31 +121,41 @@ class CIDependencyTest(unittest.TestCase):
         ]
 
     def test_save_and_restore_remove_stale_versions(self):
-        old = self.cache / "sf" / "old.dist-info"
-        old.mkdir(parents=True)
-        (self.root / "sf").mkdir()
-        (self.root / "sf" / "current.dist-info").touch()
-        (self.root / "sf" / "python").symlink_to(sys.executable)
+        for environment in ("sf", "sf-capture"):
+            (self.cache / environment / "old.dist-info").mkdir(parents=True)
+            current = self.root / environment
+            current.mkdir()
+            (current / "current.dist-info").write_text(environment)
+            (current / "python").symlink_to(sys.executable)
         self.run_step("Save dependency cache")
-        self.assertFalse(old.exists())
-        (self.root / "sf" / "stale.dist-info").touch()
+        for environment in ("sf", "sf-capture"):
+            self.assertFalse((self.cache / environment / "old.dist-info").exists())
+            (self.root / environment / "stale.dist-info").touch()
         # Exercise only the venv restore; the model cache is unrelated to this test.
         restore = self.steps["Restore cache"]["run"]
-        restore = restore[restore.index('if [ -d "$SPECFORGE_CI_CACHE/sf"') :]
+        restore = restore[restore.index("for environment in sf sf-capture; do") :]
         result = self.run_shell(restore)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            {p.name for p in (self.root / "sf").iterdir()},
-            {"current.dist-info", "python"},
-        )
-        self.assertTrue((self.root / "sf" / "python").is_symlink())
+        for environment in ("sf", "sf-capture"):
+            with self.subTest(environment=environment):
+                restored = self.root / environment
+                self.assertEqual(
+                    {p.name for p in restored.iterdir()},
+                    {"current.dist-info", "python"},
+                )
+                self.assertEqual(
+                    (restored / "current.dist-info").read_text(), environment
+                )
+                self.assertTrue((restored / "python").is_symlink())
 
     def test_failed_copy_preserves_previous_snapshot(self):
-        (self.cache / "sf").mkdir()
-        (self.cache / "sf" / "valid").touch()
+        for environment in ("sf", "sf-capture"):
+            (self.cache / environment).mkdir()
+            (self.cache / environment / "valid").touch()
         result = self.run_shell(self.steps["Save dependency cache"]["run"])
         self.assertNotEqual(result.returncode, 0)
-        self.assertTrue((self.cache / "sf" / "valid").exists())
+        for environment in ("sf", "sf-capture"):
+            self.assertTrue((self.cache / environment / "valid").exists())
         self.assertEqual(list(self.cache.glob("sf.*")), [])
 
     def test_fa_install_then_healthy_environment_skips_install(self):
@@ -208,6 +218,7 @@ class CIDependencyTest(unittest.TestCase):
         names = list(self.steps)
         ordered = [
             "Install dependencies",
+            "Install pinned plugin capture environment",
             "Ensure FlashAttention ABI",
             "Save dependency cache",
             "Run live server-capture numerics gate",
