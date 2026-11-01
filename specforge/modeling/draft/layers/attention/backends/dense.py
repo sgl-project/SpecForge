@@ -8,6 +8,9 @@ if TYPE_CHECKING:
     from ..base import DenseAttention
 
 import torch
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    eager_attention_forward as eager_attention_with_sinks,
+)
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     eager_attention_forward,
@@ -31,6 +34,13 @@ def dense_attention(
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     implementation = module.config._attn_implementation
+    # A per-head sink logit, HF's ``sinks`` (gpt-oss, DeepSeek-V4/V4.1); only backends
+    # that expose the softmax normalizer can apply it: fused flex on GPU, eager on CPU.
+    sink = getattr(module, "sinks", None)
+    if sink is not None and implementation not in ("eager", "flex_attention"):
+        raise ValueError(
+            "Attention sinks need flex_attention (fast, GPU) or eager (CPU reference)"
+        )
     causal = kwargs.pop("is_causal", module.is_causal)
     if not isinstance(causal, bool):
         raise ValueError("is_causal must be a boolean")
@@ -84,6 +94,12 @@ def dense_attention(
             attention_mask is not None
             and getattr(module.o_proj, "bias", None) is not None
         )
+        if sink is not None and q.device.type != "cuda":
+            # Inductor cannot emit the logsumexp for CPU flex; eager carries sinks there.
+            raise ValueError(
+                "Attention sinks under flex_attention need CUDA; use eager"
+            )
+        return_lse = need_validity or sink is not None
         result = compile_friendly_flex_attention(
             q,
             k,
@@ -92,17 +108,25 @@ def dense_attention(
             enable_gqa=True,
             scale=module.scaling,
             kernel_options=kernel_options or None,
-            return_lse=need_validity,
+            return_lse=return_lse,
         )
-        if need_validity:
+        if return_lse:
             attn_output, lse = result
-            valid_queries = (~torch.isneginf(lse)).unsqueeze(-1)
+            if need_validity:
+                valid_queries = (~torch.isneginf(lse)).unsqueeze(-1)
+            if sink is not None:
+                # softmax over [keys, sink] = softmax over keys x sigmoid(lse - sink);
+                # flex's lse is the natural log, and -inf (no keys) keeps zeros.
+                gate = torch.sigmoid(lse - sink.float().view(1, -1, 1))
+                attn_output = attn_output * gate.unsqueeze(-1).to(attn_output.dtype)
         else:
             attn_output = result
         attn_output = attn_output.transpose(1, 2)
         attn_weights = None
     else:
         attn_fn: Callable = eager_attention_forward
+        if sink is not None:
+            attn_fn = eager_attention_with_sinks
         if implementation in ("eager", "sdpa"):
             attention_mask, valid_queries = prepare_tensor_mask(
                 attention_mask, q.dtype, eager=implementation == "eager"
