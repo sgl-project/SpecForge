@@ -273,7 +273,7 @@ checked-in Qwen3-8B DFlash recipe with:
 
 ```bash
 python scripts/prepare_hidden_states.py \
-  --server-urls http://127.0.0.1:30000 \
+    --server-urls http://127.0.0.1:30000 \
     --strategy dflash \
     --target-model-path Qwen/Qwen3-8B \
     --draft-model-config configs/qwen3-8b-dflash.json \
@@ -329,7 +329,7 @@ For preformatted input, add `--is-preformatted` to the same command and keep
 
 ```bash
 python scripts/prepare_hidden_states.py \
-  --server-urls http://127.0.0.1:30000 \
+    --server-urls http://127.0.0.1:30000 \
     --strategy eagle3 \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config configs/llama3-8B-eagle3.json \
