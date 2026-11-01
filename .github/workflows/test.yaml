@@ -119,7 +119,7 @@ jobs:
       - name: Install capture server Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Matches rust/rust-toolchain.toml at the SGLang revision below.
+          # Current upstream rust/rust-toolchain.toml requirement.
           toolchain: "1.92"
 
       - name: Install plugin capture server environment
@@ -130,8 +130,9 @@ jobs:
           uv venv sf-capture -p 3.12
           uv pip install --python sf-capture/bin/python torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
           uv pip install --python sf-capture/bin/python wheel setuptools setuptools-rust setuptools-scm
-          uv pip install --python sf-capture/bin/python --no-build-isolation \
-            'sglang @ git+https://github.com/sgl-project/sglang.git@4a58dc983825e1b150d2f375e6885a9f2c7f52ec#subdirectory=python' \
+          # Resolve upstream main on every run, including when uv has a cached checkout.
+          uv pip install --python sf-capture/bin/python --no-build-isolation --refresh-package sglang \
+            'sglang @ git+https://github.com/sgl-project/sglang.git@main#subdirectory=python' \
             mooncake-transfer-engine-cuda13
           uv pip install --python sf-capture/bin/python --no-deps plugins/sglang-spec-capture
           sf-capture/bin/python -c 'from sglang.srt.model_executor.forward_observer import ForwardObserver; from sglang.srt.managers.deferred_output import ResponseCompletion'
