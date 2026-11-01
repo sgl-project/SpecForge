@@ -158,9 +158,8 @@ class AllDraftConfigsTest(unittest.TestCase):
                             (Path(directory) / "config.json").read_text()
                         )
                         self.assertEqual(saved["block_size"], model.config.block_size)
-                        self.assertEqual(
-                            saved["block_size"], saved["dflash_config"]["block_size"]
-                        )
+                        self.assertNotIn("block_size", saved["dflash_config"])
+                        self.assertEqual(saved["schema_version"], 1)
                     restored = AutoDraftModel.from_pretrained(
                         directory, config=model.config, local_files_only=True
                     )

@@ -135,10 +135,8 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         )
         mock_from_pretrained.assert_called_once()
         self.assertEqual(mock_from_pretrained.call_args.args, (self.temp_dir,))
-        self.assertEqual(
-            mock_from_pretrained.call_args.kwargs["config"].hidden_size,
-            mock_model.config.hidden_size,
-        )
+        adapter = mock_from_pretrained.call_args.kwargs["config"]
+        self.assertEqual(adapter.layers, mock_model.config.to_dict()["layers"])
         self.assertIsInstance(loaded_model, LlamaForCausalLMEagle3)
 
     def test_model_forward_pass(self):

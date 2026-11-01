@@ -14,6 +14,7 @@ from transformers import PretrainedConfig
 from specforge.config.draft import AutoDraftConfig
 from specforge.config.draft.serialization.checkpoint import read_checkpoint_contract
 from specforge.config.draft.serialization.contract import draft_config_contract
+from specforge.config.draft.serialization.format import encode_format
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.registry import DRAFT_REGISTRY
 
@@ -110,9 +111,9 @@ class DraftConfigTest(unittest.TestCase):
         self.assertEqual(load.call_args.kwargs["revision"], "branch")
         self.assertEqual(load.call_args.kwargs["subfolder"], "draft")
 
-    def test_hub_metadata_is_comparison_only_and_never_mutated(self):
+    def test_canonical_hub_metadata_is_comparison_only_and_never_mutated(self):
         config = AutoDraftConfig.from_yaml(self.path)
-        payload = config.to_hf_config(for_export=False).to_dict()
+        payload = encode_format(config)
         original = copy.deepcopy(payload)
         model_cls = DRAFT_REGISTRY["LlamaForCausalLMEagle3"]
         with (
@@ -135,14 +136,13 @@ class DraftConfigTest(unittest.TestCase):
         self.assertEqual(hub.call_args.kwargs["revision"], "branch")
         self.assertEqual(hub.call_args.kwargs["subfolder"], "draft")
         self.assertEqual(
-            draft_config_contract(weights.call_args.kwargs["config"]),
-            draft_config_contract(config),
+            weights.call_args.kwargs["config"].layers, config.to_dict()["layers"]
         )
 
     def test_checkpoint_mismatch_fails_before_model_or_weights_are_loaded(self):
         config = AutoDraftConfig.from_yaml(self.path)
-        payload = config.to_hf_config(for_export=False).to_dict()
-        payload["intermediate_size"] += 8
+        payload = encode_format(config)
+        payload["layers"][0]["ffn"]["intermediate_size"] += 8
         with (
             mock.patch.object(
                 PretrainedConfig, "get_config_dict", return_value=(payload, {})
