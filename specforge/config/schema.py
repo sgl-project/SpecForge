@@ -64,7 +64,7 @@ _SGLANG_UNSUPPORTED_FLAGS: Mapping[str, str] = {
     ),
     "--config": "SGLang merges that file unchecked; list its flags instead",
 }
-#: SGLang v0.5.18 spellings that write the same option, checked against its
+#: Pinned SGLang CLI spellings that write the same option, checked against its
 #: parser in tests. Positive/negative boolean flags belong to one group too:
 #: they conflict under the no-overrides rule, but their argv is never rewritten.
 _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
@@ -85,33 +85,26 @@ _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
     "--experts-shared-outer-loras": ("--no-experts-shared-outer-loras",),
     "--lora-strict-loading": ("--no-lora-strict-loading",),
     "--dllm-fdfo": ("--no-dllm-fdfo",),
-    "--mamba-radix-cache-strategy": ("--mamba-scheduler-strategy",),
-    "--stream-output": ("--incremental-streaming-output",),
-    "--cuda-graph-bs-decode": ("--cuda-graph-bs",),
-    "--cuda-graph-max-bs-decode": ("--cuda-graph-max-bs",),
-    "--cuda-graph-bs-prefill": ("--piecewise-cuda-graph-tokens",),
-    "--cuda-graph-max-bs-prefill": ("--piecewise-cuda-graph-max-tokens",),
-    "--cuda-graph-backend-prefill": (
-        "--enable-breakable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
-        "--enforce-piecewise-cuda-graph",
+    "--enable-tf32-matmul": ("--no-enable-tf32-matmul",),
+    "--attn-dp-size": ("--attention-data-parallel-size",),
+    "--cuda-graph-prefill-max-context": ("--context-bucket",),
+    "--enable-fused-qk-norm-rope": ("--no-enable-fused-qk-norm-rope",),
+    "--speculative-enable-w4a4-mxfp4-megamoe": (
+        "--no-speculative-enable-w4a4-mxfp4-megamoe",
     ),
-    "--cuda-graph-tc-compiler": ("--piecewise-cuda-graph-compiler",),
-    "--dsa-prefill-cp-mode": ("--nsa-prefill-cp-mode",),
-    "--dsa-prefill-backend": ("--nsa-prefill-backend",),
-    "--dsa-decode-backend": ("--nsa-decode-backend",),
-    "--enable-dsa-prefill-context-parallel": ("--enable-nsa-prefill-context-parallel",),
-    "--enable-linear-replayssm-spec": ("--enable-gdn-replayssm-spec",),
-    "--speculative-draft-window-size": ("--speculative-dflash-draft-window-size",),
+    "--enable-hierarchical-cache": ("--enable-hicache",),
+    "--mm-enable-dp-encoder": ("--no-mm-enable-dp-encoder",),
+    "--ple-offload-embedding": ("--no-ple-offload-embedding",),
+    "--enable-decoder-swa-bounded-replay": ("--no-enable-decoder-swa-bounded-replay",),
+    "--enable-megamoe-for-layernorm-sp": ("--no-enable-megamoe-for-layernorm-sp",),
+    "--enable-dsa-fused-indexer": ("--no-enable-dsa-fused-indexer",),
 }
-#: Complete SGLang v0.5.18 options that are also prefixes of other options.
+#: Complete pinned SGLang CLI options that are also prefixes of other options.
 #: argparse matches these exactly instead of expanding them. Keep this small
-#: table in sync with the pinned parser (covered by the launch-plan tests),
+#: table in sync with the installed parser (covered by the launch-plan tests),
 #: without importing SGLang/PyTorch during configuration validation.
 _SGLANG_EXACT_PREFIX_FLAGS = frozenset(
     {
-        "--cuda-graph-bs",
-        "--cuda-graph-max-bs",
         "--disable-cuda-graph",
         "--dllm-algorithm",
         "--enable-dp-attention",
@@ -126,7 +119,9 @@ _SGLANG_EXACT_PREFIX_FLAGS = frozenset(
         "--log-level",
         "--log-requests",
         "--model",
+        "--prefill-decode-interval",
         "--quantization",
+        "--radix-eviction-policy",
         "--sidecar",
         "--speculative-adaptive",
         "--speculative-draft-model",
