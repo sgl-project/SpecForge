@@ -13,7 +13,7 @@ config/tokenizer and the same draft config used for training.
 
 Use an SGLang environment with the native APIs described in the
 [plugin installation guide](../../plugins/sglang-spec-capture/README.md), and
-install the current plugin there. SGLang main is required; released 0.5.23
+install the current plugin there. Use the SGLang commit pinned in `pyproject.toml`; released 0.5.23
 still lacks the capture APIs. The server and SpecForge client may use the same
 environment with a compatible Mooncake wheel, or separate environments.
 

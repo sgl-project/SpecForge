@@ -24,6 +24,7 @@ from typing import Dict, List, Literal, Mapping, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
 from specforge.runtime.contracts import consumer_dispatch_quantum
 
 # SGLang reserves one generated-token slot plus five internal slots, and its
@@ -63,7 +64,7 @@ _SGLANG_UNSUPPORTED_FLAGS: Mapping[str, str] = {
     ),
     "--config": "SGLang merges that file unchecked; list its flags instead",
 }
-#: SGLang main CLI spellings that write the same option, checked against its
+#: Pinned SGLang CLI spellings that write the same option, checked against its
 #: parser in tests. Positive/negative boolean flags belong to one group too:
 #: they conflict under the no-overrides rule, but their argv is never rewritten.
 _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
@@ -95,10 +96,10 @@ _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
     "--mm-enable-dp-encoder": ("--no-mm-enable-dp-encoder",),
     "--ple-offload-embedding": ("--no-ple-offload-embedding",),
     "--enable-decoder-swa-bounded-replay": ("--no-enable-decoder-swa-bounded-replay",),
-    "--enable-amd-monokernel": ("--monokernel-backend",),
+    "--enable-megamoe-for-layernorm-sp": ("--no-enable-megamoe-for-layernorm-sp",),
     "--enable-dsa-fused-indexer": ("--no-enable-dsa-fused-indexer",),
 }
-#: Complete SGLang main CLI options that are also prefixes of other options.
+#: Complete pinned SGLang CLI options that are also prefixes of other options.
 #: argparse matches these exactly instead of expanding them. Keep this small
 #: table in sync with the installed parser (covered by the launch-plan tests),
 #: without importing SGLang/PyTorch during configuration validation.

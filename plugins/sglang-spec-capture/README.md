@@ -21,7 +21,8 @@ build with these generic extension points:
 This version requires SGLang's [aux-capture changes in PR #43449](https://github.com/sgl-project/sglang/pull/43449)
 and the completion-based `defer_response` revision of
 [PR #43450](https://github.com/sgl-project/sglang/pull/43450), or a branch containing
-both. Use SGLang main: the released 0.5.23 wheel still lacks the forward
+both. SpecForge pins SGLang to commit
+`c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`; the released 0.5.23 wheel still lacks the forward
 observer, completion and auxiliary-capture APIs required here.
 
 The aux-capture API returns `last_hidden_states` after the final norm and
@@ -30,11 +31,12 @@ preserves those values; SpecForge folds `logits_mup_width_multiplier` into
 its frozen target head. Older builds that return scaled states are unsupported;
 upgrade the capture environment to a build with the required API.
 
-SpecForge and its capture server now use the same dependency versions: SGLang
-main, Torch 2.14.1 and Transformers 5.19.0. They can run in the same environment;
+SpecForge and its capture server use the same pinned SGLang revision,
+Torch 2.14.1 and Transformers 5.19.0. They can run in the same environment;
 the server remains a separate process. Separate environments are also supported
 through `capture_servers[].python_executable`. The plugin itself does not import
-the main SpecForge package.
+the main SpecForge package. CI uses a separate `sf-capture` environment for
+the live server and reads its SGLang requirement directly from `pyproject.toml`.
 
 Install into the SGLang server's environment. The plugin declares no
 dependencies, so the server's pins stay intact:
@@ -53,7 +55,7 @@ compiler, and CUDA development tools. An existing compatible SGLang server
 environment can also be used.
 
 For example, from the SpecForge checkout on a CUDA 13 host with the Rust,
-C/C++ and CUDA build tools required by SGLang main:
+C/C++ and CUDA build tools required by the pinned SGLang revision:
 
 ```bash
 uv venv .venv -p 3.12
@@ -65,7 +67,7 @@ uv pip install --no-deps plugins/sglang-spec-capture
 uv pip install mooncake-transfer-engine-cuda13
 ```
 
-The SGLang requirement follows `main`; no cache refresh is forced. Rebuild
+The SGLang requirement uses the exact commit above; no cache refresh is forced. Rebuild
 optional compiled training kernels against the installed Torch when upgrading.
 
 SGLang discovers the plugin through the `sglang.srt.plugins` entry point. If
