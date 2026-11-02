@@ -23,6 +23,7 @@ def _reference_dflash_mask(
     device,
     sliding_window=None,
     is_causal=None,
+    context_window=None,
 ):
     """Element-level reference for full and sliding DFlash attention.
 
@@ -62,6 +63,9 @@ def _reference_dflash_mask(
                     draft_visible = draft_visible and (
                         abs(kv_offset - q_offset) < sliding_window
                     )
+                if context_window is not None:
+                    # DSpark: the block shares the last context_window keys.
+                    ctx_visible = ctx_visible and kv_idx >= anchor_pos - context_window
 
                 if ctx_visible or draft_visible:
                     mask[b, 0, q_idx, kv_idx] = True
@@ -97,6 +101,7 @@ class TestDFlashMask(unittest.TestCase):
         block_size,
         sliding_window=None,
         is_causal=None,
+        context_window=None,
     ):
         """Compare create_dflash_sdpa_mask against element-level reference (ground truth)."""
         anchor_positions = anchor_positions.to(self.device)
@@ -110,6 +115,7 @@ class TestDFlashMask(unittest.TestCase):
             device=self.device,
             sliding_window=sliding_window,
             is_causal=is_causal,
+            context_window=context_window,
         )
 
         ref_mask = _reference_dflash_mask(
@@ -120,6 +126,7 @@ class TestDFlashMask(unittest.TestCase):
             device=self.device,
             sliding_window=sliding_window,
             is_causal=is_causal,
+            context_window=context_window,
         )
 
         self.assertEqual(
@@ -143,6 +150,7 @@ class TestDFlashMask(unittest.TestCase):
         block_size,
         sliding_window=None,
         is_causal=None,
+        context_window=None,
     ):
         """Verify create_dflash_block_mask block-level mask is consistent with reference."""
         anchor_positions = anchor_positions.to(self.device)
@@ -156,6 +164,7 @@ class TestDFlashMask(unittest.TestCase):
             device=self.device,
             sliding_window=sliding_window,
             is_causal=is_causal,
+            context_window=context_window,
         )
 
         ref_mask = _reference_dflash_mask(
@@ -166,6 +175,7 @@ class TestDFlashMask(unittest.TestCase):
             device=self.device,
             sliding_window=sliding_window,
             is_causal=is_causal,
+            context_window=context_window,
         )
 
         dense_blocks = block_mask.to_dense()  # (B, H, Q_blocks, KV_blocks)
@@ -306,6 +316,107 @@ class TestDFlashMask(unittest.TestCase):
                         device=self.device,
                         sliding_window=0,
                     )
+
+    def test_context_window_is_anchored_to_the_block(self):
+        """DSpark (DeepSeek-V4/V4.1): every block query sees the same last keys."""
+        anchor_positions = torch.tensor([[6]])
+        block_keep_mask = torch.tensor([[True]])
+        for is_causal in (False, True):
+            mask = create_dflash_sdpa_mask(
+                anchor_positions=anchor_positions.to(self.device),
+                block_keep_mask=block_keep_mask.to(self.device),
+                S=12,
+                block_size=4,
+                device=self.device,
+                is_causal=is_causal,
+                context_window=4,
+            )
+            for query_offset in range(4):
+                with self.subTest(is_causal=is_causal, query_offset=query_offset):
+                    visible = mask[0, 0, query_offset].nonzero().flatten().tolist()
+                    last_draft_key = 12 + (query_offset if is_causal else 3)
+                    self.assertEqual(
+                        visible, [2, 3, 4, 5] + list(range(12, last_draft_key + 1))
+                    )
+
+    def test_context_window_clips_at_the_sequence_start(self):
+        mask = create_dflash_sdpa_mask(
+            anchor_positions=torch.tensor([[2]], device=self.device),
+            block_keep_mask=torch.tensor([[True]], device=self.device),
+            S=8,
+            block_size=2,
+            device=self.device,
+            context_window=8,
+        )
+        self.assertEqual(mask[0, 0, 0].nonzero().flatten().tolist(), [0, 1, 8, 9])
+
+    def test_context_window_matches_reference(self):
+        anchor_positions = torch.tensor([[5, 130, 190], [0, 140, 199]])
+        block_keep_mask = torch.tensor([[True, True, True], [True, False, True]])
+        for context_window, sliding_window, is_causal in (
+            (4, None, None),
+            (1, None, False),
+            (6, 3, None),
+            (5, None, True),
+        ):
+            with self.subTest(
+                context_window=context_window,
+                sliding_window=sliding_window,
+                is_causal=is_causal,
+            ):
+                for check in (
+                    self._compare_masks,
+                    self._compare_block_mask_consistency,
+                ):
+                    check(
+                        anchor_positions,
+                        block_keep_mask,
+                        S=200,
+                        block_size=3,
+                        sliding_window=sliding_window,
+                        is_causal=is_causal,
+                        context_window=context_window,
+                    )
+
+    def test_invalid_context_window(self):
+        for factory in (create_dflash_sdpa_mask, create_dflash_block_mask):
+            with self.subTest(factory=factory.__name__):
+                with self.assertRaisesRegex(ValueError, "context_window must be > 0"):
+                    factory(
+                        anchor_positions=torch.tensor([[12]], device=self.device),
+                        block_keep_mask=torch.tensor([[True]], device=self.device),
+                        S=16,
+                        block_size=4,
+                        device=self.device,
+                        context_window=0,
+                    )
+
+    def test_training_mask_reads_draft_context_window(self):
+        anchors = torch.tensor([[12]], device=self.device)
+        keep = torch.tensor([[True]], device=self.device)
+        draft_model = _RecordingDraftModel().to(self.device)
+        draft_model.context_window = 3
+        model = OnlineDFlashModel(
+            draft_model=draft_model,
+            target_lm_head=nn.Identity(),
+            target_embed_tokens=nn.Embedding(32, 8).to(self.device),
+            mask_token_id=31,
+            block_size=4,
+            attention_backend="sdpa",
+        )
+        with mock.patch.object(
+            model, "_sample_anchor_positions", return_value=(anchors, keep)
+        ):
+            model._forward_draft_blocks(
+                input_ids=torch.arange(16, device=self.device).unsqueeze(0),
+                hidden_states=torch.randn(1, 16, 8, device=self.device),
+                loss_mask=torch.ones(1, 16, device=self.device),
+            )
+        for layer_type, mask in draft_model.attention_mask.items():
+            with self.subTest(layer_type=layer_type):
+                context = mask[0, 0, :, :16]
+                self.assertTrue(torch.all(context[:, 9:12]))
+                self.assertFalse(context[:, :9].any())
 
     def test_all_dflash_families_build_mixed_layer_masks(self):
         anchors = torch.tensor([[12]], device=self.device)
