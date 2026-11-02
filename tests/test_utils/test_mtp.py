@@ -21,6 +21,11 @@ from types import SimpleNamespace
 
 import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5Attention,
+    Qwen3_5TextRotaryEmbedding,
+)
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.mtp.providers import _init_from_native_mtp
@@ -30,7 +35,6 @@ from specforge.modeling.draft.mtp import Qwen3_5MTPDraftModel
 from specforge.modeling.draft.mtp.qwen3_5 import (
     PartialRotaryEmbedding,
     Qwen3MTPAttention,
-    apply_rotary_pos_emb,
 )
 from specforge.training.strategies.base import MTPTrainStrategy
 
@@ -252,21 +256,44 @@ class OnlineMTPModelTest(unittest.TestCase):
         self.assertEqual([[5, 6, 7, 8]], draft.position_ids.tolist())
 
 
+def _transformers_qwen3_5_config(config: Qwen3Config) -> Qwen3_5TextConfig:
+    """The transformers Qwen3.5 text config with the same attention geometry."""
+    return Qwen3_5TextConfig(
+        hidden_size=config.hidden_size,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        rms_norm_eps=config.rms_norm_eps,
+        attention_bias=config.attention_bias,
+        attention_dropout=config.attention_dropout,
+        partial_rotary_factor=config.partial_rotary_factor,
+        rope_theta=config.rope_parameters["rope_theta"],
+    )
+
+
 class Qwen3MTPAttentionTest(unittest.TestCase):
-    def test_matches_reference_attention(self):
-        """Heads are merged per position before o_proj, as SGLang serves it."""
+    def test_matches_transformers_qwen3_5_attention(self):
+        """Same weights, same output as transformers' Qwen3_5Attention."""
         for impl in ("eager", "sdpa"):
             with self.subTest(attn_implementation=impl):
-                config = _tiny_config()
+                config = _tiny_config(rope_theta=1e7)
                 config._attn_implementation = impl
+                reference_config = _transformers_qwen3_5_config(config)
+                reference_config._attn_implementation = impl
                 torch.manual_seed(0)
                 attn = Qwen3MTPAttention(config, layer_idx=0).double().eval()
+                with torch.no_grad():
+                    # q/k norm weights default to zero; randomize everything
+                    for parameter in attn.parameters():
+                        parameter.normal_(0.0, 0.2)
+                reference = Qwen3_5Attention(reference_config, layer_idx=0)
+                reference.double().eval()
+                reference.load_state_dict(attn.state_dict(), strict=True)
+
                 bsz, seq_len = 2, 7
-                num_heads, num_kv_heads = 4, 2
-                head_dim = config.head_dim
                 hidden = torch.randn(bsz, seq_len, config.hidden_size).double()
                 position_ids = torch.arange(seq_len).expand(bsz, -1)
-                cos, sin = PartialRotaryEmbedding(config, head_dim)(
+                cos, sin = PartialRotaryEmbedding(config, config.head_dim)(
                     hidden, position_ids
                 )
                 causal = torch.full((seq_len, seq_len), float("-inf")).triu(1)
@@ -275,36 +302,52 @@ class Qwen3MTPAttentionTest(unittest.TestCase):
                 out, _ = attn(
                     hidden, attention_mask=mask, position_embeddings=(cos, sin)
                 )
-
-                q, gate = torch.chunk(
-                    attn.q_proj(hidden).view(bsz, seq_len, num_heads, 2 * head_dim),
-                    2,
-                    dim=-1,
+                expected, _ = reference(
+                    hidden, position_embeddings=(cos, sin), attention_mask=mask
                 )
-                q = attn.q_norm(q).transpose(1, 2)
-                k = attn.k_proj(hidden).view(bsz, seq_len, num_kv_heads, head_dim)
-                k = attn.k_norm(k).transpose(1, 2)
-                v = attn.v_proj(hidden).view(bsz, seq_len, num_kv_heads, head_dim)
-                v = v.transpose(1, 2)
-                q, k = apply_rotary_pos_emb(q, k, cos, sin)
-                k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
-                v = v.repeat_interleave(num_heads // num_kv_heads, dim=1)
-                probs = torch.softmax(q @ k.transpose(-1, -2) * attn.scaling + mask, -1)
-                merged = (probs @ v).transpose(1, 2).reshape(bsz, seq_len, -1)
-                gate = torch.sigmoid(gate.reshape(bsz, seq_len, -1))
-                expected = attn.o_proj(merged * gate)
 
                 torch.testing.assert_close(out, expected)
 
 
 class PartialRotaryEmbeddingTest(unittest.TestCase):
-    def test_reads_rope_theta_from_config(self):
+    def test_matches_transformers_rotary_embedding(self):
+        """rope_theta comes from rope_parameters (transformers 5)."""
         config = _tiny_config(rope_theta=1e7)
         rope = PartialRotaryEmbedding(config, config.head_dim)
+        reference = Qwen3_5TextRotaryEmbedding(_transformers_qwen3_5_config(config))
+        x = torch.zeros(1)
+        position_ids = torch.tensor([[0, 1, 100, 1000, 10000, 30000]])
 
-        dim = int(config.head_dim * config.partial_rotary_factor)
-        expected = 1.0 / (1e7 ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
-        torch.testing.assert_close(rope.inv_freq, expected)
+        cos, sin = rope(x, position_ids)
+        expected_cos, expected_sin = reference(x, position_ids)
+
+        self.assertEqual(1e7, rope.rope_theta)
+        torch.testing.assert_close(cos, expected_cos)
+        torch.testing.assert_close(sin, expected_sin)
+
+    def test_reads_legacy_rope_theta_attribute(self):
+        config = SimpleNamespace(rope_theta=1e6, partial_rotary_factor=0.25)
+        rope = PartialRotaryEmbedding(config, head_dim=16)
+
+        self.assertEqual(1e6, rope.rope_theta)
+
+    def test_missing_rope_theta_raises(self):
+        config = SimpleNamespace(partial_rotary_factor=0.25)
+        with self.assertRaisesRegex(ValueError, "rope_theta"):
+            PartialRotaryEmbedding(config, head_dim=16)
+
+    def test_autocast_keeps_fp32_frequencies(self):
+        config = _tiny_config(rope_theta=1e7)
+        rope = PartialRotaryEmbedding(config, config.head_dim)
+        x = torch.zeros(1)
+        position_ids = torch.tensor([[100, 1000, 10000, 30000]])
+
+        cos, sin = rope(x, position_ids)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            cos_autocast, sin_autocast = rope(x, position_ids)
+
+        torch.testing.assert_close(cos_autocast, cos)
+        torch.testing.assert_close(sin_autocast, sin)
 
     def test_bf16_cast_keeps_fp32_frequencies(self):
         """build_draft casts the draft to bf16; long positions must not drift."""
