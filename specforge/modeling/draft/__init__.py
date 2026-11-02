@@ -6,6 +6,7 @@ from .dflash import (
     sample,
 )
 from .dflash2 import DFlash2DraftModel
+from .dmtp import DMTPDraftModel
 from .domino import DominoDraftModel
 from .dspark import DSparkDraftModel
 from .dspine import DSpineDraftModel
@@ -18,6 +19,7 @@ __all__ = [
     "Eagle3DraftModel",
     "DFlashDraftModel",
     "DFlash2DraftModel",
+    "DMTPDraftModel",
     "DominoDraftModel",
     "DSparkDraftModel",
     "DSpineDraftModel",

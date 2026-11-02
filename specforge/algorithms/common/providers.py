@@ -517,12 +517,14 @@ class ServerCaptureLayout:
     last_hidden_feature: str | None
     passthrough: Tuple[Tuple[str, str, Tuple[int, ...]], ...]
     attention_mask_feature: str | None = None
+    mtp_hidden_feature: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
             "aux_feature",
             "last_hidden_feature",
             "attention_mask_feature",
+            "mtp_hidden_feature",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -552,6 +554,7 @@ class ServerCaptureLayout:
                         self.aux_feature,
                         self.last_hidden_feature,
                         self.attention_mask_feature,
+                        self.mtp_hidden_feature,
                     )
                     if feature is not None
                 ),
@@ -815,6 +818,7 @@ def resolve_server_capture_layout(
             "aux_feature",
             "last_hidden_feature",
             "attention_mask_feature",
+            "mtp_hidden_feature",
         ):
             selected = getattr(layout, field_name)
             if selected is not None and selected != getattr(

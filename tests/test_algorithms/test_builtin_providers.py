@@ -24,7 +24,7 @@ from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "dspine", "eagle3", "mtp", "peagle")
+BUILTINS = ("dflash", "dmtp", "domino", "dspark", "dspine", "eagle3", "mtp", "peagle")
 
 
 def _teacher_metrics_config(enabled: bool):
@@ -62,7 +62,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertEqual(contract_keys, provider_keys)
 
     def test_dflash_family_requires_a_trainable_block_size(self):
-        for algorithm in ("dflash", "domino", "dspark"):
+        for algorithm in ("dflash", "dmtp", "domino", "dspark"):
             minimum_loss_tokens = self.registry.resolve(
                 algorithm
             ).providers.model.minimum_loss_tokens
@@ -280,6 +280,8 @@ class BuiltinProviderContractTest(unittest.TestCase):
             },
         }
 
+        models["dmtp"] = models["dflash"]
+        expected_keys["dmtp"] = {"dmtp_alignment", "dmtp_context_offset"}
         for name in BUILTINS:
             with self.subTest(algorithm=name):
                 step = self.registry.resolve(name).providers.step
@@ -588,7 +590,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==7; "
+            "r=builtin_algorithm_registry(); assert len(r)==8; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

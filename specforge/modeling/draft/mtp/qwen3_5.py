@@ -231,8 +231,9 @@ class Qwen3MTPAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, -1)
+        # HF attention backends already return [batch, sequence, heads, dim].
+        # Transposing again mixes token and head axes and breaks causality.
+        attn_output = attn_output.reshape(bsz, q_len, -1)
 
         if self.attn_output_gate:
             attn_output = attn_output * torch.sigmoid(gate)
@@ -367,7 +368,11 @@ class Qwen3_5MTPModel(nn.Module):
                 attention_mask, hidden_states.dtype, tgt_len=seq_len
             ).to(hidden_states.device)
             attention_mask = expanded_mask + combined_mask
-        elif attention_mask is None and seq_len > 1:
+        elif (
+            attention_mask is None
+            and seq_len > 1
+            and self.config._attn_implementation != "sdpa"
+        ):
             attention_mask = _make_causal_mask(
                 (bsz, seq_len), hidden_states.dtype, device=hidden_states.device
             )
@@ -378,6 +383,12 @@ class Qwen3_5MTPModel(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
+                **(
+                    {"is_causal": True}
+                    if attention_mask is None
+                    and self.config._attn_implementation == "sdpa"
+                    else {}
+                ),
             )[0]
 
         hidden_states = self.norm(hidden_states)

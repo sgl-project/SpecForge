@@ -34,7 +34,11 @@ Use separate environments for the SGLang server and SpecForge training.
 SpecForge currently pins SGLang 0.5.18 and different Torch/Transformers versions;
 installing the main SpecForge package into the server environment would replace
 the server's dependencies. The server only needs this plugin, its SGLang build,
-and Mooncake; the plugin does not import the main SpecForge package.
+and Mooncake for ordinary capture. Optional `mtp_hidden` capture additionally
+uses the frozen native-MTP implementation from this SpecForge checkout; install
+it with `--no-deps` to preserve the server stack. See
+[DMTP training](../../docs/sections/advanced_features/dmtp.md) for setup and the
+`anchor_post_norm_v1` tensor contract.
 
 Install into the SGLang server's environment. The plugin declares no
 dependencies, so the server's pins stay intact:

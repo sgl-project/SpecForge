@@ -60,9 +60,19 @@ STR_DTYPE = {v: k for k, v in DTYPE_STR.items()}
 
 ARTIFACT_AUX = "aux"
 ARTIFACT_LAST_HIDDEN = "last_hidden"
+ARTIFACT_MTP_HIDDEN = "mtp_hidden"
+MTP_ALIGNMENT = "anchor_post_norm_v1"
 
 # One captured sample: (request spec, aux rows or None, last-hidden rows or None).
-Sample = Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]]
+Sample = (
+    Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]]
+    | Tuple[
+        Dict[str, Any],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]
+)
 
 NVLINK = "nvlink"
 #: HBM the writer GPU reserves for NVLink capture objects (required for nvlink).
@@ -462,7 +472,9 @@ class SpecCaptureSink:
             }
             feature_meta.append(result_feats[name])
 
-        for spec, aux, last_hidden in samples:
+        for sample in samples:
+            spec, aux, last_hidden = sample[:3]
+            mtp_hidden = sample[3] if len(sample) == 4 else None
             store_id = str(spec["store_id"])
             sample_id = str(spec["sample_id"])
             gen = int(spec.get("gen", 1))
@@ -474,6 +486,7 @@ class SpecCaptureSink:
             for artifact, tensor in (
                 (ARTIFACT_AUX, aux),
                 (ARTIFACT_LAST_HIDDEN, last_hidden),
+                (ARTIFACT_MTP_HIDDEN, mtp_hidden),
             ):
                 name = features.get(artifact)
                 if name is None:
@@ -515,6 +528,11 @@ class SpecCaptureSink:
                     "gen": gen,
                     "aux_layer_ids": self.aux_layer_ids,
                     "features": result_feats,
+                    **(
+                        {"mtp_hidden_alignment": MTP_ALIGNMENT}
+                        if ARTIFACT_MTP_HIDDEN in features
+                        else {}
+                    ),
                 }
             )
 

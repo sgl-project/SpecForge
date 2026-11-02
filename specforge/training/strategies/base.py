@@ -534,6 +534,8 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         }
         if ctx is not None:
             model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
+        if "mtp_hidden" in self.required_features:
+            model_inputs["mtp_hidden"] = t["mtp_hidden"].to(device, non_blocking=True)
         target_last_hidden_states = t.get("target_last_hidden_states")
         # Teacher hidden states only feed diagnostics; skip the copy when the
         # run disabled them (training.dflash_teacher_metrics=false).

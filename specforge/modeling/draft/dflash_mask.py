@@ -25,6 +25,7 @@ def create_dflash_sdpa_mask(
     device,
     sliding_window: Optional[int] = None,
     is_causal: Optional[bool] = None,
+    context_offset: int = 0,
 ):
     """Construct a full or sliding dense boolean DFlash mask."""
 
@@ -50,7 +51,7 @@ def create_dflash_sdpa_mask(
         block_size, dim=2
     )
 
-    mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+    mask_context = (kv_indices < S) & (kv_indices < anchor_expanded + context_offset)
     if sliding_window is not None:
         # The current draft token occupies one slot in the window.
         context_lower_bound = anchor_expanded + q_block_offsets - (sliding_window - 1)
@@ -83,6 +84,7 @@ def create_dflash_block_mask(
     device: torch.device,
     sliding_window: Optional[int] = None,
     is_causal: Optional[bool] = None,
+    context_offset: int = 0,
     **kwargs,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash.
@@ -106,7 +108,7 @@ def create_dflash_block_mask(
         is_context = kv_idx < S
         # Strictly less than: matches inference where target_hidden[anchor_pos]
         # is not available as context.
-        mask_context = is_context & (kv_idx < anchor_pos)
+        mask_context = is_context & (kv_idx < anchor_pos + context_offset)
         if sliding_window is not None:
             # The current draft token occupies one slot in the window.
             context_lower_bound = anchor_pos + q_block_offset - (sliding_window - 1)
