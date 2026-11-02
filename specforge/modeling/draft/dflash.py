@@ -28,9 +28,13 @@ from .layers.attention.mla import MLAAttention
 from .layers.attention.mla import validate_mla_config as validate_dflash_mla_config
 from .layers.config import AttentionConfig, ResidualConfig
 from .layers.decoder import DecoderLayer
-from .layers.factory import build_attention, build_ffn, build_residual
+from .layers.factory import (
+    build_attention,
+    build_ffn,
+    build_residual,
+    build_residual_readout,
+)
 from .layers.residual.base import ResidualStream, collapse_streams, expand_streams
-from .layers.residual.gr import GatedResidual
 from .registry import register_draft
 
 FULL_ATTENTION = "full_attention"
@@ -87,7 +91,11 @@ def dflash_residual_resume_contract(draft_model) -> dict:
     if options.kind == "gr":
         settings += (options.gate_rank,)
     else:
-        settings += (options.sinkhorn_iters, options.sinkhorn_eps)
+        settings += (
+            options.sinkhorn_iters,
+            options.sinkhorn_eps,
+            options.pre_from_prev,
+        )
     return {"draft_residual_semantics": (1, *settings)}
 
 
@@ -430,16 +438,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
-        self.residual_readout = (
-            GatedResidual(
-                config.hidden_size,
-                self.residual_options.num_streams,
-                self.residual_options.gate_rank,
-                config.rms_norm_eps,
-                readout=True,
-            )
-            if self.residual_options.kind == "gr"
-            else nn.Identity()
+        self.residual_readout = build_residual_readout(
+            self.residual_options,
+            hidden_size=config.hidden_size,
+            norm_eps=config.rms_norm_eps,
         )
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
@@ -603,11 +605,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             past_key_values,
             is_causal=kwargs.get("is_causal"),
         )
+        # V4.1 mHC carries a pre-mix between sublayers and collapses with the last one.
+        lagged_mhc = (
+            self.residual_options.kind == "mhc" and self.residual_options.pre_from_prev
+        )
         if self.residual_options.kind != "standard":
             hidden_states = expand_streams(
                 hidden_states,
                 self.residual_options.num_streams,
-                single_pass=self.residual_options.kind == "mhc",
+                single_pass=lagged_mhc,
             )
         for layer_type, layer in zip(self.layer_types, self.layers):
             layer_attention_mask = (
@@ -625,9 +631,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        if self.residual_options.kind == "mhc":
+        if lagged_mhc:
             hidden_states = collapse_streams(hidden_states)
-        elif self.residual_options.kind == "gr":
+        else:
+            # GR's gated readout, V4 mHC's learned head, or the identity.
             hidden_states = self.residual_readout(hidden_states)
         return self.norm(hidden_states)
 

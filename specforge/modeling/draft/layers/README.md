@@ -15,7 +15,8 @@ and prediction heads. This package owns reusable layer computations.
 - `residual/standard.py`: pre-norm read and additive write. Norms remain
   registered on their decoder so existing checkpoint keys stay unchanged.
 - `residual/gr.py`: per-branch Gemma RMSNorm, low-rank gated read and gated write.
-- `residual/mhc.py`: single-pass mHC, FP32 coefficient computation and Sinkhorn.
+- `residual/mhc.py`: DeepSeek-V4 mHC with its learned head and the V4.1 single-pass
+  variant, FP32 coefficient computation and Sinkhorn.
 - `ffn/dense.py`: gated FFN, including the original EAGLE tensor-parallel path.
 - `config.py`, `factory.py`: typed construction options and explicit factories.
   `LayerKernels` injects the existing native or Liger norm/FFN implementations.
@@ -82,7 +83,15 @@ layout. The new variants are opt-in architectures:
                     "sinkhorn_iters": 20, "sinkhorn_eps": 1e-6}}
 ```
 
-Both expand the algorithm's initial hidden vector into parallel streams.
+```json
+{"draft_residual": {"kind": "mhc", "pre_from_prev": false, "num_streams": 4,
+                    "sinkhorn_iters": 20, "sinkhorn_eps": 1e-6}}
+```
+
+`pre_from_prev` (default true, SGLang's name) selects the V4.1 single-pass read;
+false is DeepSeek-V4: each sublayer reads with the pre-mix of its own input, and
+a learned sigmoid head (`residual_readout`) collapses the streams before the
+final norm. All expand the algorithm's initial hidden vector into parallel streams.
 Attention and FFN receive single-stream inputs and have independent residual
 parameters. DFlash2's convolutions remain between residual read and write.
 GR normalizes each stream before its gated read; its learned final readout

@@ -40,12 +40,13 @@ def expand_streams(
     return HyperConnectionState(streams, pre_mix)
 
 
+def mix_streams(streams: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Weighted sum of the streams, accumulated in float32."""
+    return (streams.float() * weights.unsqueeze(-1)).sum(-2).to(streams.dtype)
+
+
 def collapse_streams(state: HyperConnectionState) -> torch.Tensor:
     """Read the last single-pass mHC mix, including at the model head."""
     if state.pre_mix is None:
         raise ValueError("single-pass mHC requires the incoming pre_mix")
-    return (
-        (state.streams.float() * state.pre_mix.unsqueeze(-1))
-        .sum(-2)
-        .to(state.streams.dtype)
-    )
+    return mix_streams(state.streams, state.pre_mix)
