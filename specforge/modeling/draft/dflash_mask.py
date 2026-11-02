@@ -25,11 +25,18 @@ def create_dflash_sdpa_mask(
     device,
     sliding_window: Optional[int] = None,
     is_causal: Optional[bool] = None,
+    context_window: Optional[int] = None,
 ):
-    """Construct a full or sliding dense boolean DFlash mask."""
+    """Construct a full or sliding dense boolean DFlash mask.
+
+    ``context_window`` keeps only the last that many context keys before the
+    anchor, the same keys for every query of the block (DSpark on DeepSeek-V4).
+    """
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
+    if context_window is not None and context_window <= 0:
+        raise ValueError("context_window must be > 0")
     is_causal = resolve_dflash_is_causal(
         is_causal,
         "sliding_attention" if sliding_window is not None else "full_attention",
@@ -55,6 +62,8 @@ def create_dflash_sdpa_mask(
         # The current draft token occupies one slot in the window.
         context_lower_bound = anchor_expanded + q_block_offsets - (sliding_window - 1)
         mask_context = mask_context & (kv_indices >= context_lower_bound)
+    if context_window is not None:
+        mask_context = mask_context & (kv_indices >= anchor_expanded - context_window)
 
     is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
@@ -83,15 +92,19 @@ def create_dflash_block_mask(
     device: torch.device,
     sliding_window: Optional[int] = None,
     is_causal: Optional[bool] = None,
+    context_window: Optional[int] = None,
     **kwargs,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash.
 
+    ``context_window`` is the block-anchored window of ``create_dflash_sdpa_mask``.
     Extra keyword arguments (e.g. ``BLOCK_SIZE``) go to ``create_block_mask``.
     """
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
+    if context_window is not None and context_window <= 0:
+        raise ValueError("context_window must be > 0")
     is_causal = resolve_dflash_is_causal(
         is_causal,
         "sliding_attention" if sliding_window is not None else "full_attention",
@@ -111,6 +124,8 @@ def create_dflash_block_mask(
             # The current draft token occupies one slot in the window.
             context_lower_bound = anchor_pos + q_block_offset - (sliding_window - 1)
             mask_context = mask_context & (kv_idx >= context_lower_bound)
+        if context_window is not None:
+            mask_context = mask_context & (kv_idx >= anchor_pos - context_window)
 
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size

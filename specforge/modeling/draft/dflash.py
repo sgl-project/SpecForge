@@ -51,6 +51,19 @@ def resolve_dflash_causal_block(config) -> Optional[bool]:
     return value
 
 
+def resolve_dflash_context_window(config) -> Optional[int]:
+    """Context keys each draft block sees, counted back from its anchor (DSpark)."""
+
+    value = (getattr(config, "dflash_config", None) or {}).get("context_window")
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+    ):
+        raise ValueError(
+            "dflash_config.context_window must be a positive integer or null"
+        )
+    return value
+
+
 def dflash_attention_resume_contract(draft_model) -> dict:
     """Version only settings whose interpretation differs from legacy checkpoints.
 
@@ -59,25 +72,28 @@ def dflash_attention_resume_contract(draft_model) -> dict:
     """
 
     is_causal = resolve_dflash_causal_block(draft_model.config)
-    if is_causal is None:
+    context_window = getattr(draft_model, "context_window", None)
+    if is_causal is None and context_window is None:
         return {}
 
     sliding_window = getattr(draft_model, "sliding_window", None)
-    if sliding_window is None:
+    if sliding_window is None and context_window is None:
         if not is_causal:
             return {}
         architectures = getattr(draft_model.config, "architectures", None) or []
         if _LEGACY_CAUSAL_ARCHITECTURES.intersection(architectures):
             return {}
 
-    return {
-        "draft_attention_mask_semantics": (
-            _ATTENTION_MASK_SEMANTICS_VERSION,
-            tuple(draft_model.layer_types),
-            sliding_window,
-            is_causal,
-        )
-    }
+    settings = (
+        _ATTENTION_MASK_SEMANTICS_VERSION,
+        tuple(draft_model.layer_types),
+        sliding_window,
+        is_causal,
+    )
+    if context_window is not None:
+        # Appended only when set, so contracts of existing runs keep their shape.
+        settings += (context_window,)
+    return {"draft_attention_mask_semantics": settings}
 
 
 def dflash_residual_resume_contract(draft_model) -> dict:
@@ -412,6 +428,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.config = config
         resolve_dflash_causal_block(config)
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
+        self.context_window = resolve_dflash_context_window(config)
         self.attention_mode = validate_dflash_attention_config(config)
         self.residual_options = ResidualConfig(
             **(getattr(config, "draft_residual", None) or {})
@@ -595,6 +612,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "S": context_length,
             "block_size": block_size,
             "device": hidden_states.device,
+            "context_window": self.context_window,
         }
         if implementation == "flex_attention":
             mask_builder = create_dflash_block_mask
@@ -606,10 +624,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         masks = {}
         if FULL_ATTENTION in self.layer_types:
-            # A bidirectional full layer sees every key, so it needs no mask.
+            # A bidirectional full layer without a context window sees every key.
             full_causal = resolve_dflash_is_causal(is_causal, FULL_ATTENTION)
             masks[FULL_ATTENTION] = (
-                mask_builder(**mask_args, is_causal=True) if full_causal else None
+                mask_builder(**mask_args, is_causal=full_causal)
+                if full_causal or self.context_window is not None
+                else None
             )
         if SLIDING_ATTENTION in self.layer_types:
             masks[SLIDING_ATTENTION] = mask_builder(

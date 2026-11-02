@@ -575,6 +575,7 @@ class OnlineDFlashModel(nn.Module):
             "is_causal": getattr(
                 getattr(self.draft_model, "config", None), "is_causal", None
             ),
+            "context_window": getattr(self.draft_model, "context_window", None),
         }
         if (
             self.attention_backend == "flex_attention"
