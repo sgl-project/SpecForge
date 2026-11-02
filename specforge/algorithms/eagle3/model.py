@@ -44,25 +44,6 @@ from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
 
-def _draft_t2d(draft_model: nn.Module, device: torch.device) -> torch.Tensor:
-    """Identity target-to-draft map when the draft has no pruned vocabulary."""
-
-    t2d = getattr(draft_model, "t2d", None)
-    if t2d is not None:
-        return t2d
-    return torch.ones(int(draft_model.vocab_size), dtype=torch.bool, device=device)
-
-
-def _draft_d2t(draft_model: nn.Module, device: torch.device) -> torch.Tensor:
-    """Zero draft-to-target offsets when the draft uses the full vocabulary."""
-
-    d2t = getattr(draft_model, "d2t", None)
-    if d2t is not None:
-        return d2t
-    size = int(getattr(draft_model, "draft_vocab_size", draft_model.vocab_size))
-    return torch.zeros(size, dtype=torch.int64, device=device)
-
-
 class Eagle3Model(nn.Module):
     pass
 
@@ -196,8 +177,9 @@ class OnlineEagle3Model(Eagle3Model):
     ]:
         with torch.no_grad():
             pred_draft_token_ids = logits.argmax(-1)
-            d2t = _draft_d2t(self.draft_model, logits.device)
-            pred_target_token_ids = pred_draft_token_ids + d2t[pred_draft_token_ids]
+            pred_target_token_ids = (
+                pred_draft_token_ids + self.draft_model.d2t[pred_draft_token_ids]
+            )
             local_correct = (
                 (pred_target_token_ids == target_token_ids) * loss_mask.squeeze(-1)
             ).sum()
@@ -319,8 +301,6 @@ class OnlineEagle3Model(Eagle3Model):
                 supervised positions when the batch/objective supports it.
         """
         adapter = self._make_adapter()
-        t2d = _draft_t2d(self.draft_model, hidden_states.device)
-        self.last_candidate_recall = None
         # Step 1: handle vocab size
         if target_hidden_for_compact is not None:
             (
@@ -331,7 +311,7 @@ class OnlineEagle3Model(Eagle3Model):
             ) = compute_target_p_padded_from_hidden(
                 hidden=target_hidden_for_compact,
                 lm_head_weight=target_head_weight,
-                t2d=t2d,
+                t2d=self.draft_model.t2d,
                 loss_mask=loss_mask,
                 length=self.length,
                 chunk_size=compact_teacher_chunk_size,
@@ -368,7 +348,7 @@ class OnlineEagle3Model(Eagle3Model):
                 # fall through to the full path below.
                 trim_pack = _build_trim_pack(
                     target,
-                    t2d,
+                    self.draft_model.t2d,
                     loss_mask,
                     self.length,
                     chunk_len=trim_chunk_len,
@@ -386,7 +366,7 @@ class OnlineEagle3Model(Eagle3Model):
                     position_mask,
                 ) = _compute_target_p_padded(
                     target=target,
-                    t2d=t2d,
+                    t2d=self.draft_model.t2d,
                     loss_mask=loss_mask,
                     length=self.length,
                 )
@@ -436,7 +416,6 @@ class OnlineEagle3Model(Eagle3Model):
         metric_denoms = []
         metric_losses = []
         metric_loss_denoms = []
-        candidate_recalls = []
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
         if self.attention_backend in ["sdpa", "fa", "usp"]:
@@ -500,6 +479,8 @@ class OnlineEagle3Model(Eagle3Model):
                 past_key_values=past_key_values,
                 use_cache=True,
             )
+
+            # Keep raw outputs for logits; normalize only the next-depth input.
             logit_hidden = hidden_states_out
             next_depth = getattr(self.draft_model, "next_depth_hidden", None)
             hidden_states = (
@@ -509,8 +490,6 @@ class OnlineEagle3Model(Eagle3Model):
             )
 
             # Step 5.4 + 5.5 + 5.6: logits, metric and loss
-            recall_hidden = None
-            recall_ids = None
             if trim_pack is not None:
                 # A-level: only the rows that can carry loss at this step go through
                 # norm + lm_head. Rows shift down by one per step (rows = sup - idx)
@@ -518,8 +497,9 @@ class OnlineEagle3Model(Eagle3Model):
                 rows_j = trim_pack["rows_steps"][idx]
                 keep_j = trim_pack["keep_steps"][idx]
                 nrows_j = trim_pack["nrows_steps"][idx]
-                selected_hidden = logit_hidden.index_select(1, rows_j)
-                logits = self.draft_model.compute_logits(selected_hidden)
+                logits = self.draft_model.compute_logits(
+                    logit_hidden.index_select(1, rows_j)
+                )
                 pm_j = trim_pack["position_mask_sup"].index_select(1, keep_j)
                 lm_j = trim_pack["loss_mask_sup"].index_select(1, keep_j)
                 if nrows_j == 0:
@@ -530,7 +510,6 @@ class OnlineEagle3Model(Eagle3Model):
                     # runs the same kernels and collective calls.
                     pm_j = torch.zeros_like(pm_j)
                     lm_j = torch.zeros_like(lm_j)
-                target_token_ids = trim_pack["token_ids_c"].index_select(1, keep_j)
                 (
                     acc,
                     acceptance_rate,
@@ -543,16 +522,13 @@ class OnlineEagle3Model(Eagle3Model):
                     logits=logits,
                     target_p=trim_pack["target_p_c"].index_select(1, keep_j),
                     target_p_on_draft=trim_pack["on_draft_c"].index_select(1, keep_j),
-                    target_token_ids=target_token_ids,
+                    target_token_ids=trim_pack["token_ids_c"].index_select(1, keep_j),
                     position_mask=pm_j,
                     loss_mask=lm_j,
                     adapter=adapter,
                     loss_scale=nrows_j / trim_pack["full_len"],
                     full_positions=trim_pack["full_len"],
                 )
-                if nrows_j > 0:
-                    recall_hidden = selected_hidden
-                    recall_ids = target_token_ids
             else:
                 logits = self.draft_model.compute_logits(logit_hidden)
                 (
@@ -572,8 +548,6 @@ class OnlineEagle3Model(Eagle3Model):
                     loss_mask=state.loss_mask,
                     adapter=adapter,
                 )
-                recall_hidden = logit_hidden
-                recall_ids = state.target_token_ids
             acces.append(acc)
             acceptance_rates.append(acceptance_rate)
             plosses.append(loss)
@@ -581,13 +555,6 @@ class OnlineEagle3Model(Eagle3Model):
             metric_denoms.append(denom)
             metric_losses.append(metric_loss)
             metric_loss_denoms.append(loss_denom)
-            recall_fn = getattr(self.draft_model, "candidate_recall", None)
-            if (
-                recall_fn is not None
-                and getattr(self.draft_model, "efficient_lm_head", None) is not None
-                and recall_hidden is not None
-            ):
-                candidate_recalls.append(recall_fn(recall_hidden, recall_ids))
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -595,8 +562,6 @@ class OnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
-        if candidate_recalls:
-            self.last_candidate_recall = torch.stack(candidate_recalls).mean()
         return (
             plosses,
             acceptance_rates,

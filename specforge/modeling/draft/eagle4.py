@@ -6,7 +6,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""EAGLE-4 draft: Eagle3 plus config-gated fusion, window, MoE, and candidate head."""
+"""EAGLE-4 draft: Eagle3 plus config-gated fusion, window, MoE, and a dense head."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.modeling._mask_utils import prepare_decoder_attention_mask
@@ -23,7 +22,6 @@ from specforge.modeling.draft.eagle4_moe import update_eagle4_router_bias
 from specforge.modeling.draft.eagle4_structure import (
     EAGLE4_ARCH,
     draft_sliding_window,
-    parse_efficient_lm_head_config,
 )
 from specforge.modeling.draft.llama3_eagle import (
     LlamaDecoderLayer,
@@ -31,34 +29,6 @@ from specforge.modeling.draft.llama3_eagle import (
 )
 from specforge.modeling.draft.registry import register_draft
 from specforge.utils import print_with_rank
-
-
-def candidate_logits(
-    hidden_states: torch.Tensor,
-    down_weight: torch.Tensor,
-    score_weight: torch.Tensor,
-    lm_head_weight: torch.Tensor,
-    num_candidates: int,
-) -> torch.Tensor:
-    """Low-rank scores pick ``num_candidates`` rows; the dense head rescores them.
-
-    Other vocabulary positions are ``-inf`` so a full-vocab softmax/KL sees only
-    the candidate support.
-    """
-
-    approx = F.linear(F.linear(hidden_states, down_weight), score_weight)
-    k = min(num_candidates, approx.shape[-1])
-    indices = approx.topk(k, dim=-1).indices
-    selected = lm_head_weight[indices]
-    exact = (hidden_states.unsqueeze(-2) * selected).sum(-1)
-    approx_selected = approx.gather(-1, indices)
-    # Forward is the dense rescore; backward also trains the factor tensors.
-    rescored = exact + (approx_selected - approx_selected.detach())
-    logits = hidden_states.new_full(
-        hidden_states.shape[:-1] + (lm_head_weight.shape[0],),
-        torch.finfo(hidden_states.dtype).min,
-    )
-    return logits.scatter_(-1, indices, rescored.to(logits.dtype))
 
 
 @register_draft
@@ -75,8 +45,18 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         if EAGLE4_ARCH not in architectures:
             config.architectures = [EAGLE4_ARCH]
 
+        if getattr(config, "efficient_lm_head_config", None) is not None:
+            raise ValueError(
+                "Stage-1 EAGLE-4 training requires a dense LM head; remove efficient_lm_head_config"
+            )
+        if config.num_hidden_layers != 1:
+            raise ValueError("EAGLE-4 supports one draft layer")
         self.vocab_size = config.vocab_size
-        self.draft_vocab_size = getattr(config, "draft_vocab_size", None) or config.vocab_size
+        self.draft_vocab_size = (
+            getattr(config, "draft_vocab_size", None) or config.vocab_size
+        )
+        if self.draft_vocab_size != self.vocab_size:
+            raise ValueError("Stage-1 EAGLE-4 requires draft_vocab_size == vocab_size")
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -102,29 +82,8 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         self.norm_output = getattr(config, "norm_output", False)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
-        self.efficient_lm_head_config = parse_efficient_lm_head_config(config)
-        if self.efficient_lm_head_config is not None:
-            if self.draft_vocab_size != self.vocab_size:
-                raise ValueError(
-                    "efficient_lm_head_config rescores candidates with the "
-                    "full-vocab lm_head; train without draft vocab pruning"
-                )
-            rank = self.efficient_lm_head_config["rank"]
-            self.efficient_lm_head_down_proj = nn.Linear(
-                config.hidden_size, rank, bias=False
-            )
-            self.efficient_lm_head = nn.Linear(rank, self.vocab_size, bias=False)
-            self.num_candidates = self.efficient_lm_head_config["num_candidates"]
-        else:
-            self.efficient_lm_head_down_proj = None
-            self.efficient_lm_head = None
-            self.num_candidates = None
-
-        if self.efficient_lm_head_config is None:
-            self.register_buffer("t2d", torch.ones(self.vocab_size, dtype=torch.bool))
-            self.register_buffer(
-                "d2t", torch.zeros(self.draft_vocab_size, dtype=torch.int64)
-            )
+        self.register_buffer("t2d", torch.ones(self.vocab_size, dtype=torch.bool))
+        self.register_buffer("d2t", torch.zeros(self.vocab_size, dtype=torch.int64))
 
         self.post_init()
 
@@ -176,61 +135,7 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         return hidden_states if post_norm is None else post_norm(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.norm(hidden_states)
-        if self.efficient_lm_head is None:
-            return self.lm_head(hidden_states)
-        return candidate_logits(
-            hidden_states,
-            self.efficient_lm_head_down_proj.weight,
-            self.efficient_lm_head.weight,
-            self.lm_head.weight,
-            self.num_candidates,
-        )
-
-    def candidate_recall(
-        self, hidden_states: torch.Tensor, target_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Fraction of ``target_ids`` that fall in the low-rank top-k."""
-
-        if self.efficient_lm_head is None:
-            raise RuntimeError("candidate_recall requires efficient_lm_head_config")
-        hidden_states = self.norm(hidden_states)
-        approx = F.linear(
-            F.linear(hidden_states, self.efficient_lm_head_down_proj.weight),
-            self.efficient_lm_head.weight,
-        )
-        k = min(self.num_candidates, approx.shape[-1])
-        indices = approx.topk(k, dim=-1).indices
-        return (indices == target_ids.unsqueeze(-1)).any(dim=-1).float().mean()
-
-    @torch.no_grad()
-    def init_efficient_head_from_dense(
-        self,
-        token_frequency: Optional[torch.Tensor] = None,
-        smooth_factor: float = 10.0,
-    ) -> None:
-        """SVD-initialize the candidate factors from the dense ``lm_head``."""
-
-        if self.efficient_lm_head is None:
-            raise RuntimeError(
-                "init_efficient_head_from_dense requires efficient_lm_head_config"
-            )
-        weight = self.lm_head.weight.float()
-        if (
-            self.efficient_lm_head_config["type"] == "weighted_low_rank"
-            and token_frequency is not None
-        ):
-            freq = token_frequency.to(device=weight.device, dtype=weight.dtype)
-            scale = (freq / freq.mean().clamp_min(1e-8) + smooth_factor).sqrt()
-            weight = weight * scale.unsqueeze(-1)
-        rank = self.efficient_lm_head_down_proj.out_features
-        u, s, vh = torch.linalg.svd(weight, full_matrices=False)
-        scores = u[:, :rank] * s[:rank]
-        down = vh[:rank]
-        self.efficient_lm_head.weight.copy_(scores.to(self.efficient_lm_head.weight.dtype))
-        self.efficient_lm_head_down_proj.weight.copy_(
-            down.to(self.efficient_lm_head_down_proj.weight.dtype)
-        )
+        return self.lm_head(self.norm(hidden_states))
 
     def update_moe_router_bias(self) -> Optional[float]:
         return update_eagle4_router_bias(self)
@@ -295,7 +200,7 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
             past_key_values=None,
             use_cache=False,
         )
-        return self.next_depth_hidden(hidden_states)
+        return hidden_states
 
 
-__all__ = ["LlamaForCausalLMEagle4", "candidate_logits"]
+__all__ = ["LlamaForCausalLMEagle4"]

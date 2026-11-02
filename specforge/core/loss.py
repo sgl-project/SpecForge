@@ -37,7 +37,7 @@ def _calculate_settings(n):
     elif BLOCK_SIZE >= 2048:
         num_warps = 8
 
-    # AMD GPU (ROCm)
+    # Account for the backend's wider wavefront when choosing the warp count.
     if hasattr(torch.version, "hip") and torch.version.hip is not None:
         num_warps //= 2
 

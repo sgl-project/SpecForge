@@ -142,7 +142,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
     def test_target_derived_defaults_and_overrides_are_provider_owned(self):
         expected = {
             "eagle3": ("llama", 1, 32000, False),
-            "eagle4": ("llama", 1, 32000, False),
+            "eagle4": ("llama", 1, None, False),
             "peagle": ("llama", 4, 32000, False),
             "dflash": ("qwen3", 1, None, True),
         }

@@ -19,11 +19,9 @@ except ImportError:
 
 from specforge.modeling._mask_utils import _make_causal_mask
 from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.eagle4 import LlamaForCausalLMEagle4, candidate_logits
+from specforge.modeling.draft.eagle4 import LlamaForCausalLMEagle4
 from specforge.modeling.draft.eagle4_moe import (
     Eagle4MoE,
-    _expert_mlp,
-    _grouped_mm_fn,
     relu2,
     resolve_act_fn,
 )
@@ -31,7 +29,6 @@ from specforge.modeling.draft.eagle4_structure import (
     EAGLE4_ARCH,
     draft_sliding_window,
     draft_uses_rope,
-    parse_efficient_lm_head_config,
 )
 from specforge.modeling.draft.flex_attention import generate_eagle3_mask
 from specforge.modeling.draft.llama3_eagle import (
@@ -89,26 +86,6 @@ class Eagle4StructureTest(unittest.TestCase):
         self.assertFalse(draft_uses_rope(_config(position_embedding_type="none")))
         self.assertFalse(draft_uses_rope(_config(partial_rotary_factor=0)))
 
-    def test_efficient_head_config_validation(self):
-        self.assertIsNone(parse_efficient_lm_head_config(_config()))
-        parsed = parse_efficient_lm_head_config(
-            _config(
-                efficient_lm_head_config={
-                    "type": "low_rank",
-                    "rank": 4,
-                    "num_candidates": 3,
-                }
-            )
-        )
-        self.assertEqual(
-            {"type": "low_rank", "rank": 4, "num_candidates": 3},
-            parsed,
-        )
-        with self.assertRaisesRegex(ValueError, "low_rank"):
-            parse_efficient_lm_head_config(
-                _config(efficient_lm_head_config={"type": "full", "rank": 4})
-            )
-
 
 class Eagle4FusionTest(unittest.TestCase):
     def test_eagle3_qkv_width_stays_2h(self):
@@ -160,10 +137,15 @@ class Eagle4FusionTest(unittest.TestCase):
                     self.assertFalse(torch.allclose(residual, attention_input))
                 # Zero attention and MLP isolate the skip connection, while
                 # recording the input verifies normalization still feeds QKV.
-                with mock.patch.object(
-                    layer.self_attn, "forward", return_value=torch.zeros_like(hidden)
-                ) as attention, mock.patch.object(
-                    layer.mlp, "forward", side_effect=torch.zeros_like
+                with (
+                    mock.patch.object(
+                        layer.self_attn,
+                        "forward",
+                        return_value=torch.zeros_like(hidden),
+                    ) as attention,
+                    mock.patch.object(
+                        layer.mlp, "forward", side_effect=torch.zeros_like
+                    ),
                 ):
                     output = layer(input_emb=embeds, hidden_states=hidden)
                 torch.testing.assert_close(output, residual)
@@ -188,7 +170,9 @@ class Eagle4FusionTest(unittest.TestCase):
         torch.testing.assert_close(logits, model.lm_head(model.norm(raw)))
 
     def test_no_rope_is_identity_rotation(self):
-        model = LlamaForCausalLMEagle4(_config(use_rope=False), attention_backend="sdpa")
+        model = LlamaForCausalLMEagle4(
+            _config(use_rope=False), attention_backend="sdpa"
+        )
         rotary = model.midlayer.self_attn.rotary_emb
         self.assertIsInstance(rotary, NoRotaryEmbedding)
         query = torch.randn(1, 2, 4, 4)
@@ -211,13 +195,23 @@ class Eagle4FusionTest(unittest.TestCase):
         self.assertLess(mask[0, 0, 5, 1].item(), 0.0)
         self.assertLess(mask[0, 0, 5, 2].item(), 0.0)
 
+        cached = _make_causal_mask(
+            (1, 1),
+            torch.float32,
+            torch.device("cpu"),
+            past_key_values_length=5,
+            window=3,
+        )
+        torch.testing.assert_close(
+            cached[0, 0, 0] == 0,
+            torch.tensor([False, False, False, True, True, True]),
+        )
+
         model = LlamaForCausalLMEagle4(
             _config(sliding_window=3), attention_backend="sdpa"
         )
         hidden = torch.ones(1, 6, 8)
-        attn = model.prepare_decoder_attention_mask(
-            torch.ones(1, 6), hidden, 1, 6, 0
-        )
+        attn = model.prepare_decoder_attention_mask(torch.ones(1, 6), hidden, 1, 6, 0)
         self.assertLess(attn[0, 0, 5, 1].item(), 0.0)
         self.assertEqual(0.0, attn[0, 0, 5, 4].item())
 
@@ -313,190 +307,97 @@ class Eagle4MoETest(unittest.TestCase):
         self.assertEqual((2, 4, 8), tuple(out.shape))
         self.assertTrue(torch.isfinite(out).all())
 
-    def test_grouped_mm_is_skipped_on_hip(self):
-        h = mock.Mock()
-        h.is_cuda = True
-        h.device.type = "cuda"
-        with mock.patch(
-            "specforge.modeling.draft.eagle4_moe.F.grouped_mm",
-            mock.Mock(),
-            create=True,
-        ), mock.patch(
-            "specforge.modeling.draft.eagle4_moe.torch.version.hip",
-            "6.4",
-        ):
-            self.assertIsNone(_grouped_mm_fn(h))
 
-    def test_expert_mlp_falls_back_when_grouped_mm_raises(self):
-        h = torch.randn(4, 4)
-        idx = torch.tensor([[0], [1], [0], [1]])
-        weights = torch.ones(4, 1)
-        up = torch.randn(2, 8, 4)
-        down = torch.randn(2, 4, 8)
-        expected = _expert_mlp(h, idx, weights, up, down, True, relu2)
-        grouped = mock.Mock(side_effect=RuntimeError("no grouped_mm"))
-        with mock.patch(
-            "specforge.modeling.draft.eagle4_moe._grouped_mm_fn",
-            return_value=grouped,
-        ):
-            out = _expert_mlp(h, idx, weights, up, down, True, relu2)
-        torch.testing.assert_close(out, expected)
-        grouped.assert_called()
-
-
-class Eagle4CandidateHeadTest(unittest.TestCase):
-    def _head_config(self, **overrides):
-        return _config(
-            efficient_lm_head_config={
-                "type": "low_rank",
-                "rank": 4,
-                "num_candidates": 3,
-            },
-            **overrides,
-        )
-
-    def test_pruned_vocab_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "full-vocab"):
-            LlamaForCausalLMEagle4(
-                self._head_config(draft_vocab_size=8, vocab_size=16),
-                attention_backend="sdpa",
-            )
-
-    def test_candidate_shapes_and_exact_rescore(self):
-        model = LlamaForCausalLMEagle4(self._head_config(), attention_backend="sdpa")
-        self.assertEqual((4, 8), tuple(model.efficient_lm_head_down_proj.weight.shape))
-        self.assertEqual((16, 4), tuple(model.efficient_lm_head.weight.shape))
-        self.assertEqual((16, 8), tuple(model.lm_head.weight.shape))
-        self.assertFalse(hasattr(model, "t2d"))
-        self.assertFalse(hasattr(model, "d2t"))
-
-        hidden = torch.randn(2, 3, 8)
-        logits = candidate_logits(
-            hidden,
-            model.efficient_lm_head_down_proj.weight,
-            model.efficient_lm_head.weight,
-            model.lm_head.weight,
-            3,
-        )
-        self.assertEqual((2, 3, 16), tuple(logits.shape))
-        approx = torch.nn.functional.linear(
-            torch.nn.functional.linear(
-                hidden, model.efficient_lm_head_down_proj.weight
+class Eagle4DenseHeadTest(unittest.TestCase):
+    def test_rejects_candidate_training_and_pruned_vocabulary(self):
+        for cfg in (
+            _config(
+                efficient_lm_head_config={
+                    "type": "low_rank",
+                    "rank": 4,
+                    "num_candidates": 3,
+                }
             ),
-            model.efficient_lm_head.weight,
+            _config(draft_vocab_size=8),
+        ):
+            with (
+                self.subTest(config=cfg),
+                self.assertRaisesRegex(ValueError, "Stage-1"),
+            ):
+                LlamaForCausalLMEagle4(cfg, attention_backend="sdpa")
+
+    def test_dense_export_roundtrip_preserves_identity_mapping(self):
+        model = LlamaForCausalLMEagle4(_config(), attention_backend="sdpa")
+        hidden = torch.randn(1, 3, 8)
+        torch.testing.assert_close(
+            model.compute_logits(hidden), model.lm_head(model.norm(hidden))
         )
-        indices = approx.topk(3, dim=-1).indices
-        dense = torch.nn.functional.linear(hidden, model.lm_head.weight)
-        torch.testing.assert_close(logits.gather(-1, indices), dense.gather(-1, indices))
-        fill = torch.finfo(logits.dtype).min
-        blocked = torch.ones_like(logits, dtype=torch.bool).scatter_(-1, indices, False)
-        self.assertTrue(torch.all(logits[blocked] == fill))
-        self.assertEqual(3, int((~blocked)[0, 0].sum().item()))
-
-    def test_compute_logits_matches_dense_on_chosen_rows(self):
-        model = LlamaForCausalLMEagle4(self._head_config(), attention_backend="sdpa")
-        raw = torch.randn(1, 2, 8)
-        logits = model.compute_logits(raw)
-        normed = model.norm(raw)
-        dense = model.lm_head(normed)
-        approx = torch.nn.functional.linear(
-            torch.nn.functional.linear(
-                normed, model.efficient_lm_head_down_proj.weight
-            ),
-            model.efficient_lm_head.weight,
-        )
-        indices = approx.topk(3, dim=-1).indices
-        torch.testing.assert_close(logits.gather(-1, indices), dense.gather(-1, indices))
-        fill = torch.finfo(logits.dtype).min
-        blocked = torch.ones_like(logits, dtype=torch.bool).scatter_(-1, indices, False)
-        self.assertTrue(torch.all(logits[blocked] == fill))
-
-    def test_factors_receive_gradients(self):
-        model = LlamaForCausalLMEagle4(self._head_config(), attention_backend="sdpa")
-        raw = torch.randn(2, 3, 8, requires_grad=True)
-        logits = model.compute_logits(raw)
-        logits[torch.isfinite(logits)].sum().backward()
-        self.assertIsNotNone(model.efficient_lm_head.weight.grad)
-        self.assertIsNotNone(model.efficient_lm_head_down_proj.weight.grad)
-
-    def test_svd_init_and_export_roundtrip(self):
-        model = LlamaForCausalLMEagle4(self._head_config(), attention_backend="sdpa")
-        model.init_efficient_head_from_dense()
-        self.assertEqual((16, 4), tuple(model.efficient_lm_head.weight.shape))
-        state = model.state_dict()
-        self.assertIn("lm_head.weight", state)
-        self.assertIn("efficient_lm_head.weight", state)
-        self.assertIn("efficient_lm_head_down_proj.weight", state)
-        self.assertNotIn("t2d", state)
-        self.assertNotIn("d2t", state)
-
+        self.assertTrue(bool(model.t2d.all()))
+        self.assertTrue(bool((model.d2t == 0).all()))
+        self.assertFalse(any("efficient_lm_head" in k for k in model.state_dict()))
         with tempfile.TemporaryDirectory() as directory:
             model.save_pretrained(directory)
-            with open(os.path.join(directory, "config.json"), encoding="utf-8") as handle:
-                payload = json.load(handle)
-            self.assertEqual([EAGLE4_ARCH], payload["architectures"])
-            self.assertEqual("low_rank", payload["efficient_lm_head_config"]["type"])
-            self.assertEqual(4, payload["efficient_lm_head_config"]["rank"])
-            reloaded = AutoDraftModel.from_pretrained(
-                directory, local_files_only=True
-            )
-            self.assertIsInstance(reloaded, LlamaForCausalLMEagle4)
+            reloaded = AutoDraftModel.from_pretrained(directory, local_files_only=True)
             torch.testing.assert_close(
-                reloaded.efficient_lm_head.weight,
-                model.efficient_lm_head.weight,
+                model.compute_logits(hidden), reloaded.compute_logits(hidden)
             )
-            torch.testing.assert_close(reloaded.lm_head.weight, model.lm_head.weight)
 
-    def test_candidate_recall_is_one_when_target_is_the_argmax(self):
-        model = LlamaForCausalLMEagle4(self._head_config(), attention_backend="sdpa")
-        with torch.no_grad():
-            model.lm_head.weight.zero_()
-            model.lm_head.weight[3].fill_(1.0)
-            model.efficient_lm_head_down_proj.weight.copy_(
-                torch.eye(4, 8)[:4]
-            )
-            model.efficient_lm_head.weight.zero_()
-            model.efficient_lm_head.weight[3, 0] = 10.0
-        hidden = torch.zeros(1, 2, 8)
-        hidden[..., 0] = 1.0
-        target = torch.full((1, 2), 3, dtype=torch.long)
-        recall = model.candidate_recall(hidden, target)
-        self.assertGreater(float(recall), 0.99)
+    def test_forward_returns_raw_hidden_for_single_logit_normalization(self):
+        model = LlamaForCausalLMEagle4(
+            _config(norm_output=True), attention_backend="sdpa"
+        )
+        hidden, embeds = _inputs()
+        raw = torch.randn(2, 4, 8)
+        with mock.patch.object(model, "backbone", return_value=raw):
+            output = model(hidden_states=hidden, inputs_embeds=embeds)
+        torch.testing.assert_close(output, raw)
+        torch.testing.assert_close(
+            model.compute_logits(output), model.lm_head(model.norm(raw))
+        )
+        torch.testing.assert_close(model.next_depth_hidden(output), model.norm(raw))
 
 
 @unittest.skipUnless(
     OnlineEagle3Model is not None, "OnlineEagle3Model imports require triton"
 )
 class Eagle4TTTHookTest(unittest.TestCase):
-    def test_ttt_uses_next_depth_hidden_and_identity_vocab_without_t2d(self):
+    def test_dense_ttt_uses_next_depth_hidden_and_backpropagates(self):
         model = LlamaForCausalLMEagle4(
-            _config(
-                efficient_lm_head_config={
-                    "type": "low_rank",
-                    "rank": 4,
-                    "num_candidates": 4,
-                },
-                norm_output=True,
+            _config(attn_norm=True, norm_output=True), attention_backend="sdpa"
+        )
+        wrapper = OnlineEagle3Model(model, length=2, attention_backend="sdpa")
+
+        def reference_loss(logits, target_p, mask, target_on_draft=None):
+            # Exercise the TTT plumbing on CPU; the fused kernel has separate tests.
+            loss = -(mask * target_p * logits.float().log_softmax(-1)).sum(-1).mean()
+            if target_on_draft is None:
+                return loss
+            rows = torch.minimum(logits.float().softmax(-1), target_on_draft).sum(-1)
+            return loss, rows
+
+        with (
+            mock.patch.object(
+                model, "next_depth_hidden", wraps=model.next_depth_hidden
+            ) as next_depth,
+            mock.patch(
+                "specforge.algorithms.eagle3.model.LogSoftmaxLoss.apply",
+                side_effect=reference_loss,
             ),
-            attention_backend="sdpa",
-        ).eval()
-        self.assertFalse(hasattr(model, "t2d"))
-        wrapper = OnlineEagle3Model(model, length=1, attention_backend="sdpa")
-        batch, seq, hidden, vocab = 1, 4, 8, 16
-        with mock.patch.object(
-            model, "next_depth_hidden", wraps=model.next_depth_hidden
-        ) as next_depth:
+        ):
             plosses, *_ = wrapper(
-                input_ids=torch.ones(batch, seq, dtype=torch.long),
-                attention_mask=torch.ones(batch, seq),
-                target=torch.randn(batch, seq, vocab),
-                loss_mask=torch.ones(batch, seq, 1),
-                hidden_states=torch.randn(batch, seq, hidden * 3),
+                input_ids=torch.ones(1, 4, dtype=torch.long),
+                attention_mask=torch.ones(1, 4),
+                target=torch.randn(1, 4, 16),
+                loss_mask=torch.ones(1, 4, 1),
+                hidden_states=torch.randn(1, 4, 24),
             )
-        self.assertTrue(next_depth.called)
-        self.assertEqual(1, len(plosses))
-        self.assertTrue(torch.isfinite(plosses[0]))
-        self.assertIsNotNone(wrapper.last_candidate_recall)
+            loss = sum(plosses)
+            loss.backward()
+        self.assertEqual(next_depth.call_count, 2)
+        self.assertEqual(len(plosses), 2)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(model.lm_head.weight.grad).all())
+        self.assertTrue(torch.isfinite(model.midlayer.eh_proj.weight.grad).all())
 
 
 if __name__ == "__main__":

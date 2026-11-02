@@ -173,6 +173,8 @@ assert not torch.cuda.is_initialized()
                     self.assertEqual(resolved.layer_types, ["full_attention"])
                     self.assertIsNone(resolved.sliding_window)
                     self.assertFalse(resolved.use_sliding_window)
+                elif strategy == "eagle4":
+                    self.assertEqual(resolved.draft_vocab_size, resolved.vocab_size)
                 else:
                     self.assertEqual(resolved.draft_vocab_size, 32000)
 

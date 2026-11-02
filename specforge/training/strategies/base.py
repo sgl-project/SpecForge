@@ -231,28 +231,22 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
                 getattr(getattr(self.target_head, "config", None), "vocab_size", 0)
             )
         )
-        t2d = getattr(draft_model, "t2d", None)
-        d2t = getattr(draft_model, "d2t", None)
-        if t2d is None or d2t is None:
-            vocab = int(draft_model.vocab_size)
-            t2d = torch.ones(vocab, dtype=torch.bool)
-            d2t = torch.zeros(vocab, dtype=torch.int64)
         draft_vocab_size = int(
             getattr(
                 getattr(draft_model, "config", None),
                 "draft_vocab_size",
-                int(t2d.sum().item()),
+                int(draft_model.t2d.sum().item()),
             )
         )
         validate_compact_teacher_enabled(
             is_online=False,
             draft_vocab_size=draft_vocab_size,
             vocab_size=vocab_size,
-            t2d=t2d,
+            t2d=draft_model.t2d,
             target_head_weight=target_head_weight,
             chunk_size=self.compact_teacher_chunk_size,
         )
-        validate_vocab_mapping_consistency(t2d, d2t)
+        validate_vocab_mapping_consistency(draft_model.t2d, draft_model.d2t)
 
     def trainable_module(self) -> nn.Module:
         return self.eagle3_model
@@ -362,12 +356,6 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
             "metric_losses": [m.detach() for m in metric_losses],
             "metric_loss_denoms": [d.detach() for d in metric_loss_denoms],
         }
-        live = self._live_eagle3_model()
-        recall = getattr(live, "last_candidate_recall", None)
-        if recall is not None:
-            metrics["candidate_recall"] = (
-                recall.detach() if isinstance(recall, torch.Tensor) else recall
-            )
         imbalance = getattr(self, "_moe_load_imbalance", None)
         if imbalance is not None:
             metrics["moe_load_imbalance"] = imbalance

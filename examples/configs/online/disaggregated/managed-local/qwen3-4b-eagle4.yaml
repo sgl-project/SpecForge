@@ -1,14 +1,8 @@
-# Qwen3-4B EAGLE-4 dense stage-1, online, same node.
-#
-# SpecForge has no online colocated topology. This managed-local recipe is the
-# same-node path: one `specforge train` owns Mooncake, the SGLang capture
-# server (GPU 0), and the trainer (GPU 1). Capture method is eagle3 (EAGLE-4
-# reuses that aux layout). Requires the v0.5.18 spec-capture patch, not a
-# Muse Spark image.
-#
-#   specforge train --config examples/configs/online/disaggregated/managed-local/qwen3-4b-eagle4-amd.yaml
-#
-# Stage 1 trains a full-vocab dense lm_head. Do not pass vocab_mapping_path.
+# Qwen3-4B EAGLE-4 stage-1: one capture GPU and seven trainer GPUs.
+# Uses the eagle3 auxiliary-feature capture contract with full-vocabulary identity maps.
+# Requires an SGLang build with SpecForge streaming capture support.
+# Run: specforge train --config examples/configs/online/disaggregated/managed-local/qwen3-4b-eagle4.yaml
+# See docs/eagle4.md for prerequisites and historical validation differences.
 model:
   target_model_path: "Qwen/Qwen3-4B"
   draft_model_config: "configs/qwen3-4b-eagle4.json"
@@ -16,7 +10,6 @@ model:
   embedding_key: "model.embed_tokens.weight"
   torch_dtype: "bfloat16"
   use_liger_kernel: false
-  sglang_attention_backend: "aiter"
   sglang_mem_fraction_static: 0.5
   sglang_context_length: 4096
   sglang_disable_radix_cache: true
@@ -47,7 +40,7 @@ deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 1
+    nproc_per_node: 7
   disaggregated:
     control_dir: outputs/qwen3-4b-eagle4-online/control
     consumer_state_dir: outputs/qwen3-4b-eagle4-online/consumer-state
@@ -55,6 +48,12 @@ deployment:
     managed_local:
       trainer_cuda_visible_devices:
         - "1"
+        - "2"
+        - "3"
+        - "4"
+        - "5"
+        - "6"
+        - "7"
       mooncake:
         protocol: tcp
         global_segment_size_bytes: 34359738368
@@ -65,8 +64,3 @@ deployment:
             - "0"
           tp_size: 1
           mem_fraction_static: 0.5
-          attention_backend: aiter
-          env:
-            SGLANG_USE_AITER: "1"
-            SGLANG_USE_AITER_UNIFIED_ATTN: "1"
-            AITER_FLYDSL_FORCE: "1"

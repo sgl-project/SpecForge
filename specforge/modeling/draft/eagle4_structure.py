@@ -53,48 +53,8 @@ def draft_sliding_window(config: Any) -> Optional[int]:
     return window
 
 
-def parse_efficient_lm_head_config(config: Any) -> Optional[dict]:
-    """Return a validated ``efficient_lm_head_config`` dict, or None."""
-
-    head = getattr(config, "efficient_lm_head_config", None)
-    if not head:
-        return None
-    if not isinstance(head, dict):
-        raise ValueError(
-            f"efficient_lm_head_config must be a dict, got {type(head).__name__}"
-        )
-    head_type = head.get("type")
-    if head_type not in ("low_rank", "weighted_low_rank"):
-        raise ValueError(
-            "efficient_lm_head_config.type must be 'low_rank' or "
-            f"'weighted_low_rank', got {head_type!r}"
-        )
-    rank = head.get("rank")
-    num_candidates = head.get("num_candidates", head.get("top_k"))
-    if not isinstance(rank, int) or isinstance(rank, bool) or rank < 1:
-        raise ValueError(f"efficient_lm_head_config.rank must be >= 1, got {rank!r}")
-    if (
-        not isinstance(num_candidates, int)
-        or isinstance(num_candidates, bool)
-        or num_candidates < 1
-    ):
-        raise ValueError(
-            "efficient_lm_head_config.num_candidates must be >= 1, got "
-            f"{num_candidates!r}"
-        )
-    parsed = {
-        "type": head_type,
-        "rank": rank,
-        "num_candidates": num_candidates,
-    }
-    if "smooth_factor" in head:
-        parsed["smooth_factor"] = head["smooth_factor"]
-    return parsed
-
-
 __all__ = [
     "EAGLE4_ARCH",
     "draft_sliding_window",
     "draft_uses_rope",
-    "parse_efficient_lm_head_config",
 ]

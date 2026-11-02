@@ -50,9 +50,7 @@ class Eagle4Router(nn.Module):
             )
         )
         self.register_buffer("e_score_correction_bias", torch.zeros(n))
-        self.register_buffer(
-            "load", torch.zeros(n, dtype=torch.long), persistent=False
-        )
+        self.register_buffer("load", torch.zeros(n, dtype=torch.long), persistent=False)
         self.update_rate = getattr(
             config,
             "expert_bias_update_rate",
@@ -140,7 +138,12 @@ class Eagle4MoE(nn.Module):
         biased = scores + self.gate.e_score_correction_bias
         if self.n_group > 1:
             groups = biased.unflatten(-1, (self.n_group, -1))
-            best = groups.topk(2, dim=-1).values.sum(-1).topk(self.topk_group, dim=-1).indices
+            best = (
+                groups.topk(2, dim=-1)
+                .values.sum(-1)
+                .topk(self.topk_group, dim=-1)
+                .indices
+            )
             dropped = torch.ones_like(groups[..., 0], dtype=torch.bool).scatter_(
                 1, best, False
             )
@@ -167,58 +170,7 @@ class Eagle4MoE(nn.Module):
         return out.view_as(hidden_states)
 
 
-def _grouped_mm_fn(h: torch.Tensor):
-    """``F.grouped_mm`` when it is a real CUDA kernel; HIP reports ``is_cuda``."""
-
-    grouped_mm = getattr(F, "grouped_mm", None)
-    if grouped_mm is None:
-        return None
-    if getattr(torch.version, "hip", None):
-        return None
-    if not (h.is_cuda and h.device.type == "cuda"):
-        return None
-    return grouped_mm
-
-
-def _expert_mlp(
-    h: torch.Tensor,
-    idx: torch.Tensor,
-    weights: torch.Tensor,
-    up: torch.Tensor,
-    down: torch.Tensor,
-    latent: bool,
-    act_fn,
-) -> torch.Tensor:
-    grouped_mm = _grouped_mm_fn(h)
-    if grouped_mm is None:
-        return _expert_mlp_loop(h, idx, weights, up, down, latent, act_fn)
-    try:
-        return _expert_mlp_grouped(h, idx, weights, up, down, latent, act_fn, grouped_mm)
-    except RuntimeError:
-        return _expert_mlp_loop(h, idx, weights, up, down, latent, act_fn)
-
-
-def _expert_mlp_grouped(
-    h, idx, weights, up, down, latent, act_fn, grouped_mm
-) -> torch.Tensor:
-    order = idx.flatten().argsort()
-    tokens = order // idx.shape[-1]
-    counts = torch.bincount(idx.flatten(), minlength=up.shape[0])
-    offs = counts.cumsum(0).int()
-    inner = grouped_mm(h[tokens], up.transpose(1, 2), offs=offs)
-    if latent:
-        inner = act_fn(inner)
-    else:
-        gate, value = inner.chunk(2, dim=-1)
-        inner = act_fn(gate) * value
-    out = grouped_mm(inner, down.transpose(1, 2), offs=offs)
-    out = out * weights.flatten()[order, None].to(out.dtype)
-    return h.new_zeros(h.shape).index_add_(0, tokens, out)
-
-
-def _expert_mlp_loop(
-    h, idx, weights, up, down, latent, act_fn
-) -> torch.Tensor:
+def _expert_mlp(h, idx, weights, up, down, latent, act_fn) -> torch.Tensor:
     out = h.new_zeros(h.shape)
     n_experts = up.shape[0]
     for expert in range(n_experts):

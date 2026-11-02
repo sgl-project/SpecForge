@@ -131,7 +131,7 @@ def algorithm_spec() -> AlgorithmSpec:
             attention_backends={"sdpa", "flex_attention", "fa", "usp"},
             supports_compact_teacher=True,
             supports_trim_loss_positions=True,
-            supports_vocab_mapping=True,
+            supports_vocab_mapping=False,
             allows_aux_layer_override=True,
         ),
     )
@@ -153,7 +153,7 @@ def algorithm_providers() -> AlgorithmProviders:
                 target_defaults=TargetDerivedDraftDefaults(
                     model_type="llama",
                     num_hidden_layers=1,
-                    draft_vocab_size=32000,
+                    draft_vocab_size=None,
                 ),
             ),
             build_draft=build_draft,
@@ -199,7 +199,7 @@ def algorithm_providers() -> AlgorithmProviders:
                 build_collator=build_server_collator,
             ),
         ),
-        vocab_mapping_modes=frozenset({FeatureMode.OFFLINE, FeatureMode.STREAMING}),
+        vocab_mapping_modes=frozenset(),
     )
 
 

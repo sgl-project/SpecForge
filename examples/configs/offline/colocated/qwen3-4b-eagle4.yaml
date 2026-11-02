@@ -1,12 +1,11 @@
-# Qwen3-4B EAGLE-4 dense stage-1 draft, offline (features captured to disk) — AMD ROCm.
+# Qwen3-4B EAGLE-4 dense stage-1 offline smoke test.
 #
 # Stage 1 trains a full-vocab dense lm_head (no efficient_lm_head_config).
-# The low-rank candidate head is a follow-up stage after this dense checkpoint.
+# SVD conversion for serving is separate from this training recipe.
 #
 # Qwen3-4B is a dense target. Capture uses the stock SGLang eagle3 layer hook
 # (no --sglang-disable-radix-cache).
 #
-#   SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1 \
 #   torchrun --standalone --nproc_per_node 1 \
 #     scripts/prepare_hidden_states.py \
 #     --target-model-path Qwen/Qwen3-4B \
@@ -19,11 +18,10 @@
 #     --num-samples 256 \
 #     --tp-size 1 \
 #     --batch-size 8 \
-#     --sglang-attention-backend aiter \
 #     --sglang-mem-fraction-static 0.8 \
 #     --sglang-context-length 4096
 #
-#   specforge train --config examples/configs/offline/colocated/qwen3-4b-eagle4-amd.yaml
+#   specforge train --config examples/configs/offline/colocated/qwen3-4b-eagle4.yaml
 #
 # Do not pass model.vocab_mapping_path: stage 1 trains the dense head at full
 # vocab (draft_vocab_size == vocab_size).
