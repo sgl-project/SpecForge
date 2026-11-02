@@ -139,6 +139,43 @@ class Eagle4FusionTest(unittest.TestCase):
         out = on(hidden_states=hidden, inputs_embeds=embeds, ttt_length=1)
         self.assertEqual((2, 4, 8), tuple(out.shape))
 
+    def test_attention_residual_preserves_unnormalized_fusion(self):
+        for attn_norm in (False, True):
+            with self.subTest(attn_norm=attn_norm):
+                torch.manual_seed(42)
+                layer = LlamaForCausalLMEagle4(
+                    _config(attn_norm=attn_norm), attention_backend="sdpa"
+                ).midlayer
+                hidden = torch.randn(1, 3, 8, requires_grad=True)
+                embeds = torch.randn(1, 3, 8, requires_grad=True)
+                joined = torch.cat(
+                    (layer.input_layernorm(embeds), layer.hidden_norm(hidden)),
+                    dim=-1,
+                )
+                residual = layer.eh_proj(joined) if attn_norm else hidden
+                attention_input = (
+                    layer.pre_attention_layernorm(residual) if attn_norm else joined
+                )
+                if attn_norm:
+                    self.assertFalse(torch.allclose(residual, attention_input))
+                # Zero attention and MLP isolate the skip connection, while
+                # recording the input verifies normalization still feeds QKV.
+                with mock.patch.object(
+                    layer.self_attn, "forward", return_value=torch.zeros_like(hidden)
+                ) as attention, mock.patch.object(
+                    layer.mlp, "forward", side_effect=torch.zeros_like
+                ):
+                    output = layer(input_emb=embeds, hidden_states=hidden)
+                torch.testing.assert_close(output, residual)
+                torch.testing.assert_close(
+                    attention.call_args.kwargs["hidden_states"], attention_input
+                )
+                actual_grad = torch.autograd.grad(
+                    output.sum(), hidden, retain_graph=True
+                )[0]
+                expected_grad = torch.autograd.grad(residual.sum(), hidden)[0]
+                torch.testing.assert_close(actual_grad, expected_grad)
+
     def test_fc_norm_and_norm_output_flags(self):
         model = LlamaForCausalLMEagle4(
             _config(fc_norm=True, norm_output=True),
@@ -283,6 +320,7 @@ class Eagle4MoETest(unittest.TestCase):
         with mock.patch(
             "specforge.modeling.draft.eagle4_moe.F.grouped_mm",
             mock.Mock(),
+            create=True,
         ), mock.patch(
             "specforge.modeling.draft.eagle4_moe.torch.version.hip",
             "6.4",

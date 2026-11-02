@@ -1575,11 +1575,12 @@ class LlamaDecoderLayer(nn.Module):
     def fuse_layer_input(
         self, input_emb: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        """Fuse the normalized inputs, before the attention-only RMSNorm."""
         hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
         if self.attn_norm:
-            hidden_states = self.pre_attention_layernorm(self.eh_proj(hidden_states))
+            hidden_states = self.eh_proj(hidden_states)
         return hidden_states
 
     def forward(
@@ -1612,7 +1613,10 @@ class LlamaDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.fuse_layer_input(input_emb, hidden_states)
         if self.attn_norm:
+            # EAGLE-4 keeps the fusion projection as the residual; only the
+            # attention input passes through the pre-attention RMSNorm.
             residual = hidden_states
+            hidden_states = self.pre_attention_layernorm(hidden_states)
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
             hidden_states=hidden_states,
