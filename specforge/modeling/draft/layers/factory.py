@@ -67,4 +67,24 @@ def build_residual(
         norm_eps,
         options.sinkhorn_iters,
         options.sinkhorn_eps,
+        pre_from_prev=options.pre_from_prev,
     )
+
+
+def build_residual_readout(
+    options: ResidualConfig, *, hidden_size: int, norm_eps: float
+) -> nn.Module:
+    """The model-level read of the residual streams before the final norm."""
+    if options.kind == "gr":
+        from .residual.gr import GatedResidual
+
+        return GatedResidual(
+            hidden_size, options.num_streams, options.gate_rank, norm_eps, readout=True
+        )
+    if options.kind == "mhc" and not options.pre_from_prev:
+        from .residual.mhc import HyperConnectionHead
+
+        return HyperConnectionHead(
+            hidden_size, options.num_streams, norm_eps, options.sinkhorn_eps
+        )
+    return nn.Identity()

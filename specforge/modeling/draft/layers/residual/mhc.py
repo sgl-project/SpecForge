@@ -1,8 +1,10 @@
-"""DeepSeek-V4.1 single-pass mHC, expressed in differentiable PyTorch.
+"""DeepSeek-V4 and V4.1 mHC, expressed in differentiable PyTorch.
 
-Matches inference/model.py Block and inference/kernel.py hc_split_sinkhorn:
-a sublayer reads the incoming pre_mix and produces the *next* pre_mix.
-Coefficient projection, Sinkhorn and stream accumulation use float32.
+Matches inference/model.py Block and inference/kernel.py hc_split_sinkhorn.
+V4 reads each sublayer with the pre-mix computed from its own input and ends
+with a learned head; V4.1 (single pass) reads with the incoming pre_mix and
+produces the *next* one. Coefficient projection, Sinkhorn and stream
+accumulation use float32.
 """
 
 from typing import NamedTuple
@@ -11,12 +13,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .base import HyperConnectionState, Residual, collapse_streams
+from .base import HyperConnectionState, Residual, collapse_streams, mix_streams
 
 
 class MHCWriteState(NamedTuple):
     streams: torch.Tensor
-    next_pre: torch.Tensor
+    next_pre: torch.Tensor | None
     post: torch.Tensor
     combination: torch.Tensor
 
@@ -29,12 +31,15 @@ class ManifoldHyperConnection(Residual[MHCWriteState]):
         norm_eps: float,
         sinkhorn_iters: int,
         eps: float,
+        *,
+        pre_from_prev: bool = True,
     ):
         super().__init__()
         self.count = count
         self.norm_eps = norm_eps
         self.sinkhorn_iters = sinkhorn_iters
         self.eps = eps
+        self.pre_from_prev = pre_from_prev
         size = (count + 2) * count
         self.mix_weight = nn.Parameter(
             torch.empty(size, count * hidden_size, dtype=torch.float32)
@@ -83,9 +88,13 @@ class ManifoldHyperConnection(Residual[MHCWriteState]):
         self, state: HyperConnectionState, norm: nn.Module
     ) -> tuple[torch.Tensor, MHCWriteState]:
         pre, post, combination = self.mixes(state.streams)
-        return norm(collapse_streams(state)), MHCWriteState(
-            state.streams, pre, post, combination
-        )
+        if self.pre_from_prev:
+            # V4.1: read with the incoming mix; this one feeds the next sublayer.
+            hidden, next_pre = collapse_streams(state), pre
+        else:
+            # V4: read with this sublayer's own mix; nothing is carried forward.
+            hidden, next_pre = mix_streams(state.streams, pre), None
+        return norm(hidden), MHCWriteState(state.streams, next_pre, post, combination)
 
     def write(self, update: torch.Tensor, state: MHCWriteState) -> HyperConnectionState:
         # Matrix indices are [source stream, destination stream].
@@ -94,3 +103,28 @@ class ManifoldHyperConnection(Residual[MHCWriteState]):
         ).sum(-3)
         streams = mixed + state.post.unsqueeze(-1) * update.float().unsqueeze(-2)
         return HyperConnectionState(streams.to(update.dtype), state.next_pre)
+
+
+class HyperConnectionHead(nn.Module):
+    """DeepSeek-V4's hc_head: a learned sigmoid read of the streams before the norm."""
+
+    def __init__(self, hidden_size: int, count: int, norm_eps: float, eps: float):
+        super().__init__()
+        self.norm_eps = norm_eps
+        self.eps = eps
+        self.mix_weight = nn.Parameter(
+            torch.empty(count, count * hidden_size, dtype=torch.float32)
+        )
+        self.mix_scale = nn.Parameter(torch.full((1,), 0.01, dtype=torch.float32))
+        self.mix_bias = nn.Parameter(torch.zeros(count, dtype=torch.float32))
+        nn.init.normal_(self.mix_weight, std=(count * hidden_size) ** -0.5)
+
+    def forward(self, state: HyperConnectionState) -> torch.Tensor:
+        streams = state.streams
+        with torch.autocast(device_type=streams.device.type, enabled=False):
+            flat = streams.flatten(-2).float()
+            scores = F.linear(flat, self.mix_weight.float()) * torch.rsqrt(
+                flat.square().mean(-1, keepdim=True) + self.norm_eps
+            )
+            pre = (scores * self.mix_scale.float() + self.mix_bias.float()).sigmoid()
+        return mix_streams(streams, pre + self.eps)

@@ -23,7 +23,10 @@ from specforge.modeling.draft.layers.residual.base import (
     expand_streams,
 )
 from specforge.modeling.draft.layers.residual.gr import GatedResidual
-from specforge.modeling.draft.layers.residual.mhc import ManifoldHyperConnection
+from specforge.modeling.draft.layers.residual.mhc import (
+    HyperConnectionHead,
+    ManifoldHyperConnection,
+)
 from tests.test_modeling.test_layers.test_composition import config
 
 
@@ -97,6 +100,13 @@ def mhc_reference(module, streams, incoming, update, norm):
         dim=-2,
     ).to(update.dtype)
     return read, written, pre
+
+
+def residual_options(kind, **options):
+    """Test labels: ``mhc_v4`` is kind ``mhc`` with ``pre_from_prev`` false."""
+    if kind == "mhc_v4":
+        return {"kind": "mhc", "pre_from_prev": False, **options}
+    return {"kind": kind, **options}
 
 
 class HyperConnectionTest(unittest.TestCase):
@@ -199,6 +209,69 @@ class HyperConnectionTest(unittest.TestCase):
             self.assertEqual(a.dtype, torch.float32)
             assert_close(a, b, atol=0, rtol=0)
 
+    def test_mhc_v4_reads_its_own_mix_and_matches_reference(self):
+        module = ManifoldHyperConnection(8, 3, 1e-6, 20, 1e-6, pre_from_prev=False)
+        with torch.no_grad():
+            module.mix_bias.normal_()
+            module.mix_scale.fill_(0.3)
+        streams = torch.randn(2, 4, 3, 8, requires_grad=True)
+        update = torch.randn(2, 4, 8, requires_grad=True)
+        norm = nn.RMSNorm(8, eps=1e-6)
+        read, saved = module.read(HyperConnectionState(streams), norm)
+        written = module.write(update, saved)
+        # DeepSeek-V4's hc_pre/hc_post: the same coefficients as single-pass mHC,
+        # read with this sublayer's own pre instead of an incoming mix.
+        _, ref_written, ref_pre = mhc_reference(
+            module, streams, torch.zeros(2, 4, 3), update, norm
+        )
+        ref_read = norm(
+            sum(
+                streams[..., i, :].float() * ref_pre[..., i, None] for i in range(3)
+            ).to(streams.dtype)
+        )
+        assert_close(read, ref_read)
+        assert_close(written.streams, ref_written)
+        self.assertIsNone(saved.next_pre)
+        self.assertIsNone(written.pre_mix)
+        variables = (streams, update, *module.parameters(), *norm.parameters())
+        actual = torch.autograd.grad(
+            read.square().sum() + written.streams.square().sum(),
+            variables,
+            retain_graph=True,
+        )
+        expected = torch.autograd.grad(
+            ref_read.square().sum() + ref_written.square().sum(), variables
+        )
+        for a, b in zip(actual, expected):
+            assert_close(a, b, atol=3e-5, rtol=3e-5)
+
+    def test_hyper_connection_head_matches_reference(self):
+        head = HyperConnectionHead(8, 3, 1e-6, 1e-6)
+        with torch.no_grad():
+            head.mix_bias.normal_()
+            head.mix_scale.fill_(0.3)
+        streams = torch.randn(2, 4, 3, 8, requires_grad=True)
+        output = head(HyperConnectionState(streams))
+        # DeepSeek-V4's hc_head: sigmoid mixes, no Sinkhorn, before the final norm.
+        flat = streams.flatten(-2).float()
+        scores = (flat @ head.mix_weight.T) / (
+            flat.square().mean(-1, keepdim=True) + 1e-6
+        ).sqrt()
+        pre = (scores * head.mix_scale + head.mix_bias).sigmoid() + 1e-6
+        expected = sum(
+            streams[..., i, :].float() * pre[..., i, None] for i in range(3)
+        ).to(streams.dtype)
+        assert_close(output, expected)
+        variables = (streams, *head.parameters())
+        actual = torch.autograd.grad(
+            output.square().sum(), variables, retain_graph=True
+        )
+        reference = torch.autograd.grad(expected.square().sum(), variables)
+        for a, b in zip(actual, reference):
+            assert_close(a, b, atol=3e-5, rtol=3e-5)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            assert_close(head(HyperConnectionState(streams)), expected)
+
     def test_invalid_config(self):
         for kwargs in (
             {"kind": "unknown"},
@@ -206,6 +279,7 @@ class HyperConnectionTest(unittest.TestCase):
             {"gate_rank": True},
             {"sinkhorn_iters": -1},
             {"sinkhorn_eps": 0},
+            {"pre_from_prev": 1},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 ResidualConfig(**kwargs)
@@ -214,7 +288,7 @@ class HyperConnectionTest(unittest.TestCase):
 class ResidualModelTest(unittest.TestCase):
     def make_model(self, kind, cls=DFlashDraftModel, attention="gqa"):
         cfg = config(attention)
-        cfg.draft_residual = {"kind": kind, "num_streams": 4, "gate_rank": 8}
+        cfg.draft_residual = residual_options(kind, num_streams=4, gate_rank=8)
         cfg.dflash_config.update(
             conv_kernel_size=2, conv_group_size=4, selector_rank=8, selector_top_k=4
         )
@@ -228,7 +302,7 @@ class ResidualModelTest(unittest.TestCase):
         )
 
     def test_family_models_compose_residuals_and_receive_gradients(self):
-        for kind in ("gr", "mhc"):
+        for kind in ("gr", "mhc", "mhc_v4"):
             for cls in (DFlashDraftModel, DFlash2DraftModel, DSparkDraftModel):
                 for attention in ("gqa", "mla"):
                     with self.subTest(kind=kind, cls=cls.__name__, attention=attention):
@@ -245,13 +319,19 @@ class ResidualModelTest(unittest.TestCase):
                                 model.layers[0].input_layernorm, nn.Identity
                             )
                             self.assertIsInstance(model.norm, nn.Identity)
+                        if kind == "mhc_v4":
+                            residual = model.layers[0].attention_residual
+                            self.assertFalse(residual.pre_from_prev)
+                            self.assertIsInstance(
+                                model.residual_readout, HyperConnectionHead
+                            )
 
     def test_dspark_objective_trains_residual_and_prediction_heads(self):
-        for kind in ("gr", "mhc"):
+        for kind in ("gr", "mhc", "mhc_v4"):
             with self.subTest(kind=kind):
                 cfg = config()
                 cfg.is_causal = True
-                cfg.draft_residual = {"kind": kind, "gate_rank": 8}
+                cfg.draft_residual = residual_options(kind, gate_rank=8)
                 cfg.dflash_config.update(
                     markov_rank=4, enable_confidence_head=True, mask_token_id=31
                 )
@@ -293,7 +373,7 @@ class ResidualModelTest(unittest.TestCase):
                     )
 
     def test_checkpoint_recomputation_matches_outputs_and_gradients(self):
-        for kind in ("gr", "mhc"):
+        for kind in ("gr", "mhc", "mhc_v4"):
             with self.subTest(kind=kind):
                 model = self.make_model(kind)
                 reference = copy.deepcopy(model)
@@ -317,7 +397,7 @@ class ResidualModelTest(unittest.TestCase):
                     assert_close(a.grad, b.grad, atol=0, rtol=0)
 
     def test_reentrant_checkpointing_is_rejected_before_training(self):
-        for kind in ("gr", "mhc"):
+        for kind in ("gr", "mhc", "mhc_v4"):
             with self.assertRaisesRegex(ValueError, "use_reentrant=False"):
                 self.make_model(kind).gradient_checkpointing_enable(
                     {"use_reentrant": True}
@@ -325,7 +405,7 @@ class ResidualModelTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_bfloat16_models_train_on_cuda(self):
-        for kind in ("gr", "mhc"):
+        for kind in ("gr", "mhc", "mhc_v4"):
             model = self.make_model(kind).to(device="cuda", dtype=torch.bfloat16)
             inputs = {
                 k: v.detach().to(
@@ -357,9 +437,13 @@ class ResidualModelTest(unittest.TestCase):
             dflash_residual_resume_contract(original),
             dflash_residual_resume_contract(self.make_model("gr")),
         )
+        self.assertNotEqual(
+            dflash_residual_resume_contract(original),
+            dflash_residual_resume_contract(self.make_model("mhc_v4")),
+        )
 
     def test_save_load_preserves_config_weights_and_outputs(self):
-        for kind in ("gr", "mhc"):
+        for kind in ("gr", "mhc", "mhc_v4"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 model = self.make_model(kind).eval()
                 inputs = self.inputs()
