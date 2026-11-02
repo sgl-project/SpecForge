@@ -17,7 +17,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 from .flex_attention import compile_friendly_flex_attention
-from .flex_attention_backend import flex_attention_backend
+from .flex_attention_backend import flex_kernel_options
 from .visibility import prepare_tensor_mask, resolve_visibility
 
 
@@ -82,10 +82,9 @@ def dense_attention(
     else:
         raise ValueError(f"Unsupported dense attention backend: {implementation}")
     if implementation == "flex_attention":
-        kernel_options = dict(kwargs.pop("kernel_options", None) or {})
-        backend = flex_attention_backend()
-        if backend is not None:
-            kernel_options["BACKEND"] = backend
+        kernel_options, v = flex_kernel_options(
+            q, k, v, dict(kwargs.pop("kernel_options", None) or {})
+        )
 
         # Flex already returns zeros for queries (and heads) without visible
         # keys; validity is only needed to keep an o_proj bias from reviving
