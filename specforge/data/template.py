@@ -427,6 +427,21 @@ TEMPLATE_REGISTRY.register(
 )
 
 
+# Muse Spark renders through the target tokenizer. reasoning_content becomes
+# assistant to=self, closed by <|eom|>; the answer becomes assistant to=user,
+# closed by <|eot|>. Tool-call and commentary messages use the same shape with
+# a different recipient, so the muse parser masks each rendered span itself.
+TEMPLATE_REGISTRY.register(
+    name="muse",
+    template=ChatTemplate(
+        assistant_header=None,
+        user_header="<|start|>user<|message|>",
+        system_prompt=None,
+        end_of_turn_token=None,
+        parser_type="muse",
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="qwen3.5",
     template=ChatTemplate(

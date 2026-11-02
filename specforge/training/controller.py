@@ -8,10 +8,9 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainerCore + TrainerController: the trainer-boundary split.
 
-``TrainerCore`` runs exactly one branch-free step (strategy forward/loss, backend
-backward/step) plus the grad-accumulation boundary. ``TrainerController`` owns
-the lifecycle: fit / evaluate / save_checkpoint. EAGLE3 and DFlash share this
-unchanged — only the strategy differs.
+``TrainerCore`` owns strategy forward/loss, optional window replay, backend
+backward/step, and the accumulation boundary. ``TrainerController`` owns
+the lifecycle: fit / evaluate / save_checkpoint.
 """
 
 from __future__ import annotations
@@ -23,7 +22,8 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from contextlib import ExitStack
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import torch
@@ -418,19 +418,53 @@ class TrainerCore:
         self._micro = 0
         self._ratio_totals: Dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self._sum_totals: Dict[str, torch.Tensor] = {}
+        self._prepared_steps: List[StepOutput] = []
 
     @property
     def accumulation_remainder(self) -> int:
         """Micro-batches whose gradients have not reached an optimizer step."""
-        return self._micro % self.accumulation_steps
+        return (self._micro + len(self._prepared_steps)) % self.accumulation_steps
 
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
+        ctx = replace(ctx or StepContext(), accumulation_steps=self.accumulation_steps)
         is_boundary = (self._micro + 1) % self.accumulation_steps == 0
-        with self.backend.accumulation_context(is_boundary=is_boundary):
+        with ExitStack() as accumulation:
+            accumulation.enter_context(
+                self.backend.accumulation_context(is_boundary=is_boundary)
+            )
             out: StepOutput = self.strategy.forward_loss(batch, ctx)
+            self._validate_window_mode(out)
+            if out.replay_loss is not None:
+                # Replay owns fresh accumulation contexts for its backward passes.
+                accumulation.close()
+                return self._prepare_and_replay(out)
             return self._backward_step(out)
+
+    def _validate_window_mode(self, out: StepOutput) -> None:
+        wants_replay = out.replay_loss is not None
+        if (self._prepared_steps and not wants_replay) or (
+            self._micro % self.accumulation_steps and wants_replay
+        ):
+            raise ValueError("Cannot mix immediate and replayed losses in one window")
+
+    def _prepare_and_replay(self, out: StepOutput) -> StepResult:
+        """Collect a complete prepass window, then replay through controller backward."""
+        self._prepared_steps.append(out)
+        self._accumulate_ratio_metrics(out.ratio_metrics)
+        if len(self._prepared_steps) < self.accumulation_steps:
+            return self._result(out, None, False)
+
+        window_ratios = self._ratio_totals
+        prepared_steps = self._prepared_steps
+        self._ratio_totals = {}
+        self._prepared_steps = []
+        for prepared in prepared_steps:
+            is_boundary = (self._micro + 1) % self.accumulation_steps == 0
+            with self.backend.accumulation_context(is_boundary=is_boundary):
+                result = self._backward_step(prepared.replay_loss(window_ratios))
+        return result
 
     def _backward_step(self, out: StepOutput) -> StepResult:
         loss = out.loss

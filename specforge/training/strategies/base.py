@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -43,6 +43,10 @@ class StepOutput:
     # Additive telemetry (for example reached/accepted counts), summed across
     # the optimizer window and data-parallel ranks, never averaged.
     sum_metrics: Dict[str, Any] = field(default_factory=dict)
+    # Replay a graph-free prepass once the window's local ratio totals are known.
+    replay_loss: Optional[
+        Callable[[Dict[str, Tuple[torch.Tensor, torch.Tensor]]], StepOutput]
+    ] = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,7 @@ class StepContext:
     global_step: int = 0
     total_steps: Optional[int] = None
     collect_detailed_metrics: bool = True
+    accumulation_steps: int = 1
 
 
 def linear_lambda_base(
