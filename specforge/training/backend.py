@@ -346,7 +346,13 @@ class FSDPTrainingBackend(TrainingBackend):
         FSDP defers reduction here; DDP requires ``accumulation_context``
         around both forward and backward to defer its reducer.
         """
-        if is_boundary or not self._wrapped or self._wrapper_kind == "ddp":
+        # FULL_SHARD skips no_sync, which keeps full unsharded gradients on every rank.
+        if (
+            is_boundary
+            or not self._wrapped
+            or self._wrapper_kind == "ddp"
+            or self.parallel_config.sharding_strategy == "FULL_SHARD"
+        ):
             loss.backward()
         else:
             with self.module.no_sync():
