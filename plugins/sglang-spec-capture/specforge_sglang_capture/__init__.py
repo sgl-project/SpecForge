@@ -67,6 +67,9 @@ def _capture_internal_state(result, scheduler, *args, **kwargs):
     runtime = getattr(scheduler, "_specforge_capture_runtime", None)
     if runtime is not None:
         result.internal_state["spec_capture_backend"] = "plugin"
+        if os.environ.get("SPECFORGE_MTP_MODEL_PATH"):
+            result.internal_state["spec_capture_mtp_hidden"] = True
+            result.internal_state["spec_capture_mtp_alignment"] = "anchor_post_norm_v1"
         if runtime.is_writer:
             control = runtime.sink.control_endpoint()
             if control is not None:

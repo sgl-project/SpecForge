@@ -48,6 +48,7 @@ import torch
 from specforge_sglang_capture.sink import (
     ARTIFACT_AUX,
     ARTIFACT_LAST_HIDDEN,
+    ARTIFACT_MTP_HIDDEN,
     Sample,
     SpecCaptureSink,
     arena_bytes,
@@ -169,8 +170,11 @@ class CaptureObserver:
         available = {
             ARTIFACT_AUX: aux is not None,
             ARTIFACT_LAST_HIDDEN: last_hidden is not None,
+            ARTIFACT_MTP_HIDDEN: self.runtime.mtp_capture is not None
+            and last_hidden is not None,
         }
         checked = []
+        reqs = {req.rid: req for req in batch.reqs}
         for item in items:
             if item.error is None:
                 if batch_error is not None:
@@ -181,12 +185,36 @@ class CaptureObserver:
                         error=(
                             f"the server did not capture {missing}; launch with "
                             "--enable-return-aux-hidden-states and "
-                            "--return-hidden-states-mode full"
+                            "--return-hidden-states-mode full; mtp_hidden additionally "
+                            "requires SPECFORGE_MTP_MODEL_PATH"
                         ),
                     )
+                elif (
+                    ARTIFACT_MTP_HIDDEN in (item.spec.get("features") or {})
+                    and getattr(reqs[item.rid], "multimodal_inputs", None) is not None
+                ):
+                    item = dataclasses.replace(
+                        item, error="mtp_hidden capture supports text-only requests"
+                    )
             checked.append(item)
+        mtp_hidden = None
+        requested = [
+            item
+            for item in checked
+            if item.error is None
+            and ARTIFACT_MTP_HIDDEN in (item.spec.get("features") or {})
+        ]
+        if requested:
+            mtp_hidden = torch.zeros_like(last_hidden)
+            for item in requested:
+                req = reqs[item.rid]
+                ids = torch.tensor(
+                    req.origin_input_ids, device=last_hidden.device, dtype=torch.long
+                )
+                rows = slice(item.start, item.start + item.length)
+                mtp_hidden[rows] = self.runtime.mtp_capture(ids, last_hidden[rows])
         return CaptureDeviceOutput.from_rows(
-            self.runtime, checked, aux, last_hidden, copy=can_run_graph
+            self.runtime, checked, aux, last_hidden, mtp_hidden, copy=can_run_graph
         )
 
 
@@ -230,16 +258,19 @@ def _covers_all_rows(spans: List[Tuple[int, int]], num_rows: int) -> bool:
 class CaptureDeviceOutput:
     """DeviceAuxiliaryOutput holding a forward's capture rows on the device."""
 
-    def __init__(self, runtime, items, aux, last_hidden):
+    def __init__(self, runtime, items, aux, last_hidden, mtp_hidden=None):
         self.runtime = runtime
         self.items = items
         self.aux = aux
         self.last_hidden = last_hidden
+        self.mtp_hidden = mtp_hidden
 
     @classmethod
-    def from_rows(cls, runtime, items, aux, last_hidden, *, copy):
-        items, (aux, last_hidden) = _select_rows(items, (aux, last_hidden), copy=copy)
-        return cls(runtime, items, aux, last_hidden)
+    def from_rows(cls, runtime, items, aux, last_hidden, mtp_hidden=None, *, copy):
+        items, (aux, last_hidden, mtp_hidden) = _select_rows(
+            items, (aux, last_hidden, mtp_hidden), copy=copy
+        )
+        return cls(runtime, items, aux, last_hidden, mtp_hidden)
 
     def copy_to_host(self, copy_tensor):
         if self.runtime.gpu_put:
@@ -247,24 +278,33 @@ class CaptureDeviceOutput:
             ready = torch.cuda.Event()
             ready.record()
             return CaptureHostOutput(
-                self.runtime, self.items, self.aux, self.last_hidden, ready_event=ready
+                self.runtime,
+                self.items,
+                self.aux,
+                self.last_hidden,
+                self.mtp_hidden,
+                ready_event=ready,
             )
         return CaptureHostOutput(
             self.runtime,
             self.items,
             copy_tensor(self.aux) if self.aux is not None else None,
             copy_tensor(self.last_hidden) if self.last_hidden is not None else None,
+            copy_tensor(self.mtp_hidden) if self.mtp_hidden is not None else None,
         )
 
 
 class CaptureHostOutput:
     """HostAuxiliaryOutput: publish finished capture requests, then hold them."""
 
-    def __init__(self, runtime, items, aux, last_hidden, *, ready_event=None):
+    def __init__(
+        self, runtime, items, aux, last_hidden, mtp_hidden=None, *, ready_event=None
+    ):
         self.runtime = runtime
         self.items = items
         self.aux = aux
         self.last_hidden = last_hidden
+        self.mtp_hidden = mtp_hidden
         self.ready_event = ready_event
 
     def _rows(self, tensor, item):
@@ -294,13 +334,19 @@ class CaptureHostOutput:
                     item.spec,
                     self._rows(self.aux, item),
                     self._rows(self.last_hidden, item),
+                    *(
+                        [self._rows(self.mtp_hidden, item)]
+                        if self.mtp_hidden is not None
+                        else []
+                    ),
                 )
             )
             held.append(req)
         if not samples:
             return
         future = self.runtime.pending.submit(samples, ready_event=self.ready_event)
-        for index, (req, (spec, _, _)) in enumerate(zip(held, samples, strict=True)):
+        for index, (req, sample) in enumerate(zip(held, samples, strict=True)):
+            spec = sample[0]
             self.runtime.defer_response(
                 req,
                 CaptureCompletion(
@@ -421,6 +467,7 @@ class CaptureRuntime:
         self.results: Dict[str, Dict[str, Any]] = {}
         self.pending = PendingCaptures(self, max_pending_batches)
         self.observer = CaptureObserver(self)
+        self.mtp_capture = None
 
 
 def install(scheduler) -> CaptureRuntime:
@@ -471,6 +518,20 @@ def install(scheduler) -> CaptureRuntime:
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
         defer_response=scheduler.defer_response,
     )
+    mtp_path = os.environ.get("SPECFORGE_MTP_MODEL_PATH")
+    if mtp_path and runtime.is_writer:
+        from specforge.inference.mtp_capture import FrozenMTPCapture
+
+        target_path = model_runner.model_config.model_path
+        if os.path.realpath(mtp_path) != os.path.realpath(target_path):
+            raise ValueError(
+                "SPECFORGE_MTP_MODEL_PATH must match the served target checkpoint"
+            )
+        runtime.mtp_capture = FrozenMTPCapture.from_pretrained(
+            mtp_path,
+            device=model_runner.device,
+            dtype=model_runner.dtype,
+        )
     model_runner.forward_observer = runtime.observer
     scheduler.output_streamer.spec_capture_results = runtime.results
     scheduler._specforge_capture_runtime = runtime

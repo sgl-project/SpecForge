@@ -101,6 +101,7 @@ class ServerCaptureSchema:
     last_hidden_feature: Optional[str]
     passthrough: Tuple[Tuple[str, str, Tuple[int, ...]], ...]
     attention_mask_feature: Optional[str] = None
+    mtp_hidden_feature: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -275,6 +276,11 @@ class SGLangServerCaptureAdapter:
                     self.base_url,
                     self.server_capture,
                 )
+            if (
+                self.schema.mtp_hidden_feature is not None
+                and self.server_capture != "plugin"
+            ):
+                raise ValueError("mtp_hidden requires the capture plugin")
             return self.server_capture
 
     # -- request construction -------------------------------------------------
@@ -312,6 +318,8 @@ class SGLangServerCaptureAdapter:
             features["aux"] = self.schema.aux_feature
         if self.schema.last_hidden_feature is not None:
             features["last_hidden"] = self.schema.last_hidden_feature
+        if self.schema.mtp_hidden_feature is not None:
+            features["mtp_hidden"] = self.schema.mtp_hidden_feature
         passthrough: List[Dict[str, Any]] = []
         for feature_name, payload_key, trailing in self.schema.passthrough:
             if payload_key == "input_ids":
@@ -365,6 +373,9 @@ class SGLangServerCaptureAdapter:
     ):
         from specforge.runtime.contracts import SampleRef
 
+        if self.schema.mtp_hidden_feature is not None:
+            if result.get("mtp_hidden_alignment") != "anchor_post_norm_v1":
+                raise ValueError("capture returned no supported mtp_hidden alignment")
         sample_id = str(result["sample_id"])
         gen = int(result["gen"])
         feats: Dict[str, Dict[str, Any]] = result["features"]
@@ -373,6 +384,17 @@ class SGLangServerCaptureAdapter:
         for name, meta in feats.items():
             shape = tuple(int(d) for d in meta["shape"])
             dtype = str(meta["dtype"])
+            if name == self.schema.mtp_hidden_feature:
+                if (
+                    len(shape) != 3
+                    or shape[0] != 1
+                    or shape[-1] != capture.target_hidden_size
+                ):
+                    raise ValueError(
+                        "mtp_hidden must have shape [1, sequence, target_hidden_size]"
+                    )
+                if dtype not in ("float16", "bfloat16", "float32"):
+                    raise ValueError("mtp_hidden must be a floating-point tensor")
             extra: Dict[str, Any] = {}
             if name == self.schema.last_hidden_feature:
                 extra["target_repr"] = capture.target_repr

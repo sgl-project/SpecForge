@@ -580,6 +580,9 @@ class OnlineDFlashModel(nn.Module):
         ):
             # FLASH requires a minimum of this block size.
             mask_args["BLOCK_SIZE"] = (256, 128)
+        context_offset = getattr(self, "context_offset", 0)
+        if context_offset:
+            mask_args["context_offset"] = context_offset
         sliding_window = self.draft_model.sliding_window
         if sliding_window is None:
             dflash_attn_mask = mask_builder(**mask_args)
@@ -603,6 +606,7 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        mtp_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -614,8 +618,9 @@ class OnlineDFlashModel(nn.Module):
             max_valid_anchors=max_valid_anchors,
         )
 
+        noise_kwargs = {"mtp_hidden": mtp_hidden} if mtp_hidden is not None else {}
         noise_embedding = self._create_noise_embed(
-            input_ids, anchor_positions, block_keep_mask
+            input_ids, anchor_positions, block_keep_mask, **noise_kwargs
         )
 
         context_position_ids = (
@@ -1292,6 +1297,7 @@ class OnlineDFlashModel(nn.Module):
         max_valid_anchors: Optional[int] = None,
         selector_loss_alpha: Optional[float] = None,
         collect_detailed_metrics: bool = True,
+        mtp_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -1307,6 +1313,7 @@ class OnlineDFlashModel(nn.Module):
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            **({"mtp_hidden": mtp_hidden} if mtp_hidden is not None else {}),
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
