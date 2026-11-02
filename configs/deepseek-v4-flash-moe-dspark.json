@@ -9,6 +9,7 @@
     "attention_mode": "deepseek_v4",
     "confidence_head_alpha": 1.0,
     "confidence_head_bias": false,
+    "confidence_head_input": "pre_norm",
     "confidence_head_with_markov": true,
     "context_window": 128,
     "enable_confidence_head": true,

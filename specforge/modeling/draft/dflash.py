@@ -553,8 +553,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         hidden_states: torch.Tensor,
         *,
         prev_token_ids: Optional[torch.Tensor] = None,
+        pre_norm_hidden_states: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        del hidden_states, prev_token_ids
+        del hidden_states, prev_token_ids, pre_norm_hidden_states
         return None
 
     def _sample_draft_tokens(
@@ -650,6 +651,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         moe_token_mask: Optional[torch.Tensor] = None,
+        return_pre_norm_hidden: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
@@ -694,7 +696,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         else:
             # GR's gated readout, V4 mHC's learned head, or the identity.
             hidden_states = self.residual_readout(hidden_states)
-        return self.norm(hidden_states)
+        pre_norm_hidden = hidden_states
+        hidden_states = self.norm(hidden_states)
+        if return_pre_norm_hidden:
+            # DSpark on DeepSeek-V4 scores confidence on the readout before the norm.
+            return hidden_states, pre_norm_hidden
+        return hidden_states
 
     @torch.inference_mode()
     def spec_generate(

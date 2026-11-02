@@ -94,6 +94,7 @@ class DeepseekV4DSparkConfigTest(unittest.TestCase):
         self.assertIsInstance(model.layers[0].self_attn, DeepseekV4Attention)
         self.assertIsInstance(model.layers[0].mlp, MoELayer)
         self.assertIsNone(model.confidence_head.proj.bias)
+        self.assertEqual(model.confidence_head_input, "pre_norm")
         shapes = {name: tuple(t.shape) for name, t in model.state_dict().items()}
         self.assertEqual(shapes, _expected_shapes())
         # Every element of the official mtp.* tensors and nothing else: three
