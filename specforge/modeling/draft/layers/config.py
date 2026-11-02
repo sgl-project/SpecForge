@@ -49,10 +49,16 @@ class ResidualConfig:
     gate_rank: int = 16
     sinkhorn_iters: int = 20
     sinkhorn_eps: float = 1e-6
+    # mHC reads with the previous sublayer's pre-mix (DeepSeek-V4.1, SGLang's
+    # ``pre_from_prev``); False is DeepSeek-V4: each sublayer's own pre-mix and a
+    # learned head.
+    pre_from_prev: bool = True
 
     def __post_init__(self) -> None:
         if self.kind not in ("standard", "gr", "mhc"):
             raise ValueError(f"Unsupported residual kind: {self.kind!r}")
+        if not isinstance(self.pre_from_prev, bool):
+            raise ValueError("pre_from_prev must be a boolean")
         for name in ("num_streams", "gate_rank", "sinkhorn_iters"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
