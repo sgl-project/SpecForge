@@ -6,8 +6,8 @@ and prediction heads. This package owns reusable layer computations.
 - `attention/base.py`: `AttentionContext`, `AttentionOutput[State]` and the
   `Attention[State]` contract. `DenseAttention` is a separate scaffold for
   explicit Q/K/V and Hugging Face caches.
-- `attention/gqa.py`, `attention/mla.py`: projections and dense attention
-  implementations. Projection mixins contain no backend dispatch.
+- `attention/gqa.py`, `attention/mla.py`, `attention/deepseek_v4.py`: projections
+  and dense attention implementations. Projection mixins contain no backend dispatch.
 - `attention/backends/`: eager, SDPA, FlashAttention and FlexAttention execution;
   the existing FlexAttention compilation/backend adapters live here.
 - `attention/rotary.py`: full and partial rotary position encoding.

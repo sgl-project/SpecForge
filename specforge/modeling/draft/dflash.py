@@ -23,6 +23,7 @@ from .dflash_mask import (
 )
 from .layers.attention.backends.flex_attention_backend import flex_attention_backend
 from .layers.attention.base import AttentionContext
+from .layers.attention.deepseek_v4 import validate_deepseek_v4_config
 from .layers.attention.gqa import GQAAttention
 from .layers.attention.mla import MLAAttention
 from .layers.attention.mla import validate_mla_config as validate_dflash_mla_config
@@ -138,17 +139,17 @@ def resolve_dflash_attention_layout(
 def resolve_dflash_attention_mode(config: Qwen3Config) -> str:
     """Validate and return the configured draft attention mode.
 
-    ``gqa`` and ``mha`` share :class:`Qwen3DFlashAttention`; ``mla`` swaps in
-    the latent parameterization while retaining the family decoder,
-    target-context injection, masks, and objectives.
+    ``gqa`` and ``mha`` share :class:`Qwen3DFlashAttention`; ``mla`` and
+    ``deepseek_v4`` swap in their parameterizations while retaining the family
+    decoder, target-context injection, masks, and objectives.
     """
 
     dflash_config = getattr(config, "dflash_config", None) or {}
     attention_mode = str(dflash_config.get("attention_mode", "gqa")).lower()
-    if attention_mode not in ("gqa", "mha", "mla"):
+    if attention_mode not in ("gqa", "mha", "mla", "deepseek_v4"):
         raise ValueError(
             "DFlash dflash_config.attention_mode must be one of "
-            f"gqa, mha, mla, got {attention_mode!r}"
+            f"gqa, mha, mla, deepseek_v4, got {attention_mode!r}"
         )
     return attention_mode
 
@@ -167,13 +168,15 @@ def validate_dflash_attention_config(config: Qwen3Config) -> str:
         )
     if attention_mode == "mla":
         validate_dflash_mla_config(config)
+    if attention_mode == "deepseek_v4":
+        validate_deepseek_v4_config(config)
     return attention_mode
 
 
 def _rope_config(config: Qwen3Config, attention_mode: str) -> Qwen3Config:
-    """Rotary config for the mode: MLA rotates only the partial-RoPE slice."""
+    """Rotary config for the mode: MLA and V4 rotate only the partial-RoPE slice."""
 
-    if attention_mode != "mla":
+    if attention_mode not in ("mla", "deepseek_v4"):
         return config
     rope_config = copy.deepcopy(config)
     rope_config.head_dim = config.qk_rope_head_dim
