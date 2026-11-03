@@ -41,16 +41,28 @@ _PREFETCH_JOIN_TIMEOUT_S = float(
 )
 
 
+def _device_module(device: torch.device):
+    if device.type == "cuda":
+        return torch.cuda
+    if device.type == "npu":
+        npu = getattr(torch, "npu", None)
+        if npu is None:
+            raise ValueError("NPU feature batches need torch_npu imported")
+        return npu
+    return None
+
+
 @dataclass
 class _PreparedBatch:
     batch: TrainBatch
-    ready: Dict[torch.device, torch.cuda.Event]
+    ready: Dict[torch.device, Any]
 
     def consume(self) -> TrainBatch:
-        # Futures synchronize Python threads, not CUDA work. Hand off both
+        # Futures synchronize Python threads, not device work. Hand off both
         # execution ordering and allocator lifetime to the consumer's streams.
         for device, event in self.ready.items():
-            stream = torch.cuda.current_stream(device)
+            module = _device_module(device)
+            stream = module.current_stream(device)
             stream.wait_event(event)
             for tensor in self.batch.tensors.values():
                 if tensor.device == device:
@@ -235,10 +247,15 @@ class FeatureDataLoader:
         batch = self._timed_make_batch(refs)
         ready = {}
         for tensor in batch.tensors.values():
-            if tensor.is_cuda and tensor.device not in ready:
-                event = torch.cuda.Event()
-                event.record(torch.cuda.current_stream(tensor.device))
-                ready[tensor.device] = event
+            device = tensor.device
+            if device in ready:
+                continue
+            module = _device_module(device)
+            if module is None:
+                continue
+            event = module.Event()
+            event.record(module.current_stream(device))
+            ready[device] = event
         return _PreparedBatch(batch, ready)
 
     def _maybe_gc(self) -> None:
