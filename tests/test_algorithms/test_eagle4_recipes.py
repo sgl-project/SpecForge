@@ -1,8 +1,8 @@
 """Validate the stage-1 recipes without a target model or external mapping file."""
 
 import json
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.application.planning import validate_resolved_run

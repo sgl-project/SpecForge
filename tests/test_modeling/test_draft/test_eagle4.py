@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 import tempfile
 import unittest
 from unittest import mock
@@ -20,11 +18,7 @@ except ImportError:
 from specforge.modeling._mask_utils import _make_causal_mask
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.eagle4 import LlamaForCausalLMEagle4
-from specforge.modeling.draft.eagle4_moe import (
-    Eagle4MoE,
-    relu2,
-    resolve_act_fn,
-)
+from specforge.modeling.draft.eagle4_moe import Eagle4MoE, relu2, resolve_act_fn
 from specforge.modeling.draft.eagle4_structure import (
     EAGLE4_ARCH,
     draft_sliding_window,

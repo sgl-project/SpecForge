@@ -24,10 +24,7 @@ from specforge.modeling.draft.eagle4_structure import (
     draft_sliding_window,
     efficient_head_export_config,
 )
-from specforge.modeling.draft.llama3_eagle import (
-    LlamaDecoderLayer,
-    LlamaRMSNorm,
-)
+from specforge.modeling.draft.llama3_eagle import LlamaDecoderLayer, LlamaRMSNorm
 from specforge.modeling.draft.registry import register_draft
 from specforge.utils import print_with_rank
 
