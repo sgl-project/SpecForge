@@ -423,6 +423,30 @@ class CaptureRuntime:
         self.observer = CaptureObserver(self)
 
 
+def _model_device(model_runner) -> Optional[torch.device]:
+    """The model runner's actual device, or ``None`` when it does not say."""
+    raw = getattr(model_runner, "device", None)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = torch.device(raw)
+        except (TypeError, RuntimeError):
+            return None
+    device_type = getattr(raw, "type", None)
+    if device_type is None:
+        return None
+    if getattr(raw, "index", None) is not None:
+        return raw
+    # Some runners keep the device type and the logical card apart (the NPU
+    # fork: device="npu", gpu_id=1). Fill the index from the runner so the
+    # sink worker binds the right card instead of defaulting to index 0.
+    gpu_id = getattr(model_runner, "gpu_id", None)
+    if isinstance(gpu_id, int) and gpu_id >= 0:
+        return torch.device(device_type, gpu_id)
+    return raw
+
+
 def install(scheduler) -> CaptureRuntime:
     """Validate the server configuration and wire capture into ``scheduler``."""
     from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -463,11 +487,16 @@ def install(scheduler) -> CaptureRuntime:
         # The sink allocates the arena on the first capture; reject a missing
         # size now rather than failing every capture batch.
         arena_bytes()
+    # Resolve publication against the model's actual device at startup: an
+    # unsupported combination (GPU_PUT=1 or nvlink on non-CUDA) fails here,
+    # not inside the first capture's sink thread.
+    device = _model_device(model_runner)
+    gpu_put = gpu_put_enabled(device)
 
     runtime = CaptureRuntime(
-        sink=SpecCaptureSink(features.return_aux_hidden_state_layer_ids),
+        sink=SpecCaptureSink(features.return_aux_hidden_state_layer_ids, device=device),
         is_writer=get_parallel().attn_tp_rank == 0,
-        gpu_put=gpu_put_enabled(),
+        gpu_put=gpu_put,
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
         defer_response=scheduler.defer_response,
     )

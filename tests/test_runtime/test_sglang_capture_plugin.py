@@ -419,6 +419,54 @@ def _scheduler():
     return scheduler
 
 
+def _fake_npu_device_parse():
+    """Parse ``npu`` device strings into stand-ins on hosts without torch_npu.
+
+    ``torch.device("npu")`` only resolves when the torch_npu backend is
+    registered; these tests exercise the plugin's generic device logic, so
+    the parse itself is mocked locally and never touches other tests.
+    """
+    real_device = torch.device
+
+    def parse(*args):
+        if args and isinstance(args[0], str) and args[0].startswith("npu"):
+            text = args[0]
+            index = args[1] if len(args) > 1 else None
+            if ":" in text:
+                _, _, suffix = text.partition(":")
+                index = int(suffix)
+            return SimpleNamespace(type="npu", index=index)
+        return real_device(*args)
+
+    return mock.patch.object(capture.torch, "device", side_effect=parse)
+
+
+class TestModelDevice(unittest.TestCase):
+    def test_missing_or_unparsable_devices_yield_none(self):
+        self.assertIsNone(capture._model_device(SimpleNamespace()))
+        self.assertIsNone(capture._model_device(SimpleNamespace(device=object())))
+
+    def test_explicit_index_wins_over_gpu_id(self):
+        runner = SimpleNamespace(device=torch.device("cuda", 2), gpu_id=1)
+        self.assertEqual(capture._model_device(runner), torch.device("cuda", 2))
+
+    def test_missing_index_is_filled_from_gpu_id(self):
+        # Generic logic on a device type every torch build knows.
+        runner = SimpleNamespace(device="meta", gpu_id=1)
+        self.assertEqual(capture._model_device(runner), torch.device("meta", 1))
+
+    def test_split_npu_device_and_gpu_id(self):
+        # The NPU fork's real interface: device="npu", gpu_id=<logical card>.
+        with _fake_npu_device_parse():
+            device = capture._model_device(SimpleNamespace(device="npu", gpu_id=1))
+        self.assertEqual((device.type, device.index), ("npu", 1))
+
+    @unittest.skipUnless(hasattr(torch, "npu"), "requires torch_npu")
+    def test_real_npu_device_parse(self):
+        runner = SimpleNamespace(device="npu", gpu_id=1)
+        self.assertEqual(capture._model_device(runner), torch.device("npu", 1))
+
+
 class TestInstall(unittest.TestCase):
     FEATURES = dict(
         enable_return_aux_hidden_states=True,
@@ -501,6 +549,75 @@ class TestInstall(unittest.TestCase):
                 scheduler.disaggregation_mode = mode
                 with self.assertRaisesRegex(RuntimeError, "PD disaggregation"):
                     self._install(scheduler)
+
+    def test_npu_server_selects_host_publication(self):
+        scheduler = _scheduler()
+        scheduler.tp_worker.model_runner.device = "npu:1"
+        env = {"MOONCAKE_PROTOCOL": "rdma", "ASCEND_RT_VISIBLE_DEVICES": "0,1"}
+        with _fake_npu_device_parse():
+            _, runtime = self._install(scheduler, env=env)
+        self.addCleanup(runtime.sink._executor.shutdown)
+        self.assertFalse(runtime.gpu_put)
+        self.assertEqual(
+            (runtime.sink.device.type, runtime.sink.device.index), ("npu", 1)
+        )
+
+    def test_npu_split_device_and_gpu_id_binds_the_right_card(self):
+        # Regression: the NPU fork reports device="npu" and gpu_id separately;
+        # the sink must not fall back to card 0.
+        scheduler = _scheduler()
+        scheduler.tp_worker.model_runner.device = "npu"
+        scheduler.tp_worker.model_runner.gpu_id = 1
+        with _fake_npu_device_parse():
+            _, runtime = self._install(scheduler)
+        self.addCleanup(runtime.sink._executor.shutdown)
+        self.assertEqual(
+            (runtime.sink.device.type, runtime.sink.device.index), ("npu", 1)
+        )
+
+    def test_npu_rejects_device_publication_at_install(self):
+        scheduler = _scheduler()
+        scheduler.tp_worker.model_runner.device = "npu:0"
+        env = {"MOONCAKE_PROTOCOL": "rdma", "SGLANG_SPEC_CAPTURE_GPU_PUT": "1"}
+        with _fake_npu_device_parse():
+            with self.assertRaisesRegex(ValueError, "SGLANG_SPEC_CAPTURE_GPU_PUT"):
+                self._install(scheduler, env=env)
+
+    def test_npu_rejects_nvlink_at_install(self):
+        scheduler = _scheduler()
+        scheduler.tp_worker.model_runner.device = "npu:0"
+        env = {
+            "MOONCAKE_PROTOCOL": "nvlink",
+            "SGLANG_SPEC_CAPTURE_ARENA_BYTES": str(1 << 30),
+        }
+        with _fake_npu_device_parse():
+            with self.assertRaisesRegex(ValueError, "nvlink"):
+                self._install(scheduler, env=env)
+
+    def test_cuda_server_keeps_device_publication(self):
+        scheduler = _scheduler()
+        scheduler.tp_worker.model_runner.device = "cuda:0"
+        env = {"MOONCAKE_PROTOCOL": "rdma", "SGLANG_SPEC_CAPTURE_GPU_PUT": "1"}
+        with (
+            mock.patch.object(torch.version, "cuda", "12.4"),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+        ):
+            _, runtime = self._install(scheduler, env=env)
+        self.addCleanup(runtime.sink._executor.shutdown)
+        self.assertTrue(runtime.gpu_put)
+
+    def test_rocm_auto_mode_stays_on_host_publication(self):
+        # ROCm also reports device.type "cuda", but torch.version.cuda is
+        # None; auto RDMA mode must keep its historical host publication.
+        scheduler = _scheduler()
+        scheduler.tp_worker.model_runner.device = "cuda:0"
+        with (
+            mock.patch.object(torch.version, "cuda", None),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+        ):
+            _, runtime = self._install(scheduler, env={"MOONCAKE_PROTOCOL": "rdma"})
+        self.addCleanup(runtime.sink._executor.shutdown)
+        self.assertFalse(runtime.gpu_put)
 
     def test_rejects_sglang_builds_without_the_extension_points(self):
         for missing in ("forward_observer", "defer_response"):

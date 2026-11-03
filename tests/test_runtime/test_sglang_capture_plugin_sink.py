@@ -473,5 +473,139 @@ class NvlinkArenaTest(unittest.TestCase):
         self.arena._stream.synchronize.assert_called_once_with()
 
 
+class AscendHostPublicationTest(unittest.TestCase):
+    """N1: the sink follows the model's device, not Ascend env hints.
+
+    NPU devices are stand-ins (``SimpleNamespace(type="npu", index=...)``):
+    ``torch.device("npu")`` does not resolve without torch_npu, and these
+    tests exercise generic logic that must run on plain CPU/CUDA hosts.
+    """
+
+    def _store_module(self, store):
+        store_module = types.ModuleType("mooncake.store")
+        store_module.MooncakeDistributedStore = lambda: store
+        store_module.ReplicateConfig = lambda: SimpleNamespace(replica_num=1)
+        return {
+            "mooncake": types.ModuleType("mooncake"),
+            "mooncake.store": store_module,
+        }
+
+    def _connect(self, device, env, store):
+        capture_sink = sink.SpecCaptureSink(device=device)
+        self.addCleanup(capture_sink._executor.shutdown)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.dict(sys.modules, self._store_module(store)),
+        ):
+            capture_sink._connect()
+        return capture_sink
+
+    def test_ascend_mount_follows_the_model_device_not_the_env(self):
+        store = mock.Mock()
+        store.setup.return_value = 0
+        store.allocate_and_mount_segment.return_value = {"ret": 0}
+        # No ASCEND_RT_VISIBLE_DEVICES: the runner's NPU device decides.
+        device = SimpleNamespace(type="npu", index=0)
+        self._connect(device, {"MOONCAKE_PROTOCOL": "tcp"}, store)
+        kwargs = store.setup.call_args.kwargs
+        self.assertEqual(kwargs["global_segment_size"], 0)
+        self.assertEqual(kwargs["local_buffer_size"], 0)
+        store.allocate_and_mount_segment.assert_called_once_with(1 << 30, "tcp", "cpu")
+
+    def test_non_ascend_device_overrides_the_env_hint(self):
+        store = mock.Mock()
+        store.setup.return_value = 0
+        env = {"MOONCAKE_PROTOCOL": "tcp", "ASCEND_RT_VISIBLE_DEVICES": "0"}
+        self._connect(torch.device("cpu"), env, store)
+        kwargs = store.setup.call_args.kwargs
+        self.assertEqual(kwargs["global_segment_size"], 1 << 30)
+        self.assertEqual(kwargs["local_buffer_size"], 1 << 30)
+        store.allocate_and_mount_segment.assert_not_called()
+
+    def test_mount_failure_raises_instead_of_returning_a_store(self):
+        store = mock.Mock()
+        store.setup.return_value = 0
+        store.allocate_and_mount_segment.return_value = {"ret": -1}
+        with self.assertRaisesRegex(RuntimeError, "mount segment failed"):
+            self._connect(SimpleNamespace(type="npu", index=0), {}, store)
+
+    def test_setup_failure_raises_instead_of_returning_a_store(self):
+        store = mock.Mock()
+        store.setup.return_value = -1
+        with self.assertRaisesRegex(RuntimeError, "setup failed"):
+            self._connect(SimpleNamespace(type="npu", index=0), {}, store)
+
+    def test_sink_worker_binds_the_model_device_context(self):
+        device = SimpleNamespace(type="npu", index=1)
+        npu_module = mock.Mock()
+        with mock.patch.object(torch, "npu", npu_module, create=True):
+            capture_sink = sink.SpecCaptureSink(device=device)
+            self.addCleanup(capture_sink._executor.shutdown)
+            future = capture_sink._executor.submit(
+                lambda: threading.current_thread().name
+            )
+            self.assertIn("spec-capture-batch-put", future.result(timeout=10))
+        npu_module.set_device.assert_called_once_with(device)
+
+    def test_sink_worker_defaults_to_index_zero_when_the_device_has_none(self):
+        # Generic fallback on a device type every torch build knows.
+        device = SimpleNamespace(type="meta", index=None)
+        meta_module = mock.Mock()
+        with mock.patch.object(torch, "meta", meta_module, create=True):
+            capture_sink = sink.SpecCaptureSink(device=device)
+            self.addCleanup(capture_sink._executor.shutdown)
+            capture_sink._executor.submit(lambda: None).result(timeout=10)
+        meta_module.set_device.assert_called_once_with(torch.device("meta", 0))
+
+    def test_sink_worker_skips_context_binding_on_cpu_and_cuda(self):
+        for device in (None, torch.device("cpu"), torch.device("cuda", 0)):
+            with self.subTest(device=device):
+                npu_module = mock.Mock()
+                with mock.patch.object(torch, "npu", npu_module, create=True):
+                    capture_sink = sink.SpecCaptureSink(device=device)
+                    self.addCleanup(capture_sink._executor.shutdown)
+                    future = capture_sink._executor.submit(lambda: None)
+                    future.result(timeout=10)
+                npu_module.set_device.assert_not_called()
+
+    def test_gpu_put_follows_the_model_device(self):
+        env = {"MOONCAKE_PROTOCOL": "rdma", "SGLANG_SPEC_CAPTURE_GPU_PUT": "1"}
+        npu = SimpleNamespace(type="npu", index=0)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(torch.version, "cuda", "12.4"),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+        ):
+            self.assertTrue(sink.gpu_put_enabled(torch.device("cuda", 0)))
+            with self.assertRaisesRegex(ValueError, "SGLANG_SPEC_CAPTURE_GPU_PUT"):
+                sink.gpu_put_enabled(npu)
+        with mock.patch.dict(
+            os.environ,
+            {"MOONCAKE_PROTOCOL": "nvlink", ARENA_BYTES: "4096"},
+            clear=True,
+        ):
+            self.assertTrue(sink.gpu_put_enabled(torch.device("cuda", 0)))
+            with self.assertRaisesRegex(ValueError, "nvlink"):
+                sink.gpu_put_enabled(npu)
+
+    def test_rocm_behavior_is_unchanged(self):
+        # ROCm reports device.type "cuda" with torch.version.cuda = None.
+        # Auto mode keeps its historical host publication, and an explicit
+        # GPU_PUT=1 keeps working exactly as before the device was consulted.
+        rocm = torch.device("cuda", 0)
+        with (
+            mock.patch.object(torch.version, "cuda", None),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+        ):
+            with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "rdma"}, clear=True):
+                self.assertFalse(sink.gpu_put_enabled(rocm))
+            with mock.patch.dict(
+                os.environ,
+                {"MOONCAKE_PROTOCOL": "rdma", "SGLANG_SPEC_CAPTURE_GPU_PUT": "1"},
+                clear=True,
+            ):
+                self.assertTrue(sink.gpu_put_enabled(rocm))
+
+
 if __name__ == "__main__":
     unittest.main()
