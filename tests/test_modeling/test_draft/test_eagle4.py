@@ -309,8 +309,8 @@ class Eagle4MoETest(unittest.TestCase):
 
 
 class Eagle4DenseHeadTest(unittest.TestCase):
-    def test_rejects_candidate_training_and_pruned_vocabulary(self):
-        for cfg in (
+    def test_efficient_head_config_is_export_metadata_only(self):
+        model = LlamaForCausalLMEagle4(
             _config(
                 efficient_lm_head_config={
                     "type": "low_rank",
@@ -318,13 +318,16 @@ class Eagle4DenseHeadTest(unittest.TestCase):
                     "num_candidates": 3,
                 }
             ),
-            _config(draft_vocab_size=8),
-        ):
-            with (
-                self.subTest(config=cfg),
-                self.assertRaisesRegex(ValueError, "Stage-1"),
-            ):
-                LlamaForCausalLMEagle4(cfg, attention_backend="sdpa")
+            attention_backend="sdpa",
+        )
+        self.assertFalse(any("efficient_lm_head" in k for k in model.state_dict()))
+        hidden = torch.randn(1, 3, 8)
+        logits = model.compute_logits(hidden)
+        torch.testing.assert_close(logits, model.lm_head(model.norm(hidden)))
+        logits.sum().backward()
+        self.assertIsNotNone(model.lm_head.weight.grad)
+        with self.assertRaisesRegex(ValueError, "draft_vocab_size"):
+            LlamaForCausalLMEagle4(_config(draft_vocab_size=8))
 
     def test_dense_export_roundtrip_preserves_identity_mapping(self):
         model = LlamaForCausalLMEagle4(_config(), attention_backend="sdpa")

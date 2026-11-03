@@ -22,6 +22,7 @@ from specforge.modeling.draft.eagle4_moe import update_eagle4_router_bias
 from specforge.modeling.draft.eagle4_structure import (
     EAGLE4_ARCH,
     draft_sliding_window,
+    efficient_head_export_config,
 )
 from specforge.modeling.draft.llama3_eagle import (
     LlamaDecoderLayer,
@@ -45,10 +46,8 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         if EAGLE4_ARCH not in architectures:
             config.architectures = [EAGLE4_ARCH]
 
-        if getattr(config, "efficient_lm_head_config", None) is not None:
-            raise ValueError(
-                "Stage-1 EAGLE-4 training requires a dense LM head; remove efficient_lm_head_config"
-            )
+        # This is an inference-export specification, not a training head.
+        efficient_head_export_config(config)
         if config.num_hidden_layers != 1:
             raise ValueError("EAGLE-4 supports one draft layer")
         self.vocab_size = config.vocab_size

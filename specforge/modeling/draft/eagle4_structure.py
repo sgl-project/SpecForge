@@ -15,6 +15,29 @@ from typing import Any, Optional
 EAGLE4_ARCH = "LlamaForCausalLMEagle4"
 
 
+def efficient_head_export_config(config: Any) -> Optional[dict]:
+    """Validate inference-export metadata; stage-1 training stays dense."""
+    head = getattr(config, "efficient_lm_head_config", None)
+    if head is None:
+        return None
+    if not isinstance(head, dict) or head.get("type") != "low_rank":
+        raise ValueError("efficient_lm_head_config must specify type='low_rank'")
+    for key, maximum in (
+        ("rank", min(config.hidden_size, config.vocab_size)),
+        ("num_candidates", config.vocab_size),
+    ):
+        value = head.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= maximum
+        ):
+            raise ValueError(
+                f"efficient_lm_head_config.{key} must be in [1, {maximum}]"
+            )
+    return dict(head)
+
+
 def draft_uses_rope(config: Any) -> bool:
     """RoPE is off if any of the three position settings disables it."""
 

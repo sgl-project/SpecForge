@@ -18,6 +18,7 @@ class Eagle4RecipeTest(unittest.TestCase):
         self.assertFalse(algorithm.providers.vocab_mapping_modes)
         for relative in (
             "examples/configs/offline/colocated/qwen3-4b-eagle4.yaml",
+            "examples/configs/offline/colocated/qwen3.8-27b-eagle4.yaml",
             "examples/configs/online/disaggregated/managed-local/qwen3-4b-eagle4.yaml",
         ):
             with self.subTest(recipe=relative):
@@ -26,7 +27,10 @@ class Eagle4RecipeTest(unittest.TestCase):
                 self.assertFalse(cfg.model.vocab_mapping_path)
                 draft = json.loads((ROOT / cfg.model.draft_model_config).read_text())
                 self.assertEqual(draft["draft_vocab_size"], draft["vocab_size"])
-                self.assertNotIn("efficient_lm_head_config", draft)
+                self.assertEqual(
+                    draft["efficient_lm_head_config"],
+                    {"type": "low_rank", "rank": 128, "num_candidates": 128},
+                )
                 self.assertEqual(cfg.training.ttt_length, 7)
                 self.assertEqual(cfg.training.attention_backend, "flex_attention")
                 if cfg.deployment.mode == "disaggregated":
