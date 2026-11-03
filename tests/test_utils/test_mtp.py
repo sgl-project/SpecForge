@@ -20,8 +20,6 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
@@ -29,7 +27,7 @@ from specforge.algorithms.mtp.providers import _init_from_native_mtp
 from specforge.core.mtp import OnlineMTPModel
 from specforge.modeling.draft import available_drafts, resolve_draft
 from specforge.modeling.draft.mtp import Qwen3_5MTPDraftModel
-from specforge.training.strategies.base import MTPTrainStrategy
+from specforge.training.strategies.base import MTPTrainStrategy, _cpu_supervised_rows
 
 
 def _tiny_config(**overrides) -> Qwen3Config:
@@ -64,6 +62,14 @@ def _tiny_batch(config: Qwen3Config, seq_len: int = 16, batch: int = 2):
     return input_ids, hidden_states, loss_mask
 
 
+def _sparse_loss_mask(like: torch.Tensor) -> torch.Tensor:
+    """Mostly prompt: a few supervised spans, as in multi-turn data."""
+    loss_mask = torch.zeros_like(like)
+    loss_mask[0, 3:6] = 1.0
+    loss_mask[1, 10:15] = 1.0
+    return loss_mask
+
+
 def _cfg(target_model_path: str, draft_checkpoint_path: str = ""):
     return SimpleNamespace(
         model=SimpleNamespace(
@@ -72,14 +78,6 @@ def _cfg(target_model_path: str, draft_checkpoint_path: str = ""):
             cache_dir=None,
         )
     )
-
-
-def _free_port() -> int:
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 class OnlineMTPModelTest(unittest.TestCase):
@@ -133,35 +131,40 @@ class OnlineMTPModelTest(unittest.TestCase):
         config = _tiny_config()
         draft = Qwen3_5MTPDraftModel(config)
         input_ids, hidden_states, loss_mask = _tiny_batch(config)
-        for chunk_size in (0, 4):
-            with self.subTest(chunk_size=chunk_size):
-                draft.zero_grad(set_to_none=True)
-                model = OnlineMTPModel(draft, objective_chunk_size=chunk_size)
-                loss, corrects, denoms = model(
-                    input_ids=input_ids,
-                    hidden_states=hidden_states,
-                    loss_mask=torch.zeros_like(loss_mask),
-                )
-                loss.backward()
+        loss_mask = torch.zeros_like(loss_mask)
+        # rows found in the model, and the empty rows found on the host
+        for supervised_rows in (None, _cpu_supervised_rows(loss_mask)):
+            for chunk_size in (0, 4):
+                with self.subTest(
+                    host_rows=supervised_rows is not None, chunk_size=chunk_size
+                ):
+                    draft.zero_grad(set_to_none=True)
+                    model = OnlineMTPModel(draft, objective_chunk_size=chunk_size)
+                    loss, corrects, denoms = model(
+                        input_ids=input_ids,
+                        hidden_states=hidden_states,
+                        loss_mask=loss_mask,
+                        supervised_rows=supervised_rows,
+                    )
+                    loss.backward()
 
-                self.assertEqual(0.0, loss.item())
-                self.assertEqual(0.0, corrects[0].sum().item())
-                self.assertEqual(0.0, denoms[0].sum().item())
-                for name, parameter in draft.named_parameters():
-                    if parameter.requires_grad:
-                        with self.subTest(parameter=name):
-                            self.assertIsNotNone(parameter.grad)
-                            self.assertEqual(0.0, parameter.grad.abs().sum().item())
+                    self.assertEqual(0.0, loss.item())
+                    self.assertEqual(0.0, corrects[0].sum().item())
+                    self.assertEqual(0.0, denoms[0].sum().item())
+                    for name, parameter in draft.named_parameters():
+                        if parameter.requires_grad:
+                            self.assertIsNotNone(parameter.grad, name)
+                            self.assertEqual(
+                                0.0, parameter.grad.abs().sum().item(), name
+                            )
 
-    def test_precomputed_supervised_rows_match_lookup(self):
+    def test_host_supervised_rows_match_model_lookup(self):
         config = _tiny_config()
         torch.manual_seed(0)
         draft = Qwen3_5MTPDraftModel(config)
         input_ids, hidden_states, loss_mask = _tiny_batch(config)
-        loss_mask.zero_()
-        loss_mask[0, 3:6] = 1.0
-        loss_mask[1, 10:15] = 1.0
-        rows = OnlineMTPModel.supervised_rows(loss_mask)
+        loss_mask = _sparse_loss_mask(loss_mask)
+        rows = _cpu_supervised_rows(loss_mask)
         for chunk_size in (0, 4):
             results = []
             for supervised_rows in (None, rows):
@@ -195,10 +198,7 @@ class OnlineMTPModelTest(unittest.TestCase):
         # ragged supervision so chunk boundaries cross masked/unmasked rows
         loss_mask[0, 5:9] = 0.0
         if sparse:
-            # mostly prompt: a few supervised spans, as in multi-turn data
-            loss_mask.zero_()
-            loss_mask[0, 3:6] = 1.0
-            loss_mask[1, 10:15] = 1.0
+            loss_mask = _sparse_loss_mask(loss_mask)
         input_ids, loss_mask = input_ids.to(device), loss_mask.to(device)
         hidden_states = hidden_states.to(device=device, dtype=dtype)
         for frozen_head in (False, True):
@@ -334,8 +334,6 @@ class MTPTrainStrategyTest(unittest.TestCase):
         denoms = [torch.tensor([[1.0, 1.0, 1.0]])]
 
         class _Stub(torch.nn.Module):
-            supervised_rows = staticmethod(OnlineMTPModel.supervised_rows)
-
             def __init__(self):
                 super().__init__()
                 self.proj = torch.nn.Linear(1, 1)
@@ -369,8 +367,6 @@ class MTPTrainStrategyTest(unittest.TestCase):
         received = {}
 
         class _Stub(torch.nn.Module):
-            supervised_rows = staticmethod(OnlineMTPModel.supervised_rows)
-
             def __init__(self):
                 super().__init__()
                 self.proj = torch.nn.Linear(1, 1)
@@ -394,37 +390,6 @@ class MTPTrainStrategyTest(unittest.TestCase):
 
         # labels are x[t+2]: shifted mask [1, 0, 1, 1, 0]
         self.assertEqual([0, 2, 3], received["supervised_rows"].tolist())
-
-    def test_forward_loss_through_ddp_wrapper(self):
-        # NO_SHARD wraps the model in DistributedDataParallel, which does not
-        # forward attribute access, so the strategy has to look through it.
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(_free_port()))
-        dist.init_process_group(backend="gloo", rank=0, world_size=1)
-        try:
-            config = _tiny_config()
-            torch.manual_seed(0)
-            model = OnlineMTPModel(Qwen3_5MTPDraftModel(config))
-            input_ids, hidden_states, loss_mask = _tiny_batch(config)
-            loss_mask[:, :9] = 0.0
-            batch = SimpleNamespace(
-                tensors={
-                    "input_ids": input_ids,
-                    "loss_mask": loss_mask,
-                    "target_last_hidden_states": hidden_states,
-                }
-            )
-            wrapped = DDP(model)
-            self.assertFalse(hasattr(wrapped, "supervised_rows"))
-
-            out = MTPTrainStrategy(wrapped).forward_loss(batch)
-            expected, _, _ = model(
-                input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
-            )
-
-            self.assertTrue(torch.equal(out.loss.detach(), expected.detach()))
-        finally:
-            dist.destroy_process_group()
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_forward_loss_does_not_sync_cuda(self):

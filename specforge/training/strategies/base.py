@@ -96,6 +96,20 @@ def _cpu_max_valid_anchors(loss_mask: torch.Tensor) -> Optional[int]:
     return int(valid.sum(dim=1).max().item())
 
 
+def _cpu_supervised_rows(loss_mask: torch.Tensor) -> Optional[torch.Tensor]:
+    """Find the MTP positions with loss without synchronizing the GPU.
+
+    OnlineMTPModel runs lm_head + CE only on positions whose x[t+2] label is
+    supervised, i.e. the flat nonzero indices of ``loss_mask[:, 2:]`` padded by
+    one. ``nonzero`` has a data-dependent size, so on the host it is cheap and
+    on the GPU it syncs. Direct GPU callers keep the model's fallback.
+    """
+    if loss_mask.device.type != "cpu":
+        return None
+    shifted = nn.functional.pad(loss_mask[:, 2:], (0, 1))
+    return shifted.reshape(-1).nonzero(as_tuple=True)[0]
+
+
 class DraftTrainStrategy(abc.ABC):
     name: str
     required_features: set
@@ -654,27 +668,15 @@ class MTPTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.mtp_model.parameters()).device
 
-    def _mtp_module(self) -> nn.Module:
-        # NO_SHARD wraps the model in DistributedDataParallel, which does not
-        # forward attribute access (see DFlashTrainStrategy._draft_attr).
-        return getattr(self.mtp_model, "module", self.mtp_model)
-
     def forward_loss(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepOutput:
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        # The objective runs only on supervised rows. Their indices have a
-        # data-dependent size, so find them while loss_mask is still on the host
-        # (as pinned Mooncake receives keep it); on the device that would sync.
-        # A device-resident loss_mask leaves the lookup to the model.
-        supervised_rows = None
-        if t["loss_mask"].device.type == "cpu":
-            supervised_rows = self._mtp_module().supervised_rows(t["loss_mask"])
-            if device.type != "cpu":
-                supervised_rows = supervised_rows.pin_memory()
-            supervised_rows = supervised_rows.to(device, non_blocking=True)
+        supervised_rows = _cpu_supervised_rows(t["loss_mask"])
+        if supervised_rows is not None and device.type != "cpu":
+            supervised_rows = supervised_rows.pin_memory().to(device, non_blocking=True)
         # OnlineMTPModel performs the next-token shift internally and returns
         # per-position correct/denominator tensors (single-layer: length-1 lists).
         # Non-blocking like the other strategies: pinned Mooncake receives keep
