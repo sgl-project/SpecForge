@@ -280,6 +280,42 @@ class TestConsume(unittest.TestCase):
         self.assertEqual(runtime.results["a"]["sample_id"], "a")
         self.assertEqual(runtime.pending.pending_bytes, 0)
 
+    def test_filtered_samples_keep_the_original_storage_reservation(self):
+        for mode in ("missing", "unfinished"):
+            with self.subTest(mode=mode):
+                runtime = _runtime(max_pending=8, max_pending_bytes=60)
+                reqs = [_req(rid, 1, _spec(rid)) for rid in "abc"]
+                batch = SimpleNamespace(reqs=reqs)
+                device = runtime.observer.after_forward(
+                    batch,
+                    _forward_batch([1, 1, 1]),
+                    _logits_output(3, aux_width=3, hidden=2),
+                    can_run_graph=False,
+                )
+                host = device.copy_to_host(_host_copy)
+                if mode == "unfinished":
+                    for req in reqs[1:]:
+                        req.finished = lambda: False
+                    consume_batch = batch
+                else:
+                    consume_batch = SimpleNamespace(reqs=reqs[:1])
+                host.consume(consume_batch, commits=None)
+
+                [(samples, future)] = runtime.sink.submissions
+                self.assertEqual(len(samples), 1)
+                storage_bytes = sum(
+                    tensor.untyped_storage().nbytes() for tensor in samples[0][1:]
+                )
+                self.assertEqual(storage_bytes, 60)
+                self.assertEqual(runtime.pending.pending_bytes, 60)
+                self.assertIsNone(runtime.pending.try_reserve(40))
+
+                future.set_result([{"sample_id": "a"}])
+                admitted = runtime.pending.try_reserve(40)
+                self.assertIsNotNone(admitted)
+                self.assertEqual(runtime.pending.pending_bytes, 40)
+                admitted.release()
+
     def test_d2h_failure_releases_the_reservation(self):
         runtime = _runtime()
         req = _req("a", 2, _spec("a"))

@@ -475,13 +475,24 @@ class SGLangServerCaptureAdapter:
                     )
                 return results
             time.sleep(min(self.backpressure_poll_s, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                continue
             retry_tasks = [tasks[index] for index in retry_indices]
-            retry_results = self._produce_refs_once(retry_tasks, capture=capture)
+            retry_results = self._produce_refs_once(
+                retry_tasks,
+                capture=capture,
+                timeout_s=min(self.timeout_s, remaining),
+            )
             for index, result in zip(retry_indices, retry_results, strict=True):
                 results[index] = result
 
     def _produce_refs_once(
-        self, tasks: List[PromptTask], *, capture: CaptureConfig
+        self,
+        tasks: List[PromptTask],
+        *,
+        capture: CaptureConfig,
+        timeout_s: Optional[float] = None,
     ) -> List[Union["SampleRef", ServerCaptureFailure]]:  # noqa: F821
         """One batched server call, order-aligned with ``tasks``.
 
@@ -525,7 +536,9 @@ class SGLangServerCaptureAdapter:
                 server_url=self.base_url,
             )
         rows = self.post_fn(
-            f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
+            f"{self.base_url}/generate",
+            json_body=body,
+            timeout=self.timeout_s if timeout_s is None else timeout_s,
         )
         rows = _flatten_list_wrappers(rows)
         if len(rows) != len(tasks):

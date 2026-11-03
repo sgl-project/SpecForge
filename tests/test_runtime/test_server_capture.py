@@ -682,6 +682,52 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertIsNone(result.backpressure)
         self.assertGreater(len(calls), 1)
 
+    def test_backpressure_deadline_gates_retries_and_caps_http_timeout(self):
+        for poll_s, advance_request, expected_timeouts in (
+            (1.0, False, [300.0]),
+            (0.25, True, [300.0, 0.75]),
+        ):
+            with self.subTest(poll_s=poll_s):
+                now = [0.0]
+                timeouts = []
+
+                def server(url, json_body, timeout):
+                    timeouts.append(timeout)
+                    if advance_request and len(timeouts) > 1:
+                        now[0] += timeout
+                    return [
+                        {
+                            "meta_info": {
+                                "spec_capture": {
+                                    "sample_id": "run0:t0",
+                                    "error": "publication byte budget exhausted",
+                                    "backpressure": "publication_bytes",
+                                }
+                            }
+                        }
+                    ]
+
+                _, _, _, adapter = _mk(server=server)
+                adapter.backpressure_timeout_s = 1.0
+                adapter.backpressure_poll_s = poll_s
+                with (
+                    mock.patch(
+                        "specforge.inference.adapters.server_capture.time.monotonic",
+                        side_effect=lambda: now[0],
+                    ),
+                    mock.patch(
+                        "specforge.inference.adapters.server_capture.time.sleep",
+                        side_effect=lambda delay: now.__setitem__(0, now[0] + delay),
+                    ),
+                ):
+                    (result,) = adapter.produce_refs(
+                        [_task(0, 4)], capture=_eagle3_contract()
+                    )
+
+                self.assertEqual(timeouts, expected_timeouts)
+                self.assertEqual(now[0], 1.0)
+                self.assertIn("backpressure wait exhausted", result.reason)
+
     def test_per_task_server_error_becomes_failure_marker(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend, error_sample_ids={"run0:t0"})

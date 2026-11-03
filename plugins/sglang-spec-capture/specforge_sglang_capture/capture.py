@@ -435,11 +435,6 @@ class _PublicationLease:
         self._pending = pending
         self.nbytes = nbytes
 
-    def adjust(self, nbytes: int) -> None:
-        if self._pending is not None:
-            self._pending._pending_bytes += nbytes - self.nbytes
-            self.nbytes = nbytes
-
     def release(self) -> None:
         pending, self._pending = self._pending, None
         if pending is not None:
@@ -519,8 +514,12 @@ class PendingCaptures:
 
     def submit(self, samples: List[Sample], *, ready_event=None, lease=None) -> Future:
         nbytes = _samples_nbytes(samples)
-        lease = lease or self._reserve_blocking(nbytes)
-        lease.adjust(nbytes)
+        if lease is None:
+            lease = self._reserve_blocking(nbytes)
+        else:
+            # Samples may be views into the full batch storage, so filtering
+            # requests must not shrink the original reservation.
+            nbytes = lease.nbytes
         try:
             future = self.runtime.sink.submit_samples(samples, ready_event=ready_event)
         except Exception:
