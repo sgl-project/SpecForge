@@ -62,10 +62,13 @@ def _install(result, scheduler, *args, **kwargs):
 
 
 def _capture_internal_state(result, scheduler, *args, **kwargs):
-    """Expose the writer's cleanup endpoint through SGLang's /server_info."""
+    """Advertise the plugin, and the writer's cleanup endpoint, through
+    SGLang's /server_info (``server_capture: auto`` detects the former)."""
     runtime = getattr(scheduler, "_specforge_capture_runtime", None)
-    if runtime is not None and runtime.is_writer:
-        control = runtime.sink.control_endpoint()
-        if control is not None:
-            result.internal_state["spec_capture_control"] = control
+    if runtime is not None:
+        result.internal_state["spec_capture_backend"] = "plugin"
+        if runtime.is_writer:
+            control = runtime.sink.control_endpoint()
+            if control is not None:
+                result.internal_state["spec_capture_control"] = control
     return result

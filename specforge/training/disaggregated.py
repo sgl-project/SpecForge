@@ -219,11 +219,12 @@ def _server_urls(cfg: Config) -> list[str]:
 
 
 def _server_capture(cfg: Config) -> str:
-    """Capture backend of the servers: deployment config, else DISAGG_SERVER_CAPTURE."""
-    deployment = cfg.deployment.disaggregated
-    if deployment is not None:
-        return deployment.server_capture
-    return os.environ.get("DISAGG_SERVER_CAPTURE", "patch")
+    """Capture backend of the servers: explicit deployment config, else
+    DISAGG_SERVER_CAPTURE (a managed supervisor exports its resolution), else
+    ``auto``, which each adapter detects from its server's /server_info."""
+    from specforge.launch_plan import requested_server_capture
+
+    return requested_server_capture(cfg, os.environ)
 
 
 def _consumer_database_path(cfg: Config) -> Optional[str]:
