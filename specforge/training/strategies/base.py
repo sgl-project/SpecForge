@@ -657,9 +657,21 @@ class MTPTrainStrategy(DraftTrainStrategy):
     def forward_loss(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepOutput:
+        from specforge.core.mtp import OnlineMTPModel
+
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
+        # The objective runs only on supervised rows. Their indices have a
+        # data-dependent size, so find them while loss_mask is still on the host
+        # (as pinned Mooncake receives keep it); on the device that would sync.
+        # A device-resident loss_mask leaves the lookup to the model.
+        supervised_rows = None
+        if t["loss_mask"].device.type == "cpu":
+            supervised_rows = OnlineMTPModel.supervised_rows(t["loss_mask"])
+            if device.type != "cpu":
+                supervised_rows = supervised_rows.pin_memory()
+            supervised_rows = supervised_rows.to(device, non_blocking=True)
         # OnlineMTPModel performs the next-token shift internally and returns
         # per-position correct/denominator tensors (single-layer: length-1 lists).
         # Non-blocking like the other strategies: pinned Mooncake receives keep
@@ -668,6 +680,7 @@ class MTPTrainStrategy(DraftTrainStrategy):
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["target_last_hidden_states"].to(device, non_blocking=True),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
+            supervised_rows=supervised_rows,
         )
         correct_sum = corrects[0].sum()
         denom_sum = denoms[0].sum()
