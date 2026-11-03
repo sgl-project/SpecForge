@@ -654,11 +654,14 @@ class MTPTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.mtp_model.parameters()).device
 
+    def _mtp_module(self) -> nn.Module:
+        # NO_SHARD wraps the model in DistributedDataParallel, which does not
+        # forward attribute access (see DFlashTrainStrategy._draft_attr).
+        return getattr(self.mtp_model, "module", self.mtp_model)
+
     def forward_loss(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepOutput:
-        from specforge.core.mtp import OnlineMTPModel
-
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
@@ -668,7 +671,7 @@ class MTPTrainStrategy(DraftTrainStrategy):
         # A device-resident loss_mask leaves the lookup to the model.
         supervised_rows = None
         if t["loss_mask"].device.type == "cpu":
-            supervised_rows = OnlineMTPModel.supervised_rows(t["loss_mask"])
+            supervised_rows = self._mtp_module().supervised_rows(t["loss_mask"])
             if device.type != "cpu":
                 supervised_rows = supervised_rows.pin_memory()
             supervised_rows = supervised_rows.to(device, non_blocking=True)
