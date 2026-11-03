@@ -59,8 +59,10 @@ logger = logging.getLogger(__name__)
 
 #: ``custom_params`` key of the request spec and ``meta_info`` key of the result.
 SPEC_CAPTURE_KEY = "spec_capture"
-#: Bound on scheduler batches whose rows the sink still holds.
+#: Bounds on scheduler batches and payload bytes whose rows the sink still holds.
 MAX_PENDING_BATCHES_ENV = "SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES"
+MAX_PENDING_BYTES_ENV = "SGLANG_SPEC_CAPTURE_MAX_PENDING_BYTES"
+DEFAULT_MAX_PENDING_BYTES = 4 << 30
 
 _UNPARSED = object()
 
@@ -185,8 +187,22 @@ class CaptureObserver:
                         ),
                     )
             checked.append(item)
+        nbytes = _capture_nbytes(checked, aux, last_hidden)
+        lease = self.runtime.pending.try_reserve(nbytes) if nbytes else None
+        if nbytes and lease is None:
+            checked = [
+                (
+                    dataclasses.replace(
+                        item,
+                        error="publication byte budget exhausted; retry the capture",
+                    )
+                    if item.error is None
+                    else item
+                )
+                for item in checked
+            ]
         return CaptureDeviceOutput.from_rows(
-            self.runtime, checked, aux, last_hidden, copy=can_run_graph
+            self.runtime, checked, aux, last_hidden, copy=can_run_graph, lease=lease
         )
 
 
@@ -230,42 +246,64 @@ def _covers_all_rows(spans: List[Tuple[int, int]], num_rows: int) -> bool:
 class CaptureDeviceOutput:
     """DeviceAuxiliaryOutput holding a forward's capture rows on the device."""
 
-    def __init__(self, runtime, items, aux, last_hidden):
+    def __init__(self, runtime, items, aux, last_hidden, *, lease=None):
         self.runtime = runtime
         self.items = items
         self.aux = aux
         self.last_hidden = last_hidden
+        self.lease = lease
 
     @classmethod
-    def from_rows(cls, runtime, items, aux, last_hidden, *, copy):
-        items, (aux, last_hidden) = _select_rows(items, (aux, last_hidden), copy=copy)
-        return cls(runtime, items, aux, last_hidden)
+    def from_rows(cls, runtime, items, aux, last_hidden, *, copy, lease=None):
+        try:
+            items, (aux, last_hidden) = _select_rows(
+                items, (aux, last_hidden), copy=copy
+            )
+            return cls(runtime, items, aux, last_hidden, lease=lease)
+        except Exception:
+            if lease is not None:
+                lease.release()
+            raise
 
     def copy_to_host(self, copy_tensor):
-        if self.runtime.gpu_put:
-            # Device publication: the sink waits for everything enqueued so far.
-            ready = torch.cuda.Event()
-            ready.record()
+        try:
+            if self.runtime.gpu_put:
+                # Device publication: the sink waits for everything enqueued so far.
+                ready = torch.cuda.Event()
+                ready.record()
+                return CaptureHostOutput(
+                    self.runtime,
+                    self.items,
+                    self.aux,
+                    self.last_hidden,
+                    ready_event=ready,
+                    lease=self.lease,
+                )
             return CaptureHostOutput(
-                self.runtime, self.items, self.aux, self.last_hidden, ready_event=ready
+                self.runtime,
+                self.items,
+                copy_tensor(self.aux) if self.aux is not None else None,
+                copy_tensor(self.last_hidden) if self.last_hidden is not None else None,
+                lease=self.lease,
             )
-        return CaptureHostOutput(
-            self.runtime,
-            self.items,
-            copy_tensor(self.aux) if self.aux is not None else None,
-            copy_tensor(self.last_hidden) if self.last_hidden is not None else None,
-        )
+        except Exception:
+            if self.lease is not None:
+                self.lease.release()
+            raise
 
 
 class CaptureHostOutput:
     """HostAuxiliaryOutput: publish finished capture requests, then hold them."""
 
-    def __init__(self, runtime, items, aux, last_hidden, *, ready_event=None):
+    def __init__(
+        self, runtime, items, aux, last_hidden, *, ready_event=None, lease=None
+    ):
         self.runtime = runtime
         self.items = items
         self.aux = aux
         self.last_hidden = last_hidden
         self.ready_event = ready_event
+        self.lease = lease
 
     def _rows(self, tensor, item):
         if tensor is None:
@@ -273,40 +311,52 @@ class CaptureHostOutput:
         return tensor[item.start : item.start + item.length]
 
     def consume(self, batch, commits) -> None:
-        reqs = {req.rid: req for req in batch.reqs}
-        samples: List[Sample] = []
-        held = []
-        for item in self.items:
-            req = reqs.get(item.rid)
-            if req is None:
-                continue
-            error = item.error
-            if error is None and not req.finished():
-                error = (
-                    "spec capture requests must finish at prefill (max_new_tokens=0)"
+        try:
+            reqs = {req.rid: req for req in batch.reqs}
+            samples: List[Sample] = []
+            held = []
+            for item in self.items:
+                req = reqs.get(item.rid)
+                if req is None:
+                    continue
+                error = item.error
+                if error is None and not req.finished():
+                    error = (
+                        "spec capture requests must finish at prefill "
+                        "(max_new_tokens=0)"
+                    )
+                if error is not None:
+                    # Not held: the error result streams with this batch.
+                    self.runtime.results[req.rid] = error_result(item.spec, error)
+                    continue
+                samples.append(
+                    (
+                        item.spec,
+                        self._rows(self.aux, item),
+                        self._rows(self.last_hidden, item),
+                    )
                 )
-            if error is not None:
-                # Not held: the error result streams with this batch.
-                self.runtime.results[req.rid] = error_result(item.spec, error)
-                continue
-            samples.append(
-                (
-                    item.spec,
-                    self._rows(self.aux, item),
-                    self._rows(self.last_hidden, item),
+                held.append(req)
+            if not samples:
+                if self.lease is not None:
+                    self.lease.release()
+                return
+            future = self.runtime.pending.submit(
+                samples, ready_event=self.ready_event, lease=self.lease
+            )
+            for index, (req, (spec, _, _)) in enumerate(
+                zip(held, samples, strict=True)
+            ):
+                self.runtime.defer_response(
+                    req,
+                    CaptureCompletion(
+                        future, index, len(samples), req.rid, spec, self.runtime.results
+                    ),
                 )
-            )
-            held.append(req)
-        if not samples:
-            return
-        future = self.runtime.pending.submit(samples, ready_event=self.ready_event)
-        for index, (req, (spec, _, _)) in enumerate(zip(held, samples, strict=True)):
-            self.runtime.defer_response(
-                req,
-                CaptureCompletion(
-                    future, index, len(samples), req.rid, spec, self.runtime.results
-                ),
-            )
+        except Exception:
+            if self.lease is not None:
+                self.lease.release()
+            raise
 
 
 @dataclasses.dataclass
@@ -353,23 +403,136 @@ class CaptureCompletion:
         return True
 
 
-class PendingCaptures:
-    """Bound in-flight publication batches without retaining SGLang requests."""
+def _rows_nbytes(tensor: Optional[torch.Tensor], rows: int) -> int:
+    if tensor is None or rows == 0:
+        return 0
+    return tensor.element_size() * rows * tensor.shape[1:].numel()
 
-    def __init__(self, runtime: CaptureRuntime, max_pending_batches: int) -> None:
+
+def _requested_nbytes(spec, aux, last_hidden, rows: int) -> int:
+    features = spec.get("features") or {}
+    return (_rows_nbytes(aux, rows) if ARTIFACT_AUX in features else 0) + (
+        _rows_nbytes(last_hidden, rows) if ARTIFACT_LAST_HIDDEN in features else 0
+    )
+
+
+def _capture_nbytes(items, aux, last_hidden) -> int:
+    return sum(
+        _requested_nbytes(item.spec, aux, last_hidden, item.length)
+        for item in items
+        if item.error is None
+    )
+
+
+def _samples_nbytes(samples: List[Sample]) -> int:
+    total = 0
+    for spec, aux, last_hidden in samples:
+        rows = aux if aux is not None else last_hidden
+        if rows is not None:
+            total += _requested_nbytes(spec, aux, last_hidden, rows.shape[0])
+    return total
+
+
+class _PublicationLease:
+    def __init__(self, pending: PendingCaptures, nbytes: int) -> None:
+        self._pending = pending
+        self.nbytes = nbytes
+
+    def adjust(self, nbytes: int) -> None:
+        if self._pending is not None:
+            self._pending._pending_bytes += nbytes - self.nbytes
+            self.nbytes = nbytes
+
+    def release(self) -> None:
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            pending._pending_bytes -= self.nbytes
+
+    def _submit(self) -> None:
+        self._pending = None
+
+    def __del__(self):
+        self.release()
+
+
+@dataclasses.dataclass
+class _PendingPublication:
+    future: Future
+    nbytes: int
+
+
+class PendingCaptures:
+    """Bound reserved and in-flight publication batches and payload bytes."""
+
+    def __init__(
+        self,
+        runtime: CaptureRuntime,
+        max_pending_batches: int,
+        max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES,
+    ) -> None:
         if max_pending_batches < 1:
             raise ValueError(f"{MAX_PENDING_BATCHES_ENV} must be >= 1")
+        if max_pending_bytes < 1:
+            raise ValueError(f"{MAX_PENDING_BYTES_ENV} must be >= 1")
         self.runtime = runtime
         self.max_pending_batches = max_pending_batches
-        self._futures: Deque[Future] = deque()
+        self.max_pending_bytes = max_pending_bytes
+        self._futures: Deque[_PendingPublication] = deque()
+        self._pending_bytes = 0
+        self._retry_required = False
 
-    def submit(self, samples: List[Sample], *, ready_event=None) -> Future:
-        while self._futures and self._futures[0].done():
-            self._futures.popleft()
-        future = self.runtime.sink.submit_samples(samples, ready_event=ready_event)
-        self._futures.append(future)
+    @property
+    def pending_bytes(self) -> int:
+        return self._pending_bytes
+
+    def _release_completed(self) -> None:
+        while self._futures and self._futures[0].future.done():
+            completed = self._futures.popleft()
+            self._pending_bytes -= completed.nbytes
+
+    def try_reserve(self, nbytes: int) -> Optional[_PublicationLease]:
+        self._release_completed()
+        if not self._pending_bytes:
+            self._retry_required = False
+        if self._retry_required:
+            return None
+        # An oversized batch runs alone after older publications drain. Pause
+        # new admissions after a rejection so short requests cannot starve it.
+        if (
+            self._pending_bytes
+            and self._pending_bytes + nbytes > self.max_pending_bytes
+        ):
+            self._retry_required = True
+            return None
+        self._pending_bytes += nbytes
+        return _PublicationLease(self, nbytes)
+
+    def _reserve_blocking(self, nbytes: int) -> _PublicationLease:
+        while True:
+            lease = self.try_reserve(nbytes)
+            if lease is not None:
+                return lease
+            if not self._futures:
+                raise RuntimeError(
+                    "publication bytes are held by outputs that have not reached "
+                    "the sink; retry the capture"
+                )
+            wait_futures([self._futures[0].future])
+
+    def submit(self, samples: List[Sample], *, ready_event=None, lease=None) -> Future:
+        nbytes = _samples_nbytes(samples)
+        lease = lease or self._reserve_blocking(nbytes)
+        lease.adjust(nbytes)
+        try:
+            future = self.runtime.sink.submit_samples(samples, ready_event=ready_event)
+        except Exception:
+            lease.release()
+            raise
+        lease._submit()
+        self._futures.append(_PendingPublication(future, nbytes))
         if len(self._futures) > self.max_pending_batches:
-            wait_futures([self._futures.popleft()])
+            wait_futures([self._futures[0].future])
+            self._release_completed()
         return future
 
 
@@ -412,6 +575,7 @@ class CaptureRuntime:
         gpu_put: bool,
         max_pending_batches: int,
         defer_response: Callable[[Any, CaptureCompletion], None],
+        max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES,
     ) -> None:
         self.sink = sink
         self.is_writer = is_writer
@@ -419,7 +583,7 @@ class CaptureRuntime:
         self.defer_response = defer_response
         # rid -> result dict, read by the streamer when the request streams.
         self.results: Dict[str, Dict[str, Any]] = {}
-        self.pending = PendingCaptures(self, max_pending_batches)
+        self.pending = PendingCaptures(self, max_pending_batches, max_pending_bytes)
         self.observer = CaptureObserver(self)
 
 
@@ -469,6 +633,9 @@ def install(scheduler) -> CaptureRuntime:
         is_writer=get_parallel().attn_tp_rank == 0,
         gpu_put=gpu_put_enabled(),
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
+        max_pending_bytes=int(
+            os.environ.get(MAX_PENDING_BYTES_ENV, str(DEFAULT_MAX_PENDING_BYTES))
+        ),
         defer_response=scheduler.defer_response,
     )
     model_runner.forward_observer = runtime.observer

@@ -162,6 +162,7 @@ with RDMA NICs. Without it, Mooncake installs its RDMA transport instead.
 | `SPECFORGE_SPEC_CAPTURE=1` | Enable the plugin (otherwise it does nothing). |
 | `SGLANG_SPEC_CAPTURE_GPU_PUT` | `1`: publish device tensors (needs RDMA). `0`: publish from pinned host memory. Unset: device on RDMA+CUDA or NVLink, host otherwise. |
 | `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES` | Scheduler batches the writer may hold (default 2). |
+| `SGLANG_SPEC_CAPTURE_MAX_PENDING_BYTES` | Maximum reserved or in-flight aux/last-hidden payload bytes (default 4 GiB), before row selection and D2H. Capacity failure returns a retryable capture error without cloning and pauses new admissions until older payload drains. An oversized batch is admitted only with no older payload, so the producer can retry until it runs alone. Mooncake-resident objects are not limited. |
 | `SGLANG_SPEC_CAPTURE_TIMING=1` | Log per-batch publish timings. |
 | `SGLANG_SPEC_CAPTURE_ARENA_BYTES` | Arena size in bytes. Required with `MOONCAKE_PROTOCOL=nvlink`. |
 | `SGLANG_SPEC_CAPTURE_CONTROL_PORT` | Port of the NVLink free endpoint (default: ephemeral). |

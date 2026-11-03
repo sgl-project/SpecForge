@@ -87,12 +87,15 @@ class FakeSink:
         return future
 
 
-def _runtime(*, is_writer=True, gpu_put=False, max_pending=2):
+def _runtime(
+    *, is_writer=True, gpu_put=False, max_pending=2, max_pending_bytes=4 << 30
+):
     return capture.CaptureRuntime(
         sink=FakeSink(),
         is_writer=is_writer,
         gpu_put=gpu_put,
         max_pending_batches=max_pending,
+        max_pending_bytes=max_pending_bytes,
         defer_response=mock.Mock(),
     )
 
@@ -275,6 +278,23 @@ class TestConsume(unittest.TestCase):
         runtime.defer_response.assert_not_called()
         self.assertIn("max_new_tokens=0", runtime.results["a"]["error"])
         self.assertEqual(runtime.results["a"]["sample_id"], "a")
+        self.assertEqual(runtime.pending.pending_bytes, 0)
+
+    def test_d2h_failure_releases_the_reservation(self):
+        runtime = _runtime()
+        req = _req("a", 2, _spec("a"))
+        device = runtime.observer.after_forward(
+            SimpleNamespace(reqs=[req]),
+            _forward_batch([2]),
+            _logits_output(2),
+            can_run_graph=False,
+        )
+        self.assertGreater(runtime.pending.pending_bytes, 0)
+        with self.assertRaisesRegex(RuntimeError, "injected D2H failure"):
+            device.copy_to_host(
+                mock.Mock(side_effect=RuntimeError("injected D2H failure"))
+            )
+        self.assertEqual(runtime.pending.pending_bytes, 0)
 
 
 class TestCaptureCompletion(unittest.TestCase):
@@ -347,6 +367,97 @@ class TestPendingCaptures(unittest.TestCase):
             runtime.pending.submit([(_spec("b"), None, None)])
         wait.assert_not_called()
         self.assertIsNone(previous())
+
+    @staticmethod
+    def _sample(sample_id, rows, *, features=("aux", "last_hidden")):
+        return (
+            _spec(sample_id, features=features),
+            torch.zeros(rows, 3, dtype=torch.float32),
+            torch.zeros(rows, 2, dtype=torch.float32),
+        )
+
+    def test_byte_budget_releases_completed_batches_before_admission(self):
+        runtime = _runtime(max_pending=8, max_pending_bytes=60)
+        first = runtime.pending.submit([self._sample("a", 2)])
+        self.assertEqual(runtime.pending.pending_bytes, 40)
+        second = runtime.pending.submit([self._sample("b", 1)])
+        self.assertEqual(runtime.pending.pending_bytes, 60)
+        waited = []
+
+        def complete_oldest(futures):
+            waited.extend(futures)
+            futures[0].set_result([{"sample_id": "a"}])
+
+        with mock.patch.object(capture, "wait_futures", side_effect=complete_oldest):
+            runtime.pending.submit([self._sample("c", 1)])
+        self.assertEqual(waited, [first, second])
+        self.assertEqual(runtime.pending.pending_bytes, 20)
+
+    def test_oversized_batch_runs_alone_instead_of_waiting_forever(self):
+        runtime = _runtime(max_pending=8, max_pending_bytes=20)
+        with mock.patch.object(capture, "wait_futures") as wait:
+            first = runtime.pending.submit([self._sample("a", 2)])
+        wait.assert_not_called()
+        self.assertEqual(runtime.pending.pending_bytes, 40)
+
+        def complete_oldest(futures):
+            futures[0].set_result([{"sample_id": "a"}])
+
+        with mock.patch.object(capture, "wait_futures", side_effect=complete_oldest):
+            runtime.pending.submit([self._sample("b", 1)])
+        self.assertTrue(first.done())
+        self.assertEqual(runtime.pending.pending_bytes, 20)
+
+    def test_rejection_pauses_new_admissions_until_payload_drains(self):
+        runtime = _runtime(max_pending_bytes=60)
+        existing = runtime.pending.try_reserve(40)
+        self.assertIsNone(runtime.pending.try_reserve(30))
+        self.assertIsNone(runtime.pending.try_reserve(10))
+        existing.release()
+        admitted = runtime.pending.try_reserve(20)
+        self.assertIsNotNone(admitted)
+        admitted.release()
+
+    def test_observer_reserves_actual_feature_bytes_before_row_selection(self):
+        runtime = _runtime(max_pending_bytes=44)
+        reqs = [
+            _req("a", 2, _spec("a", features=("aux",))),
+            _req("b", 1, _spec("b")),
+        ]
+        real_select = capture._select_rows
+
+        def record_select(items, tensors, *, copy):
+            self.assertEqual(runtime.pending.pending_bytes, 44)
+            return real_select(items, tensors, copy=copy)
+
+        with mock.patch.object(capture, "_select_rows", side_effect=record_select):
+            device = runtime.observer.after_forward(
+                SimpleNamespace(reqs=reqs),
+                _forward_batch([2, 1]),
+                _logits_output(3, aux_width=3, hidden=2),
+                can_run_graph=True,
+            )
+        self.assertEqual(device.lease.nbytes, 44)
+        device.lease.release()
+        self.assertEqual(runtime.pending.pending_bytes, 0)
+
+    def test_observer_rejects_before_cloning_when_reservation_fails(self):
+        runtime = _runtime(max_pending_bytes=40)
+        existing = runtime.pending.try_reserve(40)
+        req = _req("a", 1, _spec("a"))
+
+        device = runtime.observer.after_forward(
+            SimpleNamespace(reqs=[req]),
+            _forward_batch([1]),
+            _logits_output(1, aux_width=3, hidden=2),
+            can_run_graph=True,
+        )
+
+        self.assertIn("byte budget", device.items[0].error)
+        self.assertIsNone(device.aux)
+        self.assertIsNone(device.last_hidden)
+        self.assertEqual(runtime.pending.pending_bytes, 40)
+        existing.release()
 
 
 class FakeStreamer:
