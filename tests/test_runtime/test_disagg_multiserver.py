@@ -820,6 +820,45 @@ class TestMultiServerProducer(unittest.TestCase):
         self.assertFalse(channel.is_closed())
         self.assertIn("RuntimeError", channel.failure())
 
+    def test_publication_backpressure_does_not_consume_prompt_attempts(self):
+        backend = _FakeMooncakeStore()
+        healthy = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        calls = []
+
+        def backpressure_then_healthy(url, json_body, timeout):
+            calls.append(json_body)
+            if len(calls) > 7:
+                return healthy(url, json_body, timeout)
+            return [
+                {
+                    "meta_info": {
+                        "spec_capture": {
+                            "sample_id": spec["sample_id"],
+                            "error": "publication byte budget exhausted",
+                            "backpressure": "publication_bytes",
+                        }
+                    }
+                }
+                for spec in json_body["spec_capture"]
+            ]
+
+        adapter = _adapter(store, backpressure_then_healthy)
+        adapter.backpressure_poll_s = 0.001
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            adapter,
+            _prompts(2),
+            store,
+            channel,
+            lease=2,
+            max_prompt_attempts=1,
+        )
+
+        self.assertEqual(drive(max_rounds=10_000), 2)
+        self.assertEqual(len(calls), 8)
+        self.assertTrue(channel.is_closed())
+
     def test_poisoned_prompt_goes_terminal_not_infinite(self):
         # PR654 known rough edge: an all-failed round used to read as
         # pool-drained (silent truncation); with drained = pending==0 AND

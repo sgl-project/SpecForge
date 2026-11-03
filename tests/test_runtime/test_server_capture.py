@@ -617,6 +617,71 @@ class TestServerCaptureAdapter(unittest.TestCase):
         self.assertIn("capture omitted aux-layer ids", result.reason)
         self.assertFalse(any(backend._d), f"leaked keys: {list(backend._d)}")
 
+    def test_publication_backpressure_retries_only_rejected_tasks(self):
+        backend = _FakeMooncakeStore()
+        healthy = _StubCaptureServer(backend)
+        requests = []
+
+        def server(url, json_body, timeout):
+            specs = json_body["spec_capture"]
+            requests.append([spec["sample_id"] for spec in specs])
+            if len(requests) > 1:
+                return healthy(url, json_body, timeout)
+            subset = {
+                **json_body,
+                "input_ids": [json_body["input_ids"][1]],
+                "extra_key": [json_body["extra_key"][1]],
+                "spec_capture": [specs[1]],
+            }
+            return [
+                {
+                    "meta_info": {
+                        "spec_capture": {
+                            "sample_id": "run0:t0",
+                            "error": "publication byte budget exhausted",
+                            "backpressure": "publication_bytes",
+                        }
+                    }
+                },
+                healthy(url, subset, timeout)[0],
+            ]
+
+        _, _, _, adapter = _mk(server=server, backend=backend)
+        adapter.backpressure_poll_s = 0.001
+        results = adapter.produce_refs(
+            [_task(0, 4), _task(1, 4)], capture=_eagle3_contract()
+        )
+
+        self.assertTrue(all(isinstance(result, SampleRef) for result in results))
+        self.assertEqual(requests, [["run0:t0", "run0:t1"], ["run0:t0"]])
+
+    def test_publication_backpressure_wait_is_bounded(self):
+        calls = []
+
+        def server(url, json_body, timeout):
+            calls.append(json_body)
+            return [
+                {
+                    "meta_info": {
+                        "spec_capture": {
+                            "sample_id": "run0:t0",
+                            "error": "publication byte budget exhausted",
+                            "backpressure": "publication_bytes",
+                        }
+                    }
+                }
+            ]
+
+        _, _, _, adapter = _mk(server=server)
+        adapter.backpressure_timeout_s = 0.05
+        adapter.backpressure_poll_s = 0.001
+        (result,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+
+        self.assertIsInstance(result, ServerCaptureFailure)
+        self.assertIn("backpressure wait exhausted", result.reason)
+        self.assertIsNone(result.backpressure)
+        self.assertGreater(len(calls), 1)
+
     def test_per_task_server_error_becomes_failure_marker(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend, error_sample_ids={"run0:t0"})

@@ -62,7 +62,8 @@ SPEC_CAPTURE_KEY = "spec_capture"
 #: Bounds on scheduler batches and payload bytes whose rows the sink still holds.
 MAX_PENDING_BATCHES_ENV = "SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES"
 MAX_PENDING_BYTES_ENV = "SGLANG_SPEC_CAPTURE_MAX_PENDING_BYTES"
-DEFAULT_MAX_PENDING_BYTES = 4 << 30
+DEFAULT_MAX_PENDING_BYTES = 0
+PUBLICATION_BACKPRESSURE_ERROR = "publication byte budget exhausted; retry the capture"
 
 _UNPARSED = object()
 
@@ -99,7 +100,10 @@ def request_spec(req) -> Optional[Dict[str, Any]]:
 
 
 def error_result(spec: Dict[str, Any], error: str) -> Dict[str, Any]:
-    return {"sample_id": str(spec.get("sample_id")), "error": error}
+    result = {"sample_id": str(spec.get("sample_id")), "error": error}
+    if error == PUBLICATION_BACKPRESSURE_ERROR:
+        result["backpressure"] = "publication_bytes"
+    return result
 
 
 def collect_capture_items(
@@ -194,7 +198,7 @@ class CaptureObserver:
                 (
                     dataclasses.replace(
                         item,
-                        error="publication byte budget exhausted; retry the capture",
+                        error=PUBLICATION_BACKPRESSURE_ERROR,
                     )
                     if item.error is None
                     else item
@@ -409,28 +413,21 @@ def _rows_nbytes(tensor: Optional[torch.Tensor], rows: int) -> int:
     return tensor.element_size() * rows * tensor.shape[1:].numel()
 
 
-def _requested_nbytes(spec, aux, last_hidden, rows: int) -> int:
-    features = spec.get("features") or {}
-    return (_rows_nbytes(aux, rows) if ARTIFACT_AUX in features else 0) + (
-        _rows_nbytes(last_hidden, rows) if ARTIFACT_LAST_HIDDEN in features else 0
-    )
-
-
 def _capture_nbytes(items, aux, last_hidden) -> int:
     return sum(
-        _requested_nbytes(item.spec, aux, last_hidden, item.length)
+        _rows_nbytes(aux, item.length) + _rows_nbytes(last_hidden, item.length)
         for item in items
         if item.error is None
     )
 
 
 def _samples_nbytes(samples: List[Sample]) -> int:
-    total = 0
-    for spec, aux, last_hidden in samples:
-        rows = aux if aux is not None else last_hidden
-        if rows is not None:
-            total += _requested_nbytes(spec, aux, last_hidden, rows.shape[0])
-    return total
+    return sum(
+        tensor.numel() * tensor.element_size()
+        for _, aux, last_hidden in samples
+        for tensor in (aux, last_hidden)
+        if tensor is not None
+    )
 
 
 class _PublicationLease:
@@ -472,8 +469,8 @@ class PendingCaptures:
     ) -> None:
         if max_pending_batches < 1:
             raise ValueError(f"{MAX_PENDING_BATCHES_ENV} must be >= 1")
-        if max_pending_bytes < 1:
-            raise ValueError(f"{MAX_PENDING_BYTES_ENV} must be >= 1")
+        if max_pending_bytes < 0:
+            raise ValueError(f"{MAX_PENDING_BYTES_ENV} must be >= 0")
         self.runtime = runtime
         self.max_pending_batches = max_pending_batches
         self.max_pending_bytes = max_pending_bytes
@@ -497,9 +494,10 @@ class PendingCaptures:
         if self._retry_required:
             return None
         # An oversized batch runs alone after older publications drain. Pause
-        # new admissions after a rejection so short requests cannot starve it.
+        # new admissions after a rejection to reduce short-request starvation.
         if (
-            self._pending_bytes
+            self.max_pending_bytes
+            and self._pending_bytes
             and self._pending_bytes + nbytes > self.max_pending_bytes
         ):
             self._retry_required = True

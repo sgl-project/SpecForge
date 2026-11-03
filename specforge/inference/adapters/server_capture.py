@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
@@ -110,6 +111,7 @@ class ServerCaptureFailure:
     task_id: str
     reason: str
     retryable: bool = True
+    backpressure: Optional[str] = None
 
 
 class _SessionPost:
@@ -208,7 +210,13 @@ class SGLangServerCaptureAdapter:
         target_model_version: str = "unknown",
         server_capture: str = "patch",
         server_info_fn: Optional[Callable[[str, float], Mapping[str, Any]]] = None,
+        backpressure_timeout_s: float = 60.0,
+        backpressure_poll_s: float = 0.2,
     ) -> None:
+        if backpressure_timeout_s < 0:
+            raise ValueError("backpressure_timeout_s must be >= 0")
+        if backpressure_poll_s <= 0:
+            raise ValueError("backpressure_poll_s must be > 0")
         if server_capture not in ("auto", *SERVER_CAPTURE_BACKENDS):
             raise ValueError(
                 "server_capture must be one of "
@@ -245,6 +253,8 @@ class SGLangServerCaptureAdapter:
             )
         self.request_input_adapter = request_input_adapter
         self.timeout_s = timeout_s
+        self.backpressure_timeout_s = backpressure_timeout_s
+        self.backpressure_poll_s = backpressure_poll_s
         self.post_fn = post_fn or _SessionPost()
         self.target_model_version = target_model_version
         #: ``auto`` until the first request reads the server's backend.
@@ -434,10 +444,48 @@ class SGLangServerCaptureAdapter:
     def produce_refs(
         self, tasks: List[PromptTask], *, capture: CaptureConfig
     ) -> List[Union["SampleRef", ServerCaptureFailure]]:  # noqa: F821
-        """One batched server call -> one committed-ready ref per task.
+        """Produce refs, retrying only capacity-limited tasks inside the call.
 
-        Order-aligned with ``tasks``; a per-task server error becomes a
-        :class:`ServerCaptureFailure` (the worker fails just that lease). Any
+        Publication backpressure does not consume the controller's prompt-attempt
+        budget. A bounded wait still ends in a normal retryable failure so a
+        persistently overloaded server cannot trap the producer forever.
+        """
+        results = self._produce_refs_once(tasks, capture=capture)
+        deadline = time.monotonic() + self.backpressure_timeout_s
+        while True:
+            retry_indices = [
+                index
+                for index, result in enumerate(results)
+                if isinstance(result, ServerCaptureFailure)
+                and result.backpressure == "publication_bytes"
+            ]
+            if not retry_indices:
+                return results
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                for index in retry_indices:
+                    failure = results[index]
+                    results[index] = ServerCaptureFailure(
+                        task_id=failure.task_id,
+                        reason=(
+                            f"{failure.reason} (backpressure wait exhausted after "
+                            f"{self.backpressure_timeout_s:.1f}s)"
+                        ),
+                        retryable=True,
+                    )
+                return results
+            time.sleep(min(self.backpressure_poll_s, remaining))
+            retry_tasks = [tasks[index] for index in retry_indices]
+            retry_results = self._produce_refs_once(retry_tasks, capture=capture)
+            for index, result in zip(retry_indices, retry_results, strict=True):
+                results[index] = result
+
+    def _produce_refs_once(
+        self, tasks: List[PromptTask], *, capture: CaptureConfig
+    ) -> List[Union["SampleRef", ServerCaptureFailure]]:  # noqa: F821
+        """One batched server call, order-aligned with ``tasks``.
+
+        A per-task server error becomes a :class:`ServerCaptureFailure`. Any
         transport-level error raises — the worker fails the whole lease batch
         retryable, mirroring ``generate_features`` semantics.
         """
@@ -520,6 +568,7 @@ class SGLangServerCaptureAdapter:
                         task_id=task.task_id,
                         reason=f"server_capture:{result['error']}",
                         retryable=True,
+                        backpressure=result.get("backpressure"),
                     )
                 )
                 continue

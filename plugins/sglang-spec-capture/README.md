@@ -124,7 +124,10 @@ JSON string in `sampling_params.custom_params["spec_capture"]`:
 The response's `meta_info["spec_capture"]` holds `[result]`, where `result` is
 `{sample_id, store_id, gen, aux_layer_ids, features: {name: {shape, dtype}}}`
 or `{sample_id, error}`. Objects are stored at
-`{store_id}/{sample_id}/g{gen}/{name}`.
+`{store_id}/{sample_id}/g{gen}/{name}`. A publication-capacity error also carries
+`backpressure: "publication_bytes"`; SpecForge's adapter retries only those
+tasks with a bounded wait instead of consuming prompt attempts while waiting
+for capacity.
 
 ## Multi-node NVLink
 
@@ -162,7 +165,7 @@ with RDMA NICs. Without it, Mooncake installs its RDMA transport instead.
 | `SPECFORGE_SPEC_CAPTURE=1` | Enable the plugin (otherwise it does nothing). |
 | `SGLANG_SPEC_CAPTURE_GPU_PUT` | `1`: publish device tensors (needs RDMA). `0`: publish from pinned host memory. Unset: device on RDMA+CUDA or NVLink, host otherwise. |
 | `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES` | Scheduler batches the writer may hold (default 2). |
-| `SGLANG_SPEC_CAPTURE_MAX_PENDING_BYTES` | Maximum reserved or in-flight aux/last-hidden payload bytes (default 4 GiB), before row selection and D2H. Capacity failure returns a retryable capture error without cloning and pauses new admissions until older payload drains. An oversized batch is admitted only with no older payload, so the producer can retry until it runs alone. Mooncake-resident objects are not limited. |
+| `SGLANG_SPEC_CAPTURE_MAX_PENDING_BYTES` | Reserved or in-flight aux/last-hidden payload budget in bytes, counted from the actual tensors before row selection and D2H. `0` (default) preserves unlimited admission. Capacity failure returns a backpressure result without cloning and pauses new admissions until older payload drains. An oversized batch is admitted only with no older payload, so it can exceed the configured budget; this is not a hard peak-memory cap. Passthrough and Mooncake-resident objects are not limited. |
 | `SGLANG_SPEC_CAPTURE_TIMING=1` | Log per-batch publish timings. |
 | `SGLANG_SPEC_CAPTURE_ARENA_BYTES` | Arena size in bytes. Required with `MOONCAKE_PROTOCOL=nvlink`. |
 | `SGLANG_SPEC_CAPTURE_CONTROL_PORT` | Port of the NVLink free endpoint (default: ephemeral). |

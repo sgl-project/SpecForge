@@ -408,6 +408,16 @@ class TestPendingCaptures(unittest.TestCase):
         self.assertTrue(first.done())
         self.assertEqual(runtime.pending.pending_bytes, 20)
 
+    def test_zero_byte_budget_preserves_unlimited_admission(self):
+        runtime = _runtime(max_pending_bytes=0)
+        first = runtime.pending.try_reserve(100)
+        second = runtime.pending.try_reserve(100)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(runtime.pending.pending_bytes, 200)
+        first.release()
+        second.release()
+
     def test_rejection_pauses_new_admissions_until_payload_drains(self):
         runtime = _runtime(max_pending_bytes=60)
         existing = runtime.pending.try_reserve(40)
@@ -418,28 +428,48 @@ class TestPendingCaptures(unittest.TestCase):
         self.assertIsNotNone(admitted)
         admitted.release()
 
-    def test_observer_reserves_actual_feature_bytes_before_row_selection(self):
-        runtime = _runtime(max_pending_bytes=44)
-        reqs = [
-            _req("a", 2, _spec("a", features=("aux",))),
-            _req("b", 1, _spec("b")),
-        ]
-        real_select = capture._select_rows
+    def test_observer_reserves_and_copies_actual_tensor_bytes(self):
+        feature_sets = (
+            (("aux",), ("aux",)),
+            (("last_hidden",), ("last_hidden",)),
+            (("aux",), ("aux", "last_hidden")),
+        )
+        for first_features, second_features in feature_sets:
+            with self.subTest(
+                first_features=first_features, second_features=second_features
+            ):
+                runtime = _runtime(max_pending_bytes=60)
+                reqs = [
+                    _req("a", 2, _spec("a", features=first_features)),
+                    _req("b", 1, _spec("b", features=second_features)),
+                ]
+                real_select = capture._select_rows
 
-        def record_select(items, tensors, *, copy):
-            self.assertEqual(runtime.pending.pending_bytes, 44)
-            return real_select(items, tensors, copy=copy)
+                def record_select(items, tensors, *, copy):
+                    self.assertEqual(runtime.pending.pending_bytes, 60)
+                    return real_select(items, tensors, copy=copy)
 
-        with mock.patch.object(capture, "_select_rows", side_effect=record_select):
-            device = runtime.observer.after_forward(
-                SimpleNamespace(reqs=reqs),
-                _forward_batch([2, 1]),
-                _logits_output(3, aux_width=3, hidden=2),
-                can_run_graph=True,
-            )
-        self.assertEqual(device.lease.nbytes, 44)
-        device.lease.release()
-        self.assertEqual(runtime.pending.pending_bytes, 0)
+                with mock.patch.object(
+                    capture, "_select_rows", side_effect=record_select
+                ):
+                    device = runtime.observer.after_forward(
+                        SimpleNamespace(reqs=reqs),
+                        _forward_batch([2, 1]),
+                        _logits_output(3, aux_width=3, hidden=2),
+                        can_run_graph=True,
+                    )
+                copied = []
+
+                def record_copy(tensor):
+                    copied.append(tensor.numel() * tensor.element_size())
+                    return tensor.clone()
+
+                host = device.copy_to_host(record_copy)
+                self.assertEqual(device.lease.nbytes, 60)
+                self.assertEqual(sum(copied), 60)
+                self.assertEqual(runtime.pending.pending_bytes, 60)
+                host.lease.release()
+                self.assertEqual(runtime.pending.pending_bytes, 0)
 
     def test_observer_rejects_before_cloning_when_reservation_fails(self):
         runtime = _runtime(max_pending_bytes=40)
@@ -457,6 +487,8 @@ class TestPendingCaptures(unittest.TestCase):
         self.assertIsNone(device.aux)
         self.assertIsNone(device.last_hidden)
         self.assertEqual(runtime.pending.pending_bytes, 40)
+        device.copy_to_host(_host_copy).consume(SimpleNamespace(reqs=[req]), None)
+        self.assertEqual(runtime.results["a"]["backpressure"], "publication_bytes")
         existing.release()
 
 
