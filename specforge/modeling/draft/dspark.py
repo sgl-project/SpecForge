@@ -26,9 +26,9 @@ def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 class AcceptRatePredictor(nn.Module):
     """Predict target/draft distribution acceptance probability per draft step."""
 
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, bias: bool = True):
         super().__init__()
-        self.proj = nn.Linear(int(input_dim), 1)
+        self.proj = nn.Linear(int(input_dim), 1, bias=bias)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         # fp32 like DeepSeek's projection: the features may be an unnormalized readout.
@@ -371,7 +371,11 @@ class DSparkDraftModel(DFlashDraftModel):
             input_dim = config.hidden_size
             if self.confidence_head_with_markov:
                 input_dim += self.markov_head.markov_rank
-            self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
+            # DeepSeek-V4.1's confidence projection has no bias.
+            self.confidence_head = AcceptRatePredictor(
+                input_dim=input_dim,
+                bias=bool(dflash_config.get("confidence_head_bias", True)),
+            )
 
     def apply_logits_head(
         self,
