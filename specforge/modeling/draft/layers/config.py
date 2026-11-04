@@ -23,12 +23,12 @@ class AttentionConfig:
     supply token positions when sequence storage differs from logical order.
     """
 
-    kind: Literal["gqa", "mha", "mla"] = "gqa"
+    kind: Literal["gqa", "mha", "mla", "deepseek_v41"] = "gqa"
     is_causal: bool = False
     sliding_window: int | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in ("gqa", "mha", "mla"):
+        if self.kind not in ("gqa", "mha", "mla", "deepseek_v41"):
             raise ValueError(f"Unsupported attention kind: {self.kind!r}")
         if not isinstance(self.is_causal, bool):
             raise ValueError("is_causal must be a boolean")

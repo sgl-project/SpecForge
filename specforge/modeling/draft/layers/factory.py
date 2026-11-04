@@ -20,6 +20,10 @@ def build_attention(
         from .attention.mla import MLAAttention
 
         return MLAAttention(config, layer_idx, kernels, options)
+    if options.kind == "deepseek_v41":
+        from .attention.deepseek_v41 import DeepseekV41Attention
+
+        return DeepseekV41Attention(config, layer_idx, kernels, options)
     if (
         options.kind == "mha"
         and config.num_key_value_heads != config.num_attention_heads
