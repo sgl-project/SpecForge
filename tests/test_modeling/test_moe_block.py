@@ -362,6 +362,9 @@ class DeepSeekV4BlockTest(unittest.TestCase):
             routed_scaling_factor=1.5,
         )
         self.assertIsInstance(build_ffn(config, 0, dense=Qwen3MLP), MoELayer)
+        # DeepSeek-V4.1 drafts reach the same family through the alias.
+        config.moe_preset = "deepseek_v41"
+        self.assertIsInstance(build_ffn(config, 0, dense=Qwen3MLP), MoELayer)
 
 
 if __name__ == "__main__":

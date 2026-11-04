@@ -1,5 +1,5 @@
 # coding=utf-8
-"""DeepSeek-V4 family: the MoE layer from its config (sqrtsoftplus router, clamped SwiGLU)."""
+"""DeepSeek-V4 family, shared by V4.1: sqrtsoftplus router, clamped SwiGLU, one shared expert."""
 
 import torch
 import torch.nn.functional as F
