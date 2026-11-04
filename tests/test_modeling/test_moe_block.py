@@ -105,6 +105,47 @@ def _v4_pair(**overrides):
     return layer, reference
 
 
+class _DeepSeekV41Reference(torch.nn.Module):
+    """DeepSeek-V4.1's inference MoE on our layer's weights (text tokens only)."""
+
+    def __init__(self, layer, gate_temp=1.0, swiglu_limit=10.0, route_scale=1.5):
+        super().__init__()
+        self.layer = layer
+        self.gate_temp, self.limit = gate_temp, swiglu_limit
+        self.route_scale = route_scale
+
+    def _expert(self, w1, w2, w3, x, weights=None):
+        # Up clamped on both sides, gate only from above; the routing weight before w2.
+        gate = torch.nn.functional.linear(x, w1).float().clamp(max=self.limit)
+        up = torch.nn.functional.linear(x, w3).float().clamp(-self.limit, self.limit)
+        hidden = torch.nn.functional.silu(gate) * up
+        if weights is not None:
+            hidden = weights * hidden
+        return torch.nn.functional.linear(hidden.to(x.dtype), w2)
+
+    def forward(self, x):
+        layer, h = self.layer, x.reshape(-1, x.shape[-1])
+        logits = torch.nn.functional.linear(h.float(), layer.gate.weight.float())
+        scores = torch.nn.functional.softplus(logits / self.gate_temp).sqrt()
+        # The bias picks the experts; the weights come from the raw scores.
+        indices = (scores + layer.gate.expert_bias).topk(layer.gate.top_k, dim=-1)[1]
+        weights = scores.gather(1, indices)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+        weights = weights * self.route_scale
+        y = torch.zeros_like(h, dtype=torch.float32)
+        for expert in range(layer.gate.num_experts):
+            rows, top = torch.where(indices == expert)
+            w1, w3 = layer.experts.gate_up_proj[expert].chunk(2, dim=0)
+            w2 = layer.experts.down_proj[expert]
+            out = self._expert(w1, w2, w3, h[rows], weights[rows, top, None])
+            y = y.index_add(0, rows, out.float())
+        shared = layer.shared_expert
+        y = y + self._expert(
+            shared.gate_proj.weight, shared.down_proj.weight, shared.up_proj.weight, h
+        )
+        return y.type_as(x).view_as(x)
+
+
 def _forward_and_grads(module, x):
     x = x.clone().requires_grad_()
     out = module(x)
@@ -321,6 +362,19 @@ class DeepSeekV4BlockTest(unittest.TestCase):
                 _assert_same_forward_and_backward(
                     self, layer, reference, self.x, rename=_v4_key, **tolerance
                 )
+
+    def test_matches_deepseek_v41_inference_moe(self):
+        # V4.1 keeps V4's MoE for text: gate_temp 1.0, no image bias, +1e-20 renorm.
+        layer, _ = _v4_pair()
+        _assert_same_forward_and_backward(
+            self,
+            layer,
+            _DeepSeekV41Reference(layer),
+            self.x,
+            rename=lambda name: name if name == "x" else f"layer.{name}",
+            rtol=1e-4,
+            atol=1e-6,
+        )
 
     def test_family_reads_the_config_and_rejects_bad_values(self):
         layer = deepseek_v4.build_moe(_v4_config())
