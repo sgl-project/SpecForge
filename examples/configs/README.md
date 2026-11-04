@@ -98,6 +98,14 @@ servers. Its
 covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
+`deepseek-v4.1-flash-moe-dspark.yaml` fine-tunes DeepSeek-V4.1's own DSpark
+draft (`configs/deepseek-v4.1-flash-moe-dspark.json`, warm-started from the
+official `mtp.*` weights) for DeepSeek-V4.1-Flash on thinking-mode data the
+target regenerated, with one TP4/EP4 capture server on the capture plugin. Its
+[runbook](../../docs/recipes/deepseek-v4.1-flash-moe-dspark-disaggregated.md)
+covers the SGLang revision, the warm start and the export back to the official
+layout.
+
 `qwen3.8-27b-dflash2.yaml` (external services, two nodes) and
 its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4.yaml`
 (one node, four capture servers plus a DP4 trainer) and
