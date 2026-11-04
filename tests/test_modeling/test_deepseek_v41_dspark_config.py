@@ -10,9 +10,7 @@ from transformers import Qwen3Config
 
 from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 from specforge.modeling.draft.dspark import DSparkDraftModel
-from specforge.modeling.draft.layers.attention.deepseek_v41 import (
-    DeepseekV41Attention,
-)
+from specforge.modeling.draft.layers.attention.deepseek_v41 import DeepseekV41Attention
 from specforge.modeling.draft.layers.ffn.moe import MoELayer
 
 CONFIG = (

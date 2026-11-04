@@ -711,8 +711,6 @@ class MuseParser(ThinkingParser):
         return matches[start:]
 
 
-class GLMParser(ThinkingParser):
-    """Render GLM templates while preserving reasoning and tool-result identity."""
 class DeepSeekV41Parser(DeepSeekV4Parser):
     """Render DeepSeek-V4.1 conversations with its official Python encoder.
 
@@ -761,8 +759,8 @@ class DeepSeekV41Parser(DeepSeekV4Parser):
         return sanitized
 
 
-class GLMParser(GeneralParser):
-    """Render GLM-5.2's hybrid-thinking template consistently for training."""
+class GLMParser(ThinkingParser):
+    """Render GLM templates while preserving reasoning and tool-result identity."""
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         kwargs.setdefault("enable_thinking", False)

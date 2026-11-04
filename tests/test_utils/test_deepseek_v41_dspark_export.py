@@ -181,7 +181,10 @@ class DeepseekV41DSparkConverterTest(unittest.TestCase):
         self.assertNotIn("mtp.0.norm.weight", official)
         self.assertFalse({k for k in official if "hc_head" in k})  # single-pass mHC
         # The image-token routing bias is written as a copy of the text one.
-        bias, bias_vl = official["mtp.0.ffn.gate.bias"], official["mtp.0.ffn.gate.bias_vl"]
+        bias, bias_vl = (
+            official["mtp.0.ffn.gate.bias"],
+            official["mtp.0.ffn.gate.bias_vl"],
+        )
         assert_close(bias_vl, bias)
         self.assertEqual(official["mtp.0.ffn.gate.bias_vl"].dtype, torch.float32)
         self.assertEqual(official["mtp.0.attn.attn_sink"].dtype, torch.float32)

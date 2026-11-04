@@ -11,9 +11,7 @@ from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.dspark import DSparkDraftModel
 from specforge.modeling.draft.layers.attention.base import AttentionContext
-from specforge.modeling.draft.layers.attention.deepseek_v41 import (
-    DeepseekV41Attention,
-)
+from specforge.modeling.draft.layers.attention.deepseek_v41 import DeepseekV41Attention
 from specforge.modeling.draft.layers.config import AttentionConfig
 from specforge.modeling.draft.layers.factory import build_attention
 
