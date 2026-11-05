@@ -471,6 +471,8 @@ def install(scheduler) -> CaptureRuntime:
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
         defer_response=scheduler.defer_response,
     )
+    method = features.aux_hidden_state_capture
+    runtime.capture_method = str(getattr(method, "name", method)).lower()
     model_runner.forward_observer = runtime.observer
     scheduler.output_streamer.spec_capture_results = runtime.results
     scheduler._specforge_capture_runtime = runtime

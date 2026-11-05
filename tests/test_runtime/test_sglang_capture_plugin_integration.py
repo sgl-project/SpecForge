@@ -129,7 +129,9 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
             ("get_serving", SimpleNamespace(stream_interval=1, weight_version="w")),
             (
                 "get_observability",
-                SimpleNamespace(enable_request_time_stats_logging=False),
+                SimpleNamespace(
+                    enable_request_time_stats_logging=False, enable_metrics=False
+                ),
             ),
         ):
             patcher = mock.patch(
@@ -154,6 +156,7 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
             tree_cache=None,
             server_args=SimpleNamespace(enable_lmcache=False),
             is_generation=True,
+            skip_tokenizer_init=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
