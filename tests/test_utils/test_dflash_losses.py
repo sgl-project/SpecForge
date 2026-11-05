@@ -64,15 +64,10 @@ OnlineDFlashModel = _dflash_module.OnlineDFlashModel
 OnlineDSparkModel = _dflash_module.OnlineDSparkModel
 
 
-def _anchor_sampler_subject(num_anchors: int = 8):
-    return types.SimpleNamespace(num_anchors=num_anchors)
-
-
 class _FixedDraft(nn.Module):
     def __init__(self, hidden_size: int):
         super().__init__()
         self.hidden_size = hidden_size
-        self.sliding_window = None
 
     def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
         bsz, draft_len = noise_embedding.shape[:2]
@@ -138,14 +133,7 @@ class _FixedHead(nn.Module):
         self.register_buffer("fixed_logits", logits)
 
     def forward(self, hidden_states):
-        logits = self.fixed_logits
-        if logits.ndim == 4:
-            # DFlash objectives omit the anchor; diagnostics keep the full block.
-            _, blocks, slots, _ = logits.shape
-            if hidden_states.shape[1] == blocks * (slots - 1):
-                logits = logits[:, :, 1:]
-            logits = logits.flatten(1, 2)
-        return logits.to(device=hidden_states.device)
+        return self.fixed_logits.to(device=hidden_states.device)
 
 
 class _DualFixedHead(nn.Module):
@@ -172,13 +160,13 @@ def _fixed_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         bsz,
         n_blocks * self.block_size,
         self.embed_tokens.embedding_dim,
-        dtype=self.embed_tokens.weight.dtype,
+        dtype=torch.double,
         device=input_ids.device,
     )
 
 
 def _fixed_anchor_sampler(anchors, keep_mask):
-    def _sample(self, seq_len, loss_mask, device, max_valid_anchors=None):
+    def _sample(self, seq_len, loss_mask, device):
         return anchors.to(device), keep_mask.to(device)
 
     return _sample
@@ -188,7 +176,8 @@ def _make_model(logits, anchors, keep_mask, draft_model=None, lm_head=None, **kw
     bsz, n_blocks, block_size, vocab_size = logits.shape
     model = OnlineDFlashModel(
         draft_model=draft_model or _FixedDraft(hidden_size=4),
-        target_lm_head=lm_head or _FixedHead(logits),
+        target_lm_head=lm_head
+        or _FixedHead(logits.reshape(bsz, n_blocks * block_size, vocab_size)),
         target_embed_tokens=nn.Embedding(vocab_size, 4).double(),
         mask_token_id=0,
         block_size=block_size,
@@ -204,28 +193,20 @@ def _make_model(logits, anchors, keep_mask, draft_model=None, lm_head=None, **kw
 
 
 def _make_dspark_model(
-    logits,
-    anchors,
-    keep_mask,
-    draft_model=None,
-    lm_head=None,
-    dtype=torch.double,
-    **kwargs,
+    logits, anchors, keep_mask, draft_model=None, lm_head=None, **kwargs
 ):
-    # Exercise the eager/legacy-TV formulas independently of joint fusion.
-    kwargs.setdefault("fused_logits_loss", False)
     bsz, n_blocks, block_size, vocab_size = logits.shape
     model = OnlineDSparkModel(
         draft_model=draft_model or _FixedDraft(hidden_size=4),
         target_lm_head=lm_head
         or _FixedHead(logits.reshape(bsz, n_blocks * block_size, vocab_size)),
-        target_embed_tokens=nn.Embedding(vocab_size, 4).to(dtype),
+        target_embed_tokens=nn.Embedding(vocab_size, 4).double(),
         mask_token_id=0,
         block_size=block_size,
         attention_backend="sdpa",
         num_anchors=n_blocks,
         **kwargs,
-    ).to(dtype)
+    ).double()
     model._sample_anchor_positions = types.MethodType(
         _fixed_anchor_sampler(anchors, keep_mask), model
     )
@@ -336,23 +317,7 @@ def _naive_dflash_loss(neg_log_q, binary_mask, gamma):
         positions = torch.arange(block_size, dtype=neg_log_q.dtype).view(1, 1, -1)
         decay = torch.exp(-(positions - 1).clamp(min=0) / gamma)
         weight = weight * decay
-    return (neg_log_q * weight).sum() / weight.sum()
-
-
-def _sequence_balanced_anchor_terms(per_token_loss, loss_weights, binary_mask):
-    valid_anchors = (binary_mask > 0).any(dim=-1)
-    anchor_counts = valid_anchors.sum(dim=1).to(per_token_loss.dtype)
-    sequence_numerators = (per_token_loss * loss_weights).sum(dim=(1, 2))
-    valid_sequences = anchor_counts > 0
-    normalized_sequence_numerators = torch.where(
-        valid_sequences,
-        sequence_numerators / anchor_counts.clamp_min(1.0),
-        torch.zeros_like(sequence_numerators),
-    )
-    return (
-        normalized_sequence_numerators.sum(),
-        valid_sequences.sum().to(per_token_loss.dtype),
-    )
+    return (neg_log_q * weight).sum() / (weight.sum() + 1e-6)
 
 
 class TestDFlashLosses(unittest.TestCase):
@@ -391,125 +356,19 @@ class TestDFlashLosses(unittest.TestCase):
         want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=None)
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
-    def test_public_dpace_weights_are_detached_and_match_reference(self):
-        from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
-
-        probability = self.q.detach().requires_grad_(True)
-        mask = self.binary_mask.clone()
-        mask[..., 1] = 0  # A gap must not reset the survival prefix.
-        mask[0, 0] = 0
-        for mode in sorted(DPACE_LOSS_TYPES):
-            for alpha in (0.0, 0.5, 1.0):
-                with self.subTest(mode=mode, alpha=alpha):
-                    weights = dpace_weights(probability, mask, alpha=alpha, mode=mode)
-                    expected = _naive_dpace_weight(probability, mask, alpha, mode)
-                    torch.testing.assert_close(weights, expected)
-                    self.assertFalse(weights.requires_grad)
-        with self.assertRaisesRegex(ValueError, "unknown D-PACE mode"):
-            dpace_weights(probability, mask, alpha=0.5, mode="unsupported")
-
     def test_dflash_decay_gamma_is_preserved(self):
         gamma = 7.0
         got = self._forward_loss(loss_type="dflash", loss_decay_gamma=gamma)
         want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=gamma)
         torch.testing.assert_close(got, want, rtol=0, atol=1e-8)
 
-    def test_dflash_tv_objective_matches_hard_target_total_variation(self):
-        got = self._forward_loss(lk_loss_type="tv")
-        want = ((1.0 - self.q) * self.binary_mask).sum() / self.binary_mask.sum()
-        torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
-
-    def test_dflash_lk_lambda_mixes_ce_and_tv(self):
-        kl_scale = 1.0
-        kl_decay = 1.0
-        got = self._forward_loss(
-            lk_loss_type="lambda",
-            kl_scale=kl_scale,
-            kl_decay=kl_decay,
-        )
-        ce = (self.neg_log_q * self.binary_mask).sum() / self.binary_mask.sum()
-        tv = ((1.0 - self.q) * self.binary_mask).sum() / self.binary_mask.sum()
-        acceptance = (self.q * self.binary_mask).sum() / self.binary_mask.sum()
-        lk_weight = kl_scale * torch.exp(-kl_decay * acceptance)
-        want = lk_weight * ce + (1.0 - lk_weight) * tv
-        torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
-
-    def test_dflash_lk_alpha_equals_ce_for_hard_targets(self):
-        got = self._forward_loss(lk_loss_type="alpha")
-        want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=None)
-        torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
-
-    def test_dflash_exposes_additive_loss_and_accuracy_terms(self):
-        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
-        model = _make_model(
-            self.logits,
-            self.anchors,
-            self.keep_mask,
-            draft_model=_LearnableDSparkDraft(4).double(),
-            lm_head=head,
-        )
-
-        loss, accuracy, metrics = model(
-            input_ids=self.input_ids,
-            hidden_states=self.hidden_states,
-            loss_mask=self.loss_mask,
-        )
-
-        loss_num, loss_den = metrics["loss_terms"]
-        self.assertTrue(loss_num.requires_grad)
-        torch.testing.assert_close(loss, loss_num / loss_den)
-        accuracy_num, accuracy_den = metrics["ratio_metrics"]["acc"]
-        torch.testing.assert_close(accuracy, accuracy_num / accuracy_den)
-
-    def test_dflash_partial_tail_has_one_finite_target(self):
-        vocab_size = 7
-        logits = torch.randn(1, 1, 5, vocab_size, dtype=torch.double)
-        input_ids = torch.tensor([[1, 2, 3, 4]])
-        loss_mask = torch.ones_like(input_ids, dtype=torch.double)
-        model = _make_model(
-            logits,
-            anchors=torch.tensor([[2]]),
-            keep_mask=torch.tensor([[True]]),
-        )
-
-        loss, _accuracy, metrics = model(
-            input_ids=input_ids,
-            hidden_states=torch.zeros(1, 4, 4, dtype=torch.double),
-            loss_mask=loss_mask,
-        )
-
-        expected = F.cross_entropy(logits[0, 0, 1].unsqueeze(0), input_ids[:, 3])
-        torch.testing.assert_close(loss, expected)
-        torch.testing.assert_close(metrics["loss_terms"][1], loss.new_tensor(1.0))
-
     def test_dpace_full_matches_naive_reference(self):
         alpha = 0.5
         got = self._forward_loss(loss_type="dpace", dpace_alpha=alpha)
         weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
-        effective_weight = weight * self.binary_mask
-        numerator, denominator = _sequence_balanced_anchor_terms(
-            self.neg_log_q,
-            effective_weight,
-            self.binary_mask,
+        want = (self.neg_log_q * weight * self.binary_mask).sum() / float(
+            self.input_ids.shape[0]
         )
-        want = numerator / denominator
-        torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
-
-    def test_dpace_tv_uses_dynamic_position_weights(self):
-        alpha = 0.5
-        got = self._forward_loss(
-            loss_type="dpace",
-            dpace_alpha=alpha,
-            lk_loss_type="tv",
-        )
-        weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
-        effective_weight = weight * self.binary_mask
-        numerator, denominator = _sequence_balanced_anchor_terms(
-            1.0 - self.q,
-            effective_weight,
-            self.binary_mask,
-        )
-        want = numerator / denominator
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
     def test_cumulative_confidence_ablation_matches_naive_reference(self):
@@ -523,13 +382,9 @@ class TestDFlashLosses(unittest.TestCase):
             alpha,
             "dpace-cumulative-confidence-only",
         )
-        effective_weight = weight * self.binary_mask
-        numerator, denominator = _sequence_balanced_anchor_terms(
-            self.neg_log_q,
-            effective_weight,
-            self.binary_mask,
+        want = (self.neg_log_q * weight * self.binary_mask).sum() / float(
+            self.input_ids.shape[0]
         )
-        want = numerator / denominator
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
     def test_continuation_value_ablation_matches_naive_reference(self):
@@ -543,61 +398,20 @@ class TestDFlashLosses(unittest.TestCase):
             alpha,
             "dpace-continuation-value-only",
         )
-        effective_weight = weight * self.binary_mask
-        numerator, denominator = _sequence_balanced_anchor_terms(
-            self.neg_log_q,
-            effective_weight,
-            self.binary_mask,
+        want = (self.neg_log_q * weight * self.binary_mask).sum() / float(
+            self.input_ids.shape[0]
         )
-        want = numerator / denominator
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
-    def test_dpace_loss_reduces_by_sequence_balanced_anchor_count(self):
+    def test_dpace_loss_reduces_by_batch_size(self):
         alpha = 0.5
-        model = _make_model(
-            self.logits,
-            self.anchors,
-            self.keep_mask,
-            loss_type="dpace",
-            dpace_alpha=alpha,
-        )
-        got, _accuracy, metrics = model(
-            input_ids=self.input_ids,
-            hidden_states=self.hidden_states,
-            loss_mask=self.loss_mask,
-        )
+        got = self._forward_loss(loss_type="dpace", dpace_alpha=alpha)
         weight = _naive_dpace_weight(self.q, self.binary_mask, alpha, "dpace")
-        effective_weight = weight * self.binary_mask
-        numerator, denominator = _sequence_balanced_anchor_terms(
-            self.neg_log_q,
-            effective_weight,
-            self.binary_mask,
-        )
-        torch.testing.assert_close(got, numerator / denominator, rtol=0, atol=1e-10)
-        torch.testing.assert_close(metrics["loss_terms"][0], numerator)
-        torch.testing.assert_close(metrics["loss_terms"][1], denominator)
-
-    def test_dpace_zero_effective_weight_has_finite_local_loss(self):
-        logits = torch.zeros_like(self.logits)
-        logits.scatter_(-1, self.targets.unsqueeze(-1), -1000.0)
-        model = _make_model(
-            logits,
-            self.anchors,
-            self.keep_mask,
-            loss_type="dpace",
-            dpace_alpha=0.0,
-        )
-
-        loss, _accuracy, metrics = model(
-            input_ids=self.input_ids,
-            hidden_states=self.hidden_states,
-            loss_mask=self.loss_mask,
-        )
-
-        self.assertTrue(torch.isfinite(loss))
-        self.assertEqual(loss.item(), 0.0)
-        valid_sequences = (self.binary_mask > 0).any(dim=-1).any(dim=-1).sum().item()
-        self.assertEqual(metrics["loss_terms"][1].item(), valid_sequences)
+        weighted_sum = (self.neg_log_q * weight * self.binary_mask).sum()
+        token_count_loss = weighted_sum / ((weight * self.binary_mask).sum() + 1e-6)
+        batch_loss = weighted_sum / float(self.input_ids.shape[0])
+        torch.testing.assert_close(got, batch_loss, rtol=0, atol=1e-10)
+        self.assertFalse(torch.allclose(got, token_count_loss))
 
     def test_alpha_changes_dpace_loss(self):
         low_alpha = self._forward_loss(loss_type="dpace", dpace_alpha=0.1)
@@ -959,214 +773,29 @@ class TestDFlashLosses(unittest.TestCase):
         self.assertEqual(anchors[0, 0].item(), 4)
         self.assertEqual(keep[0].tolist(), [True, False])
 
-    def test_shared_sampler_uses_adjacent_targets_and_partial_tails(self):
-        sampler = OnlineDFlashModel._sample_anchor_positions
-        model = _anchor_sampler_subject()
-        loss_mask = torch.tensor([[1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0]])
-
-        anchors, keep = sampler(
-            model,
-            seq_len=loss_mask.shape[1],
-            loss_mask=loss_mask,
-            device=loss_mask.device,
-        )
-
-        self.assertEqual(anchors[keep].tolist(), [0, 5])
-
-    def test_shared_sampler_is_batch_padding_invariant(self):
-        sampler = OnlineDFlashModel._sample_anchor_positions
-        model = _anchor_sampler_subject()
-        short_mask = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
-        short_anchors, short_keep = sampler(
-            model,
-            seq_len=4,
-            loss_mask=short_mask,
-            device=short_mask.device,
-        )
-        padded_batch = torch.tensor(
-            [
-                [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
-                [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-                [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-            ]
-        )
-        batch_anchors, batch_keep = sampler(
-            model,
-            seq_len=7,
-            loss_mask=padded_batch,
-            device=padded_batch.device,
-        )
-
-        self.assertEqual(short_anchors[short_keep].tolist(), [2])
-        self.assertEqual(batch_anchors[0][batch_keep[0]].tolist(), [2])
-        self.assertFalse(batch_keep[2].any())
-
-    def test_shared_sampler_rejects_a_batch_without_adjacent_targets(self):
-        model = _anchor_sampler_subject()
-        loss_mask = torch.tensor([[1.0, 0.0, 1.0]])
-        with self.assertRaisesRegex(ValueError, "two consecutive"):
-            OnlineDFlashModel._sample_anchor_positions(
-                model,
-                seq_len=loss_mask.shape[1],
-                loss_mask=loss_mask,
-                device=loss_mask.device,
-            )
-
-
-def _triton_available() -> bool:
-    """True only for a real Triton install; mirrors test_fused_loss.py."""
-    try:
-        import triton
-        import triton.language  # noqa: F401
-    except ImportError:
-        return False
-    return hasattr(triton, "jit")
-
-
-_ACCELERATOR_DEVICE = "cuda" if torch.cuda.is_available() else None
-_REQUIRES_FUSED = unittest.skipUnless(
-    _ACCELERATOR_DEVICE is not None and _triton_available(),
-    "fused DSpark loss requires Triton and CUDA",
-)
-
-
-class TestDSparkFusedLoss(unittest.TestCase):
-    """DSpark loss, telemetry and gradient parity across supported accelerators."""
-
-    def setUp(self):
-        (
-            self.logits,
-            self.input_ids,
-            self.loss_mask,
-            self.hidden_states,
-            self.anchors,
-            self.keep_mask,
-        ) = _sample_tensors()
-
-    def _forward_with_target(self, model):
-        return model(
-            input_ids=self.input_ids,
-            hidden_states=self.hidden_states,
-            loss_mask=self.loss_mask,
-            target_last_hidden_states=torch.zeros_like(self.hidden_states),
-        )
-
-    def test_top1_telemetry_matches_softmax_reference(self):
-        """Pin p_max = exp(max_logit - logsumexp) to the softmax reference."""
-        torch.manual_seed(55)
-        target_logits = torch.randn_like(self.logits)
+    def test_dspark_sampler_pads_empty_usp_shard_to_shared_width(self):
         model = _make_dspark_model(
             self.logits,
             self.anchors,
             self.keep_mask,
-            lm_head=_DualFixedHead(self.logits, target_logits).double(),
         )
-        _loss, _acc, metrics = self._forward_with_target(model)
-        _targets, eval_mask = _dspark_targets_and_mask(
-            self.input_ids,
-            self.loss_mask,
-            self.anchors,
-            self.keep_mask,
-            self.logits.shape[2],
+        empty_local_mask = torch.zeros(1, 6)
+        anchors, keep = OnlineDSparkModel._sample_anchor_positions(
+            model,
+            seq_len=6,
+            loss_mask=empty_local_mask,
+            device=empty_local_mask.device,
+            minimum_anchor_width=2,
         )
-        teacher_ref = (
-            torch.softmax(target_logits.float(), dim=-1).max(dim=-1).values * eval_mask
-        ).sum()
-        draft_ref = (
-            torch.softmax(self.logits.float(), dim=-1).max(dim=-1).values * eval_mask
-        ).sum()
-        ratio = metrics["ratio_metrics"]
-        torch.testing.assert_close(
-            ratio["teacher_top1_prob"][0],
-            teacher_ref,
-            rtol=1e-4,
-            atol=1e-6,
-            check_dtype=False,
+        self.assertEqual(anchors.tolist(), [[0, 0]])
+        self.assertEqual(keep.tolist(), [[False, False]])
+        _, eval_mask, _ = model._build_dspark_labels_and_mask(
+            input_ids=torch.arange(6, dtype=torch.long).unsqueeze(0),
+            loss_mask=empty_local_mask,
+            anchor_positions=anchors,
+            block_keep_mask=keep,
         )
-        torch.testing.assert_close(
-            ratio["draft_top1_prob"][0],
-            draft_ref,
-            rtol=1e-4,
-            atol=1e-6,
-            check_dtype=False,
-        )
-
-    @_REQUIRES_FUSED
-    def test_fused_kernel_matches_eager_on_accelerator(self):
-        """Fused loss vs the eager path: loss, telemetry, gradients."""
-        self._check_fused_kernel_matches_eager(torch.float32)
-
-    @_REQUIRES_FUSED
-    def test_default_bf16_kernel_matches_eager_on_accelerator(self):
-        """The default BF16 route must execute the kernel and preserve gradients."""
-        self._check_fused_kernel_matches_eager(torch.bfloat16)
-
-    def _check_fused_kernel_matches_eager(self, dtype):
-        torch.manual_seed(2024)
-        device = torch.device(_ACCELERATOR_DEVICE)
-        bsz, n_blocks, block_size, vocab_size = 2, 3, 4, 100
-        seq_len = 10
-        anchors = torch.tensor([[0, 2, 5], [1, 3, 5]])
-        keep_mask = torch.tensor([[True, True, True], [True, False, True]])
-        input_ids = torch.randint(0, vocab_size, (bsz, seq_len))
-        loss_mask = torch.ones(bsz, seq_len)
-        hidden_states = torch.randn(bsz, seq_len, 4)
-        target_hidden = torch.randn(bsz, seq_len, 4)
-        head = nn.Linear(4, vocab_size, bias=False)
-        shape_stub = torch.empty(bsz, n_blocks, block_size, vocab_size)
-
-        def build():
-            model = _make_dspark_model(
-                shape_stub,
-                anchors,
-                keep_mask,
-                draft_model=_LearnableDSparkDraft(4),
-                lm_head=copy.deepcopy(head),
-                dtype=dtype,
-            )
-            return model.to(device)
-
-        eager_model = build()
-        fused_model = build()
-        fused_model.load_state_dict(eager_model.state_dict())
-
-        inputs = dict(
-            input_ids=input_ids.to(device),
-            hidden_states=hidden_states.to(device=device, dtype=dtype),
-            loss_mask=loss_mask.to(device),
-            target_last_hidden_states=target_hidden.to(device=device, dtype=dtype),
-        )
-        fused_model.fused_logits_loss = True
-        with patch.object(
-            _dflash_module.fused_loss,
-            "fused_ce_l1_loss",
-            wraps=_dflash_module.fused_loss.fused_ce_l1_loss,
-        ) as fused_call:
-            fused_value, _fused_acc, fused_metrics = fused_model(**inputs)
-            fused_value.backward()
-        fused_call.assert_called()
-        eager_value, _eager_acc, eager_metrics = eager_model(**inputs)
-        eager_value.backward()
-        torch.testing.assert_close(fused_value, eager_value, rtol=1e-3, atol=1e-5)
-        for name, eager_pair in eager_metrics["ratio_metrics"].items():
-            fused_pair = fused_metrics["ratio_metrics"][name]
-            torch.testing.assert_close(
-                fused_pair[0], eager_pair[0], rtol=1e-3, atol=1e-5, check_dtype=False
-            )
-            torch.testing.assert_close(fused_pair[1], eager_pair[1])
-
-        torch.testing.assert_close(
-            fused_model.draft_model.signal.grad,
-            eager_model.draft_model.signal.grad,
-            rtol=1e-2,
-            atol=1e-4,
-        )
-        torch.testing.assert_close(
-            fused_model.lm_head.weight.grad,
-            eager_model.lm_head.weight.grad,
-            rtol=1e-2,
-            atol=1e-4,
-        )
+        self.assertFalse(eval_mask.any())
 
 
 if __name__ == "__main__":

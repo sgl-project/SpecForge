@@ -8,7 +8,7 @@ from specforge.algorithms.common.defaults import (
     empty_options,
     no_missing_checkpoint_keys,
 )
-from specforge.algorithms.common.hidden_states_data import (
+from specforge.algorithms.common.dflash_family_data import (
     DSPARK_NORMALIZER_ID,
     build_dspark_collator,
     build_dspark_offline_normalizer,
@@ -33,11 +33,9 @@ from specforge.algorithms.contracts import (
     FeatureMode,
     OfflineStorageContract,
 )
-from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
-COMPATIBLE_DRAFT_ARCHITECTURES = frozenset({DRAFT_ARCHITECTURE})
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
@@ -50,9 +48,7 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
-    from specforge.modeling.draft.dflash import dflash_attention_resume_contract
-
-    contract = {
+    return {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -68,22 +64,11 @@ def resume_contract(_config, draft_model, training_model):
             training_model.dspark_confidence_head_alpha
         ),
     }
-    contract.update(dflash_attention_resume_contract(draft_model))
-    if getattr(draft_model.config, "is_causal", None) is True:
-        contract["dspark_causal_block"] = True
-    return contract
 
 
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
-    if config.model.use_liger_kernel:
-        from specforge.algorithms.dflash.providers import resolve_dflash_kernels
-        from specforge.algorithms.model_providers import build_dflash_draft
-
-        return build_dflash_draft(
-            config, draft_config, resolve_dflash_kernels(config, draft_config)
-        )
     return build_registered_draft(config, draft_config)
 
 
@@ -127,7 +112,7 @@ def algorithm_spec() -> AlgorithmSpec:
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
-            compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
+            compatible_architectures={DRAFT_ARCHITECTURE},
             default_architecture=DRAFT_ARCHITECTURE,
         ),
         feature_contracts=(
@@ -152,8 +137,7 @@ def algorithm_spec() -> AlgorithmSpec:
             ),
         ),
         capabilities=AlgorithmCapabilities(
-            attention_backends={"eager", "sdpa", "flex_attention"},
-            supports_liger_kernel=True,
+            attention_backends={"eager", "sdpa", "flex_attention", "usp"},
         ),
     )
 
@@ -171,7 +155,6 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
-                compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
                 expected_auto_map_model="dspark.DSparkDraftModel",
             ),
             build_draft=build_draft,
@@ -180,14 +163,13 @@ def algorithm_providers() -> AlgorithmProviders:
             minimum_loss_tokens=minimum_loss_tokens,
             needs_input_tools=needs_input_tools,
             default_dataloader_num_workers=8,
-            loss_mask_filter=has_consecutive_supervised_tokens,
         ),
         offline=(
             OfflineDataProvider(
                 modality="text",
                 normalizer_id=DSPARK_NORMALIZER_ID,
                 capture_layout=OfflineCaptureLayout(
-                    capture_method="dspark",
+                    capture_method="dflash",
                     aux_feature="hidden_states",
                     last_hidden_feature="target_last_hidden_states",
                     passthrough=(
@@ -203,7 +185,7 @@ def algorithm_providers() -> AlgorithmProviders:
         server_streaming=(
             ServerStreamingProvider(
                 modality="text",
-                capture_method="dspark",
+                capture_method="dflash",
                 target_representation="hidden_state",
                 layout=ServerCaptureLayout(
                     aux_feature="hidden_states",

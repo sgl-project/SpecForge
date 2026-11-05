@@ -37,7 +37,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
                     "hidden_states",
                     "target_last_hidden_states",
                 },
-                {"eager", "sdpa", "flex_attention"},
+                {"eager", "sdpa", "flex_attention", "usp"},
                 None,
             ),
             "eagle3": (
@@ -144,11 +144,6 @@ class BuiltinProviderParityTest(unittest.TestCase):
         self.assertEqual("hidden_state", peagle_stream.target_representation)
         self.assertTrue(peagle.step.uses_external_target_head)
 
-    def test_dspark_uses_the_dedicated_server_capture_method(self):
-        stream = self.registry.resolve("dspark").providers.server_streaming_for("text")
-
-        self.assertEqual("dspark", stream.capture_method)
-
     def test_step_factories_preserve_concrete_strategy_types(self):
         expected = {
             "eagle3": "Eagle3TrainStrategy",
@@ -215,38 +210,6 @@ class BuiltinProviderParityTest(unittest.TestCase):
                     torch.all(batch["target_last_hidden_states"][0, 2:] == 0)
                 )
 
-    def test_dflash_collator_preserves_optional_teacher_hidden_states(self):
-        short = {
-            "input_ids": torch.tensor([[1, 2]]),
-            "loss_mask": torch.ones(1, 2, dtype=torch.long),
-            "hidden_states": torch.ones(1, 2, 4),
-            "target_last_hidden_states": torch.ones(1, 2, 3),
-        }
-        long = {
-            "input_ids": torch.tensor([[1, 2, 3]]),
-            "loss_mask": torch.ones(1, 3, dtype=torch.long),
-            "hidden_states": torch.ones(1, 3, 4),
-            "target_last_hidden_states": torch.ones(1, 3, 3),
-        }
-        collate = (
-            self.registry.resolve("dflash")
-            .providers.server_streaming_for("text")
-            .build_collator()
-        )
-
-        batch = collate([short, long])
-
-        self.assertEqual((2, 3, 3), tuple(batch["target_last_hidden_states"].shape))
-        self.assertTrue(torch.all(batch["target_last_hidden_states"][0, 2:] == 0))
-
-        without_teacher = {
-            key: value
-            for key, value in short.items()
-            if key != "target_last_hidden_states"
-        }
-        with self.assertRaisesRegex(KeyError, "target_last_hidden_states"):
-            collate([without_teacher, long])
-
     def test_dspark_offline_contract_and_normalizer_preserve_target_hidden(self):
         registration = self.registry.resolve("dspark")
         contract = registration.spec.feature_contract("offline", "text")
@@ -300,15 +263,18 @@ class BuiltinProviderParityTest(unittest.TestCase):
     def test_dspark_offline_reader_exposes_both_target_feature_sets(self):
         provider = self.registry.resolve("dspark").providers.offline_for("text")
         with tempfile.TemporaryDirectory(prefix="dspark-offline-reader-") as path:
-            torch.save(
-                {
-                    "input_ids": torch.tensor([1, 2, 3]),
-                    "loss_mask": torch.ones(3, dtype=torch.long),
-                    "hidden_states": torch.ones(1, 3, 4),
-                    "target_last_hidden_states": torch.ones(1, 3, 2),
-                },
-                os.path.join(path, "0000.ckpt"),
-            )
+            with mock.patch.dict(
+                os.environ, {"SPECFORGE_VALIDATE_OFFLINE_FEATURES": "1"}
+            ):
+                torch.save(
+                    {
+                        "input_ids": torch.tensor([1, 2, 3]),
+                        "loss_mask": torch.ones(3, dtype=torch.long),
+                        "hidden_states": torch.ones(1, 3, 4),
+                        "target_last_hidden_states": torch.ones(1, 3, 2),
+                    },
+                    os.path.join(path, "0000.ckpt"),
+                )
 
             ref = provider.build_reader(
                 path,

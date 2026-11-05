@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -29,36 +29,21 @@ from specforge.runtime.contracts import TrainBatch
 @dataclass(frozen=True)
 class StepOutput:
     """Per-step result: loss + strategy-specific metrics, kept generic so
-    per-position (TTT) and single-scalar strategies share one trainer loop.
-
-    ``loss_terms`` carries an additive objective numerator and denominator when
-    gradients and reported loss must be normalized across the full optimizer
-    window.
-    """
+    per-position (TTT) and single-scalar strategies share one trainer loop."""
 
     loss: torch.Tensor
     metrics: Dict[str, Any]
     ratio_metrics: Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
-    loss_terms: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    # Additive telemetry (for example reached/accepted counts), summed across
-    # the optimizer window and data-parallel ranks, never averaged.
-    sum_metrics: Dict[str, Any] = field(default_factory=dict)
-    # Replay a graph-free prepass once the window's local ratio totals are known.
-    replay_loss: Optional[
-        Callable[[Dict[str, Tuple[torch.Tensor, torch.Tensor]]], StepOutput]
-    ] = None
 
 
 @dataclass(frozen=True)
 class StepContext:
-    """Training-schedule state passed into ``forward_loss``.
-
-    ``collect_detailed_metrics`` gates expensive diagnostics to log steps."""
+    """Training-schedule state passed into ``forward_loss`` for objectives that
+    depend on where in training we are (e.g. Domino's decaying ``lambda_base``);
+    most strategies ignore it."""
 
     global_step: int = 0
     total_steps: Optional[int] = None
-    collect_detailed_metrics: bool = True
-    accumulation_steps: int = 1
 
 
 def linear_lambda_base(
@@ -73,27 +58,6 @@ def linear_lambda_base(
     decay_steps = max(1, int(total_steps * decay_ratio))
     progress = min(global_step / decay_steps, 1.0)
     return max(0.0, min(1.0, lambda_start * (1.0 - progress)))
-
-
-def _cpu_max_valid_anchors(loss_mask: torch.Tensor) -> Optional[int]:
-    """Count the widest valid anchor row without synchronizing the GPU.
-
-    Online/offline loaders hand strategies CPU integer features; Mooncake
-    device consumers keep them on the host while hidden states land on the
-    GPU.  Computing this one scalar before the asynchronous H2D copies lets
-    DFlash-family models size their anchor tensors without a CUDA ``item()``
-    in the forward critical path.  Direct GPU callers keep the model's
-    existing fallback.
-    """
-    if loss_mask.device.type != "cpu":
-        return None
-    num_candidates = max(loss_mask.shape[1] - 1, 0)
-    valid = (loss_mask[:, :num_candidates] > 0.5) & (
-        loss_mask[:, 1 : num_candidates + 1] > 0.5
-    )
-    if valid.shape[0] == 0:
-        return 0
-    return int(valid.sum(dim=1).max().item())
 
 
 class DraftTrainStrategy(abc.ABC):
@@ -146,17 +110,9 @@ def _prepare_eagle_target(
         input_ids, target, loss_mask = target_head.preprocess(
             input_ids, target, loss_mask
         )
-        target = target_head(target.to(device, non_blocking=True))
-        return (
-            input_ids.to(device, non_blocking=True),
-            target,
-            loss_mask.to(device, non_blocking=True),
-        )
-    return (
-        input_ids.to(device, non_blocking=True),
-        target.to(device, non_blocking=True),
-        loss_mask.to(device, non_blocking=True),
-    )
+        target = target_head(target.to(device))
+        return input_ids.to(device), target, loss_mask.to(device)
+    return input_ids.to(device), target.to(device), loss_mask.to(device)
 
 
 class Eagle3TrainStrategy(DraftTrainStrategy):
@@ -183,14 +139,12 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         *,
         target_head: Optional[nn.Module] = None,
         ploss_decay: float = 0.8,
-        trim_loss_positions: bool = False,
         compact_teacher: bool = False,
         compact_teacher_chunk_size: Optional[int] = None,
     ) -> None:
         self.eagle3_model = eagle3_model
         self.target_head = target_head
         self.ploss_decay = ploss_decay
-        self.trim_loss_positions = trim_loss_positions
         self.compact_teacher = compact_teacher
         self.compact_teacher_chunk_size = compact_teacher_chunk_size
         if compact_teacher:
@@ -295,9 +249,9 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
             input_ids, target_hidden, loss_mask = self.target_head.preprocess(
                 t["input_ids"], t["target"], t["loss_mask"]
             )
-            input_ids = input_ids.to(device, non_blocking=True)
-            target_hidden = target_hidden.to(device, non_blocking=True)
-            loss_mask = loss_mask.to(device, non_blocking=True)
+            input_ids = input_ids.to(device)
+            target_hidden = target_hidden.to(device)
+            loss_mask = loss_mask.to(device)
             from specforge.core.compact_teacher import build_offline_teacher_inputs
 
             target, compact_kwargs = build_offline_teacher_inputs(
@@ -321,16 +275,11 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
             metric_loss_denoms,
         ) = self.eagle3_model(
             input_ids=input_ids,
-            attention_mask=t["attention_mask"].to(device, non_blocking=True),
+            attention_mask=t["attention_mask"].to(device),
             loss_mask=loss_mask,
             target=target,
-            hidden_states=t["hidden_state"].to(device, non_blocking=True),
-            position_ids=(
-                position_ids.to(device, non_blocking=True)
-                if position_ids is not None
-                else None
-            ),
-            trim_loss_positions=self.trim_loss_positions,
+            hidden_states=t["hidden_state"].to(device),
+            position_ids=position_ids.to(device) if position_ids is not None else None,
             **compact_kwargs,
         )
         weights = [self.ploss_decay**i for i in range(len(plosses))]
@@ -420,11 +369,11 @@ class PEagleTrainStrategy(DraftTrainStrategy):
 
         loss, model_metrics = self.peagle_model(
             input_ids=input_ids,
-            attention_mask=tensors["attention_mask"].to(device, non_blocking=True),
+            attention_mask=tensors["attention_mask"].to(device),
             loss_mask=loss_mask,
             target=target,
-            hidden_states=tensors["hidden_state"].to(device, non_blocking=True),
-            lengths=lengths.to(device, non_blocking=True),
+            hidden_states=tensors["hidden_state"].to(device),
+            lengths=lengths.to(device),
         )
         if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
             raise ValueError(
@@ -478,86 +427,21 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.dflash_model.parameters()).device
 
-    def _draft_attr(self, name: str, default: float) -> float:
-        """Read a schedule or diagnostics attribute from the draft model.
-
-        Under ``fsdp_sharding: NO_SHARD`` the backend wraps the draft in
-        ``DistributedDataParallel``, which does not forward attribute access
-        to the wrapped module, so ``selector_loss_alpha`` and the warmup and
-        ramp ratios read as their defaults and the selector objective is
-        silently disabled. Look through the wrapper when the attribute is
-        not on the outer module.
-        """
-        model = self.dflash_model
-        if not hasattr(model, name):
-            inner = getattr(model, "module", None)
-            if isinstance(inner, nn.Module):
-                model = inner
-        return float(getattr(model, name, default))
-
-    def _selector_loss_alpha(self, ctx: Optional[StepContext]) -> float:
-        target = self._draft_attr("selector_loss_alpha", 0.0)
-        if target <= 0 or ctx is None or not ctx.total_steps:
-            return target
-
-        total_steps = int(ctx.total_steps)
-        warmup_steps = int(total_steps * self._draft_attr("selector_warmup_ratio", 0.0))
-        if ctx.global_step < warmup_steps:
-            return 0.0
-
-        ramp_steps = int(total_steps * self._draft_attr("selector_ramp_ratio", 0.0))
-        if ramp_steps <= 0:
-            return target
-        ramp_progress = min(
-            max((ctx.global_step - warmup_steps + 1) / ramp_steps, 0.0),
-            1.0,
-        )
-        return target * ramp_progress
-
     def forward_loss(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepOutput:
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        selector_loss_alpha = self._selector_loss_alpha(ctx)
-        max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
-        collect_detailed_metrics = (
-            ctx.collect_detailed_metrics if ctx is not None else True
+        loss, accuracy, model_metrics = self.dflash_model(
+            input_ids=t["input_ids"].to(device),
+            hidden_states=t["hidden_states"].to(device),
+            loss_mask=t["loss_mask"].to(device),
         )
-        model_inputs = {
-            "input_ids": t["input_ids"].to(device, non_blocking=True),
-            "hidden_states": t["hidden_states"].to(device, non_blocking=True),
-            "loss_mask": t["loss_mask"].to(device, non_blocking=True),
-            "max_valid_anchors": max_valid_anchors,
-            "selector_loss_alpha": selector_loss_alpha,
-        }
-        if ctx is not None:
-            model_inputs["collect_detailed_metrics"] = collect_detailed_metrics
-        target_last_hidden_states = t.get("target_last_hidden_states")
-        # Teacher hidden states only feed diagnostics; skip the copy when the
-        # run disabled them (training.dflash_teacher_metrics=false).
-        if (
-            target_last_hidden_states is not None
-            and collect_detailed_metrics
-            and bool(self._draft_attr("teacher_metrics", 1.0))
-        ):
-            model_inputs["target_last_hidden_states"] = target_last_hidden_states.to(
-                device, non_blocking=True
-            )
-        loss, accuracy, model_metrics = self.dflash_model(**model_inputs)
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:
             metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
-        if "selector_loss_alpha" in model_metrics:
-            metrics["selector_loss_alpha"] = model_metrics["selector_loss_alpha"]
-        return StepOutput(
-            loss=loss,
-            metrics=metrics,
-            ratio_metrics=model_metrics.get("ratio_metrics", {}),
-            loss_terms=model_metrics.get("loss_terms"),
-            sum_metrics=model_metrics.get("sum_metrics", {}),
-        )
+        return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Everything trainable lives under draft_model.; the target
@@ -595,17 +479,13 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
         loss, accuracy, model_metrics = self.dspark_model(
-            input_ids=t["input_ids"].to(device, non_blocking=True),
-            hidden_states=t["hidden_states"].to(device, non_blocking=True),
-            loss_mask=t["loss_mask"].to(device, non_blocking=True),
-            target_last_hidden_states=t["target_last_hidden_states"].to(
-                device, non_blocking=True
-            ),
-            max_valid_anchors=max_valid_anchors,
-            collect_detailed_metrics=(
-                ctx.collect_detailed_metrics if ctx is not None else True
+            input_ids=t["input_ids"].to(device),
+            hidden_states=t["hidden_states"].to(device),
+            loss_mask=t["loss_mask"].to(device),
+            target_last_hidden_states=t["target_last_hidden_states"].to(device),
+            attention_mask=(
+                t["attention_mask"].to(device) if "attention_mask" in t else None
             ),
         )
         metrics = {
@@ -628,65 +508,6 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            k.replace("draft_model.", ""): v
-            for k, v in state_dict.items()
-            if "draft_model." in k
-        }
-
-
-class MTPTrainStrategy(DraftTrainStrategy):
-    """MTP strategy over ``OnlineMTPModel`` with final-hidden supervision."""
-
-    name = "mtp"
-    required_features = {
-        "input_ids",
-        "loss_mask",
-        "target_last_hidden_states",
-    }
-
-    def __init__(self, mtp_model: nn.Module) -> None:
-        self.mtp_model = mtp_model
-
-    def trainable_module(self) -> nn.Module:
-        return self.mtp_model
-
-    def _device(self) -> torch.device:
-        return next(self.mtp_model.parameters()).device
-
-    def forward_loss(
-        self, batch: TrainBatch, ctx: Optional[StepContext] = None
-    ) -> StepOutput:
-        self.validate_batch(batch)
-        t = batch.tensors
-        device = self._device()
-        # OnlineMTPModel performs the next-token shift internally and returns
-        # per-position correct/denominator tensors (single-layer: length-1 lists).
-        # Non-blocking like the other strategies: pinned Mooncake receives keep
-        # integer features on the host, and a blocking H2D would sync the GPU.
-        loss, corrects, denoms = self.mtp_model(
-            input_ids=t["input_ids"].to(device, non_blocking=True),
-            hidden_states=t["target_last_hidden_states"].to(device, non_blocking=True),
-            loss_mask=t["loss_mask"].to(device, non_blocking=True),
-        )
-        correct_sum = corrects[0].sum()
-        denom_sum = denoms[0].sum()
-        metrics = {
-            "accuracy": (correct_sum / denom_sum.clamp_min(1)).detach(),
-            "accuracy_denom": denom_sum.detach(),
-        }
-        return StepOutput(
-            loss=loss,
-            metrics=metrics,
-            ratio_metrics={"accuracy": (correct_sum, denom_sum)},
-            # TrainerCore backpropagates additive numerators and divides by the
-            # global token denominator across accumulation steps / DP ranks.
-            loss_terms=(loss * denom_sum, denom_sum),
-        )
-
-    def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
-        # Everything trainable lives under draft_model.; persisting the stripped
-        # keys (embed_tokens.* + mtp.*) matches the native serving layout.
         return {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
@@ -737,30 +558,19 @@ class DominoTrainStrategy(DraftTrainStrategy):
         t = batch.tensors
         device = self._device()
         lambda_base = self._lambda_base(ctx)
-        max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
         loss, accuracy, model_metrics = self.domino_model(
-            input_ids=t["input_ids"].to(device, non_blocking=True),
-            hidden_states=t["hidden_states"].to(device, non_blocking=True),
-            loss_mask=t["loss_mask"].to(device, non_blocking=True),
+            input_ids=t["input_ids"].to(device),
+            hidden_states=t["hidden_states"].to(device),
+            loss_mask=t["loss_mask"].to(device),
             lambda_base=lambda_base,
-            max_valid_anchors=max_valid_anchors,
-            collect_detailed_metrics=(
-                ctx.collect_detailed_metrics if ctx is not None else True
-            ),
         )
         metrics = dict(model_metrics)
-        ratio_metrics = metrics.pop("ratio_metrics", {})
         metrics["accuracy"] = accuracy.detach()
         metrics.setdefault(
             "lambda_base",
-            float(lambda_base),
+            torch.tensor(float(lambda_base), device=loss.device),
         )
-        return StepOutput(
-            loss=loss,
-            metrics=metrics,
-            loss_terms=model_metrics.get("loss_terms"),
-            ratio_metrics=ratio_metrics,
-        )
+        return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Everything trainable lives under draft_model.; the target
