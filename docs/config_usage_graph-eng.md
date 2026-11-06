@@ -96,7 +96,7 @@ Providing only a target path does not trigger native draft loading: training fro
 
 - A canonical configuration always has `model_type: specforge_draft`, registered with SpecForge's single HF configuration class. The target's `model_type` is never copied. Target configuration classes can reject draft fields, substitute default `text_config` dimensions, or inject MLA defaults, and some require the target's remote code.
 - The `model_type` of an external draft, such as `qwen3` in an existing DFlash checkpoint, is input to its import adapter only. The SGLang converter writes whatever legacy value its output requires.
-- `architectures` holds exactly one registered name, which selects the model class and the `spec_config` schema. SpecForge resolves it through its registries, not as a Python import path. Other selectors, such as `training.strategy`, are derived from it and are not specified separately.
+- `architectures` holds exactly one registered name, which selects the model class and the `spec_config` schema. This follows HF's division of roles: `model_type` selects the configuration class, and `architectures` selects the model class. SpecForge resolves the name through its registries, not as a Python import path. There is no separate algorithm field; other selectors, such as `training.strategy`, are derived from `architectures` and are not specified separately.
 - Canonical architecture names must not be names that released SGLang versions map to the legacy layout. Otherwise an SGLang release without canonical support, run with `--trust-remote-code`, could load a canonical directory and serve it with default block settings (Section 6).
 
 ### 2.2 Input YAML and saved JSON
@@ -387,5 +387,4 @@ Replacing attention, MLP, or residual structures while reusing only some weights
 
 ## 6. Open Questions
 
-1. **Selector.** This document selects the draft implementation with `architectures`. That matches HF's division of roles, where `model_type` selects the configuration class and `architectures` the model class, and it matches the existing draft-configuration loader. The alternative is a `spec_config.algorithm` field, with `architectures` written only by exporters. In either case, exactly one selector is stored.
-2. **Canonical architecture names.** Names must not collide with the legacy names that released SGLang versions map to the legacy layout (Section 2.1). Whether to rename the model classes or to register separate canonical names is open.
+**Canonical architecture names.** Names must not collide with the legacy names that released SGLang versions map to the legacy layout (Section 2.1). Whether to rename the model classes or to register separate canonical names is open.
