@@ -20,13 +20,17 @@ source .venv/bin/activate
 uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
 uv pip install wheel setuptools setuptools-rust setuptools-scm
 uv pip install -v -e . --no-build-isolation --prerelease=allow
+# Install SGLang explicitly; SpecForge's package dependencies do not install it.
+uv pip install --no-build-isolation --prerelease=allow \
+  "sglang @ git+https://github.com/sgl-project/sglang.git@c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0#subdirectory=python"
 uv pip install --no-deps plugins/sglang-spec-capture
 uv pip install mooncake-transfer-engine-cuda13
 ```
 
-Source installs pin SGLang to commit
-`c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`, with Torch `2.14.1` and
-Transformers `5.19.0`. Normal installer caches are reused. Online
+Install SGLang commit `c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0` manually
+using the command above for capture workloads. SpecForge pins Torch `2.14.1`
+and Transformers `5.19.0`, but does not install SGLang automatically.
+Normal installer caches are reused. Online
 training and offline feature preparation use the capture plugin; see the
 [plugin guide](../../../plugins/sglang-spec-capture/README.md) for server setup.
 Offline training from existing features does not require a capture server.
@@ -44,6 +48,10 @@ pip install specforge
 ```
 
 :::
+
+PyPI installation also requires the explicit SGLang installation above when
+using a capture server. Install SGLang and the capture plugin in the server's
+environment; an existing compatible server can be used separately.
 
 ## Accelerator-specific environments
 

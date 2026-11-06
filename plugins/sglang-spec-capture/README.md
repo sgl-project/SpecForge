@@ -21,7 +21,7 @@ build with these generic extension points:
 This version requires SGLang's [aux-capture changes in PR #43449](https://github.com/sgl-project/sglang/pull/43449)
 and the completion-based `defer_response` revision of
 [PR #43450](https://github.com/sgl-project/sglang/pull/43450), or a branch containing
-both. SpecForge pins SGLang to commit
+both. Install SGLang manually at commit
 `c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`; the released 0.5.23 wheel still lacks the forward
 observer, completion and auxiliary-capture APIs required here.
 
@@ -31,12 +31,14 @@ preserves those values; SpecForge folds `logits_mup_width_multiplier` into
 its frozen target head. Older builds that return scaled states are unsupported;
 upgrade the capture environment to a build with the required API.
 
-SpecForge and its capture server use the same pinned SGLang revision,
-Torch 2.14.1 and Transformers 5.19.0. They can run in the same environment;
+The supported capture setup uses this SGLang revision with
+Torch 2.14.1 and Transformers 5.19.0. SpecForge does not install SGLang as a
+package dependency. They can run in the same environment;
 the server remains a separate process. Separate environments are also supported
 through `capture_servers[].python_executable`. The plugin itself does not import
 the main SpecForge package. CI uses a separate `sf-capture` environment for
-the live server and reads its SGLang requirement directly from `pyproject.toml`.
+the live server. Both CI environments install the revision specified by
+`SGLANG_COMMIT` in `.github/workflows/test.yaml`.
 
 Install into the SGLang server's environment. The plugin declares no
 dependencies, so the server's pins stay intact:
@@ -63,6 +65,8 @@ source .venv/bin/activate
 uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
 uv pip install wheel setuptools setuptools-rust setuptools-scm
 uv pip install --no-build-isolation --prerelease=allow -e .
+uv pip install --no-build-isolation --prerelease=allow \
+  "sglang @ git+https://github.com/sgl-project/sglang.git@c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0#subdirectory=python"
 uv pip install --no-deps plugins/sglang-spec-capture
 uv pip install mooncake-transfer-engine-cuda13
 ```

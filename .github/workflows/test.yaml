@@ -51,6 +51,8 @@ jobs:
       # v2 deliberately ignores the legacy venv cache with stale dist-info files.
       SPECFORGE_CI_CACHE: /github/home/specforge-ci-v2
       FLASH_ATTN_VERSION: 2.8.3.post2
+      # Both CI environments need the plugin's forward-observer/completion APIs.
+      SGLANG_COMMIT: c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -96,7 +98,8 @@ jobs:
           source sf/bin/activate
           uv pip install wheel setuptools setuptools-rust setuptools-scm psutil packaging ninja
           uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
-          uv pip install -v . --no-build-isolation --prerelease=allow
+          uv pip install -v . --no-build-isolation --prerelease=allow \
+            "sglang @ git+https://github.com/sgl-project/sglang.git@${SGLANG_COMMIT}#subdirectory=python"
           uv pip install --no-deps plugins/sglang-spec-capture
           # The live server-capture gate needs the Mooncake client AND the
           # mooncake_master console script; the isolated venv cannot see the
@@ -110,13 +113,11 @@ jobs:
           if [ ! -d sf-capture ]; then
             uv venv sf-capture -p 3.12
           fi
-          # Read the exact VCS pin from the package manifest so both test
-          # environments use the same revision, with ordinary cache reuse.
-          sglang_requirement=$(sf/bin/python -c 'import tomllib; print(next(dep for dep in tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"] if dep.startswith("sglang @ ")))')
+          # Use the same CI-owned revision as sf, with ordinary cache reuse.
           uv pip install --python sf-capture/bin/python wheel setuptools setuptools-rust setuptools-scm
           uv pip install --python sf-capture/bin/python torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
           uv pip install --python sf-capture/bin/python --no-build-isolation --prerelease=allow \
-            "$sglang_requirement" mooncake-transfer-engine-cuda13
+            "sglang @ git+https://github.com/sgl-project/sglang.git@${SGLANG_COMMIT}#subdirectory=python" mooncake-transfer-engine-cuda13
           uv pip install --python sf-capture/bin/python --no-deps plugins/sglang-spec-capture
           sf-capture/bin/python -c 'from sglang.srt.model_executor.forward_observer import ForwardObserver; from sglang.srt.managers.deferred_output import ResponseCompletion'
 

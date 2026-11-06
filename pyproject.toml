@@ -28,7 +28,6 @@ dependencies = [
     "psutil",
     "pyyaml",
     "safetensors",
-    "sglang @ git+https://github.com/sgl-project/sglang.git@c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0#subdirectory=python",
     "requests",
     "tensorboard",
     "typing-extensions",
