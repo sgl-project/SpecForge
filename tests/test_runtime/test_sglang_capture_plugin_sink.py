@@ -76,6 +76,10 @@ class _BufferStore:
             self.values[key] = ctypes.string_at(ptr, size)
         return [0] * len(keys)
 
+    def remove(self, key, *, force=False):
+        self.values.pop(key, None)
+        return 0
+
 
 def _engine_module(backing):
     """A ``mooncake.engine`` whose TransferEngine allocates ``backing``."""
@@ -138,6 +142,67 @@ class SpecCaptureSinkTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
             with self.assertRaisesRegex(ValueError, ARENA_BYTES):
                 sink.NvlinkArena(torch.device("cpu"))
+
+    def test_cancelled_sample_is_freed_after_delayed_batch_preserving_siblings(self):
+        store = self.sink._store = _BufferStore()
+        started, publish = threading.Event(), threading.Event()
+        put = store.batch_put_from
+
+        def delayed(*args):
+            started.set()
+            if not publish.wait(10):
+                raise RuntimeError("test did not release publication")
+            return put(*args)
+
+        spec = _spec("cancelled")
+        spec["gen"] = 2
+        spec["passthrough"] = [
+            {"name": "input_ids", "data": [1, 2], "shape": [2]}
+        ]
+        old_key = "test/cancelled/g1/hidden_states"
+        store.values[old_key] = b"previous generation"
+        with (
+            mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "tcp"}),
+            mock.patch.object(store, "batch_put_from", side_effect=delayed),
+        ):
+            future = self.sink.submit_samples(
+                [
+                    (spec, torch.ones(2, 4), None),
+                    (_spec("sibling"), torch.ones(2, 4), None),
+                ]
+            )
+            try:
+                self.assertTrue(started.wait(10))
+                # Client cleanup can finish before any of the new keys exist.
+                store.remove("test/cancelled/g2/hidden_states")
+                cleanup = self.sink.discard_sample(spec)
+                self.assertFalse(cleanup.done())
+            finally:
+                publish.set()
+            self.assertEqual(len(future.result(timeout=10)), 2)
+            cleanup.result(timeout=10)
+        self.assertEqual(set(store.values), {old_key, "test/sibling/g1/hidden_states"})
+
+    def test_cancel_cleanup_retries_failed_removes_and_accepts_missing_keys(self):
+        self.sink._store = mock.Mock()
+        self.sink._store.remove.side_effect = [RuntimeError("RPC"), -706, -704]
+        with mock.patch.object(sink.time, "sleep"):
+            self.sink.discard_sample(_spec("cancelled")).result(timeout=10)
+        self.assertEqual(self.sink._store.remove.call_count, 3)
+        self.sink._store.remove.assert_called_with(
+            "test/cancelled/g1/hidden_states", force=True
+        )
+
+    def test_cancel_cleanup_reports_persistent_failure(self):
+        self.sink._store = mock.Mock()
+        self.sink._store.remove.return_value = -1
+        with mock.patch.object(sink.time, "sleep"), self.assertLogs(
+            sink.logger, level="ERROR"
+        ):
+            future = self.sink.discard_sample(_spec("cancelled"))
+            with self.assertRaisesRegex(RuntimeError, "could not reclaim"):
+                future.result(timeout=10)
+            self.sink._executor.submit(lambda: None).result(timeout=10)
 
     def test_nvlink_always_publishes_device_memory(self):
         with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "nvlink"}, clear=True):
@@ -396,6 +461,15 @@ class NvlinkArenaTest(unittest.TestCase):
         return self.arena._allocate(
             key, nbytes, deadline=time.monotonic() + self.arena._WAIT_S
         )
+
+    def test_server_cancellation_frees_arena_without_more_client_requests(self):
+        writer = sink.SpecCaptureSink()
+        self.addCleanup(writer._executor.shutdown)
+        writer._nvlink = self.arena
+        self._allocate("test/cancelled/g1/hidden_states", 512)
+        self._allocate("test/sibling/g1/hidden_states", 512)
+        writer.discard_sample(_spec("cancelled")).result(timeout=10)
+        self.assertEqual(set(self.arena._objects), {"test/sibling/g1/hidden_states"})
 
     def test_freed_space_is_reused_and_coalesced(self):
         sizes = (("a", 100), ("b", 1000), ("c", 1))

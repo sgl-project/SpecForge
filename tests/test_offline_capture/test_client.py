@@ -4,8 +4,10 @@ import gzip
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -18,6 +20,11 @@ from tests.test_runtime.test_server_capture import _FakeMooncakeStore, _request_
 
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[2] / "plugins/sglang-spec-capture")
+)
+from specforge_sglang_capture.capture import (
+    CaptureHostOutput,
+    CaptureItem,
+    CaptureRuntime,
 )
 from specforge_sglang_capture.sink import SpecCaptureSink
 
@@ -180,6 +187,55 @@ class OfflineCaptureTest(unittest.TestCase):
             _request_specs(self.calls[1])[0]["sample_id"],
         )
         self.assertFalse(self.backend._d)
+
+    def test_timeout_before_publication_is_reclaimed_by_server(self):
+        started, publish = threading.Event(), threading.Event()
+        original = self.sink.put_samples
+
+        def delayed(samples):
+            started.set()
+            if not publish.wait(10):
+                raise RuntimeError("test did not release publication")
+            return original(samples)
+
+        completions = []
+        runtime = CaptureRuntime(
+            sink=self.sink,
+            is_writer=True,
+            gpu_put=False,
+            max_pending_batches=2,
+            defer_response=lambda req, completion: completions.append(completion),
+        )
+
+        def timeout(url, json_body, timeout):
+            (spec,) = _request_specs(json_body)
+            req = SimpleNamespace(rid="late", finished=lambda: True)
+            CaptureHostOutput(
+                runtime,
+                [CaptureItem(req.rid, spec, 0, 2)],
+                torch.ones(2, 8),
+                torch.ones(2, 4),
+            ).consume(SimpleNamespace(reqs=[req]), commits=None)
+            self.assertTrue(started.wait(10))
+            # SGLang cancels the deferred completion on client disconnect.
+            self.assertTrue(completions[0].cancel())
+            raise TimeoutError("HTTP timeout before publication")
+
+        client = self.client(post_fn=timeout)
+        with mock.patch.object(self.sink, "put_samples", side_effect=delayed):
+            try:
+                with self.assertRaises(TimeoutError):
+                    with client.capture_rows([[1, 2]], sample_ids=[9]):
+                        self.fail("timed-out capture must not yield rows")
+                self.assertFalse(self.backend._d)
+                self.assertFalse(self.store._external_provisional)
+                client.close()
+            finally:
+                publish.set()
+            # The writer and its queued cancellation cleanup have both finished.
+            self.sink._executor.submit(lambda: None).result(timeout=10)
+        self.assertFalse(self.backend._d)
+        self.assertFalse(runtime.results)
 
     def test_read_failure_releases_already_adopted_batch(self):
         client = self.client()

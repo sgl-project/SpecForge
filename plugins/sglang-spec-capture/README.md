@@ -15,7 +15,10 @@ generic extension points it uses:
 - `Scheduler.defer_response(req, completion)`: SGLang holds a finished
   request until its objects are written, then reads the completion on the
   scheduler thread before returning capture metadata. Cancelling one request
-  does not cancel a shared write needed by other requests.
+  does not cancel a shared write needed by other requests. It queues reclamation
+  of that request's objects on the writer after publication, so a client cleanup
+  that ran before the objects existed cannot leave them orphaned. Cleanup RPC
+  failures are retried and logged if they persist.
 
 ## Install
 
