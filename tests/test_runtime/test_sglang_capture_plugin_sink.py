@@ -156,9 +156,7 @@ class SpecCaptureSinkTest(unittest.TestCase):
 
         spec = _spec("cancelled")
         spec["gen"] = 2
-        spec["passthrough"] = [
-            {"name": "input_ids", "data": [1, 2], "shape": [2]}
-        ]
+        spec["passthrough"] = [{"name": "input_ids", "data": [1, 2], "shape": [2]}]
         old_key = "test/cancelled/g1/hidden_states"
         store.values[old_key] = b"previous generation"
         with (
@@ -196,8 +194,9 @@ class SpecCaptureSinkTest(unittest.TestCase):
     def test_cancel_cleanup_reports_persistent_failure(self):
         self.sink._store = mock.Mock()
         self.sink._store.remove.return_value = -1
-        with mock.patch.object(sink.time, "sleep"), self.assertLogs(
-            sink.logger, level="ERROR"
+        with (
+            mock.patch.object(sink.time, "sleep"),
+            self.assertLogs(sink.logger, level="ERROR"),
         ):
             future = self.sink.discard_sample(_spec("cancelled"))
             with self.assertRaisesRegex(RuntimeError, "could not reclaim"):
