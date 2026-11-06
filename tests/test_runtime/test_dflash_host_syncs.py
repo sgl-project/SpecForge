@@ -67,8 +67,6 @@ def _tiny_dflash2(attention_backend, *, sliding):
         draft_model=draft,
         target_lm_head=nn.Linear(64, 64, bias=False).to(device, torch.bfloat16),
         target_embed_tokens=nn.Embedding(64, 64).to(device, torch.bfloat16),
-        mask_token_id=63,
-        block_size=4,
         attention_backend=attention_backend,
         num_anchors=16,
         loss_decay_gamma=7.0,

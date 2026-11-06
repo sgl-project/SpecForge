@@ -1,6 +1,5 @@
 """DSpine uses the existing target-feature capture and training lifecycle."""
 
-from dataclasses import asdict
 from functools import partial
 
 from specforge.algorithms.common.defaults import (
@@ -22,7 +21,6 @@ from specforge.algorithms.common.providers import (
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepProvider,
-    TargetDerivedDraftDefaults,
     make_registration,
 )
 from specforge.algorithms.contracts import (
@@ -33,7 +31,6 @@ from specforge.algorithms.contracts import (
     FeatureMode,
     OfflineStorageContract,
 )
-from specforge.algorithms.dflash.providers import apply_draft_overrides
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 
@@ -68,29 +65,21 @@ def build_training_model(config, draft_model, draft_config, target_config, token
     )
 
 
-def populate_target_defaults(payload, target_config, config):
-    from specforge.algorithms.model_providers import populate_dflash_generated_config
-    from specforge.modeling.draft.dflash import build_target_layer_ids
-
-    populate_dflash_generated_config(payload, target_config, config)
-    payload["dflash_config"]["target_layer_ids"] = build_target_layer_ids(
-        payload["num_target_layers"], payload["num_hidden_layers"]
-    )
-
-
 def resume_contract(_config, draft_model, training_model):
     return {
         "dspine_attention_layout": (
-            tuple(draft_model.layer_types),
-            draft_model.sliding_window,
+            tuple(draft_model.config.layer_types),
+            draft_model.config.sliding_window,
             True,
         ),
-        "dspine_options": tuple(sorted(asdict(draft_model.dspine_config).items())),
-        "dspine_block_size": draft_model.block_size,
-        "dspine_target_layer_ids": tuple(draft_model.target_layer_ids),
+        "dspine_options": tuple(sorted(draft_model.config.dspine_config.items())),
+        "dspine_block_size": draft_model.config.block_size,
+        "dspine_target_layer_ids": tuple(
+            draft_model.config.dflash_config["target_layer_ids"]
+        ),
         "dspine_num_hidden_layers": len(draft_model.layers),
         "dspine_num_anchors": training_model.num_anchors,
-        "dspine_mask_token_id": training_model.mask_token_id,
+        "dspine_mask_token_id": draft_model.config.dflash_config["mask_token_id"],
         "dspine_attention_backend": training_model.attention_backend,
         "dspine_loss_decay_gamma": training_model.loss_decay_gamma,
     }
@@ -126,7 +115,6 @@ def algorithm_spec() -> AlgorithmSpec:
         draft=DraftRequirement(
             compatible_architectures=frozenset({"DSpineDraftModel"}),
             default_architecture="DSpineDraftModel",
-            supported_overrides={"num_hidden_layers", "block_size"},
         ),
         feature_contracts=(
             FeatureContract(
@@ -170,13 +158,6 @@ def algorithm_providers() -> AlgorithmProviders:
             draft_config=DraftConfigProvider(
                 architecture="DSpineDraftModel",
                 compatible_architectures=frozenset({"DSpineDraftModel"}),
-                expected_auto_map_model="dspine.DSpineDraftModel",
-                target_defaults=TargetDerivedDraftDefaults(
-                    model_type="qwen3",
-                    num_hidden_layers=5,
-                    populate=populate_target_defaults,
-                ),
-                apply_overrides=apply_draft_overrides,
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

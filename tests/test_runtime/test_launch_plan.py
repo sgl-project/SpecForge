@@ -34,6 +34,7 @@ from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
 from specforge.runtime.data_plane import mooncake_rdma
 from specforge.training.capture_contract import ServerCaptureContract
+from tests.draft_config_utils import draft_settings
 from tests.test_runtime.test_mooncake_rdma import FakeHost
 from tests.utils import wait_for_processes_to_stop
 
@@ -81,7 +82,10 @@ def _mooncake_clients(plan):
 
 def _config(*, mode="local_colocated", nproc=1, nnodes=1):
     raw = {
-        "model": {"target_model_path": "target", "draft_model_config": "draft"},
+        "model": {
+            "target_model_path": "target",
+            "draft_model_config": draft_settings("dflash"),
+        },
         "data": (
             {"prompts_path": "prompts.jsonl"}
             if mode == "disaggregated"

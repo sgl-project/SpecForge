@@ -54,9 +54,9 @@ four additional model fields:
 and `selector_top_k` must be between 1 and `vocab_size`. The checked-in complete
 configuration is
 [`configs/qwen3.6-27b-dflash2.json`](https://github.com/sgl-project/SpecForge/blob/main/configs/qwen3.6-27b-dflash2.json).
-Unlike a standard DFlash draft, DFlash2 cannot be selected through
-target-derived defaults: provide this config or a pretrained DFlash2 directory
-whose `config.json` declares `DFlash2DraftModel`.
+Embed these settings under `model.draft_model_config` in the training YAML,
+with `architectures: [DFlash2DraftModel]`. All training methods use inline
+settings, including warm starts from a pretrained DFlash2 checkpoint.
 
 ## Selector objective and schedule
 
@@ -118,9 +118,8 @@ Offline DFlash2 uses the normal DFlash feature preparation path:
 ```bash
 torchrun --nproc_per_node=8 \
   scripts/prepare_hidden_states.py \
-  --strategy dflash \
   --target-model-path /path/to/Qwen3.6-27B \
-  --draft-model-config configs/qwen3.6-27b-dflash2.json \
+  --config examples/configs/online/disaggregated/external/qwen3.6-27b-dflash2.yaml \
   --data-path /path/to/train.jsonl \
   --output-path ./cache/hidden_states/qwen3.6-27b-dflash2 \
   --chat-template qwen3.5 \

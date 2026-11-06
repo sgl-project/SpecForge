@@ -72,7 +72,12 @@ class _FixedDraft(nn.Module):
     def __init__(self, hidden_size: int):
         super().__init__()
         self.hidden_size = hidden_size
-        self.sliding_window = None
+        self.config = types.SimpleNamespace(
+            sliding_window=None,
+            layer_types=["full_attention"],
+            block_size=4,
+            dflash_config=dict(mask_token_id=0),
+        )
 
     def forward(self, position_ids, noise_embedding, target_hidden, attention_mask):
         bsz, draft_len = noise_embedding.shape[:2]
@@ -170,7 +175,7 @@ def _fixed_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
     bsz, n_blocks = anchor_positions.shape
     return torch.zeros(
         bsz,
-        n_blocks * self.block_size,
+        n_blocks * self.draft_model.config.block_size,
         self.embed_tokens.embedding_dim,
         dtype=self.embed_tokens.weight.dtype,
         device=input_ids.device,
@@ -186,12 +191,12 @@ def _fixed_anchor_sampler(anchors, keep_mask):
 
 def _make_model(logits, anchors, keep_mask, draft_model=None, lm_head=None, **kwargs):
     bsz, n_blocks, block_size, vocab_size = logits.shape
+    draft_model = draft_model or _FixedDraft(hidden_size=4)
+    draft_model.config.block_size = block_size
     model = OnlineDFlashModel(
-        draft_model=draft_model or _FixedDraft(hidden_size=4),
+        draft_model=draft_model,
         target_lm_head=lm_head or _FixedHead(logits),
         target_embed_tokens=nn.Embedding(vocab_size, 4).double(),
-        mask_token_id=0,
-        block_size=block_size,
         attention_backend="sdpa",
         num_anchors=n_blocks,
         **kwargs,
@@ -215,13 +220,13 @@ def _make_dspark_model(
     # Exercise the eager/legacy-TV formulas independently of joint fusion.
     kwargs.setdefault("fused_logits_loss", False)
     bsz, n_blocks, block_size, vocab_size = logits.shape
+    draft_model = draft_model or _FixedDraft(hidden_size=4)
+    draft_model.config.block_size = block_size
     model = OnlineDSparkModel(
-        draft_model=draft_model or _FixedDraft(hidden_size=4),
+        draft_model=draft_model,
         target_lm_head=lm_head
         or _FixedHead(logits.reshape(bsz, n_blocks * block_size, vocab_size)),
         target_embed_tokens=nn.Embedding(vocab_size, 4).to(dtype),
-        mask_token_id=0,
-        block_size=block_size,
         attention_backend="sdpa",
         num_anchors=n_blocks,
         **kwargs,

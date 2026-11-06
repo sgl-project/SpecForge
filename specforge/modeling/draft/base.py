@@ -28,14 +28,20 @@ from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
 
 from specforge.modeling._mask_utils import prepare_decoder_attention_mask
+from specforge.modeling.draft.serialization import DraftSerializationMixin
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
 
-class Eagle3DraftModel(PreTrainedModel, ABC):
+class Eagle3DraftModel(DraftSerializationMixin, PreTrainedModel, ABC):
     """
     This is the base class for the Eagle3 draft model implementation. The child class needs to implement
     the abstract methods to support training with TTT.
     """
+
+    def __init__(self, config):
+        # EAGLE uses its own attention dispatch rather than HF dispatch.
+        config._attn_implementation = None
+        super().__init__(config)
 
     @abstractmethod
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

@@ -20,7 +20,7 @@ import copy
 import json
 import os
 import re
-from typing import Dict, List, Literal, Mapping, Optional
+from typing import Any, Dict, List, Literal, Mapping, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -271,18 +271,12 @@ class StrictConfigModel(BaseModel):
 
 class ModelConfig(StrictConfigModel):
     target_model_path: str
-    #: Draft config as a local JSON file, a directory containing config.json,
-    #: or a Hugging Face repository. EAGLE3, P-EAGLE, and DFlash can derive it
-    #: from the target when omitted.
-    draft_model_config: Optional[str] = None
-    #: Load draft weights only. Unlike training.resume_from, this never restores
-    #: optimizer/scheduler state, counters, data position, or RNG state.
+    #: Authoritative draft architecture/settings embedded in the training YAML.
+    #: Paths and target/checkpoint-derived settings are not supported.
+    draft_model_config: Dict[str, Any] = Field(min_length=1)
+    #: Load weights only, validating them against the inline draft configuration.
+    #: training.resume_from additionally restores optimizer and training state.
     draft_checkpoint_path: Optional[str] = None
-    #: Optional architecture override. Auto-generated defaults preserve the
-    #: former trainers: EAGLE3=1, P-EAGLE=4, DFlash=1.
-    draft_num_hidden_layers: Optional[int] = Field(default=None, gt=0)
-    #: Optional DFlash block-size override (auto-generated default: 16).
-    draft_block_size: Optional[int] = Field(default=None, gt=0)
     #: Online capture always runs on an external SGLang server; the in-process
     #: HF/custom target backends were removed with the server-only cutover, so
     #: configs naming them fail at load instead of being silently ignored.
@@ -307,13 +301,8 @@ class ModelConfig(StrictConfigModel):
     vocab_mapping_path: str = ""
     #: copy the frozen target embedding into the draft before training.
     load_target_embedding: bool = True
-    #: aux hidden-state layer ids to capture (None = backend defaults).
-    aux_hidden_state_layer_ids: Optional[List[int]] = None
     torch_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     cache_dir: Optional[str] = None
-    #: DFlash-family and P-EAGLE mask token. ``None`` resolves it from the
-    #: draft config, then the target tokenizer.
-    mask_token_id: Optional[int] = None
     #: Explicit tokenizer padding ID for released targets whose tokenizer
     #: metadata omits it or whose padding row is outside the unpadded vocab.
     tokenizer_pad_token_id: Optional[int] = Field(default=None, ge=0)
@@ -1054,7 +1043,6 @@ class TrainingConfig(StrictConfigModel):
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8
     down_sample_ratio_min: float = 0.2
-    norm_before_residual: Optional[bool] = None
     save_interval: int = Field(default=0, ge=0)
     #: Run a full evaluation pass every N optimizer steps (0 = disabled).
     eval_interval: int = Field(default=0, ge=0)
@@ -1499,7 +1487,9 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
         if keys[-1] not in node:
             raise ValueError(f"override path {path!r} does not exist")
         current = node[keys[-1]]
-        if isinstance(current, (dict, list)) and value.lstrip().startswith(("[", "{")):
+        if path.startswith("model.draft_model_config.") or (
+            isinstance(current, (dict, list)) and value.lstrip().startswith(("[", "{"))
+        ):
             import yaml
 
             try:

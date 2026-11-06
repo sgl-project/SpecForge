@@ -17,6 +17,7 @@ from specforge.training.assembly import (
     _prompt_cache_key,
 )
 from specforge.training.vocab_mapping import count_effective_feature_tokens
+from tests.draft_config_utils import draft_settings
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
@@ -41,6 +42,7 @@ class OfflineVocabMappingTest(unittest.TestCase):
             cfg = Config.model_validate(
                 {
                     "model": {
+                        "draft_model_config": draft_settings(),
                         "target_model_path": "target/model",
                         "target_backend": "sglang",
                     },
@@ -144,6 +146,7 @@ class OfflineVocabMappingTest(unittest.TestCase):
             cfg = Config.model_validate(
                 {
                     "model": {
+                        "draft_model_config": draft_settings(),
                         "target_model_path": "target/model",
                     },
                     "data": {

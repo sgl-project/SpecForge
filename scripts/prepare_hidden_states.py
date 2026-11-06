@@ -3,7 +3,7 @@
 The local target exists only for this preprocessing command. Online training
 consumes features from an external server and never loads a target model in the
 trainer process. Precomputing target features removes the target model's memory
-and latency cost from the later offline training run. ``--strategy`` selects
+and latency cost from the later offline training run. The training YAML supplied through ``--config`` selects
 the algorithm-owned capture layers and persisted tensor schema.
 The hidden states are saved in ${output_path} and the vocabulary mapping is saved
 in ${output_path}/vocab_mapping/vocab_mapping.pt
@@ -20,8 +20,7 @@ torchrun --nproc_per_node=2 \
     --tp-size 1 \
     --batch-size 32 \
     --num-samples 10000 \
-    --strategy dspark \
-    --draft-model-config configs/qwen3-8b-dspark.json
+    --config examples/configs/online/disaggregated/external/qwen3-8b-dspark.yaml
 
 
 For pre-formatted data (with chat template already applied), add --is-preformatted:
@@ -35,8 +34,7 @@ torchrun --nproc_per_node=2 \
     --tp-size 1 \
     --batch-size 32 \
     --num-samples 10000 \
-    --strategy dspark \
-    --draft-model-config configs/qwen3-8b-dspark.json \
+    --config examples/configs/online/disaggregated/external/qwen3-8b-dspark.yaml \
     --is-performatted
 """
 
@@ -59,7 +57,7 @@ from transformers import AutoConfig
 
 from specforge.algorithms.common.providers import OfflineCaptureLayout
 from specforge.application import resolve_offline_capture
-from specforge.config import Config
+from specforge.config import Config, load_config
 from specforge.data.preprocessing import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
@@ -103,19 +101,10 @@ def parse_args():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
     model_group.add_argument(
-        "--strategy",
+        "--config",
         type=str,
-        default="eagle3",
-        help="Offline draft strategy (default: eagle3)",
-    )
-    model_group.add_argument(
-        "--draft-model-config",
-        type=str,
-        default=None,
-        help=(
-            "Draft config used to resolve capture layers; required by strategies "
-            "without target-derived defaults"
-        ),
+        required=True,
+        help="Training YAML containing the inline draft settings and strategy",
     )
     model_group.add_argument(
         "--trust-remote-code",
@@ -328,10 +317,15 @@ def resolve_offline_capture_plan(
 ) -> OfflineCapturePlan:
     """Resolve capture layers and output keys through the algorithm registry."""
 
-    strategy = getattr(args, "strategy", "eagle3")
+    recipe = load_config(args.config)
+    strategy = recipe.training.strategy
+    if args.target_model_path != recipe.model.target_model_path:
+        raise ValueError(
+            "--target-model-path must match model.target_model_path in --config"
+        )
     model = {
         "target_model_path": args.target_model_path,
-        "draft_model_config": getattr(args, "draft_model_config", None),
+        "draft_model_config": recipe.model.draft_model_config,
         "trust_remote_code": args.trust_remote_code,
         "cache_dir": getattr(args, "cache_dir", None),
     }

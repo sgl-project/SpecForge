@@ -47,6 +47,11 @@ class MTPDraftModel(nn.Module):
     embed_tokens: nn.Embedding
     mtp: nn.Module
 
+    @property
+    def share_lm_head(self) -> bool:
+        """Whether the resolved architecture shares the target output head."""
+        raise NotImplementedError
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -89,8 +94,7 @@ class MTPDraftModel(nn.Module):
         """
         self.embed_tokens.weight = embed_weight
         self.embed_tokens.requires_grad_(False)
-        mtp_config = getattr(self.config, "mtp_config", None) or {}
-        if mtp_config.get("share_lm_head", True):
+        if self.share_lm_head:
             if lm_head_weight is None:
                 raise ValueError(
                     "share_lm_head is enabled but no target lm_head weight given"
@@ -115,8 +119,7 @@ class MTPDraftModel(nn.Module):
         partial prefix match would leave part of the trainable head randomized.
         """
         required = set(self.native_state_dict())
-        mtp_config = getattr(self.config, "mtp_config", None) or {}
-        if mtp_config.get("share_lm_head", True):
+        if self.share_lm_head:
             required.discard(f"{self.NATIVE_KEY_PREFIX}lm_head.weight")
         return required
 
@@ -130,8 +133,7 @@ class MTPDraftModel(nn.Module):
         checkpoint as incompatible.
         """
         extra = {f"{self.NATIVE_KEY_PREFIX}embed_tokens.weight"}
-        mtp_config = getattr(self.config, "mtp_config", None) or {}
-        if mtp_config.get("share_lm_head", True):
+        if self.share_lm_head:
             extra.add(f"{self.NATIVE_KEY_PREFIX}lm_head.weight")
         return extra
 

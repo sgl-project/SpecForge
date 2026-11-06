@@ -53,8 +53,6 @@ def build_model(args):
         draft_model=draft,
         target_lm_head=head,
         target_embed_tokens=embed,
-        mask_token_id=config.dflash_config["mask_token_id"],
-        block_size=draft.block_size,
         num_anchors=args.anchors,
         objective_chunk_blocks=args.chunk,
         objective_checkpointing=False,
@@ -63,9 +61,7 @@ def build_model(args):
     if args.method == "dspark":
         model = family.OnlineDSparkModel(**common, fused_logits_loss=False)
     elif args.method == "domino":
-        model = family.OnlineDominoModel(
-            **common, shift_label=draft.shift_label, fused_logits_loss=False
-        )
+        model = family.OnlineDominoModel(**common, fused_logits_loss=False)
     else:
         model = family.OnlineDFlashModel(**common, fused_logits_loss=False)
     model.to(device="cuda", dtype=torch.bfloat16).train()
@@ -208,7 +204,8 @@ def main():
         hidden_states=torch.randn(
             1,
             args.sequence,
-            len(model.draft_model.target_layer_ids) * config.hidden_size,
+            len(model.draft_model.config.dflash_config["target_layer_ids"])
+            * config.hidden_size,
             device="cuda",
             dtype=torch.bfloat16,
         ),
@@ -247,7 +244,7 @@ def main():
             sequence=args.sequence,
             anchors=args.anchors,
             chunk=args.chunk,
-            block=model.block_size,
+            block=model.draft_model.config.block_size,
             hidden=config.hidden_size,
             layers=config.num_hidden_layers,
             vocab=config.vocab_size,

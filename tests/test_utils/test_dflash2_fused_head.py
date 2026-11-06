@@ -68,8 +68,6 @@ def _online_model(device, dtype, *, plain=False, draft_overrides=None, **kwargs)
         draft_model=draft,
         target_lm_head=head,
         target_embed_tokens=embed,
-        mask_token_id=config.vocab_size - 1,
-        block_size=4,
         attention_backend="sdpa",
         num_anchors=12,
         **kwargs,

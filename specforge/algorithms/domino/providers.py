@@ -68,15 +68,18 @@ def resume_contract(config, draft_model, training_model):
         **dflash_attention_resume_contract(draft_model),
         "domino_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "domino_target_layer_ids": tuple(
-            int(layer_id) for layer_id in draft_model.target_layer_ids
+            int(layer_id)
+            for layer_id in draft_model.config.dflash_config["target_layer_ids"]
         ),
-        "domino_block_size": int(training_model.block_size),
-        "domino_mask_token_id": int(training_model.mask_token_id),
+        "domino_block_size": int(draft_model.config.block_size),
+        "domino_mask_token_id": int(draft_model.config.dflash_config["mask_token_id"]),
         "domino_attention_backend": str(training_model.attention_backend),
         "domino_num_anchors": int(training_model.num_anchors),
         "domino_loss_decay_gamma": training_model.loss_decay_gamma,
-        "domino_shift_label": bool(training_model.shift_label),
-        "domino_pure_draft_prefix_len": int(draft_model.pure_draft_prefix_len),
+        "domino_shift_label": bool(draft_model.config.dflash_config["shift_label"]),
+        "domino_pure_draft_prefix_len": int(
+            draft_model.config.dflash_config["pure_draft_prefix_len"]
+        ),
         "domino_lambda_base_start": float(config.training.lambda_base_start),
         "domino_lambda_base_decay_ratio": float(
             config.training.lambda_base_decay_ratio
@@ -173,7 +176,6 @@ def algorithm_providers() -> AlgorithmProviders:
         model=ModelProvider(
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
-                expected_auto_map_model="domino.DominoDraftModel",
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

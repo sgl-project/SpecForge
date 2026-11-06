@@ -213,14 +213,12 @@ class OnlinePEagleModel(nn.Module):
     def __init__(
         self,
         draft_model: PEagleDraftModel,
-        mask_token_id: int,
         num_depths: int = 8,
         down_sample_ratio: float = 0.7,
         down_sample_ratio_min: float = 0.2,
     ):
         super().__init__()
         self.draft_model = draft_model
-        self.mask_token_id = mask_token_id
         self.num_depths = num_depths
         self.down_sample_ratio = down_sample_ratio
         self.down_sample_ratio_min = down_sample_ratio_min
@@ -276,7 +274,11 @@ class OnlinePEagleModel(nn.Module):
         sampled_ids = torch.where(
             is_depth_0,
             input_ids[0, orig_positions],
-            torch.tensor(self.mask_token_id, dtype=input_ids.dtype, device=device),
+            torch.tensor(
+                self.draft_model.config.mask_token_id,
+                dtype=input_ids.dtype,
+                device=device,
+            ),
         ).unsqueeze(0)
 
         inputs_embeds = self.draft_model.embed_input_ids(sampled_ids).to(
