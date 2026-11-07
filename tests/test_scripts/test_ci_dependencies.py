@@ -101,41 +101,56 @@ class CIDependencyTest(unittest.TestCase):
         )
         uv.chmod(0o755)
         # curl serves the PyPI JSON and an sdist tarball whose setup.py builds a
-        # real (trivial) wheel once the CI script patches its -std flag.
+        # real (trivial) wheel once the CI script patches its -std flag. The
+        # tarball is byte-stable so the JSON can carry its sha256.
         curl = self.bin / "curl"
         curl.write_text(
             f"#!{sys.executable}\n"
             + textwrap.dedent(
                 """\
+                import gzip
+                import hashlib
                 import io
                 import json
                 import os
                 import sys
                 import tarfile
+                from pathlib import Path
+
+                def sdist():
+                    version = os.environ["FLASH_ATTN_VERSION"]
+                    payload = (
+                        "import os, sys\\n"
+                        "# flags: -std=c++17\\n"
+                        "if os.environ.get('TEST_INSTALL_FAIL'):\\n"
+                        "    sys.exit(1)\\n"
+                        "assert os.environ.get('FLASH_ATTENTION_FORCE_BUILD') == 'TRUE'\\n"
+                        "src = open(__file__).read()\\n"
+                        "assert '-std=' + 'c++17' not in src, \\"setup.py not patched\\"\\n"
+                        "from setuptools import setup\\n"
+                        "setup(name='flash-attn', version=os.environ['FLASH_ATTN_VERSION'])\\n"
+                    ).encode()
+                    raw = io.BytesIO()
+                    with tarfile.open(fileobj=raw, mode="w") as tar:
+                        info = tarfile.TarInfo(f"flash_attn-{version}/setup.py")
+                        info.size = len(payload)
+                        tar.addfile(info, io.BytesIO(payload))
+                    return gzip.compress(raw.getvalue(), mtime=0)
 
                 args = sys.argv[1:]
+                with (Path(os.environ["TEST_ROOT"]) / "downloads").open("a") as log:
+                    log.write(" ".join(args) + "\\n")
                 if "-o" not in args:
+                    digest = hashlib.sha256(sdist()).hexdigest()
+                    if os.environ.get("TEST_BAD_SHA256"):
+                        digest = "0" * 64
                     print(json.dumps({"urls": [{
                         "packagetype": "sdist",
                         "url": "https://files.example.invalid/flash_attn.tar.gz",
+                        "digests": {"sha256": digest},
                     }]}))
                     sys.exit(0)
-                out = args[args.index("-o") + 1]
-                version = os.environ["FLASH_ATTN_VERSION"]
-                payload = (
-                    "import os, sys\\n"
-                    "# flags: -std=c++17\\n"
-                    "if os.environ.get('TEST_INSTALL_FAIL'):\\n"
-                    "    sys.exit(1)\\n"
-                    "src = open(__file__).read()\\n"
-                    "assert '-std=' + 'c++17' not in src, \\"setup.py not patched\\"\\n"
-                    "from setuptools import setup\\n"
-                    "setup(name='flash-attn', version=os.environ['FLASH_ATTN_VERSION'])\\n"
-                ).encode()
-                with tarfile.open(out, "w:gz") as tar:
-                    info = tarfile.TarInfo(f"flash_attn-{version}/setup.py")
-                    info.size = len(payload)
-                    tar.addfile(info, io.BytesIO(payload))
+                Path(args[args.index("-o") + 1]).write_bytes(sdist())
                 """
             )
         )
@@ -155,6 +170,15 @@ class CIDependencyTest(unittest.TestCase):
         return [
             json.loads(line) for line in (self.root / "calls").read_text().splitlines()
         ]
+
+    def sdist_downloads(self):
+        downloads = self.root / "downloads"
+        if not downloads.exists():
+            return 0
+        return downloads.read_text().count("flash_attn.tar.gz")
+
+    def cached_wheels(self):
+        return sorted(p.name for p in self.cache.glob("flash-attn/*/wheels/*"))
 
     def test_save_and_restore_remove_stale_versions(self):
         for environment in ("sf", "sf-capture"):
@@ -247,6 +271,46 @@ class CIDependencyTest(unittest.TestCase):
         del self.env["TEST_INSTALL_FAIL"]
         self.env["TEST_ABI_FAIL"] = "1"
         self.run_fa(success=False)
+
+    def test_only_a_wheel_that_passes_the_abi_check_is_cached(self):
+        self.setup_fa()
+        self.env["TEST_ABI_FAIL"] = "1"
+        self.run_fa(success=False)
+        self.assertEqual(self.cached_wheels(), [])
+        del self.env["TEST_ABI_FAIL"]
+        self.run_fa()
+        self.assertEqual(self.sdist_downloads(), 2)
+        (wheel,) = self.cached_wheels()
+        self.assertTrue(wheel.startswith("flash_attn-") and wheel.endswith(".whl"))
+
+    def test_cached_wheel_that_fails_is_dropped_and_rebuilt(self):
+        self.setup_fa()
+        self.run_fa()
+        self.assertEqual(len(self.cached_wheels()), 1)
+        (self.root / "ready").unlink()
+        self.env["TEST_ABI_FAIL"] = "1"
+        self.run_fa(success=False)
+        self.assertEqual(self.sdist_downloads(), 1)
+        self.assertEqual(self.cached_wheels(), [])
+        del self.env["TEST_ABI_FAIL"]
+        self.run_fa()
+        self.assertEqual(self.sdist_downloads(), 2)
+        self.assertEqual(len(self.cached_wheels()), 1)
+
+    def test_sdist_checksum_mismatch_stops_before_build(self):
+        self.setup_fa()
+        self.env["TEST_BAD_SHA256"] = "1"
+        self.run_fa(success=False)
+        self.assertEqual(self.cached_wheels(), [])
+        self.assertFalse((self.root / "calls").exists())
+
+    def test_trusting_the_workspace_is_idempotent(self):
+        self.env["GIT_CONFIG_GLOBAL"] = str(self.root / "gitconfig")
+        self.env["GITHUB_WORKSPACE"] = str(self.root / "workspace")
+        for _ in range(2):
+            self.run_step("Trust the workspace for later git calls")
+        result = self.run_shell("git config --global --get-all safe.directory")
+        self.assertEqual(result.stdout.splitlines(), [self.env["GITHUB_WORKSPACE"]])
 
     def test_workflow_orders_install_check_and_snapshot_before_tests(self):
         names = list(self.steps)
