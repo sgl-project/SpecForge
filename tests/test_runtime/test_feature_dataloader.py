@@ -476,7 +476,7 @@ class TestFeatureDataLoader(unittest.TestCase):
         self.assertEqual(transformed["input_ids"].shape, (1, 3))
         self.assertEqual(transformed["hidden_state"].shape, (1, 3, 6))
         self.assertEqual(transformed["target"].shape, (1, 3, 2))
-        self.assertEqual(transformed["loss_mask"].tolist(), [[1, 1, 0]])
+        self.assertEqual(transformed["loss_mask"].tolist(), [[1, 1, 1]])
 
     def test_offline_workers_prefetch_without_reordering_batches(self):
         with tempfile.TemporaryDirectory() as d:
