@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from transformers import LlamaConfig
 
 from specforge.modeling._mask_utils import prepare_decoder_attention_mask
-from specforge.modeling.draft.llama3_eagle import (
+from specforge.modeling.draft.eagle3 import (
     LlamaAttention,
     LlamaFlashAttention,
     _std_flash_attn_varlen_backward,
