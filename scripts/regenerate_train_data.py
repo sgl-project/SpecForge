@@ -233,10 +233,14 @@ def build_query_kwargs(args, messages, max_tokens=None):
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
+    # Qwen templates read enable_thinking; DeepSeek-V4 and V3.2 read thinking.
     if args.reasoning == "disable":
-        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        extra_body["chat_template_kwargs"] = {
+            "enable_thinking": False,
+            "thinking": False,
+        }
     elif args.reasoning == "save":
-        extra_body["chat_template_kwargs"] = {"enable_thinking": True}
+        extra_body["chat_template_kwargs"] = {"enable_thinking": True, "thinking": True}
     if extra_body:
         query_kwargs["extra_body"] = extra_body
     if args.is_gpt_oss:
