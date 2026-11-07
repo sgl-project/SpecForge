@@ -561,6 +561,7 @@ def _build_offline(
         max_steps=cfg.training.max_steps,
         total_steps=cfg.training.total_steps,
         save_interval=cfg.training.save_interval,
+        save_on_epoch_end=cfg.training.save_on_epoch_end,
         eval_interval=cfg.training.eval_interval,
         eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
         logger=logger,
@@ -827,6 +828,18 @@ def _build_online(
     total_steps = cfg.training.total_steps
     if total_steps is None and cfg.training.max_steps is None:
         total_steps = _read_online_total_steps(cfg, channel_path)
+    # The online consumer is epoch-agnostic (single continuous producer stream,
+    # controller num_epochs=1), so save_on_epoch_end's iterator-exhaustion save
+    # never fires. Derive the per-epoch optimizer-step boundaries from the plan
+    # (total_steps spans all num_epochs epochs) and pin a rotation-exempt
+    # checkpoint at each; producer owns the epoch schedule but the consumer is
+    # the only writer of checkpoints.
+    epoch_pin_steps = None
+    if cfg.training.save_on_epoch_end and total_steps and cfg.training.num_epochs > 1:
+        ne = int(cfg.training.num_epochs)
+        epoch_pin_steps = sorted(
+            {int(round(e * total_steps / ne)) for e in range(1, ne + 1)}
+        )
     bundle = build_model_bundle(cfg)
     trainer = build_disagg_online_consumer(
         algorithm=algorithm,
@@ -842,7 +855,9 @@ def _build_online(
         accumulation_steps=cfg.training.accumulation_steps,
         max_steps=cfg.training.max_steps,
         total_steps=total_steps,
+        epoch_pin_steps=epoch_pin_steps,
         save_interval=cfg.training.save_interval,
+        save_on_epoch_end=cfg.training.save_on_epoch_end,
         idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", "0")) or None,
         metadata_db_path=_consumer_database_path(cfg),
         logger=logger,
