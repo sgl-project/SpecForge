@@ -710,6 +710,14 @@ The producer itself is not restarted or resumed. Optimizer/FSDP checkpoints
 currently require the same trainer world size; control-plane ref redistribution
 does not imply optimizer-state resharding.
 
+`training.lr_scheduler: constant_linear_decay` keeps the `constant` rate
+through `training.lr_decay_start_update` (D), then decays it linearly to
+`base / (T - D)` at `training.lr_decay_end_update` (T). A `constant` checkpoint
+at any update up to D can resume into it, which branches a cooldown off a
+constant-rate run. The rates match a run that used the decay schedule from the
+start. The checkpoint records the branch, and later resumes must keep the same
+warmup, D, and T. Every other scheduler change on resume is rejected.
+
 Training metrics are printed every `training.log_interval` steps and forwarded
 to the configured tracking backend.
 
