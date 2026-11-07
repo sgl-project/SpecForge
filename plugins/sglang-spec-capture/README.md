@@ -1,9 +1,8 @@
 # specforge-sglang-capture
 
 An SGLang plugin that writes a target model's prefill hidden states straight
-into Mooncake for SpecForge's disaggregated training. It replaces the
-versioned source patch under `patches/sglang/` on SGLang builds that ship the
-generic extension points it uses:
+into Mooncake for SpecForge's disaggregated training and offline preparation.
+It requires an SGLang build with these generic extension points:
 
 - `--enable-return-aux-hidden-states` / `--return-aux-hidden-state-layer-ids`:
   aux hidden-state capture on a target without a draft. `--speculative-algorithm`
@@ -31,8 +30,8 @@ cached `sf-capture` environment. These extension points are not available in sto
 The aux-capture API returns `last_hidden_states` after the final norm and
 before LM-head-only scaling, including Inkling's muP division. The plugin
 preserves those values; SpecForge folds `logits_mup_width_multiplier` into
-its frozen target head. Older builds that return scaled states require the
-version-specific capture patch instead.
+its frozen target head. Older builds that return scaled states are unsupported;
+upgrade the capture environment to a build with the required API.
 
 Use separate environments for the SGLang server and SpecForge training.
 SpecForge currently pins SGLang 0.5.18 and different Torch/Transformers versions;
@@ -95,8 +94,8 @@ The default, `auto`, finds it without configuration:
   server's Python. It selects the plugin when `specforge_sglang_capture`,
   `sglang.srt.model_executor.forward_observer` and
   `sglang.srt.managers.deferred_output` (with `ResponseCompletion`, the
-  `defer_response` completion protocol) import. Otherwise it selects the
-  patch if the patched SGLang imports. It then renders the flags above and
+  `defer_response` completion protocol) import. Otherwise startup fails with
+  installation instructions. It renders the flags above and
   `SPECFORGE_SPEC_CAPTURE=1`. `specforge train --plan` shows the result.
 - External servers: before the first request, the producer reads each
   server's `/server_info`. The enabled plugin adds `spec_capture_backend:

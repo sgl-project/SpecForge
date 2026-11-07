@@ -19,7 +19,7 @@ the reference source and feature-store backend change.
 | --- | --- | --- | --- | --- |
 | Colocated offline | Precomputed feature files | Fixed `SampleRef` list | `LocalFeatureStore` reads `file://` refs | Re-iterable; epochs and checkpoint resume are supported |
 | Disaggregated offline | `CONFIG=path/to/offline-disagg.yaml run_offline.sh --role producer` ingests existing files and writes a static manifest | Fixed manifest refs | Shared directory or Mooncake | Re-iterable; DP/multi-node epochs and checkpoint resume are supported |
-| Online | Patched SGLang server writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
+| Online | SGLang capture plugin writes tensors; producer publishes refs | Per-rank `StreamingRefQueue` inbox | Mooncake | Consume once; consumer-only recovery reconciles retained state; no producer resume or second pass |
 
 `training.num_epochs` on an online run controls how many prompt passes the
 producer creates. Each pass receives new task and sample ids. The consumer
@@ -45,7 +45,7 @@ There is one consumer path for both one-rank and multi-rank runs:
 ```mermaid
 flowchart LR
   subgraph P[producer pool]
-    SG[patched SGLang capture]
+    SG[SGLang with the capture plugin capture]
     MCW[Mooncake tensor writes]
     RW[RolloutWorker]
     CH[StreamingRefChannel]
