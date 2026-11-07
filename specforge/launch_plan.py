@@ -197,7 +197,7 @@ class LaunchPlan:
     managed_ports: tuple[int, ...] = ()
     #: How managed capture servers implement spec capture (preflight checks it);
     #: ``auto`` only while ``server_capture_error`` says why it is unresolved.
-    server_capture: Literal["auto", "patch", "plugin"] = "patch"
+    server_capture: Literal["auto", "plugin"] = "plugin"
     #: True when ``auto`` was resolved by probing every capture server's
     #: interpreter, which already covers the preflight's module check.
     server_capture_detected: bool = False
@@ -634,28 +634,19 @@ def _sglang_argv(
 
 
 def _capture_flags(server_capture: str, contract) -> tuple[str, ...]:
-    """SGLang flags enabling spec capture for the selected server backend."""
-    layer_ids = tuple(str(layer) for layer in contract.aux_layer_ids)
-    if server_capture == "plugin":
-        # The plugin (enabled by SPECFORGE_SPEC_CAPTURE) reads the aux and
-        # last hidden states that full hidden-state capture produces. With
-        # --enable-return-aux-hidden-states, --speculative-algorithm only names
-        # the capture convention: SGLang resets it, so no draft runs.
-        return (
-            "--speculative-algorithm",
-            contract.method.upper(),
-            "--enable-return-aux-hidden-states",
-            "--return-aux-hidden-state-layer-ids",
-            *layer_ids,
-            "--return-hidden-states-mode",
-            "full",
-        )
+    """SGLang flags enabling the plugin's native auxiliary capture."""
+    if server_capture != "plugin":
+        raise ValueError(f"Unsupported server capture backend: {server_capture!r}")
+    # With aux capture enabled, the algorithm names the capture convention only;
+    # SGLang resets it so no draft runs.
     return (
-        "--enable-spec-capture",
-        "--spec-capture-method",
-        contract.method,
-        "--spec-capture-aux-layer-ids",
-        *layer_ids,
+        "--speculative-algorithm",
+        contract.method.upper(),
+        "--enable-return-aux-hidden-states",
+        "--return-aux-hidden-state-layer-ids",
+        *(str(layer) for layer in contract.aux_layer_ids),
+        "--return-hidden-states-mode",
+        "full",
     )
 
 
@@ -797,11 +788,7 @@ def _managed_local_services(
                 if gpu_put is not None
                 else {}
             ),
-            **(
-                {"SPECFORGE_SPEC_CAPTURE": "1" if server_capture == "plugin" else "0"}
-                if server_capture is not None
-                else {}
-            ),
+            **({"SPECFORGE_SPEC_CAPTURE": "1"} if server_capture is not None else {}),
             "FLASHINFER_DISABLE_VERSION_CHECK": "1",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
@@ -1307,16 +1294,12 @@ _SERVER_CAPTURE_REQUIREMENTS = {
         # protocol; the earlier deferred-output revision lacks both.
         "sglang.srt.managers.deferred_output:ResponseCompletion",
     ),
-    "patch": ("sglang.srt.spec_capture_sink",),
 }
 _SERVER_CAPTURE_INSTALL = {
     "plugin": (
         "the specforge-sglang-capture plugin (pip install --no-deps "
         "plugins/sglang-spec-capture) on an SGLang build with forward "
         "observers and deferred outputs"
-    ),
-    "patch": (
-        "patched SGLang spec capture; run scripts/apply_sglang_spec_capture_patch.sh"
     ),
 }
 
@@ -1380,7 +1363,7 @@ print(json.dumps(missing))
 
 
 def requested_server_capture(cfg: Config, env: Mapping[str, str]) -> str:
-    """The requested capture backend: an explicit ``patch``/``plugin`` in the
+    """The requested capture backend: an explicit ``plugin`` in the
     deployment config, else ``DISAGG_SERVER_CAPTURE``, else ``auto``."""
     deployment = cfg.deployment.disaggregated
     configured = deployment.server_capture if deployment is not None else "auto"
@@ -1389,7 +1372,7 @@ def requested_server_capture(cfg: Config, env: Mapping[str, str]) -> str:
     requested = env.get("DISAGG_SERVER_CAPTURE") or "auto"
     if requested not in ("auto", *_SERVER_CAPTURE_REQUIREMENTS):
         raise ValueError(
-            "DISAGG_SERVER_CAPTURE must be auto, patch or plugin, " f"got {requested!r}"
+            "DISAGG_SERVER_CAPTURE must be auto or plugin, " f"got {requested!r}"
         )
     return requested
 
@@ -1398,16 +1381,9 @@ def _detect_server_capture(
     services: Sequence[ServiceSpec],
     probe: Callable[[CommandSpec, Sequence[str]], list[str]],
 ) -> tuple[str, Optional[str]]:
-    """Resolve ``auto`` from what each capture server's interpreter provides.
-
-    Every server resolves to the plugin when its requirements are met, else to
-    the patch. Returns ``(server_capture, None)`` when all servers agree, else
-    ``("auto", error)``.
-    """
-    requirements = [
-        name for needed in _SERVER_CAPTURE_REQUIREMENTS.values() for name in needed
-    ]
-    detected: dict[str, str] = {}
+    """Resolve ``auto`` only when every capture server supports the plugin."""
+    requirements = _SERVER_CAPTURE_REQUIREMENTS["plugin"]
+    detected = False
     for service in services:
         command = service.command
         if not command.label.startswith("capture-server-"):
@@ -1416,34 +1392,16 @@ def _detect_server_capture(
             missing = probe(command, requirements)
         except RuntimeError as exc:
             return "auto", str(exc)
-        found = [
-            backend
-            for backend, needed in _SERVER_CAPTURE_REQUIREMENTS.items()
-            if not set(needed).intersection(missing)
-        ]
-        if not found:
+        if missing:
             return "auto", (
                 "deployment.disaggregated.server_capture=auto found no capture "
-                f"backend for {command.label} using {command.argv[0]!r} "
-                f"(missing {missing}); install {_SERVER_CAPTURE_INSTALL['plugin']}, "
-                f"or {_SERVER_CAPTURE_INSTALL['patch']}"
+                f"backend for {command.label} using {command.argv[0]!r}; "
+                f"install {_SERVER_CAPTURE_INSTALL['plugin']}; missing {missing}"
             )
-        # Modules every backend needs (mooncake.store).
-        shared = [name for name in missing if name not in requirements]
-        if shared:
-            return "auto", (
-                f"managed_local requires {_SERVER_CAPTURE_INSTALL[found[0]]} for "
-                f"{command.label} using {command.argv[0]!r}; missing {shared}"
-            )
-        detected[command.label] = found[0]
-    if len(set(detected.values())) != 1:
-        return "auto", (
-            "deployment.disaggregated.server_capture=auto resolved the capture "
-            f"servers to different backends {detected}; one plan needs one "
-            "backend, so install the same one for every capture server or set "
-            "server_capture: patch|plugin"
-        )
-    return next(iter(detected.values())), None
+        detected = True
+    if not detected:
+        return "auto", "No capture servers were configured for plugin detection"
+    return "plugin", None
 
 
 def _managed_rdma_preflight(plan: LaunchPlan) -> None:

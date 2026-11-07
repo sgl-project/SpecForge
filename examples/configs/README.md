@@ -80,7 +80,7 @@ second runtime or launch path.
 
 Recipes under `online/disaggregated/managed-local` are opt-in, single-node
 full-stack examples. Their typed `managed_local` blocks own Mooncake, one or
-more patched SGLang capture servers, and the trainer GPU allocation; the same
+more SGLang capture servers, and the trainer GPU allocation; the same
 `specforge train -c ...` command starts and cleans up the complete stack.
 Recipes under `online/disaggregated/external` omit `managed_local`, so Mooncake
 and SGLang remain owned by the user, scheduler, or service platform.
@@ -88,14 +88,14 @@ and SGLang remain owned by the user, scheduler, or service platform.
 The `kimi-k3-dspark.yaml` recipe is the external
 two-node migration of the 64K Kimi K3 continual run. Its dedicated
 [runbook](../../docs/recipes/kimi-k3-dspark-disaggregated.md) pins the K3
-SGLang revision and patch target, preserves the old effective global batch and
+SGLang capture plugin requirements, preserves the old effective global batch and
 prompt order, and documents the TP8 capture plus four-rank trainer topology.
 
 `deepseek-v4-flash-dspark.yaml` trains a DSpark drafter for
 DeepSeek-V4-Flash-0731 from scratch on ShareGPT, with external capture
 servers. Its
 [runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
-covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
+covers the SGLang capture plugin and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
 `qwen3.8-27b-dflash2.yaml` (external services, two nodes) and
@@ -248,7 +248,7 @@ should make their training strategy and topology explicit.
 | `model.sglang_linear_attn_prefill_backend` | `null` | Optional linear-attention (GDN/KDA) prefill kernel backend for hybrid targets (`--linear-attn-prefill-backend`). |
 | `model.sglang_fp8_gemm_backend` | `null` | Optional blockwise FP8 GEMM runner (`--fp8-gemm-backend`). |
 | `model.sglang_disable_cuda_graph` | `false` | Pass `--disable-cuda-graph`, which disables SGLang's decode and prefill CUDA graphs. |
-| `model.sglang_extra_args` | `[]` | Further SGLang CLI tokens appended to every managed-local capture server, one flag or value per list item (`["--prefill-max-requests", "8"]`). The list must start with a `--flag`. Flags the launcher owns (`--model-path`, `--port`, `--host`, `--tp-size`, `--dtype`, `--trust-remote-code`, `--skip-tokenizer-init`, `--chunked-prefill-size`, `--context-length`, the `--spec-capture-*` flags) and flags another `model.sglang_*` field already renders are rejected, including their SGLang aliases and abbreviations; so are `--api-key` (the capture adapter sends no key), `--enable-dp-attention`/`--enable-dp-lm-head` (unsupported by managed-local capture) and `--config`. External servers take their flags from their own launch command. |
+| `model.sglang_extra_args` | `[]` | Further SGLang CLI tokens appended to every managed-local capture server, one flag or value per list item (`["--prefill-max-requests", "8"]`). The list must start with a `--flag`. Flags the launcher owns (`--model-path`, `--port`, `--host`, `--tp-size`, `--dtype`, `--trust-remote-code`, `--skip-tokenizer-init`, `--chunked-prefill-size`, `--context-length`, the auxiliary hidden-state capture flags) and flags another `model.sglang_*` field already renders are rejected, including their SGLang aliases and abbreviations; so are `--api-key` (the capture adapter sends no key), `--enable-dp-attention`/`--enable-dp-lm-head` (unsupported by managed-local capture) and `--config`. External servers take their flags from their own launch command. |
 
 ### `data`: choose exactly one training source
 
@@ -355,8 +355,8 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.inbox_server_url` | `null` | Optional private `http://host:port` rank-0 relay for tensor-free inbox refs when remote trainer ranks cannot share `control_dir`. Online multi-node only; no credentials, path, query, TLS, or built-in authentication. |
 | `deployment.disaggregated.store_root` | `null` | Shared feature directory; required when `backend: shared_dir`. |
 | `deployment.disaggregated.store_id` | `null` | Feature-store namespace; defaults to `run_id`. |
-| `deployment.disaggregated.server_urls` | `[]` | External SGLang capture endpoints (patched, or running the capture plugin). One rollout worker is created per entry. Do not set with `managed_local`. |
-| `deployment.disaggregated.server_capture` | `auto` | How the capture servers implement spec capture: `patch` is the source patch under `patches/sglang`; `plugin` is the `specforge-sglang-capture` plugin (`plugins/sglang-spec-capture`) on an SGLang build with forward observers, deferred outputs and `--enable-return-aux-hidden-states`. `auto` uses an exported `DISAGG_SERVER_CAPTURE` (`patch` or `plugin`) when set; otherwise managed-local planning probes each capture server's Python (`capture_servers[].python_executable`) and picks `plugin` when the plugin and those SGLang extension points import, else `patch` when the patched SGLang does. All managed servers must resolve to the same backend, and `specforge train --plan` shows the result. For external servers, the producer reads each server's `/server_info` before its first request: `enable_spec_capture` marks the patch, the plugin's `spec_capture_backend` marks the plugin. Managed-local servers are launched to match; external servers must already run that backend. |
+| `deployment.disaggregated.server_urls` | `[]` | External SGLang capture endpoints (running the capture plugin). One rollout worker is created per entry. Do not set with `managed_local`. |
+| `deployment.disaggregated.server_capture` | `auto` | SGLang capture uses the `specforge-sglang-capture` plugin; allowed values are `auto` and `plugin`. `auto` honors `DISAGG_SERVER_CAPTURE=plugin`, otherwise managed-local planning checks each server interpreter for the plugin and its required SGLang APIs. External capture detects `spec_capture_backend: plugin` in `/server_info`. Missing support fails with installation instructions; source-patch servers are unsupported. See [plugin setup](../../plugins/sglang-spec-capture/README.md). |
 | `deployment.disaggregated.mooncake_metadata_server` | `null` | External Mooncake metadata URL. |
 | `deployment.disaggregated.mooncake_master_server_addr` | `null` | External Mooncake RPC `host:port`. |
 | `deployment.disaggregated.mooncake_local_hostname` | `null` | Node-local Mooncake transfer hostname; usually supplied through the environment. |
@@ -412,7 +412,7 @@ Managed-local fields:
 | --- | --- | --- |
 | `deployment.disaggregated.managed_local.trainer_cuda_visible_devices` | required | One device token per `nproc_per_node`; trainer and capture devices must not overlap. |
 | `deployment.disaggregated.managed_local.mooncake` | default object | Owned loopback Mooncake configuration described by the nested fields below. |
-| `deployment.disaggregated.managed_local.capture_servers` | required | One or more owned patched SGLang server definitions. |
+| `deployment.disaggregated.managed_local.capture_servers` | required | One or more owned SGLang server running the capture plugin definitions. |
 | `deployment.disaggregated.managed_local.shutdown_grace_s` | `30` | Positive graceful process-group shutdown window. |
 | `deployment.disaggregated.managed_local.mooncake.rpc_port` | `35551` | Owned Mooncake RPC port. |
 | `deployment.disaggregated.managed_local.mooncake.metadata_port` | `35880` | Owned metadata HTTP port. |
@@ -435,7 +435,7 @@ Managed-local fields:
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
 | `deployment.disaggregated.managed_local.capture_servers[].startup_timeout_s` | `1800` | Positive server readiness timeout. |
 | `deployment.disaggregated.managed_local.capture_servers[].extra_args` | `[]` | SGLang CLI tokens for this server only, appended after `model.sglang_extra_args` under the same rules. A flag may appear once per command line, so set a per-server flag here and not in the global list. |
-| `deployment.disaggregated.managed_local.capture_servers[].env` | `{}` | Extra environment for this server process, for example the capture patch's `SGLANG_SPEC_CAPTURE_TIMING` or `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`. Keys the launcher sets are rejected: `MOONCAKE_*`, `DISAGG_*`, device-visibility variables, `SGLANG_SPEC_CAPTURE_GPU_PUT` (use `gpu_put`) and `FLASHINFER_DISABLE_VERSION_CHECK`. |
+| `deployment.disaggregated.managed_local.capture_servers[].env` | `{}` | Extra environment for this server process, for example the capture plugin's `SGLANG_SPEC_CAPTURE_TIMING` or `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`. Keys the launcher sets are rejected: `MOONCAKE_*`, `DISAGG_*`, device-visibility variables, `SGLANG_SPEC_CAPTURE_GPU_PUT` (use `gpu_put`) and `FLASHINFER_DISABLE_VERSION_CHECK`. |
 | `deployment.disaggregated.managed_local.capture_servers[].probe_timeout_s` | `5` | Positive, finite HTTP health-probe timeout, capped by the remaining startup timeout. SGLang's generation-based `/health` waits at least one second; allow headroom instead of setting this to one second. |
 
 Managed-local stacks use Mooncake RDMA by default and never fall back to TCP
@@ -477,7 +477,7 @@ the strategy's non-blocking copy.
 Select `receive_buffers: pageable` to restore fresh host receives. The 8 GiB receive-pool
 budget is allocated lazily per rank and excludes returned tensors and overflow buffers.
 
-Patched CUDA capture servers use GPU publication automatically when
+CUDA capture servers with the plugin use GPU publication automatically when
 `MOONCAKE_PROTOCOL=rdma` (managed-local: when `mooncake.protocol: rdma` is set
 explicitly); TCP and non-CUDA workers use host publication. External
 servers can set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` to disable it or `1` to explicitly

@@ -6,7 +6,7 @@ builds one RolloutWorker per SGLangServerCaptureAdapter (1 server : 1 adapter :
 1 worker), all leasing DISJOINT prompts from the one controller and publishing
 into the one channel, concurrently. A logical worker can continuously maintain
 multiple capture calls without duplicating worker/controller state. Each stub
-``post_fn`` stands in for one patched SGLang server writing into the shared fake
+``post_fn`` stands in for a SGLang capture plugin writing into the shared fake
 Mooncake backend — the same topology configured through ``specforge train``
 producer and consumer roles.
 
@@ -931,7 +931,7 @@ class _OverlapCheckingServer:
             index = self._calls
             self._calls += 1
             self.dispatched.extend(
-                spec["sample_id"] for spec in json_body["spec_capture"]
+                spec["sample_id"] for spec in self.stub._specs(json_body)
             )
             if self.status_probe is not None:
                 self.max_resident_prompts = max(

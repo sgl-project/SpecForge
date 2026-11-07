@@ -39,7 +39,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     container:
-      image: lmsysorg/sglang:v0.5.18-cu130 # we lock to this version to avoid repeated docker pull
+      image: lmsysorg/sglang:v0.5.18-cu130 # CUDA build-toolchain base; the venvs install the pinned SGLang revision below
       options: --gpus all --shm-size=2g --rm -v /dev/shm --privileged --pid=host
     # The self-hosted runner exports HTTP(S)_PROXY into the container but no
     # longer a NO_PROXY, so local requests (sglang's own warmup to 127.0.0.1)
@@ -51,9 +51,19 @@ jobs:
       # v2 deliberately ignores the legacy venv cache with stale dist-info files.
       SPECFORGE_CI_CACHE: /github/home/specforge-ci-v2
       FLASH_ATTN_VERSION: 2.8.3.post2
+      # Both CI environments need the plugin's forward-observer/completion APIs.
+      SGLANG_COMMIT: c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # checkout@v4 whitelists the workspace only in its own temporary git
+      # config; later steps that build the package with --no-build-isolation
+      # invoke git again (setuptools-scm's file finder) and fail with
+      # "detected dubious ownership" on this self-hosted container.
+      - name: Trust the workspace for later git calls
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # Cancelled or timed-out runs can leave processes behind which keep GPU
       # memory allocated and make this run OOM. --pid=host above is what makes
@@ -69,14 +79,22 @@ jobs:
             cp -p -r /github/home/cache ./
           fi
 
-          if [ -d "$SPECFORGE_CI_CACHE/sf" ]; then
-            rm -rf sf
-            cp -a "$SPECFORGE_CI_CACHE/sf" sf
-          fi
+          for environment in sf sf-capture; do
+            if [ -d "$SPECFORGE_CI_CACHE/$environment" ]; then
+              rm -rf "$environment"
+              cp -a "$SPECFORGE_CI_CACHE/$environment" "$environment"
+            fi
+          done
 
       - name: Remove flashinfer # this is needed to avoid flashinfer jit compilation makes the program hang
         run: |
           rm -rf /github/home/.cache/flashinfer
+
+      - name: Install capture server Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Pinned SGLang revision's rust/rust-toolchain.toml requirement.
+          toolchain: "1.92"
 
       - name: Install dependencies
         shell: bash
@@ -86,16 +104,30 @@ jobs:
             uv venv sf -p 3.11
           fi
           source sf/bin/activate
-          uv pip install wheel setuptools psutil packaging ninja
-          uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
-          uv pip install -v . --prerelease=allow
-          # SGLang 0.5.18 installs cubin separately and requires it to match
-          # flashinfer-python; replace the 0.6.12 copy in cached venvs.
-          uv pip install flashinfer-cubin==0.6.17 --index-url https://flashinfer.ai/whl
+          uv pip install wheel setuptools setuptools-rust setuptools-scm psutil packaging ninja
+          uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+          uv pip install -v . --no-build-isolation --prerelease=allow \
+            "sglang @ git+https://github.com/sgl-project/sglang.git@${SGLANG_COMMIT}#subdirectory=python"
+          uv pip install --no-deps plugins/sglang-spec-capture
           # The live server-capture gate needs the Mooncake client AND the
           # mooncake_master console script; the isolated venv cannot see the
           # container's site-packages. cu130 image -> the cuda13 wheel.
           uv pip install mooncake-transfer-engine-cuda13
+
+      - name: Install pinned plugin capture environment
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          if [ ! -d sf-capture ]; then
+            uv venv sf-capture -p 3.12
+          fi
+          # Use the same CI-owned revision as sf, with ordinary cache reuse.
+          uv pip install --python sf-capture/bin/python wheel setuptools setuptools-rust setuptools-scm
+          uv pip install --python sf-capture/bin/python torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+          uv pip install --python sf-capture/bin/python --no-build-isolation --prerelease=allow \
+            "sglang @ git+https://github.com/sgl-project/sglang.git@${SGLANG_COMMIT}#subdirectory=python" mooncake-transfer-engine-cuda13
+          uv pip install --python sf-capture/bin/python --no-deps plugins/sglang-spec-capture
+          sf-capture/bin/python -c 'from sglang.srt.model_executor.forward_observer import ForwardObserver; from sglang.srt.managers.deferred_output import ResponseCompletion'
 
       - name: Ensure FlashAttention ABI
         timeout-minutes: 30
@@ -112,9 +144,11 @@ jobs:
           mkdir -p "$SPECFORGE_CI_CACHE"
           staging=$(mktemp -d "$SPECFORGE_CI_CACHE/sf.XXXXXX")
           trap 'rm -rf "$staging"' EXIT
-          cp -a sf "$staging/sf"
-          rm -rf "${SPECFORGE_CI_CACHE:?}/sf"
-          mv "$staging/sf" "$SPECFORGE_CI_CACHE/sf"
+          for environment in sf sf-capture; do
+            cp -a "$environment" "$staging/$environment"
+            rm -rf "${SPECFORGE_CI_CACHE:?}/$environment"
+            mv "$staging/$environment" "$SPECFORGE_CI_CACHE/$environment"
+          done
 
       - name: Run live server-capture numerics gate
         timeout-minutes: 15
@@ -124,7 +158,8 @@ jobs:
         run: |
           source sf/bin/activate
           export PYTHONPATH=$PWD
-          bash scripts/apply_sglang_spec_capture_patch.sh
+          export SPECFORGE_SERVER_CAPTURE=plugin
+          export SPECFORGE_CAPTURE_GATE_SERVER_PYTHON="$PWD/sf-capture/bin/python"
           python -c 'import importlib.util, shutil, torch; assert torch.cuda.is_available(), "live capture gate requires CUDA"; assert importlib.util.find_spec("mooncake.store"), "live capture gate requires mooncake.store"; assert shutil.which("mooncake_master") or __import__("os").environ.get("MOONCAKE_MASTER_SERVER_ADDR"), "live capture gate requires mooncake_master"'
           python -m unittest tests.test_runtime.test_server_capture_gate -v
 

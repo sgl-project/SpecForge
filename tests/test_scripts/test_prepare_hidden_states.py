@@ -11,7 +11,6 @@ from scripts.prepare_hidden_states import (
     HiddenStatesGenerator,
     _generate_shared_vocab_mapping,
     _resolve_draft_vocab_size,
-    build_target_model,
     parse_args,
     resolve_offline_capture_plan,
 )
@@ -24,6 +23,8 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
     def test_cli_defaults_to_legacy_eagle3_capture(self):
         argv = [
             "prepare_hidden_states.py",
+            "--server-urls",
+            "http://localhost:30000",
             "--target-model-path",
             "target",
             "--data-path",
@@ -34,28 +35,17 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
 
         self.assertEqual("eagle3", args.strategy)
         self.assertIsNone(args.draft_model_config)
-        self.assertFalse(args.sglang_disable_radix_cache)
+        self.assertEqual(args.server_urls, ["http://localhost:30000"])
+        self.assertFalse(hasattr(args, "tp_size"))
         self.assertFalse(hasattr(args, "draft_num_hidden_layers"))
         self.assertFalse(hasattr(args, "draft_block_size"))
         self.assertFalse(hasattr(args, "capture_layers"))
 
-    def test_cli_can_explicitly_disable_radix_cache(self):
-        argv = [
-            "prepare_hidden_states.py",
-            "--target-model-path",
-            "target",
-            "--data-path",
-            "data.jsonl",
-            "--sglang-disable-radix-cache",
-        ]
-        with mock.patch("sys.argv", argv):
-            args = parse_args()
-
-        self.assertTrue(args.sglang_disable_radix_cache)
-
     def test_cli_accepts_dflash_family_config(self):
         argv = [
             "prepare_hidden_states.py",
+            "--server-urls",
+            "http://localhost:30000",
             "--target-model-path",
             "target",
             "--data-path",
@@ -135,84 +125,6 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 else:
                     self.assertTrue(plan.loss_mask_filter([0, 1, 1]))
                     self.assertFalse(plan.loss_mask_filter([1, 0, 1]))
-
-    def test_build_uses_dedicated_offline_loader(self):
-        config = SimpleNamespace(num_hidden_layers=32, dtype=None)
-        args = SimpleNamespace(
-            target_model_path="target",
-            trust_remote_code=True,
-            sglang_attention_backend="fa3",
-            sglang_mem_fraction_static=0.4,
-            sglang_context_length=4096,
-            sglang_enable_nccl_nvls=False,
-            sglang_enable_symm_mem=False,
-            sglang_enable_torch_compile=False,
-            sglang_enable_dp_attention=False,
-            sglang_enable_dp_lm_head=False,
-            sglang_ep_size=1,
-            sglang_disable_radix_cache=False,
-            batch_size=4,
-            max_length=128,
-        )
-        target = mock.Mock()
-        with mock.patch(
-            "scripts.prepare_hidden_states.load_offline_capture",
-            return_value=target,
-        ) as load:
-            self.assertIs(
-                build_target_model(args, config, capture_layers=[2, 7, 19]),
-                target,
-            )
-
-        load.assert_called_once()
-        self.assertEqual(load.call_args.args, ("target",))
-        self.assertNotIn("device", load.call_args.kwargs)
-        self.assertNotIn("cache_dir", load.call_args.kwargs)
-        self.assertFalse(load.call_args.kwargs["disable_radix_cache"])
-        target.set_capture_layers.assert_called_once_with(
-            [2, 7, 19],
-            capture_method="eagle3",
-        )
-
-    def test_build_accepts_pre_resolved_arbitrary_capture_layers(self):
-        config = SimpleNamespace(num_hidden_layers=40, dtype=None)
-        args = SimpleNamespace(
-            target_model_path="target",
-            trust_remote_code=True,
-            sglang_attention_backend="fa3",
-            sglang_mem_fraction_static=0.4,
-            sglang_context_length=4096,
-            sglang_enable_nccl_nvls=False,
-            sglang_enable_symm_mem=False,
-            sglang_enable_torch_compile=False,
-            sglang_enable_dp_attention=False,
-            sglang_enable_dp_lm_head=False,
-            sglang_ep_size=1,
-            sglang_disable_radix_cache=True,
-            batch_size=4,
-            max_length=128,
-        )
-        target = mock.Mock()
-        capture_layers = [1, 9, 17, 25, 33]
-        with mock.patch(
-            "scripts.prepare_hidden_states.load_offline_capture",
-            return_value=target,
-        ) as load:
-            self.assertIs(
-                build_target_model(
-                    args,
-                    config,
-                    capture_layers=capture_layers,
-                    capture_method="dflash",
-                ),
-                target,
-            )
-
-        self.assertTrue(load.call_args.kwargs["disable_radix_cache"])
-        target.set_capture_layers.assert_called_once_with(
-            capture_layers,
-            capture_method="dflash",
-        )
 
 
 class PrepareHiddenStatesSerializationTest(unittest.TestCase):
@@ -333,6 +245,10 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
                     "scripts.prepare_hidden_states.generate_vocab_mapping_file",
                     side_effect=generate,
                 ) as generate_mock,
+                mock.patch(
+                    "scripts.prepare_hidden_states.dist.is_initialized",
+                    return_value=True,
+                ),
                 mock.patch(
                     "scripts.prepare_hidden_states.dist.get_rank", return_value=0
                 ),

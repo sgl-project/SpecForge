@@ -83,19 +83,15 @@ class CIDependencyTest(unittest.TestCase):
                 root = Path(os.environ["TEST_ROOT"])
                 modules = root / "modules"
                 cache = Path(os.environ["UV_CACHE_DIR"])
+                version = os.environ["FLASH_ATTN_VERSION"]
                 with (root / "calls").open("a") as log:
-                    log.write(json.dumps({"args": sys.argv[1:], "cache": str(cache),
-                              "force": os.environ.get("FLASH_ATTENTION_FORCE_BUILD")}) + "\\n")
+                    log.write(json.dumps({"args": sys.argv[1:], "cache": str(cache)}) + "\\n")
                 if sys.argv[2] == "uninstall":
                     for entry in modules.glob("flash_attn-*.dist-info"):
                         shutil.rmtree(entry)
                 else:
-                    if os.environ.get("TEST_INSTALL_FAIL"):
-                        sys.exit(1)
-                    cache.mkdir(parents=True, exist_ok=True)
-                    version = os.environ["FLASH_ATTN_VERSION"]
                     metadata = modules / f"flash_attn-{version}.dist-info"
-                    metadata.mkdir()
+                    metadata.mkdir(exist_ok=True)
                     (metadata / "METADATA").write_text(
                         f"Name: flash-attn\\nVersion: {version}\\n")
                     if not os.environ.get("TEST_ABI_FAIL"):
@@ -104,6 +100,46 @@ class CIDependencyTest(unittest.TestCase):
             )
         )
         uv.chmod(0o755)
+        # curl serves the PyPI JSON and an sdist tarball whose setup.py builds a
+        # real (trivial) wheel once the CI script patches its -std flag.
+        curl = self.bin / "curl"
+        curl.write_text(
+            f"#!{sys.executable}\n"
+            + textwrap.dedent(
+                """\
+                import io
+                import json
+                import os
+                import sys
+                import tarfile
+
+                args = sys.argv[1:]
+                if "-o" not in args:
+                    print(json.dumps({"urls": [{
+                        "packagetype": "sdist",
+                        "url": "https://files.example.invalid/flash_attn.tar.gz",
+                    }]}))
+                    sys.exit(0)
+                out = args[args.index("-o") + 1]
+                version = os.environ["FLASH_ATTN_VERSION"]
+                payload = (
+                    "import os, sys\\n"
+                    "# flags: -std=c++17\\n"
+                    "if os.environ.get('TEST_INSTALL_FAIL'):\\n"
+                    "    sys.exit(1)\\n"
+                    "src = open(__file__).read()\\n"
+                    "assert '-std=' + 'c++17' not in src, \\"setup.py not patched\\"\\n"
+                    "from setuptools import setup\\n"
+                    "setup(name='flash-attn', version=os.environ['FLASH_ATTN_VERSION'])\\n"
+                ).encode()
+                with tarfile.open(out, "w:gz") as tar:
+                    info = tarfile.TarInfo(f"flash_attn-{version}/setup.py")
+                    info.size = len(payload)
+                    tar.addfile(info, io.BytesIO(payload))
+                """
+            )
+        )
+        curl.chmod(0o755)
 
     def run_fa(self, success=True):
         result = subprocess.run(
@@ -121,31 +157,41 @@ class CIDependencyTest(unittest.TestCase):
         ]
 
     def test_save_and_restore_remove_stale_versions(self):
-        old = self.cache / "sf" / "old.dist-info"
-        old.mkdir(parents=True)
-        (self.root / "sf").mkdir()
-        (self.root / "sf" / "current.dist-info").touch()
-        (self.root / "sf" / "python").symlink_to(sys.executable)
+        for environment in ("sf", "sf-capture"):
+            (self.cache / environment / "old.dist-info").mkdir(parents=True)
+            current = self.root / environment
+            current.mkdir()
+            (current / "current.dist-info").write_text(environment)
+            (current / "python").symlink_to(sys.executable)
         self.run_step("Save dependency cache")
-        self.assertFalse(old.exists())
-        (self.root / "sf" / "stale.dist-info").touch()
+        for environment in ("sf", "sf-capture"):
+            self.assertFalse((self.cache / environment / "old.dist-info").exists())
+            (self.root / environment / "stale.dist-info").touch()
         # Exercise only the venv restore; the model cache is unrelated to this test.
         restore = self.steps["Restore cache"]["run"]
-        restore = restore[restore.index('if [ -d "$SPECFORGE_CI_CACHE/sf"') :]
+        restore = restore[restore.index("for environment in sf sf-capture; do") :]
         result = self.run_shell(restore)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            {p.name for p in (self.root / "sf").iterdir()},
-            {"current.dist-info", "python"},
-        )
-        self.assertTrue((self.root / "sf" / "python").is_symlink())
+        for environment in ("sf", "sf-capture"):
+            with self.subTest(environment=environment):
+                restored = self.root / environment
+                self.assertEqual(
+                    {p.name for p in restored.iterdir()},
+                    {"current.dist-info", "python"},
+                )
+                self.assertEqual(
+                    (restored / "current.dist-info").read_text(), environment
+                )
+                self.assertTrue((restored / "python").is_symlink())
 
     def test_failed_copy_preserves_previous_snapshot(self):
-        (self.cache / "sf").mkdir()
-        (self.cache / "sf" / "valid").touch()
+        for environment in ("sf", "sf-capture"):
+            (self.cache / environment).mkdir()
+            (self.cache / environment / "valid").touch()
         result = self.run_shell(self.steps["Save dependency cache"]["run"])
         self.assertNotEqual(result.returncode, 0)
-        self.assertTrue((self.cache / "sf" / "valid").exists())
+        for environment in ("sf", "sf-capture"):
+            self.assertTrue((self.cache / environment / "valid").exists())
         self.assertEqual(list(self.cache.glob("sf.*")), [])
 
     def test_fa_install_then_healthy_environment_skips_install(self):
@@ -155,11 +201,9 @@ class CIDependencyTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0]["args"], ["pip", "uninstall", "flash-attn"])
         install = calls[1]
-        self.assertEqual(install["force"], "TRUE")
-        for flag in ("--no-deps", "--no-build-isolation", "--no-binary"):
-            self.assertIn(flag, install["args"])
-        for flag in ("--no-cache", "--reinstall-package", "--refresh"):
-            self.assertNotIn(flag, install["args"])
+        self.assertEqual(install["args"][:2], ["pip", "install"])
+        self.assertTrue(install["args"][-1].endswith(".whl"))
+        self.assertIn("--no-deps", install["args"])
         self.run_fa()
         self.assertEqual(self.calls(), calls)
 
@@ -208,6 +252,7 @@ class CIDependencyTest(unittest.TestCase):
         names = list(self.steps)
         ordered = [
             "Install dependencies",
+            "Install pinned plugin capture environment",
             "Ensure FlashAttention ABI",
             "Save dependency cache",
             "Run live server-capture numerics gate",
@@ -216,6 +261,36 @@ class CIDependencyTest(unittest.TestCase):
         self.assertEqual(sorted(ordered, key=names.index), ordered)
         self.assertNotIn("flash-attn", self.steps["Install dependencies"]["run"])
         self.assertNotIn("/github/home/sf", self.steps["Restore cache"]["run"])
+
+    def test_both_environments_install_ci_pin_without_package_manifest(self):
+        self.env["SGLANG_COMMIT"] = self.job["env"]["SGLANG_COMMIT"]
+        uv = self.bin / "uv"
+        uv.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "with (Path(os.environ['TEST_ROOT']) / 'calls').open('a') as log:\n"
+            "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        )
+        uv.chmod(0o755)
+        for environment in ("sf", "sf-capture"):
+            bin_dir = self.root / environment / "bin"
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "activate").touch()
+            # Stub only the capture environment's post-install import check.
+            python = bin_dir / "python"
+            python.write_text("#!/bin/sh\nexit 0\n")
+            python.chmod(0o755)
+        self.run_step("Install dependencies")
+        self.run_step("Install pinned plugin capture environment")
+        requirement = (
+            "sglang @ git+https://github.com/sgl-project/sglang.git@"
+            f"{self.env['SGLANG_COMMIT']}#subdirectory=python"
+        )
+        installs = [args for args in self.calls() if requirement in args]
+        self.assertEqual(len(installs), 2)
+        self.assertIn(".", installs[0])
+        self.assertIn("sf-capture/bin/python", installs[1])
 
 
 if __name__ == "__main__":
