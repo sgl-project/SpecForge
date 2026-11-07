@@ -39,7 +39,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     container:
-      image: lmsysorg/sglang:v0.5.18-cu130 # CUDA build-toolchain base; the venvs install the pinned SGLang revision below
+      image: lmsysorg/sglang:v0.5.18-cu130 # CUDA build-toolchain base; the capture venv installs the pinned SGLang revision below
       options: --gpus all --shm-size=2g --rm -v /dev/shm --privileged --pid=host
     # The self-hosted runner exports HTTP(S)_PROXY into the container but no
     # longer a NO_PROXY, so local requests (sglang's own warmup to 127.0.0.1)
@@ -51,8 +51,6 @@ jobs:
       # v2 deliberately ignores the legacy venv cache with stale dist-info files.
       SPECFORGE_CI_CACHE: /github/home/specforge-ci-v2
       FLASH_ATTN_VERSION: 2.8.3.post2
-      # Both CI environments need the plugin's forward-observer/completion APIs.
-      SGLANG_COMMIT: c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -96,11 +94,12 @@ jobs:
             uv venv sf -p 3.11
           fi
           source sf/bin/activate
-          uv pip install wheel setuptools setuptools-rust setuptools-scm psutil packaging ninja
-          uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
-          uv pip install -v . --no-build-isolation --prerelease=allow \
-            "sglang @ git+https://github.com/sgl-project/sglang.git@${SGLANG_COMMIT}#subdirectory=python"
-          uv pip install --no-deps plugins/sglang-spec-capture
+          uv pip install wheel setuptools psutil packaging ninja
+          uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+          uv pip install -v . --prerelease=allow
+          # SGLang 0.5.18 installs cubin separately and requires it to match
+          # flashinfer-python; replace the 0.6.12 copy in cached venvs.
+          uv pip install flashinfer-cubin==0.6.17 --index-url https://flashinfer.ai/whl
           # The live server-capture gate needs the Mooncake client AND the
           # mooncake_master console script; the isolated venv cannot see the
           # container's site-packages. cu130 image -> the cuda13 wheel.
@@ -113,11 +112,12 @@ jobs:
           if [ ! -d sf-capture ]; then
             uv venv sf-capture -p 3.12
           fi
-          # Use the same CI-owned revision as sf, with ordinary cache reuse.
+          # Keep native plugin APIs isolated from the training environment.
+          sglang_requirement="sglang @ git+https://github.com/sgl-project/sglang.git@c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0#subdirectory=python"
           uv pip install --python sf-capture/bin/python wheel setuptools setuptools-rust setuptools-scm
           uv pip install --python sf-capture/bin/python torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
           uv pip install --python sf-capture/bin/python --no-build-isolation --prerelease=allow \
-            "sglang @ git+https://github.com/sgl-project/sglang.git@${SGLANG_COMMIT}#subdirectory=python" mooncake-transfer-engine-cuda13
+            "$sglang_requirement" mooncake-transfer-engine-cuda13
           uv pip install --python sf-capture/bin/python --no-deps plugins/sglang-spec-capture
           sf-capture/bin/python -c 'from sglang.srt.model_executor.forward_observer import ForwardObserver; from sglang.srt.managers.deferred_output import ResponseCompletion'
 

@@ -6,13 +6,13 @@ build-backend = "setuptools.build_meta"
 name = "specforge"
 dynamic = ["version"]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 description = "SpecForge: Speculative Decoding Training Framework"
 authors = [{name = "SGLang Team"}]
 urls = {Homepage = "https://github.com/sgl-project/SpecForge"}
 dependencies = [
-    "torch==2.14.1+xpu",
-    "transformers==5.19.0",
+    "torch==2.13.0+xpu",
+    "transformers==5.12.1",
     "datasets",
     "tqdm",
     "accelerate",
@@ -24,7 +24,7 @@ dependencies = [
     "psutil",
     "pyyaml",
     "safetensors",
-    # Install an XPU-compatible SGLang main build and the capture plugin separately.
+    #"sglang==0.5.18", # commented due to CUDA dependencies
     "requests",
     "tensorboard",
     "typing-extensions",

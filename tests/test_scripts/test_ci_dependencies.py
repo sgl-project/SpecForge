@@ -228,36 +228,6 @@ class CIDependencyTest(unittest.TestCase):
         self.assertNotIn("flash-attn", self.steps["Install dependencies"]["run"])
         self.assertNotIn("/github/home/sf", self.steps["Restore cache"]["run"])
 
-    def test_both_environments_install_ci_pin_without_package_manifest(self):
-        self.env["SGLANG_COMMIT"] = self.job["env"]["SGLANG_COMMIT"]
-        uv = self.bin / "uv"
-        uv.write_text(
-            f"#!{sys.executable}\n"
-            "import json, os, sys\n"
-            "from pathlib import Path\n"
-            "with (Path(os.environ['TEST_ROOT']) / 'calls').open('a') as log:\n"
-            "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-        )
-        uv.chmod(0o755)
-        for environment in ("sf", "sf-capture"):
-            bin_dir = self.root / environment / "bin"
-            bin_dir.mkdir(parents=True)
-            (bin_dir / "activate").touch()
-            # Stub only the capture environment's post-install import check.
-            python = bin_dir / "python"
-            python.write_text("#!/bin/sh\nexit 0\n")
-            python.chmod(0o755)
-        self.run_step("Install dependencies")
-        self.run_step("Install pinned plugin capture environment")
-        requirement = (
-            "sglang @ git+https://github.com/sgl-project/sglang.git@"
-            f"{self.env['SGLANG_COMMIT']}#subdirectory=python"
-        )
-        installs = [args for args in self.calls() if requirement in args]
-        self.assertEqual(len(installs), 2)
-        self.assertIn(".", installs[0])
-        self.assertIn("sf-capture/bin/python", installs[1])
-
 
 if __name__ == "__main__":
     unittest.main()

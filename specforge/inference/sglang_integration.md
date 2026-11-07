@@ -5,7 +5,7 @@
 Online capture uses [specforge-sglang-capture](../../plugins/sglang-spec-capture/README.md).
 Install it in an SGLang environment with native auxiliary hidden-state capture,
 `ModelRunner.forward_observer` and completion-based `Scheduler.defer_response`.
-Use the SGLang commit pinned in `pyproject.toml`; released 0.5.23 does not expose those APIs. SpecForge does not ship source
+Use SGLang commit `c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`; released 0.5.23 does not expose those APIs. SpecForge does not ship source
 patches or fall back to patched servers.
 
 The launcher accepts `server_capture: auto` or `plugin`. Managed-local `auto`
