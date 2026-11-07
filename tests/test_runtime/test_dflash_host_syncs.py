@@ -21,6 +21,7 @@ from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import (
     DFlashTrainStrategy,
     DominoTrainStrategy,
+    DraftTrainStrategy,
     DSparkTrainStrategy,
     StepContext,
     StepOutput,
@@ -28,9 +29,17 @@ from specforge.training.strategies.base import (
 
 CUDA = torch.cuda.is_available()
 _CTX = StepContext(global_step=5, total_steps=100, collect_detailed_metrics=False)
+_TINY_MOE = {
+    "moe_preset": "qwen3_5_moe",
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 48,
+    "norm_topk_prob": False,
+}
 
 
-def _tiny_dflash2(attention_backend, *, sliding):
+def _tiny_dflash2(attention_backend, *, sliding, moe=False):
     from transformers import Qwen3Config
 
     from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
@@ -61,6 +70,10 @@ def _tiny_dflash2(attention_backend, *, sliding):
         },
     )
     config._attn_implementation = attention_backend
+    if moe:  # the MoE FFN, with the router knobs the DSpark MoE recipe trains
+        config.update(_TINY_MOE)
+        config.dflash_config["moe_router_selection_bias"] = True
+        config.dflash_config["moe_router_aux_loss_type"] = "batch_wise"
     device = torch.device("cuda")
     draft = DFlash2DraftModel(config).to(device, torch.bfloat16)
     return OnlineDFlashModel(
@@ -177,9 +190,15 @@ class TestHostAnchorSizing(unittest.TestCase):
 @unittest.skipUnless(CUDA, "requires CUDA")
 class TestDFlashMicroStepSyncs(unittest.TestCase):
     def test_micro_step_is_sync_free_with_host_loss_mask(self):
-        for backend, sliding in (("sdpa", False), ("flex_attention", True)):
-            with self.subTest(backend=backend, sliding=sliding):
-                strategy = DFlashTrainStrategy(_tiny_dflash2(backend, sliding=sliding))
+        for backend, sliding, moe in (
+            ("sdpa", False, False),
+            ("flex_attention", True, False),
+            ("sdpa", False, True),  # the MoE router's counts must stay on device
+        ):
+            with self.subTest(backend=backend, sliding=sliding, moe=moe):
+                strategy = DFlashTrainStrategy(
+                    _tiny_dflash2(backend, sliding=sliding, moe=moe)
+                )
                 for _ in range(2):  # compile / allocator warm-up
                     _micro_step(strategy, _batch("cpu"))
                 batch = _batch("cpu")
@@ -262,10 +281,11 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
             torch.cuda.set_sync_debug_mode("default")
 
 
-class _WeightedStrategy:
+class _WeightedStrategy(DraftTrainStrategy):
     """Scalar-loss strategy with ``loss_terms`` and a host schedule metric."""
 
     name = "weighted"
+    required_features = {"x"}
 
     def __init__(self, model, denominator):
         self.model = model
