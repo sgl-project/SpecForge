@@ -362,13 +362,13 @@ specforge/
 │       ├── hf_config.py              # SpecForgeDraftConfig(PreTrainedConfig): model.config, holding DraftConfig as draft
 │       ├── base.py                   # DraftPreTrainedModel, depending only on PreTrainedModel; _supports_attention_backend = False
 │       ├── build.py                  # build_draft_model(config)
-│       ├── backbone.py               # DraftBackbone: decoder layers from layer_types, final norm, rotary
+│       ├── backbone.py               # DraftBackbone: sequential/per-layer execution, final norm, rotary
 │       ├── registry.py               # Architecture name -> model class of the same name
 │       ├── models/
 │       │   ├── eagle3.py  peagle.py  dflash.py  dflash2.py
-│       │   ├── dspark.py  domino.py  dspine.py
+│       │   ├── dspark.py  domino.py  dmtp.py  dspine.py
 │       │   └── native/               # Specialized native architectures such as Qwen3.5 MTP
-│       ├── heads/                    # Selector, Markov, confidence, GRU, and injection heads
+│       ├── heads/                    # Selector, Markov, confidence, GRU, and inter-layer injection modules
 │       └── layers/
 │           ├── decoder.py            # DecoderLayer: wiring from a decoder layer node
 │           ├── registry.py           # (kind, type) -> builder
@@ -400,6 +400,10 @@ specforge/
 ```
 
 Dependencies point one way. `modeling` depends only on `config.draft` and performs no file I/O. `checkpoint` depends on `config.draft` and `modeling`, `loading` depends on `checkpoint` and `modeling`, `algorithms` depends on `modeling`, and `training` uses `loading` and `algorithms`. The existing `specforge.modeling.auto` entry point stays only as a façade that imports `loading` inside its functions, and it is removed once callers move. Configuration classes do not import model implementations, download weights, or start training. Model components do not depend on checkpoint or export workflows. The design document (Section 9) lists the rules and the tests that enforce them.
+
+Models own their execution order. DFlash, DFlash2, and DMTP use the backbone's sequential forward; DSpine uses its per-layer execution and finalization interfaces to interleave injection and collect typed intermediate outputs. Both paths reuse the same decoder modules and common execution mechanisms. The [design document, Section 1.3](design-eng.md#13-module-interfaces) defines the boundary and shows example forwards.
+
+DMTP's trainable input fusion and DSpine's injection parameters belong to the draft model and are saved with its weights. Frozen MTP feature production stays in the feature provider, input preparation aligns features and tokens, and objectives own supervision and replacement schedules. Serving owns candidate sampling, verification, and cache updates. Training and serving call the same learned model computations and use the spec's token-alignment and block-count rules; the backbone receives neither training schedules nor algorithm-specific callbacks.
 
 ### 5.1 Registries
 

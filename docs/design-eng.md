@@ -29,11 +29,11 @@ When replacing a model-family base class, take explicit ownership of initializat
 | Components (`layers/`) | Attention, MLP / MoE, sublayer convolution, residual streams, normalization | One component node each |
 | Target-family modules (`layers/target/`) | The target model family's own attention, MLP, or decoder-layer implementation | One `target` node (Section 7.2) |
 | `DecoderLayer` | Wiring of one `decoder` layer: norms, residual connections, optional sublayer convolution | One `layer_configs` entry of type `decoder` |
-| `DraftBackbone` | Stack of decoder layers, final norm, rotary embedding | `layer_types` and model-level fields |
-| Heads (`heads/`) | Algorithm outputs such as the DFlash2 selector, the DSpark Markov and confidence heads, the Domino GRU, and DSpine injection | `spec_config` |
-| Algorithm model (`models/<algorithm>.py`) | Target-feature fusion, input and output layout, assembly of the backbone and heads | The whole `DraftConfig` |
+| `DraftBackbone` | Decoder layers, final norm, rotary embedding; sequential and per-layer execution | `layer_types` and model-level fields |
+| Heads (`heads/`) | Auxiliary computations such as the DFlash2 selector, the DSpark Markov and confidence heads, the Domino GRU, and inter-layer DSpine injection | `spec_config` |
+| Algorithm model (`models/<algorithm>.py`) | Input fusion, execution order, typed inputs and outputs, assembly of the backbone and heads | The whole `DraftConfig` |
 
-An algorithm model is a composition of input fusion, `DraftBackbone`, and heads. No algorithm model inherits from another algorithm model, and base classes carry no hooks for a particular algorithm's heads. Training objectives and serving-time verification scheduling belong to algorithms, not to the model base class.
+An algorithm model is a composition of input fusion, `DraftBackbone`, and heads. It may call the backbone's sequential forward or own the layer loop; component reuse does not require a shared forward loop. No algorithm model inherits from another algorithm model, and base classes carry no hooks for a particular algorithm's heads. Training objectives and serving-time verification scheduling belong to algorithms, not to the model base class.
 
 Specialized architectures, such as a native MTP draft or a vendor draft with fixed connections, implement those connections explicitly and reuse common components. They use the components their configuration declares rather than silently substituting fixed implementations. Do not introduce a specialized class when the general composition represents the native structure accurately.
 
@@ -51,6 +51,57 @@ DecoderLayer(attention: nn.Module, mlp: nn.Module, *, hidden_size: int,
 Components never receive the whole `DraftConfig`, `spec_config`, or a model-family configuration such as `Qwen3Config`. HF modules receive the whole configuration and read whatever fields they need, for example `config.layer_types[layer_idx]` inside an attention module. This design deliberately does not copy that pattern, because it is what couples components to each other and to the model.
 
 Target-family modules follow the same rule. Their builder receives the `target` node and model-level dimensions and constructs the family's configuration object internally (Section 7.2).
+
+#### Execution ownership
+
+`DraftBackbone.forward` runs the layers in order and applies final normalization. `run_layer` executes one layer through the same module-call and gradient-checkpointing path; `finalize` owns final normalization and any supported residual-stream reduction. Residual-stream expansion and per-layer RoPE preparation are shared by both execution paths. Layer inputs carry the required context tensors, masks, and positions or RoPE inputs, not an algorithm spec or training settings. The backbone contains no architecture-name branches or algorithm callbacks.
+
+| Architecture | Model-owned computation | Backbone execution |
+|---|---|---|
+| DFlash | Target-feature fusion | Sequential forward |
+| DFlash2 | Target-feature fusion and candidate selector; convolution stays inside each decoder layer | Sequential forward |
+| DMTP | Fuse the first candidate's embedding with aligned, frozen MTP features | Sequential forward |
+| DSpine | Interleave decoder layers and injection; collect intermediate features | Per-layer execution, then finalization |
+
+```mermaid
+flowchart LR
+    subgraph DMTP
+        M["Frozen MTP features + T1 embedding"] --> F["Trainable input fusion"]
+        F --> B["Sequential decoder layers"] --> N["Final norm"]
+    end
+    subgraph DSpine
+        L0["Layer 0"] --> I0["Injection 0"] --> L1["Layer 1 …"]
+        L1 --> P["Last pre-injection state"] --> I1["Last injection"] --> N1["Final norm"]
+        I0 -.-> R["Per-layer readouts"]
+        I1 -.-> R
+    end
+```
+
+DMTP's trainable fusion belongs to the model and is called by its forward in both training and serving. The feature provider runs the frozen MTP; training supplies the first candidate from data, while serving obtains it from MTP prediction. Input preparation aligns tokens and teacher features, the objective chooses supervised positions, and serving owns candidate sampling, verification, and cache updates. None of these policies is implemented by the backbone.
+
+DSpine owns one injection module containing per-layer readout/write parameters and shared message/gating parameters. Its forward controls when injection runs; `heads/` does not imply execution only after the backbone. Illustrative forwards, with block reshaping and shared input preparation omitted:
+
+```python
+# DMTP model: learned input construction is part of forward.
+first = self.mtp_fusion(first_token_embedding, mtp_hidden)
+x = assemble_slots(first, masked_suffix_embeddings)
+hidden = self.backbone(x, layer_inputs)
+
+# DSpine model: the architecture owns the inter-layer computation.
+features = []
+for i in range(len(self.backbone.layers)):
+    x = self.backbone.run_layer(i, x, layer_inputs[i])
+    pre_injection = x
+    x = self.injection(x, i, token_ids, self.transfer_codes, replace_mask)
+    features.append(self.injection.feature(x, i))
+output = DSpineOutput(
+    hidden_states=self.backbone.finalize(x),
+    pre_injection=pre_injection,
+    layer_features=torch.stack(features),
+)
+```
+
+`DSpineOutput` preserves the final pre-injection, pre-normalization state and the post-injection readouts with their gradients. Refinement reuses the same final-layer injection parameters and final normalization. Training computes replacement schedules and samples `replace_mask` before calling the model; the model receives the mask, not the training step or schedule. An injection module's residual-stream requirements are validated before construction; support for a single hidden stream does not imply support for mHC streams.
 
 ### 1.4 Algorithm contracts
 
@@ -105,13 +156,14 @@ Validation has two levels. Each node validates its own fields and rejects unknow
 
 ### 2.3 Algorithm parameters
 
-`spec_config` holds what lies outside the decoder stack: the block or step protocol, target feature layers, the mask token, input fusion, and algorithm heads. The draft architecture selects its schema (see the usage guide). Fields are valid only for their algorithm; there is no untyped `params` dictionary.
+`spec_config` holds the algorithm protocol and computations around or between decoder layers: the block or step protocol, target feature layers, the mask token, input fusion, and algorithm heads. The draft architecture selects its schema (see the usage guide). Fields are valid only for their algorithm; there is no untyped `params` dictionary.
 
 | Algorithm | Examples |
 |---|---|
 | EAGLE3 / P-EAGLE | Auxiliary target layers, draft vocabulary mapping, fusion normalization |
 | DFlash | `block_size`, `mask_token_id`, `target_layer_ids` |
 | DFlash2 | DFlash parameters, selector rank and top-k, output multiplier, final logit softcap |
+| DMTP | Block protocol, MTP feature alignment and width, first-candidate input fusion |
 | DSpark | Block and feature parameters, Markov head, confidence head |
 | Domino | Block and feature parameters, GRU head |
 | DSpine | Block and feature parameters, injection and transfer settings |
@@ -130,6 +182,8 @@ Each algorithm keeps its own block convention:
 | DSpark | `block_size = 7` | 7 | 8 |
 
 Consumers never interpret `block_size` themselves. Each algorithm spec exposes the derived quantities, such as `num_draft_tokens`, `verify_window`, and the query layout. Training, data dispatch, export, and serving read those. The spec node owns these formulas, and SGLang vendors the same torch-free `config.draft` package, so both use one derivation (Section 8). EAGLE expansion steps are serving settings, not model structure.
+
+The protocol also distinguishes model slots, positions predicted by the draft, and candidates supplied by another predictor. For example, DMTP with seven slots `[T1, MASK, ..., MASK]` predicts T2–T7 in the draft, receives T1 from MTP at serving time, and verifies `[A, T1, ..., T7]`, a window of eight. Token alignment and these counts come from the spec; training and serving do not infer them independently.
 
 ## 3. Examples
 
@@ -524,6 +578,7 @@ No single registry links configuration, models, training protocols, and adapters
 | `config.draft` loads neither torch nor transformers | Import it in a subprocess and inspect `sys.modules` |
 | Package dependencies follow Section 9.1 | Scan imports with `ast` |
 | Components receive only their own node and explicit dimensions | Inspect the constructor signatures of registered components |
+| Shared components support model-owned execution | With the same layers and inputs, sequential and manual per-layer backbone execution agree; DMTP fusion and DSpine intermediate outputs, refinement, and gradients remain unchanged with checkpointing enabled |
 | No algorithm class inherits from another algorithm's class | For every registered spec, model, and objective class, check that its MRO contains no other registered algorithm class |
 | Encoding is lossless | `parse(encode(c)) == c`, and `encode(parse(j)) == j` for canonical fixtures |
 | No scattered defaults or raw formats | `dflash_config`, `eagle_config`, and similar keys appear only under `config/draft/codec/` and `checkpoint/formats/`, and no code calls `getattr(config, name, default)` on configuration objects |
