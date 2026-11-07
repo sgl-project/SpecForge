@@ -59,6 +59,16 @@ class TemplateRegistryTest(unittest.TestCase):
         self.assertIsNone(template.enable_thinking)
         self.assertEqual(template.ignore_token, ["<|end_of_msg|>"])
 
+    def test_minimax_m3_template_matches_target_contract(self):
+        template = TEMPLATE_REGISTRY.get("minimax-m3")
+        self.assertEqual(template.assistant_header, "]~b]ai\n")
+        self.assertEqual(template.user_header, "]~b]user\n")
+        self.assertIsNone(template.system_prompt)
+        self.assertEqual(template.end_of_turn_token, "[e~[\n")
+        self.assertEqual(template.parser_type, "thinking")
+        self.assertFalse(template.enable_thinking)
+        self.assertEqual(template.ignore_token, ["[e~["])
+
 
 if __name__ == "__main__":
     unittest.main()

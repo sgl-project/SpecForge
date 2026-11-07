@@ -273,6 +273,23 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# MiniMax-M3 renders every assistant turn as `]~b]ai\n`. The header stops
+# there: under adaptive thinking the model emits `<mm:think>` itself, so that
+# opener stays inside the loss. system_prompt is None because the tokenizer
+# template already emits the system preamble.
+TEMPLATE_REGISTRY.register(
+    name="minimax-m3",
+    template=ChatTemplate(
+        assistant_header="]~b]ai\n",
+        user_header="]~b]user\n",
+        system_prompt=None,
+        end_of_turn_token="[e~[\n",
+        parser_type="thinking",
+        enable_thinking=False,
+        ignore_token=["[e~["],
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="deepseek-v3",
     template=ChatTemplate(
