@@ -473,6 +473,7 @@ Section 9.3 lists the tests that enforce these rules.
 The [usage guide](config_usage_graph-eng.md#5-code-organization) shows the full tree. The model side follows these conventions:
 
 - `specforge/config/draft/` holds the frozen configuration nodes, the codec, and cross-node validation. It imports neither torch nor transformers, so SGLang can vendor the codec.
+- `specforge/config/draft/presets/` holds named, composed draft configurations. Its `native/` subdirectory holds configurations matching a target model's native draft structure. A preset expands into the full frozen configuration before model construction; checkpoints persist the expanded configuration and never resolve a preset name on reload. Presets do not implement forward computation, load weights, or select training objectives.
 - `specforge/modeling/draft/layers/` holds the components. It is a sibling of `models/` because general and specialized models both use it.
 - `specforge/modeling/draft/heads/` holds algorithm heads, and `backbone.py` holds `DraftBackbone`.
 - `specforge/modeling/draft/models/` holds algorithm models, with `models/native/` for specialized native architectures.
@@ -502,6 +503,7 @@ cli -> training -> loading -> checkpoint -> modeling -> config.draft
 
 Each package owns its registry:
 
+- `config.draft.presets` maps preset names to concrete configurations. Presets select registered types and supply their parameters; adding a preset using existing types requires no new model registration. Preset names are resolved before configuration validation and are not required to reload checkpoints.
 - `config.draft` maps architecture names to specs.
 - `modeling` maps architecture names to model classes. Each class is named after its architecture.
 - `checkpoint.formats` maps architecture names to converters.
