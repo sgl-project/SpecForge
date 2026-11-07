@@ -96,11 +96,20 @@ class TestDominoLambdaSchedule(unittest.TestCase):
 @unittest.skipUnless(CUDA, "Domino offline launcher path requires CUDA")
 class TestDominoOfflineLaunch(unittest.TestCase):
     def test_domino_trains_from_precomputed_dflash_features(self):
+        self._check_backend("fsdp")
+
+    def test_fsdp2_trains_through_the_same_launcher(self):
+        self._check_backend("fsdp2")
+
+    def _check_backend(self, training_backend):
         from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port="29571")
 
+        from torch.distributed.fsdp import FSDPModule
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        expected_wrapper = FSDPModule if training_backend == "fsdp2" else FSDP
 
         from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
@@ -137,6 +146,7 @@ class TestDominoOfflineLaunch(unittest.TestCase):
             draft_model=model,
             target_head=None,
             optimizer_factory=optimizer_factory,
+            training_backend=training_backend,
             run_id="domino-offline",
             output_dir=os.path.join(workdir, "out"),
             max_len=sequence_length,
@@ -148,7 +158,7 @@ class TestDominoOfflineLaunch(unittest.TestCase):
         )
 
         module = trainer.core.strategy.trainable_module()
-        self.assertIsInstance(module, FSDP)
+        self.assertIsInstance(module, expected_wrapper)
         self.assertEqual(trainer.fit(), 2)
         self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 
