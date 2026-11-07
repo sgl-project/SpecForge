@@ -83,19 +83,15 @@ class CIDependencyTest(unittest.TestCase):
                 root = Path(os.environ["TEST_ROOT"])
                 modules = root / "modules"
                 cache = Path(os.environ["UV_CACHE_DIR"])
+                version = os.environ["FLASH_ATTN_VERSION"]
                 with (root / "calls").open("a") as log:
-                    log.write(json.dumps({"args": sys.argv[1:], "cache": str(cache),
-                              "force": os.environ.get("FLASH_ATTENTION_FORCE_BUILD")}) + "\\n")
+                    log.write(json.dumps({"args": sys.argv[1:], "cache": str(cache)}) + "\\n")
                 if sys.argv[2] == "uninstall":
                     for entry in modules.glob("flash_attn-*.dist-info"):
                         shutil.rmtree(entry)
                 else:
-                    if os.environ.get("TEST_INSTALL_FAIL"):
-                        sys.exit(1)
-                    cache.mkdir(parents=True, exist_ok=True)
-                    version = os.environ["FLASH_ATTN_VERSION"]
                     metadata = modules / f"flash_attn-{version}.dist-info"
-                    metadata.mkdir()
+                    metadata.mkdir(exist_ok=True)
                     (metadata / "METADATA").write_text(
                         f"Name: flash-attn\\nVersion: {version}\\n")
                     if not os.environ.get("TEST_ABI_FAIL"):
@@ -104,6 +100,46 @@ class CIDependencyTest(unittest.TestCase):
             )
         )
         uv.chmod(0o755)
+        # curl serves the PyPI JSON and an sdist tarball whose setup.py builds a
+        # real (trivial) wheel once the CI script patches its -std flag.
+        curl = self.bin / "curl"
+        curl.write_text(
+            f"#!{sys.executable}\n"
+            + textwrap.dedent(
+                """\
+                import io
+                import json
+                import os
+                import sys
+                import tarfile
+
+                args = sys.argv[1:]
+                if "-o" not in args:
+                    print(json.dumps({"urls": [{
+                        "packagetype": "sdist",
+                        "url": "https://files.example.invalid/flash_attn.tar.gz",
+                    }]}))
+                    sys.exit(0)
+                out = args[args.index("-o") + 1]
+                version = os.environ["FLASH_ATTN_VERSION"]
+                payload = (
+                    "import os, sys\\n"
+                    "# flags: -std=c++17\\n"
+                    "if os.environ.get('TEST_INSTALL_FAIL'):\\n"
+                    "    sys.exit(1)\\n"
+                    "src = open(__file__).read()\\n"
+                    "assert '-std=' + 'c++17' not in src, \\"setup.py not patched\\"\\n"
+                    "from setuptools import setup\\n"
+                    "setup(name='flash-attn', version=os.environ['FLASH_ATTN_VERSION'])\\n"
+                ).encode()
+                with tarfile.open(out, "w:gz") as tar:
+                    info = tarfile.TarInfo(f"flash_attn-{version}/setup.py")
+                    info.size = len(payload)
+                    tar.addfile(info, io.BytesIO(payload))
+                """
+            )
+        )
+        curl.chmod(0o755)
 
     def run_fa(self, success=True):
         result = subprocess.run(
@@ -165,11 +201,9 @@ class CIDependencyTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0]["args"], ["pip", "uninstall", "flash-attn"])
         install = calls[1]
-        self.assertEqual(install["force"], "TRUE")
-        for flag in ("--no-deps", "--no-build-isolation", "--no-binary"):
-            self.assertIn(flag, install["args"])
-        for flag in ("--no-cache", "--reinstall-package", "--refresh"):
-            self.assertNotIn(flag, install["args"])
+        self.assertEqual(install["args"][:2], ["pip", "install"])
+        self.assertTrue(install["args"][-1].endswith(".whl"))
+        self.assertIn("--no-deps", install["args"])
         self.run_fa()
         self.assertEqual(self.calls(), calls)
 
