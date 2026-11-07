@@ -946,6 +946,37 @@ class TestBestTracking(unittest.TestCase):
             self.assertAlmostEqual(meta["score"], 0.5, places=6)
 
 
+class TestEpochPinSteps(unittest.TestCase):
+    def test_epoch_pin_step_saves_pinned_checkpoint_that_survives_rotation(self):
+        # The online disaggregated consumer is epoch-agnostic (continuous stream,
+        # num_epochs=1), so it never reaches the epoch-exhaustion save. It instead
+        # passes precomputed epoch-boundary steps as epoch_pin_steps; each must
+        # produce a rotation-exempt (pinned) checkpoint at exactly that step.
+        strat = FakeStrategy()
+        backend = FakeBackend(strat.model)
+        core = TrainerCore(strat, backend, accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core,
+                run_id="r",
+                output_dir=d,
+                num_epochs=1,
+                max_steps=5,
+                save_interval=1,
+                epoch_pin_steps=[2],
+                checkpoint_manager=CheckpointManager(d, "r", max_checkpoints=2),
+            )
+            ctrl.fit([_batch() for _ in range(5)])
+            # rolling keeps the newest 2 (4, 5); step 2 is pinned so it survives
+            # while the unpinned 1 and 3 rotate out.
+            self.assertTrue(os.path.isdir(os.path.join(d, "r-step2")))
+            self.assertTrue(os.path.isdir(os.path.join(d, "r-step4")))
+            self.assertTrue(os.path.isdir(os.path.join(d, "r-step5")))
+            self.assertFalse(os.path.isdir(os.path.join(d, "r-step1")))
+            self.assertFalse(os.path.isdir(os.path.join(d, "r-step3")))
+            self.assertEqual(ctrl._checkpoint_manager()._pinned_steps, {2})
+
+
 class TestEvalMetricsFlow(unittest.TestCase):
     def test_eval_metrics_reach_logger_and_last_metrics(self):
         strat = FakeStrategy()
