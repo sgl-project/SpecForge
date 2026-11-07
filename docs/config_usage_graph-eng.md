@@ -102,12 +102,12 @@ Providing only a target path does not trigger native draft loading: training fro
 | `schema_version` | Version of the canonical layout | Written by the codec |
 | Model-level fields | `hidden_size`, `vocab_size`, `draft_vocab_size`, `rms_norm_eps`, `max_position_embeddings`, default `rope_parameters` | YAML or checkpoint |
 | `attention_configs`, `mlp_configs`, `conv_configs` | Named component definitions, each with a `type` and that type's parameters | YAML or checkpoint |
-| `layer_configs` | Named layer definitions, each with a `type`; `decoder` layers reference components | YAML or checkpoint |
+| `layer_configs` | Named `LayerSpec` definitions referencing attention, MLP, and optional convolution; no layer-level `type` | YAML or checkpoint |
 | `layer_types` | The layer definition used by each decoder layer | YAML or checkpoint |
 | `num_hidden_layers` | Equal to `len(layer_types)`; kept for HF tooling | Written by the codec and verified on read |
 | `residual_config` | Model-level residual-stream type and parameters | YAML or checkpoint |
 | `spec_config` | Algorithm protocol, target feature layers, mask token, input fusion, and heads | YAML or checkpoint |
-| `target_bindings` | Draft modules that are the target's own modules: frozen, not saved with the draft, and supplied by the target at serving time | YAML or checkpoint; derived from the target configuration when the draft is created from a target |
+| `target_bindings` | Draft modules using the target's weights: frozen, not saved with the draft, and supplied by the target at serving time | YAML or checkpoint; derived from the target configuration when the draft is created from a target |
 | `extensions` | Loading prerequisite, not part of `DraftConfig`: the extensions whose kinds the configuration uses, read before decoding | Written by the codec from the kinds the configuration uses and verified on read; listed in YAML when training from scratch with extension kinds |
 | HF metadata | `auto_map`, `transformers_version`, `dtype`, and similar fields that Transformers writes; not part of `DraftConfig` | Written by Transformers and the HF exporter |
 | Artifact metadata | Format, weight layout, and converter version of a written directory; not part of `DraftConfig` | Written by `checkpoint` and the exporters |
@@ -171,7 +171,7 @@ The shorthand exists only in YAML, and it cannot be mixed with named definitions
     "default": {"type": "dense", "intermediate_size": 14336, "hidden_act": "silu"}
   },
   "layer_configs": {
-    "default": {"type": "decoder", "attention": "default", "mlp": "default"}
+    "default": {"attention": "default", "mlp": "default"}
   },
   "layer_types": ["default", "default", "default", "default"],
   "residual_config": {"type": "standard"},
@@ -189,32 +189,31 @@ With named definitions, the YAML gives `layer_types`, and `num_hidden_layers`, i
 
 Structural fields have no defaults. A value that can be derived from the target is derived only by a documented rule with the target configuration as an explicit input, and the result is saved. Examples are `target_layer_ids` from the target layer count and the target module paths in `target_bindings`. `draft_vocab_size` equals `vocab_size` unless a draft vocabulary mapping is configured. Non-structural values with documented defaults, such as `initializer_range`, are written into the saved file, so the file is complete without SpecForge's defaults. Keep `initialization` and training hyperparameters outside the model configuration. Training YAML contains no export configuration.
 
-A registered preset can supply the YAML draft structure in place of inline fields or a configuration file. Resolve its name to the complete configuration before codec validation, then apply the same source-selection rules as for inline structure (Section 1). Checkpoints save the expanded configuration; reloading them never looks up the preset. A native preset describes a target's native draft structure, but selecting it does not load target weights or choose a training objective. Weight loading and objective selection remain separate.
+A preset is a YAML configuration file under `config/draft/presets/`, referenced through `draft` like any user configuration file. File names and directories do not select implementations; only configuration contents do. Presets require no registration. Checkpoints save the expanded configuration and do not depend on the source file. A native preset describes a target's native draft structure, but selecting it does not load target weights or choose a training objective. Weight loading and objective selection remain separate.
 
 ### 2.3 Drafts built from parts of the target
 
-A draft can reuse its target in three ways (design document, Section 7):
+A draft is assembled from SpecForge components and can reuse target weights in two ways (design document, Section 7):
 
-- **Implementation.** A `target` node builds an attention, MLP, or decoder layer with the target family's own code.
 - **Copy.** `initialization.from_target` in training YAML copies target parameters into draft parameters before training. The copies are trained and saved with the draft.
-- **Binding.** `target_bindings` in the draft structure makes a draft module the target's module. Bound modules are frozen, are not saved with the draft, and are supplied by the target at serving time.
+- **Binding.** `target_bindings` in the draft structure binds a draft module to the target's weights. Bound modules are frozen, are not saved with the draft, and are supplied by the target at serving time.
 
-For example, an MTP-style draft can use the target family's decoder layer and start from a copy of the target's last layer. The architecture name is illustrative:
+For example, an MTP-style draft can use the same structure as a target decoder layer and start from a copy of the target's last layer. The architecture name is illustrative:
 
 ```yaml
 draft:
   architectures: [SpecForgeMTP]
   layer_configs:
-    mtp: {type: target, family: qwen3, module: decoder_layer, config: from_target}
+    mtp: {attention: mtp, mlp: mtp}
   layer_types: [mtp]
-  # Model-level fields and spec_config omitted.
+  # Component definitions, model-level fields, and spec_config omitted.
 
 initialization:
   from_target:
     layers.0: model.layers.35  # Copy the target's last decoder layer, then train it.
 ```
 
-`config: from_target` asks the codec to fill the fragment from the target configuration, and the saved configuration contains the concrete fields. The codec also derives the `target_bindings` for the embeddings and LM head. The weight-loading plan checks that every copied or bound pair has identical structure before loading.
+The weight-loading plan checks computational compatibility, parameter mappings, and shapes before loading. It does not instantiate target-family modules.
 
 ## 3. Importing External Configurations
 
@@ -251,7 +250,7 @@ Example conversion for an external DFlash2 checkpoint in the legacy layout:
 
 The legacy codec owns these field mappings. The adapter detects the format, calls the codec for the configuration, and owns the weight mapping.
 
-A native target's `architectures` usually describes the entire language model. The native adapter uses it to identify the source implementation, then produces a draft architecture name. It never builds the whole draft from the target model class or reuses the target layer count as the draft layer count; individual modules can still use the target family's implementation through `target` nodes. Its output can include `target_bindings`, for example when a native draft shares the target's embeddings and LM head.
+A native target's `architectures` usually describes the entire language model. The native adapter uses it to identify the source implementation, then produces a draft architecture name. It builds the draft from SpecForge components, not the target model class, and never reuses the target layer count as the draft layer count. Its output can include `target_bindings`, for example when a native draft shares the target's embeddings and LM head.
 
 ## 4. Exporting to HF and SGLang
 
@@ -340,17 +339,16 @@ specforge/
 │   ├── training.py                   # Training, objective, initialization, and resume settings; no structural fields
 │   └── draft/                        # Frozen configuration nodes; imports neither torch nor transformers
 │       ├── model.py                  # DraftConfig: model-level fields, component groups, layer_types, residual, spec
-│       ├── presets/                  # Named, composed configurations; expanded before validation
+│       ├── presets/                  # Maintained YAML configurations; loaded like user files
 │       │   └── native/               # Configurations matching native target draft structures
 │       ├── attention.py              # GQA, MLA, DSA, QSA, and KDA nodes, dispatched by type
 │       ├── mlp.py                    # Dense and MoE nodes
 │       ├── conv.py                   # Sublayer convolution nodes
-│       ├── layer.py                  # Layer nodes: decoder (references only) and other registered types
+│       ├── layer.py                  # LayerSpec: fixed schema of component references
 │       ├── residual.py               # Standard, GR, and mHC nodes
-│       ├── target/                   # Fragment schemas for target-family modules, one file per family
 │       ├── spec/                     # One algorithm spec per file, owning its derivations; composed, never inherited
 │       ├── validate.py               # Cross-node validation and algorithm contracts
-│       ├── registry.py               # Architecture name -> spec class; component and layer schemas
+│       ├── registry.py               # Architecture name -> spec class; component schemas
 │       ├── extensions.py             # Reads `extensions` before decoding; loads them via the specforge.extensions entry points
 │       └── codec/
 │           ├── v1.py                 # Canonical schema v1 <-> DraftConfig; strict
@@ -366,8 +364,7 @@ specforge/
 │       ├── registry.py               # Architecture name -> model class of the same name
 │       ├── models/
 │       │   ├── eagle3.py  peagle.py  dflash.py  dflash2.py
-│       │   ├── dspark.py  domino.py  dmtp.py  dspine.py
-│       │   └── native/               # Specialized native architectures such as Qwen3.5 MTP
+│       │   └── dspark.py  domino.py  dmtp.py  dspine.py
 │       ├── heads/                    # Selector, Markov, confidence, GRU, and inter-layer injection modules
 │       └── layers/
 │           ├── decoder.py            # DecoderLayer: wiring from a decoder layer node
@@ -379,8 +376,7 @@ specforge/
 │           │   └── parallel/         # ring.py
 │           ├── mlp/                  # dense.py  moe.py
 │           ├── conv/                 # grouped_causal.py
-│           ├── residual/             # standard.py  gr.py  mhc.py
-│           └── target/               # Target-family builders; family config classes are constructed only here
+│           └── residual/             # standard.py  gr.py  mhc.py
 ├── algorithms/
 │   ├── registry.py                   # Objective name -> objective, its requirements, and the modules it trains; default per architecture
 │   └── <algorithm>/objective.py      # Training objective; shared pieces are functions, not base classes
@@ -411,7 +407,6 @@ Each package registers what it owns:
 
 ```python
 # Illustrative interfaces
-register_draft_preset("qwen3-8b-dflash", qwen3_8b_dflash_config)  # specforge/config/draft/presets/
 register_spec("SpecForgeDFlash2", DFlash2Spec)               # specforge/config/draft/registry.py
 register_model(SpecForgeDFlash2)                              # specforge/modeling/draft/registry.py; key = class name
 register_objective("dflash2", DFlash2Objective,               # specforge/algorithms/registry.py
@@ -419,9 +414,9 @@ register_objective("dflash2", DFlash2Objective,               # specforge/algori
 register_converter("SpecForgeDFlash2", dflash2_to_legacy)     # specforge/checkpoint/formats/sglang.py
 ```
 
-The preset registry maps names to concrete configurations, not to model implementations. Presets select registered architecture and component types and supply their parameters. Adding a preset that uses existing types requires no new model registration; a new implementation requires registration at the architecture, layer, or component level it extends. Preset definitions live under `config/draft/presets/`, with `native/` for configurations matching native draft structures.
+Presets are YAML files, not registered implementations. Presets select registered architecture and component types and supply their parameters. Adding a preset that uses existing types requires no registration; a new implementation requires registration at the architecture or component level it extends. Preset definitions live under `config/draft/presets/`, with `native/` for configurations matching native draft structures.
 
-A consistency test checks that every architecture has the entries it needs, that each model class is named after its architecture, and that each default objective is compatible. Objectives declare the model inputs and outputs they require, so a compatible objective can train another architecture without a new registration. Components, layer types, and target-family modules register schemas and builders in the same way. Extensions outside the repository call the same functions, and a configuration lists the extensions it needs in `extensions`. The unified loader contains no model-name conditionals.
+A consistency test checks that every architecture has the entries it needs, that each model class is named after its architecture, and that each default objective is compatible. Objectives declare the model inputs and outputs they require, so a compatible objective can train another architecture without a new registration. Components register schemas and builders in the same way. Extensions outside the repository call the same functions, and a configuration lists the extensions it needs in `extensions`. The unified loader contains no model-name conditionals.
 
 ### 5.2 Configuration classes
 
@@ -518,4 +513,4 @@ These are the user-visible changes compared with SpecForge main. The design docu
 ## 7. Open Questions
 
 1. **Canonical architecture names.** Canonical names are model class names (Section 2.1), and they must not collide with the names that released SGLang versions register. The affected model classes therefore need new names. The naming scheme is open; the `SpecForge` prefix in this document's examples is a placeholder.
-2. **Serving bound target layers and target-family modules.** SGLang already shares the target's embeddings and LM head with drafts. Drafts that bind target decoder layers, such as self-speculative drafts, or that build modules from `target` nodes, need SGLang support before they can be served. Until then, their export fails.
+2. **Serving bound target layers.** SGLang already shares the target's embeddings and LM head with drafts. Drafts that bind target decoder weights, such as self-speculative drafts, need compatible SGLang support before they can be served. Until then, their export fails.
