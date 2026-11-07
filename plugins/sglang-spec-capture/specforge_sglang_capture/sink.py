@@ -83,26 +83,53 @@ def arena_bytes() -> int:
     return int(capacity)
 
 
-def gpu_put_enabled() -> bool:
+def gpu_put_enabled(device: Optional[torch.device] = None) -> bool:
+    """Whether captures publish device memory instead of staging on the host.
+
+    ``device`` is the model's actual device, per the installed model runner.
+    When omitted, CUDA is assumed present if this torch build has it — the
+    historical default for callers that never learned the server device.
+    """
     protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp")
     configured = os.environ.get("SGLANG_SPEC_CAPTURE_GPU_PUT")
+    device_type = getattr(device, "type", None)
+
+    def _cuda_available() -> bool:
+        if device_type is not None and device_type != "cuda":
+            return False
+        # device.type "cuda" covers ROCm too: keep the historical backend
+        # check so ROCm stays on host publication, exactly as before the
+        # model device was taken into account.
+        return torch.version.cuda is not None and torch.cuda.is_available()
+
     if protocol == NVLINK:
         # NVLink moves device memory only; captures never stage on the host.
         if configured == "0":
             raise ValueError(
                 "SGLANG_SPEC_CAPTURE_GPU_PUT=0 conflicts with MOONCAKE_PROTOCOL=nvlink"
             )
+        if device_type is not None and device_type != "cuda":
+            raise ValueError(
+                "MOONCAKE_PROTOCOL=nvlink publishes CUDA fabric memory; the "
+                f"capture server's model device is {device_type!r}. Use host "
+                "publication (MOONCAKE_PROTOCOL=tcp/rdma, without "
+                "SGLANG_SPEC_CAPTURE_GPU_PUT=1) on this platform."
+            )
         return True
     if configured is None:
-        return (
-            protocol == "rdma"
-            and torch.version.cuda is not None
-            and torch.cuda.is_available()
-        )
+        return protocol == "rdma" and _cuda_available()
     enabled = configured == "1"
     if enabled and protocol != "rdma":
         raise ValueError(
             "SGLANG_SPEC_CAPTURE_GPU_PUT=1 requires MOONCAKE_PROTOCOL=rdma"
+        )
+    if enabled and device_type is not None and device_type != "cuda":
+        # Only a known non-CUDA runner is rejected; an explicit GPU_PUT=1 on
+        # any CUDA-type device (ROCm included) keeps its historical behavior.
+        raise ValueError(
+            "SGLANG_SPEC_CAPTURE_GPU_PUT=1 publishes CUDA device memory over "
+            f"RDMA; the capture server's model device is {device_type!r}. "
+            "Unset SGLANG_SPEC_CAPTURE_GPU_PUT to stage captures on the host."
         )
     return enabled
 
@@ -300,8 +327,17 @@ class NvlinkArena:
 class SpecCaptureSink:
     """Writes captured per-request tensors into Mooncake in SpecForge layout."""
 
-    def __init__(self, aux_layer_ids: Optional[Sequence[int]] = None) -> None:
+    def __init__(
+        self,
+        aux_layer_ids: Optional[Sequence[int]] = None,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
         self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids else None
+        # The model runner's actual device (logical index; visible-device
+        # remapping already applied). None means callers never learned it and
+        # every platform decision falls back to environment hints.
+        self.device = device
         self._store = None
         self._put_config = None
         self._nvlink: Optional[NvlinkArena] = None
@@ -310,8 +346,46 @@ class SpecCaptureSink:
         # One writer is enough: Mooncake stripes a batched transfer itself.
         # The thread only decouples that transfer from the scheduler.
         self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="spec-capture-batch-put"
+            max_workers=1,
+            thread_name_prefix="spec-capture-batch-put",
+            initializer=self._bind_worker_context,
         )
+
+    def _bind_worker_context(self) -> None:
+        """Bind the writer thread's device context before Mooncake setup.
+
+        Ascend's transport calls ``aclrtGetDevice`` during ``setup()`` and
+        fails with ``ACL_ERROR_RT_CONTEXT_NULL`` when the calling thread has
+        no device context. No-op on CUDA, where the transport lazily defaults
+        to device 0.
+        """
+        device = self.device
+        if device is None or device.type in ("cpu", "cuda"):
+            return
+        module = getattr(torch, device.type, None)  # torch.npu, via torch_npu
+        set_device = getattr(module, "set_device", None)
+        if set_device is None:
+            logger.warning(
+                "spec-capture cannot bind the sink worker to %s: torch.%s is "
+                "unavailable; Mooncake setup may fail without a device context",
+                device,
+                device.type,
+            )
+            return
+        if device.index is not None:
+            set_device(device)
+        else:
+            set_device(torch.device(device.type, 0))
+
+    def _needs_cpu_mount(self) -> bool:
+        """Ascend Mooncake rejects wildcard registration; mount CPU instead.
+
+        The installed model runner's device is authoritative; the visibility
+        variable is only a fallback for callers that never learned it.
+        """
+        if self.device is not None:
+            return self.device.type == "npu"
+        return bool(os.environ.get("ASCEND_RT_VISIBLE_DEVICES"))
 
     # -- connection ---------------------------------------------------------
     def _connect(self):
@@ -332,7 +406,7 @@ class SpecCaptureSink:
             protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp")
             # Ascend Mooncake rejects the wildcard location ("location:* is not
             # supported"); skip it in setup() and mount with location="cpu".
-            ascend_host = bool(os.environ.get("ASCEND_RT_VISIBLE_DEVICES"))
+            ascend_host = self._needs_cpu_mount()
             segment_to_mount = global_segment_size if ascend_host else 0
             if ascend_host:
                 global_segment_size = 0
@@ -504,7 +578,7 @@ class SpecCaptureSink:
 
         store = None if nvlink_enabled() else self._connect()
         timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
-        gpu_put = gpu_put_enabled()
+        gpu_put = gpu_put_enabled(self.device)
         started = time.perf_counter()
         keys: List[str] = []
         tensors: List[torch.Tensor] = []
