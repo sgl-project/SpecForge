@@ -1,7 +1,6 @@
 """DSpine causal isolation, refinement parity, and persistent transfer state."""
 
 import copy
-import math
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -96,6 +95,7 @@ def training_model(chunk_size=0, head_dim=4):
         num_anchors=4,
         attention_backend="sdpa",
         objective_chunk_blocks=chunk_size,
+        warmup_ratio=0.04,
     )
 
 
@@ -337,7 +337,7 @@ class DSpineTest(unittest.TestCase):
                     DSpineDraftModel(tiny_config(**options))
 
     def test_schedules_reach_the_paper_endpoints(self):
-        options = DSpineConfig()
+        options = DSpineConfig(alignment_warmup_steps=146)
         self.assertEqual(options.schedule(0, 600), (0, 0.5))
         self.assertEqual(options.schedule(100, 600)[1], 0.5)
         self.assertLessEqual(
@@ -346,6 +346,17 @@ class DSpineTest(unittest.TestCase):
         self.assertEqual(options.schedule(200, 600)[1], 0)
         self.assertEqual(options.schedule(146, 600)[0], 0.5)
         self.assertEqual(options.schedule(0, None)[1], 0)
+
+    def test_default_alignment_ramp_follows_the_lr_warmup(self):
+        options = DSpineConfig()
+        self.assertEqual(options.schedule(0, 600, 0.04)[0], 0)
+        self.assertEqual(options.schedule(12, 600, 0.04)[0], 0.25)
+        self.assertEqual(options.schedule(24, 600, 0.04)[0], 0.5)
+        self.assertEqual(options.schedule(300, 600, 0.04)[0], 0.5)
+        with self.assertRaisesRegex(ValueError, "LR warmup"):
+            options.schedule(0, None, 0.04)
+        with self.assertRaisesRegex(ValueError, "LR warmup"):
+            options.schedule(0, 600)
 
     def test_chunked_objective_matches_full_loss_and_all_parameter_gradients(self):
         for chunk_size in [1, 3]:
@@ -384,9 +395,7 @@ class DSpineTest(unittest.TestCase):
             torch.tensor([[True]]),
         )
         expected, _, metrics = model(**inputs, global_step=300, total_steps=600)
-        torch.testing.assert_close(
-            metrics["loss_terms"][1], torch.tensor(1 + math.exp(-1 / 7))
-        )
+        torch.testing.assert_close(metrics["loss_terms"][1], torch.tensor(1.0))
         inputs["target_last_hidden_states"][:, 3:] += 100
         actual, _, _ = model(**inputs, global_step=300, total_steps=600)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -410,6 +419,7 @@ class DSpineTest(unittest.TestCase):
             torch.ones(1, 3, dtype=torch.bool),
         )
         self.assertEqual(terms[2].item(), 0)
+        self.assertEqual(terms[4].item(), 0)
         self.assertTrue(all((torch.isfinite(term) for term in terms)))
 
     def test_strategy_runs_an_optimizer_step_and_exports_the_fixed_codes(self):

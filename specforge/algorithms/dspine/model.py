@@ -12,7 +12,7 @@ from specforge.core.fused_loss import ce_l1_loss
 
 
 class OnlineDSpineModel(OnlineDFlashModel):
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, *, warmup_ratio: float | None = None, **kwargs) -> None:
         if kwargs.get("loss_decay_gamma") is None:
             kwargs["loss_decay_gamma"] = 7.0
         super().__init__(**kwargs)
@@ -22,6 +22,11 @@ class OnlineDSpineModel(OnlineDFlashModel):
         if self.block_size != self.draft_model.block_size:
             raise ValueError("DSpine training block_size must match the draft")
         self.dspine_config = self.draft_model.dspine_config
+        self.warmup_ratio = warmup_ratio
+        if self.dspine_config.alignment_warmup_steps is None and warmup_ratio is None:
+            raise ValueError(
+                "DSpine needs warmup_ratio when alignment_warmup_steps is unset"
+            )
         if not self.draft_model.transfer_ready.item():
             self.draft_model.initialize_transfer_space(self.lm_head.weight)
 
@@ -75,7 +80,8 @@ class OnlineDSpineModel(OnlineDFlashModel):
         )
         # Missing labels use index zero above only as a placeholder for CE.
         refined_ce = refinement.cross_entropy * covered.any(dim=-1)
-        refined_l1 = refinement.teacher_l1 * (mass > config.candidate_mass_threshold)
+        eligible = mass > config.candidate_mass_threshold
+        refined_l1 = refinement.teacher_l1 * eligible
         reference_codes = F.embedding(labels, self.draft_model.transfer_codes).float()
         alignment = 1 - F.cosine_similarity(
             layer_features.float(), reference_codes.unsqueeze(1), dim=-1
@@ -83,13 +89,15 @@ class OnlineDSpineModel(OnlineDFlashModel):
         with torch.no_grad():
             correct = ((terms.argmax_ids == labels) * supervised).sum()
             coverage = (covered.any(dim=-1) * supervised).sum()
+            covered_mass = (covered.any(dim=-1) * weights).sum()
+            eligible_mass = (eligible * weights).sum()
         return (
             (terms.cross_entropy * weights).sum(),
             (terms.teacher_l1 * weights).sum(),
-            (
-                (config.ce_weight * refined_ce + (1 - config.ce_weight) * refined_l1)
-                * weights
-            ).sum(),
+            (refined_ce * weights).sum(),
+            covered_mass,
+            (refined_l1 * weights).sum(),
+            eligible_mass,
             (alignment * weights.unsqueeze(1)).sum(),
             correct.float(),
             coverage.float(),
@@ -135,7 +143,9 @@ class OnlineDSpineModel(OnlineDFlashModel):
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             weights = weights * torch.exp(-offsets[:-1].float() / self.loss_decay_gamma)
         denominator = weights.sum()
-        beta, probability = self.dspine_config.schedule(global_step, total_steps)
+        beta, probability = self.dspine_config.schedule(
+            global_step, total_steps, self.warmup_ratio
+        )
         replace = None
         if self.training and probability > 0:
             replace = (
@@ -198,7 +208,17 @@ class OnlineDSpineModel(OnlineDFlashModel):
         layer_features = (
             output.layer_features[..., 1:, :].permute(1, 2, 0, 3, 4).flatten(0, 1)
         )
-        ce, l1, refinement, alignment, correct, coverage = checkpointed_chunk_reduce(
+        (
+            ce,
+            l1,
+            refine_ce_sum,
+            refine_ce_mass,
+            refine_l1_sum,
+            refine_l1_mass,
+            alignment,
+            correct,
+            coverage,
+        ) = checkpointed_chunk_reduce(
             self._objective_terms,
             output.hidden_states[..., 1:, :].reshape(
                 -1, tokens, output.hidden_states.shape[-1]
@@ -224,13 +244,29 @@ class OnlineDSpineModel(OnlineDFlashModel):
             )
             alignment_ce = scale_terms[0] / scale_terms[1]
         alignment_scale = beta * alignment_ce.detach()
+        alignment = alignment / layer_features.shape[1]
+        count = supervised.sum().float()
+        refine_ce = torch.where(
+            refine_ce_mass > 0,
+            refine_ce_sum / refine_ce_mass.clamp_min(1e-30),
+            refine_ce_sum * 0.0,
+        )
+        refine_l1 = torch.where(
+            refine_l1_mass > 0,
+            refine_l1_sum / refine_l1_mass.clamp_min(1e-30),
+            refine_l1_sum * 0.0,
+        )
+        refinement = (
+            self.dspine_config.ce_weight * refine_ce
+            + (1 - self.dspine_config.ce_weight) * refine_l1
+        ) * count
         numerator = (
             self.dspine_config.ce_weight * ce
             + (1 - self.dspine_config.ce_weight) * l1
             + refinement
             + alignment_scale * alignment
         )
-        count = supervised.sum().float()
+        sequences = denominator.new_full((), float(batch))
         ratios = {
             "acc": (correct, count),
             "dspine/backbone_ce": (ce.detach(), denominator),
@@ -242,10 +278,10 @@ class OnlineDSpineModel(OnlineDFlashModel):
         metrics = dict(
             ratio_metrics=ratios,
             accuracy_denom=count,
-            loss_terms=(numerator, denominator),
+            loss_terms=(numerator, sequences),
         )
         return (
-            numerator / denominator.clamp_min(1),
+            numerator / sequences.clamp_min(1),
             correct / count.clamp_min(1),
             metrics,
         )
