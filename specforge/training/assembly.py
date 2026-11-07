@@ -246,6 +246,17 @@ class _ConfiguredOptimizerFactory:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.total_steps = cfg.training.total_steps or cfg.training.max_steps
+        #: Muon only: canonical name -> logical shape / group, captured by the
+        #: backend before FSDP flattens the parameters.
+        self.parameter_layout = None
+
+    def capture_parameter_layout(self, draft_module) -> None:
+        """Record logical matrix shapes before the FSDP wrap (Muon only)."""
+        if self.cfg.training.optimizer != "muon":
+            return
+        from specforge.muon import capture_parameter_layout
+
+        self.parameter_layout = capture_parameter_layout(draft_module)
 
     def configure_total_steps(self, total_steps: int) -> None:
         if self.total_steps is None:
@@ -262,6 +273,21 @@ class _ConfiguredOptimizerFactory:
         if self.total_steps is None:
             raise RuntimeError("optimizer total_steps was not resolved before assembly")
         t = self.cfg.training
+        # An AdamW run builds exactly as before.
+        muon = (
+            dict(
+                optimizer="muon",
+                muon_lr=t.muon_learning_rate,
+                muon_momentum=t.muon_momentum,
+                muon_nesterov=t.muon_nesterov,
+                muon_ns_steps=t.muon_ns_steps,
+                muon_weight_decay=t.muon_weight_decay,
+                muon_adjust_lr_fn=t.muon_adjust_lr_fn,
+                parameter_layout=self.parameter_layout,
+            )
+            if t.optimizer == "muon"
+            else {}
+        )
         return BF16Optimizer(
             draft_module,
             lr=t.learning_rate,
@@ -270,6 +296,7 @@ class _ConfiguredOptimizerFactory:
             lr_scheduler=t.lr_scheduler,
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
+            **muon,
         )
 
 
