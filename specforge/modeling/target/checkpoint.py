@@ -92,6 +92,36 @@ def _resolve_weight_layout(
     raise FileNotFoundError(f"No checkpoint found in {checkpoint_dir}")
 
 
+def _check_shard_name(checkpoint_dir: str, shard: str, index_path: str) -> None:
+    """Reject a ``weight_map`` value that resolves outside ``checkpoint_dir``.
+
+    ``weight_map`` values are shard file names inside the checkpoint directory.
+    A value that is absolute, or that walks out of the directory with ``..``,
+    makes the loader read a tensor file the caller never pointed at; the
+    exported draft then ships those weights, so refuse the index instead of
+    following it.
+    """
+
+    if os.path.isabs(shard):
+        raise ValueError(
+            f"Checkpoint index {index_path} maps a tensor to the absolute shard "
+            f"path {shard!r}; weight_map values must be shard file names inside "
+            f"{checkpoint_dir}"
+        )
+    root = os.path.realpath(checkpoint_dir)
+    resolved = os.path.realpath(os.path.join(checkpoint_dir, shard))
+    try:
+        inside = os.path.commonpath([root, resolved]) == root
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ValueError(
+            f"Checkpoint index {index_path} maps a tensor to the shard {shard!r}, "
+            f"which resolves outside {checkpoint_dir}; weight_map values must be "
+            "shard file names inside the checkpoint directory"
+        )
+
+
 def _read_weight_map_file(index_path: str) -> Dict[str, str]:
     with open(index_path, encoding="utf-8") as handle:
         index = json.load(handle)
@@ -103,6 +133,9 @@ def _read_weight_map_file(index_path: str) -> Dict[str, str]:
         for key, filename in weight_map.items()
     ):
         raise ValueError(f"Checkpoint index has an invalid weight_map: {index_path}")
+    checkpoint_dir = os.path.dirname(os.path.abspath(index_path))
+    for filename in weight_map.values():
+        _check_shard_name(checkpoint_dir, filename, index_path)
     return weight_map
 
 
