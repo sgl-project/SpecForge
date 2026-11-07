@@ -212,7 +212,7 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
         self.assertEqual(float(out.metrics["accuracy_denom"]), 4.0)
         self.assertEqual(out.sum_metrics["dflash/hard_label/block_count"], 2)
 
-    def test_dflash_strategy_forwards_teacher_hidden_only_for_detailed_metrics(self):
+    def test_dflash_strategy_forwards_teacher_for_metrics_or_objective(self):
         model = _FakeDFlashModel()
         strategy = DFlashTrainStrategy(model)
         teacher_hidden = torch.randn(1, 4, 8)
@@ -238,6 +238,11 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
         )
         self.assertIsNone(model.target_last_hidden_states)
         self.assertEqual(out.sum_metrics, {})
+
+        model.teacher_metrics = False
+        model.requires_teacher_distribution = True
+        strategy.forward_loss(batch, ctx=StepContext(collect_detailed_metrics=False))
+        self.assertIs(model.target_last_hidden_states, teacher_hidden)
 
     def test_dflash_strategy_drops_teacher_hidden_when_teacher_metrics_are_off(self):
         # A consumer with training.dflash_teacher_metrics=false never forwards
