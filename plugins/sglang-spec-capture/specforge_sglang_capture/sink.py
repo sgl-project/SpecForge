@@ -266,8 +266,20 @@ class NvlinkArena:
                 continue
             *lines, self._peers[sock] = (self._peers[sock] + chunk).split(b"\n")
             for line in lines:
-                if line:
-                    freed += self.free(json.loads(line))
+                if not line:
+                    continue
+                try:
+                    keys = json.loads(line)
+                    if not isinstance(keys, list) or not all(
+                        isinstance(key, str) for key in keys
+                    ):
+                        raise ValueError("expected a list of object keys")
+                except (ValueError, UnicodeDecodeError) as exc:
+                    logger.warning(
+                        "Ignoring invalid spec-capture free message: %s", exc
+                    )
+                    continue
+                freed += self.free(keys)
         return freed
 
     def health(self) -> Dict[str, int]:
@@ -480,6 +492,64 @@ class SpecCaptureSink:
                 pass
 
     # -- batch entry points ---------------------------------------------------
+    def discard_sample(self, spec: Dict[str, Any]) -> Future:
+        """Reclaim a cancelled request after its already-submitted publication.
+
+        Use the same single writer as submit_samples: deleting on the scheduler
+        thread could run before the objects exist, and would race the NVLink
+        arena. Only this request's generation and feature keys are removed.
+        """
+        names = list((spec.get("features") or {}).values())
+        names.extend(item["name"] for item in spec.get("passthrough") or [])
+        keys = list(
+            dict.fromkeys(
+                object_key(
+                    str(spec["store_id"]),
+                    str(spec["sample_id"]),
+                    int(spec.get("gen", 1)),
+                    str(name),
+                )
+                for name in names
+            )
+        )
+        future = self._executor.submit(self._discard_keys, keys)
+
+        def report_failure(done):
+            try:
+                done.result()
+            except Exception:
+                logger.exception("Failed to reclaim cancelled capture keys %s", keys)
+
+        future.add_done_callback(report_failure)
+        return future
+
+    def _discard_keys(self, keys: List[str]) -> None:
+        if self._nvlink is not None:
+            self._nvlink.free(keys)
+            return
+        if not keys or self._store is None:
+            return
+        pending = keys
+        for attempt in range(3):
+            failed = []
+            for key in pending:
+                try:
+                    try:
+                        rc = self._store.remove(key, force=True)
+                    except TypeError:
+                        rc = self._store.remove(key)
+                    # Missing objects are fine after the writer has finished.
+                    if rc is not None and int(rc) not in (0, -704):
+                        failed.append(key)
+                except Exception:
+                    failed.append(key)
+            if not failed:
+                return
+            pending = failed
+            if attempt < 2:
+                time.sleep(0.1)
+        raise RuntimeError(f"could not reclaim cancelled capture objects: {pending}")
+
     def submit_samples(
         self,
         samples: List[Sample],

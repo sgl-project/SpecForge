@@ -1,7 +1,7 @@
 # Domino disaggregated performance findings
 
 This page preserves the measured tuning results from the Qwen3-8B Domino
-online-disaggregated investigation on one 8×H200 node: one patched SGLang
+online-disaggregated investigation on one 8×H200 node: one SGLang with the capture plugin
 capture server, seven FSDP draft trainers, and an approximately 1.1B-parameter
 Domino/DFlash-family draft. Treat these numbers as historical evidence for that
 hardware, model, dataset, and software revision, not as a current-release

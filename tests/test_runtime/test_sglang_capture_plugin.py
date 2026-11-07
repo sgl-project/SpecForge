@@ -80,6 +80,7 @@ def _logits_output(num_rows, *, aux_width=6, hidden=2, last=True, indices=None):
 class FakeSink:
     def __init__(self):
         self.submissions = []
+        self.discard_sample = mock.Mock()
 
     def submit_samples(self, samples, *, ready_event=None):
         future = Future()
@@ -282,7 +283,15 @@ class TestCaptureCompletion(unittest.TestCase):
         runtime = _runtime()
         future = runtime.pending.submit([(_spec(rid), None, None) for rid in "ab"])
         completions = [
-            capture.CaptureCompletion(future, i, 2, rid, _spec(rid), runtime.results)
+            capture.CaptureCompletion(
+                future,
+                i,
+                2,
+                rid,
+                _spec(rid),
+                runtime.results,
+                runtime.sink.discard_sample,
+            )
             for i, rid in enumerate("ab")
         ]
         return runtime, future, completions
@@ -299,6 +308,7 @@ class TestCaptureCompletion(unittest.TestCase):
             runtime.results, {"a": {"sample_id": "a"}, "b": {"sample_id": "b"}}
         )
         self.assertFalse(completions[0].cancel())
+        runtime.sink.discard_sample.assert_not_called()
 
     def test_failed_or_malformed_batches_produce_each_requests_error(self):
         for failure in (RuntimeError("put failed"), []):
@@ -317,11 +327,22 @@ class TestCaptureCompletion(unittest.TestCase):
     def test_cancellation_suppresses_metadata_without_cancelling_siblings(self):
         runtime, future, (first, second) = self._batch()
         self.assertTrue(first.cancel())
+        self.assertTrue(first.cancel())
+        runtime.sink.discard_sample.assert_called_once_with(_spec("a"))
         self.assertTrue(first.done())
         self.assertFalse(future.cancelled())
         future.set_result([{"sample_id": "a"}, {"sample_id": "b"}])
         first.result()
         second.result()
+        self.assertEqual(runtime.results, {"b": {"sample_id": "b"}})
+
+    def test_cancel_after_publication_before_metadata_is_read(self):
+        runtime, future, (first, second) = self._batch()
+        future.set_result([{"sample_id": "a"}, {"sample_id": "b"}])
+        self.assertTrue(first.cancel())
+        first.result()
+        second.result()
+        runtime.sink.discard_sample.assert_called_once_with(_spec("a"))
         self.assertEqual(runtime.results, {"b": {"sample_id": "b"}})
 
 
@@ -684,7 +705,12 @@ class TestInstall(unittest.TestCase):
                     specforge_sglang_capture._capture_internal_state(result, scheduler)
                 self.assertEqual(
                     result.internal_state,
-                    {"existing": "value", "spec_capture_backend": "plugin"},
+                    {
+                        "existing": "value",
+                        "spec_capture_backend": "plugin",
+                        "spec_capture_method": "dflash",
+                        "spec_capture_aux_layer_ids": [1, 3],
+                    },
                 )
                 self.assertIsNone(runtime.sink._control_listener)
 

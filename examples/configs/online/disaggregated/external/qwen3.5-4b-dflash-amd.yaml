@@ -1,6 +1,6 @@
 # Qwen3.5-4B DFlash draft, online disaggregated — AMD ROCm single node.
 # The producer/consumer stream target features live through Mooncake. Launch the
-# patched capture server with AITER + --disable-radix-cache (Qwen3.5-4B is a hybrid
+# plugin-enabled capture server with AITER + --disable-radix-cache (Qwen3.5-4B is a hybrid
 # Mamba target); the trainer runs on ROCm unchanged (flex_attention).
 # See docs/sections/basic_usage/AMD/amd_rocm.md, Section 4.
 model:
