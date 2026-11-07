@@ -1,0 +1,51 @@
+# gpt-oss-120B DSpark, online on TPU: an external sglang-torchtpu capture server
+# (specforge_tpu.sglang_capture plugin) and a v7x-8 trainer (torch_tpu, 8 ranks).
+# SERVER_HOST / TRAINER_HOST are the two pods' DNS names; override on the CLI.
+model:
+  target_model_path: /models/gpt/gpt-oss-120b
+  draft_model_config: configs/gpt-oss-120B-dspark.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_train.jsonl
+  max_length: 2048
+  chat_template: gpt-oss
+  cache_dir: ./cache
+  build_dataset_num_proc: 32
+
+training:
+  strategy: dspark
+  num_epochs: 1
+  batch_size: 1
+  accumulation_steps: 4
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  fsdp_sharding: NO_SHARD
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  save_interval: 500
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+run_id: gpt-oss-120b-dspark-tpu
+output_dir: ./outputs/gpt-oss-120b-dspark-tpu
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: ./outputs/gpt-oss-120b-dspark-tpu/control
+    backend: mooncake
+    server_urls: [http://SERVER_HOST:30000]
+    mooncake_metadata_server: http://SERVER_HOST:8080/metadata
+    mooncake_master_server_addr: SERVER_HOST:50051
+    mooncake_local_hostname: TRAINER_HOST
+    mooncake_protocol: tcp
+    receive_buffers: pinned
