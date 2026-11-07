@@ -37,7 +37,7 @@ payload size and which from the GPU generation.
   retries transient read failures. The in-flight watermarks in the recipes are
   sized for that loader.
 - A compatible SGLang build with the
-  [capture plugin](../../plugins/sglang-spec-capture/README.md) on every capture
+  [capture plugin](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md) on every capture
   host. Servers run `--enable-return-aux-hidden-states --speculative-algorithm DFLASH`
   with the draft's auxiliary layers
   `5 19 33 47 61`; the DFlash2 selector exists only on the trainer.
