@@ -189,6 +189,8 @@ With named definitions, the YAML gives `layer_types`, and `num_hidden_layers`, i
 
 Structural fields have no defaults. A value that can be derived from the target is derived only by a documented rule with the target configuration as an explicit input, and the result is saved. Examples are `target_layer_ids` from the target layer count and the target module paths in `target_bindings`. `draft_vocab_size` equals `vocab_size` unless a draft vocabulary mapping is configured. Non-structural values with documented defaults, such as `initializer_range`, are written into the saved file, so the file is complete without SpecForge's defaults. Keep `initialization` and training hyperparameters outside the model configuration. Training YAML contains no export configuration.
 
+A registered preset can supply the YAML draft structure in place of inline fields or a configuration file. Resolve its name to the complete configuration before codec validation, then apply the same source-selection rules as for inline structure (Section 1). Checkpoints save the expanded configuration; reloading them never looks up the preset. A native preset describes a target's native draft structure, but selecting it does not load target weights or choose a training objective. Weight loading and objective selection remain separate.
+
 ### 2.3 Drafts built from parts of the target
 
 A draft can reuse its target in three ways (design document, Section 7):
@@ -338,6 +340,8 @@ specforge/
 │   ├── training.py                   # Training, objective, initialization, and resume settings; no structural fields
 │   └── draft/                        # Frozen configuration nodes; imports neither torch nor transformers
 │       ├── model.py                  # DraftConfig: model-level fields, component groups, layer_types, residual, spec
+│       ├── presets/                  # Named, composed configurations; expanded before validation
+│       │   └── native/               # Configurations matching native target draft structures
 │       ├── attention.py              # GQA, MLA, DSA, QSA, and KDA nodes, dispatched by type
 │       ├── mlp.py                    # Dense and MoE nodes
 │       ├── conv.py                   # Sublayer convolution nodes
@@ -403,12 +407,15 @@ Each package registers what it owns:
 
 ```python
 # Illustrative interfaces
+register_draft_preset("qwen3-8b-dflash", qwen3_8b_dflash_config)  # specforge/config/draft/presets/
 register_spec("SpecForgeDFlash2", DFlash2Spec)               # specforge/config/draft/registry.py
 register_model(SpecForgeDFlash2)                              # specforge/modeling/draft/registry.py; key = class name
 register_objective("dflash2", DFlash2Objective,               # specforge/algorithms/registry.py
                    default_for=["SpecForgeDFlash2"])
 register_converter("SpecForgeDFlash2", dflash2_to_legacy)     # specforge/checkpoint/formats/sglang.py
 ```
+
+The preset registry maps names to concrete configurations, not to model implementations. Presets select registered architecture and component types and supply their parameters. Adding a preset that uses existing types requires no new model registration; a new implementation requires registration at the architecture, layer, or component level it extends. Preset definitions live under `config/draft/presets/`, with `native/` for configurations matching native draft structures.
 
 A consistency test checks that every architecture has the entries it needs, that each model class is named after its architecture, and that each default objective is compatible. Objectives declare the model inputs and outputs they require, so a compatible objective can train another architecture without a new registration. Components, layer types, and target-family modules register schemas and builders in the same way. Extensions outside the repository call the same functions, and a configuration lists the extensions it needs in `extensions`. The unified loader contains no model-name conditionals.
 
