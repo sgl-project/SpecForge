@@ -84,7 +84,8 @@ class _ArenaCaptureServer(_StubCaptureServer):
     def __call__(self, url, json_body, timeout):
         rows = super().__call__(url, json_body, timeout)
         for row in rows:
-            result = row["meta_info"]["spec_capture"]
+            # The stub wraps each result like the real server; unwrap it.
+            (result,) = row["meta_info"]["spec_capture"]
             prefix = f"{result['store_id']}/{result['sample_id']}/g{result['gen']}"
             result["arena"] = {"session": SESSION, "control": self.backend.control}
             for name, meta in result["features"].items():
