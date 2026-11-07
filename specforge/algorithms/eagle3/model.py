@@ -480,8 +480,14 @@ class OnlineEagle3Model(Eagle3Model):
                 use_cache=True,
             )
 
-            # update hidden states for next step
-            hidden_states = hidden_states_out
+            # Keep raw outputs for logits; normalize only the next-depth input.
+            logit_hidden = hidden_states_out
+            next_depth = getattr(self.draft_model, "next_depth_hidden", None)
+            hidden_states = (
+                next_depth(hidden_states_out)
+                if callable(next_depth)
+                else hidden_states_out
+            )
 
             # Step 5.4 + 5.5 + 5.6: logits, metric and loss
             if trim_pack is not None:
@@ -492,7 +498,7 @@ class OnlineEagle3Model(Eagle3Model):
                 keep_j = trim_pack["keep_steps"][idx]
                 nrows_j = trim_pack["nrows_steps"][idx]
                 logits = self.draft_model.compute_logits(
-                    hidden_states.index_select(1, rows_j)
+                    logit_hidden.index_select(1, rows_j)
                 )
                 pm_j = trim_pack["position_mask_sup"].index_select(1, keep_j)
                 lm_j = trim_pack["loss_mask_sup"].index_select(1, keep_j)
@@ -524,7 +530,7 @@ class OnlineEagle3Model(Eagle3Model):
                     full_positions=trim_pack["full_len"],
                 )
             else:
-                logits = self.draft_model.compute_logits(hidden_states)
+                logits = self.draft_model.compute_logits(logit_hidden)
                 (
                     acc,
                     acceptance_rate,

@@ -88,6 +88,29 @@ def _load_vocab_mapping(cfg: Config, draft_model: Any) -> None:
         draft_model.load_vocab_mapping(cfg.model.vocab_mapping_path)
 
 
+def build_eagle4_draft(cfg: Config, draft_config: PretrainedConfig):
+    from specforge.modeling.auto import AutoDraftModel
+
+    if cfg.model.vocab_mapping_path:
+        raise ValueError(
+            "Stage-1 EAGLE-4 uses the full vocabulary; omit model.vocab_mapping_path"
+        )
+    draft_model = AutoDraftModel.from_config(
+        draft_config,
+        attention_backend=cfg.training.attention_backend,
+        torch_dtype=_torch_dtype(cfg),
+    )
+    _warm_start(cfg, draft_model, draft_config, allow_missing_embedding=True)
+    if cfg.model.load_target_embedding:
+        draft_model.load_embedding(
+            cfg.model.target_model_path,
+            embedding_key=cfg.model.embedding_key,
+            cache_dir=cfg.model.cache_dir,
+        )
+    draft_model.freeze_embedding()
+    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+
+
 def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
 
@@ -558,6 +581,7 @@ __all__ = [
     "build_dspine_model",
     "build_eagle3_draft",
     "build_eagle3_model",
+    "build_eagle4_draft",
     "build_peagle_draft",
     "peagle_resume_contract",
     "build_peagle_model",

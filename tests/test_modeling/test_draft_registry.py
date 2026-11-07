@@ -24,6 +24,7 @@ from specforge.modeling.draft import (
     DominoDraftModel,
     DSparkDraftModel,
     LlamaForCausalLMEagle3,
+    LlamaForCausalLMEagle4,
     available_drafts,
     register_draft,
     resolve_draft,
@@ -109,11 +110,13 @@ def _write(cfg: dict) -> str:
 class DraftRegistryTest(unittest.TestCase):
     def test_builtin_architectures_registered(self):
         self.assertIn("LlamaForCausalLMEagle3", available_drafts())
+        self.assertIn("LlamaForCausalLMEagle4", available_drafts())
         self.assertIn("DFlashDraftModel", available_drafts())
         self.assertIn("DFlash2DraftModel", available_drafts())
         self.assertIn("DominoDraftModel", available_drafts())
         self.assertIn("DSparkDraftModel", available_drafts())
         self.assertIs(resolve_draft("LlamaForCausalLMEagle3"), LlamaForCausalLMEagle3)
+        self.assertIs(resolve_draft("LlamaForCausalLMEagle4"), LlamaForCausalLMEagle4)
         self.assertIs(resolve_draft("DFlashDraftModel"), DFlashDraftModel)
         self.assertIs(resolve_draft("DFlash2DraftModel"), DFlash2DraftModel)
         self.assertIs(resolve_draft("DominoDraftModel"), DominoDraftModel)

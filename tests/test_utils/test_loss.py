@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from specforge.core.loss import LogSoftmaxLoss, _compute_loss
+from specforge.core.loss import LogSoftmaxLoss, _calculate_settings, _compute_loss
 from tests.test_utils.utils import norm_tensor
 
 
@@ -28,6 +28,10 @@ class TestLogSoftmaxLoss(unittest.TestCase):
         output1.backward()
         output2.backward()
         torch.testing.assert_close(logits.grad, logits2.grad, rtol=1e-4, atol=1e-4)
+
+    def test_calculate_settings_caps_oversize_vocab(self):
+        block, _warps = _calculate_settings(151936)
+        self.assertEqual(block, 131072)
 
     def test_loss(self):
         B = [1, 2, 4]
