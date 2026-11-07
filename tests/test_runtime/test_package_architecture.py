@@ -687,7 +687,7 @@ class TestPackageArchitecture(unittest.TestCase):
             )
         )
 
-    def test_offline_capture_uses_only_the_dedicated_local_capture(self):
+    def test_offline_capture_uses_the_plugin_client(self):
         source = (REPO_ROOT / "scripts" / "prepare_hidden_states.py").read_text()
         self.assertNotIn("--enable-aux-hidden-states", source)
         self.assertNotIn("--aux-hidden-states-layers", source)
@@ -695,7 +695,8 @@ class TestPackageArchitecture(unittest.TestCase):
         self.assertNotIn("get_target_engine", source)
         self.assertNotIn("return_last_hidden_states=True", source)
         self.assertNotIn("return_logits=False", source)
-        self.assertIn("load_offline_capture", source)
+        self.assertIn("OfflineCaptureClient", source)
+        self.assertNotIn("ModelRunner", source)
 
     def test_only_canonical_draft_configs_are_checked_in(self):
         present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}

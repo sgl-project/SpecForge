@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import unittest
-from unittest import mock
 
 import torch
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.providers import OfflineCaptureLayout
-from specforge.offline_capture import OfflineSGLangCapture
 
 
 class OfflineCaptureLayoutTest(unittest.TestCase):
@@ -152,24 +150,6 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("last_hidden_states", message)
         self.assertIn("target_last_hidden_states", message)
-
-    def test_local_capture_forwards_the_algorithm_capture_method(self):
-        backend = mock.Mock()
-        capture = OfflineSGLangCapture(backend)
-
-        for capture_method in ("dflash", "dspark"):
-            with self.subTest(capture_method=capture_method):
-                backend.reset_mock()
-                capture.set_capture_layers(
-                    [1, 9, 17, 25, 33],
-                    capture_method=capture_method,
-                )
-
-                self.assertEqual(capture_method, capture.capture_method)
-                backend.set_capture_layers.assert_called_once_with(
-                    [1, 9, 17, 25, 33],
-                    capture_method=capture_method,
-                )
 
 
 if __name__ == "__main__":

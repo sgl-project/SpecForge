@@ -195,6 +195,12 @@ class _PluginStubCaptureServer(_StubCaptureServer):
         return [result]
 
 
+def _request_specs(body):
+    return [
+        json.loads(p["custom_params"]["spec_capture"]) for p in body["sampling_params"]
+    ]
+
+
 class _FakeController:
     def __init__(self):
         self.committed: List[SampleRef] = []
