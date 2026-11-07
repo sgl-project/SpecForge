@@ -127,7 +127,9 @@ class DomainTrainerWiringTest(unittest.TestCase):
             tr,
             FeatureDataLoader=FakeLoader,
             ParallelConfig=FakeParallel,
-            FSDPTrainingBackend=FakeBackend,
+            create_training_backend=lambda name, parallel, **kwargs: FakeBackend(
+                parallel, **kwargs
+            ),
             TrainerCore=FakeCore,
             TrainerController=FakeController,
         ):
@@ -220,7 +222,12 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertIsNone(cap["ctrl_kw"]["ack_fn"])
         self.assertEqual(
             cap["parallel_kw"],
-            {"tp_size": 1, "sp_ulysses_size": 1, "sp_ring_size": 1},
+            {
+                "tp_size": 1,
+                "sp_ulysses_size": 1,
+                "sp_ring_size": 1,
+                "sharding_strategy": None,
+            },
         )
 
         # run identity rides the shared checkpoint payload, validated on resume
