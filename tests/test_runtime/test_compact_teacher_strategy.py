@@ -322,6 +322,7 @@ class CompactTeacherStrategyTest(unittest.TestCase):
         self.assertIsNone(model.kwargs["target"])
         self.assertEqual(model.kwargs["target_hidden_for_compact"].shape, (1, 4, 4))
         self.assertIs(model.kwargs["target_head_weight"], head.fc.weight)
+        self.assertIsNone(model.kwargs["target_logit_softcap"])
         self.assertEqual(model.kwargs["compact_teacher_chunk_size"], 2)
         self.assertEqual(model.kwargs["loss_mask"].shape, (1, 4, 1))
         self.assertEqual(model.kwargs["loss_mask"].squeeze(-1).tolist(), [[1, 1, 1, 0]])

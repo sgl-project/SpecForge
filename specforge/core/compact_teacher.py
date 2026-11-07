@@ -60,6 +60,7 @@ def _tiled_logsumexp_argmax(
     *,
     chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
     selected_token_ids: Optional[torch.Tensor] = None,
+    softcap: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
@@ -89,6 +90,9 @@ def _tiled_logsumexp_argmax(
     for start in range(0, vocab_size, chunk_size):
         end = min(start + chunk_size, vocab_size)
         chunk_logits = F.linear(hidden, weight[start:end]).float()
+        if softcap is not None:
+            # TargetHead.forward's softcap, applied per chunk (elementwise).
+            chunk_logits = torch.tanh(chunk_logits / softcap) * softcap
 
         if selected_ids_host is not None:
             selected_end = bisect_left(selected_ids_host, end, lo=selected_start)
@@ -126,6 +130,7 @@ def tiled_logsumexp_argmax(
     weight: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+    softcap: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Full-vocabulary fp32 ``logsumexp`` (``[..., 1]``) and ``argmax`` (``[...]``).
 
@@ -133,7 +138,9 @@ def tiled_logsumexp_argmax(
     logits are upcast to fp32 to match ``target.float()``; ties resolve to the lowest
     index like ``torch.argmax``.
     """
-    log_z, argmax, _ = _tiled_logsumexp_argmax(hidden, weight, chunk_size=chunk_size)
+    log_z, argmax, _ = _tiled_logsumexp_argmax(
+        hidden, weight, chunk_size=chunk_size, softcap=softcap
+    )
     return log_z, argmax
 
 
@@ -145,6 +152,7 @@ def compute_target_from_hidden(
     loss_mask: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+    softcap: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compact-teacher equivalent of ``_compute_target_p``, computed from hidden states.
 
@@ -170,6 +178,7 @@ def compute_target_from_hidden(
         lm_head_weight,
         chunk_size=chunk_size,
         selected_token_ids=selected_token_ids,
+        softcap=softcap,
     )
     assert draft_logits is not None
     target_p = torch.softmax(draft_logits, dim=-1)
@@ -195,6 +204,7 @@ def compute_target_p_padded_from_hidden(
     length: int,
     *,
     chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+    softcap: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compact-teacher equivalent of ``_compute_target_p_padded`` (same pad constants)."""
     (
@@ -203,7 +213,7 @@ def compute_target_p_padded_from_hidden(
         target_token_ids,
         position_mask,
     ) = compute_target_from_hidden(
-        hidden, lm_head_weight, t2d, loss_mask, chunk_size=chunk_size
+        hidden, lm_head_weight, t2d, loss_mask, chunk_size=chunk_size, softcap=softcap
     )
 
     assert target_p.dim() == 3
@@ -246,6 +256,7 @@ def build_offline_teacher_inputs(
     return None, {
         "target_hidden_for_compact": target_hidden,
         "target_head_weight": target_model.fc.weight,
+        "target_logit_softcap": getattr(target_model, "logit_softcap", None),
         "compact_teacher_chunk_size": chunk_size,
     }
 
