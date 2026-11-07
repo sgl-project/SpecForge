@@ -53,7 +53,7 @@ DFlash2 references convolution through a layer node's `sublayer_conv`, wrapping 
 - Native drafts use the same components. Model origin is not a layer type, and the target model's whole-layer implementation is not called directly.
 - `layer_types` selects a named `LayerSpec` for each layer. Its entries are layer-definition names, not implementation types or registry keys. `num_hidden_layers` is derived from its length.
 
-Referencing the same layer definition means identical structure, not shared weights. Each instantiation creates an independent module by default; parameter sharing must be explicit.
+Referencing the same layer definition means identical structure, not shared weights. Each instantiation creates an independent module. Draft modules never share parameters with each other; the only modules taken from the target are those listed in `target_bindings`.
 
 `LayerSpec` describes neither training loops nor arbitrary execution graphs. Architecture models still organize DMTP's input fusion and DSpine's inter-layer injection; these do not belong in ordinary decoder-layer configuration.
 
@@ -161,9 +161,9 @@ residual_config: {type: standard}
 
 Saving writes the complete effective configuration, including the derived `num_hidden_layers: 2`. Loading restores the same `DraftConfig`. A checkpoint does not depend on the original configuration file's path or subsequent changes.
 
-The HF shell stores HF metadata; the checkpoint stores format and weight-layout metadata. Neither belongs to `DraftConfig`. Training configuration and loading plans own initialization from target weights. `target_bindings` describes frozen external weight bindings; bound weights are not saved with the draft. The draft is still built from its declared components. Weight plans check computational compatibility, key mappings, and shapes, without requiring the source and draft modules to use identical Python classes.
+The HF shell stores HF metadata; the checkpoint stores format and weight-layout metadata. Neither belongs to `DraftConfig`. Training configuration and loading plans own copies from target weights (`initialization.from_target`): tensors are copied unchanged, every mapped draft parameter and target tensor must be used, and names and shapes must match exactly. Copies are draft weights and are saved with the draft; decoder layers are never bound. `target_bindings` lists which of `embed_tokens` and `lm_head` come from the target; they are frozen and not saved with the draft. The draft is still built from its declared components.
 
-HF export uses the canonical configuration. For SGLang versions without canonical-format support, a converter generates the legacy layout and retains the canonical configuration in `specforge_config.json` for re-import. Format representability and engine execution support are validated separately. Unsupported structures fail export. Export does not modify the model configuration.
+HF export uses the canonical configuration. SGLang never reads canonical configurations: the SGLang converter writes SGLang's own draft format, with every field that affects computation written explicitly, and retains the canonical configuration in `specforge_config.json` for re-import. Format representability and engine execution support are validated separately. Unsupported structures fail export. Export does not modify the model configuration.
 
 ## 6. Code Organization and Validation
 

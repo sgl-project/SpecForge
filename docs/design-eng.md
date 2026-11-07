@@ -111,7 +111,7 @@ Matching dimensions do not make components interchangeable. Algorithms declare w
 | DSpine: in-block attention is causal | `is_causal` of every attention node |
 | DFlash2: the convolution kernel fits in one block | Convolution node against the block protocol |
 | mHC: every layer supports the configured residual-stream layout | Residual capability of each layer |
-| Target bindings: a bound draft module has compatible computation and parameter shapes under the weight mapping | Target configuration and checkpoint (Section 7.3) |
+| Target bindings: only `embed_tokens` and `lm_head`, with the target's vocabulary and hidden sizes | Target configuration (Section 7.3) |
 
 Components and decoder layers never check architecture names, and algorithms never rewrite a component setting to satisfy a requirement. An unmet requirement is a configuration error.
 
@@ -145,9 +145,9 @@ Explicit groups also remove a naming conflict: the top-level `intermediate_size`
 
 `num_hidden_layers` equals `len(layer_types)`. The codec writes it to `config.json` for HF tooling and verifies it on read; it never acts as a second, independent input.
 
-`layer_types` holds `layer_configs` names, not HF's attention-kind values such as `full_attention` or `linear_attention`. Code that relies on HF's values, such as SGLang's hybrid-layout detection, reads the per-layer layout that the spec derives instead (usage guide, Section 4.1).
+`layer_types` holds `layer_configs` names, not HF's attention-kind values such as `full_attention` or `linear_attention`. SGLang never reads canonical configurations: the SGLang converter writes the per-layer values that SGLang reads, in SGLang's own format (usage guide, Section 4.1).
 
-`tie_word_embeddings` is required. `true` is rejected when `target_bindings` binds `embed_tokens` or `lm_head`, because a bound module's weight comes from the target and each weight has one source.
+`tie_word_embeddings` is required. `true` is rejected when `target_bindings` lists `embed_tokens` or `lm_head`, because a bound module's weight comes from the target and each weight has one source.
 
 Component nodes use HF field names without prefixes. A KDA node uses `num_key_heads`, not `linear_num_key_heads`. In a MoE node, `intermediate_size` is the per-expert width, so no new name such as `expert_intermediate_size` is needed.
 
@@ -180,7 +180,7 @@ Each algorithm keeps its own block convention:
 | DFlash2 | `block_size = 16` | 15 | 16 |
 | DSpark | `block_size = 7` | 7 | 8 |
 
-Consumers never interpret `block_size` themselves. Each algorithm spec exposes the derived quantities, such as `num_draft_tokens`, `verify_window`, and the query layout. Training, data dispatch, export, and serving read those. The spec node owns these formulas, and SGLang vendors the same torch-free `config.draft` package, so both use one derivation (Section 8). EAGLE expansion steps are serving settings, not model structure.
+Consumers never interpret `block_size` themselves. Each algorithm spec exposes the derived quantities, such as `num_draft_tokens`, `verify_window`, and the query layout. Training, data dispatch, and export read those. The spec node owns these formulas, and the SGLang converter writes the resulting values in SGLang's own terms, so SGLang never interprets a SpecForge field (Section 8). EAGLE expansion steps are serving settings, not model structure.
 
 The protocol also distinguishes model slots, positions predicted by the draft, and candidates supplied by another predictor. For example, DMTP with seven slots `[T1, MASK, ..., MASK]` predicts T2–T7 in the draft, receives T1 from MTP at serving time, and verifies `[A, T1, ..., T7]`, a window of eight. Token alignment and these counts come from the spec; training and serving do not infer them independently.
 
@@ -233,7 +233,7 @@ A DSpark draft with four sliding-window layers and one full-attention layer. Val
   },
   "layer_types": ["swa_dense", "swa_dense", "swa_dense", "swa_dense", "full_dense"],
   "residual_config": {"type": "standard"},
-  "target_bindings": {"embed_tokens": "model.embed_tokens", "lm_head": "lm_head"},
+  "target_bindings": ["embed_tokens", "lm_head"],
   "extensions": [],
   "spec_config": {
     "block_size": 7,
@@ -430,35 +430,31 @@ Draft architectures and layer architectures keep changing, and a draft may be bu
 
 `presets/native/` holds YAML configurations matching native draft structures, assembled from the same SpecForge components. There is no `target` component or layer type. Native checkpoint adapters convert source configuration and weights into these nodes and an explicit weight-loading plan.
 
-### 7.3 Target weights: initialization and binding
+### 7.3 Target weights: copies, and the shared embeddings and LM head
 
-A draft can relate to target weights in two ways:
+Target weights reach a draft in two ways:
 
 | Relationship | Meaning | Declared in | Saved with the draft | At serving time |
 |---|---|---|---|---|
-| Initialization | Draft parameters start as a copy of target parameters and are then trained | Training configuration: `initialization.from_target` | Yes | The draft's own weights |
-| Binding | A component-built draft module uses target-owned frozen weights | Draft configuration: `target_bindings` | No | Supplied by the target |
+| Copy | Draft parameters start as unchanged copies of target parameters, then are trained or frozen as training configuration says | Training configuration: `initialization.from_target` | Yes | The draft's own weights |
+| Shared embeddings and LM head | The draft uses the target's `embed_tokens` and `lm_head`, frozen | Draft configuration: `target_bindings` | No | SGLang uses the target's modules, as it already does for EAGLE3 and DFlash drafts |
 
-Initialization is a training choice. It belongs to training configuration and the weight-loading plan, and the run's metadata records it. Binding changes what the draft checkpoint contains and what serving must supply, so it is part of the golden configuration. Keys are draft module paths, and values are target module paths:
+Decoder layers are reused only by copying. Binding them, or deriving draft nodes from a target layer automatically, would require SGLang to share target weight storage with the draft and to understand SpecForge's mapping. A copy keeps the two decoupled: SGLang loads the draft's own weights and never sees `initialization`.
 
-```json
-{
-  "target_bindings": {
-    "embed_tokens": "model.embed_tokens",
-    "lm_head": "lm_head",
-    "layers.0": "model.layers.0",
-    "layers.1": "model.layers.1"
-  }
-}
-```
+Copies:
 
-- A bound or initialized pair must have compatible computational structure and parameter shapes. The weight-loading plan validates explicit key mappings and any declared transforms before loading; it does not require identical Python classes.
-- Bound modules are frozen, consistent with a frozen target. Training loads them from the target checkpoint, export omits them and keeps the bindings, and SGLang shares compatible target weight storage. A binding that the serving engine does not support fails at export or load, not silently.
-- One mechanism covers several cases:
-  - drafts that use the target's embeddings and LM head;
-  - native MTP drafts initialized from the MTP weights in the target checkpoint;
-  - drafts whose layers start from copies of target layers;
-  - self-speculative drafts that run a prefix of the target's layers followed by trained heads.
+- `initialization.from_target` maps draft module prefixes to target module prefixes. The mapping is written by hand in training YAML or a preset, and the draft's nodes are written explicitly like any other draft's. Nothing derives nodes from the target's layers, and there is no per-family adapter for this.
+- SpecForge reads the tensors from the target's checkpoint files, as main already does for embeddings and LM heads. It never asks the target server for weights.
+- The copy is strict. Tensors are copied unchanged, with no transforms. Under each mapped prefix, every draft parameter must receive a tensor, every target tensor must be used, and the parameter names after the prefix and the shapes must match exactly. A violation fails before training and names the tensors.
+- A target computation that no component implements, such as an RMSNorm parameterized as `1 + w` or an attention output gate, needs a component that implements it. The copy never rewrites values to fit another component.
+- Matching names and shapes do not prove matching computation: `1 + w` and `w` norm weights, or two partial-rotary fractions, have the same shapes. The draft then trains from a worse start, without an error. Bundled presets that copy target layers are therefore checked in CI. With zero context length and a causal mask, a DFlash-family layer reduces to ordinary attention, so the draft layer with copied weights must reproduce the target layer's output on reference inputs. For a user-written mapping, the loader prints the full mapping, and the node definitions are the user's responsibility.
+- Freezing a copied layer is a training setting. A frozen copy is still saved with the draft and costs serving memory; self-speculative drafts that run the target's own layers at serving time are not supported.
+
+Shared embeddings and LM head:
+
+- `target_bindings` lists modules from the closed set `embed_tokens` and `lm_head`; no other module can be bound. The configuration records only which modules come from the target. The target checkpoint keys they load from are a training-side detail of the weight-loading plan, as `embedding_key` and `lm_head_key` are on main, and are not part of `DraftConfig`.
+- Bound modules are frozen, consistent with a frozen target. Training loads them from the target checkpoint, and exports omit them and record `target_bindings`.
+- Copying them into the draft would make exports self-contained, but each costs serving memory of the vocabulary size times the hidden size, and SGLang would have to load them from the draft instead of sharing the target's.
 
 ## 8. Single Source of Truth
 
@@ -475,19 +471,19 @@ Structural source, exactly one per run:
       v                   v                      v                                    v
  model.config.draft   modules hold their     training objective, data dispatch,    derived artifacts:
  inside the HF shell  own node               and launch code read the spec         encode -> config.json
-                                                                                   convert -> SGLang legacy layout
+                                                                                   convert -> SGLang format
 ```
 
 | Rule | Meaning |
 |---|---|
 | G1. One structural source per run | Training from scratch, and warm-starts that change structure (`initialization.weights_from`), read the YAML draft section; the source checkpoint of a warm-start supplies weights only, through an explicit mapping. Continued training from a checkpoint (`initialization.checkpoint`) and resumption read the checkpoint, and imports read the adapter output. If YAML also provides structure in those cases, it must be identical to the checkpoint's or loading fails; fields are never merged. Training configuration cannot contain structural fields. |
 | G2. One parser, one owner per rule | Spec nodes own semantics, validation, and derivation formulas. The codec owns serialization and migration rules. It handles legacy aliases once, at the entry point, and rejects conflicting values; examples are a top-level `block_size` versus `dflash_config.block_size`, and `rope_theta` versus `rope_parameters`. Checkpoint adapters call both and own only weight mappings. Downstream code never reads raw configuration dictionaries or calls `getattr(config, name, default)`. |
-| G3. One definition per default and derivation | Structural fields have no defaults. Values derived from the target, such as default `target_layer_ids`, EAGLE auxiliary layers, and `target_bindings`, are computed at parse time with the target configuration as an explicit input and stored as concrete values, so the saved configuration records what was used. Pure derivations, such as `num_hidden_layers` or `num_draft_tokens`, are methods. A derived value written to JSON for compatibility is recomputed and checked on read. |
+| G3. One definition per default and derivation | Structural fields have no defaults. Values derived from the target, such as default `target_layer_ids` and EAGLE auxiliary layers, are computed at parse time with the target configuration as an explicit input and stored as concrete values, so the saved configuration records what was used. Pure derivations, such as `num_hidden_layers` or `num_draft_tokens`, are methods. A derived value written to JSON for compatibility is recomputed and checked on read. |
 | G4. Immutable after parsing | Values that depend on the tokenizer or the target, such as `mask_token_id`, are resolved by the parser, which receives the tokenizer and the target configuration as explicit inputs, before the model is built. Nothing writes to the configuration after construction; a structural change requires a new configuration and a new model. |
 | G5. References, not copies | Modules hold their own node instead of copying values into attributes such as `self.block_size`. Training objectives, data dispatch, and launch code receive `config.spec` or the node they need, not separate arguments with their own defaults. `architectures` is the only structural selector, and the model family is derived from it. The training objective is chosen separately (Section 9.2) because it is not structure. |
 | G6. The HF configuration object is a shell | `model.config` is `SpecForgeDraftConfig`, and `model.config.draft` is the golden configuration. The shell declares no structural fields or defaults. It may hold HF metadata and runtime fields that Transformers writes during construction and saving, such as `auto_map`, `transformers_version`, `architectures`, `dtype`, and the attention implementation. Its `to_dict` is the codec's encoding of `draft` plus that metadata, so re-saving an exported package keeps its loading entry points. Its `from_dict` decodes through the codec and sets no structural attributes, so generic HF or SGLang code that inspects attributes such as `head_dim` or `layer_types` finds nothing instead of misreading draft values. |
-| G7. Artifacts are derived | The canonical `config.json` is the encoding of the golden configuration, and an SGLang legacy directory is a conversion of it. When a converted directory also carries the canonical configuration for re-import, SpecForge reads only the canonical file. Derived files are never read back as input. Every written directory also records artifact metadata outside `DraftConfig`: its format, weight layout, and converter version. One `DraftConfig` can be stored with different weight layouts, so loading selects its weight-loading plan from that metadata. |
-| G8. SGLang shares the configuration package | SGLang vendors the same torch-free `config.draft` package, spec nodes and codec together, and runs the same fixtures. A rule that SpecForge and SGLang each implement, such as the legacy `is_causal` default, would otherwise have to be kept in sync by hand. SGLang reads the per-layer layout it needs for memory pools from a spec method, not from flat attributes (usage guide, Section 4.1). |
+| G7. Artifacts are derived | The canonical `config.json` is the encoding of the golden configuration, and an SGLang directory is a conversion of it. When a converted directory also carries the canonical configuration for re-import, SpecForge reads only the canonical file. Derived files are never read back as input. Every written directory also records artifact metadata outside `DraftConfig`: its format, weight layout, and converter version. One `DraftConfig` can be stored with different weight layouts, so loading selects its weight-loading plan from that metadata. |
+| G8. SGLang is reached only through an exported artifact | SGLang imports no SpecForge code and never reads canonical configurations; SpecForge depends only on SGLang's documented draft format. SGLang owns that format. The SGLang converter is the one place that translates a `DraftConfig` into it, and it writes every field that SGLang reads and that affects computation, including per-layer values. SGLang's defaults therefore never decide a draft's computation, and no rule, such as the legacy `is_causal` default, is implemented in both repositories. A structure that SGLang's format cannot express fails the export (usage guide, Section 4.1). |
 
 Section 9.3 lists the tests that enforce these rules.
 
@@ -495,7 +491,7 @@ Section 9.3 lists the tests that enforce these rules.
 
 The [usage guide](config_usage_graph-eng.md#5-code-organization) shows the full tree. The model side follows these conventions:
 
-- `specforge/config/draft/` holds the frozen configuration nodes, the codec, and cross-node validation. It imports neither torch nor transformers, so SGLang can vendor the codec.
+- `specforge/config/draft/` holds the frozen configuration nodes, the codec, and cross-node validation. It imports neither torch nor transformers, so configurations are parsed and validated before any model code loads.
 - `specforge/config/draft/presets/` holds draft configuration YAML files. Its `native/` subdirectory holds configurations matching a target model's native draft structure. A preset is read like any configuration file into the full frozen configuration before model construction; checkpoints persist the expanded configuration and never read the preset file on reload. Presets do not implement forward computation, load weights, or select training objectives.
 - `specforge/modeling/draft/layers/` holds the components. It is a sibling of `models/` because general and specialized models both use it.
 - `specforge/modeling/draft/heads/` holds algorithm heads, and `backbone.py` holds `DraftBackbone`.
@@ -553,10 +549,11 @@ No single registry links configuration, models, training protocols, and adapters
 | Family configuration classes stay in checkpoint formats | `Qwen3Config`, `DeepseekV3Config`, and similar classes are imported only under `checkpoint/formats/` |
 | No mutable mirrors | Nothing writes to the configuration or to a value copied from it after construction, and `hash(model.config.draft)` is unchanged after building the model and running a training step |
 | Values cross packages as nodes | Registered objectives, data dispatch, and launch components take configuration nodes, not copied scalars such as `block_size` |
-| One owner per derivation | Fixture tests compare the derived quantities that consumers use, including SGLang's, with the spec methods |
+| One owner per derivation | Fixture tests compare the derived quantities that consumers use, including the values the SGLang converter writes, with the spec methods |
+| Copies from the target are strict | A `from_target` mapping that leaves a draft parameter without a tensor, leaves a target tensor unused, or mismatches a name or shape fails before training and names the tensors |
 | No structural fields in training configuration | The training schema forbids extra fields and rejects structural names |
 | Registries agree | Every architecture has a spec, a model class named after it, a compatible default objective that covers its serving-time modules, and, where applicable, a converter; every registered component kind has both a schema and a builder |
-| Canonical names never reach SGLang's legacy model classes | Registered architecture names are compared with a frozen list of the names that released SGLang versions register |
+| Canonical names never reach SGLang's model classes | Registered architecture names are compared with a frozen list of the names that released SGLang versions register |
 | SGLang's Transformers backend refuses draft classes | `is_backend_compatible()` is False for every registered model class |
 
 These checks target independent sources of the same value. Read-only values that a module derives from its own node at construction, and HF metadata on the shell, are allowed.
@@ -580,8 +577,8 @@ Proceed incrementally and keep existing entry points until migration is complete
 3. Components behind node-only constructors.
 4. Algorithm models as compositions, with heads extracted.
 5. One training objective per algorithm.
-6. The switch to canonical artifacts, in one PR: training checkpoints and `--format hf` write canonical configurations, and the SGLang converter covers every algorithm. The usage guide (Section 6) lists the resulting changes for users. Native SGLang support for canonical configurations follows in SGLang, with shared fixtures.
-7. Target bindings, starting with the embeddings and LM heads that drafts already share, then compatible component-built layers.
+6. The switch to canonical artifacts, in one PR: training checkpoints and `--format hf` write canonical configurations, the embeddings and LM heads that drafts already share become `target_bindings`, and the SGLang converter covers every algorithm. The usage guide (Section 6) lists the resulting changes for users. SGLang keeps reading only its own format.
+7. Strict `initialization.from_target` copies, with the CI equivalence check for each bundled preset that copies target layers.
 
 Steps 1 to 5 are behaviour-equivalent: they change no file format, command flag, or numerics, and checks 1 and 2 hold after each step. Every user-visible change waits for step 6.
 
@@ -589,15 +586,16 @@ Checks:
 
 1. With identical weights and inputs, outputs match before and after base-class replacement, and initialization and gradient checkpointing are preserved.
 2. Encoding round-trips. Every existing configuration decodes and builds a model whose parameter names, shapes, and forward outputs on identical weights are bit-identical to those of the model that main builds from the same file. Existing checkpoints load, including EAGLE3 warm-start checkpoints.
-3. Derived algorithm quantities, especially block semantics, agree between SpecForge and SGLang on shared fixtures.
+3. For every architecture, the SGLang export loads in the pinned SGLang version, and its block quantities and draft outputs on reference inputs match SpecForge's.
 4. Forward, backward, and parameter-update checks pass for every declared component combination.
 5. Supported backend and Ring combinations preserve masks, and their outputs match the eager backend within each combination's measured tolerance. Unsupported combinations fail before execution.
 6. Specialized architectures use their declared components and reject configurations that violate fixed structural constraints before construction.
-7. A released SGLang version without canonical support rejects a canonical directory instead of serving it with default settings, including an HF export loaded with `--trust-remote-code`.
+7. SGLang rejects a canonical directory instead of serving it with default settings, including an HF export loaded with `--trust-remote-code`.
 8. The boundary tests in Section 9.3 pass.
 9. A bundled preset YAML, an equivalent user configuration file, and inline YAML produce the same `DraftConfig` without dispatching on file names or directories. Native presets build only registered components and match the native computation on reference weights and inputs.
-10. Bound parameters are frozen, are excluded from the draft checkpoint, and are restored from the target when the checkpoint is loaded.
+10. Bound embeddings and LM heads are frozen, are excluded from the draft checkpoint, and are restored from the target when the checkpoint is loaded.
 11. Two draft architectures load in one process, are saved, and reload with the same `DraftConfig`, both through SpecForge's loader and through Transformers with the exported `auto_map`.
 12. Exporting to each format and re-importing gives identical weights and forward outputs.
 13. For every existing configuration, the `config.json` that the SGLang converter writes equals the one that main's `--to hf` export writes, except for listed differences that SGLang does not read.
 14. With each architecture's default objective, every module that the architecture uses at serving time receives a gradient.
+15. Each bundled preset that copies target layers reproduces the target layer's output with the copied weights, zero context length, and a causal mask.
