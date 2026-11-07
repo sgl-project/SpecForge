@@ -225,7 +225,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "domino": dflash_family,
             "dspark": dflash_family,
             "dspine": dflash_family,
-            "mtp": SimpleNamespace(),
+            "mtp": SimpleNamespace(num_steps=3, ploss_decay=0.6),
         }
         expected_keys = {
             "eagle3": {
@@ -277,6 +277,8 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "mtp_draft_vocab_size",
                 "mtp_share_lm_head",
                 "mtp_attention_backend",
+                "mtp_num_steps",
+                "mtp_ploss_decay",
             },
         }
 

@@ -738,6 +738,34 @@ class TestMultiServerProducer(unittest.TestCase):
             },
         )
 
+    @patch.dict(os.environ, {"SPECFORGE_LENGTH_BUCKET": "4"})
+    def test_bucketed_prompt_ingest_keeps_all_samples_across_epochs(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        prompts = list(reversed(_prompts(7)))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            prompts,
+            store,
+            channel,
+            lease=2,
+            prompt_epochs=2,
+            prompt_ingest_batch_size=3,
+        )
+
+        self.assertEqual(drive(), 14)
+        self.assertCountEqual(
+            _published_sample_ids(channel.path),
+            [
+                f"run0:epoch{epoch:04d}-prompt{index:012d}"
+                for epoch in range(2)
+                for index in range(7)
+            ],
+        )
+        self.assertTrue(channel.is_closed())
+
     def test_prompt_epoch_order_is_seeded_and_reconstruction_stable(self):
         prompts = _prompts(12)
 

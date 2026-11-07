@@ -418,13 +418,82 @@ def _epoch_online_prompts(
     ]
 
 
+_LENGTH_BUCKET_ENV = "SPECFORGE_LENGTH_BUCKET"
+
+
+def _prompt_length(prompt) -> int:
+    """Length proxy for length bucketing: exact prompt tokens when known."""
+    if not isinstance(prompt, dict):
+        return 0
+    payload = prompt.get("payload")
+    if isinstance(payload, dict):
+        ids = payload.get("input_ids")
+        if ids is not None:
+            try:
+                return len(ids)
+            except TypeError:
+                pass
+    total = 0
+    msgs = prompt.get("messages")
+    if msgs is None:
+        msgs = prompt.get("conversations") or []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        total += len(text)
+                elif isinstance(part, str):
+                    total += len(part)
+    single = prompt.get("prompt")
+    if isinstance(single, str):
+        total += len(single)
+    return total
+
+
+def _length_bucket_size() -> int:
+    """Samples per bucket; opt in through the producer environment."""
+    raw = os.environ.get(_LENGTH_BUCKET_ENV)
+    if raw is None or not raw.strip():
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
 def _epoch_prompt_indices(prompts, epoch: int, *, seed: int = 0):
-    """Return the legacy deterministic shuffle without materializing payloads."""
+    """Return a deterministic shuffle that groups similar lengths together.
+
+    Each capture batch is padded to its longest prompt, so randomly mixed
+    batches pay the longest sample's cost for every member.  Sorting by a
+    length proxy inside fixed-size blocks can reduce padding. Block membership
+    follows source order; block order is shuffled with seed + epoch. Every
+    sample appears exactly once. ``SPECFORGE_LENGTH_BUCKET`` defaults to 0
+    (legacy random order), also used when no prompt carries a length. A single
+    block retains its sorted order across epochs.
+    """
     import random
 
-    indices = list(range(len(prompts)))
-    random.Random(int(seed) + int(epoch)).shuffle(indices)
-    return indices
+    rng = random.Random(int(seed) + int(epoch))
+    n = len(prompts)
+    block = _length_bucket_size()
+    lengths = [_prompt_length(prompts[i]) for i in range(n)] if block > 1 else []
+    if block <= 1 or not any(lengths):
+        indices = list(range(n))
+        rng.shuffle(indices)
+        return indices
+    blocks = [list(range(start, min(start + block, n))) for start in range(0, n, block)]
+    for members in blocks:
+        members.sort(key=lambda i: lengths[i])
+    rng.shuffle(blocks)
+    return [index for members in blocks for index in members]
 
 
 def _epoch_online_prompt(prompt, index: int, epoch: int, prompt_epochs: int):
@@ -956,6 +1025,7 @@ def build_disagg_online_producer(
         f"algorithm={algorithm.name} modality={modality} "
         f"base_prompts={base_prompt_count} "
         f"prompt_epochs={prompt_epochs} "
+        f"length_bucket_size={_length_bucket_size()} "
         f"prompt_ingest_batch_size={prompt_ingest_batch_size} "
         f"lease={worker_lease} workers={num_rollout_workers} "
         f"concurrency={producer_concurrency} "

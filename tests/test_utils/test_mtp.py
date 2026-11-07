@@ -78,7 +78,7 @@ class OnlineMTPModelTest(unittest.TestCase):
         model = OnlineMTPModel(Qwen3_5MTPDraftModel(config))
         input_ids, hidden_states, loss_mask = _tiny_batch(config)
 
-        loss, corrects, denoms = model(
+        loss, corrects, denoms, *_metrics = model(
             input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
         )
 
@@ -96,7 +96,7 @@ class OnlineMTPModelTest(unittest.TestCase):
         model = OnlineMTPModel(draft)
         input_ids, hidden_states, loss_mask = _tiny_batch(config)
 
-        loss, _, _ = model(
+        loss, *_metrics = model(
             input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
         )
         loss.backward()
@@ -161,7 +161,7 @@ class OnlineMTPModelTest(unittest.TestCase):
                     denoms = [mask]
                 else:
                     model = OnlineMTPModel(current, objective_chunk_size=chunk_size)
-                    loss, corrects, denoms = model(
+                    loss, corrects, denoms, *_metrics = model(
                         input_ids=input_ids, hidden_states=inputs, loss_mask=loss_mask
                     )
                 loss.backward()
@@ -259,7 +259,7 @@ class MTPTrainStrategyTest(unittest.TestCase):
                 self.proj = torch.nn.Linear(1, 1)
 
             def forward(self, input_ids, hidden_states, loss_mask):
-                return loss, corrects, denoms
+                return loss, corrects, denoms, [loss.detach()], [denoms[0].sum()]
 
         strategy = MTPTrainStrategy(_Stub())
         batch = SimpleNamespace(

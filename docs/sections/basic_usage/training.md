@@ -533,6 +533,30 @@ without `training.total_steps`, the fallback optimizer/loss schedule horizon.
 stop an online stream. When a finite online run omits both, the producer
 publishes the exact schedule horizon and the consumer trains to EOF.
 
+### Online prompt length bucketing
+
+Set `SPECFORGE_LENGTH_BUCKET` in the producer environment to group similarly
+sized prompts before online capture:
+
+```bash
+SPECFORGE_LENGTH_BUCKET=2048 specforge train -c run.yaml
+```
+
+The value is the number of source samples per block. Each block is sorted by
+length, then block order is shuffled with `training.seed + epoch`. Tokenized
+payloads use the exact `input_ids` length; raw messages use text character
+counts as a proxy. This can reduce padding when neighboring prompts are
+captured together. Asynchronous capture completion and consumer dispatch may
+change the order seen by training, so a padding or throughput improvement is
+workload-dependent. Consumer dispatch policies are separate controls.
+
+The default is `0`, retaining the original random shuffle. Values at most 1,
+invalid values, or inputs with no usable lengths also use that shuffle. The
+plan preserves every sample once per epoch and keeps the existing epoch-specific
+sample IDs. Record the bucket size and seed with the run configuration to
+reconstruct the producer plan. A dataset fitting in one block retains the same
+length-sorted order across epochs.
+
 ## Parallel topologies
 
 The launcher creates every process group from the typed run config:
@@ -769,6 +793,40 @@ retain their original dtypes, but the exported config falls back to BF16.
 Default reloading therefore does not guarantee restoration of each tensor's
 original precision. Native mixed-precision or quantized MTP models require
 model-specific loading and export support beyond this precision guarantee.
+
+MTP trains one prediction step by default. To train the same native head as a
+three-step chain, configure:
+
+```yaml
+training:
+  strategy: mtp
+  attention_backend: sdpa
+  mtp_num_steps: 3
+  mtp_ploss_decay: 0.8
+```
+
+Step `i` reuses the previous step's hidden states and predicts the label shifted
+by `2 + i` tokens. Its cross-entropy mean has weight `mtp_ploss_decay ** i`.
+The default single-step objective keeps weight 1, regardless of the decay.
+
+The vocabulary head and cross-entropy process only positions with nonzero
+supervision weights; the draft backbone still processes the full context.
+This reduces projection work on masked prompts and padding while preserving
+the weighted objective and the original per-position metric layout. An empty
+supervision mask retains zero gradients for the hidden states and trainable head.
+
+Multi-step training currently requires equal supervised-token counts at every
+chain depth so that gradient accumulation and data-parallel reduction preserve
+this objective. `loss_mask[:, 2:mtp_num_steps + 1]` must therefore be zero;
+ordinary assistant-only supervision with a masked prompt prefix satisfies this
+condition. Unsupported masks raise before the model forward instead of silently
+changing the weighting. Sequences must be longer than `mtp_num_steps`.
+
+Full-run checkpoints record both chain depth and loss decay, and resume rejects
+a change to either. For checkpoints from before these fields were recorded, use
+`model.draft_checkpoint_path` to warm-start a new run rather than assuming the
+previous objective. These controls train the draft head; acceptance length and
+serving throughput must be evaluated separately.
 
 MTP is deployed by merging its trained native head back into the target model.
 The merge command accepts the same runtime checkpoint shapes as the generic
