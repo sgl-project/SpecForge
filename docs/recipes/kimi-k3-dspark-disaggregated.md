@@ -18,7 +18,7 @@ effective global batch, constant learning rate, and DSpark loss weights.
 - SpecForge with configurable LR scheduling, an independent online prompt
   seed, and dedicated DSpark capture support.
 - A Kimi K3 SGLang build containing the generic capture extension APIs required
-  by [the capture plugin](../../plugins/sglang-spec-capture/README.md), with
+  by [the capture plugin](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md), with
   `set_dspark_layers_to_capture` support. The historical `ee560a2` baseline
   alone is insufficient for plugin capture.
 - Install `pip install --no-deps plugins/sglang-spec-capture` in the capture

@@ -91,7 +91,7 @@ python -m pip install --no-deps tensorboard tensorboard-data-server absl-py mark
 
 The images' stock SGLang 0.5.18 lacks the generic capture extension APIs.
 Use a separate ROCm-compatible SGLang environment with the APIs documented in
-[the plugin guide](../../../../plugins/sglang-spec-capture/README.md), then install:
+[the plugin guide](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md), then install:
 
 ```bash
 python -m pip install --no-deps plugins/sglang-spec-capture
@@ -150,7 +150,7 @@ radix cache selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU
 (FLA) at server init and fails on ROCm:
 
 Start the compatible plugin server and Mooncake following the
-[offline guide](../../../../examples/offline/README.md), with
+[offline guide](https://github.com/sgl-project/SpecForge/blob/main/examples/offline/README.md), with
 `SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1`
 and server flags `--attention-backend aiter --disable-radix-cache
 --mem-fraction-static 0.8 --context-length 2560`. Then run the CPU client:
