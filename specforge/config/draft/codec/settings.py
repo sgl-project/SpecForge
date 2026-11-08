@@ -4,11 +4,12 @@ from collections.abc import Mapping
 from dataclasses import asdict
 
 from ..logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
-from ..rope import DefaultRoPESpec, LinearRoPESpec, NoRoPESpec, RopeSpec
+from ..rope import DefaultRoPESpec, LinearRoPESpec, NoRoPESpec, RopeSpec, YaRNSpec
 from ._schema import _construct
 
 _ROPE = {
-    schema.rope_type: schema for schema in (DefaultRoPESpec, LinearRoPESpec, NoRoPESpec)
+    schema.rope_type: schema
+    for schema in (DefaultRoPESpec, LinearRoPESpec, NoRoPESpec, YaRNSpec)
 }
 _LOGITS = {
     schema.type: schema for schema in (NoLogitTransformSpec, MuPLogitTransformSpec)

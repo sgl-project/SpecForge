@@ -4,6 +4,7 @@ from collections.abc import Mapping
 
 from ..._validation import boolean, positive_int
 from ..settings import decode_rope
+from .yarn import expand_yarn
 
 _MISSING = object()
 
@@ -45,6 +46,8 @@ def resolve_rope(payload: Mapping):
         values["partial_rotary_factor"] = resolve_alias(
             "partial_rotary_factor", values, payload, default=1.0
         )
+        if values["rope_type"] == "yarn":
+            values = expand_yarn(values, payload.get("max_position_embeddings", 32768))
         return decode_rope(values)
 
     result = normalize(modern if modern is not None else (scaling or {}))
