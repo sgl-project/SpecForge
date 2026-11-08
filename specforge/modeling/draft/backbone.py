@@ -5,25 +5,10 @@ from dataclasses import dataclass, field, replace
 
 import torch
 from torch import Tensor, nn
-from torch.nn.attention.flex_attention import BlockMask
 from torch.utils.checkpoint import checkpoint
 
+from .layers.inputs import LayerInputs
 from .layers.residual import ResidualStreams
-
-
-@dataclass(frozen=True, eq=False, kw_only=True)
-class LayerInputs:
-    """Prepared runtime inputs, without algorithm settings or mutable KV caches.
-
-    Masks may be additive/boolean tensors or prebuilt FlexAttention block masks.
-    RoPE can be supplied directly or computed from this layer's position_ids.
-    Tensor contents must not be mutated while their autograd graph is live.
-    """
-
-    target_context: Tensor | None = None
-    attention_mask: Tensor | BlockMask | None = None
-    position_ids: Tensor | None = None
-    position_embeddings: tuple[Tensor, Tensor] | None = None
 
 
 @dataclass(frozen=True, eq=False)

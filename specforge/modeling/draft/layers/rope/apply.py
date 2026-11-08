@@ -4,11 +4,18 @@ import torch
 from torch import Tensor
 
 
-def apply_rotary(hidden: Tensor, position_embeddings: tuple[Tensor, Tensor]) -> Tensor:
+def apply_rotary(
+    hidden: Tensor,
+    position_embeddings: tuple[Tensor, Tensor],
+    *,
+    interleaved: bool = False,
+) -> Tensor:
     """Rotate [batch, heads, sequence, dim] using [batch, sequence, rotary_dim].
 
     Queries and keys may have different head counts or positions; callers select
     their embeddings separately. Dimensions after rotary_dim pass through.
+    Embeddings always duplicate the frequency half; interleaved=True pairs
+    adjacent activation channels instead of the first and second halves.
     """
     cos, sin = position_embeddings
     if hidden.ndim != 4 or cos.ndim != 3 or sin.shape != cos.shape:
@@ -17,7 +24,14 @@ def apply_rotary(hidden: Tensor, position_embeddings: tuple[Tensor, Tensor]) -> 
     if dim < 2 or dim % 2 or dim > hidden.shape[-1]:
         raise ValueError("rotary dimension must be positive, even, and fit the head")
     rotated, tail = hidden[..., :dim], hidden[..., dim:]
-    first, second = rotated.chunk(2, dim=-1)
-    half_rotated = torch.cat((-second, first), dim=-1)
+    if interleaved:
+        cos = cos[..., : dim // 2].repeat_interleave(2, dim=-1)
+        sin = sin[..., : dim // 2].repeat_interleave(2, dim=-1)
+        half_rotated = torch.stack(
+            (-rotated[..., 1::2], rotated[..., ::2]), dim=-1
+        ).flatten(-2)
+    else:
+        first, second = rotated.chunk(2, dim=-1)
+        half_rotated = torch.cat((-second, first), dim=-1)
     output = rotated * cos.unsqueeze(1) + half_rotated * sin.unsqueeze(1)
     return torch.cat((output, tail), dim=-1)
