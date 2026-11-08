@@ -22,6 +22,7 @@ from specforge.config.draft.norm import RMSNormSpec
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
+from tests.test_checkpoint.test_native_presets import native_configs
 from tests.test_checkpoint.test_sglang_export import serving_configs
 from tests.test_config.test_draft_mtp_spec import mtp_config
 
@@ -123,6 +124,7 @@ class SGLangCompatibilityTest(unittest.TestCase):
             stack.enter_context(patch("sglang.srt.models.utils._is_cuda", False))
             configs = serving_configs()
             if torch.cuda.is_available():
+                configs.extend(native_configs(small=True))
                 base = mtp_config()
                 configs.append(
                     replace(
