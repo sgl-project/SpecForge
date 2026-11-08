@@ -5,29 +5,11 @@ from dataclasses import dataclass, field, replace
 
 import torch
 from torch import Tensor, nn
-from torch.nn.attention.flex_attention import BlockMask
 from torch.utils.checkpoint import checkpoint
 
-from .layers.attention.backends import PreparedAttention
+from .layers.inputs import LayerInputs
 from .layers.residual import ResidualStreams
 from .layers.rope.base import RotaryEmbedding
-
-
-@dataclass(frozen=True, eq=False, kw_only=True)
-class LayerInputs:
-    """Prepared runtime inputs, without algorithm settings or mutable KV caches.
-
-    Attention is prepared once by the model and reused across equivalent layers.
-    The legacy attention_mask field accepts tensor or FlexAttention masks.
-    RoPE can be supplied directly or computed from this layer's position_ids.
-    Tensor contents must not be mutated while their autograd graph is live.
-    """
-
-    attention: PreparedAttention | None = None
-    target_context: Tensor | None = None
-    attention_mask: Tensor | BlockMask | None = None
-    position_ids: Tensor | None = None
-    position_embeddings: tuple[Tensor, Tensor] | None = None
 
 
 @dataclass(frozen=True, eq=False)
