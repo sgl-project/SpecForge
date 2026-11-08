@@ -272,12 +272,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspine_attention_backend",
                 "dspine_loss_decay_gamma",
             },
-            "mtp": {
-                "mtp_draft_num_hidden_layers",
-                "mtp_draft_vocab_size",
-                "mtp_share_lm_head",
-                "mtp_attention_backend",
-            },
+            "mtp": set(),
         }
 
         for name in BUILTINS:

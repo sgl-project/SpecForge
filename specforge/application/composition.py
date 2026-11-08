@@ -59,6 +59,12 @@ def resolve_run(
             cfg, registry, target_config=target_config
         )
         return bind_run(cfg, algorithm)
+    if cfg.training.strategy == "mtp":
+        raise ValueError(
+            "MTP now requires draft and initialization (or resume); "
+            "use the native preset for target initialization, or "
+            "initialization.checkpoint to import historical draft weights"
+        )
     try:
         algorithm = registry.resolve(cfg.training.strategy)
     except KeyError as exc:

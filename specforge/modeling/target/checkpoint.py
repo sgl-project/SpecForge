@@ -9,8 +9,6 @@ an intentional full load. Both sharded checkpoints
 
 from __future__ import annotations
 
-import glob
-import json
 import os
 from typing import Callable, Dict, Iterable, List, Optional
 
@@ -77,15 +75,6 @@ def _read_weight_map_file(index_path: str) -> Dict[str, str]:
     ):
         raise ValueError(f"Checkpoint index has an invalid weight_map: {index_path}")
     return weight_map
-
-
-def _weight_artifact_paths(checkpoint_dir: str) -> set[str]:
-    """Return top-level files that can participate in weight resolution."""
-
-    paths: set[str] = set()
-    for pattern in ("*.index.json", "*.safetensors", "*.bin"):
-        paths.update(glob.glob(os.path.join(checkpoint_dir, pattern)))
-    return paths
 
 
 def resolve_checkpoint_dir(
@@ -227,134 +216,9 @@ def load_checkpoint_tensors(
     return selected
 
 
-def merge_state_into_checkpoint(
-    base_checkpoint_dir: str,
-    state: Dict[str, torch.Tensor],
-    output_dir: str,
-    *,
-    shard_name: str,
-    drop_prefixes: Iterable[str] = (),
-) -> None:
-    """Merge a state dict into a copy of a base checkpoint (model-agnostic).
-
-    Copies non-weight files, drops base weight entries under ``drop_prefixes``,
-    and merges ``state``.  Sharded bases get ``state`` written to a new
-    ``shard_name`` shard with the index ``weight_map`` updated in place (the
-    large base shards are never rewritten); single-file bases are rewritten
-    whole under their original file name.
-    """
-
-    import shutil
-
-    from safetensors.torch import save_file
-
-    if os.path.realpath(base_checkpoint_dir) == os.path.realpath(output_dir):
-        raise ValueError("base_checkpoint_dir and output_dir must be different")
-
-    os.makedirs(output_dir, exist_ok=True)
-    prefixes = tuple(drop_prefixes)
-    layout_kind, base_weight_path = _resolve_weight_layout(base_checkpoint_dir)
-
-    # A pre-existing model.safetensors, index, or shard may outrank the layout
-    # written below and make the merged checkpoint load stale weights. Refuse
-    # that ambiguous destination instead of deleting user files implicitly.
-    existing_weight_files = sorted(_weight_artifact_paths(output_dir))
-    if existing_weight_files:
-        raise FileExistsError(
-            f"Output directory already contains checkpoint weight files: "
-            f"{existing_weight_files}"
-        )
-
-    # Copy non-weight files so the output directory is self-contained. Only
-    # the selected model-weight representation is written below; copying an
-    # alternate representation would leave a stale model in the output.
-    weight_files = {
-        os.path.basename(path) for path in _weight_artifact_paths(base_checkpoint_dir)
-    }
-    for fname in os.listdir(base_checkpoint_dir):
-        src = os.path.join(base_checkpoint_dir, fname)
-        if os.path.isfile(src) and fname not in weight_files:
-            shutil.copy2(src, os.path.join(output_dir, fname))
-
-    if layout_kind == "index":
-        with open(base_weight_path, encoding="utf-8") as f:
-            index = json.load(f)
-        weight_map = _read_weight_map_file(base_weight_path)
-        shard_formats = {
-            "safetensors" if name.endswith(".safetensors") else "bin"
-            for name in weight_map.values()
-        }
-        if len(shard_formats) != 1:
-            raise ValueError(
-                f"Checkpoint index mixes weight formats: {base_weight_path}"
-            )
-
-        old_keys = [k for k in weight_map if k.startswith(prefixes)]
-        for key in old_keys:
-            del weight_map[key]
-        if old_keys:
-            print(
-                f"Replaced {len(old_keys)} weight entries under {prefixes} "
-                "from base model."
-            )
-
-        for base_shard in sorted(set(weight_map.values())):
-            source_path = os.path.join(base_checkpoint_dir, base_shard)
-            if not os.path.isfile(source_path):
-                raise FileNotFoundError(
-                    f"Checkpoint index {base_weight_path} references missing "
-                    f"shard {source_path}"
-                )
-            destination_path = os.path.join(output_dir, base_shard)
-            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-            shutil.copy2(source_path, destination_path)
-
-        # Write the incoming tensors in the index's existing format; base
-        # shards remain untouched.
-        shard_format = shard_formats.pop()
-        shard_suffix = ".safetensors" if shard_format == "safetensors" else ".bin"
-        output_shard_name = os.path.splitext(shard_name)[0] + shard_suffix
-        output_shard_path = os.path.join(output_dir, output_shard_name)
-        if shard_format == "safetensors":
-            save_file(state, output_shard_path)
-        else:
-            torch.save(state, output_shard_path)
-        for key in state.keys():
-            weight_map[key] = output_shard_name
-
-        index["weight_map"] = weight_map
-        with open(
-            os.path.join(output_dir, os.path.basename(base_weight_path)),
-            "w",
-            encoding="utf-8",
-        ) as f:
-            json.dump(index, f, indent=2)
-        return
-
-    # Single-file base: load, drop, merge, rewrite under the original name.
-    base_state = load_checkpoint_tensors(base_checkpoint_dir)
-    out_name = os.path.basename(base_weight_path)
-
-    old_keys = [k for k in base_state if k.startswith(prefixes)]
-    for key in old_keys:
-        del base_state[key]
-    if old_keys:
-        print(
-            f"Replaced {len(old_keys)} weight entries under {prefixes} "
-            "from base model."
-        )
-
-    merged = {**base_state, **state}
-    if out_name.endswith(".safetensors"):
-        save_file(merged, os.path.join(output_dir, out_name))
-    else:
-        torch.save(merged, os.path.join(output_dir, out_name))
-
-
 __all__ = [
     "list_checkpoint_keys",
     "load_checkpoint_tensors",
-    "merge_state_into_checkpoint",
     "read_weight_map",
     "resolve_checkpoint_dir",
 ]

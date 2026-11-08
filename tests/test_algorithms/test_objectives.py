@@ -153,15 +153,13 @@ class ObjectiveTest(unittest.TestCase):
         model = build_draft_model(config)
         batch = training_batch(config)
         captured = []
-        handle = model.register_forward_hook(
-            lambda module, args, output: captured.append(output.logits)
+        handle = model.lm_head.register_forward_hook(
+            lambda module, args, output: captured.append(output)
         )
         result = build_objective_model(model)(batch)
         handle.remove()
         labels = batch["input_ids"][:, 2:8]
-        reference = torch.nn.functional.cross_entropy(
-            captured[0][:, :6].flatten(0, 1), labels.flatten()
-        )
+        reference = torch.nn.functional.cross_entropy(captured[0][:6], labels.flatten())
         torch.testing.assert_close(result.loss, reference)
 
     def test_domino_reuses_base_logits_and_aligned_predecessors(self):

@@ -96,20 +96,6 @@ def _cpu_max_valid_anchors(loss_mask: torch.Tensor) -> Optional[int]:
     return int(valid.sum(dim=1).max().item())
 
 
-def _cpu_supervised_rows(loss_mask: torch.Tensor) -> Optional[torch.Tensor]:
-    """Find the MTP positions with loss without synchronizing the GPU.
-
-    OnlineMTPModel runs lm_head + CE only on positions whose x[t+2] label is
-    supervised, i.e. the flat nonzero indices of ``loss_mask[:, 2:]`` padded by
-    one. ``nonzero`` has a data-dependent size, so on the host it is cheap and
-    on the GPU it syncs. Direct GPU callers keep the model's fallback.
-    """
-    if loss_mask.device.type != "cpu":
-        return None
-    shifted = nn.functional.pad(loss_mask[:, 2:], (0, 1))
-    return shifted.reshape(-1).nonzero(as_tuple=True)[0]
-
-
 class DraftTrainStrategy(abc.ABC):
     name: str
     required_features: set
@@ -642,69 +628,6 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            k.replace("draft_model.", ""): v
-            for k, v in state_dict.items()
-            if "draft_model." in k
-        }
-
-
-class MTPTrainStrategy(DraftTrainStrategy):
-    """MTP strategy over ``OnlineMTPModel`` with final-hidden supervision."""
-
-    name = "mtp"
-    required_features = {
-        "input_ids",
-        "loss_mask",
-        "target_last_hidden_states",
-    }
-
-    def __init__(self, mtp_model: nn.Module) -> None:
-        self.mtp_model = mtp_model
-
-    def trainable_module(self) -> nn.Module:
-        return self.mtp_model
-
-    def _device(self) -> torch.device:
-        return next(self.mtp_model.parameters()).device
-
-    def forward_loss(
-        self, batch: TrainBatch, ctx: Optional[StepContext] = None
-    ) -> StepOutput:
-        self.validate_batch(batch)
-        t = batch.tensors
-        device = self._device()
-        supervised_rows = _cpu_supervised_rows(t["loss_mask"])
-        if supervised_rows is not None and device.type != "cpu":
-            supervised_rows = supervised_rows.pin_memory().to(device, non_blocking=True)
-        # OnlineMTPModel performs the next-token shift internally and returns
-        # per-position correct/denominator tensors (single-layer: length-1 lists).
-        # Non-blocking like the other strategies: pinned Mooncake receives keep
-        # integer features on the host, and a blocking H2D would sync the GPU.
-        loss, corrects, denoms = self.mtp_model(
-            input_ids=t["input_ids"].to(device, non_blocking=True),
-            hidden_states=t["target_last_hidden_states"].to(device, non_blocking=True),
-            loss_mask=t["loss_mask"].to(device, non_blocking=True),
-            supervised_rows=supervised_rows,
-        )
-        correct_sum = corrects[0].sum()
-        denom_sum = denoms[0].sum()
-        metrics = {
-            "accuracy": (correct_sum / denom_sum.clamp_min(1)).detach(),
-            "accuracy_denom": denom_sum.detach(),
-        }
-        return StepOutput(
-            loss=loss,
-            metrics=metrics,
-            ratio_metrics={"accuracy": (correct_sum, denom_sum)},
-            # TrainerCore backpropagates additive numerators and divides by the
-            # global token denominator across accumulation steps / DP ranks.
-            loss_terms=(loss * denom_sum, denom_sum),
-        )
-
-    def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
-        # Everything trainable lives under draft_model.; persisting the stripped
-        # keys (embed_tokens.* + mtp.*) matches the native serving layout.
         return {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()

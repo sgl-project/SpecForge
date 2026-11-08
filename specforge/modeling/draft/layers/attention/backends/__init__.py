@@ -11,6 +11,7 @@ from .dense import EagerAttentionBackend, SDPAAttentionBackend
 from .eager import eager_attention
 from .flash import FlashAttentionBackend
 from .flex import FlexAttentionBackend
+from .sdpa import sdpa_attention
 
 _BACKENDS = {
     "eager": EagerAttentionBackend(),
@@ -42,4 +43,5 @@ __all__ = [
     "PaddingMask",
     "resolve_attention_backend",
     "eager_attention",
+    "sdpa_attention",
 ]

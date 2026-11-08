@@ -51,6 +51,8 @@ def register_draft(cls: Optional[type] = None, *, name: Optional[str] = None):
 
 
 def resolve_draft(name: str) -> type:
+    from . import legacy  # noqa: F401
+
     try:
         return DRAFT_REGISTRY[name]
     except KeyError:
@@ -60,6 +62,8 @@ def resolve_draft(name: str) -> type:
 
 
 def available_drafts() -> List[str]:
+    from . import legacy  # noqa: F401
+
     return sorted(DRAFT_REGISTRY)
 
 

@@ -32,6 +32,12 @@ use the source dtype or exact widening (for example BF16 to FP32). Narrowing
 fails before reading tensors. Copied weights remain trainable and are saved;
 optional `training.frozen` prefixes freeze them independently of initialization.
 
+MTP training supports `training.attention_backend: eager` or `sdpa`.
+`training.objective_options.objective_chunk_size` defaults to 4096 token positions;
+0 disables chunking. Each chunk computes LM head and loss together and is
+recomputed during backward, bounding saved logits as well as forward temporaries.
+This does not bound attention or backbone activation memory.
+
 For continuation use `initialization.checkpoint`; for full training resume use
 `resume`. Neither takes `from_target`. To merge trained weights back into a
 separate target directory, use `specforge export --format sglang --target-model
