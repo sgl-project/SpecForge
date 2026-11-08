@@ -30,6 +30,10 @@ class AutoDraftConfig:
     def from_dict(cls, payload: Mapping[str, Any]) -> PretrainedConfig:
         if not isinstance(payload, Mapping):
             raise ValueError("draft config must be a JSON object")
+        if payload.get("model_type") == "specforge_draft":
+            raise ValueError(
+                "canonical drafts must use SpecForgeDraftConfig or load_draft"
+            )
         payload = copy.deepcopy(dict(payload))
         architectures = payload.get("architectures")
         if (
