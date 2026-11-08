@@ -10,7 +10,7 @@ class RotaryEmbedding(nn.Module):
     """Derived frequencies are rebuilt on the input device, never checkpointed.
 
     This avoids rounding them during module casts or leaving uninitialized
-    buffers after meta loading. Subclasses change only the frequency rule.
+    buffers after meta loading. Subclasses own frequency and amplitude rules.
     """
 
     def __init__(self, config: RotarySpec, *, head_dim: int):
@@ -27,6 +27,9 @@ class RotaryEmbedding(nn.Module):
             )
         )
 
+    def _cos_sin(self, angles: Tensor) -> tuple[Tensor, Tensor]:
+        return angles.cos(), angles.sin()
+
     @torch.no_grad()
     def forward(self, hidden: Tensor, position_ids: Tensor) -> tuple[Tensor, Tensor]:
         """Return [batch, sequence, rotary_dim] cosine/sine for explicit positions."""
@@ -37,4 +40,5 @@ class RotaryEmbedding(nn.Module):
             positions = position_ids.to(device=hidden.device, dtype=torch.float32)
             freqs = positions.unsqueeze(-1) * inv_freq
             angles = torch.cat((freqs, freqs), dim=-1)
-            return angles.cos().to(hidden.dtype), angles.sin().to(hidden.dtype)
+            cos, sin = self._cos_sin(angles)
+            return cos.to(hidden.dtype), sin.to(hidden.dtype)

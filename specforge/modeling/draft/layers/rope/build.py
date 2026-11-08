@@ -6,17 +6,20 @@ from specforge.config.draft.rope import (
     Llama3RoPESpec,
     NoRoPESpec,
     RopeSpec,
+    YaRNSpec,
 )
 
 from .base import RotaryEmbedding
 from .default import DefaultRotaryEmbedding
 from .linear import LinearRotaryEmbedding
 from .llama3 import Llama3RotaryEmbedding
+from .yarn import YaRNRotaryEmbedding
 
 _BUILDERS = {
     DefaultRoPESpec: DefaultRotaryEmbedding,
     LinearRoPESpec: LinearRotaryEmbedding,
     Llama3RoPESpec: Llama3RotaryEmbedding,
+    YaRNSpec: YaRNRotaryEmbedding,
 }
 
 
