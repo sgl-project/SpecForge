@@ -15,7 +15,7 @@ from specforge.modeling.draft.dflash import apply_mla_rope
 from specforge.modeling.draft.layers.residual import StandardResidual
 from specforge.modeling.draft.layers.rope import DefaultRotaryEmbedding, apply_rotary
 from specforge.modeling.draft.llama3_eagle import LlamaRotaryEmbedding
-from specforge.modeling.draft.mtp.qwen3_5 import (
+from tests.test_modeling.mtp_reference import (
     PartialRotaryEmbedding,
     apply_rotary_pos_emb,
 )

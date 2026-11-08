@@ -274,7 +274,6 @@ DOC_ONLY_PACKAGE_INITIALIZERS = (
     "specforge/core/__init__.py",
     "specforge/data/__init__.py",
     "specforge/inference/__init__.py",
-    "specforge/modeling/__init__.py",
     "specforge/modeling/target/__init__.py",
 )
 
@@ -650,6 +649,12 @@ class TestPackageArchitecture(unittest.TestCase):
                 keyword.arg: keyword.value for keyword in controller_call.keywords
             }
             self.assertIs(controller_keywords["enable_sample_queue"].value, False, name)
+
+    def test_modeling_exports_only_canonical_construction(self):
+        self.assertEqual(
+            {"build_draft_model"},
+            _literal_all(REPO_ROOT / "specforge/modeling/__init__.py"),
+        )
 
     def test_aggregate_packages_stay_doc_only(self):
         for relative_path in DOC_ONLY_PACKAGE_INITIALIZERS:

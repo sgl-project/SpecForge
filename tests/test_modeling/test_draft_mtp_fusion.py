@@ -15,8 +15,8 @@ from specforge.config.draft.norm import RMSNormSpec
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models.assembly import build_decoder_backbone
 from specforge.modeling.draft.models.mtp_fusion import MTPInputFusion
-from specforge.modeling.draft.mtp.qwen3_5 import Qwen3_5RMSNorm
 from tests.test_config.test_draft_mtp_spec import mtp_config
+from tests.test_modeling.mtp_reference import OffsetRMSNorm
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -37,7 +37,7 @@ class MTPFusionTest(unittest.TestCase):
                     device=device,
                     dtype=dtype,
                 )
-                norm_cls = Qwen3_5RMSNorm if offset else Qwen3RMSNorm
+                norm_cls = OffsetRMSNorm if offset else Qwen3RMSNorm
                 reference = nn.ModuleDict(
                     {
                         "pre_fc_norm_embedding": norm_cls(32),

@@ -40,7 +40,7 @@ from specforge.core.lk_loss import (
     compute_lk_loss,
 )
 from specforge.core.loss import LogSoftmaxLoss
-from specforge.modeling.draft import Eagle3DraftModel
+from specforge.modeling.draft.base import Eagle3DraftModel
 from specforge.utils import padding
 
 

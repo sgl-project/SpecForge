@@ -10,7 +10,7 @@ from specforge.config.draft.rope import RopeSpec
 
 from ..registry import build_component, register_component_builder
 from ..rope import apply_rotary
-from .backends import eager_attention
+from .backends import eager_attention, sdpa_attention
 from .inputs import validate_attention_inputs
 from .masks import AttentionLayout, dense_attention_mask
 
@@ -38,8 +38,9 @@ class GQAAttention(nn.Module):
         if config.rope_parameters is not None and rope != config.rope_parameters:
             raise ValueError("rope must match the attention RoPE override")
         rotary_dim = rope.rotary_dim(config.head_dim)
-        if backend != "eager":
-            raise ValueError("GQAAttention currently supports only the eager backend")
+        if backend not in ("eager", "sdpa"):
+            raise ValueError("GQAAttention supports eager and sdpa backends")
+        self.attention = eager_attention if backend == "eager" else sdpa_attention
         self.config = config
         self.rotary_dim = rotary_dim
         self.q_norm = (
@@ -128,7 +129,7 @@ class GQAAttention(nn.Module):
         # FP32 norms/RoPE can promote Q/K under autocast. Preserve their precision
         # through softmax/dropout; the matmuls still follow the autocast policy.
         value = value.to(query.dtype)
-        output = eager_attention(
+        output = self.attention(
             query,
             key,
             value,

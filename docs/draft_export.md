@@ -52,7 +52,7 @@ loading rejects a serving artifact.
 | Domino | `DFlashDraftModel` with explicit Domino projector settings |
 | DSpark | `DSparkDraftModel`; Markov and confidence heads required by this converter |
 | EAGLE3 | `LlamaForCausalLMEagle3`; embedding bound, draft head owned |
-| MTP | Dense Qwen3.5 native merge-back; one layer, offset RMSNorm, default RoPE |
+| MTP | Dense Qwen3.5 native merge-back; one layer, offset RMSNorm, default or interleaved multi-axis RoPE |
 | DSpine, DMTP, P-EAGLE | Rejected: this pinned SGLang has no matching serving implementation |
 
 Supported DFlash-family layers use uniform dense SiLU MLPs, standard residuals,
