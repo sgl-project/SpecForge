@@ -289,6 +289,7 @@ class LoadingTest(unittest.TestCase):
                     payload["target_hidden_size"] = 32
                 if factory is eagle_payload:
                     payload["draft_vocab_size"] = 32
+                    payload["fc_norm"] = True
                 old = AutoDraftModel.from_config(
                     AutoDraftConfig.from_dict(payload)
                 ).float()

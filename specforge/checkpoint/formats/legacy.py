@@ -70,6 +70,7 @@ def read_legacy(payload, store, target_config):
             ("midlayer.", "backbone.layers.0."),
             ("norm.", "backbone.final_norm."),
             ("fc.", "fusion.fc."),
+            ("fc_norm.", "fusion.fc_norm."),
             ("hidden_norm.", "fusion.hidden_norm."),
             ("pre_fc_norm_embedding.", "fusion.pre_fc_norm_embedding."),
             ("pre_fc_norm_hidden.", "fusion.pre_fc_norm_hidden."),
