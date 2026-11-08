@@ -98,10 +98,20 @@ class GQAAttention(nn.Module):
             or target_context.shape[0] != batch
             or target_context.shape[-1] != hidden.shape[-1]
             or target_context.device != hidden.device
-            or target_context.dtype != hidden.dtype
+            or not target_context.is_floating_point()
+            or (
+                target_context.dtype != hidden.dtype
+                and not (
+                    torch.is_autocast_enabled(hidden.device.type)
+                    and hidden.dtype in (torch.float32, torch.float16, torch.bfloat16)
+                    and target_context.dtype
+                    in (torch.float32, torch.float16, torch.bfloat16)
+                )
+            )
         ):
             raise ValueError(
-                "target_context must match hidden batch, input width, dtype, and device"
+                "target_context must match hidden batch, input width, and device; "
+                "different floating dtypes require autocast"
             )
         context_length = 0 if target_context is None else target_context.shape[1]
         keys = context_length + length
