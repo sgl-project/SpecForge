@@ -3,8 +3,10 @@
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
+import torch
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
+from torch.utils.checkpoint import checkpoint
 
 from .layers.residual import ResidualStreams
 
@@ -64,6 +66,7 @@ class DraftBackbone(nn.Module):
         self.rotary = nn.ModuleList(rotary)
         self.residual = residual
         self._state_owner = object()
+        self.gradient_checkpointing = False
 
     @property
     def num_layers(self) -> int:
@@ -96,9 +99,16 @@ class DraftBackbone(nn.Module):
         self._check_state(state)
         if not 0 <= state.next_layer < self.num_layers:
             raise ValueError("no next layer remains")
-        hidden = self.layers[state.next_layer](
-            state.hidden, state.layer_inputs[state.next_layer]
-        )
+        layer = self.layers[state.next_layer]
+        inputs = state.layer_inputs[state.next_layer]
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            # Non-reentrant checkpointing retains gradients for nested context/RoPE
+            # tensors, and works when inputs are frozen but layer weights are not.
+            # Pass the selected module directly: recomputation must not close over
+            # an advancing layer index. Normal module hooks still run.
+            hidden = checkpoint(layer, state.hidden, inputs, use_reentrant=False)
+        else:
+            hidden = layer(state.hidden, inputs)
         return replace(state, hidden=hidden, next_layer=state.next_layer + 1)
 
     def finalize(self, state: BackboneState) -> Tensor:
