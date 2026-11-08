@@ -23,7 +23,6 @@ an optimizer, scheduler, controller counters, or RNG state.
 from __future__ import annotations
 
 import glob
-import json
 import logging
 import os
 from dataclasses import dataclass
@@ -90,75 +89,6 @@ def _looks_like_local_path(source: str) -> bool:
         or source.endswith(".json")
         or os.path.exists(os.path.expanduser(_without_file_uri(source)))
     )
-
-
-def _draft_config_from_dict(payload: Dict[str, Any]) -> "PretrainedConfig":
-    # Importing the draft package registers every built-in architecture before
-    # consulting the registry. Model modules keep accelerator-only dependencies
-    # behind execution boundaries, so this remains safe in a CPU producer.
-    import specforge.modeling.draft  # noqa: F401
-    from specforge.modeling.draft.registry import DRAFT_REGISTRY, available_drafts
-
-    payload = dict(payload)
-    architectures = payload.get("architectures") or []
-    if not isinstance(architectures, (list, tuple)) or len(architectures) != 1:
-        raise ValueError(
-            "draft config must name exactly one architecture; " f"got {architectures!r}"
-        )
-    architecture = architectures[0]
-    if architecture not in DRAFT_REGISTRY:
-        raise ValueError(
-            f"draft architecture {architecture!r} is not registered; "
-            f"available: {available_drafts()}"
-        )
-
-    payload["architectures"] = [architecture]
-    payload["tie_word_embeddings"] = False
-    payload.setdefault("use_cache", True)
-    if "draft_vocab_size" in payload and payload["draft_vocab_size"] is None:
-        raise ValueError("draft config draft_vocab_size cannot be null")
-    if "draft_vocab_size" not in payload:
-        payload["draft_vocab_size"] = payload.get("vocab_size")
-    return DRAFT_REGISTRY[architecture].config_class.from_dict(payload)
-
-
-def load_draft_config_source(
-    source: str,
-    *,
-    cache_dir: Optional[str] = None,
-    trust_remote_code: bool = False,
-) -> "PretrainedConfig":
-    """Load a registered draft config from JSON, a directory, or an HF repo."""
-
-    if not source:
-        raise ValueError("draft config source must be non-empty")
-    local_source = os.path.abspath(os.path.expanduser(_without_file_uri(str(source))))
-    if os.path.isfile(local_source):
-        config_path = local_source
-    elif os.path.isdir(local_source):
-        config_path = os.path.join(local_source, _CONFIG_FILE)
-        if not os.path.isfile(config_path):
-            raise FileNotFoundError(
-                f"draft model directory has no {_CONFIG_FILE}: {local_source}"
-            )
-    else:
-        if _looks_like_local_path(str(source)):
-            raise FileNotFoundError(f"draft model config does not exist: {source}")
-        from transformers import AutoConfig
-
-        loaded = AutoConfig.from_pretrained(
-            source,
-            cache_dir=cache_dir,
-            trust_remote_code=trust_remote_code,
-        )
-        return _draft_config_from_dict(loaded.to_dict())
-
-    try:
-        with open(config_path, encoding="utf-8") as stream:
-            payload = json.load(stream)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid draft config JSON {config_path}: {exc}") from exc
-    return _draft_config_from_dict(payload)
 
 
 def _checkpoint_config_source(checkpoint_source: Optional[str]) -> Optional[str]:
@@ -256,7 +186,9 @@ def _generate_draft_config(
         payload["draft_vocab_size"] = defaults.draft_vocab_size
     if defaults.populate is not None:
         defaults.populate(payload, target_config, cfg)
-    return _draft_config_from_dict(payload)
+    from specforge.modeling.draft.config import AutoDraftConfig
+
+    return AutoDraftConfig.from_dict(payload)
 
 
 def _apply_draft_overrides(
@@ -278,11 +210,13 @@ def resolve_draft_config(
 ) -> "PretrainedConfig":
     """Resolve and validate the draft architecture for one typed run config."""
 
+    from specforge.modeling.draft.config import AutoDraftConfig
+
     source = cfg.model.draft_model_config
     if not source:
         source = _checkpoint_config_source(cfg.model.draft_checkpoint_path)
     if source:
-        draft_config = load_draft_config_source(
+        draft_config = AutoDraftConfig.from_pretrained(
             source,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
@@ -502,7 +436,6 @@ def warm_start_draft_model(
 __all__ = [
     "WarmStartReport",
     "draft_config_dict",
-    "load_draft_config_source",
     "preflight_draft_kernels",
     "resolve_draft_config",
     "warm_start_draft_model",
