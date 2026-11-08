@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -173,6 +174,73 @@ class CheckpointLoadingTest(unittest.TestCase):
             torch.testing.assert_close(
                 loaded["model.embed_tokens.weight"], torch.ones(2, 2)
             )
+
+    def test_weight_map_accepts_huggingface_snapshot_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "hub" / "models--org--name"
+            snapshot = repo / "snapshots" / "9f1c0b7"
+            blobs = repo / "blobs"
+            snapshot.mkdir(parents=True)
+            blobs.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+
+            shard = "model-00001-of-00001.safetensors"
+            payload = {"model.embed_tokens.weight": torch.full((2, 2), 1.5078125)}
+            save_file(payload, str(root / "tmp.safetensors"))
+            shard_blob = blobs / ("a" * 40)
+            (root / "tmp.safetensors").replace(shard_blob)
+            save_file(
+                {"model.embed_tokens.weight": torch.full((2, 2), 7.3125)},
+                str(outside / "licensed.safetensors"),
+            )
+            # A real snapshot holds links for every file, the index included,
+            # so the validation must key off the snapshot directory rather than
+            # off the resolved location of the index it just read.
+            index_blob = blobs / ("b" * 40)
+            index_blob.write_text(
+                json.dumps({"weight_map": {"model.embed_tokens.weight": shard}})
+            )
+            self._symlink(
+                os.path.join("..", "..", "blobs", index_blob.name),
+                snapshot / "model.safetensors.index.json",
+            )
+            self._symlink(
+                os.path.join("..", "..", "blobs", shard_blob.name), snapshot / shard
+            )
+
+            loaded = load_checkpoint_tensors(
+                str(snapshot), keys=["model.embed_tokens.weight"]
+            )
+            torch.testing.assert_close(
+                loaded["model.embed_tokens.weight"],
+                payload["model.embed_tokens.weight"],
+            )
+
+            # The same snapshot layout must not become a way out of the cache
+            # repository: a link that leaves ``models--org--name`` is refused.
+            escaping = "model-00001-of-00001-link.safetensors"
+            self._symlink(
+                os.path.join("..", "..", "..", "outside", "licensed.safetensors"),
+                snapshot / escaping,
+            )
+            index_blob.write_text(
+                json.dumps({"weight_map": {"model.embed_tokens.weight": escaping}})
+            )
+            with self.assertRaisesRegex(
+                ValueError, "weight_map values must be shard file names"
+            ):
+                load_checkpoint_tensors(
+                    str(snapshot), keys=["model.embed_tokens.weight"]
+                )
+
+    def _symlink(self, target: str, link: Path) -> None:
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as error:
+            # Windows needs Developer Mode or admin rights for symlinks.
+            self.skipTest(f"symlinks are unavailable here: {error}")
 
     def test_invalid_selectors_are_rejected(self):
         with self.assertRaises(ValueError):

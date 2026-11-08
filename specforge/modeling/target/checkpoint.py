@@ -92,14 +92,55 @@ def _resolve_weight_layout(
     raise FileNotFoundError(f"No checkpoint found in {checkpoint_dir}")
 
 
-def _check_shard_name(checkpoint_dir: str, shard: str, index_path: str) -> None:
-    """Reject a ``weight_map`` value that resolves outside ``checkpoint_dir``.
+_HUB_CACHE_REPO_PREFIX = "models--"
 
-    ``weight_map`` values are shard file names inside the checkpoint directory.
-    A value that is absolute, or that walks out of the directory with ``..``,
+
+def _inside(path: str, root: str) -> bool:
+    """Return whether ``path`` is ``root`` itself or lives below it."""
+
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        # Different drives on Windows: no common path, hence no containment.
+        return False
+
+
+def _hub_cache_repo_root(checkpoint_dir: str) -> Optional[str]:
+    """Return the cache repository directory of a Hugging Face snapshot, if any.
+
+    ``huggingface_hub`` stores one repository as ``blobs/<sha>`` next to
+    ``snapshots/<revision>/<file>``, where the snapshot entries are symbolic
+    links that point back into ``blobs``. A snapshot directory therefore
+    resolves its shards outside itself by design, but never outside the
+    ``models--<org>--<name>`` directory that holds both parts.
+    """
+
+    snapshots_dir = os.path.dirname(os.path.realpath(checkpoint_dir))
+    if os.path.basename(snapshots_dir) != "snapshots":
+        return None
+    repo_root = os.path.dirname(snapshots_dir)
+    if not os.path.basename(repo_root).startswith(_HUB_CACHE_REPO_PREFIX):
+        return None
+    if not os.path.isdir(os.path.join(repo_root, "blobs")):
+        return None
+    return repo_root
+
+
+def _check_shard_name(checkpoint_dir: str, shard: str, index_path: str) -> None:
+    """Reject a ``weight_map`` value that points outside the checkpoint.
+
+    ``weight_map`` values name shard files inside the checkpoint directory. A
+    value that is absolute, or that walks out of the directory with ``..``,
     makes the loader read a tensor file the caller never pointed at; the
-    exported draft then ships those weights, so refuse the index instead of
-    following it.
+    exported draft then ships those weights, so the index is refused instead of
+    followed.
+
+    Symbolic links are a separate case from the index value itself. A standard
+    Hugging Face snapshot names plain relative shards whose targets live in the
+    neighbouring ``blobs`` directory, and :func:`resolve_checkpoint_dir` returns
+    exactly such a snapshot directory, so those links are supported as long as
+    they stay inside the same cache repository. A link that leaves it is
+    refused like any other escape.
     """
 
     if os.path.isabs(shard):
@@ -108,18 +149,22 @@ def _check_shard_name(checkpoint_dir: str, shard: str, index_path: str) -> None:
             f"path {shard!r}; weight_map values must be shard file names inside "
             f"{checkpoint_dir}"
         )
-    root = os.path.realpath(checkpoint_dir)
-    resolved = os.path.realpath(os.path.join(checkpoint_dir, shard))
-    try:
-        inside = os.path.commonpath([root, resolved]) == root
-    except ValueError:
-        inside = False
-    if not inside:
-        raise ValueError(
-            f"Checkpoint index {index_path} maps a tensor to the shard {shard!r}, "
-            f"which resolves outside {checkpoint_dir}; weight_map values must be "
-            "shard file names inside the checkpoint directory"
-        )
+
+    directory = os.path.abspath(checkpoint_dir)
+    joined = os.path.normpath(os.path.join(directory, shard))
+    if _inside(joined, directory):
+        resolved = os.path.realpath(joined)
+        if _inside(resolved, os.path.realpath(directory)):
+            return
+        repo_root = _hub_cache_repo_root(directory)
+        if repo_root is not None and _inside(resolved, repo_root):
+            return
+
+    raise ValueError(
+        f"Checkpoint index {index_path} maps a tensor to the shard {shard!r}, "
+        f"which resolves outside {checkpoint_dir}; weight_map values must be "
+        "shard file names inside the checkpoint directory"
+    )
 
 
 def _read_weight_map_file(index_path: str) -> Dict[str, str]:
