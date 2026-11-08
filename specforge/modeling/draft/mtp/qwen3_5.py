@@ -231,8 +231,9 @@ class Qwen3MTPAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, -1)
+        # Transformers attention interfaces already return [batch, query, head,
+        # dim]. Transposing again mixes query positions with heads on flatten.
+        attn_output = attn_output.reshape(bsz, q_len, -1)
 
         if self.attn_output_gate:
             attn_output = attn_output * torch.sigmoid(gate)

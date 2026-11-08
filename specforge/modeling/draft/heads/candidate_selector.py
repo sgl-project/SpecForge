@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from transformers import initialization as init
 
 
 class CandidateSelector(nn.Module):
@@ -17,6 +18,8 @@ class CandidateSelector(nn.Module):
         state_rank: int,
         top_k: int,
         initializer_range: float,
+        device=None,
+        dtype=None,
     ) -> None:
         super().__init__()
         if state_rank < 1:
@@ -27,23 +30,34 @@ class CandidateSelector(nn.Module):
                 f"{top_k} for vocab_size={vocab_size}"
             )
         self.top_k = int(top_k)
+        self.initializer_range = initializer_range
         self.predecessor_codebook = nn.Parameter(
-            torch.empty(int(vocab_size), int(state_rank))
+            torch.empty(int(vocab_size), int(state_rank), device=device, dtype=dtype)
         )
         self.successor_codebook = nn.Parameter(
-            torch.empty(int(vocab_size), int(state_rank))
+            torch.empty(int(vocab_size), int(state_rank), device=device, dtype=dtype)
         )
         self.hidden_projection = nn.Linear(
             int(hidden_size),
             int(state_rank),
             bias=False,
+            device=device,
+            dtype=dtype,
         )
-        nn.init.normal_(self.predecessor_codebook, std=initializer_range)
+        self.reset_draft_parameters()
+
+    def reset_draft_parameters(self) -> None:
+        """Initialize own factors while respecting HF's loaded-tensor flags.
+
+        The owning pretrained model initializes the child Linear separately.
+        Standalone construction preserves the existing Linear initialization.
+        """
+        init.normal_(self.predecessor_codebook, std=self.initializer_range)
         # The transition must start as a no-op so a fresh DFlash2 selector is
         # numerically identical to the unary DFlash proposal. The successor
         # factor learns first; the other bilinear factors receive signal once it
         # becomes non-zero.
-        nn.init.zeros_(self.successor_codebook)
+        init.zeros_(self.successor_codebook)
 
     def score_candidates(
         self,
