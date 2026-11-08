@@ -647,6 +647,10 @@ class MTPTrainStrategy(DraftTrainStrategy):
 
     def __init__(self, mtp_model: nn.Module) -> None:
         self.mtp_model = mtp_model
+        # Controller reads ``ploss_decay`` for the structured chain-loss
+        # telemetry (decay-weighted sum of per-step plosses); 1.0 keeps
+        # single-step runs numerically identical to the pre-chain behavior.
+        self.ploss_decay = float(getattr(mtp_model, "ploss_decay", 1.0))
 
     def trainable_module(self) -> nn.Module:
         return self.mtp_model
@@ -660,25 +664,58 @@ class MTPTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
+        # Preserve the per-step mean objective without changing its weights.
+        # Equal counts at every depth make the scalar TrainerCore denominator
+        # valid across micro-batches and DP ranks. Validate host masks before H2D.
+        num_steps = int(getattr(self.mtp_model, "num_steps", 1))
+        if num_steps > 1 and bool(t["loss_mask"][:, 2 : num_steps + 1].any()):
+            raise ValueError(
+                "Multi-step MTP requires equal supervision counts at every step; "
+                "loss_mask[:, 2:num_steps+1] must be zero. Keep this prefix "
+                "unsupervised, or use mtp_num_steps=1."
+            )
         # OnlineMTPModel performs the next-token shift internally and returns
-        # per-position correct/denominator tensors (single-layer: length-1 lists).
+        # per-step per-position correct/denominator tensors (num_steps == 1
+        # yields length-1 lists, keeping the single-step behavior exact).
         # Non-blocking like the other strategies: pinned Mooncake receives keep
         # integer features on the host, and a blocking H2D would sync the GPU.
-        loss, corrects, denoms = self.mtp_model(
+        loss, corrects, denoms, plosses, loss_denoms = self.mtp_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["target_last_hidden_states"].to(device, non_blocking=True),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
         )
-        correct_sum = corrects[0].sum()
-        denom_sum = denoms[0].sum()
+        correct_sum = sum(correct.sum() for correct in corrects)
+        denom_sum = sum(denom.sum() for denom in denoms)
         metrics = {
             "accuracy": (correct_sum / denom_sum.clamp_min(1)).detach(),
             "accuracy_denom": denom_sum.detach(),
+            # Chain telemetry for the controller's structured EAGLE3 reduction
+            # (acc_i / ploss_i / decay-weighted loss) and for the evaluator's
+            # per-step acceptance simulation.  Per-step scalar lists; a
+            # single-step run degenerates to the historical scalar metrics.
+            "plosses": plosses,
+            "acc_corrects": [correct.sum() for correct in corrects],
+            "acc_denoms": [denom.sum() for denom in denoms],
+            "metric_losses": plosses,
+            "metric_loss_denoms": loss_denoms,
         }
+        # Generic ratio metrics are accumulated over the optimizer window and
+        # DP-reduced by TrainerCore, overriding last-micro-batch diagnostics.
+        ratio_metrics = {
+            "accuracy": (correct_sum, denom_sum),
+            "acc": (correct_sum, denom_sum),
+            "kl_loss": (loss.detach() * denom_sum, denom_sum),
+        }
+        for step, (ploss, correct, denom) in enumerate(
+            zip(plosses, corrects, loss_denoms)
+        ):
+            ratio_metrics[f"ploss_{step}"] = (ploss * denom, denom)
+            ratio_metrics[f"kl_loss_{step}"] = (ploss * denom, denom)
+            ratio_metrics[f"acc_{step}"] = (correct.sum(), denom)
         return StepOutput(
             loss=loss,
             metrics=metrics,
-            ratio_metrics={"accuracy": (correct_sum, denom_sum)},
+            ratio_metrics=ratio_metrics,
             # TrainerCore backpropagates additive numerators and divides by the
             # global token denominator across accumulation steps / DP ranks.
             loss_terms=(loss * denom_sum, denom_sum),

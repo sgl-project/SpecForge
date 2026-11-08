@@ -17,7 +17,7 @@ Weight key layout matches SGLang's Qwen3_5ForCausalLMMTP:
 """
 
 import copy
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -31,6 +31,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3MLP,
     Qwen3PreTrainedModel,
     eager_attention_forward,
+    repeat_kv,
     rotate_half,
 )
 from typing_extensions import Unpack
@@ -94,8 +95,16 @@ class PartialRotaryEmbedding(nn.Module):
 
     def __init__(self, config, head_dim):
         super().__init__()
-        rope_theta = getattr(config, "rope_theta", 10000.0)
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        # transformers v5 folds rope_theta / partial_rotary_factor into
+        # `rope_parameters` (the top-level `rope_theta` attribute no longer
+        # exists); fall back to the v4 attributes for older configs.
+        rope_params = getattr(config, "rope_parameters", None) or {}
+        rope_theta = rope_params.get(
+            "rope_theta", getattr(config, "rope_theta", 10000.0)
+        )
+        partial_rotary_factor = rope_params.get(
+            "partial_rotary_factor", getattr(config, "partial_rotary_factor", 1.0)
+        )
         dim = int(head_dim * partial_rotary_factor)
         inv_freq = 1.0 / (
             rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim)
@@ -174,6 +183,7 @@ class Qwen3MTPAttention(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        cache_hidden: Optional[List[List[torch.Tensor]]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len, _ = hidden_states.size()
@@ -221,24 +231,77 @@ class Qwen3MTPAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attn_fn(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, -1)
+        if cache_hidden is not None:
+            # TTT chain mode: cache this step's repeat_kv'd k/v, then attend
+            # across steps once the seed block exists.
+            cache_hidden[0].append(repeat_kv(key_states, self.num_key_value_groups))
+            cache_hidden[1].append(repeat_kv(value_states, self.num_key_value_groups))
+
+        if cache_hidden is not None and len(cache_hidden[0]) > 1:
+            attn_output = self._chain_attention(
+                query_states, cache_hidden, attention_mask
+            )
+            attn_weights = None
+        else:
+            attn_output, attn_weights = attn_fn(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+        # NOTE: transformers v5 attention interfaces (sdpa/eager) already return
+        # [b, s, h, d]; reshape directly (same as official Qwen3_5Attention).
+        # The v4 convention (transpose here) would double-transpose the layout.
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
 
         if self.attn_output_gate:
             attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+    def _chain_attention(
+        self,
+        query_states: torch.Tensor,
+        cache_hidden: List[List[torch.Tensor]],
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Attention over the TTT step cache (EAGLE3 style).
+
+        The seed block's k/v is attended with the full causal+padding mask;
+        each later block (including the current step's own) contributes only
+        its same-row diagonal, mirroring the served NEXTN chain where every
+        step appends one position and attends to the earlier steps' cached
+        keys at that position.  Blocks hold repeat_kv'd k/v, so no further
+        repeat is needed here.  Every step runs the full sequence, so query
+        and cache rows align one to one.
+        """
+        cache_k, cache_v = cache_hidden
+        q_len = query_states.shape[2]
+
+        attn_weights = torch.matmul(query_states, cache_k[0].transpose(2, 3))
+        attn_weights = attn_weights * self.scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        for ki in cache_k[1:]:
+            attn_weightsi = (query_states * ki).sum(-1) * self.scaling
+            attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
+
+        # Upcast the softmax like the reference EAGLE3 TTT attention.
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+
+        attn_output = torch.matmul(attn_weights[..., :q_len], cache_v[0])
+        for i, vi in enumerate(cache_v[1:], start=1):
+            attn_weighti = attn_weights[..., q_len + i - 1]
+            attn_output = attn_output + attn_weighti[..., None] * vi
+        # Normalize the chain output to the HF [batch, seq, heads, dim] layout.
+        return attn_output.transpose(1, 2).contiguous()
 
 
 class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
@@ -266,6 +329,7 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_hidden: Optional[List[List[torch.Tensor]]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -278,6 +342,7 @@ class Qwen3MTPDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             past_key_value=past_key_value,
             cache_position=cache_position,
+            cache_hidden=cache_hidden,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -340,6 +405,7 @@ class Qwen3_5MTPModel(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        cache_hidden: Optional[List[List[torch.Tensor]]] = None,
     ) -> torch.Tensor:
         # Fusion
         normed_emb = self.pre_fc_norm_embedding(inputs_embeds)
@@ -378,6 +444,7 @@ class Qwen3_5MTPModel(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
+                cache_hidden=cache_hidden,
             )[0]
 
         hidden_states = self.norm(hidden_states)
@@ -430,6 +497,7 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        cache_hidden: Optional[List[List[torch.Tensor]]] = None,
     ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
         return self.mtp(
@@ -437,6 +505,7 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            cache_hidden=cache_hidden,
         )
 
     def forward(
