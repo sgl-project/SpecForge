@@ -1,0 +1,67 @@
+"""Encode and decode the scalar component schemas and layer references.
+
+Legacy aliases and defaults belong in the legacy codec, not in these readers.
+"""
+
+from collections.abc import Mapping
+from dataclasses import MISSING, asdict, fields
+
+from ..layer import LayerSpec
+from ..registry import component_schema
+
+
+def _construct(schema: type, values: Mapping, path: str):
+    expected = {field.name: field for field in fields(schema) if field.init}
+    unknown = values.keys() - expected.keys()
+    if unknown:
+        raise ValueError(f"{path}: unknown fields {sorted(unknown, key=str)}")
+    missing = [
+        name
+        for name, field in expected.items()
+        if name not in values
+        and field.default is MISSING
+        and field.default_factory is MISSING
+    ]
+    if missing:
+        raise ValueError(f"{path}: missing fields {missing}")
+    try:
+        node = schema(**values)
+        hash(node)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+    return node
+
+
+def decode_component(kind: str, payload: Mapping):
+    """Decode a typed component, without changing or filling source fields."""
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{kind}: expected a configuration object")
+    if "type" not in payload:
+        raise ValueError(f"{kind}: missing field 'type'")
+    schema = component_schema(kind, payload["type"])
+    values = {name: value for name, value in payload.items() if name != "type"}
+    return _construct(schema, values, f"{kind}/{payload['type']}")
+
+
+def encode_component(kind: str, node) -> dict:
+    """Write the registered type and all node fields, including explicit nulls."""
+    name = getattr(node, "type", None)
+    schema = component_schema(kind, name)
+    if type(node) is not schema:
+        raise ValueError(
+            f"{kind}/{name}: expected {schema.__name__}, got {type(node).__name__}"
+        )
+    hash(node)
+    return {"type": name, **asdict(node)}
+
+
+def decode_layer(payload: Mapping) -> LayerSpec:
+    if not isinstance(payload, Mapping):
+        raise ValueError("layer: expected a configuration object")
+    return _construct(LayerSpec, payload, "layer")
+
+
+def encode_layer(node: LayerSpec) -> dict:
+    if type(node) is not LayerSpec:
+        raise ValueError("layer: expected LayerSpec")
+    return asdict(node)
