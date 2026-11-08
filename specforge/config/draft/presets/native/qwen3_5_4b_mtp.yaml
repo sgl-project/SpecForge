@@ -1,0 +1,34 @@
+# Native Qwen/Qwen3.5-4B MTP structure; ordinary draft YAML.
+architectures: [MTPDraftModel]
+hidden_size: 2560
+vocab_size: 248320
+max_position_embeddings: 262144
+tie_word_embeddings: false
+num_hidden_layers: 1
+attention:
+  type: gqa
+  num_attention_heads: 16
+  num_key_value_heads: 4
+  head_dim: 256
+  qk_norm: true
+  attention_bias: false
+  output_gate: true
+  is_causal: true
+  sliding_window: null
+  attention_dropout: 0.0
+mlp:
+  type: dense
+  intermediate_size: 9216
+  hidden_act: silu
+norm_config: {type: rms, eps: 1.0e-6, weight_offset: 1}
+residual_config: {type: standard}
+rope_parameters:
+  rope_type: mrope
+  rope_theta: 10000000.0
+  partial_rotary_factor: 0.25
+  mrope_section: [11, 11, 10]
+  mrope_interleaved: true
+spec_config:
+  target_features: {hidden_size: 2560}
+target_bindings: [embed_tokens, lm_head]
+target_logit_transform: {type: none}

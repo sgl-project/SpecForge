@@ -138,7 +138,7 @@ class SGLangExportTest(unittest.TestCase):
         config = replace(
             mtp_config(), norm_config=RMSNormSpec(eps=1e-6, weight_offset=1)
         )
-        with self.assertRaisesRegex(ValueError, "default RoPE only"):
+        with self.assertRaisesRegex(ValueError, "default or multi-axis RoPE only"):
             convert_config(
                 replace(
                     config,

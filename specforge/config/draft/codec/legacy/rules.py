@@ -46,6 +46,8 @@ def resolve_rope(payload: Mapping):
         values["partial_rotary_factor"] = resolve_alias(
             "partial_rotary_factor", values, payload, default=1.0
         )
+        if values["rope_type"] == "mrope":
+            values.setdefault("mrope_interleaved", False)
         if values["rope_type"] == "yarn":
             values = expand_yarn(values, payload.get("max_position_embeddings", 32768))
         return decode_rope(values)

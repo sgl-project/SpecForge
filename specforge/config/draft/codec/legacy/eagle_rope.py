@@ -65,6 +65,8 @@ def resolve_eagle_rope(payload: Mapping):
                 )
         elif kind == "mrope":
             result["mrope_section"] = values.get("mrope_section")
+            # Historical EAGLE always used contiguous sections.
+            result["mrope_interleaved"] = False
         elif kind == "llama3":
             frequency_fields = (
                 "low_freq_factor",

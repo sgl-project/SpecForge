@@ -30,16 +30,20 @@ class MultiAxisRotaryEmbedding(RotaryEmbedding):
         with torch.autocast(device_type=hidden.device.type, enabled=False):
             frequencies = self._frequencies(hidden.device)
             positions = position_ids.to(device=hidden.device, dtype=torch.float32)
-            # Each section counts frequency pairs. Select one axis per section,
-            # then duplicate the selected phases for the rotate-half convention.
-            freqs = torch.cat(
-                [
-                    positions[axis].unsqueeze(-1) * section
-                    for axis, section in enumerate(
-                        frequencies.split(self.config.mrope_section)
-                    )
-                ],
-                dim=-1,
-            )
+            pairs = frequencies.numel()
+            if self.config.mrope_interleaved:
+                axes = torch.zeros(pairs, dtype=torch.long, device=hidden.device)
+                for axis in (1, 2):
+                    axes[axis : 3 * self.config.mrope_section[axis] : 3] = axis
+            else:
+                axes = torch.tensor(
+                    [
+                        axis
+                        for axis, size in enumerate(self.config.mrope_section)
+                        for _ in range(size)
+                    ],
+                    device=hidden.device,
+                )
+            freqs = positions[axes].permute(1, 2, 0) * frequencies
             cos, sin = self._cos_sin(torch.cat((freqs, freqs), dim=-1))
             return cos.to(hidden.dtype), sin.to(hidden.dtype)

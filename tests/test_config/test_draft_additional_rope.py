@@ -18,6 +18,7 @@ class AdditionalRoPETest(unittest.TestCase):
             "rope_theta": 10000,
             "partial_rotary_factor": 1,
             "mrope_section": [1, 1, 2],
+            "mrope_interleaved": False,
         }
         rope = decode_rope(source)
         source["mrope_section"][0] = 3
@@ -37,10 +38,16 @@ class AdditionalRoPETest(unittest.TestCase):
         for section in ((1, 2), (0, 0, 0), (-1, 2, 3), (True, 1, 2), (1.5, 1, 2)):
             with self.assertRaisesRegex(ValueError, "mrope_section"):
                 MultiAxisRoPESpec(
-                    rope_theta=10000, partial_rotary_factor=1, mrope_section=section
+                    mrope_interleaved=False,
+                    rope_theta=10000,
+                    partial_rotary_factor=1,
+                    mrope_section=section,
                 )
         rope = MultiAxisRoPESpec(
-            rope_theta=10000, partial_rotary_factor=1, mrope_section=(0, 0, 4)
+            mrope_interleaved=False,
+            rope_theta=10000,
+            partial_rotary_factor=1,
+            mrope_section=(0, 0, 4),
         )
         self.assertEqual(rope.rotary_dim(8), 8)
         with self.assertRaisesRegex(ValueError, "mrope_section"):
@@ -72,7 +79,10 @@ class AdditionalRoPETest(unittest.TestCase):
     def test_new_rope_fields_are_required_and_unknown_settings_fail(self):
         nodes = [
             MultiAxisRoPESpec(
-                rope_theta=10000, partial_rotary_factor=1, mrope_section=(1, 1, 2)
+                mrope_interleaved=False,
+                rope_theta=10000,
+                partial_rotary_factor=1,
+                mrope_section=(1, 1, 2),
             ),
             DynamicNTKRoPESpec(
                 rope_theta=10000,
