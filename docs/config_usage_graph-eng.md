@@ -106,6 +106,7 @@ Providing only a target path does not trigger native draft loading: training fro
 | `residual_config` | Model-level residual-stream type and parameters | YAML or checkpoint |
 | `spec_config` | Algorithm protocol, target feature layers, mask token, input fusion, and heads | YAML or checkpoint |
 | `target_bindings` | Which of `embed_tokens` and `lm_head` the draft takes from the target: frozen, not saved with the draft, and supplied by the target at serving time | YAML or checkpoint |
+| `target_logit_transform` | How the bound `lm_head` turns hidden states into logits, such as a muP multiplier; required only when `lm_head` is bound | Derived from the target configuration at parse time through a closed table, then saved; rechecked against the target on load |
 | `extensions` | Loading prerequisite, not part of `DraftConfig`: the extensions whose kinds the configuration uses, read before decoding | Written by the codec from the kinds the configuration uses and verified on read; listed in YAML when training from scratch with extension kinds |
 | HF metadata | `auto_map`, `transformers_version`, `dtype`, and similar fields that Transformers writes; not part of `DraftConfig` | Written by Transformers and the HF exporter |
 | Artifact metadata | Format, weight layout, and converter version of a written directory; not part of `DraftConfig` | Written by `checkpoint` and the exporters |
@@ -185,6 +186,7 @@ The shorthand exists only in YAML, and it cannot be mixed with named definitions
   "layer_types": ["default", "default", "default", "default"],
   "residual_config": {"type": "standard"},
   "target_bindings": ["embed_tokens", "lm_head"],
+  "target_logit_transform": {"type": "none"},
   "extensions": [],
   "spec_config": {"block_size": 16, "mask_token_id": 151669, "target_layer_ids": [1, 12, 22, 33]},
   "transformers_version": "5.12.1",
@@ -196,7 +198,7 @@ The last two keys are HF and artifact metadata. They are not part of `DraftConfi
 
 With named definitions, the YAML gives `layer_types`, and `num_hidden_layers`, if present, must match its length.
 
-Structural fields have no defaults. A value that can be derived from the target is derived only by a documented rule with the target configuration as an explicit input, and the result is saved. An example is `target_layer_ids` from the target layer count. `draft_vocab_size` equals `vocab_size` unless a draft vocabulary mapping is configured. Non-structural values with documented defaults, such as `initializer_range`, are written into the saved file, so the file is complete without SpecForge's defaults. Keep `initialization` and training hyperparameters outside the model configuration. Training YAML contains no export configuration.
+Structural fields have no defaults. A value that can be derived from the target is derived only by a documented rule with the target configuration as an explicit input, and the result is saved. Examples are `target_layer_ids` from the target layer count and `target_logit_transform` from the target's logit settings. `draft_vocab_size` equals `vocab_size` unless a draft vocabulary mapping is configured. Non-structural values with documented defaults, such as `initializer_range`, are written into the saved file, so the file is complete without SpecForge's defaults. Keep `initialization` and training hyperparameters outside the model configuration. Training YAML contains no export configuration.
 
 A preset is a YAML configuration file under `config/draft/presets/`, referenced through `draft` like any user configuration file. File names and directories do not select implementations; only configuration contents do. Presets require no registration. Checkpoints save the expanded configuration and do not depend on the source file. A native preset describes a target's native draft structure, but selecting it does not load target weights or choose a training objective. Weight loading and objective selection remain separate.
 
@@ -293,7 +295,7 @@ specforge export \
   --output-dir /path/to/sglang-model
 ```
 
-Model structure comes from the checkpoint configuration. If shared weights live outside the checkpoint, the export command's `--target-model` argument supplies the target source.
+Model structure comes from the checkpoint configuration. If shared weights live outside the checkpoint, the export command's `--target-model` argument supplies the target source. Exporting a native draft to SGLang always requires `--target-model`, because the output is the target checkpoint with its native draft tensors replaced. Only the shards that hold those tensors are rewritten, and the unchanged shards are linked rather than copied unless a self-contained directory is requested.
 
 The canonical configuration is the only published format. The two export formats differ as follows:
 
@@ -302,7 +304,7 @@ The canonical configuration is the only published format. The two export formats
 | Purpose | Publication and loading with Transformers | Serving with SGLang |
 | `config.json` | Canonical encoding of the golden configuration, plus HF metadata | SGLang's own format: every field SGLang reads that affects computation, written explicitly |
 | Extra files | `auto_map` naming the concrete model and configuration classes, and the bundled code | `specforge_config.json` with the canonical configuration, used for re-import |
-| Weights | SpecForge layout | Renamed to the layout the SGLang loader expects. For a native architecture, written back into a copy of the target checkpoint under the native names |
+| Weights | SpecForge layout | Renamed to the layout the SGLang loader expects. For a native architecture, written back under the native names into the target checkpoint from `--target-model`, rewriting only the affected shards |
 | Artifact metadata | `format: specforge` and the SpecForge weight layout | `format: sglang`, the SGLang weight layout, the converter version, and the SGLang version whose format it targets |
 | Shared embeddings and LM head | Not saved; `target_bindings` is recorded | Not saved; SGLang uses the target's modules. A binding set that SGLang's format does not express for the architecture fails the export |
 | Unsupported structure | Not applicable | A structure SGLang's format cannot express fails the export, naming the structure |

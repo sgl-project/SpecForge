@@ -16,7 +16,7 @@ DraftConfig
 ├── residual_config:   ResidualSpec
 ├── norm_config:       NormSpec
 ├── spec_config:       Architecture-specific protocol, fusion, and auxiliary module configuration
-└── Model-level dimensions, RoPE, target_bindings, etc.
+└── Model-level dimensions, RoPE, target_bindings, target_logit_transform, etc.
 ```
 
 All nodes are frozen dataclasses, with immutable nested collections so that the complete configuration is hashable. Nodes own their fields, local validation, and pure derivations; they hold no weights, activations, or caches. Different structures have their own types and required fields. Unknown fields are rejected.
@@ -165,7 +165,7 @@ residual_config: {type: standard}
 
 Saving writes the complete effective configuration, including the derived `num_hidden_layers: 2`. Loading restores the same `DraftConfig`. A checkpoint does not depend on the original configuration file's path or subsequent changes.
 
-The HF shell stores HF metadata; the checkpoint stores format and weight-layout metadata. Neither belongs to `DraftConfig`. Training configuration and loading plans own copies from target weights (`initialization.from_target`): copies are bit-preserving, using only explicit renames and the layout operations that components with fused parameters declare, every element of every mapped draft parameter and every target tensor must be used, and quantized tensors and narrowing casts are rejected. Copies are draft weights and are saved with the draft; decoder layers are never bound. `target_bindings` lists which of `embed_tokens` and `lm_head` come from the target; they are frozen and not saved with the draft. The draft is still built from its declared components.
+The HF shell stores HF metadata; the checkpoint stores format and weight-layout metadata. Neither belongs to `DraftConfig`. Training configuration and loading plans own copies from target weights (`initialization.from_target`): copies are bit-preserving, using only explicit renames and the layout operations that components with fused parameters declare, every element of every mapped draft parameter and every target tensor must be used, and quantized tensors and narrowing casts are rejected. Copies are draft weights and are saved with the draft; decoder layers are never bound. `target_bindings` lists which of `embed_tokens` and `lm_head` come from the target; they are frozen and not saved with the draft. A bound `lm_head` reads `target_logit_transform`, a target-derived value computed at parse time, so model code never reads the target configuration. The draft is still built from its declared components.
 
 HF export uses the canonical configuration. SGLang never reads canonical configurations: the SGLang converter writes SGLang's own draft format, with every field that affects computation written explicitly, and retains the canonical configuration in `specforge_config.json` for re-import. Format representability and engine execution support are validated separately. Unsupported structures and binding sets fail export. Export does not modify the model configuration.
 
