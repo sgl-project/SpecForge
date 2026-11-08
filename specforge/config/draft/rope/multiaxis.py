@@ -10,9 +10,12 @@ from .base import RotarySpec
 class MultiAxisRoPESpec(RotarySpec):
     rope_type: ClassVar[str] = "mrope"
     mrope_section: tuple[int, ...]
+    mrope_interleaved: bool
 
     def __post_init__(self):
         super().__post_init__()
+        if type(self.mrope_interleaved) is not bool:
+            raise ValueError("mrope_interleaved must be boolean")
         if type(self.mrope_section) is not tuple or len(self.mrope_section) != 3:
             raise ValueError("mrope_section must contain exactly three sections")
         if any(type(size) is not int or size < 0 for size in self.mrope_section):

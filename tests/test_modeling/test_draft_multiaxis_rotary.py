@@ -1,6 +1,7 @@
 """Multi-axis section selection is internal to rotary preparation."""
 
 import unittest
+from dataclasses import replace
 
 import torch
 from torch import nn
@@ -23,7 +24,10 @@ from tests.test_modeling.test_draft_rotary import RotaryLayer
 
 def multiaxis_node(partial=1.0, sections=(16, 24, 24)):
     return MultiAxisRoPESpec(
-        rope_theta=10000.0, partial_rotary_factor=partial, mrope_section=sections
+        mrope_interleaved=False,
+        rope_theta=10000.0,
+        partial_rotary_factor=partial,
+        mrope_section=sections,
     )
 
 
@@ -99,6 +103,27 @@ class MultiAxisRotaryTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_eagle_outputs_and_gradients(self):
         self._assert_parity("cuda", (torch.float32, torch.float16, torch.bfloat16))
+
+    def test_interleaved_axes_and_text_reduction(self):
+        node = replace(multiaxis_node(0.25, (11, 11, 10)), mrope_interleaved=True)
+        module = build_rotary(node, head_dim=256)
+        hidden = torch.empty(1, 3, 256)
+        positions = torch.arange(9).reshape(3, 1, 3)
+        inv = 1.0 / (node.rope_theta ** (torch.arange(0, 64, 2).float() / 64))
+        phases = positions.float().unsqueeze(-1) * inv
+        expected = phases[0].clone()
+        expected[..., 1:32:3] = phases[1, ..., 1:32:3]
+        expected[..., 2:30:3] = phases[2, ..., 2:30:3]
+        expected = torch.cat((expected, expected), -1)
+        cos, sin = module(hidden, positions)
+        torch.testing.assert_close(cos, expected.cos(), rtol=0, atol=0)
+        torch.testing.assert_close(sin, expected.sin(), rtol=0, atol=0)
+        default = build_rotary(
+            DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=0.25), head_dim=256
+        )
+        torch.testing.assert_close(
+            module(hidden, positions[0]), default(hidden, positions[0]), rtol=0, atol=0
+        )
 
     def test_text_positions_reduce_to_default_full_and_partial_rotary(self):
         positions = torch.tensor([[0, 17, 65535], [3, 4, 7]])
