@@ -7,12 +7,13 @@ from typing import Optional
 
 import torch
 from torch import nn
-from torch.func import functional_call
 
+from specforge.config.draft.architecture.domino import GRUHeadSpec
 from specforge.utils import get_device_type
 
 from .dflash import DFlashDraftModel, sample
 from .dflash_kernels import DFlashKernels
+from .heads.domino_gru import DominoGRUHead, _correction_logits, _run_gru
 from .registry import register_draft
 
 
@@ -40,19 +41,14 @@ class DominoDraftModel(DFlashDraftModel):
         self.pure_draft_prefix_len = int(dflash_config.get("pure_draft_prefix_len", 0))
         self.shift_label = bool(dflash_config.get("shift_label", False))
 
-        self.prefix_gru = nn.GRU(
-            input_size=config.hidden_size,
-            hidden_size=self.gru_hidden_dim,
-            num_layers=1,
-            batch_first=True,
-            bias=False,
+        head = DominoGRUHead(
+            GRUHeadSpec(hidden_size=self.gru_hidden_dim, projection_size=self.emb_dim),
+            hidden_size=config.hidden_size,
+            vocab_size=config.vocab_size,
         )
-        in_dim = config.hidden_size + self.gru_hidden_dim
-        self.embed_proj = nn.Sequential(
-            nn.Linear(in_dim, self.emb_dim, bias=False),
-            nn.SiLU(),
-            nn.Linear(self.emb_dim, config.vocab_size, bias=False),
-        )
+        # Keep the legacy root-level checkpoint names without registering aliases.
+        self.prefix_gru = head.prefix_gru
+        self.embed_proj = head.embed_proj
 
     @property
     def suffix_start(self) -> int:
@@ -63,22 +59,7 @@ class DominoDraftModel(DFlashDraftModel):
         )
 
     def _run_gru(self, gru_inputs: torch.Tensor) -> torch.Tensor:
-        if get_device_type() == "npu" and gru_inputs.dtype == torch.bfloat16:
-            # Ascend DynamicGRU does not accept bf16. Functionally substitute
-            # fp16 views of the real parameters so autograd still reaches the
-            # registered bf16 weights and FSDP never sees a mixed-dtype module.
-            fp16_parameters = {
-                name: parameter.to(dtype=torch.float16)
-                for name, parameter in self.prefix_gru.named_parameters()
-            }
-            output, _ = functional_call(
-                self.prefix_gru,
-                fp16_parameters,
-                (gru_inputs.to(dtype=torch.float16),),
-                strict=True,
-            )
-            return output.to(dtype=gru_inputs.dtype)
-        return self.prefix_gru(gru_inputs)[0]
+        return _run_gru(self.prefix_gru, gru_inputs, device_type=get_device_type())
 
     def _sample_draft_tokens(
         self,
@@ -132,23 +113,18 @@ class DominoDraftModel(DFlashDraftModel):
         if prev_token_embeddings is None:
             raise ValueError("DominoDraftModel requires prev_token_embeddings")
 
-        bsz, n_blocks, block_size = hidden_states.shape[:3]
-        if self.shift_label:
-            gru_inputs = prev_token_embeddings.reshape(bsz * n_blocks, block_size, -1)
-            gru_out = self._run_gru(gru_inputs)
-            gru_out = gru_out.reshape(bsz, n_blocks, block_size, -1)
-            prefix_states = gru_out[:, :, self.suffix_start :, :]
-        else:
-            gru_inputs = prev_token_embeddings[:, :, : block_size - 1, :].reshape(
-                bsz * n_blocks, block_size - 1, -1
-            )
-            gru_out = self._run_gru(gru_inputs)
-            gru_out = gru_out.reshape(bsz, n_blocks, block_size - 1, -1)
-            prefix_states = gru_out[:, :, self.suffix_start - 1 :, :]
-
-        z_n = hidden_states[:, :, self.suffix_start :, :]
-        concat_features = torch.cat([z_n, prefix_states], dim=-1)
-        return self.embed_proj(concat_features)
+        prefix_embeddings = (
+            prev_token_embeddings
+            if self.shift_label
+            else prev_token_embeddings[:, :, : hidden_states.shape[2] - 1, :]
+        )
+        return _correction_logits(
+            self.prefix_gru,
+            self.embed_proj,
+            hidden_states[:, :, self.suffix_start :, :],
+            prefix_embeddings,
+            device_type=get_device_type(),
+        )
 
 
 __all__ = ["DominoDraftModel"]
