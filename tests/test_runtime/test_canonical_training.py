@@ -1,5 +1,6 @@
 """Exercise canonical loading, data ports, trainer checkpoints and replay."""
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -142,6 +143,11 @@ class CanonicalTrainingTest(unittest.TestCase):
             first.run()
             checkpoint = root / "output" / "specforge-run-step1"
             self.assertTrue((checkpoint / "config.json").exists())
+            payload = json.loads((checkpoint / "config.json").read_text())
+            self.assertEqual(
+                payload["specforge_artifact"], {"format": "specforge", "version": 1}
+            )
+            self.assertFalse((checkpoint / "artifact.json").exists())
             model = load_draft(checkpoint, target=target, dtype=torch.float32)
             before = {
                 name: tensor.clone() for name, tensor in model.state_dict().items()
