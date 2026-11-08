@@ -8,9 +8,11 @@ from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
+
+from specforge.config.draft.architecture.dspine import AdjacentInjectionSpec
 
 from .dflash import DFlashDraftModel
+from .heads.adjacent_injection import AdjacentInjection as _AdjacentInjection
 from .registry import register_draft
 
 
@@ -85,52 +87,18 @@ class DSpineOutput(NamedTuple):
     layer_features: torch.Tensor
 
 
-class AdjacentInjection(nn.Module):
+class AdjacentInjection(_AdjacentInjection):
+    """Keep the legacy constructor and per-layer replacement filter."""
+
     def __init__(self, hidden_size: int, num_layers: int, config: DSpineConfig):
-        super().__init__()
-        self.rank = config.transfer_rank
+        super().__init__(
+            AdjacentInjectionSpec(
+                transfer_rank=config.transfer_rank, message_size=config.message_size
+            ),
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+        )
         self.replacement_layers = config.replacement_layers
-        self.readouts = nn.ModuleList(
-            nn.Linear(hidden_size, self.rank, bias=False) for _ in range(num_layers)
-        )
-        self.writes = nn.ModuleList(
-            nn.Linear(config.message_size, hidden_size, bias=False)
-            for _ in range(num_layers)
-        )
-        self.message = nn.Linear(self.rank, config.message_size, bias=False)
-        self.receiver_gate = nn.Linear(self.rank, config.message_size, bias=False)
-        self.predecessor_gate = nn.Linear(self.rank, config.message_size, bias=False)
-        self.bias = nn.Parameter(torch.zeros(config.message_size))
-        for write in self.writes:
-            nn.init.zeros_(write.weight)
-        nn.init.zeros_(self.predecessor_gate.weight)
-
-    def feature(self, hidden: torch.Tensor, layer: int) -> torch.Tensor:
-        projected = self.readouts[layer](hidden)
-        return (math.sqrt(self.rank) * F.normalize(projected.float(), dim=-1)).to(
-            hidden.dtype
-        )
-
-    def write(
-        self,
-        hidden: torch.Tensor,
-        receiver: torch.Tensor,
-        predecessor: torch.Tensor,
-        layer: int,
-    ) -> torch.Tensor:
-        # FSDP may keep the token-code buffer in FP32 while projections use BF16.
-        predecessor = predecessor.to(receiver.dtype)
-        gate = torch.sigmoid(
-            self.receiver_gate(receiver)
-            + self.predecessor_gate(predecessor)
-            + self.bias
-        )
-        delta = self.writes[layer](gate * self.message(predecessor))
-        scale = (
-            torch.linalg.vector_norm(hidden.float(), dim=-1, keepdim=True)
-            / math.sqrt(hidden.shape[-1])
-        ).to(hidden.dtype)
-        return hidden + scale * delta
 
     def forward(
         self,
@@ -140,16 +108,9 @@ class AdjacentInjection(nn.Module):
         codes: torch.Tensor,
         replace: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        features = self.feature(hidden, layer)
-        anchor = math.sqrt(self.rank) * F.embedding(token_ids[..., :1], codes)
-        predecessors = torch.cat((anchor, features[..., 1:-1, :]), dim=-2)
-        if replace is not None and layer < self.replacement_layers:
-            correct = math.sqrt(self.rank) * F.embedding(token_ids[..., :-1], codes)
-            predecessors = torch.where(replace[..., None, None], correct, predecessors)
-        successors = self.write(
-            hidden[..., 1:, :], features[..., 1:, :], predecessors, layer
-        )
-        return torch.cat((hidden[..., :1, :], successors), dim=-2)
+        if layer >= self.replacement_layers:
+            replace = None
+        return super().forward(hidden, layer, token_ids, codes, replace)
 
 
 @register_draft
