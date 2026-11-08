@@ -3,6 +3,7 @@
 from .attention import GQAAttention, MLAAttention
 from .conv import GroupedCausalConv
 from .decoder import DecoderLayer
+from .logits import MuPLogitTransform, NoLogitTransform, TargetLogitTransform
 from .mlp import DenseFFN
 from .norm import RMSNorm
 from .registry import build_component, component_builder, register_component_builder
@@ -14,8 +15,11 @@ __all__ = [
     "GQAAttention",
     "GroupedCausalConv",
     "MLAAttention",
+    "MuPLogitTransform",
+    "NoLogitTransform",
     "RMSNorm",
     "StandardResidual",
+    "TargetLogitTransform",
     "build_component",
     "component_builder",
     "register_component_builder",
