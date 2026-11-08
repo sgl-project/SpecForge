@@ -122,24 +122,18 @@ experiment, use a new suffix consistently in `run_id`, `output_dir`,
 First export the trained draft:
 
 ```bash
-# Export the draft model to HF format
+# Export a serving artifact (legacy checkpoints need the config and target)
 specforge export \
-  --to hf \
+  --format sglang \
   --checkpoint outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/consumer/${MODEL_NAME}-${SPEC_METHOD}-overfit-latest \
   --draft-config ${DRAFT_MODEL_CONFIG} \
-  --output-dir outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/draft_hf \
-  --embedding-source ${MODEL} \
-  --embedding-key model.language_model.embed_tokens.weight
-
-# Normalize the config
-python scripts/gates/normalize_dflash_export.py \
-  --config outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/draft_hf/config.json \
-  --block-size 16
+  --output-dir outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/draft_sglang \
+  --target-model ${MODEL}
 ```
 
-The normalizer preserves DFlash/Domino exports as ``DFlashDraftModel``. For a
-DSpark export it selects SGLang's ``Qwen3DSparkModel`` architecture and promotes
-the Markov/confidence settings required by the SGLang loader to the top level.
+The converter writes serving fields directly; no post-export normalization is
+needed. Canonical checkpoints do not need `--draft-config` or `--target-model`.
+The block size comes from the trained configuration.
 
 Start SGLang in the first terminal:
 
@@ -158,7 +152,7 @@ python -m sglang.launch_server \
   --trust-remote-code \
   --port 32001 \
   --speculative-algorithm DSPARK \
-  --speculative-draft-model-path outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/draft_hf \
+  --speculative-draft-model-path outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/draft_sglang \
   --reasoning-parser qwen3
 ```
 

@@ -283,13 +283,18 @@ def train(
 @click.option("--checkpoint", required=True, metavar="PATH")
 @click.option("--draft-config", default=None, metavar="PATH")
 @click.option("--target-model", default=None, metavar="PATH")
+@click.option(
+    "--copy-target",
+    is_flag=True,
+    help="Copy unchanged native target shards instead of linking them.",
+)
 @click.option("--output-dir", required=True, metavar="PATH")
 @click.option("--vocab-mapping", default=None, metavar="PATH")
 @click.option(
     "--embedding-source",
     default=None,
     metavar="PATH",
-    help="Target model path supplying a frozen embedding for HF export.",
+    help="Deprecated HF alias for --target-model; exports omit bound token tables.",
 )
 @click.option(
     "--embedding-key",
@@ -303,6 +308,7 @@ def export(
     checkpoint: str,
     draft_config: Optional[str],
     target_model: Optional[str],
+    copy_target: bool,
     output_dir: str,
     vocab_mapping: Optional[str],
     embedding_source: Optional[str],
@@ -310,6 +316,10 @@ def export(
 ) -> int:
     """Materialize a runtime checkpoint as a model directory."""
     if target == "hf":
+        if copy_target:
+            raise click.UsageError(
+                "--copy-target is only valid with --format sglang", ctx
+            )
         from specforge.export.to_hf import export_to_hf
 
         export_to_hf(
@@ -322,10 +332,6 @@ def export(
             target_model=target_model,
         )
         return 0
-    if target_model is not None:
-        raise click.UsageError(
-            "--target-model for SGLang export is not yet supported", ctx
-        )
     if embedding_source is not None:
         raise click.UsageError("--embedding-source is only valid with --to hf", ctx)
     from specforge.export.to_sglang import export_to_sglang
@@ -335,6 +341,8 @@ def export(
         draft_config,
         output_dir,
         vocab_mapping_path=vocab_mapping,
+        target_model=target_model,
+        copy_target=copy_target,
     )
     return 0
 

@@ -11,7 +11,7 @@ training strategy or feature protocol.
 | Draft architecture | `DFlash2DraftModel` |
 | Online server capture | `--speculative-algorithm DFLASH` |
 | Offline feature schema | DFlash `input_ids`, `loss_mask`, `hidden_states` |
-| Export target | `specforge export --to hf` |
+| Export target | `specforge export --format sglang` |
 | SGLang serving algorithm | `DFLASH` |
 
 This reuse is intentional. The convolution and selector run entirely in the
@@ -136,14 +136,19 @@ training backends and the same full/sliding per-layer layouts.
 
 ## Export and serve
 
-Export the runtime checkpoint as a Hugging Face draft directory:
+Export the runtime checkpoint as an SGLang serving directory:
 
 ```bash
-specforge export --to hf \
+specforge export --format sglang \
   --checkpoint ./outputs/qwen3.6-27b-dflash2-disaggregated-with-selector/qwen3.6-27b-dflash2-disaggregated-with-selector-latest \
   --draft-config configs/qwen3.6-27b-dflash2.json \
+  --target-model /path/to/Qwen3.6-27B \
   --output-dir ./exports/qwen3.6-27b-dflash2
 ```
+
+For a canonical checkpoint, omit `--draft-config` and `--target-model`.
+See [export restrictions](../../draft_export.md); mixed per-layer causality
+is rejected until the pinned SGLang format can express it.
 
 Use an SGLang release or revision that contains DFlash2 support
 ([SGLang PR #35371](https://github.com/sgl-project/sglang/pull/35371)). The
@@ -154,6 +159,5 @@ unary logits in both SpecForge's local generation path and the matching serving
 contract.
 
 Training supports the shared DFlash-family `gqa`, `mha`, and `mla` attention
-modes. SGLang DFlash-family serving currently supports GQA/MHA layouts, so do
-not use an MLA DFlash2 export for a serving benchmark until the corresponding
-loader and kernels are available.
+modes. Export checks whether the pinned SGLang format can express the selected
+components; unsupported settings fail before writing an artifact.
