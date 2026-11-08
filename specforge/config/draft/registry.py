@@ -14,6 +14,7 @@ from .architecture import (
     DSparkSpec,
     DSpineSpec,
     Eagle3Spec,
+    PEagleSpec,
 )
 from .architecture.constraints import (
     validate_dflash,
@@ -22,6 +23,7 @@ from .architecture.constraints import (
 )
 from .architecture.dspine import validate_dspine
 from .architecture.eagle3 import validate_eagle3
+from .architecture.eagle_fusion import validate_auxiliary_fusion
 from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec
 from .mlp import DenseFFNSpec, FFNSpec
@@ -149,3 +151,4 @@ register_spec("DSparkDraftModel", DSparkSpec, validate_target_context)
 register_spec("DSpineDraftModel", DSpineSpec, validate_dspine)
 register_spec("DominoDraftModel", DominoSpec, validate_target_context)
 register_spec("Eagle3DraftModel", Eagle3Spec, validate_eagle3)
+register_spec("PEagleDraftModel", PEagleSpec, validate_auxiliary_fusion)
