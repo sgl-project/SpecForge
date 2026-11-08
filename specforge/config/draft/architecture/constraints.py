@@ -8,9 +8,12 @@ if TYPE_CHECKING:
     from ..model import DraftConfig
 
 
-def validate_dflash(config: DraftConfig) -> None:
+def validate_target_context(config: DraftConfig) -> None:
+    """Constraints shared by architectures that inject full-vocabulary context."""
     if config.draft_vocab_size != config.vocab_size:
-        raise ValueError("DFlash protocols require draft_vocab_size == vocab_size")
+        raise ValueError(
+            "target-context protocols require draft_vocab_size == vocab_size"
+        )
     if config.spec_config.target_features.mask_token_id >= config.vocab_size:
         raise ValueError(
             "spec_config.target_features.mask_token_id must be below vocab_size"
@@ -20,6 +23,10 @@ def validate_dflash(config: DraftConfig) -> None:
             raise ValueError(
                 f"attention_configs.{name}: architecture requires target_context_kv"
             )
+
+
+def validate_dflash(config: DraftConfig) -> None:
+    validate_target_context(config)
 
 
 def validate_dflash2(config: DraftConfig) -> None:

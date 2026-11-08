@@ -6,8 +6,12 @@ from dataclasses import MISSING, dataclass, fields
 from inspect import isabstract
 from typing import TYPE_CHECKING, Callable
 
-from .architecture import ArchitectureSpec, DFlash2Spec, DFlashSpec
-from .architecture.constraints import validate_dflash, validate_dflash2
+from .architecture import ArchitectureSpec, DFlash2Spec, DFlashSpec, DSparkSpec
+from .architecture.constraints import (
+    validate_dflash,
+    validate_dflash2,
+    validate_target_context,
+)
 from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec
 from .mlp import DenseFFNSpec, FFNSpec
@@ -131,3 +135,4 @@ for _kind, _schema in (
 
 register_spec("DFlashDraftModel", DFlashSpec, validate_dflash)
 register_spec("DFlash2DraftModel", DFlash2Spec, validate_dflash2)
+register_spec("DSparkDraftModel", DSparkSpec, validate_target_context)
