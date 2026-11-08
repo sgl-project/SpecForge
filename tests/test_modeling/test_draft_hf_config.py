@@ -49,6 +49,7 @@ class DraftHFConfigTest(unittest.TestCase):
         metadata = {
             "auto_map": {"AutoModel": "model.DFlashDraftModel"},
             "dtype": "bfloat16",
+            "specforge_artifact": {"format": "specforge", "version": 1},
         }
         config = SpecForgeDraftConfig(draft, **metadata)
         metadata["auto_map"].clear()
@@ -93,12 +94,14 @@ class DraftHFConfigTest(unittest.TestCase):
             draft_config(),
             output_attentions=True,
             auto_map={"AutoModel": "model.DFlashDraftModel"},
+            specforge_artifact={"format": "specforge", "version": 1},
         )
         with TemporaryDirectory() as directory:
             config.save_pretrained(directory)
             restored = SpecForgeDraftConfig.from_pretrained(directory)
         self.assertEqual(restored.draft, config.draft)
         self.assertEqual(restored.auto_map, config.auto_map)
+        self.assertEqual(restored.specforge_artifact, config.specforge_artifact)
         self.assertTrue(restored.output_attentions)
         with self.assertRaises(AttributeError):
             restored.update({"hidden_size": 1})

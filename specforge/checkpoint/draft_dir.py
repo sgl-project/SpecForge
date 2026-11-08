@@ -1,0 +1,81 @@
+"""Persist a complete canonical model artifact independently of training state."""
+
+import json
+import os
+import tempfile
+from pathlib import Path
+
+from huggingface_hub import split_torch_state_dict_into_shards
+from safetensors.torch import save_file
+
+
+def read_artifact_metadata(config):
+    """Validate directory-format metadata without treating it as model structure."""
+    if "specforge_artifact" not in config:
+        return {}  # Ordinary HF save_pretrained directories have no marker.
+    metadata = config["specforge_artifact"]
+    if not isinstance(metadata, dict):
+        raise ValueError("artifact metadata must be an object")
+    if metadata.get("format") == "sglang":
+        raise ValueError(
+            "SGLang artifacts are serving-only; load the canonical checkpoint"
+        )
+    if (
+        metadata.get("format") not in ("specforge", "hf")
+        or metadata.get("version") != 1
+    ):
+        raise ValueError(f"unsupported artifact metadata: {metadata}")
+    return metadata
+
+
+def save_draft(model, path, *, max_shard_size="5GB"):
+    """Write config, owned weights and format metadata to a new directory.
+
+    Target-bound modules exclude themselves from state_dict. Tied parameters
+    are stored once; their relationship comes from the canonical configuration.
+    Existing nonempty directories are never mixed with new checkpoint shards.
+    """
+    from specforge.modeling.draft.hf_config import SpecForgeDraftConfig
+
+    if not isinstance(model.config, SpecForgeDraftConfig):
+        raise TypeError("save_draft requires a canonical draft model")
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and (
+        not destination.is_dir() or any(destination.iterdir())
+    ):
+        raise FileExistsError(f"checkpoint directory is not empty: {destination}")
+    state, seen = {}, set()
+    for key, value in model.state_dict(keep_vars=True).items():
+        if value.is_meta or hasattr(value, "to_local"):
+            raise ValueError(f"{key}: save requires materialized, gathered tensors")
+        if id(value) not in seen:
+            state[key] = value.detach().cpu().contiguous()
+            seen.add(id(value))
+    shards = split_torch_state_dict_into_shards(state, max_shard_size=max_shard_size)
+    with tempfile.TemporaryDirectory(prefix=".draft-", dir=destination.parent) as tmp:
+        staging = Path(tmp) / "artifact"
+        staging.mkdir()
+        for filename, keys in shards.filename_to_tensors.items():
+            # Clone to avoid shared storage aliases in safetensors.
+            save_file(
+                {k: state[k].clone() for k in keys},
+                staging / filename,
+                metadata={"format": "pt"},
+            )
+        if shards.is_sharded:
+            (staging / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": shards.metadata,
+                        "weight_map": shards.tensor_to_filename,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        config = model.config.to_dict() | {
+            "specforge_artifact": {"format": "specforge", "version": 1}
+        }
+        (staging / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        os.replace(staging, destination)
