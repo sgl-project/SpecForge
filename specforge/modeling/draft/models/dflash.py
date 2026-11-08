@@ -3,16 +3,16 @@
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
-from torch import Tensor, nn
+from torch import Tensor
 from transformers.utils import ModelOutput
 
-from ..bindings import BoundEmbedding, BoundLMHead
 from ..hf_config import SpecForgeDraftConfig
 from ..layers.inputs import LayerInputs
 from ..pretrained import DraftPreTrainedModel
 from .assembly import build_decoder_backbone
 from .registry import register_draft_model
 from .target_features import TargetFeatureFusion
+from .tokens import build_token_modules
 
 
 @dataclass
@@ -55,23 +55,8 @@ class DFlashDraftModel(DraftPreTrainedModel):
             device=device,
             dtype=dtype,
         )
-        options = dict(device=device, dtype=dtype)
-        self.embed_tokens = (
-            BoundEmbedding(draft.vocab_size, draft.hidden_size, **options)
-            if "embed_tokens" in draft.target_bindings
-            else nn.Embedding(draft.vocab_size, draft.hidden_size, **options)
-        )
-        self.lm_head = (
-            BoundLMHead(
-                draft.target_logit_transform,
-                vocab_size=draft.vocab_size,
-                hidden_size=draft.hidden_size,
-                **options,
-            )
-            if "lm_head" in draft.target_bindings
-            else nn.Linear(
-                draft.hidden_size, draft.draft_vocab_size, bias=False, **options
-            )
+        self.embed_tokens, self.lm_head = build_token_modules(
+            draft, device=device, dtype=dtype
         )
         self.post_init()
 
