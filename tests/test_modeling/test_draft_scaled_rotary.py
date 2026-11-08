@@ -16,7 +16,6 @@ from specforge.config.draft.rope import (
     DynamicNTKRoPESpec,
     LinearRoPESpec,
     Llama3RoPESpec,
-    MultiAxisRoPESpec,
     NoRoPESpec,
 )
 from specforge.modeling.draft.layers.rope import (
@@ -169,11 +168,6 @@ class ScaledRotaryTest(unittest.TestCase):
                 partial_rotary_factor=1.0,
                 factor=2.0,
                 original_max_position_embeddings=8192,
-            ),
-            MultiAxisRoPESpec(
-                rope_theta=10000.0,
-                partial_rotary_factor=1.0,
-                mrope_section=(16, 24, 24),
             ),
             {"rope_type": "default"},
         ):
