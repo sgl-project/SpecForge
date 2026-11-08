@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from .._validation import finite_number, positive_int
 from ..architecture.eagle_fusion import AuxiliaryFeatureSpec
-from ..architecture.features import TargetFeatureSpec
+from ..architecture.features import FinalHiddenFeatureSpec, TargetFeatureSpec
 from ..logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
 
 if TYPE_CHECKING:
@@ -86,7 +86,7 @@ def validate_target(config: DraftConfig, target: Mapping) -> None:
         positive_int("target_config.num_hidden_layers", count)
         if any(layer >= count for layer in features.target_layer_ids):
             raise ValueError("target_layer_ids exceed target num_hidden_layers")
-    if isinstance(features, AuxiliaryFeatureSpec):
+    if isinstance(features, (AuxiliaryFeatureSpec, FinalHiddenFeatureSpec)):
         width = target.get("hidden_size")
         positive_int("target_config.hidden_size", width)
         if features.hidden_size != width:

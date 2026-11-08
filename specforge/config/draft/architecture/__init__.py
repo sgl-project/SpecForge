@@ -7,6 +7,7 @@ from .domino import DominoSpec
 from .dspark import DSparkSpec
 from .dspine import DSpineSpec
 from .eagle3 import Eagle3Spec
+from .mtp import MTPSpec
 from .peagle import PEagleSpec
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "DSparkSpec",
     "DSpineSpec",
     "Eagle3Spec",
+    "MTPSpec",
     "PEagleSpec",
 ]
