@@ -97,6 +97,14 @@ class CheckpointManager:
                     )
                 if self.is_rank0() and state is not None:
                     self._atomic_save(state, self._state_path(ckpt_dir))
+                    if "canonical_draft_config" in state:
+                        # Publish structure before the durable checkpoint pointer.
+                        # TensorStore reads draft_state_dict from training_state.pt;
+                        # public model loading never restores optimizer state.
+                        import json
+
+                        with open(os.path.join(ckpt_dir, "config.json"), "w") as stream:
+                            json.dump(state["canonical_draft_config"], stream, indent=2)
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
         self._all_ok(err)

@@ -44,7 +44,8 @@ def _validate_draft_options(
     requirement = algorithm.spec.draft
     provider = algorithm.providers.model.draft_config
     if (
-        not cfg.model.draft_model_config
+        cfg.draft is None
+        and not cfg.model.draft_model_config
         and not cfg.model.draft_checkpoint_path
         and provider.target_defaults is None
     ):
