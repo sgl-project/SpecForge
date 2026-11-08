@@ -2,12 +2,16 @@
 
 from .dflash import DFlashDraftModel
 from .dflash2 import DFlash2DraftModel
+from .domino import DominoDraftModel
+from .dspark import DSparkDraftModel
 from .mtp import MTPDraftModel
 from .registry import build_draft_model, register_draft_model, resolve_draft_model
 
 __all__ = [
     "DFlashDraftModel",
     "DFlash2DraftModel",
+    "DominoDraftModel",
+    "DSparkDraftModel",
     "MTPDraftModel",
     "build_draft_model",
     "register_draft_model",
