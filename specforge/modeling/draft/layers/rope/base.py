@@ -1,0 +1,44 @@
+"""Shared FP32 phase computation for static rotary frequency rules."""
+
+import torch
+from torch import Tensor, nn
+
+from specforge.config.draft.rope.base import RotarySpec
+
+
+class RotaryEmbedding(nn.Module):
+    """Derived frequencies are rebuilt on the input device, never checkpointed.
+
+    This avoids rounding them during module casts or leaving uninitialized
+    buffers after meta loading. Subclasses own frequency and amplitude rules.
+    """
+
+    def __init__(self, config: RotarySpec, *, head_dim: int):
+        super().__init__()
+        self.config = config
+        self.rotary_dim = config.rotary_dim(head_dim)
+
+    def _frequencies(self, device: torch.device) -> Tensor:
+        return 1.0 / (
+            self.config.rope_theta
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32, device=device)
+                / self.rotary_dim
+            )
+        )
+
+    def _cos_sin(self, angles: Tensor) -> tuple[Tensor, Tensor]:
+        return angles.cos(), angles.sin()
+
+    @torch.no_grad()
+    def forward(self, hidden: Tensor, position_ids: Tensor) -> tuple[Tensor, Tensor]:
+        """Return [batch, sequence, rotary_dim] cosine/sine for explicit positions."""
+        if position_ids.ndim != 2:
+            raise ValueError("position_ids must have shape [batch, sequence]")
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            inv_freq = self._frequencies(hidden.device)
+            positions = position_ids.to(device=hidden.device, dtype=torch.float32)
+            freqs = positions.unsqueeze(-1) * inv_freq
+            angles = torch.cat((freqs, freqs), dim=-1)
+            cos, sin = self._cos_sin(angles)
+            return cos.to(hidden.dtype), sin.to(hidden.dtype)
