@@ -2,6 +2,7 @@
 
 from .dflash import DFlashDraftModel
 from .dflash2 import DFlash2DraftModel
+from .dmtp import DMTPDraftModel
 from .domino import DominoDraftModel
 from .dspark import DSparkDraftModel
 from .dspine import DSpineDraftModel
@@ -13,6 +14,7 @@ from .registry import build_draft_model, register_draft_model, resolve_draft_mod
 __all__ = [
     "DFlashDraftModel",
     "DFlash2DraftModel",
+    "DMTPDraftModel",
     "DominoDraftModel",
     "DSparkDraftModel",
     "DSpineDraftModel",
