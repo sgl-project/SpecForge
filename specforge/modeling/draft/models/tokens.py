@@ -7,13 +7,17 @@ from specforge.config.draft import DraftConfig
 from ..bindings import BoundEmbedding, BoundLMHead
 
 
-def build_token_modules(config: DraftConfig, *, device=None, dtype=None):
+def build_token_modules(
+    config: DraftConfig, *, padding_idx=None, device=None, dtype=None
+):
     """Return embedding/head modules; their owner performs initialization/tying."""
     options = dict(device=device, dtype=dtype)
     embedding = (
         BoundEmbedding(config.vocab_size, config.hidden_size, **options)
         if "embed_tokens" in config.target_bindings
-        else nn.Embedding(config.vocab_size, config.hidden_size, **options)
+        else nn.Embedding(
+            config.vocab_size, config.hidden_size, padding_idx=padding_idx, **options
+        )
     )
     head = (
         BoundLMHead(
