@@ -10,6 +10,7 @@ from .base import ConvSpec
 @dataclass(frozen=True, kw_only=True)
 class GroupedCausalConvSpec(ConvSpec):
     type: ClassVar[str] = "grouped_causal"
+    capabilities: ClassVar[frozenset[str]] = frozenset({"block_sublayer_pair"})
 
     kernel_size: int
     group_size: int

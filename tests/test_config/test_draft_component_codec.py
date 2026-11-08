@@ -23,6 +23,7 @@ from specforge.config.draft.registry import component_schema, register_component
 COMPONENTS = {
     "attention": {
         "type": "gqa",
+        "rope_parameters": None,
         "num_attention_heads": 8,
         "num_key_value_heads": 2,
         "head_dim": 16,
