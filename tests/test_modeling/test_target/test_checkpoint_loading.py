@@ -175,6 +175,36 @@ class CheckpointLoadingTest(unittest.TestCase):
                 loaded["model.embed_tokens.weight"], torch.ones(2, 2)
             )
 
+    def test_weight_map_rejects_symlink_that_leaves_a_plain_directory(self):
+        # No cache layout here on purpose: a plain package whose shard is a link
+        # to the outside must be refused, so that simplifying the resolver later
+        # (for example to string-only validation) cannot silently reopen this.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "package"
+            outside = root / "outside"
+            package.mkdir()
+            outside.mkdir()
+            save_file(
+                {"model.embed_tokens.weight": torch.full((2, 2), 7.3125)},
+                str(outside / "licensed.safetensors"),
+            )
+            shard = "model-00001-of-00001.safetensors"
+            self._symlink(
+                os.path.join("..", "outside", "licensed.safetensors"),
+                package / shard,
+            )
+            (package / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"model.embed_tokens.weight": shard}})
+            )
+            self.assertTrue(os.path.islink(package / shard))
+            with self.assertRaisesRegex(
+                ValueError, "weight_map values must be shard file names"
+            ):
+                load_checkpoint_tensors(
+                    str(package), keys=["model.embed_tokens.weight"]
+                )
+
     def test_weight_map_accepts_huggingface_snapshot_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

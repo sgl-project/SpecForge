@@ -96,10 +96,19 @@ _HUB_CACHE_REPO_PREFIX = "models--"
 
 
 def _inside(path: str, root: str) -> bool:
-    """Return whether ``path`` is ``root`` itself or lives below it."""
+    """Return whether ``path`` is ``root`` itself or lives below it.
+
+    ``os.path.commonpath`` compares the text it is given, case included, so two
+    spellings of the same Windows directory (``C:\\Temp`` vs ``c:\\temp``) would
+    compare as unrelated. ``os.path.normcase`` folds that away on the platforms
+    that need it and is the identity on POSIX, which keeps a real escape a
+    mismatch on both.
+    """
 
     try:
-        return os.path.commonpath([path, root]) == root
+        return os.path.normcase(os.path.commonpath([path, root])) == os.path.normcase(
+            root
+        )
     except ValueError:
         # Different drives on Windows: no common path, hence no containment.
         return False
