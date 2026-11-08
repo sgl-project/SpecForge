@@ -45,6 +45,8 @@ class AutoDraftConfig:
                 "draft config must name exactly one architecture; "
                 f"got {architectures!r}"
             )
+        from . import legacy  # noqa: F401
+
         architecture = architectures[0]
         if architecture not in DRAFT_REGISTRY:
             raise ValueError(

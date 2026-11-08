@@ -1,4 +1,4 @@
-"""Canonical MTP matches the existing native computation using own components."""
+"""MTP composition, checkpointing and target binding contracts."""
 
 import copy
 import unittest
@@ -6,14 +6,11 @@ from dataclasses import replace
 from tempfile import TemporaryDirectory
 
 import torch
-from transformers import Qwen3Config
 
 from specforge.config.draft.architecture.features import FinalHiddenFeatureSpec
-from specforge.config.draft.norm import RMSNormSpec
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models import MTPDraftModel
-from specforge.modeling.draft.mtp.qwen3_5 import PartialRotaryEmbedding, Qwen3_5MTPModel
 from tests.test_config.test_draft_mtp_spec import mtp_config
 from tests.test_modeling.test_draft_gqa import layout_for
 
@@ -39,85 +36,7 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
     )
 
 
-def legacy_key(name):
-    for prefix, replacement in (
-        ("fusion.", ""),
-        ("backbone.layers.", "layers."),
-        ("backbone.final_norm.", "norm."),
-    ):
-        if name.startswith(prefix):
-            return replacement + name[len(prefix) :]
-    return name
-
-
 class CanonicalMTPTest(unittest.TestCase):
-    def _parity(self, device, dtype):
-        base = mtp_config(target_bindings=(), target_logit_transform=None)
-        config = replace(
-            base,
-            norm_config=RMSNormSpec(eps=1e-6, weight_offset=1),
-            attention_configs={
-                "full": replace(base.attention_configs["full"], output_gate=True)
-            },
-            rope_parameters=replace(base.rope_parameters, partial_rotary_factor=0.5),
-        )
-        actual = build_draft_model(config, device=device, dtype=dtype)
-        legacy = Qwen3Config(
-            hidden_size=32,
-            intermediate_size=64,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            num_hidden_layers=1,
-            vocab_size=64,
-            rms_norm_eps=1e-6,
-            attn_output_gate=True,
-            attention_dropout=0,
-            partial_rotary_factor=0.5,
-            rope_theta=10000,
-        )
-        legacy._attn_implementation = "eager"
-        reference = Qwen3_5MTPModel(legacy).to(device=device, dtype=dtype)
-        # Use the same FP32-derived frequencies as canonical RoPE after casts.
-        reference.rotary_emb = PartialRotaryEmbedding(legacy, 8).to(device)
-        reference.load_state_dict(
-            {
-                legacy_key(name): value
-                for name, value in actual.state_dict().items()
-                if name != "embed_tokens.weight"
-            },
-            strict=True,
-        )
-        embedding = copy.deepcopy(actual.embed_tokens)
-        ids, features, entries = model_inputs(config, device, dtype)
-        other = features.detach().clone().requires_grad_()
-        output = actual(ids, features, entries)
-        hidden = reference(embedding(ids), other, position_ids=entries[0].position_ids)
-        expected = reference.lm_head(hidden)
-        torch.testing.assert_close(output.hidden_states, hidden, rtol=0, atol=0)
-        torch.testing.assert_close(output.logits, expected, rtol=0, atol=0)
-        upstream = torch.randn_like(expected)
-        output.logits.backward(upstream)
-        expected.backward(upstream)
-        torch.testing.assert_close(features.grad, other.grad, rtol=0, atol=0)
-        for name, parameter in actual.named_parameters():
-            ref = (
-                embedding.weight
-                if name == "embed_tokens.weight"
-                else dict(reference.named_parameters())[legacy_key(name)]
-            )
-            self.assertIsNotNone(parameter.grad, name)
-            torch.testing.assert_close(parameter.grad, ref.grad, rtol=0, atol=0)
-
-    def test_cpu_native_computation(self):
-        for dtype in (torch.float32, torch.bfloat16):
-            self._parity("cpu", dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_native_computation(self):
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._parity("cuda", dtype)
-
     def test_mixed_width_multilayer_checkpoint_and_tied_weights(self):
         base = mtp_config(
             target_bindings=(),

@@ -23,8 +23,8 @@ def checkpointed_chunk_reduce(
 
     ``chunk_size=0`` treats the full dimension as one chunk; positive sizes split
     it into smaller chunks. Independently, ``checkpoint=True`` uses non-reentrant
-    activation checkpointing when gradients are enabled and an input requires
-    gradients, including for a single full-size chunk.
+    activation checkpointing when gradients are enabled, including captured module parameters
+    and a single full-size chunk.
     ``checkpoint=False`` keeps chunking but retains each chunk's saved activations
     until backward. Smaller chunks then bound temporaries, not total saved state
     (for example, full-vocabulary logits retained by a fused loss).
@@ -73,13 +73,7 @@ def checkpointed_chunk_reduce(
             )
             for tensor in aligned_tensors
         )
-        should_checkpoint = (
-            checkpoint
-            and torch.is_grad_enabled()
-            and any(
-                tensor is not None and tensor.requires_grad for tensor in chunk_args
-            )
-        )
+        should_checkpoint = checkpoint and torch.is_grad_enabled()
         if should_checkpoint:
             from torch.utils.checkpoint import checkpoint as activation_checkpoint
 

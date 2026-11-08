@@ -3,6 +3,7 @@
 import copy
 import json
 import unittest
+from pathlib import Path
 
 from specforge.config.draft.codec import (
     decode_config,
@@ -10,11 +11,13 @@ from specforge.config.draft.codec import (
     encode_config,
 )
 from specforge.config.draft.logits import NoLogitTransformSpec
-from tests.test_config.test_draft_legacy_dflash import CONFIGS
 
 
 def mtp_payload():
-    return json.loads((CONFIGS / "qwen3.5-4b-mtp.json").read_text())
+    fixture = (
+        Path(__file__).resolve().parents[1] / "fixtures/legacy_mtp/original_config.json"
+    )
+    return json.loads(fixture.read_text())
 
 
 def target_for_mtp(payload):
@@ -22,7 +25,7 @@ def target_for_mtp(payload):
 
 
 class LegacyMTPTest(unittest.TestCase):
-    def test_bundled_recipe_round_trip_and_binding_choices(self):
+    def test_historical_recipe_round_trip_and_binding_choices(self):
         for method in (None, {}, {"share_lm_head": True}, {"share_lm_head": False}):
             payload = mtp_payload() | {"mtp_config": method}
             before = copy.deepcopy(payload)

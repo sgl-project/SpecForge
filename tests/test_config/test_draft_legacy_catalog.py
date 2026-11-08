@@ -14,7 +14,7 @@ from tests.test_config.test_draft_legacy_dflash import CONFIGS
 class LegacyCatalogTest(unittest.TestCase):
     def test_every_bundled_configuration_round_trips(self):
         paths = sorted(CONFIGS.glob("*.json"))
-        self.assertGreaterEqual(len(paths), 52)
+        self.assertGreaterEqual(len(paths), 51)
         for path in paths:
             with self.subTest(path=path.name):
                 payload = json.loads(path.read_text())

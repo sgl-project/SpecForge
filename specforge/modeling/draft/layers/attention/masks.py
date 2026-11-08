@@ -60,12 +60,11 @@ def dense_attention_mask(
     if sliding_window is not None:
         positive_int("sliding_window", sliding_window)
     allowed = layout.visibility
-    if is_causal or sliding_window is not None:
-        distance = layout.query_positions.unsqueeze(
-            -1
-        ) - layout.key_positions.unsqueeze(-2)
-        if is_causal:
-            allowed = allowed & (distance >= 0).unsqueeze(1)
-        if sliding_window is not None:
-            allowed = allowed & (distance.abs() < sliding_window).unsqueeze(1)
+    q = layout.query_positions.unsqueeze(-1)
+    k = layout.key_positions.unsqueeze(-2)
+    if is_causal:
+        # A boolean comparison avoids an unnecessary int64 Q-by-K allocation.
+        allowed = allowed & (q >= k).unsqueeze(1)
+    if sliding_window is not None:
+        allowed = allowed & ((q - k).abs() < sliding_window).unsqueeze(1)
     return allowed

@@ -18,10 +18,31 @@ def resolve_config(cfg):
 
     draft = cfg.draft
     if isinstance(draft, str):
+        import json
+
         import yaml
 
-        draft = yaml.safe_load(Path(draft).read_text())
-    supplied = parse_draft(draft) if draft is not None else None
+        text = Path(draft).read_text()
+        try:
+            draft = json.loads(text)
+        except json.JSONDecodeError:
+            draft = yaml.safe_load(text)
+    if isinstance(draft, dict) and draft.get("model_type") not in (
+        None,
+        "specforge_draft",
+    ):
+        from specforge.config.draft.codec import decode_legacy_config
+        from specforge.modeling.target.target_utils import load_target_config
+
+        target = load_target_config(
+            cfg.model.target_model_path,
+            cache_dir=cfg.model.cache_dir,
+            trust_remote_code=cfg.model.trust_remote_code,
+        )
+        target = getattr(target, "text_config", target)
+        supplied = decode_legacy_config(draft, target_config=target.to_dict())
+    else:
+        supplied = parse_draft(draft) if draft is not None else None
     initialization = cfg.initialization
     source = initialization.checkpoint if initialization else None
     if cfg.training.resume_from:
@@ -130,11 +151,33 @@ def resolve_run(cfg, registry):
         "num_depths",
         "down_sample_ratio",
         "down_sample_ratio_min",
+        "mtp_objective_chunk_size",
         "norm_before_residual",
     }
     from specforge.config.schema import TrainingConfig
 
     defaults = TrainingConfig()
+    if default == "mtp":
+        legacy_options.remove("mtp_objective_chunk_size")
+        chunk = cfg.training.mtp_objective_chunk_size
+        if chunk != defaults.mtp_objective_chunk_size:
+            options = dict(cfg.training.objective_options)
+            if (
+                "objective_chunk_size" in options
+                and options["objective_chunk_size"] != chunk
+            ):
+                raise ValueError("conflicting MTP objective_chunk_size settings")
+            options["objective_chunk_size"] = chunk
+            cfg = cfg.model_copy(
+                update={
+                    "training": cfg.training.model_copy(
+                        update={
+                            "objective_options": options,
+                            "mtp_objective_chunk_size": defaults.mtp_objective_chunk_size,
+                        }
+                    )
+                }
+            )
     present = {
         name
         for name in legacy_options
@@ -151,6 +194,13 @@ def resolve_run(cfg, registry):
             f"objective {objective!r} is incompatible with {draft.architecture}"
         )
     entry.factory(**cfg.training.objective_options)
+    if cfg.training.attention_backend == "sdpa" and default == "mtp":
+        from specforge.config.draft.attention import GQASpec, MHASpec
+
+        if any(
+            type(a) not in (GQASpec, MHASpec) for a in draft.attention_configs.values()
+        ):
+            raise ValueError("MTP SDPA currently requires GQA or MHA attention")
     if (
         cfg.training.tp_size,
         cfg.training.sp_ulysses_size,
@@ -230,7 +280,9 @@ def resolve_run(cfg, registry):
         )
     vocab = default in ("eagle3", "peagle")
     capabilities = AlgorithmCapabilities(
-        attention_backends=frozenset({"eager"}),
+        attention_backends=frozenset(
+            {"eager", "sdpa"} if default == "mtp" else {"eager"}
+        ),
         required_batch_size=1 if default == "peagle" else None,
         supports_vocab_mapping=vocab,
     )
