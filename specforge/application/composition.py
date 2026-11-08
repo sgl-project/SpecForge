@@ -49,6 +49,12 @@ def resolve_run(
         from specforge.algorithms.builtin import builtin_algorithm_registry
 
         registry = builtin_algorithm_registry()
+    from specforge.training.canonical import enabled
+    from specforge.training.canonical import resolve_run as resolve_canonical_run
+
+    if enabled(cfg):
+        cfg, algorithm = resolve_canonical_run(cfg, registry)
+        return bind_run(cfg, algorithm)
     try:
         algorithm = registry.resolve(cfg.training.strategy)
     except KeyError as exc:

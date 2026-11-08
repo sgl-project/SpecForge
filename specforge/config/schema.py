@@ -970,7 +970,37 @@ class DeploymentConfig(StrictConfigModel):
         return self
 
 
+class WeightsFromConfig(StrictConfigModel):
+    checkpoint: str
+    mapping: Optional[dict] = None
+    allow_new: List[str] = Field(default_factory=list)
+
+
+class InitializationConfig(StrictConfigModel):
+    checkpoint: Optional[str] = None
+    weights_from: Optional[WeightsFromConfig] = None
+    from_target: Optional[dict] = None
+    adapter: Optional[str] = None
+    legacy_config: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _exclusive_sources(self):
+        if self.checkpoint and (self.weights_from or self.from_target):
+            raise ValueError(
+                "initialization.checkpoint excludes weights_from/from_target"
+            )
+        if self.adapter and not self.checkpoint:
+            raise ValueError("adapter requires initialization.checkpoint")
+        if self.legacy_config and not (self.checkpoint or self.weights_from):
+            raise ValueError("legacy_config requires a checkpoint source")
+        return self
+
+
 class TrainingConfig(StrictConfigModel):
+    objective: Optional[str] = None
+    objective_options: dict = Field(default_factory=dict)
+    frozen: List[str] = Field(default_factory=list)
+
     strategy: str = "eagle3"
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
@@ -1168,6 +1198,9 @@ def migrate_legacy_config(values: dict) -> dict:
 
 
 class Config(StrictConfigModel):
+    draft: Optional[dict | str] = None
+    initialization: Optional[InitializationConfig] = None
+    resume: Optional[str] = None
     model: ModelConfig
     data: DataConfig
     training: TrainingConfig = Field(default_factory=TrainingConfig)
@@ -1195,6 +1228,38 @@ class Config(StrictConfigModel):
     @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
+        if self.resume:
+            if self.training.resume_from and self.training.resume_from != self.resume:
+                raise ValueError("resume and training.resume_from disagree")
+            self.training.resume_from = self.resume
+        canonical = (
+            self.draft is not None
+            or self.initialization is not None
+            or self.resume is not None
+        )
+        if canonical:
+            if self.model.draft_model_config or self.model.draft_checkpoint_path:
+                raise ValueError(
+                    "draft/initialization/resume cannot mix with legacy model.draft_* sources"
+                )
+            if self.initialization is not None and self.training.resume_from:
+                raise ValueError("initialization and resume are mutually exclusive")
+            if self.draft is None and not (
+                self.resume
+                or self.training.resume_from
+                or (self.initialization and self.initialization.checkpoint)
+            ):
+                raise ValueError(
+                    "scratch/weights_from/from_target requires draft structure"
+                )
+        elif (
+            self.training.objective
+            or self.training.objective_options
+            or self.training.frozen
+        ):
+            raise ValueError(
+                "objective/options/frozen require the canonical draft loading path"
+            )
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
