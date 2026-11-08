@@ -7,6 +7,8 @@ from transformers import initialization as init
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.norm import RMSNormSpec
 
+from ..registry import register_component_builder
+
 
 class RMSNorm(nn.Module):
     def __init__(
@@ -34,3 +36,6 @@ class RMSNorm(nn.Module):
             return self.weight * hidden.to(input_dtype)
         # The 1+w parameterization scales in FP32 before the final cast.
         return (hidden * (1.0 + self.weight.float())).to(input_dtype)
+
+
+register_component_builder("norm", RMSNormSpec, RMSNorm)

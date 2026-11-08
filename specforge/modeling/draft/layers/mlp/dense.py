@@ -6,6 +6,8 @@ from transformers.activations import ACT2FN
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.mlp import DenseFFNSpec
 
+from ..registry import register_component_builder
+
 # Parameter-free activation primitives with numerical parity coverage. Expanding
 # this set requires a reference test; it does not add another config default.
 SUPPORTED_ACTIVATIONS = frozenset(
@@ -54,3 +56,6 @@ class DenseFFN(nn.Module):
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden)) * self.up_proj(hidden)
         )
+
+
+register_component_builder("mlp", DenseFFNSpec, DenseFFN)
