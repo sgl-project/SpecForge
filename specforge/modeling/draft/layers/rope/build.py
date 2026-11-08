@@ -2,6 +2,7 @@
 
 from specforge.config.draft.rope import (
     DefaultRoPESpec,
+    DynamicNTKRoPESpec,
     LinearRoPESpec,
     Llama3RoPESpec,
     MultiAxisRoPESpec,
@@ -12,6 +13,7 @@ from specforge.config.draft.rope import (
 
 from .base import RotaryEmbedding
 from .default import DefaultRotaryEmbedding
+from .dynamic import DynamicNTKRotaryEmbedding
 from .linear import LinearRotaryEmbedding
 from .llama3 import Llama3RotaryEmbedding
 from .multiaxis import MultiAxisRotaryEmbedding
@@ -19,6 +21,7 @@ from .yarn import YaRNRotaryEmbedding
 
 _BUILDERS = {
     DefaultRoPESpec: DefaultRotaryEmbedding,
+    DynamicNTKRoPESpec: DynamicNTKRotaryEmbedding,
     LinearRoPESpec: LinearRotaryEmbedding,
     Llama3RoPESpec: Llama3RotaryEmbedding,
     MultiAxisRoPESpec: MultiAxisRotaryEmbedding,

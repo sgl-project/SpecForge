@@ -13,7 +13,6 @@ from transformers.modeling_rope_utils import (
 from specforge.config.draft.codec.settings import encode_rope
 from specforge.config.draft.rope import (
     DefaultRoPESpec,
-    DynamicNTKRoPESpec,
     LinearRoPESpec,
     Llama3RoPESpec,
     NoRoPESpec,
@@ -161,16 +160,8 @@ class ScaledRotaryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_rotary(NoRoPESpec(), head_dim=0)
 
-    def test_unimplemented_rules_cannot_fall_back_to_default(self):
-        for node in (
-            DynamicNTKRoPESpec(
-                rope_theta=10000.0,
-                partial_rotary_factor=1.0,
-                factor=2.0,
-                original_max_position_embeddings=8192,
-            ),
-            {"rope_type": "default"},
-        ):
+    def test_unknown_nodes_cannot_fall_back_to_default(self):
+        for node in ({"rope_type": "default"}, object()):
             with self.assertRaisesRegex(ValueError, "unsupported rotary node"):
                 build_rotary(node, head_dim=128)
 
