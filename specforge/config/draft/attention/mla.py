@@ -12,6 +12,7 @@ class MLASpec(AttentionSpec):
     """Latent projections and rotary subspace; no GQA head/cache assumptions."""
 
     type: ClassVar[str] = "mla"
+    capabilities: ClassVar[frozenset[str]] = frozenset({"target_context_kv"})
 
     num_attention_heads: int
     q_lora_rank: int | None
@@ -50,3 +51,7 @@ class MLASpec(AttentionSpec):
     @property
     def qk_head_dim(self) -> int:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    @property
+    def rotary_input_dim(self) -> int:
+        return self.qk_rope_head_dim

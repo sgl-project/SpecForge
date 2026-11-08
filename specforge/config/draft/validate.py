@@ -1,13 +1,71 @@
 """Cross-node constraints; no model construction or algorithm dispatch."""
 
+from __future__ import annotations
+
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 from ._validation import nonempty_string, positive_int
 from .attention import AttentionSpec
 from .conv import ConvSpec, GroupedCausalConvSpec
 from .layer import LayerSpec
+from .logits import MuPLogitTransformSpec, NoLogitTransformSpec
 from .mlp import FFNSpec
-from .registry import component_schema
+from .registry import architecture_spec, component_schema
+
+if TYPE_CHECKING:
+    from .model import DraftConfig
+
+
+def validate(config: DraftConfig) -> None:
+    """Validate the whole structure without importing or allocating model code."""
+    registration = architecture_spec(config.architecture)
+    if type(config.spec_config) is not registration.schema:
+        raise ValueError(
+            f"spec_config for {config.architecture} must be {registration.schema.__name__}"
+        )
+    protocol = config.spec_config.protocol
+    validate_layers(
+        hidden_size=config.hidden_size,
+        attention_configs=config.attention_configs,
+        mlp_configs=config.mlp_configs,
+        conv_configs=config.conv_configs,
+        layer_configs=config.layer_configs,
+        layer_types=config.layer_types,
+        num_model_slots=None if protocol is None else protocol.num_model_slots,
+    )
+    for kind, node in (
+        ("norm", config.norm_config),
+        ("residual", config.residual_config),
+    ):
+        if type(node) is not component_schema(kind, getattr(node, "type", None)):
+            raise ValueError(f"{kind}_config must use its registered schema")
+    for name, attention in config.attention_configs.items():
+        if attention.rotary_input_dim is not None:
+            try:
+                config.rope_parameters.rotary_dim(attention.rotary_input_dim)
+            except ValueError as exc:
+                raise ValueError(f"attention_configs.{name}: {exc}") from exc
+    if config.draft_vocab_size > config.vocab_size:
+        raise ValueError("draft_vocab_size must not exceed vocab_size")
+    if config.tie_word_embeddings:
+        if config.target_bindings:
+            raise ValueError(
+                "tie_word_embeddings cannot be combined with target_bindings"
+            )
+        if config.draft_vocab_size != config.vocab_size:
+            raise ValueError("tie_word_embeddings requires equal vocabulary sizes")
+    if "lm_head" in config.target_bindings:
+        if type(config.target_logit_transform) not in (
+            NoLogitTransformSpec,
+            MuPLogitTransformSpec,
+        ):
+            raise ValueError(
+                "bound lm_head requires an explicit supported target_logit_transform"
+            )
+    elif config.target_logit_transform is not None:
+        raise ValueError("target_logit_transform requires lm_head in target_bindings")
+    registration.validate(config)
 
 
 def validate_layers(
