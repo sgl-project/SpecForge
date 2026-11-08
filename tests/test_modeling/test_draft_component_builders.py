@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import NormSpec, RMSNormSpec
 from specforge.config.draft.registry import _SCHEMAS, register_component_schema
@@ -22,7 +23,6 @@ from specforge.modeling.draft.layers import (
     register_component_builder,
 )
 from specforge.modeling.draft.layers.registry import _BUILDERS
-from tests.test_config.draft_fixtures import draft_config
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -78,8 +78,8 @@ class ComponentBuilderTest(unittest.TestCase):
         with patch("torch.nn.Parameter") as allocate:
             with self.assertRaisesRegex(ValueError, "no modeling builder"):
                 build_component(
-                    "attention",
-                    draft_config().attention_configs["full"],
+                    "conv",
+                    GroupedCausalConvSpec(kernel_size=3, group_size=8),
                     hidden_size=32,
                 )
             with self.assertRaises(ValueError):
