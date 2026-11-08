@@ -49,7 +49,13 @@ def build(node, *, input_size=16, rotary_dim=8, offset=0, **options):
         input_size=input_size,
         hidden_size=16,
         norm=RMSNormSpec(eps=1e-6, weight_offset=offset),
-        rotary_dim=rotary_dim,
+        rope=(
+            NoRoPESpec()
+            if rotary_dim == 0
+            else DefaultRoPESpec(
+                rope_theta=10000, partial_rotary_factor=rotary_dim / node.head_dim
+            )
+        ),
         backend="eager",
         **options,
     )
@@ -270,7 +276,7 @@ class GQATest(unittest.TestCase):
                     input_size=16,
                     hidden_size=16,
                     norm=RMSNormSpec(eps=1e-6, weight_offset=0),
-                    rotary_dim=8,
+                    rope=DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=1),
                     backend="flex",
                 )
             with self.assertRaises(ValueError):
