@@ -172,7 +172,7 @@ jobs:
         run: |
           source sf/bin/activate
           export PYTHONPATH=$PWD
-          python -m unittest tests.test_checkpoint.test_sglang_export tests.test_checkpoint.test_sglang_compatibility -v
+          python -m unittest tests.test_checkpoint.test_native_presets tests.test_checkpoint.test_sglang_export tests.test_checkpoint.test_sglang_compatibility -v
 
       - name: Run Liger kernel tests
         timeout-minutes: 10

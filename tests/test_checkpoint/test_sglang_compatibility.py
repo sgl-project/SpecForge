@@ -35,6 +35,7 @@ from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.rope import apply_rotary, build_rotary
+from tests.test_checkpoint.test_native_presets import native_configs
 from tests.test_checkpoint.test_sglang_boundaries import multi_axis_config
 from tests.test_checkpoint.test_sglang_export import serving_configs
 from tests.test_config.test_draft_mtp_spec import mtp_config
@@ -290,6 +291,7 @@ class SGLangCompatibilityTest(unittest.TestCase):
             configs.append(multi_axis_config(serving_configs()[-1]))
             configs.append(dspark_config(bound=True, confidence=False))
             if torch.cuda.is_available():
+                configs.extend(native_configs(small=True))
                 base = mtp_config()
                 configs.append(
                     replace(
