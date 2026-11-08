@@ -23,6 +23,7 @@ class GQASpec(AttentionSpec):
     attention_dropout: float
 
     def __post_init__(self):
+        super().__post_init__()
         for name in ("num_attention_heads", "num_key_value_heads", "head_dim"):
             positive_int(name, getattr(self, name))
         if self.num_attention_heads % self.num_key_value_heads:

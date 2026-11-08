@@ -25,6 +25,7 @@ def draft_config(**overrides):
             "tie_word_embeddings": False,
             "attention_configs": {
                 "full": GQASpec(
+                    rope_parameters=None,
                     num_attention_heads=4,
                     num_key_value_heads=2,
                     head_dim=8,

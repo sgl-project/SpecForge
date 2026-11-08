@@ -16,6 +16,7 @@ from specforge.config.draft.residual import StandardResidualSpec
 def gqa(**overrides):
     return GQASpec(
         **{
+            "rope_parameters": None,
             "num_attention_heads": 8,
             "num_key_value_heads": 2,
             "head_dim": 16,

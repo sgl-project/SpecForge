@@ -5,7 +5,7 @@ from dataclasses import asdict
 
 from ..logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
 from ..rope import DefaultRoPESpec, LinearRoPESpec, NoRoPESpec, RopeSpec
-from .components import _construct
+from ._schema import _construct
 
 _ROPE = {
     schema.rope_type: schema for schema in (DefaultRoPESpec, LinearRoPESpec, NoRoPESpec)

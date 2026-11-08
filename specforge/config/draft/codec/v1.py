@@ -9,13 +9,8 @@ from collections.abc import Mapping
 from .._validation import positive_int
 from ..model import DraftConfig
 from ..registry import architecture_spec
-from .components import (
-    _construct,
-    decode_component,
-    decode_layer,
-    encode_component,
-    encode_layer,
-)
+from ._schema import _construct
+from .components import decode_component, decode_layer, encode_component, encode_layer
 from .nodes import decode_node, encode_node
 from .settings import (
     decode_rope,
@@ -195,6 +190,15 @@ def parse_draft(payload: Mapping) -> DraftConfig:
     values.setdefault("schema_version", SCHEMA_VERSION)
     values.setdefault("model_type", MODEL_TYPE)
     values.setdefault("conv_configs", {})
+    # YAML omission means inherit the explicitly supplied model-level RoPE.
+    # Canonical decoding remains strict and requires the resolved choice.
+    if isinstance(values.get("attention_configs"), Mapping):
+        values["attention_configs"] = {
+            name: (
+                {"rope_parameters": None, **node} if isinstance(node, Mapping) else node
+            )
+            for name, node in values["attention_configs"].items()
+        }
     if "draft_vocab_size" not in values and "vocab_size" in values:
         values["draft_vocab_size"] = values["vocab_size"]
     values.setdefault("initializer_range", 0.02)

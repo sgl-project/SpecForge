@@ -27,6 +27,7 @@ class MLASpec(AttentionSpec):
     attention_dropout: float
 
     def __post_init__(self):
+        super().__post_init__()
         for name in (
             "num_attention_heads",
             "kv_lora_rank",

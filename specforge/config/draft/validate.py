@@ -43,7 +43,9 @@ def validate(config: DraftConfig) -> None:
     for name, attention in config.attention_configs.items():
         if attention.rotary_input_dim is not None:
             try:
-                config.rope_parameters.rotary_dim(attention.rotary_input_dim)
+                attention.effective_rope(config.rope_parameters).rotary_dim(
+                    attention.rotary_input_dim
+                )
             except ValueError as exc:
                 raise ValueError(f"attention_configs.{name}: {exc}") from exc
     if config.draft_vocab_size > config.vocab_size:

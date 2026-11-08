@@ -75,6 +75,7 @@ class CanonicalCodecTest(unittest.TestCase):
                     attention, is_causal=True, sliding_window=128
                 ),
                 "latent": MLASpec(
+                    rope_parameters=None,
                     num_attention_heads=4,
                     q_lora_rank=None,
                     kv_lora_rank=16,

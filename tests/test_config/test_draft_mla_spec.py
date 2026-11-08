@@ -9,6 +9,7 @@ from specforge.config.draft.codec.components import decode_component, encode_com
 
 MLA = {
     "type": "mla",
+    "rope_parameters": None,
     "num_attention_heads": 8,
     "q_lora_rank": None,
     "kv_lora_rank": 32,

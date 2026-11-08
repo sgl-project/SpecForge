@@ -6,7 +6,7 @@ from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
 
 from .._validation import finite_number
-from .components import _construct
+from ._schema import _construct
 
 
 def _decode_value(annotation, value, path):
