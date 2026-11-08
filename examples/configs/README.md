@@ -194,6 +194,9 @@ historical suffixes.
 | --- | --- | --- |
 | `run_id` | `specforge-run` | Stable identifier for the run. It names checkpoints and is also the default disaggregated store namespace. Use a new value for a fresh attempt. |
 | `output_dir` | `./output` | Shared checkpoint, profiler, and tracker output directory. Every trainer rank must resolve it to the same location. |
+| `draft` | `null` | Canonical draft mapping or YAML/JSON path, including preset files. Its architecture selects the default objective. |
+| `initialization` | `null` | Canonical weights-only loading: `checkpoint`, or `weights_from` (`checkpoint`, `mapping`, `allow_new`) with optional disjoint `from_target` copies. See [canonical training](../../docs/draft_training.md). |
+| `resume` | `null` | Canonical full training resume; restores structure from the checkpoint and aliases `training.resume_from`. Excludes initialization. |
 
 The top-level `model` and `data` sections are required. `training`, `tracking`,
 `profiling`, `runtime`, and `deployment` have defaults, but checked-in recipes
@@ -282,6 +285,9 @@ Common fields:
 | Field | Default | What to write |
 | --- | --- | --- |
 | `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, or `dspark`. |
+| `training.objective` | `null` | Canonical objective registration; omission uses the architecture's default. |
+| `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
+| `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |

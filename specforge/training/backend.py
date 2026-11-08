@@ -212,7 +212,15 @@ class FSDPTrainingBackend(TrainingBackend):
         all-gather them before every optimizer window without saving optimizer
         memory, which is the wrong trade-off for the current trainer recipes.
         """
-        modules = []
+        modules = list(getattr(model, "frozen_target_modules", ()))
+        if any(
+            parameter.requires_grad
+            for module in modules
+            for parameter in module.parameters()
+        ):
+            raise ValueError(
+                "frozen_target_modules must contain only frozen parameters"
+            )
         for name in ("lm_head", "embed_tokens"):
             module = getattr(model, name, None)
             if not isinstance(module, nn.Module):
@@ -294,7 +302,8 @@ class FSDPTrainingBackend(TrainingBackend):
                 fsdp_kwargs = dict(
                     use_orig_params=True,
                     mixed_precision=MixedPrecision(
-                        param_dtype=pc.param_dtype, buffer_dtype=torch.float32
+                        param_dtype=getattr(model, "fsdp_param_dtype", pc.param_dtype),
+                        buffer_dtype=torch.float32,
                     ),
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,

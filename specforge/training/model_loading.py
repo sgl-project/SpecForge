@@ -210,6 +210,10 @@ def resolve_draft_config(
 ) -> "PretrainedConfig":
     """Resolve and validate the draft architecture for one typed run config."""
 
+    from specforge.training.canonical import enabled, resolve_config
+
+    if enabled(cfg):
+        return resolve_config(cfg)
     from specforge.modeling.draft.config import AutoDraftConfig
 
     source = cfg.model.draft_model_config
@@ -273,7 +277,15 @@ def draft_config_dict(
 ) -> Dict[str, Any]:
     """JSON-compatible resolved draft config for capture-only producer roles."""
 
-    return resolve_draft_config(cfg, provider=provider).to_dict()
+    resolved = resolve_draft_config(cfg, provider=provider)
+    from specforge.config.draft import DraftConfig
+    from specforge.config.draft.codec import encode_config
+
+    return (
+        encode_config(resolved)
+        if isinstance(resolved, DraftConfig)
+        else resolved.to_dict()
+    )
 
 
 def _has_pretrained_weights(path: str) -> bool:
