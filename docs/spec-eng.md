@@ -27,8 +27,8 @@ All nodes are frozen dataclasses, with immutable nested collections so that the 
 
 | Type | Main parameters |
 |---|---|
-| GQA / MHA | `num_attention_heads`, `num_key_value_heads`, `head_dim`, `qk_norm`, `attention_bias`, `output_gate`, `is_causal`, optional `sliding_window`; MHA requires equal query and KV head counts |
-| MLA | `num_attention_heads`, `q_lora_rank`, `kv_lora_rank`, projection dimensions, rotation convention, and `is_causal` |
+| GQA / MHA | `num_attention_heads`, `num_key_value_heads`, `head_dim`, `qk_norm`, `attention_bias`, `output_gate`, `is_causal`, `sliding_window` (`null` for none); MHA requires equal query and KV head counts |
+| MLA | `num_attention_heads`, `q_lora_rank` (`null` for none), `kv_lora_rank`, projection dimensions, rotation convention, and `is_causal` |
 | DSA / QSA | Projection sub-nodes and the corresponding indexing, selection, quantization, or compression parameters |
 | KDA | Its own head, state, gating, short-convolution, and projection parameters |
 
@@ -57,7 +57,7 @@ DFlash2 references convolution through a layer node's `sublayer_conv`, wrapping 
 - Native drafts use the same components. Model origin is not a layer type, and the target model's whole-layer implementation is not called directly.
 - `layer_types` selects a named `LayerSpec` for each layer. Its entries are layer-definition names, not implementation types or registry keys. `num_hidden_layers` is derived from its length.
 
-Referencing the same layer definition means identical structure, not shared weights. Each instantiation creates an independent module. Draft modules never share parameters with each other; the only modules taken from the target are those listed in `target_bindings`.
+Referencing the same layer definition means identical structure, not shared weights. Each instantiation creates an independent module. Draft modules never share parameters with each other, except the embedding and LM head when `tie_word_embeddings` is true; the only modules taken from the target are those listed in `target_bindings`.
 
 `LayerSpec` describes neither training loops nor arbitrary execution graphs. Architecture models still organize DMTP's input fusion and DSpine's inter-layer injection; these do not belong in ordinary decoder-layer configuration.
 
@@ -119,7 +119,7 @@ External extensions register through the `specforge.extensions` entry point. The
 
 DFlash, DFlash2, and DMTP use the backbone's sequential forward. DMTP's trainable MTP-feature fusion belongs to the model forward. Frozen MTP features are supplied externally, and training and inference follow the same token-alignment rules.
 
-DSpine owns its “decoder layer → injection” loop through the backbone's `begin`, `run_layer`, and `finalize`, the same calls that make up the sequential forward. One injection module manages per-layer readout/write parameters and parameters shared across layers. Outputs preserve the final layer's pre-injection state and each layer's post-injection features with their gradients. Refinement reuses the final injection and final normalization.
+DSpine owns its “decoder layer → injection” loop through the backbone's `begin`, `run_next_layer`, and `finalize`, the same calls that make up the sequential forward. One injection module manages per-layer readout/write parameters and parameters shared across layers. Outputs preserve the final layer's pre-injection state and each layer's post-injection features with their gradients. Refinement reuses the final injection and final normalization.
 
 The backbone receives no algorithm-specific hooks or training schedules. Training generates `replace_mask` and passes it to the model. The protocol spec derives the number of model slots, draft prediction positions, candidates supplied by other predictors, and the verification window.
 
@@ -145,6 +145,9 @@ attention_configs:
     num_attention_heads: 32
     num_key_value_heads: 8
     head_dim: 128
+    qk_norm: true
+    attention_bias: false
+    output_gate: false
     is_causal: true
     sliding_window: 2048
   full:
@@ -152,7 +155,11 @@ attention_configs:
     num_attention_heads: 32
     num_key_value_heads: 8
     head_dim: 128
+    qk_norm: true
+    attention_bias: false
+    output_gate: false
     is_causal: false
+    sliding_window: null
 mlp_configs:
   narrow: {type: dense, intermediate_size: 11008, hidden_act: silu}
   wide: {type: dense, intermediate_size: 14336, hidden_act: silu}
@@ -167,7 +174,7 @@ Saving writes the complete effective configuration, including the derived `num_h
 
 The HF shell stores HF metadata; the checkpoint stores format and weight-layout metadata. Neither belongs to `DraftConfig`. Training configuration and loading plans own copies from target weights (`initialization.from_target`): copies are bit-preserving, using only explicit renames and the layout operations that components with fused parameters declare, every element of every mapped draft parameter and every target tensor must be used, and quantized tensors and narrowing casts are rejected. Copies are draft weights and are saved with the draft; decoder layers are never bound. `target_bindings` lists which of `embed_tokens` and `lm_head` come from the target; they are frozen and not saved with the draft. A bound `lm_head` reads `target_logit_transform`, a target-derived value computed at parse time, so model code never reads the target configuration. The draft is still built from its declared components.
 
-HF export uses the canonical configuration. SGLang never reads canonical configurations: the SGLang converter writes SGLang's own draft format, with every field that affects computation written explicitly, and retains the canonical configuration in `specforge_config.json` for re-import. Format representability and engine execution support are validated separately. Unsupported structures and binding sets fail export. Export does not modify the model configuration.
+HF export uses the canonical configuration. SGLang never reads canonical configurations: the SGLang converter writes SGLang's own draft format, with every field that affects computation written explicitly. SGLang directories are one-way serving artifacts and are never imported. Format representability and engine execution support are validated separately. Unsupported structures and binding sets fail export. Export does not modify the model configuration.
 
 ## 6. Code Organization and Validation
 
