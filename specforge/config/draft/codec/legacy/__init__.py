@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 
 from .dflash import decode_dflash
+from .domino import decode_domino
 from .dspark import decode_dspark
 from .dspine import decode_dspine
 
@@ -11,6 +12,7 @@ _DECODERS = {
     "DFlash2DraftModel": decode_dflash,
     "DSparkDraftModel": decode_dspark,
     "DSpineDraftModel": decode_dspine,
+    "DominoDraftModel": decode_domino,
 }
 
 
