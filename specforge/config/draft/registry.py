@@ -10,6 +10,7 @@ from .architecture import (
     ArchitectureSpec,
     DFlash2Spec,
     DFlashSpec,
+    DMTPSpec,
     DominoSpec,
     DSparkSpec,
     DSpineSpec,
@@ -252,3 +253,4 @@ register_spec("DominoDraftModel", DominoSpec, validate_target_context)
 register_spec("Eagle3DraftModel", Eagle3Spec, validate_eagle3)
 register_spec("PEagleDraftModel", PEagleSpec, validate_peagle)
 register_spec("MTPDraftModel", MTPSpec, validate_mtp)
+register_spec("DMTPDraftModel", DMTPSpec, validate_target_context)
