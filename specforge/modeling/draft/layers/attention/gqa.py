@@ -6,6 +6,7 @@ from torch import Tensor, nn
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.attention import GQASpec, MHASpec
 from specforge.config.draft.norm import NormSpec
+from specforge.config.draft.rope import RopeSpec
 
 from ..registry import build_component, register_component_builder
 from ..rope import apply_rotary
@@ -22,7 +23,7 @@ class GQAAttention(nn.Module):
         input_size: int,
         hidden_size: int,
         norm: NormSpec,
-        rotary_dim: int,
+        rope: RopeSpec,
         backend: str,
         device=None,
         dtype=None,
@@ -32,22 +33,11 @@ class GQAAttention(nn.Module):
             raise TypeError("GQAAttention requires GQASpec or MHASpec")
         positive_int("input_size", input_size)
         positive_int("hidden_size", hidden_size)
-        if not isinstance(norm, NormSpec):
-            raise TypeError("norm must be a normalization node")
-        if (
-            type(rotary_dim) is not int
-            or rotary_dim < 0
-            or rotary_dim % 2
-            or rotary_dim > config.head_dim
-        ):
-            raise ValueError(
-                "rotary_dim must be zero or an even dimension within the head"
-            )
-        if (
-            config.rope_parameters is not None
-            and rotary_dim != config.rope_parameters.rotary_dim(config.head_dim)
-        ):
-            raise ValueError("rotary_dim must match the attention RoPE override")
+        if not isinstance(norm, NormSpec) or not isinstance(rope, RopeSpec):
+            raise TypeError("norm and rope must be configuration nodes")
+        if config.rope_parameters is not None and rope != config.rope_parameters:
+            raise ValueError("rope must match the attention RoPE override")
+        rotary_dim = rope.rotary_dim(config.head_dim)
         if backend != "eager":
             raise ValueError("GQAAttention currently supports only the eager backend")
         self.config = config
