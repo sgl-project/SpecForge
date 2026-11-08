@@ -98,7 +98,13 @@ class CheckpointManager:
                 if self.is_rank0() and state is not None:
                     if "canonical_draft_config" in state:
                         self._atomic_json(
-                            state["canonical_draft_config"],
+                            state["canonical_draft_config"]
+                            | {
+                                "specforge_artifact": {
+                                    "format": "specforge",
+                                    "version": 1,
+                                }
+                            },
                             os.path.join(ckpt_dir, "config.json"),
                         )
                     # training_state.pt marks a complete checkpoint to readers.
