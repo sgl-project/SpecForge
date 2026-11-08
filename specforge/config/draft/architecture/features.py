@@ -7,6 +7,16 @@ from .block import AnchoredBlockSpec
 
 
 @dataclass(frozen=True, kw_only=True)
+class FinalHiddenFeatureSpec:
+    """Target final hidden states after its final normalization."""
+
+    hidden_size: int
+
+    def __post_init__(self):
+        positive_int("target_features.hidden_size", self.hidden_size)
+
+
+@dataclass(frozen=True, kw_only=True)
 class TargetFeatureSpec:
     mask_token_id: int
     target_layer_ids: tuple[int, ...]

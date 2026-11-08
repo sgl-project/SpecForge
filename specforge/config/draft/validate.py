@@ -58,6 +58,8 @@ def validate(config: DraftConfig) -> None:
         if config.draft_vocab_size != config.vocab_size:
             raise ValueError("tie_word_embeddings requires equal vocabulary sizes")
     if "lm_head" in config.target_bindings:
+        if config.draft_vocab_size != config.vocab_size:
+            raise ValueError("bound lm_head requires draft_vocab_size == vocab_size")
         if type(config.target_logit_transform) not in (
             NoLogitTransformSpec,
             MuPLogitTransformSpec,

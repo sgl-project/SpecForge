@@ -6,7 +6,8 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from .._validation import finite_number, positive_int
-from ..architecture.features import TargetFeatureSpec
+from ..architecture.eagle_fusion import AuxiliaryFeatureSpec
+from ..architecture.features import FinalHiddenFeatureSpec, TargetFeatureSpec
 from ..logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
 
 if TYPE_CHECKING:
@@ -80,8 +81,15 @@ def validate_target(config: DraftConfig, target: Mapping) -> None:
         if config.target_logit_transform != resolve_target_logits(target):
             raise ValueError("target_logit_transform does not match target_config")
     features = getattr(config.spec_config, "target_features", None)
-    if isinstance(features, TargetFeatureSpec):
+    if isinstance(features, (TargetFeatureSpec, AuxiliaryFeatureSpec)):
         count = target.get("num_hidden_layers")
         positive_int("target_config.num_hidden_layers", count)
         if any(layer >= count for layer in features.target_layer_ids):
             raise ValueError("target_layer_ids exceed target num_hidden_layers")
+    if isinstance(features, (AuxiliaryFeatureSpec, FinalHiddenFeatureSpec)):
+        width = target.get("hidden_size")
+        positive_int("target_config.hidden_size", width)
+        if features.hidden_size != width:
+            raise ValueError(
+                "target_features.hidden_size must match target hidden_size"
+            )

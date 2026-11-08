@@ -1,4 +1,4 @@
-"""Strict conversion of typed, nested architecture nodes to JSON values."""
+"""Strict conversion of typed, nested configuration nodes to JSON values."""
 
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
