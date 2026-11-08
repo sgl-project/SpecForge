@@ -6,12 +6,19 @@ from dataclasses import MISSING, dataclass, fields
 from inspect import isabstract
 from typing import TYPE_CHECKING, Callable
 
-from .architecture import ArchitectureSpec, DFlash2Spec, DFlashSpec, DSparkSpec
+from .architecture import (
+    ArchitectureSpec,
+    DFlash2Spec,
+    DFlashSpec,
+    DSparkSpec,
+    DSpineSpec,
+)
 from .architecture.constraints import (
     validate_dflash,
     validate_dflash2,
     validate_target_context,
 )
+from .architecture.dspine import validate_dspine
 from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec
 from .mlp import DenseFFNSpec, FFNSpec
@@ -49,7 +56,7 @@ def _validate_schema(schema: type, label: str) -> None:
             raise TypeError(
                 f"{label}.{field.name}: structural fields must have no defaults"
             )
-    if issubclass(schema, (AttentionSpec, ConvSpec)):
+    if issubclass(schema, (AttentionSpec, ConvSpec, ResidualSpec)):
         if type(schema.capabilities) is not frozenset or any(
             type(name) is not str or not name for name in schema.capabilities
         ):
@@ -136,3 +143,4 @@ for _kind, _schema in (
 register_spec("DFlashDraftModel", DFlashSpec, validate_dflash)
 register_spec("DFlash2DraftModel", DFlash2Spec, validate_dflash2)
 register_spec("DSparkDraftModel", DSparkSpec, validate_target_context)
+register_spec("DSpineDraftModel", DSpineSpec, validate_dspine)
