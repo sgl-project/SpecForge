@@ -7,6 +7,7 @@ from .dspark import DSparkDraftModel
 from .dspine import DSpineDraftModel
 from .eagle3 import Eagle3DraftModel
 from .mtp import MTPDraftModel
+from .peagle import PEagleDraftModel
 from .registry import build_draft_model, register_draft_model, resolve_draft_model
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "DSpineDraftModel",
     "Eagle3DraftModel",
     "MTPDraftModel",
+    "PEagleDraftModel",
     "build_draft_model",
     "register_draft_model",
     "resolve_draft_model",
