@@ -440,24 +440,25 @@ Draft architectures and layer architectures keep changing, and a draft may be bu
 
 | Level | Selected by | A new kind registers |
 |---|---|---|
-| Draft architecture | `architectures` | Spec, a model class with the same name, a default training objective, and its SGLang converter writer |
+| Draft architecture | `architectures` | Spec, a model class with the same name, a default training objective, and, if it is served, its SGLang converter |
 | Training objective | `training.objective`, defaulting to the architecture's | Objective, with the model inputs and outputs it requires and the modules it trains |
-| Component | `type` of an attention, MLP, conv, norm, or residual node | Node schema, builder, declared capabilities, checkpoint layout, and, if it is served, its SGLang converter writer |
+| Component | `type` of an attention, MLP, conv, norm, or residual node | Node schema, builder, and declared capabilities; a checkpoint layout only if it fuses tensors that checkpoints store separately |
 
 - Architectures, objectives, and components dispatch through registries. Adding a kind means adding a module and registering it; shared files do not change. `LayerSpec` only groups component references and needs no registration.
-- Packages outside the repository, for example for models under NDA, register the same way, through the `specforge.extensions` entry-point group. `extensions` in `config.json` lists the extensions whose kinds a configuration uses. It is a loading prerequisite, not part of `DraftConfig`: the loader reads it before decoding, loads each extension, and fails with the missing extension's name when one is not installed. The codec writes it from the kinds the configuration uses and verifies it on read. A YAML draft section that uses extension kinds lists them the same way. Configurations never contain Python import paths. SGLang never loads extensions: an extension kind is served only if the extension registers an SGLang converter writer for it and SGLang implements the computation; otherwise `--format sglang` fails naming the kind (G8).
+- Packages outside the repository, for example for models under NDA, register the same way, through the `specforge.extensions` entry-point group. `extensions` in `config.json` lists the extensions whose kinds a configuration uses. It is a loading prerequisite, not part of `DraftConfig`: the loader reads it before decoding, loads each extension, and fails with the missing extension's name when one is not installed. The codec writes it from the kinds the configuration uses and verifies it on read. A YAML draft section that uses extension kinds lists them the same way. Configurations never contain Python import paths. SGLang never loads extensions: an extension kind is served only if the architecture's SGLang converter supports it and SGLang implements the computation; otherwise `--format sglang` fails naming the kind (G8).
 - Adding a kind is additive and does not change `schema_version`. Changing the fields or meaning of an existing kind requires a new name, or a new schema version with a codec migration so that older configurations stay readable.
 - Flexibility does not relax validation. Every registered kind has a strict schema and declared capabilities, and it is checked against algorithm contracts (Section 1.4) like a built-in kind.
 
 ### 7.2 Native draft structures
 
-Some targets ship their own draft, such as the MTP layers that Qwen3.5 checkpoints store under `mtp.*`. A native draft follows the same rule as copies (Section 7.3): its structure is written, not derived.
+Some targets ship their own draft, such as the MTP layers that Qwen3.5 checkpoints store under `mtp.*`. A native draft is not a special case: it is a native preset plus an ordinary copy (Section 7.3).
 
 - `presets/native/` holds one YAML configuration per supported target, assembled from SpecForge components and a registered architecture. There is no `target` component or layer type, and no code derives nodes from the target's configuration.
-- The native architecture's format module, under `checkpoint/formats/native/`, declares the one correspondence between draft parameters and the target checkpoint's native draft tensors. Training uses it through `initialization.from_target: native`. `--format sglang` uses it to write trained weights back into a copy of the target checkpoint, which SGLang serves as the target's own draft. The correspondence follows the copy rules: bit-preserving layout operations only, and full coverage in both directions.
-- CI checks each native preset with weights loaded through that correspondence: the draft reproduces SGLang's serving of the target's native draft on reference inputs. SGLang is the reference because Transformers often omits native draft layers.
+- The bundled recipe for the target copies the native draft's weights with an ordinary `initialization.from_target` mapping, for example from the target's `mtp.` prefix to the draft's modules, under the same strict rules as any copy.
+- Serving belongs to the architecture's SGLang converter. SGLang's format for a native draft is the target checkpoint itself, so `--format sglang` writes the trained weights back into a copy of the target checkpoint under the native names, as main's `specforge/export/mtp.py` does today. The correspondence therefore appears in the recipe and in the converter; exporting a native preset and copying it back must give identical weights, which keeps the two in agreement.
+- CI checks each native preset with its copied weights against SGLang's serving of the target's native draft on reference inputs. SGLang is the reference because Transformers often omits native draft layers.
 
-Main already keeps the native key layout with the model family (`MTPDraftModel.NATIVE_KEY_PREFIX`) and merges trained MTP weights back into the target checkpoint (`specforge/export/mtp.py`). This design keeps that behavior and moves the network into components and a preset.
+Main keeps the network and the `mtp.*` key layout in one family class (`Qwen3_5MTPDraftModel`). This design moves the network into components and a preset and keeps the merge-back export.
 
 ### 7.3 Target weights: copies, and the shared embeddings and LM head
 
@@ -473,7 +474,7 @@ Decoder layers are reused only by copying. Binding them, or deriving draft nodes
 Copies:
 
 - `initialization.from_target` maps draft module prefixes to target checkpoint prefixes. The mapping is written by hand in training YAML, and the draft's nodes are written explicitly like any other draft's. Nothing derives nodes from the target's layers, and there is no per-family adapter for decoder layers. Where tensor names under a prefix differ between the target and the draft, for example `shared_expert` against `shared_experts`, the mapping lists explicit renames.
-- Copies are bit-preserving. The loader applies only layout operations that move elements without changing them: renaming, stacking per-expert tensors, concatenating, splitting, and transposing. Each component kind declares, next to its builder, how its parameters are laid out in the per-tensor Hugging Face checkpoint convention. For example, a MoE component that stores its experts as one fused tensor declares that the tensor is stacked from per-expert `gate_proj`, `up_proj`, and `down_proj` tensors, the layout that Transformers 5 itself fuses at load time. The declaration belongs to the component kind and carries no model-family knowledge. Value transforms are never applied: no offset such as `1 + w`, no scaling, no dequantization, and no cast to a narrower dtype. Widening, such as BF16 to FP32, is exact and allowed.
+- Copies are bit-preserving. The loader applies only layout operations that move elements without changing them: renaming, stacking, concatenating, splitting, and transposing. A component's parameters normally match the per-tensor Hugging Face checkpoint convention one to one. Only a component kind that fuses tensors that checkpoints store separately declares, next to its builder, how to assemble them. For example, a MoE component that stores its experts as one fused tensor declares that the tensor is stacked from per-expert `gate_proj`, `up_proj`, and `down_proj` tensors, the layout that Transformers 5 itself fuses at load time. The declaration carries no model-family knowledge. Value transforms are never applied: no offset such as `1 + w`, no scaling, no dequantization, and no cast to a narrower dtype. Widening, such as BF16 to FP32, is exact and allowed.
 - The copy is strict. Every element of every draft parameter under a mapped prefix receives exactly one target element, every target tensor under the prefix is used, and shapes match after the declared layout operations. A violation fails before training and names the tensors. A target tensor in a quantized format, or one with scale tensors, fails the copy by name; dequantizing is a precision decision made outside the copy, for example by copying from the target's BF16 checkpoint.
 - A target computation that no node can express, such as a normalization or gating form that no registered component offers, needs a component or node field that implements it. The copy never rewrites values to fit another component.
 - SpecForge reads tensors from the target's checkpoint files, as main already does for embeddings and LM heads, and never asks the target server for weights. The weight-loading plan is built and validated from checkpoint metadata alone, the tensor names, shapes, and dtypes in the safetensors headers, before any tensor is read. Every rank builds the same plan from the same inputs, so validation passes or fails on all ranks together. Each rank then reads only the slices of the parameters it holds, so copying one layer of a very large target never loads the target.
@@ -529,7 +530,7 @@ The [usage guide](config_usage_graph-eng.md#5-code-organization) shows the full 
 - `specforge/modeling/draft/layers/` holds the components. It is a sibling of `models/` because general and specialized models both use it.
 - `specforge/modeling/draft/heads/` holds algorithm heads, and `backbone.py` holds `DraftBackbone`.
 - `specforge/modeling/draft/models/` holds algorithm models.
-- Checkpoint formats, including external drafts, native draft layouts, and SGLang conversion, live in `specforge/checkpoint/formats/`, not next to models.
+- Checkpoint formats, including external drafts and SGLang conversion, live in `specforge/checkpoint/formats/`, not next to models.
 - Model-family configuration classes such as `Qwen3Config` are constructed only in checkpoint formats.
 - `specforge/loading.py` is the public entry point for reading drafts from files. It reads a directory through `checkpoint` and builds the model with `modeling.build_draft_model(config)`. `modeling` performs no file I/O.
 
@@ -556,13 +557,13 @@ cli -> training -> loading -> checkpoint -> modeling -> config.draft
 Each package owns its registry:
 
 - `config.draft` maps architecture names to specs.
-- `modeling` maps architecture names to model classes, each named after its architecture, and component kinds to builders and checkpoint layouts.
-- `checkpoint.formats` maps architecture names to SGLang writers for their spec and native layouts, and component kinds to SGLang writers for their nodes. The SGLang converter is assembled from one writer per architecture and one per component kind, so a new component kind adds one writer, not one per architecture. A kind without a writer, or one the architecture's format cannot use, fails export.
+- `modeling` maps architecture names to model classes, each named after its architecture, and component kinds to builders.
+- `checkpoint.formats` maps architecture names to SGLang converters. Each converter translates the spec, the binding set, and the component nodes it supports, using shared helper functions for common nodes; a node or binding set it does not support fails export.
 - `algorithms` registers objectives under their own names. Each objective declares the model inputs and outputs it requires and the modules it trains, and each architecture names a default objective.
 
 Each architecture also declares the modules it uses at serving time, such as the DFlash2 selector or the DSpark Markov head. An objective is compatible with an architecture only if each of those modules is trained by the objective, bound to the target, or listed as frozen in training configuration. Matching inputs and outputs is not enough: a DFlash objective can train a DFlash2 model's logits but not its selector, and the untrained selector would be exported and served.
 
-A consistency test checks that every architecture has the entries it needs and that its default objective is compatible. Training can select another objective that is compatible in the same sense, so a new objective never needs a new architecture. Components register their schemas in `config.draft`, their builders and checkpoint layouts in `modeling`, and their SGLang writers in `checkpoint.formats` the same way, and extensions outside the repository call the same functions.
+A consistency test checks that every architecture has the entries it needs and that its default objective is compatible. Training can select another objective that is compatible in the same sense, so a new objective never needs a new architecture. Components register their schemas in `config.draft` and their builders in `modeling` the same way, and extensions outside the repository call the same functions.
 
 SpecForge loads drafts through these registries. Standard Transformers loading works differently: AutoModel selects the model class from the configuration class and uses `architectures` only to choose among several classes registered for it, and remote code goes through `auto_map`. An exported HF package therefore names its concrete model class in `auto_map`.
 
@@ -584,10 +585,10 @@ No single registry links configuration, models, training protocols, and adapters
 | Values cross packages as nodes | Registered objectives, data dispatch, and launch components take configuration nodes, not copied scalars such as `block_size` |
 | One owner per derivation | Fixture tests compare the derived quantities that consumers use, including the values the SGLang converter writes, with the spec methods |
 | Copies from the target are strict | A `from_target` mapping that leaves a draft element without a source, leaves a target tensor unused, mismatches a name or shape, narrows a dtype, or reads a quantized tensor fails before training and names the tensors |
-| Component checkpoint layouts are bit-preserving | For every registered component kind, splitting its parameters into the declared checkpoint layout and joining them back reproduces them bitwise |
+| Component checkpoint layouts are bit-preserving | For every component kind that declares a checkpoint layout, splitting its parameters into the declared checkpoint layout and joining them back reproduces them bitwise |
 | Weight plans are validated before reading | A plan with a missing, unused, or mismatched tensor fails on every rank from checkpoint metadata alone, before any tensor is read |
 | No structural fields in training configuration | The training schema forbids extra fields and rejects structural names |
-| Registries agree | Every architecture has a spec, a model class named after it, a compatible default objective that covers its serving-time modules, and, where applicable, an SGLang writer and a native layout; every registered component kind has a schema, a builder, and a checkpoint layout |
+| Registries agree | Every architecture has a spec, a model class named after it, a compatible default objective that covers its serving-time modules, and, where applicable, an SGLang converter; every registered component kind has both a schema and a builder |
 | Canonical names never reach SGLang's model classes | Registered architecture names are compared with a frozen list of the names that released SGLang versions register |
 | SGLang's Transformers backend refuses draft classes | `is_backend_compatible()` is False for every registered model class |
 
@@ -609,11 +610,11 @@ Proceed incrementally and keep existing entry points until migration is complete
 
 1. Configuration nodes, including `norm_config` and the explicit attention fields, the canonical codec, and the legacy codec. Every existing draft configuration and checkpoint configuration decodes. The files that training and export write do not change yet.
 2. The generic base class and `DraftBackbone` with its `begin`, `run_layer`, and `finalize` execution path.
-3. Components behind node-only constructors, each with its declared checkpoint layout.
+3. Components behind node-only constructors, with a checkpoint layout for each component that fuses parameters.
 4. Algorithm models as compositions, with heads extracted.
 5. One training objective per algorithm.
-6. The switch to canonical artifacts, in one PR: training checkpoints and `--format hf` write canonical configurations, the embeddings and LM heads that drafts already share become `target_bindings`, and the SGLang converter, assembled from per-architecture and per-component-kind writers, covers every algorithm. Training reports at startup whether a configuration can be exported to SGLang. The usage guide (Section 6) lists the resulting changes for users. SGLang keeps reading only its own format.
-7. Strict, bit-preserving `initialization.from_target` copies; native presets with `from_target: native` and merge-back export, replacing the MTP family classes; and the CI equivalence check for each bundled preset that copies target weights.
+6. The switch to canonical artifacts, in one PR: training checkpoints and `--format hf` write canonical configurations, the embeddings and LM heads that drafts already share become `target_bindings`, and the SGLang converter covers every algorithm. The usage guide (Section 6) lists the resulting changes for users. SGLang keeps reading only its own format.
+7. Strict, bit-preserving `initialization.from_target` copies; native presets with ordinary `from_target` mappings and merge-back export, replacing the MTP family classes; and the CI equivalence check for each bundled preset that copies target weights.
 
 Steps 1 to 5 are behaviour-equivalent: they change no file format, command flag, or numerics, and checks 1 and 2 hold after each step. Every user-visible change waits for step 6, except native MTP fine-tuning, which moves in step 7 (usage guide, Section 6).
 
@@ -627,10 +628,10 @@ Checks:
 6. Specialized architectures use their declared components and reject configurations that violate fixed structural constraints before construction.
 7. SGLang rejects a canonical directory instead of serving it with default settings, including an HF export loaded with `--trust-remote-code`.
 8. The boundary tests in Section 9.3 pass.
-9. A bundled preset YAML, an equivalent user configuration file, and inline YAML produce the same `DraftConfig` without dispatching on file names or directories. Native presets build only registered components and, with weights copied through their native layout, match SGLang's serving of the target's native draft on reference inputs.
+9. A bundled preset YAML, an equivalent user configuration file, and inline YAML produce the same `DraftConfig` without dispatching on file names or directories. Native presets build only registered components and, with weights copied from the target's native draft, match SGLang's serving of the target's native draft on reference inputs.
 10. Bound embeddings and LM heads are frozen, are excluded from the draft checkpoint, and are restored from the target when the checkpoint is loaded. On reference final hidden states, the target head's logits match SGLang's target logits within the floor measured for identical weights.
 11. Two draft architectures load in one process, are saved, and reload with the same `DraftConfig`, both through SpecForge's loader and through Transformers with the exported `auto_map`.
 12. Exporting to each format and re-importing gives identical weights and forward outputs.
 13. For every existing configuration, the pinned SGLang version builds the same draft from the converter's `config.json` as from main's `--to hf` output: the same resolved settings, such as block size, per-layer attention type, causality, and head counts, and the same outputs on reference inputs. Textual differences between the two files, such as fields now written explicitly, are listed.
 14. With each architecture's default objective, every module that the architecture uses at serving time receives a gradient.
-15. Each bundled preset that copies target weights reproduces the target computation with the copied weights, as Section 7.3 describes. A native preset exported with `--format sglang` and re-imported through `from_target: native` gives identical weights.
+15. Each bundled preset that copies target weights reproduces the target computation with the copied weights, as Section 7.3 describes. A native preset exported with `--format sglang` and copied back through its recipe's `from_target` mapping gives identical weights.

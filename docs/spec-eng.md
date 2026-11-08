@@ -102,7 +102,7 @@ Contracts describe inputs, outputs, tensor layouts, state, and supported computa
 
 Different computational structures may use different interfaces. Stateful attention is not forced to emulate an ordinary KV cache. Backends, masks, caches, and parallel implementations must jointly satisfy the contract. Switching backends preserves semantics, and unsupported combinations are explicitly rejected.
 
-Native presets use the same specs and builders. Missing computational capabilities require explicit component implementations and types, without falling back to target-family builders. No code derives nodes from a target's configuration: a native draft's structure is its preset, and its weights are copied through the native architecture's declared layout.
+Native presets use the same specs and builders. Missing computational capabilities require explicit component implementations and types, without falling back to target-family builders. No code derives nodes from a target's configuration: a native draft's structure is its preset, and its weights are copied by an ordinary `from_target` mapping.
 
 External extensions register through the `specforge.extensions` entry point. The configuration's `extensions` declares loading prerequisites, contains no Python import paths, and is not part of `DraftConfig`.
 
@@ -165,9 +165,9 @@ residual_config: {type: standard}
 
 Saving writes the complete effective configuration, including the derived `num_hidden_layers: 2`. Loading restores the same `DraftConfig`. A checkpoint does not depend on the original configuration file's path or subsequent changes.
 
-The HF shell stores HF metadata; the checkpoint stores format and weight-layout metadata. Neither belongs to `DraftConfig`. Training configuration and loading plans own copies from target weights (`initialization.from_target`): copies are bit-preserving, using only the layout operations that component kinds declare and explicit renames, every element of every mapped draft parameter and every target tensor must be used, and quantized tensors and narrowing casts are rejected. Copies are draft weights and are saved with the draft; decoder layers are never bound. `target_bindings` lists which of `embed_tokens` and `lm_head` come from the target; they are frozen and not saved with the draft. The draft is still built from its declared components.
+The HF shell stores HF metadata; the checkpoint stores format and weight-layout metadata. Neither belongs to `DraftConfig`. Training configuration and loading plans own copies from target weights (`initialization.from_target`): copies are bit-preserving, using only explicit renames and the layout operations that components with fused parameters declare, every element of every mapped draft parameter and every target tensor must be used, and quantized tensors and narrowing casts are rejected. Copies are draft weights and are saved with the draft; decoder layers are never bound. `target_bindings` lists which of `embed_tokens` and `lm_head` come from the target; they are frozen and not saved with the draft. The draft is still built from its declared components.
 
-HF export uses the canonical configuration. SGLang never reads canonical configurations: the SGLang converter writes SGLang's own draft format, with every field that affects computation written explicitly, and retains the canonical configuration in `specforge_config.json` for re-import. Format representability and engine execution support are validated separately. Unsupported structures and binding sets fail export, and training reports them at startup. Export does not modify the model configuration.
+HF export uses the canonical configuration. SGLang never reads canonical configurations: the SGLang converter writes SGLang's own draft format, with every field that affects computation written explicitly, and retains the canonical configuration in `specforge_config.json` for re-import. Format representability and engine execution support are validated separately. Unsupported structures and binding sets fail export. Export does not modify the model configuration.
 
 ## 6. Code Organization and Validation
 
@@ -180,8 +180,8 @@ HF export uses the canonical configuration. SGLang never reads canonical configu
 | `config/draft/codec/`, `validate.py`, `registry.py` | Encoding and decoding, cross-node validation, and configuration-type registration |
 | `config/draft/presets/`, `presets/native/` | Project-maintained configuration YAML files; the latter describes native draft structures |
 | `modeling/draft/layers/`, `heads/`, `backbone.py`, `models/` | Components, auxiliary modules, shared backbone, and architecture models |
-| `checkpoint/formats/` | External draft adapters, native draft layouts, and the SGLang converter's writers |
+| `checkpoint/formats/` | External draft adapters and the SGLang converter |
 
-Adding a component requires a node definition, a computational implementation, separate schema and builder registration, its checkpoint layout, an SGLang writer if it is served, and capability-combination validation. A new parameter combination using existing types needs only a YAML file, without registering a configuration name or a new model.
+Adding a component requires a node definition, a computational implementation, separate schema and builder registration, a checkpoint layout only if it fuses parameters, and capability-combination validation. A new parameter combination using existing types needs only a YAML file, without registering a configuration name or a new model.
 
 Validation covers immutability and configuration round-trips, missing or conflicting fields, invalid references and capabilities, forward/backward and state behavior, agreement between sequential and per-layer execution, gradients under checkpointing, weight sharing, and export rejection. Refactoring existing components preserves parameter naming, initialization, and numerical behavior.
