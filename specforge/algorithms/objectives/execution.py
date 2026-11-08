@@ -1,4 +1,4 @@
-"""Shared eager loss execution; protocols never select a projection backend."""
+"""Shared eager and chunked loss execution over deferred predictions."""
 
 from dataclasses import dataclass
 
@@ -162,6 +162,27 @@ def chain_weights(predictions, projected, weighting):
     return list(zip(weights.split(sizes), denominator.split(sizes)))
 
 
+def evaluate_chunks(predictions, loss, weighting, chunk_size):
+    selected = predictions.default_loss if loss.kind == "default" else loss
+    length = predictions.hidden.shape[0]
+    # Contextual losses use whole-set statistics; preserve that reduction.
+    if not chunk_size or chunk_size >= length or selected.registration.contextual:
+        return [evaluate_predictions(predictions, loss, weighting)]
+    from torch.utils.checkpoint import checkpoint
+
+    results = []
+    for start in range(0, length, chunk_size):
+        item = predictions.select(slice(start, start + chunk_size))
+        if torch.is_grad_enabled():
+            result = checkpoint(
+                evaluate_predictions, item, loss, weighting, use_reentrant=False
+            )
+        else:
+            result = evaluate_predictions(item, loss, weighting)
+        results.append(result)
+    return results
+
+
 def execute_batch(batch, loss, weighting, *, training):
     if weighting.kind in DPACE_LOSS_TYPES:
         predictions = list(batch.predictions)
@@ -182,7 +203,9 @@ def execute_batch(batch, loss, weighting, *, training):
         ]
     else:
         results = [
-            evaluate_predictions(item, loss, weighting) for item in batch.predictions
+            result
+            for item in batch.predictions
+            for result in evaluate_chunks(item, loss, weighting, batch.chunk_size)
         ]
     if not results:
         raise ValueError("protocol must produce at least one prediction set")

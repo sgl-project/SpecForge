@@ -67,6 +67,12 @@ def resolve_run(
         from specforge.algorithms.builtin import builtin_algorithm_registry
 
         registry = builtin_algorithm_registry()
+    if cfg.training.strategy == "mtp":
+        raise ValueError(
+            "MTP now requires draft and initialization (or resume); "
+            "use the native preset for target initialization, or "
+            "initialization.checkpoint to import historical draft weights"
+        )
     try:
         algorithm = registry.resolve(cfg.training.strategy)
     except KeyError as exc:

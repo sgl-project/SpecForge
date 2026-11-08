@@ -1,0 +1,37 @@
+# Native target initialization through ordinary draft YAML and weight mappings.
+# Prepare unshifted input_ids, loss_mask and target_last_hidden_states first.
+model:
+  target_model_path: Qwen/Qwen3.5-4B
+  torch_dtype: bfloat16
+  trust_remote_code: true
+draft: specforge/config/draft/presets/native/qwen3_5_4b_mtp.yaml
+initialization:
+  from_target:
+    "":
+      from: mtp
+      rename:
+        layers: backbone.layers
+        norm: backbone.final_norm
+        fc: fusion.fc
+        pre_fc_norm_embedding: fusion.pre_fc_norm_embedding
+        pre_fc_norm_hidden: fusion.pre_fc_norm_hidden
+data:
+  hidden_states_path: ./cache/hidden_states/qwen3.5-4b-native-mtp
+  max_length: 512
+training:
+  strategy: mtp
+  attention_backend: sdpa
+  objective_options:
+    objective_chunk_size: 4096
+  max_steps: 10000
+  batch_size: 1
+  accumulation_steps: 4
+  learning_rate: 0.0006
+  save_interval: 1000
+run_id: native-mtp
+output_dir: ./outputs/native-mtp
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

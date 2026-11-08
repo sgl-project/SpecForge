@@ -76,7 +76,6 @@ class Eagle3CodecParityTest(unittest.TestCase):
         for architecture in (
             "LlamaForCausalLMEagle3",
             "PEagleDraftModel",
-            "Qwen3_5MTPDraftModel",
         ):
             for overrides in (
                 {},

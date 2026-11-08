@@ -3,7 +3,6 @@
 # ASCEND_RT_VISIBLE_DEVICES.
 model:
   target_model_path: "Qwen/Qwen3.5-4B"
-  draft_model_config: "configs/qwen3.5-4b-mtp.json"
   target_backend: sglang
   trust_remote_code: true
   # Qwen3.5-4B nests its text decoder under model.language_model and ties
@@ -12,6 +11,17 @@ model:
   lm_head_key: "model.language_model.embed_tokens.weight"
   torch_dtype: "bfloat16"
   sglang_attention_backend: ascend
+draft: specforge/config/draft/presets/native/qwen3_5_4b_mtp.yaml
+initialization:
+  from_target:
+    "":
+      from: mtp
+      rename:
+        layers: backbone.layers
+        norm: backbone.final_norm
+        fc: fusion.fc
+        pre_fc_norm_embedding: fusion.pre_fc_norm_embedding
+        pre_fc_norm_hidden: fusion.pre_fc_norm_hidden
 data:
   train_data_path: "./cache/dataset/train_regen.jsonl"
   max_length: 32768
@@ -28,6 +38,8 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1
   attention_backend: "sdpa"
+  objective_options:
+    objective_chunk_size: 4096
   save_interval: 10000
   log_interval: 50
   dist_timeout: 30

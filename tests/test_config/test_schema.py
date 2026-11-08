@@ -41,6 +41,14 @@ def _online_payload(strategy: str = "eagle3") -> dict:
     payload["data"] = {"train_data_path": "/train.jsonl"}
     payload["training"] = {"strategy": strategy, "max_steps": 1}
     payload["deployment"] = copy.deepcopy(ONLINE_DEPLOYMENT)
+    if strategy == "mtp":
+        from specforge.config.draft.codec import encode_config
+        from tests.test_config.test_draft_mtp_spec import mtp_config
+
+        payload["model"].pop("draft_model_config", None)
+        payload["model"].pop("vocab_mapping_path", None)
+        payload["draft"] = encode_config(mtp_config())
+        payload["training"]["attention_backend"] = "sdpa"
     return payload
 
 
@@ -562,7 +570,7 @@ class ConfigSchemaTest(unittest.TestCase):
             Config.model_validate(payload)
 
     def test_mtp_objective_chunk_size_yaml_reaches_model(self):
-        from specforge.algorithms.mtp.providers import build_training_model
+        from specforge.algorithms.objectives.mtp import MTPObjective
 
         for chunk_size in (None, 0, 17):
             with self.subTest(chunk_size=chunk_size):
@@ -576,10 +584,11 @@ class ConfigSchemaTest(unittest.TestCase):
                     os.unlink(path)
                 # Construction does not run the draft: this tests YAML ->
                 # validated config -> provider -> objective without weights.
-                parts = build_training_model(config, None, None, None, None)
+                resolved = resolve_run(config)
+                objective = MTPObjective(**resolved.config.training.objective_options)
                 expected = 4096 if chunk_size is None else chunk_size
                 self.assertEqual(config.training.mtp_objective_chunk_size, expected)
-                self.assertEqual(parts.model.objective_chunk_size, expected)
+                self.assertEqual(objective.objective_chunk_size, expected)
 
         for invalid in (-1, 1.5):
             payload = _online_payload("mtp")

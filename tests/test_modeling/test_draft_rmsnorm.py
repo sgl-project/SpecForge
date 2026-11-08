@@ -9,7 +9,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.modeling.draft.layers.norm import RMSNorm
 from specforge.modeling.draft.llama3_eagle import LlamaRMSNorm
-from specforge.modeling.draft.mtp.qwen3_5 import Qwen3_5RMSNorm
+from tests.test_modeling.mtp_reference import OffsetRMSNorm
 
 
 class RMSNormTest(unittest.TestCase):
@@ -33,7 +33,7 @@ class RMSNormTest(unittest.TestCase):
         for reference_type, offset in (
             (Qwen3RMSNorm, 0),
             (LlamaRMSNorm, 0),
-            (Qwen3_5RMSNorm, 1),
+            (OffsetRMSNorm, 1),
         ):
             for input_dtype in dtypes:
                 for weight_dtype in (torch.float32, input_dtype):

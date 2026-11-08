@@ -1,9 +1,10 @@
 """Teacher h[t-1] and token[t] predict token[t+1]."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
+from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import gather, sequence_inputs, valid_tokens
 from .losses import TokenLoss
@@ -13,7 +14,9 @@ from .registry import TrainingRequirements, register_protocol
 
 @register_protocol(
     "mtp",
-    training=TrainingRequirements(capture_method="dflash"),
+    training=TrainingRequirements(
+        capture_method="dflash", attention_backends=frozenset({"eager", "sdpa"})
+    ),
     architectures=("MTPDraftModel",),
     inputs=("input_ids", "target_last_hidden_states", "loss_mask"),
     provides=("logits", "labels", "teacher_logits"),
@@ -22,6 +25,10 @@ from .registry import TrainingRequirements, register_protocol
 @dataclass
 class MTPObjective:
     default_loss = TokenLoss(kind="ce")
+    objective_chunk_size: int = 4096
+
+    def __post_init__(self):
+        check_options(zero_counts={"objective_chunk_size": self.objective_chunk_size})
 
     def __call__(self, runtime, batch, **context):
         model, spec = runtime.draft_model, runtime.draft_model.config.draft.spec_config
@@ -39,13 +46,20 @@ class MTPObjective:
         )
         if "lengths" in batch and batch["lengths"].numel() > ids.shape[0]:
             raise ValueError("MTP requires unpacked sequences")
+        entries = sequence_inputs(model.config.draft, positions, visibility)
+        if "position_ids" in batch:
+            if batch["position_ids"].shape != ids.shape:
+                raise ValueError("position_ids must align with input_ids")
+            entries = tuple(
+                replace(e, position_ids=batch["position_ids"][:, 1:]) for e in entries
+            )
         output = model(
             ids[:, 1:],
             gather(
                 batch["target_last_hidden_states"],
                 positions + spec.feature_token_offset,
             ).to(dtype=model.embed_tokens.weight.dtype),
-            sequence_inputs(model.config.draft, positions, visibility),
+            entries,
             output_logits=False,
         )
         label_positions = positions + spec.prediction_token_offset
@@ -65,4 +79,4 @@ class MTPObjective:
             positions=torch.zeros_like(positions),
             chain_ids=torch.arange(positions.numel(), device=ids.device).reshape(-1, 1),
         )
-        return PredictionBatch((predictions,))
+        return PredictionBatch((predictions,), chunk_size=self.objective_chunk_size)

@@ -85,12 +85,36 @@ def resolve_config(cfg, *, target_config=None):
 
     draft = cfg.draft
     if isinstance(draft, str):
+        import json
+
         import yaml
 
-        draft = yaml.safe_load(Path(draft).read_text())
-    supplied = (
-        parse_draft(draft, target_config=target_config) if draft is not None else None
-    )
+        text = Path(draft).read_text()
+        try:
+            draft = json.loads(text)
+        except json.JSONDecodeError:
+            draft = yaml.safe_load(text)
+    if isinstance(draft, dict) and draft.get("model_type") not in (
+        None,
+        "specforge_draft",
+    ):
+        from specforge.config.draft.codec import decode_legacy_config
+
+        if target_config is None:
+            from specforge.checkpoint.resolve import read_target_config
+
+            target_config = read_target_config(
+                cfg.model.target_model_path, cache_dir=cfg.model.cache_dir
+            )
+        supplied = decode_legacy_config(
+            draft, target_config=target_config, **_legacy_settings(cfg)
+        )
+    else:
+        supplied = (
+            parse_draft(draft, target_config=target_config)
+            if draft is not None
+            else None
+        )
     initialization = cfg.initialization
     source = initialization.checkpoint if initialization else None
     if cfg.resume_path:
@@ -277,6 +301,28 @@ def resolve_run(cfg, *, target_config=None):
     from specforge.config.schema import TrainingConfig
 
     defaults = TrainingConfig()
+    if draft.architecture == "MTPDraftModel":
+        legacy_options.remove("mtp_objective_chunk_size")
+        optimization_options.discard("mtp_objective_chunk_size")
+        chunk = cfg.training.mtp_objective_chunk_size
+        if chunk != defaults.mtp_objective_chunk_size:
+            options = dict(cfg.training.objective_options)
+            if (
+                "objective_chunk_size" in options
+                and options["objective_chunk_size"] != chunk
+            ):
+                raise ValueError("conflicting MTP objective_chunk_size settings")
+            options["objective_chunk_size"] = chunk
+            cfg = cfg.model_copy(
+                update={
+                    "training": cfg.training.model_copy(
+                        update={
+                            "objective_options": options,
+                            "mtp_objective_chunk_size": defaults.mtp_objective_chunk_size,
+                        }
+                    )
+                }
+            )
     present = {
         name
         for name in legacy_options

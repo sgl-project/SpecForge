@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -405,9 +406,17 @@ class LoadingTest(unittest.TestCase):
                 if factory is eagle_payload:
                     payload["draft_vocab_size"] = 32
                     payload["fc_norm"] = True
-                old = AutoDraftModel.from_config(
-                    AutoDraftConfig.from_dict(payload)
-                ).float()
+                if factory is mtp_payload:
+                    fixture = (
+                        Path(__file__).resolve().parents[1] / "fixtures/legacy_mtp"
+                    )
+                    payload = json.loads((fixture / "config.json").read_text())
+                    state = load_file(fixture / "model.safetensors")
+                    old = SimpleNamespace(state_dict=lambda: state)
+                else:
+                    old = AutoDraftModel.from_config(
+                        AutoDraftConfig.from_dict(payload)
+                    ).float()
                 if factory is eagle_payload:
                     old.t2d[32:] = False
                 path, target = Path(tmp) / "draft", Path(tmp) / "target"
