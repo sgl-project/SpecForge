@@ -6,6 +6,7 @@ from .dflash import decode_dflash
 from .domino import decode_domino
 from .dspark import decode_dspark
 from .dspine import decode_dspine
+from .peagle import decode_peagle
 
 _DECODERS = {
     "DFlashDraftModel": decode_dflash,
@@ -13,6 +14,7 @@ _DECODERS = {
     "DSparkDraftModel": decode_dspark,
     "DSpineDraftModel": decode_dspine,
     "DominoDraftModel": decode_domino,
+    "PEagleDraftModel": decode_peagle,
 }
 
 
