@@ -166,7 +166,7 @@ class LegacyDFlashTest(unittest.TestCase):
             payload["dflash_config"][field] = 1
             with self.assertRaisesRegex(ValueError, field):
                 decode_legacy_config(payload, target_config=target_for(payload))
-        for architectures in (None, [], ["DSpineDraftModel"], [["DFlashDraftModel"]]):
+        for architectures in (None, [], ["DominoDraftModel"], [["DFlashDraftModel"]]):
             payload = legacy_payload() | {"architectures": architectures}
             with self.assertRaisesRegex(ValueError, "architectures"):
                 decode_legacy_config(payload, target_config=target_for(payload))

@@ -4,11 +4,13 @@ from collections.abc import Mapping
 
 from .dflash import decode_dflash
 from .dspark import decode_dspark
+from .dspine import decode_dspine
 
 _DECODERS = {
     "DFlashDraftModel": decode_dflash,
     "DFlash2DraftModel": decode_dflash,
     "DSparkDraftModel": decode_dspark,
+    "DSpineDraftModel": decode_dspine,
 }
 
 
