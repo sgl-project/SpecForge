@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 
 import torch.distributed as dist
+from huggingface_hub import split_torch_state_dict_into_shards
+from safetensors.torch import save_file
 
 
 def read_artifact_metadata(config):
@@ -57,4 +59,44 @@ def save_draft(model, path, *, max_shard_size="5GB"):
         config = json.loads(config_path.read_text())
         config["specforge_artifact"] = {"format": "specforge", "version": 1}
         config_path.write_text(json.dumps(config, indent=2) + "\n")
+        os.replace(staging, destination)
+
+
+def write_artifact(
+    path, config, state, *, metadata=None, max_shard_size="5GB", write_code=None
+):
+    """Atomically publish a validated configuration and exact owned tensors."""
+    metadata = metadata or {"format": "specforge", "version": 1}
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and (
+        not destination.is_dir() or any(destination.iterdir())
+    ):
+        raise FileExistsError(f"checkpoint directory is not empty: {destination}")
+    shards = split_torch_state_dict_into_shards(state, max_shard_size=max_shard_size)
+    with tempfile.TemporaryDirectory(prefix=".draft-", dir=destination.parent) as tmp:
+        staging = Path(tmp) / "artifact"
+        staging.mkdir()
+        for filename, keys in shards.filename_to_tensors.items():
+            # Clone to avoid shared storage aliases in safetensors.
+            save_file(
+                {k: state[k].clone() for k in keys},
+                staging / filename,
+                metadata={"format": "pt"},
+            )
+        if shards.is_sharded:
+            (staging / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": shards.metadata,
+                        "weight_map": shards.tensor_to_filename,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        if write_code is not None:
+            write_code(staging)
+        payload = config | {"specforge_artifact": metadata}
+        (staging / "config.json").write_text(json.dumps(payload, indent=2) + "\n")
         os.replace(staging, destination)

@@ -104,7 +104,17 @@ class CheckpointManager:
                         import json
 
                         with open(os.path.join(ckpt_dir, "config.json"), "w") as stream:
-                            json.dump(state["canonical_draft_config"], stream, indent=2)
+                            json.dump(
+                                state["canonical_draft_config"]
+                                | {
+                                    "specforge_artifact": {
+                                        "format": "specforge",
+                                        "version": 1,
+                                    }
+                                },
+                                stream,
+                                indent=2,
+                            )
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
         self._all_ok(err)
