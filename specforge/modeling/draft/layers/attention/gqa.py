@@ -10,6 +10,7 @@ from specforge.config.draft.norm import NormSpec
 from ..registry import build_component, register_component_builder
 from ..rope import apply_rotary
 from .backends import eager_attention
+from .inputs import validate_attention_inputs
 from .masks import AttentionLayout, dense_attention_mask
 
 
@@ -90,59 +91,17 @@ class GQAAttention(nn.Module):
         followed by hidden. No cache, algorithm settings, or family config enters
         this component. rotary_dim=0 requires position_embeddings=None.
         """
-        if hidden.ndim != 3 or hidden.shape[-1] != self.q_proj.in_features:
-            raise ValueError("hidden must have shape [batch, query_length, input_size]")
+        context_length = validate_attention_inputs(
+            hidden,
+            layout,
+            position_embeddings,
+            target_context,
+            input_size=self.q_proj.in_features,
+            num_heads=self.config.num_attention_heads,
+            rotary_dim=self.rotary_dim,
+        )
         batch, length = hidden.shape[:2]
-        if target_context is not None and (
-            target_context.ndim != 3
-            or target_context.shape[0] != batch
-            or target_context.shape[-1] != hidden.shape[-1]
-            or target_context.device != hidden.device
-            or not target_context.is_floating_point()
-            or (
-                target_context.dtype != hidden.dtype
-                and not (
-                    torch.is_autocast_enabled(hidden.device.type)
-                    and hidden.dtype in (torch.float32, torch.float16, torch.bfloat16)
-                    and target_context.dtype
-                    in (torch.float32, torch.float16, torch.bfloat16)
-                )
-            )
-        ):
-            raise ValueError(
-                "target_context must match hidden batch, input width, and device; "
-                "different floating dtypes require autocast"
-            )
-        context_length = 0 if target_context is None else target_context.shape[1]
         keys = context_length + length
-        if not isinstance(layout, AttentionLayout):
-            raise TypeError("GQAAttention requires AttentionLayout")
-        if (
-            layout.query_positions.shape[0] not in (1, batch)
-            or layout.query_positions.shape[1] != length
-            or layout.key_positions.shape[1] != keys
-            or layout.query_positions.device != hidden.device
-            or layout.visibility.shape[1] not in (1, self.config.num_attention_heads)
-        ):
-            raise ValueError(
-                "layout must describe the query and context-then-query KV tensors"
-            )
-        if self.rotary_dim:
-            if position_embeddings is None or len(position_embeddings) != 2:
-                raise ValueError("rotary attention requires a joint cosine/sine pair")
-            for value in position_embeddings:
-                if (
-                    value.ndim != 3
-                    or value.shape[0] not in (1, batch)
-                    or value.shape[1:] != (keys, self.rotary_dim)
-                    or value.device != hidden.device
-                    or not value.is_floating_point()
-                ):
-                    raise ValueError(
-                        "RoPE tensors must describe all context-then-query positions"
-                    )
-        elif position_embeddings is not None:
-            raise ValueError("disabled RoPE requires position_embeddings=None")
         node = self.config
         mask = dense_attention_mask(
             layout, is_causal=node.is_causal, sliding_window=node.sliding_window
