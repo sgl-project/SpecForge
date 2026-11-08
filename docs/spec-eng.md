@@ -2,6 +2,8 @@
 
 Specs describe structure, computational semantics, and capability constraints. Parsing produces a single immutable `DraftConfig`; builders construct components from configuration nodes, and architecture models own assembly and execution order.
 
+This page is a condensed reference for the configuration nodes. The [design document](design-eng.md) is normative; where the two differ, the design document applies and this page is corrected.
+
 ## 1. Configuration Nodes
 
 ```text
@@ -12,6 +14,7 @@ DraftConfig
 ├── layer_configs:     name → LayerSpec
 ├── layer_types:       tuple[layer definition name, ...]
 ├── residual_config:   ResidualSpec
+├── norm_config:       NormSpec
 ├── spec_config:       Architecture-specific protocol, fusion, and auxiliary module configuration
 └── Model-level dimensions, RoPE, target_bindings, etc.
 ```
@@ -24,22 +27,23 @@ All nodes are frozen dataclasses, with immutable nested collections so that the 
 
 | Type | Main parameters |
 |---|---|
-| GQA / MHA | `num_attention_heads`, `num_key_value_heads`, `head_dim`, `is_causal`, optional `sliding_window`; MHA requires equal query and KV head counts |
+| GQA / MHA | `num_attention_heads`, `num_key_value_heads`, `head_dim`, `qk_norm`, `attention_bias`, `output_gate`, `is_causal`, optional `sliding_window`; MHA requires equal query and KV head counts |
 | MLA | `num_attention_heads`, `q_lora_rank`, `kv_lora_rank`, projection dimensions, rotation convention, and `is_causal` |
 | DSA / QSA | Projection sub-nodes and the corresponding indexing, selection, quantization, or compression parameters |
 | KDA | Its own head, state, gating, short-convolution, and projection parameters |
 
-Model-level `rope_parameters` supplies the default RoPE; an attention node may explicitly override or disable it. Causality and window size are specified separately. Bidirectional attention within a block must still preserve isolation between the context and different draft blocks. Capability contracts declare the implementation's input, output, cache, and state semantics.
+Every field that changes a node's parameters or computation is required, so strict copies and the SGLang converter can rely on the node alone. Model-level `rope_parameters` supplies the default RoPE, including partial rotation; an attention node may explicitly override or disable it. Causality and window size are specified separately. Bidirectional attention within a block must still preserve isolation between the context and different draft blocks. Capability contracts declare the implementation's input, output, cache, and state semantics.
 
-### FFNSpec, ResidualSpec, and ConvSpec
+### FFNSpec, ResidualSpec, NormSpec, and ConvSpec
 
 | Spec | Configuration location | Responsibility |
 |---|---|---|
 | `FFNSpec` | `mlp_configs.<name>` | Dense: `intermediate_size` and `hidden_act`; MoE: expert count, top-k, per-expert width, shared experts, and routing parameters |
 | `ResidualSpec` | Model-level `residual_config` | Residual-stream structure, gating, and mixing parameters for Standard, GR, and mHC |
+| `NormSpec` | Model-level `norm_config` | Normalization used by decoder layers, the final norm, and component-internal norms: `type`, `eps`, and `weight_offset` (1 for `1 + w`) |
 | `ConvSpec` | `conv_configs.<name>` | Sublayer convolution structure, such as `kernel_size` and `group_size` for `grouped_causal` |
 
-`FFNSpec` is serialized through `mlp_configs` and the layer reference field `mlp`; there is no separate `ffn_configs`. Component parameters live directly in their nodes. Builders receive model-level parameters such as `hidden_size` and the shared `rms_norm_eps` explicitly.
+`FFNSpec` is serialized through `mlp_configs` and the layer reference field `mlp`; there is no separate `ffn_configs`. Component parameters live directly in their nodes. Builders receive model-level parameters such as `hidden_size` and `norm_config` explicitly.
 
 There is one `ResidualSpec` at model level. The residual-stream layout is consistent across layers, with expansion and reduction at model boundaries. Layers cannot independently switch residual types without explicit conversion rules.
 
@@ -98,7 +102,7 @@ Contracts describe inputs, outputs, tensor layouts, state, and supported computa
 
 Different computational structures may use different interfaces. Stateful attention is not forced to emulate an ordinary KV cache. Backends, masks, caches, and parallel implementations must jointly satisfy the contract. Switching backends preserves semantics, and unsupported combinations are explicitly rejected.
 
-Native presets use the same specs and builders. Missing computational capabilities require explicit component implementations and types, without falling back to target-family builders. Native checkpoint adapters only convert source metadata and weights into supported configuration nodes and loading plans.
+Native presets use the same specs and builders. Missing computational capabilities require explicit component implementations and types, without falling back to target-family builders. No code derives nodes from a target's configuration: a native draft's structure is its preset, and its weights are copied through the native architecture's declared layout.
 
 External extensions register through the `specforge.extensions` entry point. The configuration's `extensions` declares loading prerequisites, contains no Python import paths, and is not part of `DraftConfig`.
 
@@ -115,7 +119,7 @@ External extensions register through the `specforge.extensions` entry point. The
 
 DFlash, DFlash2, and DMTP use the backbone's sequential forward. DMTP's trainable MTP-feature fusion belongs to the model forward. Frozen MTP features are supplied externally, and training and inference follow the same token-alignment rules.
 
-DSpine owns its “decoder layer → injection” loop, reusing shared layer execution through `run_layer` and calling `finalize` at the end. One injection module manages per-layer readout/write parameters and parameters shared across layers. Outputs preserve the final layer's pre-injection state and each layer's post-injection features with their gradients. Refinement reuses the final injection and final normalization.
+DSpine owns its “decoder layer → injection” loop through the backbone's `begin`, `run_layer`, and `finalize`, the same calls that make up the sequential forward. One injection module manages per-layer readout/write parameters and parameters shared across layers. Outputs preserve the final layer's pre-injection state and each layer's post-injection features with their gradients. Refinement reuses the final injection and final normalization.
 
 The backbone receives no algorithm-specific hooks or training schedules. Training generates `replace_mask` and passes it to the model. The protocol spec derives the number of model slots, draft prediction positions, candidates supplied by other predictors, and the verification window.
 
@@ -161,9 +165,9 @@ residual_config: {type: standard}
 
 Saving writes the complete effective configuration, including the derived `num_hidden_layers: 2`. Loading restores the same `DraftConfig`. A checkpoint does not depend on the original configuration file's path or subsequent changes.
 
-The HF shell stores HF metadata; the checkpoint stores format and weight-layout metadata. Neither belongs to `DraftConfig`. Training configuration and loading plans own copies from target weights (`initialization.from_target`): tensors are copied unchanged, every mapped draft parameter and target tensor must be used, and names and shapes must match exactly. Copies are draft weights and are saved with the draft; decoder layers are never bound. `target_bindings` lists which of `embed_tokens` and `lm_head` come from the target; they are frozen and not saved with the draft. The draft is still built from its declared components.
+The HF shell stores HF metadata; the checkpoint stores format and weight-layout metadata. Neither belongs to `DraftConfig`. Training configuration and loading plans own copies from target weights (`initialization.from_target`): copies are bit-preserving, using only the layout operations that component kinds declare and explicit renames, every element of every mapped draft parameter and every target tensor must be used, and quantized tensors and narrowing casts are rejected. Copies are draft weights and are saved with the draft; decoder layers are never bound. `target_bindings` lists which of `embed_tokens` and `lm_head` come from the target; they are frozen and not saved with the draft. The draft is still built from its declared components.
 
-HF export uses the canonical configuration. SGLang never reads canonical configurations: the SGLang converter writes SGLang's own draft format, with every field that affects computation written explicitly, and retains the canonical configuration in `specforge_config.json` for re-import. Format representability and engine execution support are validated separately. Unsupported structures fail export. Export does not modify the model configuration.
+HF export uses the canonical configuration. SGLang never reads canonical configurations: the SGLang converter writes SGLang's own draft format, with every field that affects computation written explicitly, and retains the canonical configuration in `specforge_config.json` for re-import. Format representability and engine execution support are validated separately. Unsupported structures and binding sets fail export, and training reports them at startup. Export does not modify the model configuration.
 
 ## 6. Code Organization and Validation
 
@@ -171,13 +175,13 @@ HF export uses the canonical configuration. SGLang never reads canonical configu
 |---|---|
 | `config/draft/attention.py` | `AttentionSpec` type family |
 | `config/draft/mlp.py` | `FFNSpec` type family |
-| `config/draft/residual.py`, `conv.py`, `layer.py` | `ResidualSpec`, `ConvSpec`, `LayerSpec` |
+| `config/draft/residual.py`, `norm.py`, `conv.py`, `layer.py` | `ResidualSpec`, `NormSpec`, `ConvSpec`, `LayerSpec` |
 | `config/draft/spec/` | Architecture protocols and auxiliary-module configuration; algorithms reuse these through composition |
 | `config/draft/codec/`, `validate.py`, `registry.py` | Encoding and decoding, cross-node validation, and configuration-type registration |
 | `config/draft/presets/`, `presets/native/` | Project-maintained configuration YAML files; the latter describes native draft structures |
 | `modeling/draft/layers/`, `heads/`, `backbone.py`, `models/` | Components, auxiliary modules, shared backbone, and architecture models |
-| `checkpoint/formats/` | Weight-format adapters, native draft extraction, and export conversion |
+| `checkpoint/formats/` | External draft adapters, native draft layouts, and the SGLang converter's writers |
 
-Adding a component requires a node definition, a computational implementation, separate schema and builder registration, and capability-combination validation. A new parameter combination using existing types needs only a YAML file, without registering a configuration name or a new model.
+Adding a component requires a node definition, a computational implementation, separate schema and builder registration, its checkpoint layout, an SGLang writer if it is served, and capability-combination validation. A new parameter combination using existing types needs only a YAML file, without registering a configuration name or a new model.
 
 Validation covers immutability and configuration round-trips, missing or conflicting fields, invalid references and capabilities, forward/backward and state behavior, agreement between sequential and per-layer execution, gradients under checkpointing, weight sharing, and export rejection. Refactoring existing components preserves parameter naming, initialization, and numerical behavior.

@@ -1,11 +1,11 @@
 # Draft Model and Component Design
 
-This document describes the target design for draft model configuration, model composition, and code boundaries. It is a target, not a description of the current implementation. Class and field names are illustrative unless stated otherwise, and example values do not describe real checkpoints. The [usage guide](config_usage_graph-eng.md) covers entry paths, import, export, and orchestration.
+This document describes the target design for draft model configuration, model composition, and code boundaries. It is a target, not a description of the current implementation. Class and field names are illustrative unless stated otherwise, and example values do not describe real checkpoints. The [usage guide](config_usage_graph-eng.md) covers entry paths, import, export, and orchestration. The [node reference](spec-eng.md) summarizes the configuration nodes; where the two differ, this document is normative.
 
 ## 0. Principles
 
 1. **Mirror HF target models.** Describe a draft the way HF describes a target model: attention and MLP components are assembled into decoder layers, and layers are stacked into a model. Configuration nodes and modules correspond one to one.
-2. **One golden configuration.** Parsing produces a single frozen `DraftConfig`. Every other representation is derived from it: the HF configuration object, `config.json`, the SGLang layout, and every value read by training, data, or launch code. Derived values are never stored separately, written back, or read back as input.
+2. **One golden configuration.** Parsing produces a single frozen `DraftConfig`. Every other representation is derived from it: the HF configuration object, `config.json`, the SGLang export, and every value read by training, data, or launch code. Derived values are never stored separately, written back, or read back as input.
 3. **Explicit boundaries.** A module receives only its own configuration node and explicitly passed dimensions. Configuration, model definitions, training objectives, checkpoint formats, and orchestration live in separate packages with one-way dependencies that tests enforce.
 4. **Fail before construction.** Structural fields have no defaults. Unknown fields, conflicting legacy aliases, unresolved references, and unsupported component combinations are rejected before any parameter is allocated.
 5. **Open for extension.** New draft architectures and component types are added by registering them, not by editing shared code. A draft may also use the target model's weights (Section 7).
@@ -41,24 +41,31 @@ Specialized architectures, such as a native MTP draft or a vendor draft with fix
 A component receives its own configuration node and the dimensions it needs as explicit arguments:
 
 ```python
-GQAAttention(cfg: GQAAttentionConfig, *, hidden_size: int, rotary: RotaryEmbedding)
+GQAAttention(cfg: GQAAttentionConfig, *, hidden_size: int, norm: NormConfig,
+             rotary: RotaryEmbedding)
 MoE(cfg: MoEConfig, *, hidden_size: int)
 DecoderLayer(attention: nn.Module, mlp: nn.Module, *, hidden_size: int,
-             rms_norm_eps: float, sublayer_conv: nn.Module | None)
+             norm: NormConfig, sublayer_conv: nn.Module | None)
 ```
 
 Components never receive the whole `DraftConfig`, `spec_config`, or a model-family configuration such as `Qwen3Config`. HF modules receive the whole configuration and read whatever fields they need, for example `config.layer_types[layer_idx]` inside an attention module. This design deliberately does not copy that pattern, because it is what couples components to each other and to the model.
 
 #### Execution ownership
 
-`DraftBackbone.forward` runs the layers in order and applies final normalization. `run_layer` executes one layer through the same module-call and gradient-checkpointing path; `finalize` owns final normalization and any supported residual-stream reduction. Residual-stream expansion and per-layer RoPE preparation are shared by both execution paths. Layer inputs carry the required context tensors, masks, and positions or RoPE inputs, not an algorithm spec or training settings. The backbone contains no architecture-name branches or algorithm callbacks.
+`DraftBackbone` has one execution path in three steps:
+
+- `begin(x, layer_inputs)` expands residual streams, prepares per-layer RoPE inputs, and returns a `BackboneState`.
+- `run_layer(i, state)` runs layer `i` through the shared module-call and gradient-checkpointing path. `i` must be the state's next layer.
+- `finalize(state)` requires every layer to have run, then reduces residual streams and applies final normalization.
+
+`forward(x, layer_inputs)` is exactly these calls in a loop, so sequential and per-layer execution cannot diverge, and calling them out of order raises. A model that changes the hidden state between layers reads and replaces it through the state. Whether an inter-layer module supports multiple residual streams is validated before construction. Layer inputs carry the required context tensors, masks, and positions or RoPE inputs, not an algorithm spec or training settings. The backbone contains no architecture-name branches or algorithm callbacks.
 
 | Architecture | Model-owned computation | Backbone execution |
 |---|---|---|
 | DFlash | Target-feature fusion | Sequential forward |
 | DFlash2 | Target-feature fusion and candidate selector; convolution stays inside each decoder layer | Sequential forward |
 | DMTP | Fuse the first candidate's embedding with aligned, frozen MTP features | Sequential forward |
-| DSpine | Interleave decoder layers and injection; collect intermediate features | Per-layer execution, then finalization |
+| DSpine | Interleave decoder layers and injection; collect intermediate features | `begin`, `run_layer` per layer, then `finalize` |
 
 ```mermaid
 flowchart LR
@@ -86,13 +93,16 @@ hidden = self.backbone(x, layer_inputs)
 
 # DSpine model: the architecture owns the inter-layer computation.
 features = []
-for i in range(len(self.backbone.layers)):
-    x = self.backbone.run_layer(i, x, layer_inputs[i])
-    pre_injection = x
-    x = self.injection(x, i, token_ids, self.transfer_codes, replace_mask)
-    features.append(self.injection.feature(x, i))
+state = self.backbone.begin(x, layer_inputs)
+for i in range(self.backbone.num_layers):
+    state = self.backbone.run_layer(i, state)
+    pre_injection = state.hidden
+    state = state.with_hidden(
+        self.injection(state.hidden, i, token_ids, self.transfer_codes, replace_mask)
+    )
+    features.append(self.injection.feature(state.hidden, i))
 output = DSpineOutput(
-    hidden_states=self.backbone.finalize(x),
+    hidden_states=self.backbone.finalize(state),
     pre_injection=pre_injection,
     layer_features=torch.stack(features),
 )
@@ -136,7 +146,7 @@ Explicit groups also remove a naming conflict: the top-level `intermediate_size`
 
 | Level | Fields | Excluded |
 |---|---|---|
-| Model | `hidden_size`, `vocab_size`, `draft_vocab_size`, `rms_norm_eps`, `max_position_embeddings`, default `rope_parameters`, `initializer_range`, `tie_word_embeddings`, `residual_config`, `spec_config`, `target_bindings` | Component parameters such as head counts, `head_dim`, `intermediate_size`, and windows |
+| Model | `hidden_size`, `vocab_size`, `draft_vocab_size`, `norm_config`, `max_position_embeddings`, default `rope_parameters`, `initializer_range`, `tie_word_embeddings`, `residual_config`, `spec_config`, `target_bindings` | Component parameters such as head counts, `head_dim`, `intermediate_size`, and windows |
 | Component | `attention_configs.<name>`, `mlp_configs.<name>`, `conv_configs.<name>` | Model-level dimensions. Each node has a `type` and only that type's parameters |
 | Layer | `layer_configs.<name>`: a `LayerSpec` referencing attention, MLP, and optional `sublayer_conv` definitions | A layer-level `type` discriminator or copied component parameters |
 | Stack | `layer_types`: one `layer_configs` name per decoder layer | — |
@@ -148,6 +158,8 @@ Explicit groups also remove a naming conflict: the top-level `intermediate_size`
 `layer_types` holds `layer_configs` names, not HF's attention-kind values such as `full_attention` or `linear_attention`. SGLang never reads canonical configurations: the SGLang converter writes the per-layer values that SGLang reads, in SGLang's own format (usage guide, Section 4.1).
 
 `tie_word_embeddings` is required. `true` is rejected when `target_bindings` lists `embed_tokens` or `lm_head`, because a bound module's weight comes from the target and each weight has one source.
+
+`norm_config` is a model-level node used by every normalization in the draft: the decoder layers' norms, the final norm, and normalization inside components, such as query and key norms. It holds a `type`, `eps`, and that type's parameters, for example `{"type": "rms", "eps": 1e-06, "weight_offset": 0}`. `weight_offset` is 1 for RMSNorm parameterized as `1 + w`, as in Gemma3 and Qwen3-Next, and 0 otherwise. It is required, because the two parameterizations have the same weight shapes and different outputs. The legacy codec maps `rms_norm_eps` to a node with `weight_offset: 0`. A normalization used by only one component, such as a gated norm inside a linear-attention component, belongs to that component's node. A per-layer normalization can later be added as an optional `LayerSpec` reference without changing existing configurations.
 
 Component nodes use HF field names without prefixes. A KDA node uses `num_key_heads`, not `linear_num_key_heads`. In a MoE node, `intermediate_size` is the per-expert width, so no new name such as `expert_intermediate_size` is needed.
 
@@ -197,7 +209,7 @@ A DSpark draft with four sliding-window layers and one full-attention layer. Val
   "vocab_size": 129280,
   "draft_vocab_size": 129280,
   "num_hidden_layers": 5,
-  "rms_norm_eps": 1e-06,
+  "norm_config": {"type": "rms", "eps": 1e-06, "weight_offset": 0},
   "max_position_embeddings": 1048576,
   "initializer_range": 0.02,
   "tie_word_embeddings": false,
@@ -213,6 +225,9 @@ A DSpark draft with four sliding-window layers and one full-attention layer. Val
       "num_attention_heads": 32,
       "num_key_value_heads": 8,
       "head_dim": 128,
+      "qk_norm": true,
+      "attention_bias": false,
+      "output_gate": false,
       "sliding_window": 2048,
       "is_causal": true
     },
@@ -221,6 +236,9 @@ A DSpark draft with four sliding-window layers and one full-attention layer. Val
       "num_attention_heads": 32,
       "num_key_value_heads": 8,
       "head_dim": 128,
+      "qk_norm": true,
+      "attention_bias": false,
+      "output_gate": false,
       "is_causal": false
     }
   },
@@ -258,6 +276,9 @@ A KDA and GQA hybrid whose first layer is dense and whose remaining layers use M
       "num_attention_heads": 32,
       "num_key_value_heads": 8,
       "head_dim": 128,
+      "qk_norm": true,
+      "attention_bias": false,
+      "output_gate": false,
       "is_causal": false
     }
   },
@@ -303,11 +324,13 @@ Each `attention_configs` node selects a structure with `type` and contains only 
 
 | Type | Node parameters |
 |---|---|
-| GQA / MHA | `num_attention_heads`, `num_key_value_heads`, `head_dim`, `is_causal`, optional `sliding_window` |
+| GQA / MHA | `num_attention_heads`, `num_key_value_heads`, `head_dim`, `qk_norm`, `attention_bias`, `output_gate`, `is_causal`, optional `sliding_window` |
 | MLA | `num_attention_heads`, optional `q_lora_rank`, `kv_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim`, `v_head_dim`, rotation convention, `is_causal` |
 | DSA | A projection sub-node, for example MLA, plus indexer and selection-policy settings |
 | QSA | Projection, selection, quantization, or compression settings required by the variant |
 | KDA | Head counts, state, gating, short-convolution, and projection settings; no GQA- or MLA-only fields |
+
+Every field that changes a node's parameters or its computation is required and explicit, including the presence of query and key norms, projection biases, and an attention output gate. A strict copy from the target (Section 7.3) and the SGLang converter (G8) both rely on the node alone; neither may assume a model family's default.
 
 For example, DSA combines an MLA projection with an indexer. The following shows organization only; real use requires all mandatory fields of each branch:
 
@@ -334,7 +357,7 @@ Legacy configurations may leave `is_causal` unset. Unset meant bidirectional for
 
 ### 4.2 RoPE
 
-The model-level `rope_parameters` is the default. An attention node may override it or disable rotary embedding, in the same way that Gemma3 configures RoPE per layer type and Llama4 has layers without RoPE. MLA applies rotation only to the `qk_rope_head_dim` part.
+The model-level `rope_parameters` is the default, including partial rotation such as `partial_rotary_factor`. An attention node may override it or disable rotary embedding, in the same way that Gemma3 configures RoPE per layer type and Llama4 has layers without RoPE. MLA applies rotation only to the `qk_rope_head_dim` part.
 
 ### 4.3 Compute backends and distributed execution
 
@@ -372,7 +395,7 @@ Backend and parallel settings may be saved with the training run for reproducibi
 {"residual_config": {"type": "mhc", "num_streams": 4}}
 ```
 
-Type-specific parameters, such as GR gating and the mHC mixer and constraints, live in the node. These examples do not list every type-specific field. Common normalization uses the model-level `rms_norm_eps`; only normalization unique to a residual-stream module belongs in the node.
+Type-specific parameters, such as GR gating and the mHC mixer and constraints, live in the node. These examples do not list every type-specific field. Common normalization uses the model-level `norm_config`; only normalization unique to a residual-stream module belongs in the node.
 
 The residual component declares its cross-layer constraints, such as stream count and tensor layout, and validation checks every layer against them before construction (Section 1.4). Allowing different residual types per layer later requires an explicit conversion rule declared by the components involved. Changing a type name alone is not sufficient.
 
@@ -402,7 +425,7 @@ A MoE node holds the expert count, top-k, per-expert `intermediate_size`, shared
 ```
 
 - Add fields or sub-nodes when routers, shared experts, or expert types need further distinction. Avoid expressing different structures through many interacting Boolean switches.
-- If a `variant` field is used, it names concrete computational semantics, such as a routing and shared-expert rule, not a model family such as `qwen` or `deepseek`. It never supplies numeric parameters implicitly. Differences in weight names between sources belong in checkpoint format adapters and do not justify a new variant.
+- If a `variant` field is used, it names concrete computational semantics, such as a routing and shared-expert rule, not a model family such as `qwen` or `deepseek`. It never supplies numeric parameters implicitly. Differences in weight names between sources belong in weight-loading plans, through external format adapters or renames in a `from_target` mapping (Section 7.3), and do not justify a new variant.
 - Routing structure is model configuration. Auxiliary-loss weights are training configuration.
 - The codec normalizes synonymous legacy MoE fields, so each parameter has one source.
 - The choice between dense and MoE for each layer, including a dense first layer or interleaved MoE, is expressed only through `layer_types`.
@@ -417,18 +440,24 @@ Draft architectures and layer architectures keep changing, and a draft may be bu
 
 | Level | Selected by | A new kind registers |
 |---|---|---|
-| Draft architecture | `architectures` | Spec, a model class with the same name, a default training objective, and converters |
+| Draft architecture | `architectures` | Spec, a model class with the same name, a default training objective, and its SGLang converter writer |
 | Training objective | `training.objective`, defaulting to the architecture's | Objective, with the model inputs and outputs it requires and the modules it trains |
-| Component | `type` of an attention, MLP, conv, or residual node | Node schema, builder, and declared capabilities |
+| Component | `type` of an attention, MLP, conv, norm, or residual node | Node schema, builder, declared capabilities, checkpoint layout, and, if it is served, its SGLang converter writer |
 
 - Architectures, objectives, and components dispatch through registries. Adding a kind means adding a module and registering it; shared files do not change. `LayerSpec` only groups component references and needs no registration.
-- Packages outside the repository, for example for models under NDA, register the same way, through the `specforge.extensions` entry-point group. `extensions` in `config.json` lists the extensions whose kinds a configuration uses. It is a loading prerequisite, not part of `DraftConfig`: the loader reads it before decoding, loads each extension, and fails with the missing extension's name when one is not installed. The codec writes it from the kinds the configuration uses and verifies it on read. A YAML draft section that uses extension kinds lists them the same way, and SGLang resolves names through the same entry-point group. Configurations never contain Python import paths.
+- Packages outside the repository, for example for models under NDA, register the same way, through the `specforge.extensions` entry-point group. `extensions` in `config.json` lists the extensions whose kinds a configuration uses. It is a loading prerequisite, not part of `DraftConfig`: the loader reads it before decoding, loads each extension, and fails with the missing extension's name when one is not installed. The codec writes it from the kinds the configuration uses and verifies it on read. A YAML draft section that uses extension kinds lists them the same way. Configurations never contain Python import paths. SGLang never loads extensions: an extension kind is served only if the extension registers an SGLang converter writer for it and SGLang implements the computation; otherwise `--format sglang` fails naming the kind (G8).
 - Adding a kind is additive and does not change `schema_version`. Changing the fields or meaning of an existing kind requires a new name, or a new schema version with a codec migration so that older configurations stay readable.
 - Flexibility does not relax validation. Every registered kind has a strict schema and declared capabilities, and it is checked against algorithm contracts (Section 1.4) like a built-in kind.
 
 ### 7.2 Native draft structures
 
-`presets/native/` holds YAML configurations matching native draft structures, assembled from the same SpecForge components. There is no `target` component or layer type. Native checkpoint adapters convert source configuration and weights into these nodes and an explicit weight-loading plan.
+Some targets ship their own draft, such as the MTP layers that Qwen3.5 checkpoints store under `mtp.*`. A native draft follows the same rule as copies (Section 7.3): its structure is written, not derived.
+
+- `presets/native/` holds one YAML configuration per supported target, assembled from SpecForge components and a registered architecture. There is no `target` component or layer type, and no code derives nodes from the target's configuration.
+- The native architecture's format module, under `checkpoint/formats/native/`, declares the one correspondence between draft parameters and the target checkpoint's native draft tensors. Training uses it through `initialization.from_target: native`. `--format sglang` uses it to write trained weights back into a copy of the target checkpoint, which SGLang serves as the target's own draft. The correspondence follows the copy rules: bit-preserving layout operations only, and full coverage in both directions.
+- CI checks each native preset with weights loaded through that correspondence: the draft reproduces SGLang's serving of the target's native draft on reference inputs. SGLang is the reference because Transformers often omits native draft layers.
+
+Main already keeps the native key layout with the model family (`MTPDraftModel.NATIVE_KEY_PREFIX`) and merges trained MTP weights back into the target checkpoint (`specforge/export/mtp.py`). This design keeps that behavior and moves the network into components and a preset.
 
 ### 7.3 Target weights: copies, and the shared embeddings and LM head
 
@@ -436,24 +465,28 @@ Target weights reach a draft in two ways:
 
 | Relationship | Meaning | Declared in | Saved with the draft | At serving time |
 |---|---|---|---|---|
-| Copy | Draft parameters start as unchanged copies of target parameters, then are trained or frozen as training configuration says | Training configuration: `initialization.from_target` | Yes | The draft's own weights |
+| Copy | Draft parameters start as bit-for-bit copies of target parameters, then are trained or frozen as training configuration says | Training configuration: `initialization.from_target` | Yes | The draft's own weights |
 | Shared embeddings and LM head | The draft uses the target's `embed_tokens` and `lm_head`, frozen | Draft configuration: `target_bindings` | No | SGLang uses the target's modules, as it already does for EAGLE3 and DFlash drafts |
 
 Decoder layers are reused only by copying. Binding them, or deriving draft nodes from a target layer automatically, would require SGLang to share target weight storage with the draft and to understand SpecForge's mapping. A copy keeps the two decoupled: SGLang loads the draft's own weights and never sees `initialization`.
 
 Copies:
 
-- `initialization.from_target` maps draft module prefixes to target module prefixes. The mapping is written by hand in training YAML or a preset, and the draft's nodes are written explicitly like any other draft's. Nothing derives nodes from the target's layers, and there is no per-family adapter for this.
-- SpecForge reads the tensors from the target's checkpoint files, as main already does for embeddings and LM heads. It never asks the target server for weights.
-- The copy is strict. Tensors are copied unchanged, with no transforms. Under each mapped prefix, every draft parameter must receive a tensor, every target tensor must be used, and the parameter names after the prefix and the shapes must match exactly. A violation fails before training and names the tensors.
-- A target computation that no component implements, such as an RMSNorm parameterized as `1 + w` or an attention output gate, needs a component that implements it. The copy never rewrites values to fit another component.
-- Matching names and shapes do not prove matching computation: `1 + w` and `w` norm weights, or two partial-rotary fractions, have the same shapes. The draft then trains from a worse start, without an error. Bundled presets that copy target layers are therefore checked in CI. With zero context length and a causal mask, a DFlash-family layer reduces to ordinary attention, so the draft layer with copied weights must reproduce the target layer's output on reference inputs. For a user-written mapping, the loader prints the full mapping, and the node definitions are the user's responsibility.
+- `initialization.from_target` maps draft module prefixes to target checkpoint prefixes. The mapping is written by hand in training YAML, and the draft's nodes are written explicitly like any other draft's. Nothing derives nodes from the target's layers, and there is no per-family adapter for decoder layers. Where tensor names under a prefix differ between the target and the draft, for example `shared_expert` against `shared_experts`, the mapping lists explicit renames.
+- Copies are bit-preserving. The loader applies only layout operations that move elements without changing them: renaming, stacking per-expert tensors, concatenating, splitting, and transposing. Each component kind declares, next to its builder, how its parameters are laid out in the per-tensor Hugging Face checkpoint convention. For example, a MoE component that stores its experts as one fused tensor declares that the tensor is stacked from per-expert `gate_proj`, `up_proj`, and `down_proj` tensors, the layout that Transformers 5 itself fuses at load time. The declaration belongs to the component kind and carries no model-family knowledge. Value transforms are never applied: no offset such as `1 + w`, no scaling, no dequantization, and no cast to a narrower dtype. Widening, such as BF16 to FP32, is exact and allowed.
+- The copy is strict. Every element of every draft parameter under a mapped prefix receives exactly one target element, every target tensor under the prefix is used, and shapes match after the declared layout operations. A violation fails before training and names the tensors. A target tensor in a quantized format, or one with scale tensors, fails the copy by name; dequantizing is a precision decision made outside the copy, for example by copying from the target's BF16 checkpoint.
+- A target computation that no node can express, such as a normalization or gating form that no registered component offers, needs a component or node field that implements it. The copy never rewrites values to fit another component.
+- SpecForge reads tensors from the target's checkpoint files, as main already does for embeddings and LM heads, and never asks the target server for weights. The weight-loading plan is built and validated from checkpoint metadata alone, the tensor names, shapes, and dtypes in the safetensors headers, before any tensor is read. Every rank builds the same plan from the same inputs, so validation passes or fails on all ranks together. Each rank then reads only the slices of the parameters it holds, so copying one layer of a very large target never loads the target.
+- `from_target` is allowed when training from scratch or with `initialization.weights_from`. Its draft prefixes must be disjoint from the `weights_from` mapping and from `allow_new`. With `initialization.checkpoint` or `resume` it is an error, because it would overwrite loaded weights.
+- Matching names and shapes do not prove matching computation: `1 + w` and `w` norm weights, or two partial-rotary fractions, have the same shapes, and the draft would train from a worse start without an error. Bundled presets that copy target weights are therefore checked in CI. The draft layer runs where its algorithm-specific inputs are absent, for example with zero context length and a causal mask for a DFlash-family layer, and must reproduce the target layer's output on reference inputs. Both sides run in FP32 with eager attention, and the tolerance is measured once per preset, recorded with the test, and never raised to make a preset pass. For a user-written mapping, the loader prints the full mapping, and the node definitions are the user's responsibility.
 - Freezing a copied layer is a training setting. A frozen copy is still saved with the draft and costs serving memory; self-speculative drafts that run the target's own layers at serving time are not supported.
 
 Shared embeddings and LM head:
 
 - `target_bindings` lists modules from the closed set `embed_tokens` and `lm_head`; no other module can be bound. The configuration records only which modules come from the target. The target checkpoint keys they load from are a training-side detail of the weight-loading plan, as `embedding_key` and `lm_head_key` are on main, and are not part of `DraftConfig`.
 - Bound modules are frozen, consistent with a frozen target. Training loads them from the target checkpoint, and exports omit them and record `target_bindings`.
+- A bound LM head computes logits as the target does. Target settings that change logits, such as `logits_mup_width_multiplier`, belong to the target configuration. On the training side one module, the target head, reads them from the target configuration through a closed table, and a target configuration with a logit-affecting field outside the table fails. SGLang applies the same settings from the same target configuration when it serves. A binding cannot avoid these two implementations of one target computation, so an oracle compares them: on reference final hidden states, the target head's logits match SGLang's target logits within the floor measured for identical weights. Whether a multiplier is folded into the weights, as main does today, or applied to the logits is a numerics decision made on its own, not as part of this migration.
+- SGLang decides per architecture which modules come from the target; for example, its DFlash drafts always use the target's LM head. The SGLang converter declares the binding sets that SGLang's format expresses for each architecture, and export fails for any other set (G8).
 - Copying them into the draft would make exports self-contained, but each costs serving memory of the vocabulary size times the hidden size, and SGLang would have to load them from the draft instead of sharing the target's.
 
 ## 8. Single Source of Truth
@@ -483,7 +516,7 @@ Structural source, exactly one per run:
 | G5. References, not copies | Modules hold their own node instead of copying values into attributes such as `self.block_size`. Training objectives, data dispatch, and launch code receive `config.spec` or the node they need, not separate arguments with their own defaults. `architectures` is the only structural selector, and the model family is derived from it. The training objective is chosen separately (Section 9.2) because it is not structure. |
 | G6. The HF configuration object is a shell | `model.config` is `SpecForgeDraftConfig`, and `model.config.draft` is the golden configuration. The shell declares no structural fields or defaults. It may hold HF metadata and runtime fields that Transformers writes during construction and saving, such as `auto_map`, `transformers_version`, `architectures`, `dtype`, and the attention implementation. Its `to_dict` is the codec's encoding of `draft` plus that metadata, so re-saving an exported package keeps its loading entry points. Its `from_dict` decodes through the codec and sets no structural attributes, so generic HF or SGLang code that inspects attributes such as `head_dim` or `layer_types` finds nothing instead of misreading draft values. |
 | G7. Artifacts are derived | The canonical `config.json` is the encoding of the golden configuration, and an SGLang directory is a conversion of it. When a converted directory also carries the canonical configuration for re-import, SpecForge reads only the canonical file. Derived files are never read back as input. Every written directory also records artifact metadata outside `DraftConfig`: its format, weight layout, and converter version. One `DraftConfig` can be stored with different weight layouts, so loading selects its weight-loading plan from that metadata. |
-| G8. SGLang is reached only through an exported artifact | SGLang imports no SpecForge code and never reads canonical configurations; SpecForge depends only on SGLang's documented draft format. SGLang owns that format. The SGLang converter is the one place that translates a `DraftConfig` into it, and it writes every field that SGLang reads and that affects computation, including per-layer values. SGLang's defaults therefore never decide a draft's computation, and no rule, such as the legacy `is_causal` default, is implemented in both repositories. A structure that SGLang's format cannot express fails the export (usage guide, Section 4.1). |
+| G8. SGLang is reached only through an exported artifact | SGLang imports no SpecForge code and never reads canonical configurations; SpecForge depends only on the draft format that the pinned SGLang version reads. SGLang owns that format. The SGLang converter is the one place that translates a `DraftConfig` into it, and it writes every field that SGLang reads and that affects computation, including per-layer values. Export validation records the fields SGLang reads and fails on any field the converter did not write, so SGLang's defaults never decide a draft's computation, and no rule, such as the legacy `is_causal` default, is implemented in both repositories. A structure or binding set that SGLang's format cannot express fails the export (usage guide, Section 4.1). |
 
 Section 9.3 lists the tests that enforce these rules.
 
@@ -492,11 +525,11 @@ Section 9.3 lists the tests that enforce these rules.
 The [usage guide](config_usage_graph-eng.md#5-code-organization) shows the full tree. The model side follows these conventions:
 
 - `specforge/config/draft/` holds the frozen configuration nodes, the codec, and cross-node validation. It imports neither torch nor transformers, so configurations are parsed and validated before any model code loads.
-- `specforge/config/draft/presets/` holds draft configuration YAML files. Its `native/` subdirectory holds configurations matching a target model's native draft structure. A preset is read like any configuration file into the full frozen configuration before model construction; checkpoints persist the expanded configuration and never read the preset file on reload. Presets do not implement forward computation, load weights, or select training objectives.
+- `specforge/config/draft/presets/` holds draft configuration YAML files. Its `native/` subdirectory holds one configuration per supported target with a native draft (Section 7.2). A preset is read like any configuration file into the full frozen configuration before model construction; checkpoints persist the expanded configuration and never read the preset file on reload. Presets do not implement forward computation, load weights, or select training objectives.
 - `specforge/modeling/draft/layers/` holds the components. It is a sibling of `models/` because general and specialized models both use it.
 - `specforge/modeling/draft/heads/` holds algorithm heads, and `backbone.py` holds `DraftBackbone`.
 - `specforge/modeling/draft/models/` holds algorithm models.
-- Checkpoint formats, including native-draft extraction and SGLang conversion, live in `specforge/checkpoint/formats/`, not next to models.
+- Checkpoint formats, including external drafts, native draft layouts, and SGLang conversion, live in `specforge/checkpoint/formats/`, not next to models.
 - Model-family configuration classes such as `Qwen3Config` are constructed only in checkpoint formats.
 - `specforge/loading.py` is the public entry point for reading drafts from files. It reads a directory through `checkpoint` and builds the model with `modeling.build_draft_model(config)`. `modeling` performs no file I/O.
 
@@ -523,13 +556,13 @@ cli -> training -> loading -> checkpoint -> modeling -> config.draft
 Each package owns its registry:
 
 - `config.draft` maps architecture names to specs.
-- `modeling` maps architecture names to model classes. Each class is named after its architecture.
-- `checkpoint.formats` maps architecture names to converters.
+- `modeling` maps architecture names to model classes, each named after its architecture, and component kinds to builders and checkpoint layouts.
+- `checkpoint.formats` maps architecture names to SGLang writers for their spec and native layouts, and component kinds to SGLang writers for their nodes. The SGLang converter is assembled from one writer per architecture and one per component kind, so a new component kind adds one writer, not one per architecture. A kind without a writer, or one the architecture's format cannot use, fails export.
 - `algorithms` registers objectives under their own names. Each objective declares the model inputs and outputs it requires and the modules it trains, and each architecture names a default objective.
 
 Each architecture also declares the modules it uses at serving time, such as the DFlash2 selector or the DSpark Markov head. An objective is compatible with an architecture only if each of those modules is trained by the objective, bound to the target, or listed as frozen in training configuration. Matching inputs and outputs is not enough: a DFlash objective can train a DFlash2 model's logits but not its selector, and the untrained selector would be exported and served.
 
-A consistency test checks that every architecture has the entries it needs and that its default objective is compatible. Training can select another objective that is compatible in the same sense, so a new objective never needs a new architecture. Components register their schemas in `config.draft` and their builders in `modeling` the same way, and extensions outside the repository call the same functions.
+A consistency test checks that every architecture has the entries it needs and that its default objective is compatible. Training can select another objective that is compatible in the same sense, so a new objective never needs a new architecture. Components register their schemas in `config.draft`, their builders and checkpoint layouts in `modeling`, and their SGLang writers in `checkpoint.formats` the same way, and extensions outside the repository call the same functions.
 
 SpecForge loads drafts through these registries. Standard Transformers loading works differently: AutoModel selects the model class from the configuration class and uses `architectures` only to choose among several classes registered for it, and remote code goes through `auto_map`. An exported HF package therefore names its concrete model class in `auto_map`.
 
@@ -542,17 +575,19 @@ No single registry links configuration, models, training protocols, and adapters
 | `config.draft` loads neither torch nor transformers | Import it in a subprocess and inspect `sys.modules` |
 | Package dependencies follow Section 9.1 | Scan imports with `ast` |
 | Components receive only their own node and explicit dimensions | Inspect the constructor signatures of registered components |
-| Shared components support model-owned execution | With the same layers and inputs, sequential and manual per-layer backbone execution agree; DMTP fusion and DSpine intermediate outputs, refinement, and gradients remain unchanged with checkpointing enabled |
+| Shared components support model-owned execution | `forward` is implemented as `begin`, `run_layer`, and `finalize`; manual per-layer execution with the same layers and inputs is bit-identical to it; out-of-order `run_layer` and early `finalize` raise; DMTP fusion and DSpine intermediate outputs, refinement, and gradients remain unchanged with checkpointing enabled |
 | No algorithm class inherits from another algorithm's class | For every registered spec, model, and objective class, check that its MRO contains no other registered algorithm class |
 | Encoding is lossless | `parse(encode(c)) == c`, and `encode(parse(j)) == j` for canonical fixtures |
 | No scattered defaults or raw formats | `dflash_config`, `eagle_config`, and similar keys appear only under `config/draft/codec/` and `checkpoint/formats/`, and no code calls `getattr(config, name, default)` on configuration objects |
-| Family configuration classes stay in checkpoint formats | `Qwen3Config`, `DeepseekV3Config`, and similar classes are imported only under `checkpoint/formats/` |
+| Family configuration classes stay in checkpoint formats | Within `specforge/`, `Qwen3Config`, `DeepseekV3Config`, and similar classes are imported only under `checkpoint/formats/`. Tests may import target-family modeling classes as references for equivalence checks |
 | No mutable mirrors | Nothing writes to the configuration or to a value copied from it after construction, and `hash(model.config.draft)` is unchanged after building the model and running a training step |
 | Values cross packages as nodes | Registered objectives, data dispatch, and launch components take configuration nodes, not copied scalars such as `block_size` |
 | One owner per derivation | Fixture tests compare the derived quantities that consumers use, including the values the SGLang converter writes, with the spec methods |
-| Copies from the target are strict | A `from_target` mapping that leaves a draft parameter without a tensor, leaves a target tensor unused, or mismatches a name or shape fails before training and names the tensors |
+| Copies from the target are strict | A `from_target` mapping that leaves a draft element without a source, leaves a target tensor unused, mismatches a name or shape, narrows a dtype, or reads a quantized tensor fails before training and names the tensors |
+| Component checkpoint layouts are bit-preserving | For every registered component kind, splitting its parameters into the declared checkpoint layout and joining them back reproduces them bitwise |
+| Weight plans are validated before reading | A plan with a missing, unused, or mismatched tensor fails on every rank from checkpoint metadata alone, before any tensor is read |
 | No structural fields in training configuration | The training schema forbids extra fields and rejects structural names |
-| Registries agree | Every architecture has a spec, a model class named after it, a compatible default objective that covers its serving-time modules, and, where applicable, a converter; every registered component kind has both a schema and a builder |
+| Registries agree | Every architecture has a spec, a model class named after it, a compatible default objective that covers its serving-time modules, and, where applicable, an SGLang writer and a native layout; every registered component kind has a schema, a builder, and a checkpoint layout |
 | Canonical names never reach SGLang's model classes | Registered architecture names are compared with a frozen list of the names that released SGLang versions register |
 | SGLang's Transformers backend refuses draft classes | `is_backend_compatible()` is False for every registered model class |
 
@@ -572,30 +607,30 @@ These checks target independent sources of the same value. Read-only values that
 
 Proceed incrementally and keep existing entry points until migration is complete:
 
-1. Configuration nodes, the canonical codec, and the legacy codec. Every existing draft configuration and checkpoint configuration decodes. The files that training and export write do not change yet.
-2. The generic base class and `DraftBackbone`.
-3. Components behind node-only constructors.
+1. Configuration nodes, including `norm_config` and the explicit attention fields, the canonical codec, and the legacy codec. Every existing draft configuration and checkpoint configuration decodes. The files that training and export write do not change yet.
+2. The generic base class and `DraftBackbone` with its `begin`, `run_layer`, and `finalize` execution path.
+3. Components behind node-only constructors, each with its declared checkpoint layout.
 4. Algorithm models as compositions, with heads extracted.
 5. One training objective per algorithm.
-6. The switch to canonical artifacts, in one PR: training checkpoints and `--format hf` write canonical configurations, the embeddings and LM heads that drafts already share become `target_bindings`, and the SGLang converter covers every algorithm. The usage guide (Section 6) lists the resulting changes for users. SGLang keeps reading only its own format.
-7. Strict `initialization.from_target` copies, with the CI equivalence check for each bundled preset that copies target layers.
+6. The switch to canonical artifacts, in one PR: training checkpoints and `--format hf` write canonical configurations, the embeddings and LM heads that drafts already share become `target_bindings`, and the SGLang converter, assembled from per-architecture and per-component-kind writers, covers every algorithm. Training reports at startup whether a configuration can be exported to SGLang. The usage guide (Section 6) lists the resulting changes for users. SGLang keeps reading only its own format.
+7. Strict, bit-preserving `initialization.from_target` copies; native presets with `from_target: native` and merge-back export, replacing the MTP family classes; and the CI equivalence check for each bundled preset that copies target weights.
 
-Steps 1 to 5 are behaviour-equivalent: they change no file format, command flag, or numerics, and checks 1 and 2 hold after each step. Every user-visible change waits for step 6.
+Steps 1 to 5 are behaviour-equivalent: they change no file format, command flag, or numerics, and checks 1 and 2 hold after each step. Every user-visible change waits for step 6, except native MTP fine-tuning, which moves in step 7 (usage guide, Section 6).
 
 Checks:
 
 1. With identical weights and inputs, outputs match before and after base-class replacement, and initialization and gradient checkpointing are preserved.
 2. Encoding round-trips. Every existing configuration decodes and builds a model whose parameter names, shapes, and forward outputs on identical weights are bit-identical to those of the model that main builds from the same file. Existing checkpoints load, including EAGLE3 warm-start checkpoints.
-3. For every architecture, the SGLang export loads in the pinned SGLang version, and its block quantities and draft outputs on reference inputs match SpecForge's.
+3. For every architecture, the SGLang export loads in the pinned SGLang version, and its block quantities and draft outputs on reference inputs match SpecForge's. While SGLang builds the draft, the configuration fields it reads are recorded, and a read of any field the converter did not write fails the check.
 4. Forward, backward, and parameter-update checks pass for every declared component combination.
 5. Supported backend and Ring combinations preserve masks, and their outputs match the eager backend within each combination's measured tolerance. Unsupported combinations fail before execution.
 6. Specialized architectures use their declared components and reject configurations that violate fixed structural constraints before construction.
 7. SGLang rejects a canonical directory instead of serving it with default settings, including an HF export loaded with `--trust-remote-code`.
 8. The boundary tests in Section 9.3 pass.
-9. A bundled preset YAML, an equivalent user configuration file, and inline YAML produce the same `DraftConfig` without dispatching on file names or directories. Native presets build only registered components and match the native computation on reference weights and inputs.
-10. Bound embeddings and LM heads are frozen, are excluded from the draft checkpoint, and are restored from the target when the checkpoint is loaded.
+9. A bundled preset YAML, an equivalent user configuration file, and inline YAML produce the same `DraftConfig` without dispatching on file names or directories. Native presets build only registered components and, with weights copied through their native layout, match SGLang's serving of the target's native draft on reference inputs.
+10. Bound embeddings and LM heads are frozen, are excluded from the draft checkpoint, and are restored from the target when the checkpoint is loaded. On reference final hidden states, the target head's logits match SGLang's target logits within the floor measured for identical weights.
 11. Two draft architectures load in one process, are saved, and reload with the same `DraftConfig`, both through SpecForge's loader and through Transformers with the exported `auto_map`.
 12. Exporting to each format and re-importing gives identical weights and forward outputs.
-13. For every existing configuration, the `config.json` that the SGLang converter writes equals the one that main's `--to hf` export writes, except for listed differences that SGLang does not read.
+13. For every existing configuration, the pinned SGLang version builds the same draft from the converter's `config.json` as from main's `--to hf` output: the same resolved settings, such as block size, per-layer attention type, causality, and head counts, and the same outputs on reference inputs. Textual differences between the two files, such as fields now written explicitly, are listed.
 14. With each architecture's default objective, every module that the architecture uses at serving time receives a gradient.
-15. Each bundled preset that copies target layers reproduces the target layer's output with the copied weights, zero context length, and a causal mask.
+15. Each bundled preset that copies target weights reproduces the target computation with the copied weights, as Section 7.3 describes. A native preset exported with `--format sglang` and re-imported through `from_target: native` gives identical weights.
