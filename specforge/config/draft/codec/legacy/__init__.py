@@ -7,6 +7,7 @@ from .domino import decode_domino
 from .dspark import decode_dspark
 from .dspine import decode_dspine
 from .eagle3 import decode_eagle3
+from .mtp import decode_mtp
 from .peagle import decode_peagle
 
 _DECODERS = {
@@ -17,6 +18,7 @@ _DECODERS = {
     "DominoDraftModel": decode_domino,
     "PEagleDraftModel": decode_peagle,
     "LlamaForCausalLMEagle3": decode_eagle3,
+    "Qwen3_5MTPDraftModel": decode_mtp,
 }
 
 
