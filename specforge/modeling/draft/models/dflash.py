@@ -1,7 +1,7 @@
 """Canonical DFlash: token modules, target fusion and a sequential backbone."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from torch import Tensor
 from transformers.utils import ModelOutput
@@ -10,6 +10,7 @@ from ..hf_config import SpecForgeDraftConfig
 from ..layers.inputs import LayerInputs
 from ..pretrained import DraftPreTrainedModel
 from .assembly import build_decoder_backbone
+from .context import prepare_context_inputs
 from .registry import register_draft_model
 from .target_features import TargetFeatureFusion
 from .tokens import build_token_modules
@@ -78,20 +79,13 @@ class DFlashDraftModel(DraftPreTrainedModel):
             raise ValueError("input_ids must be [batch, draft_sequence]")
         if type(output_logits) is not bool:
             raise TypeError("output_logits must be boolean")
-        if len(layer_inputs) != self.backbone.num_layers:
-            raise ValueError("layer_inputs must contain one entry per layer")
-        for inputs in layer_inputs:
-            if not isinstance(inputs, LayerInputs):
-                raise TypeError("each layer input must be LayerInputs")
-            if inputs.target_context is not None:
-                raise ValueError(
-                    "DFlash computes target_context through its trainable fusion"
-                )
-        context = self.fusion(target_features)
-        hidden = self.backbone(
-            self.embed_tokens(input_ids),
-            [replace(inputs, target_context=context) for inputs in layer_inputs],
+        prepared = prepare_context_inputs(
+            self.fusion,
+            target_features,
+            layer_inputs,
+            num_layers=self.backbone.num_layers,
         )
+        hidden = self.backbone(self.embed_tokens(input_ids), prepared)
         return DFlashOutput(
             hidden_states=hidden,
             logits=self.lm_head(hidden) if output_logits else None,
