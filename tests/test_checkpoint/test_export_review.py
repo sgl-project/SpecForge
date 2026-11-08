@@ -77,7 +77,7 @@ class ExportReviewTest(unittest.TestCase):
             self.assertEqual(result.exit_code, 2)
             self.assertIn("--vocab-mapping belongs to legacy --to", result.output)
             export.assert_not_called()
-        with patch("specforge.export.to_sglang.export_to_sglang") as export:
+        with patch("specforge.export.legacy_sglang.export_to_sglang") as export:
             result = CliRunner().invoke(cli, args + ["--to", "sglang"])
             self.assertEqual(result.exit_code, 2)
             self.assertIn("--draft-config", result.output)

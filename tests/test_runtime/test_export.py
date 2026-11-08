@@ -344,7 +344,7 @@ class TestExportCheckpointPrecision(unittest.TestCase):
     def test_to_sglang_serializes_checkpoint_precision(self):
         from safetensors.torch import load_file
 
-        from specforge.export import export_to_sglang
+        from specforge.export.legacy_sglang import export_to_sglang
 
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
@@ -365,7 +365,7 @@ class TestExportCheckpointPrecision(unittest.TestCase):
     def test_to_sglang_explicit_mapping_keeps_other_weights_exact(self):
         from safetensors.torch import load_file
 
-        from specforge.export import export_to_sglang
+        from specforge.export.legacy_sglang import export_to_sglang
 
         weights = self._checkpoint(torch.float32)
         replacement = torch.load(self.replacement_path, weights_only=True)
@@ -517,7 +517,7 @@ class TestExporters(unittest.TestCase):
     def test_to_sglang_produces_exact_serving_keys(self):
         from safetensors.torch import load_file
 
-        from specforge.export import export_to_sglang
+        from specforge.export.legacy_sglang import export_to_sglang
 
         out = export_to_sglang(
             self.ckpt.checkpoint_uri[len("file://") :],  # checkpoint dir form
@@ -544,7 +544,7 @@ class TestExporters(unittest.TestCase):
     def test_weight_map_renames_are_applied(self):
         from safetensors.torch import load_file
 
-        from specforge.export import export_to_sglang
+        from specforge.export.legacy_sglang import export_to_sglang
 
         out = export_to_sglang(
             self.out_dir,
@@ -557,7 +557,7 @@ class TestExporters(unittest.TestCase):
         self.assertNotIn("norm.weight", served)
 
     def test_missing_required_serving_key_fails_loudly(self):
-        from specforge.export.to_sglang import _serving_state
+        from specforge.export.legacy_sglang import _serving_state
 
         with self.assertRaises(ValueError):
             _serving_state({"fc.weight": torch.zeros(1)}, {})
