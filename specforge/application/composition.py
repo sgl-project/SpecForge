@@ -42,6 +42,8 @@ def bind_run(cfg: Config, algorithm: AlgorithmRegistration) -> ResolvedRun:
 def resolve_run(
     cfg: Config,
     registry: AlgorithmRegistry | None = None,
+    *,
+    target_config=None,
 ) -> ResolvedRun:
     """Resolve and validate all algorithm-owned behavior exactly once."""
 
@@ -49,6 +51,14 @@ def resolve_run(
         from specforge.algorithms.builtin import builtin_algorithm_registry
 
         registry = builtin_algorithm_registry()
+    from specforge.training.canonical import enabled
+    from specforge.training.canonical import resolve_run as resolve_canonical_run
+
+    if enabled(cfg):
+        cfg, algorithm = resolve_canonical_run(
+            cfg, registry, target_config=target_config
+        )
+        return bind_run(cfg, algorithm)
     try:
         algorithm = registry.resolve(cfg.training.strategy)
     except KeyError as exc:
@@ -70,7 +80,6 @@ def resolve_offline_capture(
     and how those generic states must be persisted for its offline reader.
     """
 
-    resolved = resolve_run(cfg, registry)
     if cfg.mode != "offline":
         raise ValueError("offline capture preparation requires an offline run config")
 
@@ -83,11 +92,16 @@ def resolve_offline_capture(
             trust_remote_code=cfg.model.trust_remote_code,
         )
 
+    from specforge.modeling.target.target_utils import target_text_config
+    from specforge.training.canonical import enabled
     from specforge.training.model_loading import resolve_draft_config
+
+    target = target_text_config(target_config).to_dict() if enabled(cfg) else None
+    resolved = resolve_run(cfg, registry, target_config=target)
 
     model_provider = resolved.algorithm.providers.model
     draft_config = resolve_draft_config(
-        cfg,
+        resolved.config,
         provider=model_provider.draft_config,
     )
     layers = tuple(
@@ -139,7 +153,14 @@ def build_application_run(
 ):
     """Build one executable run from the public config contract."""
 
-    resolved = run if isinstance(run, ResolvedRun) else resolve_run(run, registry)
+    from specforge.training.canonical import enabled
+    from specforge.training.model_loading import training_target_config
+
+    if isinstance(run, ResolvedRun):
+        resolved = run
+    else:
+        target_config = training_target_config(run) if enabled(run) else None
+        resolved = resolve_run(run, registry, target_config=target_config)
     from specforge.training.assembly import build_training_run
 
     return build_training_run(
