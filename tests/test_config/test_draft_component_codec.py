@@ -1,0 +1,217 @@
+"""Type dispatch stays in configuration; layers only hold name references."""
+
+import copy
+import json
+import subprocess
+import sys
+import unittest
+from dataclasses import dataclass
+from typing import ClassVar
+from unittest.mock import patch
+
+from specforge.config.draft import registry
+from specforge.config.draft.codec.components import (
+    decode_component,
+    decode_layer,
+    encode_component,
+    encode_layer,
+)
+from specforge.config.draft.layer import LayerSpec
+from specforge.config.draft.mlp import FFNSpec
+from specforge.config.draft.registry import component_schema, register_component_schema
+
+COMPONENTS = {
+    "attention": {
+        "type": "gqa",
+        "rope_parameters": None,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "qk_norm": True,
+        "attention_bias": False,
+        "output_gate": False,
+        "is_causal": True,
+        "sliding_window": None,
+        "attention_dropout": 0.0,
+    },
+    "mlp": {"type": "dense", "intermediate_size": 64, "hidden_act": "silu"},
+    "conv": {"type": "grouped_causal", "kernel_size": 3, "group_size": 8},
+    "norm": {"type": "rms", "eps": 1e-6, "weight_offset": 1},
+    "residual": {"type": "standard"},
+}
+
+
+class ComponentCodecTest(unittest.TestCase):
+    def test_components_round_trip_through_json(self):
+        for kind, payload in COMPONENTS.items():
+            with self.subTest(kind=kind):
+                source = copy.deepcopy(payload)
+                node = decode_component(kind, source)
+                encoded = encode_component(kind, node)
+                self.assertEqual(encoded, payload)
+                restored = decode_component(kind, json.loads(json.dumps(encoded)))
+                self.assertEqual(restored, node)
+                self.assertEqual(hash(restored), hash(node))
+                self.assertEqual(source, payload)
+                encoded["type"] = "unregistered"
+                self.assertEqual(encode_component(kind, node), payload)
+        mha = {**COMPONENTS["attention"], "type": "mha", "num_key_value_heads": 8}
+        self.assertEqual(
+            encode_component("attention", decode_component("attention", mha)), mha
+        )
+
+    def test_missing_unknown_and_malformed_fields(self):
+        for kind, payload in COMPONENTS.items():
+            for name in payload:
+                with self.subTest(kind=kind, name=name):
+                    with self.assertRaisesRegex(ValueError, name):
+                        decode_component(
+                            kind,
+                            {
+                                key: value
+                                for key, value in payload.items()
+                                if key != name
+                            },
+                        )
+            with self.assertRaisesRegex(ValueError, "typo"):
+                decode_component(kind, {**payload, "typo": 1})
+            for source in (None, [], "dense", 3):
+                with self.assertRaisesRegex(ValueError, "object"):
+                    decode_component(kind, source)
+        with self.assertRaisesRegex(ValueError, "attention/gqa.*is_causal"):
+            decode_component(
+                "attention", {**COMPONENTS["attention"], "is_causal": None}
+            )
+        with self.assertRaisesRegex(ValueError, "sliding_window"):
+            decode_component(
+                "attention", {**COMPONENTS["attention"], "sliding_window": "128"}
+            )
+
+    def test_unknown_kinds_and_types(self):
+        for name in (None, [], {}, 3, "target", "typo"):
+            with self.assertRaisesRegex(ValueError, "unknown attention type"):
+                decode_component("attention", {"type": name})
+        for kind in ("layer", "target", "ffn", None, []):
+            with self.assertRaisesRegex(ValueError, "unknown component kind"):
+                component_schema(kind, "decoder")
+
+    def test_layer_is_a_fixed_reference_schema(self):
+        payload = {"attention": "full", "mlp": "dense", "sublayer_conv": "conv"}
+        node = decode_layer(payload)
+        self.assertEqual(node, LayerSpec(**payload))
+        self.assertEqual(encode_layer(node), payload)
+        without_conv = decode_layer({"attention": "full", "mlp": "dense"})
+        self.assertIsNone(without_conv.sublayer_conv)
+        self.assertEqual(decode_layer(encode_layer(without_conv)), without_conv)
+        for field, value in (
+            ("type", "decoder"),
+            ("type", "target"),
+            ("hidden_size", 64),
+            ("residual", "standard"),
+        ):
+            with self.assertRaisesRegex(ValueError, field):
+                decode_layer({**payload, field: value})
+        with self.assertRaisesRegex(ValueError, "attention"):
+            decode_layer({"attention": COMPONENTS["attention"], "mlp": "dense"})
+        with self.assertRaisesRegex(ValueError, "object"):
+            decode_layer([])
+
+    def test_schema_registration_is_separate_from_builders(self):
+        @dataclass(frozen=True, kw_only=True)
+        class CustomFFN(FFNSpec):
+            type: ClassVar[str] = "test_ffn"
+            width: int
+
+            def __post_init__(self):
+                if type(self.width) is not int or self.width <= 0:
+                    raise ValueError("width must be positive")
+
+        @dataclass(frozen=True, kw_only=True)
+        class ConflictingFFN(FFNSpec):
+            type: ClassVar[str] = "test_ffn"
+
+        with patch.dict(registry._SCHEMAS):
+            register_component_schema("mlp", CustomFFN)
+            register_component_schema("mlp", CustomFFN)
+            self.assertIs(component_schema("mlp", "test_ffn"), CustomFFN)
+            payload = {"type": "test_ffn", "width": 32}
+            self.assertEqual(
+                encode_component("mlp", decode_component("mlp", payload)), payload
+            )
+            with self.assertRaisesRegex(ValueError, "width"):
+                decode_component("mlp", {"type": "test_ffn", "width": 0})
+            with self.assertRaisesRegex(ValueError, "already registered"):
+                register_component_schema("mlp", ConflictingFFN)
+            with self.assertRaisesRegex(TypeError, "AttentionSpec"):
+                register_component_schema("attention", CustomFFN)
+            with self.assertRaisesRegex(ValueError, "unknown component kind"):
+                register_component_schema("layer", LayerSpec)
+            with self.assertRaisesRegex(ValueError, "type name"):
+                register_component_schema("mlp", FFNSpec)
+
+    def test_encode_checks_schema_identity(self):
+        @dataclass(frozen=True, kw_only=True)
+        class Impostor(FFNSpec):
+            type: ClassVar[str] = "dense"
+
+        with self.assertRaisesRegex(ValueError, "expected DenseFFNSpec"):
+            encode_component("mlp", Impostor())
+        with self.assertRaisesRegex(ValueError, "expected LayerSpec"):
+            encode_layer({"attention": "full", "mlp": "dense"})
+
+    def test_registration_rejects_implicit_defaults_and_undeclared_fields(self):
+        class Undecorated(FFNSpec):
+            type = "test_undecorated"
+            width: int
+
+        @dataclass(frozen=True, kw_only=True)
+        class WithDefault(FFNSpec):
+            type: ClassVar[str] = "test_default"
+            width: int = 32
+
+        @dataclass(frozen=True, kw_only=True)
+        class MutableType(FFNSpec):
+            type: str = "test_mutable_type"
+
+        for schema, error in (
+            (Undecorated, "frozen dataclass"),
+            (WithDefault, "no defaults"),
+            (MutableType, "ClassVar"),
+        ):
+            with self.subTest(schema=schema), self.assertRaisesRegex(TypeError, error):
+                register_component_schema("mlp", schema)
+
+    def test_decoding_rejects_mutable_extension_values(self):
+        @dataclass(frozen=True, kw_only=True)
+        class MutableValue(FFNSpec):
+            type: ClassVar[str] = "test_mutable_value"
+            widths: list
+
+        with patch.dict(registry._SCHEMAS):
+            register_component_schema("mlp", MutableValue)
+            with self.assertRaisesRegex(ValueError, "unhashable"):
+                decode_component("mlp", {"type": "test_mutable_value", "widths": [32]})
+
+    def test_registry_and_codec_import_without_model_dependencies(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                "-c",
+                """
+import sys
+from specforge.config.draft.codec.components import decode_component
+decode_component('norm', {'type': 'rms', 'eps': 1e-6, 'weight_offset': 0})
+for name in ('torch', 'transformers', 'pydantic', 'specforge.modeling',
+             'specforge.algorithms', 'specforge.runtime', 'specforge.config.schema'):
+    assert name not in sys.modules, name
+""",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
