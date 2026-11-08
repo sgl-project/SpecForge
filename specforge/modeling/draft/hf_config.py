@@ -10,10 +10,11 @@ from transformers import PreTrainedConfig
 from specforge.config.draft import DraftConfig
 from specforge.config.draft.codec import decode_config, encode_config
 
-# Only HF metadata is separated from the canonical payload. Unknown saved keys
+# HF and artifact metadata are separated from the canonical payload. Unknown saved keys
 # still reach the strict codec rather than becoming arbitrary HF attributes.
 _METADATA = frozenset(
     {
+        "specforge_artifact",
         "auto_map",
         "transformers_version",
         "dtype",
