@@ -6,25 +6,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Export a DataFlow training checkpoint to an HF-format draft directory.
-
-The output loads back through ``AutoDraftModel.from_pretrained`` (e.g. to
-finetune from it). EAGLE-family embeddings may be absent by design — training
-reloads frozen embeddings from the target — while DFlash-family drafts do not
-own an embedding at all.
-"""
+"""Publish canonical checkpoints with standalone Transformers loading code."""
 
 from __future__ import annotations
 
 import argparse
 from typing import Optional
-
-from specforge.export.checkpoint_io import (
-    apply_legacy_rope_scaling,
-    materialize_draft,
-    resolve_training_state,
-)
-from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
 
 def export_to_hf(
@@ -35,64 +22,49 @@ def export_to_hf(
     vocab_mapping_path: Optional[str] = None,
     embedding_source: Optional[str] = None,
     embedding_key: str = "model.embed_tokens.weight",
+    target_model: Optional[str] = None,
 ) -> str:
-    """Write the checkpoint's draft as an HF directory; returns ``output_dir``.
+    """Publish canonical config, exact owned weights and standalone HF code."""
+    from specforge.checkpoint.draft_dir import write_artifact
+    from specforge.checkpoint.formats.hf import bundle_code
+    from specforge.modeling.draft.hf_config import SpecForgeDraftConfig
 
-    The exported directory is SELF-CONTAINED (reloads via ``from_pretrained``
-    with no missing keys). Draft checkpoints deliberately exclude the frozen
-    embedding, so it must come from somewhere real: pass ``embedding_source``
-    (the target model path/dir — the embedding is deterministic from it) unless
-    the checkpoint itself carries ``embed_tokens.weight``. A randomly
-    initialized embedding would silently break serving, so its absence raises.
-    """
-    state = resolve_training_state(checkpoint_path)
-    model = materialize_draft(
-        state, draft_config_path, vocab_mapping_path=vocab_mapping_path
+    from .canonical import read_export
+
+    if embedding_key != "model.embed_tokens.weight":
+        raise ValueError("custom embedding keys are not part of canonical export")
+    if target_model is not None and embedding_source is not None:
+        raise ValueError(
+            "use only target_model; embedding_source is its deprecated alias"
+        )
+    checkpoint, state, model_class = read_export(
+        checkpoint_path,
+        draft_config=draft_config_path,
+        target=target_model or embedding_source,
+        vocab_mapping=vocab_mapping_path,
     )
-    full_state = dict(model.state_dict())
-    owns_embedding = hasattr(model, "embed_tokens")
-    if owns_embedding and "embed_tokens.weight" not in state["draft_state_dict"]:
-        if not embedding_source:
-            raise ValueError(
-                "checkpoint has no embed_tokens.weight (draft checkpoints "
-                "exclude the frozen embedding); pass embedding_source=<target "
-                "model path> so the export ships the real embedding"
-            )
-        load_embedding = getattr(model, "load_embedding", None)
-        if load_embedding is not None:
-            load_embedding(embedding_source, embedding_key=embedding_key)
-    if (
-        owns_embedding
-        and "embed_tokens.weight" not in full_state
-        and "embed_tokens.weight" not in state["draft_state_dict"]
-    ):
-        if not embedding_source:
-            raise ValueError(
-                "checkpoint does not contain embed_tokens.weight; pass "
-                "embedding_source=<target model path>"
-            )
-        full_state["embed_tokens.weight"] = load_checkpoint_tensors(
-            embedding_source,
-            keys=[embedding_key],
-        )[embedding_key]
-    # Preserve checkpoint weights at their original precision, but keep the
-    # mapping explicitly loaded by materialize_draft when one was requested.
-    full_state.update(
-        {
-            key: value
-            for key, value in state["draft_state_dict"].items()
-            if not (vocab_mapping_path and key in {"t2d", "d2t"})
-        }
-    )
-    model.save_pretrained(output_dir, state_dict=full_state)
-    apply_legacy_rope_scaling(output_dir)
+    config = SpecForgeDraftConfig(checkpoint.config, **checkpoint.hf_metadata).to_dict()
+
+    dtypes = {
+        str(t.dtype).removeprefix("torch.")
+        for t in state.values()
+        if t.is_floating_point()
+    }
+    if len(dtypes) == 1:
+        config["dtype"] = dtypes.pop()
+
+    def write_code(directory):
+        config["auto_map"] = bundle_code(directory, model_class)
+
+    write_artifact(output_dir, config, state, write_code=write_code)
     return output_dir
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=export_to_hf.__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--draft-config", required=True)
+    parser.add_argument("--draft-config", default=None)
+    parser.add_argument("--target-model", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--vocab-mapping", default=None)
     parser.add_argument(
@@ -110,6 +82,7 @@ def main(argv=None) -> int:
         vocab_mapping_path=args.vocab_mapping,
         embedding_source=args.embedding_source,
         embedding_key=args.embedding_key,
+        target_model=args.target_model,
     )
     print(f"exported HF draft to {out}")
     return 0
