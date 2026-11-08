@@ -1,0 +1,32 @@
+"""Build implemented RoPE settings without silently downgrading other rules."""
+
+from specforge.config.draft.rope import (
+    DefaultRoPESpec,
+    LinearRoPESpec,
+    Llama3RoPESpec,
+    NoRoPESpec,
+    RopeSpec,
+)
+
+from .base import RotaryEmbedding
+from .default import DefaultRotaryEmbedding
+from .linear import LinearRotaryEmbedding
+from .llama3 import Llama3RotaryEmbedding
+
+_BUILDERS = {
+    DefaultRoPESpec: DefaultRotaryEmbedding,
+    LinearRoPESpec: LinearRotaryEmbedding,
+    Llama3RoPESpec: Llama3RotaryEmbedding,
+}
+
+
+def build_rotary(config: RopeSpec, *, head_dim: int) -> RotaryEmbedding | None:
+    """Accept one resolved node; None is the backbone's disabled-RoPE entry."""
+    if type(config) is NoRoPESpec:
+        config.rotary_dim(head_dim)
+        return None
+    try:
+        builder = _BUILDERS[type(config)]
+    except KeyError:
+        raise ValueError(f"unsupported rotary node: {type(config).__name__}") from None
+    return builder(config, head_dim=head_dim)

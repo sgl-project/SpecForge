@@ -114,7 +114,9 @@ class RotaryTest(unittest.TestCase):
             module.to_empty(device=device).bfloat16()
             hidden = torch.empty(2, 4, 128, device=device, dtype=torch.bfloat16)
             positions = torch.tensor([[0, 32768, 65535, 131071]], device=device)
-            expected = module(hidden.float(), positions)
+            expected = DefaultRotaryEmbedding(node, head_dim=128)(
+                hidden.float(), positions
+            )
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 actual = module(hidden, positions)
             for left, right in zip(actual, expected):
