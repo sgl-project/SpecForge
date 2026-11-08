@@ -78,8 +78,8 @@ class ComponentBuilderTest(unittest.TestCase):
         with patch("torch.nn.Parameter") as allocate:
             with self.assertRaisesRegex(ValueError, "no modeling builder"):
                 build_component(
-                    "conv",
-                    GroupedCausalConvSpec(kernel_size=3, group_size=8),
+                    "norm",
+                    TestNormSpec(),
                     hidden_size=32,
                 )
             with self.assertRaises(ValueError):
@@ -113,6 +113,11 @@ class ComponentBuilderTest(unittest.TestCase):
             ("norm", RMSNormSpec, {"hidden_size", "device", "dtype"}),
             ("mlp", DenseFFNSpec, {"hidden_size", "device", "dtype"}),
             ("residual", StandardResidualSpec, set()),
+            (
+                "conv",
+                GroupedCausalConvSpec,
+                {"hidden_size", "block_size", "device", "dtype"},
+            ),
         ):
             constructor = component_builder(kind, node_type.type)
             parameters = inspect.signature(constructor).parameters

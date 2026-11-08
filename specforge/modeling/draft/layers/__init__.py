@@ -1,6 +1,7 @@
 """Node-configured building blocks shared by draft architectures."""
 
 from .attention import GQAAttention
+from .conv import GroupedCausalConv
 from .decoder import DecoderLayer
 from .mlp import DenseFFN
 from .norm import RMSNorm
@@ -11,6 +12,7 @@ __all__ = [
     "DenseFFN",
     "DecoderLayer",
     "GQAAttention",
+    "GroupedCausalConv",
     "RMSNorm",
     "StandardResidual",
     "build_component",
