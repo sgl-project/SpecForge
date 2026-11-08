@@ -4,7 +4,7 @@ This document describes the target workflow for draft configuration across train
 
 Conventions used throughout:
 
-- Training YAML supplies the draft structure only when training from scratch. An existing checkpoint supplies the structure whenever one is loaded.
+- Training YAML supplies the draft structure whenever no draft checkpoint is loaded: training from scratch, warm-starting a new structure, and fine-tuning a native draft. A draft checkpoint supplies the structure whenever one is loaded.
 - Parsing produces one golden `DraftConfig` (design document, Section 8). `model.config` is the HF configuration shell `SpecForgeDraftConfig`, and `model.config.draft` is the golden configuration. Every artifact is derived from it.
 - Canonical configurations use `model_type: specforge_draft`, and `architectures` selects the draft structure.
 - Architecture names in examples, such as `SpecForgeDFlash`, are placeholders until the naming question is settled (Section 7).
