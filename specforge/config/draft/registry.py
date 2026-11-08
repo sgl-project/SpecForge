@@ -2,7 +2,7 @@
 
 from dataclasses import MISSING, fields
 
-from .attention import AttentionSpec, GQASpec, MHASpec
+from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec
 from .mlp import DenseFFNSpec, FFNSpec
 from .norm import NormSpec, RMSNormSpec
@@ -69,6 +69,7 @@ def component_schema(kind: str, name: str) -> type:
 for _kind, _schema in (
     ("attention", GQASpec),
     ("attention", MHASpec),
+    ("attention", MLASpec),
     ("mlp", DenseFFNSpec),
     ("conv", GroupedCausalConvSpec),
     ("norm", RMSNormSpec),
