@@ -14,8 +14,10 @@ class DecoderLayer(nn.Module):
 
     The model supplies constructed attention/FFN components. Input fusion,
     inter-layer injection, multiple residual streams, and file loading are not
-    implemented here. Sublayer convolution requires its own implementation and
-    is rejected until its execution contract is available.
+    implemented here. ``sublayer_conv`` is an optional (attention, mlp) pair of
+    independently constructed modules, each exposing prepare/finish. A single
+    LayerSpec convolution reference supplies their shared configuration, not
+    shared parameters. The layer neither builds nor clones these modules.
     """
 
     def __init__(
@@ -25,7 +27,7 @@ class DecoderLayer(nn.Module):
         *,
         hidden_size: int,
         norm: NormSpec,
-        sublayer_conv: nn.Module | None = None,
+        sublayer_conv: tuple[nn.Module, nn.Module] | None = None,
         device=None,
         dtype=None,
     ):
@@ -34,7 +36,19 @@ class DecoderLayer(nn.Module):
         if not isinstance(attention, nn.Module) or not isinstance(mlp, nn.Module):
             raise TypeError("attention and mlp must be constructed modules")
         if sublayer_conv is not None:
-            raise ValueError("DecoderLayer does not yet support sublayer convolution")
+            if not isinstance(sublayer_conv, tuple) or len(sublayer_conv) != 2:
+                raise TypeError("sublayer_conv must be an (attention, mlp) module pair")
+            for module in sublayer_conv:
+                if not isinstance(module, nn.Module) or not all(
+                    callable(getattr(module, method, None))
+                    for method in ("prepare", "finish")
+                ):
+                    raise TypeError(
+                        "sublayer convolution modules require prepare/finish"
+                    )
+            if sublayer_conv[0] is sublayer_conv[1]:
+                raise ValueError("attention and mlp require independent convolutions")
+        self.attention_conv, self.mlp_conv = sublayer_conv or (None, None)
         self.hidden_size = hidden_size
         self.self_attn = attention
         self.mlp = mlp
@@ -58,16 +72,26 @@ class DecoderLayer(nn.Module):
             )
         # Position IDs are consumed by the backbone. Direct callers must supply
         # any required RoPE embeddings, so layers never recompute frequencies.
+        update = self.input_layernorm(hidden)
+        if self.attention_conv is not None:
+            update, coefficients = self.attention_conv.prepare(update)
         update = self.self_attn(
-            self.input_layernorm(hidden),
+            update,
             layout=inputs.attention_layout,
             position_embeddings=inputs.position_embeddings,
             target_context=inputs.target_context,
         )
+        if self.attention_conv is not None:
+            update = self.attention_conv.finish(update, coefficients)
         if update.shape != hidden.shape:
             raise ValueError("attention output must preserve the residual shape")
         hidden = hidden + update
-        update = self.mlp(self.post_attention_layernorm(hidden))
+        update = self.post_attention_layernorm(hidden)
+        if self.mlp_conv is not None:
+            update, coefficients = self.mlp_conv.prepare(update)
+        update = self.mlp(update)
+        if self.mlp_conv is not None:
+            update = self.mlp_conv.finish(update, coefficients)
         if update.shape != hidden.shape:
             raise ValueError("mlp output must preserve the residual shape")
         return hidden + update

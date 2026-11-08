@@ -14,12 +14,14 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5DecoderLayer,
 )
 
+from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.residual import StandardResidualSpec
 from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
 from specforge.modeling.draft.backbone import DraftBackbone
 from specforge.modeling.draft.dflash import Qwen3DFlashDecoderLayer
+from specforge.modeling.draft.dflash2 import DFlashGroupedConv, Qwen3DFlash2DecoderLayer
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import DecoderLayer, build_component
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
@@ -29,7 +31,31 @@ from specforge.modeling.draft.layers.rope import build_rotary
 from tests.test_modeling.test_draft_gqa import build, layout_for, make_node
 
 
-def make_layer(node, *, rotary_dim=8, offset=0, device="cpu", dtype=torch.float32):
+def make_layer(
+    node,
+    *,
+    rotary_dim=8,
+    offset=0,
+    device="cpu",
+    dtype=torch.float32,
+    convolution=False,
+):
+    conv_node = GroupedCausalConvSpec(kernel_size=3, group_size=4)
+    convolutions = (
+        tuple(
+            build_component(
+                "conv",
+                conv_node,
+                hidden_size=16,
+                block_size=4,
+                device=device,
+                dtype=dtype,
+            )
+            for _ in range(2)
+        )
+        if convolution
+        else None
+    )
     return DecoderLayer(
         build(node, rotary_dim=rotary_dim, offset=offset, device=device, dtype=dtype),
         build_component(
@@ -41,6 +67,7 @@ def make_layer(node, *, rotary_dim=8, offset=0, device="cpu", dtype=torch.float3
         ),
         hidden_size=16,
         norm=RMSNormSpec(eps=1e-6, weight_offset=offset),
+        sublayer_conv=convolutions,
         device=device,
         dtype=dtype,
     )
@@ -48,7 +75,7 @@ def make_layer(node, *, rotary_dim=8, offset=0, device="cpu", dtype=torch.float3
 
 class DecoderTest(unittest.TestCase):
     def _assert_reference(self, device, dtypes, autocast=False):
-        for kind in ("qwen3", "gated", "context"):
+        for kind in ("qwen3", "gated", "context", "convolution"):
             gated = kind == "gated"
             node = make_node(output_gate=gated)
             rotary_dim = 4 if gated else 8
@@ -75,7 +102,19 @@ class DecoderTest(unittest.TestCase):
                         else Qwen3Config(**args)
                     )
                     config._attn_implementation = "eager"
-                    if kind == "context":
+                    if kind == "convolution":
+                        reference = Qwen3DFlash2DecoderLayer(
+                            config,
+                            0,
+                            DEFAULT_DFLASH_KERNELS,
+                            attention_conv=DFlashGroupedConv(16, 4, 3, 4),
+                            mlp_conv=DFlashGroupedConv(16, 4, 3, 4),
+                        )
+                        with torch.no_grad():
+                            for conv in (reference.attention_conv, reference.mlp_conv):
+                                for parameter in conv.parameters():
+                                    parameter.normal_(std=0.1)
+                    elif kind == "context":
                         reference = Qwen3DFlashDecoderLayer(
                             config, 0, DEFAULT_DFLASH_KERNELS
                         )
@@ -90,14 +129,20 @@ class DecoderTest(unittest.TestCase):
                         offset=int(gated),
                         device=device,
                         dtype=dtype,
+                        convolution=kind == "convolution",
                     )
                     actual.load_state_dict(reference.state_dict(), strict=True)
                     hidden = torch.randn(
-                        2, 3, 16, device=device, dtype=dtype, requires_grad=True
+                        2,
+                        8 if kind == "convolution" else 3,
+                        16,
+                        device=device,
+                        dtype=dtype,
+                        requires_grad=True,
                     )
                     other = hidden.detach().clone().requires_grad_()
                     context = None
-                    if kind == "context":
+                    if kind in ("context", "convolution"):
                         # Feature fusion may already have produced BF16 context
                         # while the decoder's residual/norm stream remains FP32.
                         context_dtype = torch.bfloat16 if autocast else dtype
@@ -142,9 +187,12 @@ class DecoderTest(unittest.TestCase):
                         output = actual(hidden, entry)
                     torch.manual_seed(37)
                     with (
-                        torch.autocast(device_type=device, dtype=torch.bfloat16)
-                        if autocast
-                        else nullcontext()
+                        patch.dict("os.environ", {"SPECFORGE_DFLASH2_FUSED_CONV": "0"}),
+                        (
+                            torch.autocast(device_type=device, dtype=torch.bfloat16)
+                            if autocast
+                            else nullcontext()
+                        ),
                     ):
                         if context is None:
                             expected = reference(
@@ -169,6 +217,7 @@ class DecoderTest(unittest.TestCase):
                             context.grad, other_context.grad, rtol=0, atol=0
                         )
                     for name, parameter in actual.named_parameters():
+                        self.assertIsNotNone(parameter.grad, name)
                         torch.testing.assert_close(
                             parameter.grad,
                             dict(reference.named_parameters())[name].grad,
@@ -192,14 +241,22 @@ class DecoderTest(unittest.TestCase):
         cases = [("cpu", torch.float32)]
         if torch.cuda.is_available():
             cases.append(("cuda", torch.bfloat16))
-        for device, dtype in cases:
+        for device, dtype, convolution in [
+            (device, dtype, conv) for device, dtype in cases for conv in (False, True)
+        ]:
             layers = [
-                make_layer(make_node(sliding_window=2), device=device, dtype=dtype),
+                make_layer(
+                    make_node(sliding_window=2),
+                    device=device,
+                    dtype=dtype,
+                    convolution=convolution,
+                ),
                 make_layer(
                     make_node(rope_parameters=NoRoPESpec(), is_causal=False),
                     rotary_dim=0,
                     device=device,
                     dtype=dtype,
+                    convolution=convolution,
                 ),
             ]
             base = DraftBackbone(
@@ -220,7 +277,15 @@ class DecoderTest(unittest.TestCase):
                 ],
                 residual=StandardResidual(StandardResidualSpec()),
             )
-            hidden_base = torch.randn(1, 3, 16, device=device, dtype=dtype)
+            if convolution:
+                # Nonidentity kernels exercise both sides during recomputation.
+                with torch.no_grad():
+                    for layer in layers:
+                        for conv in (layer.attention_conv, layer.mlp_conv):
+                            conv.kernel_projection.weight.normal_(std=0.1)
+            hidden_base = torch.randn(
+                1, 8 if convolution else 3, 16, device=device, dtype=dtype
+            )
             context_base = torch.randn(1, 2, 16, device=device, dtype=dtype)
             expected = None
             for manual, checkpointed in (
@@ -266,7 +331,7 @@ class DecoderTest(unittest.TestCase):
                     all(entry.position_embeddings is None for entry in entries)
                 )
 
-    def test_invalid_layout_streams_and_unimplemented_convolution_fail(self):
+    def test_invalid_layout_streams_and_convolution_contract_fail(self):
         module = make_layer(make_node())
         hidden = torch.randn(1, 3, 16)
         layout = layout_for(hidden)
@@ -277,7 +342,7 @@ class DecoderTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "single"):
                 module(hidden.unsqueeze(0), LayerInputs(attention_layout=layout))
             attention.assert_not_called()
-        with self.assertRaisesRegex(ValueError, "convolution"):
+        with self.assertRaisesRegex(TypeError, "module pair"):
             DecoderLayer(
                 nn.Identity(),
                 nn.Identity(),
@@ -288,6 +353,58 @@ class DecoderTest(unittest.TestCase):
         with patch.object(module.self_attn, "forward", return_value=torch.zeros(16)):
             with self.assertRaisesRegex(ValueError, "residual shape"):
                 module(hidden, LayerInputs(attention_layout=layout))
+
+    def test_convolutions_are_independent_and_identity_matches_plain_layer(self):
+        node = make_node(rope_parameters=NoRoPESpec())
+        wrapped = make_layer(node, rotary_dim=0, convolution=True)
+        plain = make_layer(node, rotary_dim=0)
+        plain.load_state_dict(
+            {
+                name: value
+                for name, value in wrapped.state_dict().items()
+                if not name.startswith(("attention_conv.", "mlp_conv."))
+            },
+            strict=True,
+        )
+        self.assertIs(wrapped.attention_conv.config, wrapped.mlp_conv.config)
+        for a, b in zip(
+            wrapped.attention_conv.parameters(), wrapped.mlp_conv.parameters()
+        ):
+            self.assertNotEqual(a.data_ptr(), b.data_ptr())
+        hidden = torch.randn(1, 8, 16, requires_grad=True)
+        other = hidden.detach().clone().requires_grad_()
+        entry = LayerInputs(attention_layout=layout_for(hidden))
+        torch.manual_seed(11)
+        output = wrapped(hidden, entry)
+        torch.manual_seed(11)
+        expected = plain(other, entry)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        output.square().sum().backward()
+        expected.square().sum().backward()
+        torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
+        for name, parameter in plain.named_parameters():
+            torch.testing.assert_close(
+                dict(wrapped.named_parameters())[name].grad,
+                parameter.grad,
+                rtol=0,
+                atol=0,
+            )
+        for conv in (wrapped.attention_conv, wrapped.mlp_conv):
+            for parameter in conv.parameters():
+                self.assertGreater(torch.count_nonzero(parameter.grad).item(), 0)
+        for invalid, error in (
+            ((wrapped.attention_conv,), TypeError),
+            ((nn.Identity(), nn.Identity()), TypeError),
+            ((wrapped.attention_conv, wrapped.attention_conv), ValueError),
+        ):
+            with self.assertRaises(error):
+                DecoderLayer(
+                    nn.Identity(),
+                    nn.Identity(),
+                    hidden_size=16,
+                    norm=RMSNormSpec(eps=1e-6, weight_offset=0),
+                    sublayer_conv=invalid,
+                )
 
     def test_context_dtype_validation_only_allows_autocast_supported_pairs(self):
         module = make_layer(make_node(rope_parameters=NoRoPESpec()), rotary_dim=0)
