@@ -10,6 +10,7 @@ from .architecture import (
     ArchitectureSpec,
     DFlash2Spec,
     DFlashSpec,
+    DominoSpec,
     DSparkSpec,
     DSpineSpec,
 )
@@ -144,3 +145,4 @@ register_spec("DFlashDraftModel", DFlashSpec, validate_dflash)
 register_spec("DFlash2DraftModel", DFlash2Spec, validate_dflash2)
 register_spec("DSparkDraftModel", DSparkSpec, validate_target_context)
 register_spec("DSpineDraftModel", DSpineSpec, validate_dspine)
+register_spec("DominoDraftModel", DominoSpec, validate_target_context)
