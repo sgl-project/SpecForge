@@ -250,6 +250,7 @@ class Qwen3MTPAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
+        # Attention interfaces already return [batch, query, head, dim].
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
 
         if self.attn_output_gate:
