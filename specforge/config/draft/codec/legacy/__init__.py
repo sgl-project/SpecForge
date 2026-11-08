@@ -1,1 +1,28 @@
 """Explicit migrations of historical formats; no file or model imports."""
+
+from collections.abc import Mapping
+
+from .dflash import decode_dflash
+from .dspark import decode_dspark
+
+_DECODERS = {
+    "DFlashDraftModel": decode_dflash,
+    "DFlash2DraftModel": decode_dflash,
+    "DSparkDraftModel": decode_dspark,
+}
+
+
+def decode_legacy_config(payload: Mapping, *, target_config: Mapping):
+    if not isinstance(payload, Mapping):
+        raise ValueError("legacy draft must be a configuration object")
+    architectures = payload.get("architectures")
+    if (
+        not isinstance(architectures, (list, tuple))
+        or len(architectures) != 1
+        or type(architectures[0]) is not str
+        or architectures[0] not in _DECODERS
+    ):
+        raise ValueError(
+            f"unsupported legacy architectures; expected one of {sorted(_DECODERS)}"
+        )
+    return _DECODERS[architectures[0]](payload, target_config=target_config)
