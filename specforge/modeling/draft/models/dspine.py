@@ -1,0 +1,227 @@
+"""DSpine owns the decoder/injection loop and preserves intermediate states."""
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from transformers import initialization as init
+from transformers.utils import ModelOutput
+
+from ..bindings import BoundLMHead
+from ..heads.adjacent_injection import AdjacentInjection
+from ..heads.transfer_space import initialize_transfer_space
+from ..hf_config import SpecForgeDraftConfig
+from ..layers.inputs import LayerInputs
+from ..pretrained import DraftPreTrainedModel
+from .assembly import build_decoder_backbone
+from .context import prepare_context_inputs
+from .registry import register_draft_model
+from .target_features import TargetFeatureFusion
+from .tokens import build_token_modules
+
+
+@dataclass
+class DSpineOutput(ModelOutput):
+    """States/logits retain block axes; layer_features adds a leading layer axis."""
+
+    hidden_states: Tensor | None = None
+    pre_injection: Tensor | None = None
+    layer_features: Tensor | None = None
+    logits: Tensor | None = None
+
+
+@register_draft_model
+class DSpineDraftModel(DraftPreTrainedModel):
+    """Consume explicit block visibility, token blocks and per-layer replacement masks.
+
+    The caller prepares replacement masks; training schedules and layer cutoffs
+    do not enter this model. Transfer initialization consumes an already loaded
+    target head tensor, and is called only when starting a new transfer space.
+    """
+
+    _no_split_modules = ["DecoderLayer"]
+
+    def __init__(
+        self, config: SpecForgeDraftConfig, *, backend="eager", device=None, dtype=None
+    ):
+        super().__init__(config)
+        draft, spec = config.draft, config.draft.spec_config
+        self.backbone = build_decoder_backbone(
+            draft, backend=backend, device=device, dtype=dtype
+        )
+        self.fusion = TargetFeatureFusion(
+            spec.target_features,
+            hidden_size=draft.hidden_size,
+            norm=draft.norm_config,
+            device=device,
+            dtype=dtype,
+        )
+        self.embed_tokens, self.lm_head = build_token_modules(
+            draft, device=device, dtype=dtype
+        )
+        self.injection = AdjacentInjection(
+            spec.injection,
+            hidden_size=draft.hidden_size,
+            num_layers=draft.num_hidden_layers,
+            device=device,
+            dtype=dtype,
+        )
+        self.register_buffer(
+            "transfer_codes",
+            torch.zeros(
+                draft.vocab_size,
+                spec.injection.transfer_rank,
+                device=device,
+                dtype=dtype,
+            ),
+        )
+        self.register_buffer("transfer_ready", torch.tensor(False, device=device))
+        self.post_init()
+
+    def reset_draft_parameters(self):
+        init.zeros_(self.transfer_codes)
+        init.zeros_(self.transfer_ready)
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    @torch.no_grad()
+    def initialize_transfer_space(
+        self, head_weight: Tensor, chunk_size: int = 4096
+    ) -> None:
+        initialize_transfer_space(
+            head_weight,
+            self.transfer_codes,
+            self.injection.readouts,
+            chunk_size=chunk_size,
+        )
+        self.transfer_ready.fill_(True)
+
+    def _require_transfer_space(self):
+        torch._assert_async(
+            self.transfer_ready,
+            "Initialize or load the DSpine transfer space before use",
+        )
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_features: Tensor,
+        layer_inputs: Sequence[LayerInputs],
+        *,
+        block_token_ids: Tensor,
+        replace_masks: Sequence[Tensor | None] | None = None,
+        output_logits: bool = True,
+    ) -> DSpineOutput:
+        self._require_transfer_space()
+        size = self.config.draft.spec_config.protocol.num_model_slots
+        if input_ids.ndim != 2 or input_ids.shape[1] % size:
+            raise ValueError("input_ids must be [batch, whole draft blocks]")
+        shape = (input_ids.shape[0], input_ids.shape[1] // size, size)
+        if block_token_ids.shape != shape or block_token_ids.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError(
+                "block_token_ids must be integer [batch, blocks, block_size]"
+            )
+        if type(output_logits) is not bool:
+            raise TypeError("output_logits must be boolean")
+        masks = (
+            (None,) * self.backbone.num_layers
+            if replace_masks is None
+            else tuple(replace_masks)
+        )
+        if len(masks) != self.backbone.num_layers:
+            raise ValueError("replace_masks must contain one entry per layer")
+        if any(
+            mask is not None and (mask.shape != shape[:2] or mask.dtype != torch.bool)
+            for mask in masks
+        ):
+            raise ValueError("replacement masks must be boolean [batch, blocks]")
+        prepared = prepare_context_inputs(
+            self.fusion,
+            target_features,
+            layer_inputs,
+            num_layers=self.backbone.num_layers,
+        )
+        state = self.backbone.begin(self.embed_tokens(input_ids), prepared)
+        features = []
+        for index, replace_mask in enumerate(masks):
+            state = self.backbone.run_next_layer(state)
+            pre_injection = state.hidden.reshape(*shape, state.hidden.shape[-1])
+            hidden = self.injection(
+                pre_injection, index, block_token_ids, self.transfer_codes, replace_mask
+            )
+            features.append(self.injection.feature(hidden, index))
+            state = state.with_hidden(hidden.reshape_as(state.hidden))
+        hidden = self.backbone.finalize(state).reshape_as(pre_injection)
+        return DSpineOutput(
+            hidden_states=hidden,
+            pre_injection=pre_injection,
+            layer_features=torch.stack(features),
+            logits=self.lm_head(hidden) if output_logits else None,
+        )
+
+    def refine(self, hidden: Tensor, predecessor_ids: Tensor) -> Tensor:
+        """Reuse the final injection and norm on pre-injection successor states."""
+        self._require_transfer_space()
+        if (
+            hidden.shape[-1] != self.config.draft.hidden_size
+            or predecessor_ids.shape != hidden.shape[:-1]
+            or predecessor_ids.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("predecessor_ids must align with hidden states")
+        layer = self.backbone.num_layers - 1
+        receiver = self.injection.feature(hidden, layer)
+        predecessor = math.sqrt(self.injection.rank) * F.embedding(
+            predecessor_ids, self.transfer_codes
+        )
+        return self.backbone.final_norm(
+            self.injection.write(hidden, receiver, predecessor, layer)
+        )
+
+    def transition_scores(
+        self, pre_injection: Tensor, candidate_ids: Tensor, anchor_ids: Tensor
+    ) -> Tensor:
+        """Score adjacent pairs from supplied pre-injection successor states.
+
+        Inputs are [..., positions, H], [..., positions, K], and [...] anchors.
+        Output is FP32 [..., positions, predecessor K, successor K]. At the
+        first position all predecessor rows use the anchor. Candidate creation
+        and path selection belong to the caller. Gradients remain attached.
+        """
+        if (
+            pre_injection.ndim < 2
+            or pre_injection.shape[-1] != self.config.draft.hidden_size
+            or candidate_ids.ndim != pre_injection.ndim
+            or candidate_ids.shape[:-1] != pre_injection.shape[:-1]
+            or candidate_ids.shape[-1] < 1
+            or candidate_ids.shape[-2] < 1
+            or anchor_ids.shape != candidate_ids.shape[:-2]
+        ):
+            raise ValueError("candidates and anchors must align with successor states")
+        if any(
+            ids.dtype not in (torch.int32, torch.int64)
+            for ids in (candidate_ids, anchor_ids)
+        ):
+            raise TypeError("candidate and anchor IDs must be integers")
+        count = candidate_ids.shape[-1]
+        anchor = anchor_ids[..., None, None].expand(*anchor_ids.shape, 1, count)
+        predecessors = torch.cat((anchor, candidate_ids[..., :-1, :]), dim=-2)
+        hidden = pre_injection.unsqueeze(-2).expand(
+            *pre_injection.shape[:-1], count, pre_injection.shape[-1]
+        )
+        refined = self.refine(hidden, predecessors)
+        weights = (
+            self.lm_head.candidate_weights(candidate_ids)
+            if isinstance(self.lm_head, BoundLMHead)
+            else F.embedding(candidate_ids, self.lm_head.weight)
+        )
+        return torch.einsum("...ikh,...ijh->...ikj", refined, weights).float()
