@@ -18,6 +18,7 @@ from .settings import (
     encode_rope,
     encode_target_logits,
 )
+from .target import resolve_target_logits, validate_target
 
 SCHEMA_VERSION = 1
 MODEL_TYPE = "specforge_draft"
@@ -54,7 +55,9 @@ def _map(value, path, decode):
     return result
 
 
-def decode_config(payload: Mapping) -> DraftConfig:
+def decode_config(
+    payload: Mapping, *, target_config: Mapping | None = None
+) -> DraftConfig:
     """Decode canonical structure, checking redundant depth against layer_types."""
     if not isinstance(payload, Mapping):
         raise ValueError("draft: expected a configuration object")
@@ -119,6 +122,8 @@ def decode_config(payload: Mapping) -> DraftConfig:
     config = _construct(DraftConfig, values, "draft")
     if declared_depth is not None and declared_depth != config.num_hidden_layers:
         raise ValueError("num_hidden_layers must equal len(layer_types)")
+    if target_config is not None:
+        validate_target(config, target_config)
     return config
 
 
@@ -157,7 +162,9 @@ def encode_config(config: DraftConfig) -> dict:
     return payload
 
 
-def parse_draft(payload: Mapping) -> DraftConfig:
+def parse_draft(
+    payload: Mapping, *, target_config: Mapping | None = None
+) -> DraftConfig:
     """Parse a resolved YAML draft mapping, expanding only documented shorthand.
 
     Vocabulary size derives from vocab_size when omitted. initializer_range is
@@ -202,4 +209,14 @@ def parse_draft(payload: Mapping) -> DraftConfig:
     if "draft_vocab_size" not in values and "vocab_size" in values:
         values["draft_vocab_size"] = values["vocab_size"]
     values.setdefault("initializer_range", 0.02)
-    return decode_config(values)
+    bindings = values.get("target_bindings")
+    if (
+        target_config is not None
+        and isinstance(bindings, (list, tuple))
+        and "lm_head" in bindings
+        and "target_logit_transform" not in values
+    ):
+        values["target_logit_transform"] = encode_target_logits(
+            resolve_target_logits(target_config)
+        )
+    return decode_config(values, target_config=target_config)
