@@ -227,6 +227,37 @@ class ComponentCodecTest(unittest.TestCase):
             with self.subTest(schema=schema), self.assertRaisesRegex(TypeError, error):
                 register_component_schema("mlp", schema)
 
+    def test_registration_rejects_nodes_that_would_not_read_back_as_values(self):
+        @dataclass(frozen=True, kw_only=True, eq=False)
+        class IdentityEqual(FFNSpec):
+            type: ClassVar[str] = "test_identity_equal"
+            width: int
+
+        @dataclass(frozen=True, kw_only=True)
+        class Router:
+            top_k: int = 2
+
+        @dataclass(frozen=True, kw_only=True)
+        class NestedDefault(FFNSpec):
+            type: ClassVar[str] = "test_nested_default"
+            router: Router
+
+        @dataclass(frozen=True, kw_only=True)
+        class Unresolvable(FFNSpec):
+            type: ClassVar[str] = "test_unresolvable"
+            router: "MissingRouter"
+
+        for schema, error in (
+            (IdentityEqual, "compare by value"),
+            (NestedDefault, r"mlp\.router\.top_k: structural fields must have no"),
+            (Unresolvable, "unresolvable annotation"),
+        ):
+            with (
+                self.subTest(schema=schema.__name__),
+                self.assertRaisesRegex(TypeError, error),
+            ):
+                register_component_schema("mlp", schema)
+
     def test_decoding_rejects_mutable_extension_values(self):
         @dataclass(frozen=True, kw_only=True)
         class MutableValue(FFNSpec):

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import MISSING, dataclass, fields, is_dataclass
 from inspect import isabstract
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, get_args, get_type_hints
 
 from .architecture import (
     ArchitectureSpec,
@@ -45,6 +45,39 @@ _SCHEMAS: dict[tuple[str, str], type] = {}
 _VALIDATORS: dict[tuple[str, str], Callable[..., None]] = {}
 
 
+def _dataclasses_in(annotation):
+    if isinstance(annotation, type) and is_dataclass(annotation):
+        yield annotation
+    for argument in get_args(annotation):
+        yield from _dataclasses_in(argument)
+
+
+def _check_value_schema(schema: type, label: str, checked: set) -> None:
+    """Reject classes whose decoded nodes would not be explicit, comparable values."""
+    if schema in checked:
+        return
+    checked.add(schema)
+    if not schema.__dataclass_params__.eq:
+        raise TypeError(f"{label} must compare by value; remove eq=False")
+    try:
+        annotations = get_type_hints(schema)
+    except NameError as exc:
+        raise TypeError(f"{label}: unresolvable annotation ({exc})") from exc
+    for field in fields(schema):
+        if field.init and (
+            field.default is not MISSING or field.default_factory is not MISSING
+        ):
+            raise TypeError(
+                f"{label}.{field.name}: structural fields must have no defaults"
+            )
+        for nested in _dataclasses_in(annotations[field.name]):
+            if component_kind(nested) is not None:
+                continue  # checked when its own kind registers it
+            if not nested.__dataclass_params__.frozen:
+                raise TypeError(f"{label}.{field.name} must be a frozen dataclass")
+            _check_value_schema(nested, f"{label}.{field.name}", checked)
+
+
 def _validate_schema(schema: type, label: str) -> None:
     if (
         "__dataclass_fields__" not in schema.__dict__
@@ -57,12 +90,7 @@ def _validate_schema(schema: type, label: str) -> None:
             raise TypeError(
                 "component type must be a ClassVar, not a configuration field"
             )
-        if field.init and (
-            field.default is not MISSING or field.default_factory is not MISSING
-        ):
-            raise TypeError(
-                f"{label}.{field.name}: structural fields must have no defaults"
-            )
+    _check_value_schema(schema, label, set())
     if issubclass(schema, (AttentionSpec, ConvSpec, ResidualSpec)):
         if type(schema.capabilities) is not frozenset or any(
             type(name) is not str or not name for name in schema.capabilities
