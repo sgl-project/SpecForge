@@ -69,9 +69,23 @@ def _validate_schema(schema: type, label: str) -> None:
             raise TypeError(f"{label} capabilities must be a frozenset of names")
 
 
+def component_type_field(kind: str) -> str:
+    """Return the serialized discriminator for a component kind."""
+    if not isinstance(kind, str) or kind not in _BASES:
+        raise ValueError(f"unknown component kind {kind!r}")
+    return "rope_type" if kind == "rope" else "type"
+
+
 def component_type(kind: str, node):
-    """Read the discriminator, preserving RoPE's serialized rope_type name."""
-    return getattr(node, "rope_type" if kind == "rope" else "type", None)
+    """Read the discriminator, preserving its serialized name."""
+    return getattr(node, component_type_field(kind), None)
+
+
+def component_kind(schema: type) -> str | None:
+    """Identify a component annotation or node class, including abstract bases."""
+    return next(
+        (kind for kind, base in _BASES.items() if issubclass(schema, base)), None
+    )
 
 
 def register_component_schema(

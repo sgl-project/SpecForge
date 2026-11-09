@@ -1,4 +1,4 @@
-"""Strict dataclass construction shared by the component and settings codecs."""
+"""Strict dataclass construction shared by configuration codecs."""
 
 from collections.abc import Mapping
 from dataclasses import MISSING, fields

@@ -1,4 +1,4 @@
-"""Strict conversion of typed, nested architecture nodes to JSON values."""
+"""Strict conversion of typed, nested configuration nodes to JSON values."""
 
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
@@ -6,6 +6,7 @@ from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
 
 from .._validation import finite_number
+from ..registry import component_kind
 from ._schema import _construct
 
 
@@ -20,6 +21,14 @@ def _decode_value(annotation, value, path):
             raise ValueError(f"{path}: union needs an explicit type discriminator")
         return _decode_value(choices[0], value, path)
     if isinstance(annotation, type) and is_dataclass(annotation):
+        kind = component_kind(annotation)
+        if kind is not None:
+            from .components import decode_component
+
+            node = decode_component(kind, value, path=path)
+            if not isinstance(node, annotation):
+                raise ValueError(f"{path}: expected {annotation.__name__}")
+            return node
         return decode_node(annotation, value, path)
     if origin is tuple:
         if not isinstance(value, (list, tuple)):
@@ -56,6 +65,11 @@ def decode_node(schema: type, payload: Mapping, path: str):
 
 def encode_node(value):
     if is_dataclass(value) and not isinstance(value, type):
+        kind = component_kind(type(value))
+        if kind is not None:
+            from .components import encode_component
+
+            return encode_component(kind, value)
         return {
             field.name: encode_node(getattr(value, field.name))
             for field in fields(value)

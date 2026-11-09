@@ -12,12 +12,6 @@ from ..registry import architecture_spec
 from ._schema import _construct
 from .components import decode_component, decode_layer, encode_component, encode_layer
 from .nodes import decode_node, encode_node
-from .settings import (
-    decode_rope,
-    decode_target_logits,
-    encode_rope,
-    encode_target_logits,
-)
 from .target import resolve_target_logits, validate_target
 
 SCHEMA_VERSION = 1
@@ -102,7 +96,9 @@ def decode_config(
         if field in values:
             values[field] = decode_component(kind, values[field])
     if "rope_parameters" in values:
-        values["rope_parameters"] = decode_rope(values["rope_parameters"])
+        values["rope_parameters"] = decode_component(
+            "rope", values["rope_parameters"], path="rope_parameters"
+        )
     if "spec_config" in values:
         values["spec_config"] = decode_node(
             registration.schema, values["spec_config"], "spec_config"
@@ -110,8 +106,8 @@ def decode_config(
     if "lm_head" in values.get("target_bindings", ()):
         if "target_logit_transform" not in values:
             raise ValueError("bound lm_head requires target_logit_transform")
-        values["target_logit_transform"] = decode_target_logits(
-            values["target_logit_transform"]
+        values["target_logit_transform"] = decode_component(
+            "logits", values["target_logit_transform"], path="target_logit_transform"
         )
     else:
         if "target_logit_transform" in values:
@@ -151,13 +147,13 @@ def encode_config(config: DraftConfig) -> dict:
         "num_hidden_layers": config.num_hidden_layers,
         "norm_config": encode_component("norm", config.norm_config),
         "residual_config": encode_component("residual", config.residual_config),
-        "rope_parameters": encode_rope(config.rope_parameters),
+        "rope_parameters": encode_component("rope", config.rope_parameters),
         "spec_config": encode_node(config.spec_config),
         "target_bindings": list(config.target_bindings),
     }
     if config.target_logit_transform is not None:
-        payload["target_logit_transform"] = encode_target_logits(
-            config.target_logit_transform
+        payload["target_logit_transform"] = encode_component(
+            "logits", config.target_logit_transform
         )
     return payload
 
@@ -216,7 +212,7 @@ def parse_draft(
         and "lm_head" in bindings
         and "target_logit_transform" not in values
     ):
-        values["target_logit_transform"] = encode_target_logits(
-            resolve_target_logits(target_config)
+        values["target_logit_transform"] = encode_component(
+            "logits", resolve_target_logits(target_config)
         )
     return decode_config(values, target_config=target_config)
