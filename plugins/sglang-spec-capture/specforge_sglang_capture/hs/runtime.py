@@ -107,15 +107,18 @@ class HSCaptureRuntime:
     control_namespace = "specforge_hs"
 
     def __init__(self, scheduler, capture, config: HSConfig, *, manifest=None,
-                 schema=None, tp_size=None):
+                 schema=None, tp_size=None, tp_rank=0):
         self.s, self.capture, self.config = scheduler, capture, config
         self.capture.sink.require_hard_pin = True
         self.writer, self.enabled = capture.is_writer, config.cache
         self.owner_thread = threading.get_ident()
-        self.tp_size = tp_size
+        self.tp_size, self.tp_rank = tp_size, tp_rank
         if self.tp_size is None:
             from sglang.srt.runtime_context import get_parallel
-            self.tp_size = get_parallel().tp_size
+            parallel = get_parallel()
+            # Native capture elects the attention-TP writer from this same
+            # resolved topology; keep its TP rank as execution diagnostics.
+            self.tp_size, self.tp_rank = parallel.tp_size, parallel.tp_rank
         self.epoch = self._writer_broadcast("startup.epoch", lambda: uuid.uuid4().hex)
         if manifest is None or schema is None:
             manifest, schema = self._local_phase("startup.model", self._model_identity)
@@ -449,7 +452,7 @@ class HSCaptureRuntime:
         candidate.entry.state = "ADMITTED"
         candidate.entry.last_plan = {"N": len(candidate.tokens), "L": lawful_prefix_len,
             "H": proposal.max_prefix_len, "span": [lawful_prefix_len, len(candidate.tokens)],
-            "execution_epoch": candidate.execution.execution_epoch}
+            "execution_epoch": candidate.execution.execution_epoch, "rank": self.tp_rank}
         self.history.append({"attempt_id": candidate.entry.attempt_id,
                              **candidate.entry.last_plan})
 

@@ -139,7 +139,7 @@ class ThreadedTPProtocolTests(unittest.TestCase):
                 kwargs = {"manifest": {"model": "threaded-cpu"}, "schema": _schema()}
                 if initialize is not None:
                     config, kwargs = initialize(rank, config, kwargs)
-                runtime = HSCaptureRuntime(scheduler, native, config, tp_size=2, **kwargs)
+                runtime = HSCaptureRuntime(scheduler, native, config, tp_size=2, tp_rank=rank, **kwargs)
                 if configure is not None:
                     configure(rank, runtime)
                 results[rank] = operation(rank, runtime, phase)
@@ -444,6 +444,34 @@ class ThreadedTPProtocolTests(unittest.TestCase):
         self.assertEqual(errors, [None, None])
         self.assertTrue(all(value["state"] == "RETIRED" for value in values))
         self.assertTrue(all(not snapshot["tokens"] for snapshot in snapshots))
+
+    def test_committed_diagnostics_keep_each_tp_rank_without_scheduler_rank_attribute(self):
+        def operation(rank, runtime, phase):
+            tokens = list(range(8))
+            spec = {"features": {"aux": "aux", "last_hidden": "last"}, "passthrough": []}
+            body = self.body(runtime, request_digest=digest_request(tokens, spec))
+            reply, failures = phase(lambda: runtime.control(runtime.s, body))
+            self.assertFalse(any(failures))
+            spec.update({key: reply[key] for key in (
+                "server_epoch", "attempt_id", "reservation_token", "object_key_layout",
+                "store_id", "sample_id", "gen", "request_digest")})
+            spec.update(protocol_version=1, capture_namespace=runtime.namespace,
+                        capture_signature=runtime.signature)
+            req = SimpleNamespace(rid="request", origin_input_ids=tokens,
+                sampling_params=SimpleNamespace(custom_params={"spec_capture": spec}, max_new_tokens=0))
+            proposal, failures = phase(lambda: runtime.prepare(runtime.s, req))
+            self.assertFalse(any(failures))
+            # The helper broadcasts the writer's proposal. Each rank's opaque
+            # candidate remains local, as it does in actual SG coordination.
+            phase(lambda: runtime.after_match(runtime.s, req, proposal, 0))
+            phase(lambda: runtime.reserve(runtime.s, req, proposal, 0))
+            phase(lambda: runtime.commit(runtime.s, req, proposal, 0))
+            self.assertFalse(hasattr(runtime.s, "tp_rank"))
+            return req._specforge_hs_attempt.last_plan["rank"]
+
+        values, errors, _, _ = self.pair(operation)
+        self.assertEqual(errors, [None, None])
+        self.assertEqual(values, [0, 1])
 
 
 if __name__ == "__main__":

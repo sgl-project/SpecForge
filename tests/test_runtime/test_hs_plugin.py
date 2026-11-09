@@ -82,7 +82,7 @@ class HSPluginTests(unittest.TestCase):
         self.protocol_module.stop()
         self.env.stop()
 
-    def runtime(self, *, store=None, cache=True, capacity=16):
+    def runtime(self, *, store=None, cache=True, capacity=16, parallel=None):
         writer = sink.SpecCaptureSink([1, 3])
         writer._store, writer._put_config = store or _Store(), object()
         deferred = []
@@ -91,8 +91,14 @@ class HSPluginTests(unittest.TestCase):
         scheduler = SimpleNamespace(abort_request=lambda req: None)
         config = HSConfig(capture=True, cache=cache, chunk_tokens=4, cache_bytes=4096,
             pinned_bytes=4096, output_bytes=8192, device_bytes=4096, attempt_capacity=capacity)
-        hs = HSCaptureRuntime(scheduler, native, config,
-            manifest={"model": "cpu-fixture", "weights": "load-epoch"}, schema=_schema(), tp_size=1)
+        kwargs = dict(manifest={"model": "cpu-fixture", "weights": "load-epoch"}, schema=_schema())
+        if parallel is None:
+            hs = HSCaptureRuntime(scheduler, native, config, tp_size=1, **kwargs)
+        else:
+            getter = mock.Mock(return_value=parallel)
+            with mock.patch.dict(sys.modules, {"sglang.srt.runtime_context": SimpleNamespace(get_parallel=getter)}):
+                hs = HSCaptureRuntime(scheduler, native, config, **kwargs)
+            getter.assert_called_once_with()
         native.hs = hs
         hs.deferred = deferred
         self.runtimes.append(hs)
@@ -155,7 +161,7 @@ class HSPluginTests(unittest.TestCase):
         hs.poll()
 
     def test_native_complete_n_rows_from_nonaligned_prefix_and_loss_mask_independent_identity(self):
-        hs = self.runtime()
+        hs = self.runtime(parallel=SimpleNamespace(tp_size=1, tp_rank=0))
         first = self.request(hs, "cold")
         self.admit(hs, first)
         self.forward(hs, [first], [8])
@@ -163,6 +169,8 @@ class HSPluginTests(unittest.TestCase):
         hs.deferred[0][1].result()
         cold = hs.capture.results[first.rid]
         self.assertEqual(cold["state"], "PUBLISHED")
+        self.assertEqual(cold["rank"], hs.tp_rank)
+        self.assertEqual(cold["publication_certificate"]["rank"], hs.tp_rank)
         self.assertTrue(cold["writer_drained"])
         self.assertEqual(cold["request_digest"], digest_request(first.origin_input_ids, capture.request_spec(first)))
         second = self.request(hs, "warm", mask=0)
@@ -233,6 +241,7 @@ class HSPluginTests(unittest.TestCase):
             self.spin(hs, lambda: hs.deferred[-1][1].done())
             hs.deferred[-1][1].result()
             self.assertEqual(hs.capture.results[req.rid]["span"], [0, 8])
+            self.assertEqual(hs.capture.results[req.rid]["rank"], hs.tp_rank)
         self.assertFalse(hs.capability()["cache_enabled"])
         self.assertEqual(hs.cache.stats()["cache_owned_bytes"], 0)
 
