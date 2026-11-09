@@ -96,14 +96,14 @@ class TargetSettingsTest(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, field):
                             parse_draft(payload, target_config=target)
 
-    def test_explicit_feature_layers_preserve_order_and_reject_duplicates(self):
+    def test_explicit_feature_layers_follow_the_capture_order(self):
         payload = encode_config(draft_config())
         features = payload["spec_config"]["target_features"]
         for reader in (parse_draft, decode_config):
-            features["target_layer_ids"] = [6, 1]
+            features["target_layer_ids"] = [1, 6]
             node = reader(payload, target_config=TARGET)
-            self.assertEqual(node.spec_config.target_features.target_layer_ids, (6, 1))
-            for ids in (None, [], [7, 1, 7]):
+            self.assertEqual(node.spec_config.target_features.target_layer_ids, (1, 6))
+            for ids in (None, [], [6, 1], [1, 6, 6]):
                 features["target_layer_ids"] = ids
                 with self.assertRaisesRegex(ValueError, "target_layer_ids"):
                     reader(payload, target_config=TARGET)
@@ -161,6 +161,14 @@ class TargetSettingsTest(unittest.TestCase):
             encode_config(node), target_config={**TARGET, "final_logit_softcapping": 30}
         )
         self.assertIsNone(restored.target_logit_transform)
+
+    def test_final_target_layer_is_not_a_tap(self):
+        payload = encode_config(draft_config())
+        payload["spec_config"]["target_features"]["target_layer_ids"] = [1, 7]
+        with self.assertRaisesRegex(ValueError, "final target layer"):
+            decode_config(payload, target_config=TARGET)
+        payload["spec_config"]["target_features"]["target_layer_ids"] = [1, 6]
+        decode_config(payload, target_config=TARGET)
 
     def test_bound_vocab_uses_the_padded_target_size(self):
         payload = encode_config(draft_config(vocab_size=128, draft_vocab_size=128))

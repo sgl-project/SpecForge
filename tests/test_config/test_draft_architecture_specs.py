@@ -56,8 +56,8 @@ class ArchitectureSpecsTest(unittest.TestCase):
                 schema(block_size=1)
 
     def test_target_feature_order_and_width(self):
-        node = TargetFeatureSpec(mask_token_id=0, target_layer_ids=(7, 1, 4))
-        self.assertEqual(node.target_layer_ids, (7, 1, 4))
+        node = TargetFeatureSpec(mask_token_id=0, target_layer_ids=(1, 4, 7))
+        self.assertEqual(node.target_layer_ids, (1, 4, 7))
         self.assertEqual(node.input_width(96), 288)
         for value in ([], (), (True,), (-1,), ("1",), [1, 2], (7, 1, 7)):
             with self.assertRaisesRegex(ValueError, "target_layer_ids"):

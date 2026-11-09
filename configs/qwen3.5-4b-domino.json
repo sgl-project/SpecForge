@@ -11,7 +11,7 @@
   "bos_token_id": 248043,
   "dflash_config": {
     "mask_token_id": 248070,
-    "target_layer_ids": [3, 11, 19, 27, 31],
+    "target_layer_ids": [1, 8, 15, 22, 29],
     "projector_type": "domino",
     "pure_draft_prefix_len": 1,
     "emb_dim": 256,
