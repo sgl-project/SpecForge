@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -28,12 +28,8 @@ _NO_DEPS_STACKS = {
 _LIGER_IMPORT_ROOTS = ("triton", "liger_kernel")
 
 
-@dataclass(frozen=True)
-class DFlashKernels:
-    """Stable construction boundary between DFlash and kernel providers."""
-
-    make_rms_norm: Callable[[int, float], nn.Module]
-    make_mlp: Callable[[Qwen3Config], nn.Module]
+# Compatibility name for callers supplying custom kernel factories.
+from .layers.config import LayerKernels as DFlashKernels
 
 
 def _make_qwen3_rms_norm(hidden_size: int, eps: float) -> nn.Module:

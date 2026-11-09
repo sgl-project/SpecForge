@@ -7,7 +7,7 @@ import torch.multiprocessing as mp
 from accelerate.utils import set_seed
 
 from specforge.distributed import get_tp_group, init_distributed
-from specforge.layers import ColumnParallelLinear, RowParallelLinear
+from specforge.modeling.draft.layers import ColumnParallelLinear, RowParallelLinear
 from tests.utils import get_available_port
 
 

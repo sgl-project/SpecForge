@@ -8,7 +8,7 @@ from unittest.mock import patch
 import torch
 from transformers import LlamaConfig
 
-from specforge.modeling.draft.llama3_eagle import (
+from specforge.modeling.draft.eagle3 import (
     LlamaAttention,
     LlamaForCausalLMEagle3,
     LlamaMLP,
