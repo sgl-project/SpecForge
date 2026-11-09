@@ -140,7 +140,6 @@ class DraftNodesTest(unittest.TestCase):
         result = subprocess.run(
             [
                 sys.executable,
-                "-S",
                 "-c",
                 """
 import importlib
