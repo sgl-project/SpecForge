@@ -406,7 +406,7 @@ class ModelProvider:
 
 @dataclass(frozen=True)
 class OfflineCaptureLayout:
-    """Map one generic local capture onto the persisted offline schema.
+    """Map generic captured tensors onto the persisted offline schema.
 
     Local capture always exposes the same four per-sample sources:
     ``input_ids``, ``loss_mask``, ``aux_hidden_states``, and

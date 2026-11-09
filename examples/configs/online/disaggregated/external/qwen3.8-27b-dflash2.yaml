@@ -1,5 +1,5 @@
 # Qwen3.8-27B DFlash2 across two 8-GPU nodes with externally managed services:
-# eight TP=1 patched SGLang capture servers and the Mooncake master on the
+# eight TP=1 SGLang capture servers and the Mooncake master on the
 # capture node, a DP=8 DFlash2 trainer on the trainer node.
 #
 # examples/disagg/run_qwen3.8_27b_dflash2_disagg_2node.sh starts the services

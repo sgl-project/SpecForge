@@ -10,9 +10,7 @@
 
 An external SGLang capture server runs the prefill and writes captured
 features straight into Mooncake in :class:`MooncakeFeatureStore`'s key layout.
-The server is either patched with ``patches/sglang/v0.5.18/spec-capture.patch``
-(``server_capture="patch"``: the spec rides a top-level ``spec_capture``
-request field) or runs the ``specforge-sglang-capture`` plugin
+The server runs the ``specforge-sglang-capture`` plugin
 (``server_capture="plugin"``: the spec rides ``sampling_params.custom_params``).
 ``server_capture="auto"`` reads the backend from the server's ``/server_info``
 before the first capture request.
@@ -45,21 +43,18 @@ from specforge.runtime.contracts import SCHEMA_VERSION, FeatureSpec, PromptTask
 
 logger = logging.getLogger(__name__)
 
-#: How a capture server implements spec capture: the versioned source patch or
-#: the SGLang plugin. Each takes the request spec through a different field.
-SERVER_CAPTURE_BACKENDS = ("patch", "plugin")
+#: The supported capture integration.
+SERVER_CAPTURE_BACKENDS = ("plugin",)
 _SERVER_INFO_TIMEOUT_S = 30.0
 _CAPTURE_HINTS = {
     "plugin": "the specforge-sglang-capture plugin with SPECFORGE_SPEC_CAPTURE=1",
-    "patch": "the spec-capture patch with --enable-spec-capture",
 }
 
 
 def detect_server_capture(server_info: Mapping[str, Any], *, server_url: str) -> str:
     """The capture backend a running server advertises in ``/server_info``.
 
-    The patch adds the ``enable_spec_capture`` server argument; the enabled
-    plugin marks each scheduler's internal state with ``spec_capture_backend``.
+    The enabled plugin marks each scheduler with ``spec_capture_backend``.
     """
     states = server_info.get("internal_states") or []
     if any(
@@ -67,14 +62,11 @@ def detect_server_capture(server_info: Mapping[str, Any], *, server_url: str) ->
         for state in states
     ):
         return "plugin"
-    if server_info.get("enable_spec_capture"):
-        return "patch"
     raise RuntimeError(
         f"{server_url} advertises no spec capture in /server_info: launch it with "
-        "the spec-capture patch and --enable-spec-capture, or with the "
         "specforge-sglang-capture plugin and SPECFORGE_SPEC_CAPTURE=1; or set "
         "deployment.disaggregated.server_capture (or DISAGG_SERVER_CAPTURE) to "
-        "patch or plugin"
+        "plugin"
     )
 
 
@@ -206,7 +198,7 @@ class SGLangServerCaptureAdapter:
         timeout_s: float = 300.0,
         post_fn: Optional[Callable[..., Any]] = None,
         target_model_version: str = "unknown",
-        server_capture: str = "patch",
+        server_capture: str = "plugin",
         server_info_fn: Optional[Callable[[str, float], Mapping[str, Any]]] = None,
     ) -> None:
         if server_capture not in ("auto", *SERVER_CAPTURE_BACKENDS):
@@ -351,7 +343,7 @@ class SGLangServerCaptureAdapter:
             # A task id is unique within a run, and retries happen only before
             # its ref is committed.  Keep the generation stable so a response
             # lost after the server write cannot strand gN when the retry writes
-            # gN+1.  The server patch replaces these deterministic keys on a
+            # gN+1.  The server plugin replaces these deterministic keys on a
             # retry (``replace``), bounding the attempt to one namespace.
             "gen": 1,
             "replace": int(task.attempt) > 0,
@@ -450,21 +442,16 @@ class SGLangServerCaptureAdapter:
         body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
         sampling_params = {"temperature": 0.0, "max_new_tokens": 0}
         capture_payloads = [self._spec_capture_payload(t) for t in tasks]
-        if server_capture == "plugin":
-            # custom_params values must be JSON scalars, so the spec travels
-            # as one JSON string per request.
-            body["sampling_params"] = [
-                {
-                    **sampling_params,
-                    "custom_params": {
-                        "spec_capture": json.dumps(payload, separators=(",", ":"))
-                    },
-                }
-                for payload in capture_payloads
-            ]
-        else:
-            body["sampling_params"] = sampling_params
-            body["spec_capture"] = capture_payloads
+        # custom_params values are JSON scalars: one encoded spec per request.
+        body["sampling_params"] = [
+            {
+                **sampling_params,
+                "custom_params": {
+                    "spec_capture": json.dumps(payload, separators=(",", ":"))
+                },
+            }
+            for payload in capture_payloads
+        ]
         for payload in capture_payloads:
             feature_names = list(payload["features"].values())
             feature_names.extend(

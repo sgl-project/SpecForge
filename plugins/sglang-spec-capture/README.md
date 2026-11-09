@@ -1,9 +1,8 @@
 # specforge-sglang-capture
 
 An SGLang plugin that writes a target model's prefill hidden states straight
-into Mooncake for SpecForge's disaggregated training. It replaces the
-versioned source patch under `patches/sglang/` on SGLang builds that ship the
-generic extension points it uses:
+into Mooncake for SpecForge's disaggregated training and offline preparation. It requires an SGLang
+build with these generic extension points:
 
 - `--enable-return-aux-hidden-states` / `--return-aux-hidden-state-layer-ids`:
   aux hidden-state capture on a target without a draft. `--speculative-algorithm`
@@ -15,26 +14,34 @@ generic extension points it uses:
 - `Scheduler.defer_response(req, completion)`: SGLang holds a finished
   request until its objects are written, then reads the completion on the
   scheduler thread before returning capture metadata. Cancelling one request
-  does not cancel a shared write needed by other requests.
+  does not cancel a shared write needed by other requests. It queues reclamation
+  of that request's objects on the writer after publication, so a client cleanup
+  that ran before the objects existed cannot leave them orphaned. Cleanup RPC
+  failures are retried and logged if they persist.
 
 ## Install
 
 This version requires SGLang's [aux-capture changes in PR #43449](https://github.com/sgl-project/sglang/pull/43449)
 and the completion-based `defer_response` revision of
 [PR #43450](https://github.com/sgl-project/sglang/pull/43450), or a branch containing
-both. These extension points are not available in stock SGLang 0.5.18.
+both. Install SGLang manually at commit
+`c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`; the released 0.5.23 wheel still lacks the forward
+observer, completion and auxiliary-capture APIs required here.
 
 The aux-capture API returns `last_hidden_states` after the final norm and
 before LM-head-only scaling, including Inkling's muP division. The plugin
 preserves those values; SpecForge folds `logits_mup_width_multiplier` into
-its frozen target head. Older builds that return scaled states require the
-version-specific capture patch instead.
+its frozen target head. Older builds that return scaled states are unsupported;
+upgrade the capture environment to a build with the required API.
 
-Use separate environments for the SGLang server and SpecForge training.
-SpecForge currently pins SGLang 0.5.18 and different Torch/Transformers versions;
-installing the main SpecForge package into the server environment would replace
-the server's dependencies. The server only needs this plugin, its SGLang build,
-and Mooncake; the plugin does not import the main SpecForge package.
+The supported capture setup uses this SGLang revision with
+Torch 2.14.1 and Transformers 5.19.0. SpecForge does not install SGLang as a
+package dependency. They can run in the same environment;
+the server remains a separate process. Separate environments are also supported
+through `capture_servers[].python_executable`. The plugin itself does not import
+the main SpecForge package. CI uses a separate `sf-capture` environment for
+the live server. Both CI environments install the revision specified by
+`SGLANG_COMMIT` in `.github/workflows/test.yaml`.
 
 Install into the SGLang server's environment. The plugin declares no
 dependencies, so the server's pins stay intact:
@@ -52,19 +59,23 @@ Source installation requires the Rust toolchain pinned by SGLang, a C/C++
 compiler, and CUDA development tools. An existing compatible SGLang server
 environment can also be used.
 
-For example, from the SpecForge checkout on a CUDA 13 host, with an SGLang
-checkout containing both changes:
+For example, from the SpecForge checkout on a CUDA 13 host with the Rust,
+C/C++ and CUDA build tools required by the pinned SGLang revision:
 
 ```bash
-python3.12 -m venv .venv-sglang .venv-training
-.venv-sglang/bin/python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
-.venv-sglang/bin/python -m pip install -e /path/to/sglang/python mooncake-transfer-engine-cuda13
-.venv-sglang/bin/python -m pip install --no-deps plugins/sglang-spec-capture
-.venv-training/bin/python -m pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
-.venv-training/bin/python -m pip install -e . mooncake-transfer-engine-cuda13
-.venv-sglang/bin/python -m pip check
-.venv-training/bin/python -m pip check
+uv venv .venv -p 3.12
+source .venv/bin/activate
+uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+uv pip install wheel setuptools setuptools-rust setuptools-scm
+uv pip install --no-build-isolation --prerelease=allow -e .
+uv pip install --no-build-isolation --prerelease=allow \
+  "sglang @ git+https://github.com/sgl-project/sglang.git@c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0#subdirectory=python"
+uv pip install --no-deps plugins/sglang-spec-capture
+uv pip install mooncake-transfer-engine-cuda13
 ```
+
+The SGLang requirement uses the exact commit above; no cache refresh is forced. Rebuild
+optional compiled training kernels against the installed Torch when upgrading.
 
 SGLang discovers the plugin through the `sglang.srt.plugins` entry point. If
 `SGLANG_PLUGINS` is set, it must include `specforge_spec_capture`.
@@ -75,7 +86,7 @@ SGLang discovers the plugin through the `sglang.srt.plugins` entry point. If
 SPECFORGE_SPEC_CAPTURE=1 \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:50051 \
 MOONCAKE_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-.venv-sglang/bin/python -m sglang.launch_server --model-path <target> --skip-tokenizer-init \
+python -m sglang.launch_server --model-path <target> --skip-tokenizer-init \
   --chunked-prefill-size -1 \
   --speculative-algorithm DFLASH --enable-return-aux-hidden-states \
   --return-aux-hidden-state-layer-ids 1 16 31 46 61 \
@@ -91,12 +102,15 @@ The default, `auto`, finds it without configuration:
   server's Python. It selects the plugin when `specforge_sglang_capture`,
   `sglang.srt.model_executor.forward_observer` and
   `sglang.srt.managers.deferred_output` (with `ResponseCompletion`, the
-  `defer_response` completion protocol) import. Otherwise it selects the
-  patch if the patched SGLang imports. It then renders the flags above and
+  `defer_response` completion protocol) import. Otherwise startup fails with
+  installation instructions. It renders the flags above and
   `SPECFORGE_SPEC_CAPTURE=1`. `specforge train --plan` shows the result.
 - External servers: before the first request, the producer reads each
   server's `/server_info`. The enabled plugin adds `spec_capture_backend:
-  plugin` to every scheduler's `internal_states`.
+  plugin` to every scheduler's `internal_states`, together with
+  `spec_capture_method` and `spec_capture_aux_layer_ids`. Offline preparation
+  validates these fields before submitting prompts; reinstall this plugin on
+  existing servers when updating the preparation client.
 
 `server_capture: plugin`, or `DISAGG_SERVER_CAPTURE=plugin` when the config
 leaves it at `auto`, skips detection.

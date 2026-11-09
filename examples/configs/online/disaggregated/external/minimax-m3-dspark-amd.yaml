@@ -1,0 +1,89 @@
+# MiniMax-M3 DSpark. Sequence length 4,096, 6 epochs.
+# Global batch 512 = batch 2 x accumulation 32 x 8 ranks (1 node).
+# Fill in the dataset path and replace the loopback capture addresses.
+model:
+  target_model_path: MiniMaxAI/MiniMax-M3-MXFP8
+  draft_model_config: configs/minimax-m3-dspark.json
+  target_backend: sglang
+  trust_remote_code: true
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.lm_head.weight
+  mask_token_id: 200063
+  torch_dtype: bfloat16
+  sglang_attention_backend: triton
+  sglang_mem_fraction_static: 0.80
+  sglang_context_length: 4608
+
+data:
+  train_data_path: ./cache/dataset/minimax-m3-dspark.jsonl
+  max_length: 4096
+  chat_template: minimax-m3
+  cache_dir: cache
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 8
+
+training:
+  strategy: dspark
+  num_epochs: 6
+  batch_size: 2
+  accumulation_steps: 32
+  fsdp_sharding: SHARD_GRAD_OP
+  learning_rate: 0.0006
+  lr_scheduler: cosine
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 4.5
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 100
+  max_checkpoints: 3
+  log_interval: 1
+  dist_timeout: 10
+  seed: 42
+  prompt_seed: 1
+
+tracking:
+  report_to: tensorboard
+  wandb_project: specforge-dspark
+  wandb_name: minimax-m3-dspark
+  wandb_dir: outputs/minimax-m3-dspark/tensorboard
+
+runtime:
+  producer_lease: 16
+  producer_concurrency: 4
+  in_flight_high_watermark: 1024
+  in_flight_low_watermark: 512
+  resident_high_watermark_bytes: 184683593728
+  resident_low_watermark_bytes: 92341796864
+  feature_store_max_resident_bytes: 247390109696
+
+run_id: minimax-m3-dspark
+output_dir: outputs/minimax-m3-dspark
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+    master_addr: 127.0.0.1
+    master_port: 29500
+  disaggregated:
+    control_dir: outputs/minimax-m3-dspark/control
+    consumer_state_dir: outputs/minimax-m3-dspark/consumer-state
+    backend: mooncake
+    store_id: minimax-m3-dspark
+    server_urls:
+      - http://127.0.0.1:30000
+      - http://127.0.0.1:30001
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_local_hostname: 127.0.0.1
+    mooncake_protocol: rdma
+    mooncake_rdma_devices: mlx5_0
+    client_buffer_size: 1073741824
+    idle_timeout_s: 7200
+    peer_wait_timeout_s: 7200

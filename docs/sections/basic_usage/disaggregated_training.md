@@ -43,7 +43,7 @@ loader workers) so the strategy sizes DFlash-family anchors without a GPU sync. 
 tensors, prefetched batches, and overflow allocations consume additional memory.
 Set `deployment.disaggregated.receive_buffers: pageable` to use fresh CPU receives.
 
-Patched CUDA capture servers automatically publish device tensors when
+CUDA capture servers with the plugin automatically publish device tensors when
 `MOONCAKE_PROTOCOL=rdma`; managed-local servers do so only when
 `mooncake.protocol: rdma` is set explicitly. TCP and non-CUDA workers keep host
 publication. Set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` on an external server, or
@@ -231,7 +231,7 @@ specforge train -c \
 ```
 
 The selector runs only on the consumer; capture servers still use
-`--spec-capture-method dflash` and the auxiliary layer IDs from the draft
+`--speculative-algorithm DFLASH` and the auxiliary layer IDs from the draft
 config.
 
 The Qwen3.8-27B DFlash2 recipe fills one 8-GPU node: four TP=1 capture servers
@@ -363,7 +363,7 @@ rcli exec --per-node <job> \
   'bash examples/disagg/run_qwen3_8b_dflash_disagg_2node.sh'
 ```
 
-Rank 0 starts and health-checks Mooncake and patched SGLang, then invokes the
+Rank 0 starts and health-checks Mooncake and SGLang with the capture plugin, then invokes the
 canonical producer role. Rank 1 invokes the canonical consumer role, whose
 process count still comes from the YAML. The wrapper coordinates only
 node-local services and shared lifecycle markers; it does not contain another
@@ -389,7 +389,7 @@ TP1 Qwen3.8-27B capture servers feeding an eight-rank DFlash2 trainer; see its
 Without `deployment.disaggregated.managed_local`, the unified supervisor owns
 only the requested SpecForge roles. With the default single-node launch it
 starts producer and consumer; with an explicit `--role` it starts only that
-role. Mooncake and patched SGLang remain external, usually long-lived services
+role. Mooncake and SGLang with the capture plugin remain external, usually long-lived services
 managed by Kubernetes, Slurm, systemd, or the development environment. They may
 also run on the same host: external means that the training CLI does not start,
 stop, or assign GPUs to them.
@@ -423,16 +423,15 @@ External deployments stay on `tcp` unless `mooncake_protocol` or
 and a store whose clients mix TCP and RDMA fails on the first read, so set the
 same value for every server, producer and trainer. Under RDMA a producer or
 trainer checks every device in `MOONCAKE_RDMA_DEVICES`, uses its node's usable
-HCAs when the list is empty, and fails when there is none. A patched capture
-server refuses to start without an explicit `MOONCAKE_RDMA_DEVICES`; the
-two-node wrapper resolves the capture node's HCAs before starting its servers.
-Both reject `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` and
-`MC_USE_TEV1`, which would put Mooncake on TCP or ignore the device list, and a
-producer or trainer also rejects an `MC_TE_FILTERS` that excludes a listed
-device.
+HCAs when the list is empty, and fails when there is none. Managed launchers
+check the capture environment before startup; the two-node wrapper resolves
+its HCAs before starting servers. These checks reject `MC_FORCE_TCP`,
+`MC_MS_AUTO_DISC=1`, `MC_USE_TENT`, `MC_USE_TEV1` and an `MC_TE_FILTERS` that
+excludes a listed device. For external servers, configure the same validated
+RDMA environment explicitly.
 
 The online producer sends prompts to the URLs in
-`deployment.disaggregated.server_urls`. Start a patched SGLang server separately
+`deployment.disaggregated.server_urls`. Start a SGLang server running the capture plugin separately
 with the model, capture method, and auxiliary layer ids matching the draft
 config. DFlash, DFlash2, and Domino use the DFlash capture contract, DSpark
 uses its dedicated K3 capture contract, and EAGLE3 and P-EAGLE use the EAGLE3

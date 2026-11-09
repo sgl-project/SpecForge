@@ -1,11 +1,11 @@
 # coding=utf-8
 """Unit tests for the server-side spec-capture transport (no GPU, no server).
 
-A stub ``post_fn`` stands in for the patched SGLang server: it writes raw
+A stub ``post_fn`` stands in for the SGLang plugin: it writes raw
 tensor bytes into the shared fake Mooncake backend at the sink's key layout
 (``{store_id}/{sample_id}/g{gen}/{name}``) and returns the
 ``meta_info["spec_capture"]`` result rows — i.e. it emulates
-``patches/sglang/v0.5.18/spec-capture.patch``'s ``SpecCaptureSink`` byte-for-
+the plugin's ``SpecCaptureSink`` byte-for-
 byte. The tests then drive the REAL client stack over it:
 ``SGLangServerCaptureAdapter.produce_refs`` -> contract verification from
 FeatureSpecs -> ``MooncakeFeatureStore.adopt`` -> ``RolloutWorker`` commit ->
@@ -88,7 +88,7 @@ def _dtype_str(t: torch.Tensor) -> str:
 
 
 class _StubCaptureServer:
-    """Emulates the patched server: sink writes + meta_info result rows."""
+    """Emulates the plugin server: sink writes + meta_info result rows."""
 
     def __init__(
         self,
@@ -111,10 +111,15 @@ class _StubCaptureServer:
         self.backend.put_from(key, t.data_ptr(), t.element_size() * t.numel())
 
     def _specs(self, json_body: Dict[str, Any]) -> List[Dict[str, Any]]:
-        return json_body["spec_capture"]
+        assert "spec_capture" not in json_body
+        params = json_body["sampling_params"]
+        assert isinstance(params, list) and len(params) == len(json_body["input_ids"])
+        for item in params:
+            assert item["max_new_tokens"] == 0 and item["temperature"] == 0.0
+        return _request_specs(json_body)
 
     def _result(self, result: Dict[str, Any]) -> Any:
-        return result
+        return [result]
 
     def __call__(self, url: str, json_body: Dict[str, Any], timeout: float):
         assert url.endswith("/generate")
@@ -179,20 +184,10 @@ class _StubCaptureServer:
         return rows
 
 
-class _PluginStubCaptureServer(_StubCaptureServer):
-    """Emulates the plugin: specs in custom_params, results as customized info."""
-
-    def _specs(self, json_body: Dict[str, Any]) -> List[Dict[str, Any]]:
-        assert "spec_capture" not in json_body
-        params = json_body["sampling_params"]
-        assert isinstance(params, list) and len(params) == len(json_body["input_ids"])
-        for item in params:
-            assert item["max_new_tokens"] == 0 and item["temperature"] == 0.0
-        return [json.loads(item["custom_params"]["spec_capture"]) for item in params]
-
-    def _result(self, result: Dict[str, Any]) -> Any:
-        # The tokenizer manager accumulates customized info into a list.
-        return [result]
+def _request_specs(body):
+    return [
+        json.loads(p["custom_params"]["spec_capture"]) for p in body["sampling_params"]
+    ]
 
 
 class _FakeController:
@@ -304,17 +299,12 @@ def _mk(
     backend=None,
     request_input_adapter=None,
     teacher_metrics=True,
-    server_capture="patch",
+    server_capture="plugin",
     server_info_fn=None,
 ):
     backend = backend or _FakeMooncakeStore()
     if server is None:
-        stub = (
-            _PluginStubCaptureServer
-            if server_capture == "plugin"
-            else _StubCaptureServer
-        )
-        server = stub(backend)
+        server = _StubCaptureServer(backend)
     store = MooncakeFeatureStore(store=backend, store_id="run0")
     adapter = SGLangServerCaptureAdapter(
         "http://server:30000",
@@ -367,9 +357,12 @@ class TestServerCaptureAdapter(unittest.TestCase):
         )
         self.assertEqual(
             {"temperature": 0.0, "max_new_tokens": 0},
-            request["sampling_params"],
+            {
+                k: request["sampling_params"][0][k]
+                for k in ("temperature", "max_new_tokens")
+            },
         )
-        self.assertEqual(2, len(request["spec_capture"]))
+        self.assertEqual(2, len(_request_specs(request)))
         self.assertEqual(2, len(request["extra_key"]))
         self.assertEqual(2, len(set(request["extra_key"])))
         self.assertTrue(all(len(value) == 32 for value in request["extra_key"]))
@@ -512,7 +505,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
         # stages or puts the final hidden state.
         self.assertEqual(
             [{"aux": "hidden_states"}] * 2,
-            [payload["features"] for payload in posted[0]["spec_capture"]],
+            [payload["features"] for payload in _request_specs(posted[0])],
         )
         self.assertFalse(any("target_last_hidden_states" in key for key in backend._d))
         teacher_refs = _mk(algorithm="dflash")[3].produce_refs(
@@ -675,7 +668,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
         cache_keys = []
 
         def lose_first_response(url, json_body, timeout):
-            requests.append(json_body["spec_capture"][0])
+            requests.append(_request_specs(json_body)[0])
             cache_keys.append(json_body["extra_key"][0])
             response = original_post(url, json_body, timeout)
             if len(requests) == 1:
@@ -731,7 +724,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
 
         def corrupt_second_identity(url, json_body, timeout):
             rows = server(url, json_body, timeout)
-            rows[1]["meta_info"]["spec_capture"]["store_id"] = "wrong-store"
+            rows[1]["meta_info"]["spec_capture"][0]["store_id"] = "wrong-store"
             return rows
 
         _, _, store, adapter = _mk(
@@ -831,7 +824,7 @@ class _KeepAliveCaptureHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        sample_ids = [spec["sample_id"] for spec in body["spec_capture"]]
+        sample_ids = [spec["sample_id"] for spec in _request_specs(body)]
         with self.server.lock:
             self.server.requests.append((self.client_address[1], sample_ids))
         if self.server.status != 200:
@@ -855,7 +848,7 @@ class TestServerCapturePluginTransport(unittest.TestCase):
     def test_spec_rides_custom_params_as_one_json_string_per_request(self):
         posted = []
         backend = _FakeMooncakeStore()
-        server = _PluginStubCaptureServer(backend)
+        server = _StubCaptureServer(backend)
 
         def post(url, json_body, timeout):
             posted.append(json_body)
@@ -900,7 +893,7 @@ class TestServerCapturePluginTransport(unittest.TestCase):
 
     def test_per_task_server_error_becomes_failure_marker(self):
         backend = _FakeMooncakeStore()
-        server = _PluginStubCaptureServer(backend, error_sample_ids={"run0:t1"})
+        server = _StubCaptureServer(backend, error_sample_ids={"run0:t1"})
         _, _, _, adapter = _mk(server=server, backend=backend, server_capture="plugin")
         ok, failed = adapter.produce_refs(
             [_task(0, 4), _task(1, 4)], capture=_eagle3_contract()
@@ -921,6 +914,8 @@ class TestServerCapturePluginTransport(unittest.TestCase):
     def test_unknown_backend_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "server_capture must be one of"):
             _mk(server_capture="sidecar")
+        with self.assertRaisesRegex(ValueError, "server_capture must be one of"):
+            _mk(server_capture="patch")
 
 
 PLUGIN_SERVER_INFO = {
@@ -960,8 +955,7 @@ class TestServerCaptureAutoDetection(unittest.TestCase):
 
     def test_detects_each_backend_once(self):
         for info, stub, expected in (
-            (PLUGIN_SERVER_INFO, _PluginStubCaptureServer, "plugin"),
-            (PATCH_SERVER_INFO, _StubCaptureServer, "patch"),
+            (PLUGIN_SERVER_INFO, _StubCaptureServer, "plugin"),
         ):
             with self.subTest(expected):
                 adapter, _, posted, fetched = self._auto(info, stub=stub)
@@ -974,17 +968,14 @@ class TestServerCaptureAutoDetection(unittest.TestCase):
                 self.assertEqual(adapter.server_capture, expected)
                 self.assertEqual(fetched, ["http://server:30000/server_info"])
                 for body in posted:
-                    if expected == "plugin":
-                        self.assertNotIn("spec_capture", body)
-                        self.assertIn("custom_params", body["sampling_params"][0])
-                    else:
-                        self.assertIn("spec_capture", body)
+                    self.assertNotIn("spec_capture", body)
+                    self.assertIn("custom_params", body["sampling_params"][0])
 
     def test_server_without_capture_fails_before_any_write(self):
         for info in (
             # Stock SGLang, or the plugin installed without SPECFORGE_SPEC_CAPTURE=1.
             {"enable_return_aux_hidden_states": True, "internal_states": [{}]},
-            {"enable_spec_capture": False},
+            PATCH_SERVER_INFO,
         ):
             with self.subTest(info=info):
                 adapter, store, posted, _ = self._auto(info)
@@ -992,7 +983,7 @@ class TestServerCaptureAutoDetection(unittest.TestCase):
                     mock.patch.object(store, "track_external_attempt") as track,
                     self.assertRaisesRegex(
                         RuntimeError,
-                        "advertises no spec capture.*--enable-spec-capture.*"
+                        "advertises no spec capture.*"
                         "SPECFORGE_SPEC_CAPTURE=1.*DISAGG_SERVER_CAPTURE",
                     ),
                 ):
@@ -1003,7 +994,7 @@ class TestServerCaptureAutoDetection(unittest.TestCase):
 
     def test_unreadable_server_info_is_detected_again_on_the_next_request(self):
         adapter, _, posted, fetched = self._auto(
-            ConnectionError("connection refused"), PATCH_SERVER_INFO
+            ConnectionError("connection refused"), PLUGIN_SERVER_INFO
         )
         with self.assertRaisesRegex(
             RuntimeError, "cannot read http://server:30000/server_info.*refused"
@@ -1012,7 +1003,7 @@ class TestServerCaptureAutoDetection(unittest.TestCase):
         self.assertEqual(posted, [])
         (ref,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
         self.assertIsInstance(ref, SampleRef)
-        self.assertEqual(adapter.server_capture, "patch")
+        self.assertEqual(adapter.server_capture, "plugin")
         self.assertEqual(len(fetched), 2)
 
     def test_default_server_info_fetch(self):
@@ -1020,7 +1011,7 @@ class TestServerCaptureAutoDetection(unittest.TestCase):
         response.json.return_value = PLUGIN_SERVER_INFO
         backend = _FakeMooncakeStore()
         _, _, _, adapter = _mk(
-            server=_PluginStubCaptureServer(backend),
+            server=_StubCaptureServer(backend),
             backend=backend,
             server_capture="auto",
         )
@@ -1030,13 +1021,12 @@ class TestServerCaptureAutoDetection(unittest.TestCase):
         get.assert_called_once_with("http://server:30000/server_info", timeout=30.0)
         response.raise_for_status.assert_called_once_with()
 
-    def test_detect_server_capture_reads_both_markers(self):
+    def test_detect_server_capture_rejects_legacy_marker(self):
         self.assertEqual(
             detect_server_capture(PLUGIN_SERVER_INFO, server_url="u"), "plugin"
         )
-        self.assertEqual(
-            detect_server_capture(PATCH_SERVER_INFO, server_url="u"), "patch"
-        )
+        with self.assertRaisesRegex(RuntimeError, "^u advertises no spec capture"):
+            detect_server_capture(PATCH_SERVER_INFO, server_url="u")
         with self.assertRaisesRegex(RuntimeError, "^u advertises no spec capture"):
             detect_server_capture({}, server_url="u")
 
