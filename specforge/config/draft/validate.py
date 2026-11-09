@@ -4,10 +4,10 @@ from collections.abc import Mapping
 
 from ._validation import nonempty_string, positive_int
 from .attention import AttentionSpec
-from .conv import ConvSpec, GroupedCausalConvSpec
+from .conv import ConvSpec
 from .layer import LayerSpec
 from .mlp import FFNSpec
-from .registry import component_schema
+from .registry import component_schema, validate_component
 
 
 def validate_layers(
@@ -67,19 +67,15 @@ def validate_layers(
         require("mlp", layer.mlp, f"{path}.mlp")
         if layer.sublayer_conv is not None:
             conv = require("conv", layer.sublayer_conv, f"{path}.sublayer_conv")
-            if isinstance(conv, GroupedCausalConvSpec):
-                if hidden_size % conv.group_size:
-                    raise ValueError(
-                        f"{path}.sublayer_conv: group_size must divide hidden_size"
-                    )
-                if num_model_slots is None:
-                    raise ValueError(
-                        f"{path}.sublayer_conv: grouped_causal requires a block protocol"
-                    )
-                if conv.kernel_size > num_model_slots:
-                    raise ValueError(
-                        f"{path}.sublayer_conv: kernel_size exceeds the model slot count"
-                    )
+            try:
+                validate_component(
+                    "conv",
+                    conv,
+                    hidden_size=hidden_size,
+                    num_model_slots=num_model_slots,
+                )
+            except ValueError as exc:
+                raise ValueError(f"{path}.sublayer_conv: {exc}") from exc
 
     for kind, table in tables.items():
         unused = table.keys() - used[kind]
