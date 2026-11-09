@@ -226,7 +226,6 @@ class ComponentCodecTest(unittest.TestCase):
         result = subprocess.run(
             [
                 sys.executable,
-                "-S",
                 "-c",
                 """
 import sys
