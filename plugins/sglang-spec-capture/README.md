@@ -180,3 +180,64 @@ with RDMA NICs. Without it, Mooncake installs its RDMA transport instead.
 | `SGLANG_SPEC_CAPTURE_ARENA_BYTES` | Arena size in bytes. Required with `MOONCAKE_PROTOCOL=nvlink`. |
 | `SGLANG_SPEC_CAPTURE_CONTROL_PORT` | Port of the NVLink free endpoint (default: ephemeral). |
 | `MOONCAKE_*` | Mooncake client settings. |
+
+## Opt-in HS capture protocol v1
+
+This migration additionally needs SGLang's native
+`managers.prefix_admission.CAPTURE_ADMISSION_PROTOCOL == 1` companion extension.
+It does not apply the removed legacy capture patch. Enable
+`SPECFORGE_HS_CAPTURE=1` to negotiate server-issued attempt reservations at
+`POST /spec_capture/control`; set `SPECFORGE_HS_CACHE=1` to reuse hidden-state
+prefixes. `HS_CAPTURE=1, HS_CACHE=0` keeps the same complete-output, byte-budget
+and immutable-attempt protocol while forcing a zero prefix. The ordinary
+non-negotiated capture path remains available when both are off.
+
+| Variable | Default |
+|---|---:|
+| `SPECFORGE_HS_CHUNK_TOKENS` | 256 |
+| `SPECFORGE_HS_CACHE_BYTES` | 1073741824 |
+| `SPECFORGE_HS_PINNED_BYTES` | 268435456 |
+| `SPECFORGE_HS_OUTPUT_BYTES` | 536870912 |
+| `SPECFORGE_HS_DEVICE_BYTES` | 268435456 |
+| `SPECFORGE_HS_MAX_WORKERS` | 4 |
+| `SPECFORGE_HS_ATTEMPT_CAPACITY` | 4096 |
+
+All limits must be positive. Pinned staging uses one retained arena, conservatively
+rounded down to a power of two, with aligned independent reservation slots.
+Cache adoption charges complete underlying storage, including unmatchable tails.
+Output, pinned and device limits are separate. Hard oversize fails explicitly;
+temporary admission pressure permits only the native transaction's single
+fully-rolled-back reclaim/retry. Atomic registry-capacity rejection returns
+`error_code=capture_capacity_declined, reservation_granted=false` before granting
+any attempt in that begin operation.
+
+HS capture supports complete causal text, nonchunked prefill, PP1/DP1, no
+offload/session/LoRA/weight updates, and host publication with Mooncake hard pin.
+Set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` when using RDMA host staging. Reuse additionally
+requires deterministic batch-invariant inference, enabled radix, and an exact
+selected recurrent checkpoint backend. Unsupported modes fail startup rather
+than changing capture semantics. Capability metadata advertises these limits.
+
+The content namespace binds model/config/load epoch, ordered raw auxiliary
+layers, post-norm last hidden state, dtype/layout, causal position/attention,
+TP/KV/checkpoint/backend and deterministic semantics. Tokens form complete parent
+hash chains; sample/attempt IDs and loss masks do not enter content keys.
+Passthrough data remains part of the registered request digest.
+
+Each external attempt has immutable keys
+`store/sample/g1/attempt/server_epoch/reservation_token/feature`. The native
+observer retains independently owned suffix snapshots; its auxiliary output
+carries controller jobs and performs no second D2H. Assembly reconstructs every
+row `[0,N)` from the leased prefix and the current `[L,N)` suffix. Scheduler safe
+points batch ready samples into the native sink, then resolve native deferred
+responses. A PUBLISHED certificate is issued only after exact key/schema/digest
+validation and source-reader drain. Sink completion permits cache adoption; it
+does not retire storage retained by cache leases. Unknown DMA/native transfer
+drain quarantines sources, registrations and charges until an external drain
+proof exists. Timeouts do not authorize reuse.
+
+`tests.test_runtime.test_hs_runtime` covers the migrated CPU core;
+`tests.test_runtime.test_hs_plugin` covers native-output wiring with a CPU buffer
+store; `test_hs_controller_parallel_cuda` requires actual CUDA/pinned copies.
+CPU fixtures do not certify numerical model, real Mooncake, scheduler TP or
+training equivalence.

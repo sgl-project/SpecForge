@@ -111,6 +111,25 @@ def object_key(store_id: str, sample_id: str, gen: int, name: str) -> str:
     return f"{store_id}/{sample_id}/g{gen}/{name}"
 
 
+def sample_object_key(spec: Dict[str, Any], name: str) -> str:
+    if spec.get("object_key_layout") == "attempt-v1":
+        if not spec.get("server_epoch") or not spec.get("reservation_token"):
+            raise ValueError("immutable capture keys require epoch and reservation token")
+        return (f"{spec['store_id']}/{spec['sample_id']}/g{int(spec.get('gen', 1))}"
+                f"/attempt/{spec['server_epoch']}/{spec['reservation_token']}/{name}")
+    return object_key(str(spec["store_id"]), str(spec["sample_id"]),
+                      int(spec.get("gen", 1)), name)
+
+
+class CaptureWriterUncertain(RuntimeError):
+    """A native write may still be reading its registered source allocation."""
+    capture_writer_drained = False
+
+
+class _DrainedWriteFailure(RuntimeError):
+    """A complete status vector proves the native call has returned ownership."""
+
+
 class _CudaBytes:
     """Exposes a raw device allocation to ``torch.as_tensor`` without copying."""
 
@@ -303,10 +322,14 @@ class SpecCaptureSink:
     def __init__(self, aux_layer_ids: Optional[Sequence[int]] = None) -> None:
         self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids else None
         self._store = None
+        self._owns_store = False
         self._put_config = None
         self._nvlink: Optional[NvlinkArena] = None
         self._control_listener: Optional[socket.socket] = None
         self._lock = threading.Lock()
+        self._uncertain_publications = []
+        self._closed = False
+        self.require_hard_pin = False
         # One writer is enough: Mooncake stripes a batched transfer itself.
         # The thread only decouples that transfer from the scheduler.
         self._executor = ThreadPoolExecutor(
@@ -373,10 +396,13 @@ class SpecCaptureSink:
             # Older ROCm Mooncake builds only expose `with_soft_pin`.
             if hasattr(cfg, "with_hard_pin"):
                 cfg.with_hard_pin = True
+            elif self.require_hard_pin:
+                raise RuntimeError("HS publication requires Mooncake hard-pin ownership")
             elif hasattr(cfg, "with_soft_pin"):
                 cfg.with_soft_pin = True
             self._put_config = cfg
             self._store = store
+            self._owns_store = True
             logger.info("spec-capture mooncake sink connected")
             return store
 
@@ -429,12 +455,7 @@ class SpecCaptureSink:
         names.extend(item["name"] for item in spec.get("passthrough") or [])
         keys = list(
             dict.fromkeys(
-                object_key(
-                    str(spec["store_id"]),
-                    str(spec["sample_id"]),
-                    int(spec.get("gen", 1)),
-                    str(name),
-                )
+                sample_object_key(spec, str(name))
                 for name in names
             )
         )
@@ -450,6 +471,8 @@ class SpecCaptureSink:
         return future
 
     def _discard_keys(self, keys: List[str]) -> None:
+        if any(set(keys).intersection(item["keys"]) for item in self._uncertain_publications):
+            raise CaptureWriterUncertain("cannot remove objects before native writer drain")
         if self._nvlink is not None:
             self._nvlink.free(keys)
             return
@@ -486,12 +509,40 @@ class SpecCaptureSink:
 
         ``ready_event`` orders device tensors after the work that produced them.
         """
-        return self._executor.submit(self._put_ready_samples, samples, ready_event)
+        if self._closed:
+            raise RuntimeError("capture sink is closed")
+        # Own a separate list: the caller may still be assigning completions
+        # while this worker finishes and drops its last source references.
+        return self._executor.submit(self._put_ready_samples, list(samples), ready_event)
 
     def _put_ready_samples(self, samples, ready_event):
-        if ready_event is not None:
-            ready_event.synchronize()
-        return self.put_samples(samples)
+        error = None
+        try:
+            if ready_event is not None:
+                ready_event.synchronize()
+            result = self.put_samples(samples)
+        except BaseException as exc:
+            # A Future retains its exception traceback. It must not retain
+            # drained sink tensor aliases across cache adoption.
+            from specforge_sglang_capture.hs.attempts import scalar_error
+            error = scalar_error(exc)
+        finally:
+            samples.clear()
+        if error is not None:
+            raise error
+        return result
+
+    def close(self) -> None:
+        self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        if self._uncertain_publications:
+            raise RuntimeError("capture sink retains native writes whose drain is unproven")
+        if self._control_listener is not None and self._nvlink is None:
+            self._control_listener.close()
+        if self._owns_store and self._store is not None:
+            close = getattr(self._store, "close", None)
+            if close is not None:
+                close()
 
     def put_samples(self, samples: List[Sample]) -> List[Dict[str, Any]]:
         """Publish samples with one batched Mooncake call; return their results.
@@ -501,6 +552,8 @@ class SpecCaptureSink:
         """
         if not samples:
             return []
+        if self._uncertain_publications:
+            raise CaptureWriterUncertain("capture native writer is quarantined")
 
         store = None if nvlink_enabled() else self._connect()
         timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
@@ -518,11 +571,11 @@ class SpecCaptureSink:
                 tensor = tensor.detach().contiguous()
             else:
                 tensor = tensor.detach().to("cpu").contiguous()
-            key = object_key(store_id, sample_id, gen, name)
+            key = sample_object_key(spec, name)
             keys.append(key)
             tensors.append(tensor)
             sizes.append(tensor.element_size() * tensor.numel())
-            if replace:
+            if replace and spec.get("object_key_layout") != "attempt-v1":
                 replace_keys.append(key)
             result_feats[name] = {
                 "shape": list(tensor.shape),
@@ -530,6 +583,8 @@ class SpecCaptureSink:
                     tensor.dtype, str(tensor.dtype).replace("torch.", "")
                 ),
             }
+            if spec.get("object_key_layout") == "attempt-v1":
+                result_feats[name]["key"] = key
             feature_meta.append(result_feats[name])
 
         for spec, aux, last_hidden in samples:
@@ -599,6 +654,7 @@ class SpecCaptureSink:
         self._remove_many_quiet(replace_keys)
         registered: List[int] = []
         seen_storage = set()
+        submitted = quarantined = False
         register_started = time.perf_counter()
         try:
             for tensor, nbytes in zip(tensors, sizes):
@@ -625,6 +681,7 @@ class SpecCaptureSink:
             register_ms = (time.perf_counter() - register_started) * 1000.0
             put_started = time.perf_counter()
             batch_put = getattr(store, "batch_put_from", None)
+            submitted = True
             if batch_put is None:
                 statuses = [
                     store.put_from(key, tensor.data_ptr(), nbytes, self._put_config)
@@ -638,35 +695,34 @@ class SpecCaptureSink:
                     self._put_config,
                 )
             put_ms = (time.perf_counter() - put_started) * 1000.0
-        except Exception:
+            if statuses is None:
+                statuses = [0] * len(keys)
+            if len(statuses) != len(keys):
+                raise CaptureWriterUncertain(
+                    f"capture sink returned {len(statuses)} statuses for {len(keys)} objects")
+            if any(status is not None and int(status) == -800 for status in statuses):
+                raise CaptureWriterUncertain("native capture transfer drain unknown (status -800)")
+            failed = [(key, status) for key, status in zip(keys, statuses)
+                      if status is not None and int(status) < 0]
+            if failed:
+                raise _DrainedWriteFailure(
+                    f"spec-capture batch_put_from failed for {len(failed)}/{len(keys)} keys; first={failed[0]}")
+        except Exception as exc:
+            if (getattr(exc, "capture_writer_drained", True) is False
+                    or (submitted and not isinstance(exc, _DrainedWriteFailure))):
+                quarantined = True
+                self._uncertain_publications.append({"tensors": tensors, "keys": keys,
+                    "registered": tuple(registered), "bytes": sum(sizes)})
+                raise CaptureWriterUncertain(str(exc)) from None
             self._remove_many_quiet(keys)
             raise
         finally:
-            for ptr in registered:
-                try:
-                    store.unregister_buffer(ptr)
-                except Exception:
-                    pass
-
-        if statuses is None:
-            statuses = [0] * len(keys)
-        if len(statuses) != len(keys):
-            self._remove_many_quiet(keys)
-            raise RuntimeError(
-                f"spec-capture batch_put_from returned {len(statuses)} statuses "
-                f"for {len(keys)} keys"
-            )
-        failed = [
-            (key, status)
-            for key, status in zip(keys, statuses)
-            if status is not None and int(status) < 0
-        ]
-        if failed:
-            self._remove_many_quiet(keys)
-            raise RuntimeError(
-                f"spec-capture batch_put_from failed for {len(failed)}/{len(keys)} "
-                f"keys; first={failed[0]}"
-            )
+            if not quarantined:
+                for ptr in registered:
+                    try:
+                        store.unregister_buffer(ptr)
+                    except Exception:
+                        pass
 
         if timing_enabled:
             logger.info(
