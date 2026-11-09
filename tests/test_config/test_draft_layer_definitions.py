@@ -137,6 +137,19 @@ class LayerDefinitionsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_layers(**config)
 
+    def test_unregistered_subclasses_cannot_reuse_a_type_name(self):
+        @dataclasses.dataclass(frozen=True, kw_only=True)
+        class PatchedGQA(GQASpec):
+            pass
+
+        config = definitions()
+        full = config["attention_configs"]["full"]
+        config["attention_configs"]["full"] = PatchedGQA(**dataclasses.asdict(full))
+        with self.assertRaisesRegex(
+            ValueError, "attention_configs.full: expected GQASpec"
+        ):
+            validate_layers(**config)
+
 
 if __name__ == "__main__":
     unittest.main()

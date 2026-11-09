@@ -20,7 +20,7 @@ from specforge.config.draft.codec.components import (
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import FFNSpec
 from specforge.config.draft.registry import component_schema, register_component_schema
-from specforge.config.draft.rope import RopeSpec
+from specforge.config.draft.rope import DefaultRoPESpec, RopeSpec
 
 COMPONENTS = {
     "attention": {
@@ -61,6 +61,17 @@ class ComponentCodecTest(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.dict(registry._SCHEMAS))
         self.enterContext(patch.dict(registry._VALIDATORS))
+
+    def test_nested_component_must_match_its_annotated_type(self):
+        @dataclass(frozen=True, kw_only=True)
+        class NarrowFFN(FFNSpec):
+            type: ClassVar[str] = "test_narrow_ffn"
+            rope: DefaultRoPESpec
+
+        register_component_schema("mlp", NarrowFFN)
+        payload = {"type": "test_narrow_ffn", "rope": {"rope_type": "none"}}
+        with self.assertRaisesRegex(ValueError, "rope: expected DefaultRoPESpec"):
+            decode_component("mlp", payload)
 
     def test_nested_nodes_and_components_use_the_same_codec(self):
         register_component_schema("mlp", NestedFFN)
