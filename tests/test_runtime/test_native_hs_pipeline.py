@@ -5,6 +5,8 @@ Mooncake DMA, scheduler TP agreement or numerical feature equivalence.
 """
 import os
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest import mock
 
@@ -161,6 +163,59 @@ class FencedReceiveDrain(unittest.TestCase):
         self.assertFalse(consumer._capture_read_intents)
         self.assertFalse(consumer._quarantined_buffers)
         self.assertFalse(consumer._capture_quarantined_registrations)
+
+
+    def test_close_fences_new_pageable_and_pooled_reads_before_transport_shutdown(self):
+        for kind in ("pageable", "pinned"):
+            with self.subTest(kind=kind):
+                backend, ref = self.make_ref()
+                consumer = MooncakeFeatureStore(store=backend, store_id="run0", receive_buffers=kind, receive_pool_bytes=4096)
+                consumer._owns_store = True
+                entered, finish = threading.Event(), threading.Event()
+                def close_transport():
+                    entered.set()
+                    if not finish.wait(3):
+                        raise TimeoutError("close test gate")
+                    return 0
+                with mock.patch.object(backend, "close", create=True, side_effect=close_transport), mock.patch.object(backend, "get_into", wraps=backend.get_into) as get, ThreadPoolExecutor(max_workers=1) as pool:
+                    closed = pool.submit(consumer.close)
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        with self.assertRaisesRegex(RuntimeError, "closing"):
+                            consumer.get(ref)
+                        self.assertEqual(get.call_count, 0)
+                        self.assertFalse(consumer._capture_read_intents)
+                    finally:
+                        finish.set()
+                    closed.result(timeout=3)
+                self.assertTrue(consumer._closed)
+
+    def test_close_refuses_an_existing_receive_and_keeps_new_reads_fenced(self):
+        backend, ref = self.make_ref()
+        consumer = MooncakeFeatureStore(store=backend, store_id="run0")
+        consumer._owns_store = True
+        entered, finish = threading.Event(), threading.Event()
+        original = backend.get_into
+        def get_into(*args):
+            entered.set()
+            if not finish.wait(3):
+                raise TimeoutError("read test gate")
+            return original(*args)
+        with mock.patch.object(backend, "get_into", side_effect=get_into), mock.patch.object(backend, "close", create=True, return_value=0) as close, ThreadPoolExecutor(max_workers=1) as pool:
+            read = pool.submit(consumer.get, ref)
+            try:
+                self.assertTrue(entered.wait(2))
+                with self.assertRaisesRegex(RuntimeError, "live readers"):
+                    consumer.close()
+                close.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, "closing"):
+                    consumer.get(ref)
+            finally:
+                finish.set()
+            _, handle = read.result(timeout=3)
+            consumer.release(handle)
+            consumer.close()
+            self.assertEqual(close.call_count, 1)
 
 
 class NativeHSLaunch(unittest.TestCase):

@@ -604,6 +604,9 @@ class MooncakeFeatureStore(FeatureStore):
         self.store_id = store_id or uuid.uuid4().hex[:8]
         self._owns_store = store is None
         self._closed = False
+        self._closing = False
+        self._active_get_calls = 0
+        self._close_lock = threading.Lock()
         if store is None:
             kw = dict(_MOONCAKE_SETUP_DEFAULTS)
             kw.update(setup_kwargs or {})
@@ -1115,15 +1118,23 @@ class MooncakeFeatureStore(FeatureStore):
         return torch.device("cuda", index)
 
     def close(self) -> None:
+        with self._close_lock:
+            self._close_impl()
+
+    def _close_impl(self) -> None:
         """Release receive memory after loaders and removal drains have stopped.
 
         An injected/shared backend is never closed here. Its failed-transfer
         buffers stay quarantined because its owner may still be using transport.
         """
-        if self._closed:
-            return
         with self._lock:
-            if any(intent["active"] or (intent["handle"] is not None and not intent["release_requested"])
+            if self._closed:
+                return
+            # This fence is installed atomically with read admission. It stays
+            # closed after failed shutdown; existing reads may drain and close
+            # may be retried, but no new native receive can begin.
+            self._closing = True
+            if self._active_get_calls or any(intent["active"] or (intent["handle"] is not None and not intent["release_requested"])
                    for intent in self._capture_read_intents.values()):
                 raise RuntimeError("cannot close capture transport with live readers")
         if self._receive_pool is not None:
@@ -1524,6 +1535,17 @@ class MooncakeFeatureStore(FeatureStore):
 
     # -- read --------------------------------------------------------------
     def get(self, sample_ref: SampleRef, *, device="cpu", names=None):
+        with self._lock:
+            if self._closing or self._closed:
+                raise RuntimeError("Mooncake feature store is closing or closed")
+            self._active_get_calls += 1
+        try:
+            return self._get_with_capture_fence(sample_ref, device=device, names=names)
+        finally:
+            with self._lock:
+                self._active_get_calls -= 1
+
+    def _get_with_capture_fence(self, sample_ref: SampleRef, *, device="cpu", names=None):
         self.auth.check(self._credential)
         self._recover_capture_reads()
         intent = self._begin_capture_read(sample_ref)
