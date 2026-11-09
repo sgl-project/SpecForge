@@ -7,6 +7,7 @@ from .conv import ConvSpec, GroupedCausalConvSpec
 from .mlp import DenseFFNSpec, FFNSpec
 from .norm import NormSpec, RMSNormSpec
 from .residual import ResidualSpec, StandardResidualSpec
+from .rope import DefaultRoPESpec, LinearRoPESpec, NoRoPESpec, RopeSpec
 
 _BASES = {
     "attention": AttentionSpec,
@@ -14,8 +15,14 @@ _BASES = {
     "conv": ConvSpec,
     "norm": NormSpec,
     "residual": ResidualSpec,
+    "rope": RopeSpec,
 }
 _SCHEMAS: dict[tuple[str, str], type] = {}
+
+
+def component_type(kind: str, node):
+    """Read the discriminator, preserving RoPE's serialized rope_type name."""
+    return getattr(node, "rope_type" if kind == "rope" else "type", None)
 
 
 def register_component_schema(kind: str, schema: type) -> None:
@@ -34,7 +41,7 @@ def register_component_schema(kind: str, schema: type) -> None:
     ):
         raise TypeError(f"{kind} schema must be a frozen dataclass")
     for field in fields(schema):
-        if field.name == "type":
+        if field.name in ("type", "rope_type"):
             raise TypeError(
                 "component type must be a ClassVar, not a configuration field"
             )
@@ -44,7 +51,7 @@ def register_component_schema(kind: str, schema: type) -> None:
             raise TypeError(
                 f"{kind}.{field.name}: structural fields must have no defaults"
             )
-    name = getattr(schema, "type", None)
+    name = component_type(kind, schema)
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{kind} schema must declare a nonempty type name")
     key = (kind, name)
@@ -74,5 +81,8 @@ for _kind, _schema in (
     ("conv", GroupedCausalConvSpec),
     ("norm", RMSNormSpec),
     ("residual", StandardResidualSpec),
+    ("rope", DefaultRoPESpec),
+    ("rope", LinearRoPESpec),
+    ("rope", NoRoPESpec),
 ):
     register_component_schema(_kind, _schema)

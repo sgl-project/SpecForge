@@ -4,12 +4,11 @@ from collections.abc import Mapping
 from dataclasses import asdict
 
 from ..logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
-from ..rope import DefaultRoPESpec, LinearRoPESpec, NoRoPESpec, RopeSpec
+from ..registry import component_schema, component_type
+from ..rope import RopeSpec
 from ._schema import _construct
+from .nodes import decode_node, encode_node
 
-_ROPE = {
-    schema.rope_type: schema for schema in (DefaultRoPESpec, LinearRoPESpec, NoRoPESpec)
-}
 _LOGITS = {
     schema.type: schema for schema in (NoLogitTransformSpec, MuPLogitTransformSpec)
 }
@@ -35,11 +34,26 @@ def _encode(node, schemas, tag, path):
 
 
 def decode_rope(payload: Mapping) -> RopeSpec:
-    return _decode(payload, _ROPE, "rope_type", "rope_parameters")
+    if not isinstance(payload, Mapping):
+        raise ValueError("rope_parameters: expected a configuration object")
+    try:
+        schema = component_schema("rope", payload.get("rope_type"))
+    except ValueError as error:
+        raise ValueError(f"rope_parameters.rope_type: {error}") from None
+    return decode_node(
+        schema,
+        {key: value for key, value in payload.items() if key != "rope_type"},
+        "rope_parameters",
+    )
 
 
 def encode_rope(node: RopeSpec) -> dict:
-    return _encode(node, _ROPE, "rope_type", "rope_parameters")
+    if not isinstance(node, RopeSpec):
+        raise ValueError(f"rope_parameters: unsupported node {type(node).__name__}")
+    name = component_type("rope", node)
+    if type(node) is not component_schema("rope", name):
+        raise ValueError(f"rope/{name}: expected its registered configuration node")
+    return {"rope_type": name, **encode_node(node)}
 
 
 def decode_target_logits(payload: Mapping) -> TargetLogitSpec:
